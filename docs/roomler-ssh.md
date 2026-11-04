@@ -629,7 +629,7 @@ flowchart TD
 
 | | Linux | macOS |
 |---|---|---|
-| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:1090`](../agents/roomlerd/src/companion.rs#L1090)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:616`](../agents/roomlerd/src/companion.rs#L616)) |
+| Who is at the screen | the user of logind's `ActiveSession` on `seat0`, if its `Class` is `user` ([`companion.rs:1137`](../agents/roomlerd/src/companion.rs#L1137)) | the owner of `/dev/console`, which loginwindow hands to whoever logs in at the GUI, read as the pkg's postinstall reads it ([`companion.rs:663`](../agents/roomlerd/src/companion.rs#L663)) |
 | Nobody, when | no logind, no `seat0`, an empty seat, a greeter (GDM's `gdm` at the login screen) | the login window (`root`), or a system account (`_mbsetupuser` during Setup Assistant) |
 | A text console counts | yes: a login on the machine's own VT is a person at its screen | not applicable |
 
@@ -1034,6 +1034,13 @@ roomler-ssh: waiting up to 30s for approval at the device…
 Without that line a policy of `prompt` is indistinguishable from a 30-second
 hang. Denial and timeout both refuse with their own reason and exit 1.
 
+A channel that joins a question already standing for its grant (below) waits
+only for what is left of that question's window, and is told so:
+
+```
+roomler-ssh: this is being asked at the device already; waiting up to the rest of its 30s for that answer…
+```
+
 **The prompt names the caller as the grant words it** (#2815): `«name» (via
 «device»)`, the way the screen-control and exec prompts word theirs. Until
 #2815 it showed the session's technical identity,
@@ -1048,6 +1055,76 @@ server's `Ctx`, and the field is non-optional — a server that can be
 constructed at all provably has someone to ask. (It used to be a process
 global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
+
+⚠️ **Armed before it is shown (#3442).** The device registers the question with
+the broker first (`ask_here`, [`ssh.rs:2488`](../agents/roomlerd/src/ssh.rs#L2488)), then puts it up: the native panel, the
+`.pending` marker the companion and `roomlerd consent --list` read, a companion
+it may have to start (up to 3 s), a notification. An answer counts from the
+moment anything shows the question. Until #3442 the question was armed last,
+so an answer given while the surfaces went up was refused ("no active prompt"),
+and the native panel went down with it, leaving the question asking with
+nothing on the screen. The window still runs from the show: the prompt starts
+its clock at its first look. A screen-control request and `rc:rpc.exec` arm
+first the same way ([`signaling.rs:4077`](../agents/roomlerd/src/signaling.rs#L4077), [`:5558`](../agents/roomlerd/src/signaling.rs#L5558)), as the recording question does
+(`docs/recording.md` §10).
+
+**One question per grant and activity, each under an id of its own (#3442,
+[`ssh.rs:2354`](../agents/roomlerd/src/ssh.rs#L2354)).** Channels of one session can ask at once: a command waits in a
+task of its own, so a second channel can ask while the first waits. A channel
+that asks what a question already standing for its grant asks (the same
+activity: "run a command", "open an interactive shell", "transfer files over
+SFTP") waits on that question, and one answer settles every channel waiting on
+it. A different activity is a different question: the question names the
+activity (FR-27), so an Allow given for a command never opens a shell. Each
+question is filed under a fresh object id, never the grant's, and the daemon
+logs the two side by side. A channel that joins a standing question logs that
+question's id ([`ssh.rs:2372`](../agents/roomlerd/src/ssh.rs#L2372)), and the answer's line carries the grant ([`:2566`](../agents/roomlerd/src/ssh.rs#L2566)), so a
+joiner is matched to the answer it took by id, not by timing.
+
+**One Allow settles every channel of the grant that asks about the same
+activity while the question stands,** including one that joins in the 250 ms
+before the broker next looks for the answer ([`consent.rs:67`](../agents/roomlerd/src/consent.rs#L67)). That is accepted
+on purpose: the prompt never shows the command text, so the person approves an
+activity, not a command, and one approved command can already run anything as
+the grant's identity.
+
+| Two channels of one grant ask about… | now | before #3442 |
+|---|---|---|
+| the same activity | one question, and one answer runs both | two questions under the grant's id: the second withdrew the first, whose channel was refused although nobody had said no |
+| different activities | two questions, two ids, each answered on its own | the same withdrawal; and on a desktop notification, which is dismissed by id, the older question's end took down the newer one's |
+
+A grant is single-use, so every question under it belongs to one connection.
+The question stands while any channel waits on it (a shared future): one
+channel closing does not withdraw it from the others. It comes off the table
+when it is answered, or when the last channel waiting on it goes. A channel
+that asks in the instant between the person's answer and the question coming
+off the table gets that answer. It is the same caller asking about the same
+activity, so the person could not have told the two channels apart.
+
+⚠️ **A channel's wait outlives its connection.** russh awaits the handler
+inside the connection's read loop and never aborts the session's task, and a
+command waits in a task of its own. So the last waiter going is, in practice,
+the daemon shutting down: a question runs until it is answered or its window
+ends, even after its connection died, and an Allow given then still starts
+what was asked (#3465).
+
+The SYSTEM service (FR-105) coalesces before it relays, and the relayed
+question carries its own id, which the worker checks is an object id
+([`ssh_service.rs:948`](../agents/roomlerd/src/ssh_service.rs#L948)). ⚠️ **The fix needs the service, not only the worker.** A
+service from before #3442 relays the grant's id for every question and does not
+coalesce, so a worker behind it still has the second question withdraw the
+first, until the service is updated too.
+
+Locked by five tests in `ssh::tests`. The first four were each RED on the code
+before #3442, and the fifth came with its review:
+
+| test | what it holds |
+|---|---|
+| `an_answer_given_as_the_ssh_question_goes_up_counts` | an answer given the moment the marker appears, with the companion still starting (2 s), runs the command. Before: refused, "no active prompt" |
+| `two_commands_asking_at_once_share_one_question` | two commands of one grant ask at once: one question, one Allow, both run. Before: the first was withdrawn |
+| `a_command_and_a_shell_asking_at_once_are_two_questions` | a command and a shell ask at once: two questions, neither the grant's id, both answered and both run. Before: one id, and the command was withdrawn |
+| `a_service_session_runs_once_the_worker_says_the_person_approved` | the SYSTEM service relays an object id of the question's own. Before: the grant's id |
+| `one_no_refuses_every_command_waiting_on_the_question` | two commands of one grant wait on one question, and one No refuses both, each told why. A timeout reaches every waiter through the same shared answer, but no test waits out the 30 s window |
 
 ⚠️ **A denied session burns its grant.** Authentication consumes the grant
 *before* the prompt runs, so a deny — or a timeout — means requesting a new
@@ -1597,10 +1674,10 @@ session's grant backs it.
 
 | Piece | Where |
 |---|---|
-| the grant's field | `Grant::one_command` ([`ssh.rs:2874`](../agents/roomlerd/src/ssh.rs#L2874)), recorded by `record_grant` ([`:2950`](../agents/roomlerd/src/ssh.rs#L2950)), resolved into the session's policy ([`:833`](../agents/roomlerd/src/ssh.rs#L833)) |
-| the rules | one channel ([`ssh.rs:1713`](../agents/roomlerd/src/ssh.rs#L1713)), no forward ([`:1779`](../agents/roomlerd/src/ssh.rs#L1779)), one `exec` ([`:1874`](../agents/roomlerd/src/ssh.rs#L1874)), no shell ([`:1984`](../agents/roomlerd/src/ssh.rs#L1984)), no terminal ([`:2023`](../agents/roomlerd/src/ssh.rs#L2023)), no subsystem ([`:2126`](../agents/roomlerd/src/ssh.rs#L2126)) |
+| the grant's field | `Grant::one_command` ([`ssh.rs:3036`](../agents/roomlerd/src/ssh.rs#L3036)), recorded by `record_grant` ([`:3112`](../agents/roomlerd/src/ssh.rs#L3112)), resolved into the session's policy ([`:840`](../agents/roomlerd/src/ssh.rs#L840)) |
+| the rules | one channel ([`ssh.rs:1721`](../agents/roomlerd/src/ssh.rs#L1721)), no forward ([`:1787`](../agents/roomlerd/src/ssh.rs#L1787)), one `exec` ([`:1882`](../agents/roomlerd/src/ssh.rs#L1882)), no shell ([`:1992`](../agents/roomlerd/src/ssh.rs#L1992)), no terminal ([`:2031`](../agents/roomlerd/src/ssh.rs#L2031)), no subsystem ([`:2134`](../agents/roomlerd/src/ssh.rs#L2134)) |
 | the device's word | `ssh-one-command` in the hello ([`caps.rs:4649`](../agents/roomlerd/src/encode/caps.rs#L4649)) |
-| the SYSTEM service | the claim's word ([`ssh_service.rs:637`](../agents/roomlerd/src/ssh_service.rs#L637)), the published word ([`:646`](../agents/roomlerd/src/ssh_service.rs#L646)), and the claimed grant's field ([`:612`](../agents/roomlerd/src/ssh_service.rs#L612)) |
+| the SYSTEM service | the claim's word ([`ssh_service.rs:639`](../agents/roomlerd/src/ssh_service.rs#L639)), the published word ([`:648`](../agents/roomlerd/src/ssh_service.rs#L648)), and the claimed grant's field ([`:614`](../agents/roomlerd/src/ssh_service.rs#L614)) |
 | the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2910`](../crates/remote_control/src/models.rs#L2910)) |
 
 ### The session's own device: the client (FR-90 P3-8-2b)
@@ -1649,10 +1726,10 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6804`](../agents/roomlerd/src/signaling.rs#L6804)) |
+| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6848`](../agents/roomlerd/src/signaling.rs#L6848)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6440`](../agents/roomlerd/src/signaling.rs#L6440), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6484`](../agents/roomlerd/src/signaling.rs#L6484), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ### The tool: `ssh_run` (FR-90 P3-8-2b-2)
 

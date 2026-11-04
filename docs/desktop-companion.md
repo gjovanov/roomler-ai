@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2040`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2140`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -110,7 +110,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2133`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2233`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -353,7 +353,7 @@ sequenceDiagram
   `ConfigSet` are refused on the person socket, so Settings edits the per-user half's own
   file — and says so (§5). The same socket does tell the companion, and the CLI's
   `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4627`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4727`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -364,7 +364,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1428`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1528`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -709,7 +709,7 @@ dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat 
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
 dialog is the wait (`agents/roomlerd/src/peer.rs:5760`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
+`crates/localapi/src/lib.rs:1307`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
@@ -838,7 +838,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1162`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1209`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -870,7 +870,7 @@ flowchart TD
   a password. That is a system install's root daemon, or a per-user install's root update
   helper (FR-96). A per-user daemon that sees the skew wakes its helper. Mechanics:
   [linux-self-update.md](linux-self-update.md#the-desktop-companion-follows-the-daemon-fr-117).
-- **What it reads:** `installed_package` (`companion.rs:367`) asks dpkg, then rpm. ⚠️ dpkg's
+- **What it reads:** `installed_package` (`companion.rs:414`) asks dpkg, then rpm. ⚠️ dpkg's
   answer counts only for an INSTALLED package (`dpkg_installed_version`,
   `companion/package_sync.rs:56`). `dpkg-query -W` also answers, with a version, for one that was
   removed with its config kept, and a companion a person removed must stay removed.
@@ -886,7 +886,7 @@ flowchart TD
   graphical session where one was stopped, through FR-27's `systemd_run_command`, as the Windows
   swap does (#1686). A companion that was not running stays stopped.
 - **The grid catches up at once:** the sync drops `installed_version`'s 10-minute cache
-  (`forget_installed_version`, `companion.rs:322`).
+  (`forget_installed_version`, `companion.rs:369`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
   the Windows retry. Windows' refresh at start is older and stays.
 
@@ -966,7 +966,7 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not: FR-27's consent launch, FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
-first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:724`). For a
+first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:771`). For a
 root daemon that is a transient **system** unit, which inherits nothing of the desktop; its
 environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`,
 `WAYLAND_DISPLAY`) and nothing else.
@@ -974,8 +974,8 @@ environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DI
 Since #2713 a root daemon reads the session user's systemd manager environment, the store the
 desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
 privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
-`companion.rs:804`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:752`;
-parsing in `session_env_pairs`, `companion.rs:778`):
+`companion.rs:851`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:799`;
+parsing in `session_env_pairs`, `companion.rs:825`):
 
 - ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
   runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
@@ -1068,7 +1068,7 @@ kills everything left in its cgroup. Quitting the companion, a crash, and FR-117
 crashed with them (the field check below).
 
 Since #2729 the daemon starts the companion with `--property=KillMode=process`
-(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:889`), in a root daemon's system
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:936`), in a root daemon's system
 unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
 Its own helpers end with it regardless, since WebKit's web and network processes exit when their
 UI process's connection closes.

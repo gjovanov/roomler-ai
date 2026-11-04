@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7110`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7114`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -1528,9 +1528,9 @@ Two things that read as a broken capture and are not:
 
 Both portal-shaped arms spawn the helper through `spawn_child`, which resolves
 the session user with `companion::graphical_session()`
-(`agents/roomlerd/src/companion.rs:969`) — the same `loginctl` walk the FR-27
+(`agents/roomlerd/src/companion.rs:1016`) — the same `loginctl` walk the FR-27
 consent companion uses. It accepts a session only when
-`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:1027-1030`),
+`Type=x11` or `Type=wayland` **and** `Active=yes` (`companion.rs:1074-1077`),
 which is the right test for the attended portal and the wrong one for a
 headless mutter: **a WSL2 distro has only `tty` sessions**, and so does any
 box that runs `mutter --headless` from a service. The daemon then answers
@@ -2092,7 +2092,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4504-4521`, `watchdog.rs:550`) and it forced
+watchdog's 90 s window (`app.rs:4508-4525`, `watchdog.rs:550`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

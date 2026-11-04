@@ -939,7 +939,7 @@ both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6182`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6186`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1008,7 +1008,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6056`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6060`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1807,13 +1807,13 @@ Device configuration card carries a banner naming both files
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
-person socket is the evidence now (`crates/localapi/src/lib.rs:4627`).
+person socket is the evidence now (`crates/localapi/src/lib.rs:4727`).
 
 The root half's switches are **root's to set by design**, not by omission: its
 LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person socket it
 serves the console user admits the safety surface only — status, sessions,
 consent, the Devices view — never a config verb (`localapi::person_may`,
-`crates/localapi/src/lib.rs:3129`). Whether the console user should flip the
+`crates/localapi/src/lib.rs:3229`). Whether the console user should flip the
 root half's gates from the app is the decision left open on #2871; until it is
 taken, the gate stays with `sudo`.
 

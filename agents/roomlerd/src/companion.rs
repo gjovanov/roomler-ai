@@ -280,6 +280,53 @@ pub async fn ensure_running() -> bool {
 /// One attempt per this interval, process-wide.
 const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Whether the desktop companion can show a consent question, and a
+/// recording's banner. A remote recording asks through it, and so does an SSH
+/// session (#3442), so a test can hold the companion's start open while the
+/// question is already on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Companion {
+    /// Ask the system: start the companion if it is installed and not
+    /// running ([`ensure_running`], bounded).
+    System,
+    /// A fixed answer — for tests, which must never launch the real app.
+    Fixed(bool),
+    /// Up, and waited for as [`Self::System`] is, on a test's own clock.
+    Timed {
+        poll: std::time::Duration,
+        ceiling: std::time::Duration,
+    },
+    /// Up once this long has passed: a companion that had to be started, which
+    /// [`Self::System`] waits for (up to its start budget). For tests, which
+    /// need that wait while the question is already on the screen.
+    Starting(std::time::Duration),
+}
+
+impl Companion {
+    /// Is the companion up to show the question? [`Self::System`] waits for
+    /// a start at most [`crate::signaling::COMPANION_START_BUDGET`].
+    ///
+    /// Compiled where something asks through it: a remote recording, and an
+    /// SSH session. Built without either, it is dead code, and every
+    /// `-D warnings` lane on such a build fails.
+    #[cfg(any(feature = "recording", feature = "ssh-server"))]
+    pub(crate) async fn up(self) -> bool {
+        match self {
+            Self::System => {
+                tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running())
+                    .await
+                    .unwrap_or(false)
+            }
+            Self::Fixed(up) => up,
+            Self::Timed { .. } => true,
+            Self::Starting(after) => {
+                tokio::time::sleep(after).await;
+                true
+            }
+        }
+    }
+}
+
 /// FR-27 — the version of the companion INSTALLED on this host, for the
 /// heartbeat, or `None` when there is none / it cannot be read.
 ///
