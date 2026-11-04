@@ -1513,9 +1513,6 @@ impl AgentPeer {
         // session. FR-97 P3e-2 — Linux too: a person's own X11 display, read
         // by the X idle clock; a virtual desktop holds its mode but for the
         // owner's `never`. P2d-2b — and a Mac, read by its HID idle clock.
-        // #3467 — and while its request waits for a recording's end: the
-        // viewer is told why once, and the request is decided again when the
-        // recording has ended.
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         {
             let stash = control_dc.clone();
@@ -11085,9 +11082,17 @@ fn attach_control_handler(
                         let answer = tokio::task::spawn_blocking(move || {
                             if !enable {
                                 // P3: only the owning session's toggle-off
-                                // restores, and a request this session left
-                                // waiting is dropped with it.
-                                return crate::display_match::turn_off(session_id);
+                                // restores; a non-owner disabling its OWN match
+                                // preference must not revert the mode another
+                                // session applied. Its waiting request goes too.
+                                if crate::display_match::turn_off(session_id) {
+                                    tracing::info!("display-match: restored original mode");
+                                } else {
+                                    tracing::debug!(
+                                        "display-match: disable from non-owner session — no-op"
+                                    );
+                                }
+                                return crate::display_match::Answer::Off;
                             }
                             crate::display_match::request_for(session_id, w, h)
                         })

@@ -47,12 +47,6 @@
 //! guard, as Windows' `CDS_FULLSCREEN` needs none. One active display only, as
 //! on X11. Who is at that screen comes from the HID idle clock (`presence`).
 //! Kill switch `ROOMLERD_MAC_DISPLAY_MATCH=0`.
-//!
-//! #3467 — **a recording wins.** From just before a recorder launches until it
-//! has stopped, the recording holds the display ([`hold_for_recording`]): a
-//! mode a session switched goes back first, so the recording is made at the
-//! display's own mode, and every request meanwhile is refused `recording`,
-//! then decided again at the recording's end.
 
 use crate::config::DisplayMatchPolicy;
 use crate::presence::Presence;
@@ -1684,19 +1678,13 @@ pub fn forget(session: bson::oid::ObjectId) {
     pending_forget(session);
 }
 
-/// The viewer turned display match off (`{enable:false}`). A request it left
-/// waiting is dropped, or the unlock would switch a screen whose viewer turned
-/// the match off. P3: a mode goes back only from the session that applied it,
-/// so a non-owner turning its OWN preference off never reverts the mode another
-/// session applied. Blocks on OS calls.
-pub fn turn_off(session: bson::oid::ObjectId) -> Answer {
+/// The viewer turned display match off (`{enable:false}`): a request it left
+/// waiting is dropped, or the unlock (or a recording's end) would switch a
+/// screen whose viewer turned the match off, and then [`restore_for`]. `true`
+/// when a restore ran. Blocks on OS calls.
+pub fn turn_off(session: bson::oid::ObjectId) -> bool {
     pending_forget(session);
-    if restore_for(session) {
-        tracing::info!("display-match: restored original mode");
-    } else {
-        tracing::debug!("display-match: disable from non-owner session — no-op");
-    }
-    Answer::Off
+    restore_for(session)
 }
 
 /// The answer, as it goes to the viewer on the control channel.
@@ -2060,7 +2048,7 @@ mod fr108_tests {
     fn turning_it_off_drops_the_waiting_request() {
         let a = bson::oid::ObjectId::new();
         pending_set(a, 946, 598, Waits::Unlock, true);
-        assert_eq!(turn_off(a), Answer::Off);
+        assert!(!turn_off(a), "it applied nothing, so nothing is restored");
         assert_eq!(pending_take(a), None, "the unlock would switch it anyway");
         assert_eq!(on_unlock(a), None);
     }
