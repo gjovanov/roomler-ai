@@ -225,8 +225,9 @@ compile.
   listing, marked: `cmd_config_target` (`:1185`) reports `root_only` (`root_daemon_only`,
   `:1053`, pure: the reached daemon says it runs as root, this process does not, and the OS
   is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
-  are editable, and the rest — the device-owned gates, the network, SSH, the updater — show
-  the root daemon's value with "administrator's" and `sudo roomler config set <key> <value>`
+  are editable, and the rest — the device-owned gates, the network, SSH, the updater, the
+  recordings folder — show the root daemon's value with "administrator's" and
+  `sudo roomler config set <key> <value>`
   (`settings.js`, the `read_only` row; `root_only_note`, `:1080`). From a daemon older than
   design A the card still shows the daemon, its file (`Status.config_path`:
   `/etc/roomler/config.toml`) and the administrator's commands in place of rows
