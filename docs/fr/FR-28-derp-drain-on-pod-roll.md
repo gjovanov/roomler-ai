@@ -48,7 +48,7 @@ sequenceDiagram
     A->>A: the sweep logs hard-errored and carriers rebuild
 ```
 
-The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3037-3044`)
+The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3045-3052`)
 and the Hub ends the agent's sessions when it unregisters (`crates/modules/fleet/src/hub.rs:1038-1080`).
 `docs/multi-pod-scale-out.md:182` records this; the 08-29 spec missed it.
 
