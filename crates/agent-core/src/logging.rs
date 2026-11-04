@@ -162,7 +162,8 @@ fn mirror_legacy_log_target(spec: &str) -> String {
     out.join(",")
 }
 
-/// Initialise tracing subscribers. Always installs a stdout layer; adds
+/// Initialise tracing subscribers. Installs a stdout layer, except on a
+/// console nobody reads while the file has every line (#3438); adds
 /// a daily-rolling file layer + panic hook when the platform log dir
 /// is writeable. Infallible — file logging failure falls back to
 /// stdout-only without erroring out the agent (the agent's signaling
@@ -203,6 +204,8 @@ pub fn init() {
             .map_err(std::io::Error::other)
     });
     let _ = LOG_DIR.set(opened.as_ref().map(|(d, _)| d.clone()));
+    // #3438 — no line goes to a console nobody reads while the file has them all.
+    let quiet = opened.is_some() && console_nobody_reads();
 
     if let Some((dir, appender)) = opened {
         let d = dir.as_path();
@@ -215,7 +218,7 @@ pub fn init() {
             .with_ansi(false);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
-            .with(stdout)
+            .with((!quiet).then_some(stdout))
             .with(file)
             .with(upload_layer)
             .try_init();
@@ -235,6 +238,46 @@ pub fn init() {
     for note in notes {
         tracing::warn!(%note, "logging: the log directory could not be used (#3073)");
     }
+    // #3438 — and what only stderr carries goes to that file too, as #3292 does
+    // for the per-user daemon: the watchdog's last words, a panic, FFmpeg.
+    #[cfg(windows)]
+    if quiet {
+        send_stderr_to_the_log();
+        tracing::info!(
+            "logging: this console has no window, so every line goes to the log file, \
+             stderr's too (#3438)"
+        );
+    }
+}
+
+/// #3438 — whether this process's stdout is a console nobody reads: a service
+/// process's console that has no window. The supervisor starts the SystemContext
+/// worker with `CREATE_NO_WINDOW` and no standard handles, so the worker's stdio
+/// is such a console, served by a `conhost.exe` of its own at Normal priority. A
+/// write there waits for that conhost, which a host busy with higher-priority work
+/// runs only now and then: the exit-DNS purge's 10 s bound was logged 40-46 s
+/// after the purge began. Only a process with a [`ServiceLogRole`] is asked, so a
+/// verb a person runs keeps its console lines, in a terminal or over SSH.
+#[cfg(windows)]
+fn console_nobody_reads() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetConsoleWindow, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    if SERVICE_ROLE.get().is_none() {
+        return false;
+    }
+    let mut mode = 0;
+    // SAFETY: reads this process's standard handle and its console; `mode` is a
+    // valid out-pointer.
+    unsafe {
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0
+            && GetConsoleWindow().is_null()
+    }
+}
+
+#[cfg(not(windows))]
+fn console_nobody_reads() -> bool {
+    false
 }
 
 /// #3073 — where [`init`] logs when the resolved directory cannot be used:
