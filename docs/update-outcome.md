@@ -15,12 +15,12 @@ Claims about behaviour were checked against the code at `5f126955b` plus
 
 Every self-update ends in a verdict. The updater spawns a **post-install
 watcher** beside the installer (`updater::spawn_installer_with_watch`,
-`agents/roomlerd/src/updater.rs:1897` → `spawn_watcher`, `:2853`), the watcher
+`agents/roomlerd/src/updater.rs:1920` → `spawn_watcher`, `:2892`), the watcher
 waits the installer out where there is anything to wait for, runs the new
 binary's `--version`, and writes a typed record to `<log_dir>/last-install.json`
-(`post_install::watch`, `agents/roomlerd/src/post_install.rs:230`).
+(`post_install::watch`, `agents/roomlerd/src/post_install.rs:297`).
 
-Then nothing read it. `post_install::read_outcome` (`post_install.rs:181`) had
+Then nothing read it. `post_install::read_outcome` (`post_install.rs:258`) had
 no caller on any platform; the module doc's "the new binary reads
 `last-install.json` at startup" described a wire that was never run. The only
 hosts anyone ever looked at were the ones somebody SSHed into — which is how a
@@ -32,13 +32,13 @@ reading was wrong about which mattered:
 
 | | What | Fixed |
 |---|---|---|
-| 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:221`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
-| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2795`) |
+| 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:288`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
+| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2834`) |
 
 ## 2. The record
 
 `<log_dir>/last-install.json`, one file, rewritten at every attempt
-(`post_install::write_outcome`, `post_install.rs:167`; `InstallOutcome`,
+(`post_install::write_outcome`, `post_install.rs:182`; `InstallOutcome`,
 `:118`):
 
 | Field | What |
@@ -51,7 +51,7 @@ reading was wrong about which mattered:
 | `note` | the watcher's own sentence: the probe's answer, the exit code, on Windows the service settle's verdict (`service Roomler: running (0 starts; seen Running)`) |
 
 `<log_dir>` is `logging::resolve_log_dir`'s
-(`crates/agent-core/src/logging.rs:713`): the process's per-user data dir plus
+(`crates/agent-core/src/logging.rs:721`): the process's per-user data dir plus
 `logs`, except a Windows process with a service role, which logs under
 `%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
 worker and `netd` (`ServiceLogRole`). The watcher never has one, so the record
@@ -93,13 +93,13 @@ sequenceDiagram
 > the daemon's `started_at_ms` is 1792967954; the watcher's `finished_unix` is
 > 1792967960. For those seconds the record honestly reads `InProgress`, which
 > is why the daemon reads the file **on every answer** rather than once at
-> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:961`),
+> startup (`DaemonState::status`, `agents/roomlerd/src/localapi_state.rs:987`),
 > and why a fresh `InProgress` is "still at work", not a failure (§4).
 
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:471`), a `LastInstallStatus` (`:509`) whose
+(`crates/localapi/src/lib.rs:471`), a `LastInstallStatus` (`:510`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` log line spell them so
 one grep finds all three surfaces (locked by
@@ -118,7 +118,7 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:547`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:549`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
 a record older than that (`never_reported`, `:557`).
@@ -155,7 +155,7 @@ record's file. Two topologies split roles:
   worker's own token, and only the S-1-5-18 SID is `SystemContext`
   (`agents/roomlerd/src/system_context/worker_role.rs:208`); `roomler status`
   shows the same fact as `privileged` (`process_is_privileged`,
-  `agents/roomlerd/src/localapi_state.rs:481`), `service (per-user)` when it is
+  `agents/roomlerd/src/localapi_state.rs:486`), `service (per-user)` when it is
   false. The dev box is the attended case (`privileged: false`): the 0.4.172
   and 0.4.174 records sit under the signed-in user's profile, while the SYSTEM
   profile's copy is a July `InProgress` for `agent-v0.3.0-rc.183` — a watcher
@@ -176,7 +176,7 @@ record's file. Two topologies split roles:
   (`com.roomler.update`, FR-96 / P4); the per-user half answers its own
   `<log_dir>`, where no root install ever writes. `roomler status` as the
   console user therefore reads `Absent` for the per-user half, and
-  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:217`) lends it
+  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:245`) lends it
   the root half's **network** fields only, never its install record — the
   verdict is per daemon, and the half that answers must not claim another's.
 
@@ -201,8 +201,8 @@ $ roomler status
   the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2474`;
   the sentence per word, `last_install_line`, `:2869`).
 - **The startup log**: one line, always prefixed `last install:`, right after
-  `agent starting` (`post_install::log_at_startup`, `post_install.rs:1281`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4130`). `journalctl -u
+  `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4204`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1265`): the two quiet states and a watcher
@@ -210,7 +210,7 @@ $ roomler status
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
   /usr/bin/roomlerd reports roomlerd 0.4.172)` on the watcher's stdout
-  (`post_install_watch_cmd`, `app.rs:2517`), which journald captured on a
+  (`post_install_watch_cmd`, `app.rs:2537`), which journald captured on a
   systemd host, beside the watcher's `post-install watcher started` tracing
   line on its stderr. This is the line the P7 field log read on 2026-10-19
   and the rows of §7 read on 10-26; it was the only reader before P3.
@@ -226,7 +226,7 @@ $ roomler status
   altogether** — the same inherited pipe kept the exec's reader from EOF and
   made the outgoing worker overrun its stop budget — so `spawn_watcher` gives
   it `/dev/null` for all three on every platform (`without_caller_stdio`,
-  `agents/roomlerd/src/updater.rs:2823`, called at `:2924`). From the first
+  `agents/roomlerd/src/updater.rs:2862`, called at `:2963`). From the first
   update a 0.4.176+ daemon spawns, the journal shows the daemon's own
   `post-install watcher spawned` line and nothing from the watcher; the
   verdict reaches the record file and P3's two readers, and nothing else.
@@ -256,7 +256,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7362`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7430`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries
