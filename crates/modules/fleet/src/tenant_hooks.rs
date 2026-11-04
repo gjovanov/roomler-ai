@@ -65,6 +65,5 @@ pub fn hooks(state: &FleetState) -> roomler_core::Hooks {
             state: state.clone(),
         })),
         fleet: None,
-        session: None,
     }
 }

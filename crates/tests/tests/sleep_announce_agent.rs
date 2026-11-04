@@ -15,7 +15,7 @@
 //! This file is its own test BINARY because the announcement is
 //! process-wide, as it is in the daemon (one computer, one sleep): in the
 //! lib's test binary, every other in-process agent would be told to say
-//! goodbye too. `hive_canary.rs` is separate for the same kind of reason.
+//! goodbye too.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
