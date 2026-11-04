@@ -268,7 +268,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4242`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4246`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
