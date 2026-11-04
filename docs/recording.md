@@ -75,12 +75,15 @@ the file kept time, because a missed tick is the previous frame lasting longer. 
 count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
 bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
 
-⚠️ **Display match can change the display under a recording** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467),
-open). On an X11 host nobody has touched for five minutes, a viewer that connects makes display match
-([`display-match.md`](display-match.md)) switch the display to the viewer's size, and a running recording does not
-refuse it. A local recording keeps its frame size, but everything outside the matched area freezes until the
-session lets the display go. A remote recording started in that session is recorded at the matched size.
-`display_match = never` in the device's config avoids it until #3467 lands.
+⚠️ **A recording holds the display** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)). On an X11
+host nobody had touched for five minutes, a viewer that connected made display match
+([`display-match.md`](display-match.md)) switch the display to the viewer's size under a running recording
+(release 0.4.199). A local recording kept its frame size, but everything outside the matched area froze until the
+session let the display go, and a remote recording started in that session was recorded at the matched size. Now
+the recording holds the display from just before its recorder launches until it has stopped: a mode a session
+switched goes back first, and display match refuses `recording` meanwhile, then decides those requests again at
+its end ([`display-match.md`](display-match.md#a-recording-holds-the-display-3467)). The fix rides the next agent
+release. Until a device runs it, `display_match = never` in its config avoids the problem.
 
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
@@ -437,6 +440,7 @@ sequenceDiagram
     L->>L: peer is the console user?<br/>(else: refused, never reaches M)
     L->>M: record_start(opts)
     M->>M: nobody to record as? refuse (P1e)<br/>one already running? refuse
+    M->>M: hold the display: a mode display match switched goes back first (issue 3467)
     M->>R: launch AS the person at the device (P1e):<br/>record --config … [--out record_dir]<br/>env: config fallbacks (the encoder denylist)
     R-->>M: ROOMLER_REC_JSON:{"ev":"started",…}
     M-->>C: Recording {active, path, encoder, w×h@fps}
@@ -992,6 +996,7 @@ sequenceDiagram
         Note over D: one more turn of the slowest poll, 1.1 s
     end
     Note over D,H: nothing can show it, or nothing read it in 5 s ⇒ refused {no_indicator_surface}
+    Note over D: the recording holds the display, as a local one does (display-match.md)
     D->>R: start_remote (never the microphone)
     D-->>V: rc:record.state recording {name}, then progress each second
     V->>D: rc:record.stop
