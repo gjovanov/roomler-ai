@@ -88,7 +88,7 @@ bleed into a neighbouring block. **That is false, and was false when it was writ
 `allocate_host` takes `max_host`, rides the bound on the atomic filter
 (`next_host` must be `$lte max_host`), returns a loud `DaoError::Validation` on exhaustion,
 and discards a pooled ordinal that sits above a since-shrunk ceiling rather than issuing it
-(`crates/services/src/dao/overlay_network.rs:250-310`). The test
+(`crates/services/src/dao/overlay_network.rs:255-315`). The test
 `allocate_host_stops_at_the_block_ceiling` locks it. Treat "1 022, then it refuses" as
 verified behaviour.
 
@@ -112,12 +112,12 @@ Anchors verified against master at `201e3f5a`:
 
 Flip `blocks_enabled` and set it **explicitly** in the prod configmap. Existing networks are
 untouched by construction: `ensure_block`'s virginity guard (default CIDR **and**
-`next_host <= 1` **and** an empty pool, `dao/overlay_network.rs:120-131`) refuses to re-base
+`next_host <= 1` **and** an empty pool, `dao/overlay_network.rs:125-136`) refuses to re-base
 a network that has already leased anything. Migrating a populated network stays the
 renumber endpoint's job.
 
 ⚠️ `ensure_block` **falls back to the shared `/10` when a carve fails**, at
-`tracing::error!` (`dao/overlay_network.rs:139-148`). That is the right availability trade —
+`tracing::error!` (`dao/overlay_network.rs:144-153`). That is the right availability trade —
 never fail a join over address bookkeeping — but it degrades isolation silently to anyone
 not reading logs. This FR wires that line to an alert and adds a `headroom` threshold, so
 the fallback stays a monitored condition instead of a quiet regression.
@@ -136,7 +136,7 @@ is not an assumption: `pre_rc53_server_msg_rejects_goodbye_so_agent_err_arm_fire
 The trap that *does* need a forward-compat pre-roll is a new variant of a **nested** enum
 inside a frame the old agent already parses — the `RelayStrategyWire` case, where an unknown
 tag fails the *whole enclosing `ServerMsg`* and the agent silently drops entire netmaps
-(`signaling.rs:5693-5709`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
+(`signaling.rs:5703-5719`, `relay_strategy_lenient`). `OverlayJoinRefused` is not that shape.
 
 ### 3c. Multi-block per org (P5) — the growth mechanism
 
@@ -224,7 +224,7 @@ and the operator's call: FR-68 P7 decides the flag.
       the absence of any `100.64.0.0/10` network in production.
       Tests: `blocks_are_disjoint_across_tenants` (`crates/tests/src/overlay_tests.rs:1622`)
       and `aligned_starts_are_never_partially_overlapping`
-      (`crates/remote_control/src/models.rs:9675`). Prod 2026-08-31: no network left on the
+      (`crates/remote_control/src/models.rs:9821`). Prod 2026-08-31: no network left on the
       `/10` ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486110349)),
       and the P3 dry run that listed every network found all four on `100.65.x`
       ([#1071](https://github.com/gjovanov/roomler-ai/issues/1071#issuecomment-5486189495)).
@@ -257,7 +257,7 @@ and the operator's call: FR-68 P7 decides the flag.
 - [~] **AC8** Registry `headroom` is alerted on, and the shared-`/10` carve-failure fallback pages.
       Met: both conditions emit a structured alert line. The carve-failure fallback logs
       at ERROR with `alert = "overlay_block_carve_failed"`
-      (`crates/services/src/dao/overlay_network.rs:187-193`). Registry pressure logs at
+      (`crates/services/src/dao/overlay_network.rs:192-198`). Registry pressure logs at
       WARN with `alert = "overlay_block_registry_pressure"` once a carve takes the slot
       cursor to 80 % or more (`crates/services/src/dao/overlay_block.rs:62`, `:71-84`), a
       threshold pinned by `registry_pressure_crosses_at_the_documented_threshold`
