@@ -601,7 +601,7 @@ Built behind the switch, and proven in unit tests only. Under the switch, `run_c
 | Verify | Within 60 s: connected, `delegation channel attached`, the row reports `screen-capture` | Restores both files and restarts, then says what it saw |
 | Report | Each retired row's name and id, and where to delete it | |
 
-**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1332`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:569`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
+**The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1320`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:569`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
 
 **The overlay address.** The root's enrollment is untouched, so its row keeps its node and its address. A moved enrollment keeps its row, its key and any address it had, since only the holder of the token changed. A retired row with a node of its own releases it through the delete. Where the only address in an org was on the retired row, the plan says so before anything changes.
 
@@ -617,7 +617,7 @@ Built behind the switch, and proven in unit tests only. Under the switch, `run_c
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
 | Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:641-700`). The migration touches no bundle, which is what AC5 reads |
-| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:917`) | The worker no longer dials a server, so it can displace nothing |
+| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:828`) | The worker no longer dials a server, so it can displace nothing |
 | The delegation channel's two gates (`delegate.rs:764-785`) | Unchanged |
 | The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
 
