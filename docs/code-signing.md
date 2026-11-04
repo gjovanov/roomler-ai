@@ -199,7 +199,7 @@ installing it, and is also bound to the release it claims to be: the Windows
 | Artifact | Workflow | Mechanism |
 |---|---|---|
 | `roomlerd.exe`, `roomler.exe` **inside** both MSIs | release-agent | sign-windows, *before* `cargo wix` harvests |
-| `roomler_msi_ca.dll` in the perMachine MSI's Binary table (#3375: msiexec extracts and loads it on every upgrade) | release-agent | sign-windows with the payload; the lane then reads it out of the built MSI and asserts the payload's signer and its imports (`.github/workflows/release-agent.yml:2205`) |
+| `roomler_msi_ca.dll` in the perMachine MSI's Binary table (#3375: msiexec extracts and loads it on every upgrade) | release-agent | sign-windows with the payload; the lane then reads it out of the built MSI and asserts the payload's signer and its imports (`.github/workflows/release-agent.yml:2202`) |
 | perUser + perMachine `.msi` | release-agent | sign-windows, before the size-budget/sha256 steps |
 | `roomler-desktop-<v>….exe` | release-agent | sign-windows |
 | `roomler-agent-<v>-aarch64-apple-darwin.pkg` | release-agent | inline codesign → productbuild → notarytool → staple → **verify** |
@@ -363,7 +363,7 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1704`):
+(`updater.rs:1519`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|

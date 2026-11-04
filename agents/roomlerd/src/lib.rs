@@ -33,9 +33,6 @@ pub use roomler_node_core::{
 pub mod apps;
 /// FR-97 P0d — the machine's native CPU architecture, for the hello.
 pub(crate) mod arch;
-/// FR-90 P2h-1 — `roomlerd enroll --archive-replica`: an archive replica's
-/// posture, written with the enrolled config.
-pub mod archive_replica;
 pub mod artifact_version;
 #[cfg(feature = "audio")]
 pub mod audio;
@@ -88,16 +85,6 @@ pub mod gpu_clock;
 /// #3439 — a session asked for before the capability probe's first answer waits
 /// for it, in its connection.
 pub mod held_requests;
-/// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
-/// Linux, macOS and Windows (`cfg(hive_host)`, set by `build.rs`): elsewhere
-/// the feature compiles nothing here and the build does not advertise `hive`,
-/// so no server sends it a session.
-#[cfg(hive_host)]
-pub mod hive;
-/// FR-90 P1i — agent sessions on Windows: the console user, the harness, the
-/// session's preparation, its toolbelt pipe and its directories' DACLs.
-#[cfg(all(windows, feature = "hive"))]
-pub mod hive_win;
 /// FR-99 P4 — the host's speakers are muted while a privacy curtain is up, and
 /// restored after it, after a crash too; the controller keeps the audio.
 pub mod host_mute;
@@ -235,10 +222,6 @@ pub mod sleep_notice;
 /// [`overlay`]: without an overlay there is no address to serve on.
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod ssh;
-/// FR-90 P3-8-2b — this daemon's own SSH client, for an agent session's one
-/// command on another device. With the SSH server, whose `russh` it shares.
-#[cfg(feature = "ssh-server")]
-pub mod ssh_client;
 /// The ORIGINATING side of Roomler SSH. Ungated on purpose — [`ssh`] needs an
 /// overlay to serve on, but an answer to a request WE sent arrives on the
 /// plain control WS and must be deliverable in every build.
@@ -272,15 +255,6 @@ pub mod thread_dump;
 pub mod token_renewal;
 pub mod tunnel;
 pub mod updater;
-/// FR-90 P3-3 — the device's vault key: made while `vault_enabled` is on, in
-/// memory only, its public half in the primary enrollment's hello. Compiled
-/// everywhere; without the `vault` feature it makes nothing.
-pub mod vault;
-/// FR-90 P3-5 — the vault's proxies: an endpoint that authenticates upstream
-/// with a leased value. P3-5b-1 builds the engine; the endpoint
-/// (`hive::vault_connect`, P3-5b-2, and P3-5b-4 on Windows) serves it.
-#[cfg(feature = "vault")]
-pub(crate) mod vault_proxy;
 pub mod version_sweep;
 pub mod virtual_desktop;
 pub mod watchdog;

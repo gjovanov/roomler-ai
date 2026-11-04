@@ -68,9 +68,6 @@ pub async fn handle_agent_socket(
             advertised_routes,
             supports_relay_regions,
             ssh_host_pubkey,
-            // FR-137 S-A3 — FR-90's vault key stays on the wire until P2, and
-            // nothing on this server seals to it: neither checked nor stored.
-            vault_key: _,
             peer_auth_key,
         }) => (
             machine_name,
@@ -499,19 +496,6 @@ pub async fn handle_agent_socket(
                             // dispatch below exactly as before.
                             let parsed = match parsed.namespace() {
                                 Owner::Fleet => parsed,
-                                // FR-137 S-A1 — FR-90 is parked, but until P2
-                                // the wire still parses an older agent's
-                                // frames for its three modules, and no module
-                                // here handles them. Dropped at debug: the Hub
-                                // dispatch would WARN twice per frame and dump
-                                // it, a device's account map included.
-                                owner @ (Owner::Hive | Owner::Vault | Owner::Knowhow) => {
-                                    debug!(
-                                        %agent_id, owner = owner.id(),
-                                        "a parked module's frame (FR-137) — dropped"
-                                    );
-                                    continue;
-                                }
                                 owner => match state.agent_socket.handler(owner.id()) {
                                     Some(handler) => match handler.handle(&actx, parsed).await {
                                         Some(rest) => rest,

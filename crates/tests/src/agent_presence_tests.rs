@@ -527,7 +527,7 @@ async fn a_displaced_connections_late_offline_leaves_the_newer_hello_online() {
 /// The module id [`HoldFirstClosed`] registers under. Its lifecycle runs last
 /// in `HOOK_ORDER`, so every other module's `closed` has run when it holds.
 /// Whatever that module registered itself is kept and called through.
-const HOLD_UNDER: &str = "knowhow";
+const HOLD_UNDER: &str = "saas";
 
 /// #2552 — holds the FIRST connection's teardown at `closed`: after the Hub
 /// removal, before fleet's `Offline` write (`roomler_core::agent_socket`, the

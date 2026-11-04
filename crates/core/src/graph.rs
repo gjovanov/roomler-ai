@@ -8,21 +8,10 @@
 
 /// Every module, in the order the host composes them (dependencies first).
 ///
-/// FR-137 — `hive`, `vault` and `knowhow` are FR-90's, parked off master: no
-/// crate, no route, no edge. Their ids stay until the wire's
-/// `Owner::{Hive,Vault,Knowhow}` leave (`composition.rs` requires every wire
-/// owner to be a module).
-pub const MODULES: &[&str] = &[
-    "saas",
-    "chat",
-    "conference",
-    "fleet",
-    "remote",
-    "network",
-    "hive",
-    "vault",
-    "knowhow",
-];
+/// FR-137 — FR-90's `hive`, `vault` and `knowhow` left with their wire
+/// owners. Their ids are retired, never reused
+/// (`roomler_ai_remote_control::models::RETIRED_MODULE_IDS`).
+pub const MODULES: &[&str] = &["saas", "chat", "conference", "fleet", "remote", "network"];
 
 /// The allowed **module → module** call edges. Every module may call core;
 /// core calls no module. Anything not listed here is forbidden — in particular
@@ -49,6 +38,17 @@ pub fn is_allowed_edge(from: &str, to: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-137 — FR-90's retired module ids never come back: no module, no
+    /// hook position, no edge.
+    #[test]
+    fn no_retired_module_id_is_in_the_graph() {
+        for id in roomler_ai_remote_control::models::RETIRED_MODULE_IDS {
+            assert!(!MODULES.contains(&id), "{id} is retired");
+            assert!(!crate::hooks::HOOK_ORDER.contains(&id), "{id} is retired");
+            assert!(EDGES.iter().all(|(a, b)| *a != id && *b != id), "{id}");
+        }
+    }
 
     #[test]
     fn every_edge_names_known_modules() {
