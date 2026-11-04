@@ -74,7 +74,7 @@ pub fn probe(file: &Path) -> Result<()> {
 }
 
 /// `roomlerd media export --edl <file> [--encoder …]`.
-pub async fn export(edl_path: &Path, encoder: &str) -> Result<()> {
+pub async fn export(edl_path: &Path, encoder: &str, config_path: &Path) -> Result<()> {
     let refuse = |code: &str, detail: String| -> Result<()> {
         emit(&json!({"ev": "refused", "code": code, "detail": detail}));
         bail!("{code}: {detail}")
@@ -112,6 +112,10 @@ pub async fn export(edl_path: &Path, encoder: &str) -> Result<()> {
             ))
         })
         .unwrap_or(30);
+    // FR-130 AC4 — the device's encoder keys, before the first encoder opens,
+    // as a hand-run `roomlerd record` reads them: `color_description`, the
+    // cell denylist and the pinned devices.
+    super::child::register_encoder_fallbacks_at(config_path);
     let (factory, _) = match super::child::encoder_factory(encoder, fps, 2) {
         Ok(f) => f,
         Err(e) => return refuse("encoder_unavailable", format!("{e:#}")),

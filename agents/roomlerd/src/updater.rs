@@ -10,9 +10,9 @@
 //! Scope: the agent exits after spawning the installer so the installer
 //! can overwrite the binary without `ERROR_SHARING_VIOLATION`. The
 //! Scheduled Task / systemd unit / LaunchAgent registered via
-//! `roomlerd service install` re-launches the new version on
-//! the next login (Windows) or immediately (Restart=on-failure on
-//! Linux, KeepAlive on macOS).
+//! `roomlerd service install` re-launches the new version within a
+//! minute of the install (Windows, the registration's one-shot starts,
+//! #3292) or immediately (Restart=on-failure on Linux, KeepAlive on macOS).
 //!
 //! Trust model: we assume GitHub-over-TLS is sufficient for now. No
 //! signature check beyond the MSI's cargo-wix / codesign identity
@@ -420,16 +420,22 @@ pub fn update_attempt_marker_path() -> Option<PathBuf> {
 /// moment the installer process is launched. Best-effort: any I/O
 /// failure is logged but does not block the update path (we'd
 /// rather have a working install with a noisy crash counter than
-/// no install at all).
-fn record_update_attempt() {
+/// no install at all). The per-user MSI's `service stop --for-upgrade`
+/// (#3292) calls it too: an upgrade by hand has no installer spawn of ours,
+/// and that caller reads the answer: whether the marker is on disk.
+pub fn record_update_attempt() -> bool {
     let Some(p) = update_attempt_marker_path() else {
-        return;
+        return false;
     };
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Err(e) = std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
-        tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+    match std::fs::write(&p, format!("{}\n", chrono::Utc::now().to_rfc3339())) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %p.display(), "could not write update-attempt marker");
+            false
+        }
     }
 }
 
@@ -1338,34 +1344,47 @@ impl Drop for ProtectedDirSd {
 /// here because its `Builder` has no way to pass Windows security attributes.
 #[cfg(target_os = "windows")]
 fn create_fresh_protected_dir(base: &std::path::Path) -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
-
     for _ in 0..8 {
         let name = format!("{}{:016x}", STAGING_DIR_PREFIX, rand::random::<u64>());
         let dir = base.join(name);
-        let wide: Vec<u16> = dir
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let mut sd = ProtectedDirSd::new()?;
-        // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
-        // duration of this call.
-        let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
-        if ok != 0 {
-            return Ok(dir);
+        match create_protected_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            // Name collision — try again with a fresh random suffix.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-        // Name collision — try again with a fresh random suffix.
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique staging dir name",
     ))
+}
+
+/// Make `dir`, which must not exist yet, readable and writable by SYSTEM and
+/// Administrators alone: the DACL is set AT CREATION ([`ProtectedDirSd`]), and
+/// the create fails if anything is already at the name, so a folder someone else
+/// made first is never taken for ours. It also fails for a caller who cannot
+/// name Administrators as the owner. The setup wizard stages what it runs
+/// elevated in one of these (#3246).
+#[cfg(target_os = "windows")]
+pub fn create_protected_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sd = ProtectedDirSd::new()?;
+    // SAFETY: a NUL-terminated path; the descriptor lives in `sd` for the
+    // duration of this call.
+    let ok = unsafe { CreateDirectoryW(wide.as_ptr(), sd.attributes()) };
+    if ok != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// macOS: the per-user `confstr(_CS_DARWIN_USER_TEMP_DIR)` temp dir is
@@ -1772,6 +1791,16 @@ pub(crate) async fn fetch_release_by_tag(tag: &str) -> Result<GithubRelease> {
     Ok(release)
 }
 
+/// #3289 — whether a crash loop's rollback can put an older version in place here.
+///
+/// On Windows it cannot. Both MSI flavours refuse a downgrade
+/// (`DowngradeErrorMessage`), so an attempt spent a download and a daemon exit to
+/// change nothing: measured 1603 in about a second on both flavours of released
+/// 0.4.197, with the newer files still there. Nothing raised the sentinel either way,
+/// and on a per-user device the exit took it offline: nothing restarts that daemon
+/// (#3295).
+pub const ROLLBACK_CAN_DOWNGRADE: bool = cfg!(not(target_os = "windows"));
+
 /// Pin to a specific release tag. Used by the rollback path when
 /// the crash-loop detector decides the current version is broken
 /// and the last known-good version should be reinstalled.
@@ -1961,7 +1990,9 @@ pub fn spawn_installer_with_watch(
 /// exiting, service left stopped) were undiagnosable because silent
 /// installs leave no trace; the log names the exact action a wedged
 /// run was in. The staging dir is recycled per update, so the log
-/// doesn't accumulate.
+/// doesn't accumulate. #2107 — each attempt on one staged installer
+/// gets its own name ([`next_msi_log`]): the watcher retries a wedged
+/// install from the same path, and `/l*v` truncates.
 #[cfg(any(target_os = "windows", test))]
 pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour) -> Vec<String> {
     let path = installer.to_string_lossy().into_owned();
@@ -1969,7 +2000,7 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         WindowsInstallFlavour::PerUser => "/qn",
         WindowsInstallFlavour::PerMachine => "/qn",
     };
-    let log = format!("{path}.log");
+    let log = next_msi_log(&path, |candidate| std::path::Path::new(candidate).exists());
     vec![
         "/i".to_string(),
         path,
@@ -1978,6 +2009,20 @@ pub fn msiexec_argv(installer: &std::path::Path, flavour: WindowsInstallFlavour)
         "/l*v".to_string(),
         log,
     ]
+}
+
+/// #2107 — the first free verbose-log name for one more attempt on `installer`:
+/// `<installer>.log`, then `<installer>.2.log`, and so on.
+#[cfg(any(target_os = "windows", test))]
+fn next_msi_log(installer: &str, exists: impl Fn(&str) -> bool) -> String {
+    let first = format!("{installer}.log");
+    if !exists(&first) {
+        return first;
+    }
+    (2u32..)
+        .map(|attempt| format!("{installer}.{attempt}.log"))
+        .find(|name| !exists(name))
+        .unwrap_or(first)
 }
 
 /// rc.44: variant of [`msiexec_argv`] that appends operator-supplied
@@ -2247,10 +2292,14 @@ pub fn spawn_installer_for_flavour_with_properties(
             WindowsInstallFlavour::PerUser => {
                 // /qn silent install; non-elevated msiexec inherits
                 // the user token and writes under %LOCALAPPDATA%.
-                let child = std::process::Command::new("msiexec")
-                    .args(argv.iter().map(String::as_str).collect::<Vec<_>>())
-                    .spawn()
-                    .context("spawning msiexec (perUser)")?;
+                // #2718 — `/qn` prints nothing, and an inherited copy of our
+                // stdio held a caller's pipes for the whole install.
+                let child = without_caller_stdio(
+                    std::process::Command::new(crate::appdirs::system32_tool("msiexec.exe"))
+                        .args(argv.iter().map(String::as_str).collect::<Vec<_>>()),
+                )
+                .spawn()
+                .context("spawning msiexec (perUser)")?;
                 Ok(child.id())
             }
             WindowsInstallFlavour::PerMachine => {
@@ -2630,8 +2679,13 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
 /// cycle).
 #[cfg(target_os = "windows")]
 pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
-    spawn_elevated("msiexec.exe", argv)
-        .map_err(|e| e.context("elevated msiexec — install not started"))
+    spawn_elevated(
+        &crate::appdirs::system32_tool("msiexec.exe")
+            .display()
+            .to_string(),
+        argv,
+    )
+    .map_err(|e| e.context("elevated msiexec — install not started"))
 }
 
 /// FR-104 — [`spawn_msiexec_elevated`] for any program: `ShellExecuteExW`
@@ -2644,6 +2698,11 @@ pub fn spawn_msiexec_elevated(argv: &[String]) -> Result<u32> {
 /// ⚠️ Arguments are joined with spaces; one that contains a space is quoted.
 /// An argument containing a `"` is not escaped, so none may (paths, origins,
 /// ids and JWTs never do).
+///
+/// ⚠️ `file` is a full path; anything else is refused. The shell looks for a
+/// bare name in the current directory first, and a wizard started from the
+/// person's Downloads sits among whatever a site left there: the prompt would
+/// be for that file (FR-129 C).
 #[cfg(target_os = "windows")]
 pub fn spawn_elevated(file: &str, argv: &[String]) -> Result<u32> {
     use std::os::windows::ffi::OsStrExt;
@@ -2652,6 +2711,11 @@ pub fn spawn_elevated(file: &str, argv: &[String]) -> Result<u32> {
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
+
+    anyhow::ensure!(
+        std::path::Path::new(file).is_absolute(),
+        "{file} is not a full path; refusing to ask for administrator rights for it"
+    );
 
     // Build wide-string buffers for ShellExecuteExW. The Win32 API
     // wants null-terminated UTF-16; OsStr::encode_wide returns the
@@ -2777,6 +2841,54 @@ fn strip_deleted_suffix(exe: &std::path::Path) -> Option<PathBuf> {
     Some(PathBuf::from(stripped))
 }
 
+/// #2718 — a process the updater leaves running (the post-install watcher,
+/// a perUser msiexec) gets none of its caller's stdio. One that outlives its
+/// caller and holds a copy of the caller's stdout keeps the caller's reader
+/// from ever seeing EOF. Under `roomler exec … self-update` that reader is
+/// the worker's: the exec hung, and a service stop during the update found
+/// the worker's runtime drop waiting on it, so the worker overran its 8 s
+/// stop budget into a terminate. That happened on every exec-driven update
+/// (NEO16: 0.4.169, 0.4.172, 0.4.174); the updates its own updater ran
+/// exited in ~1 s.
+///
+/// ⚠️ On Windows nulling the child's std handles is not enough. `Command`
+/// creates the child with `bInheritHandles = TRUE`, which passes EVERY
+/// inheritable handle of this process. This process's own std handles are
+/// inheritable whenever it inherited them (an exec'd `self-update` did), so
+/// the child got a copy of our stdout anyway: measured, EOF still waited the
+/// full 5 s in the test below. Their inherit flag is cleared first, which
+/// costs no later child anything: `Stdio::inherit` hands a child a fresh
+/// inheritable duplicate.
+fn without_caller_stdio(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(target_os = "windows")]
+    stop_own_std_handles_inheriting();
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+}
+
+/// Clear `HANDLE_FLAG_INHERIT` on this process's stdin/stdout/stderr
+/// ([`without_caller_stdio`]). Best effort: a console handle may refuse, and
+/// nothing is lost when it does.
+#[cfg(target_os = "windows")]
+fn stop_own_std_handles_inheriting() {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` takes a constant and returns this process's
+        // own handle, or null / INVALID_HANDLE_VALUE when there is none;
+        // `SetHandleInformation` changes only that handle's inherit flag.
+        let h = unsafe { GetStdHandle(id) };
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
 fn spawn_watcher(
     spawned: InstallerSpawn,
     installer_path: &std::path::Path,
@@ -2846,6 +2958,9 @@ fn spawn_watcher(
     if let Some(origin) = install_path_before_rename(&exe).filter(|_| !staged) {
         cmd.arg("--origin-exe").arg(&origin);
     }
+    // #2718 — the watcher outlives whoever ran this (by ~30 s). It logs to its
+    // file; nothing reads its stdio.
+    without_caller_stdio(&mut cmd);
     let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;
@@ -4164,6 +4279,17 @@ pub fn helper_owns_updates() -> Option<PathBuf> {
 // docs/fr/FR-21
 #[cfg(test)]
 mod tests {
+    /// FR-129 C — a bare name is refused before any prompt: the shell would look
+    /// for it in the current directory first.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn asking_for_administrator_rights_takes_a_full_path_only() {
+        for file in ["msiexec.exe", "msiexec", r"sub\msiexec.exe"] {
+            let refused = super::spawn_elevated(file, &[]).unwrap_err();
+            assert!(format!("{refused:#}").contains("not a full path"), "{file}");
+        }
+    }
+
     /// #2901 — the documented opt-out marker turns a daemon's own updater off,
     /// exactly as `auto_update = false` does. Field 2026-10-25, a Linux system
     /// install on 0.4.170: with the marker present the daemon logged
@@ -6432,6 +6558,43 @@ mod tests {
 
     // ----- msiexec_argv (Plan rc.18 P1) -------------------------------
 
+    /// #3289 — the constant is only as true as the two tables it describes. Whoever
+    /// lets an MSI downgrade (`AllowDowngrades`, or a schedule that drops the refusal)
+    /// lands here, and a crash loop on Windows can then go back to rolling back.
+    #[test]
+    fn no_rollback_runs_where_the_msis_refuse_a_downgrade() {
+        for table in [
+            include_str!("../wix/main.wxs"),
+            include_str!("../wix-perMachine/main.wxs"),
+        ] {
+            assert!(table.contains("DowngradeErrorMessage="));
+            assert!(!table.contains("AllowDowngrades"));
+        }
+        assert_eq!(ROLLBACK_CAN_DOWNGRADE, !cfg!(target_os = "windows"));
+    }
+
+    /// #2107 — the verbose log exists to name the action a wedged run was in, and
+    /// the watcher's retry of the same staged installer truncated it.
+    #[test]
+    fn a_retry_never_reuses_the_log_of_the_attempt_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let msi = dir.path().join("roomlerd.msi");
+        let next_log = || {
+            msiexec_argv(&msi, WindowsInstallFlavour::PerMachine)
+                .pop()
+                .unwrap()
+        };
+        let first = next_log();
+        assert_eq!(first, format!("{}.log", msi.display()));
+        std::fs::write(&first, "the wedged attempt").unwrap();
+        let second = next_log();
+        assert_ne!(second, first);
+        std::fs::write(&second, "the retry").unwrap();
+        let third = next_log();
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+    }
+
     #[test]
     fn msiexec_argv_per_user_uses_qn() {
         // perUser MSI installs without UAC; /qn (fully silent) is
@@ -6826,6 +6989,90 @@ mod tests {
             failed("fetch", rate_limited),
             CheckOutcome::Skipped(_)
         ));
+    }
+
+    // ── #2718: a process the updater leaves running holds none of its caller's stdio ──
+
+    const STDIO_2718: &str = "ROOMLER_STDIO_2718";
+
+    /// The lingering half of the test below, run by this test binary itself:
+    /// what the updater leaves running (the watcher). Nothing in an ordinary
+    /// run.
+    #[test]
+    fn stdio_lingerer_child() {
+        if std::env::var(STDIO_2718).as_deref() == Ok("linger") {
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    /// The caller half: `roomlerd self-update` under an exec. It starts the
+    /// lingerer, with or without `without_caller_stdio`, and exits without
+    /// waiting for it. Nothing in an ordinary run.
+    // Not waiting is the point: the caller must exit while the lingerer runs,
+    // as `self-update` leaves the watcher.
+    #[allow(clippy::zombie_processes)]
+    #[test]
+    fn stdio_caller_child() {
+        let detach = match std::env::var(STDIO_2718).as_deref() {
+            Ok("caller-inherit") => false,
+            Ok("caller-detached") => true,
+            _ => return,
+        };
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        cmd.args([
+            "--exact",
+            "updater::tests::stdio_lingerer_child",
+            "--test-threads=1",
+        ])
+        .env(STDIO_2718, "linger");
+        if detach {
+            without_caller_stdio(&mut cmd);
+        }
+        cmd.spawn().expect("start the lingerer");
+    }
+
+    /// How long reading the caller's stdout to EOF takes, as the worker's
+    /// exec drain threads do.
+    fn eof_after(mode: &str) -> Duration {
+        use std::io::Read;
+        let started = Instant::now();
+        let mut caller =
+            std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    "updater::tests::stdio_caller_child",
+                    "--test-threads=1",
+                ])
+                .env(STDIO_2718, mode)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("start the caller");
+        let mut out = Vec::new();
+        caller
+            .stdout
+            .take()
+            .expect("a piped stdout")
+            .read_to_end(&mut out)
+            .expect("read to EOF");
+        let _ = caller.wait();
+        started.elapsed()
+    }
+
+    #[test]
+    fn a_process_left_running_does_not_hold_its_callers_stdout() {
+        // The control first: inherited, EOF waits for the 5 s lingerer, so
+        // this test can tell the helper from a pipe that closes anyway.
+        let inherited = eof_after("caller-inherit");
+        assert!(
+            inherited >= Duration::from_secs(4),
+            "the control should wait for the lingerer: {inherited:?}"
+        );
+        let detached = eof_after("caller-detached");
+        assert!(
+            detached < Duration::from_secs(3),
+            "EOF should come when the caller exits, not the lingerer: {detached:?}"
+        );
     }
 }
 // RETIRED-NAME-ANCHOR-END

@@ -163,18 +163,23 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
 > aarch64 CLI, and the proxy answers 404 for it rather than hand over the
 > x86_64 one. `install.sh --role tunnel` picks the arch by itself
-> (`scripts/install.sh:682-686`), and the aarch64 wizard asks for
+> (`scripts/install.sh:1037-1041`), and the aarch64 wizard asks for
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
-> ⚠️ **On Debian 12 and Ubuntu 22.04 this `.deb` cannot install** (#2472).
-> `tunnel-v0.3.0-rc.266` depends on `libssl3t64`, the name Debian 13 and
-> Ubuntu 24.04 use; these two call it `libssl3`. `dpkg -i` leaves the package
-> unconfigured, and `apt-get -f install` removes it again. Use the plain tarball
-> below. `install.sh --role tunnel` checks that `roomler` runs and falls back
-> to the tarball on its own. The CLI now declares both names
-> (`agents/roomler-cli/Cargo.toml`), so from tunnel-v0.4.149 on, the `.deb` is
-> built to install on both generations.
+> ⚠️ **On x86_64 Debian 12 and Ubuntu 22.04, tunnel-v0.4.149 does not start**
+> (#3217). It was built on Ubuntu 24.04, so its binary needs glibc
+> 2.39: the `.deb` installs, and `roomler` stops with `version 'GLIBC_2.39' not
+> found`. Its tarball is the same binary, so neither it nor
+> `install.sh --role tunnel`'s fallback helps. The arm64 build is not affected.
+> From tunnel-v0.4.192 the x86_64 build is made on Ubuntu 22.04, as the arm64 one
+> is. It needs glibc 2.34, which its package declares, and it starts on both.
+
+> ⚠️ **On those two, `tunnel-v0.3.0-rc.266` cannot install at all** (#2472). It
+> depends on `libssl3t64`, the name Debian 13 and Ubuntu 24.04 use; these two
+> call it `libssl3`. `dpkg -i` leaves the package unconfigured, and
+> `apt-get -f install` removes it again. The CLI has declared both names since
+> tunnel-v0.4.149 (`agents/roomler-cli/Cargo.toml`).
 
 **Linux (plain tarball):**
 
@@ -245,7 +250,7 @@ For an "ops team reaches the prod Postgres" policy:
 |---|---|
 | Name | `ops-prod-postgres` |
 | Subjects | `Role ID` → `<your ops role hex>`, plus optionally `User ID` for specific users |
-| Targets | `Agent ID` → `<AGENT-CORP hex from Admin → Agents>` |
+| Targets | `Agent ID` → `<AGENT-CORP hex from Devices>` |
 | Allowlist | `Exact` `db.intranet.corp` ports `5432–5432`<br>(or `Wildcard` `*.intranet.corp` ports `5432–5432`<br>or `CIDR` `10.0.0.0/24` ports `1–65535`) |
 | Max concurrent flows | leave blank, or `64` for tight JDBC-pool bounds |
 | Max bytes / session | leave blank, or e.g. `10737418240` for 10 GiB cap |
@@ -270,7 +275,7 @@ In a regular (non-elevated) PowerShell on `OPERATOR-LAPTOP`:
 
 ```powershell
 roomler forward `
-  --agent <AGENT-CORP-hex from Admin → Agents> `
+  --agent <AGENT-CORP-hex from Devices> `
   --local 5432 `
   --remote db.intranet.corp:5432
 ```
@@ -402,7 +407,7 @@ roomler forward --agent … --local 5432 --remote db.intranet:5432
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `forward request timed out` after 10 s | agent offline, or no matching ACL policy | Check `Admin → Agents` shows agent online; check `Admin → Tunnel ACL` has a matching policy |
+| `forward request timed out` after 10 s | agent offline, or no matching ACL policy | Check **Devices** shows the device online; check **Network → ACL** has a matching policy |
 | `acl_denied` from the server | policy gate rejected the (subject × target × destination) tuple | Edit the policy to include the destination, or add subject/target |
 | `dial_failed` from the agent | destination unreachable from inside corp | Check from the agent host directly: `Test-NetConnection db.intranet -Port 5432` |
 | `cross_tenant` | tunnel-client and agent belong to different tenants | Re-enroll one of them in the correct tenant |

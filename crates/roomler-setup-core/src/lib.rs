@@ -16,7 +16,12 @@
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
 pub mod asset_resolver;
+/// FR-129 C3 — the wizard's elevated relaunch: `runas`, and the bounded wait
+/// for the limited copy to be gone.
+pub mod elevation;
 pub mod extract;
+/// #3246 — a staged artifact, held open from the check to the run.
+pub mod held_file;
 pub mod integration;
 pub mod msi_runner;
 pub mod progress;

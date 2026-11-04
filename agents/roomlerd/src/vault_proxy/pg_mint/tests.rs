@@ -54,6 +54,7 @@ async fn signs_in_as(f: &FakeIssuer, user: &str, password: &str) -> Result<(), S
         user: user.into(),
         password: Zeroizing::new(password.into()),
         tls: tls::connector(Some(&f.ca)).unwrap(),
+        dial: crate::vault_proxy::Dial::Direct,
     };
     let s = pg::sign_in(&up, "orders").await?;
     pg::terminate(s).await;

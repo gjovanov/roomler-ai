@@ -7,7 +7,11 @@
 #
 #   cp .env.selfhost.example .env.selfhost
 #   $EDITOR .env.selfhost                 # two secrets, both generated for you
-#   docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d --build
+#   docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost pull
+#   docker compose -f docker-compose.selfhost.yml --env-file .env.selfhost up -d
+#
+# Run `pull` first: `up -d` alone builds from source, which takes minutes rather
+# than seconds.
 #
 # Then open http://localhost:8080 and register — the first account owns the
 # first organization. Full walkthrough, including putting it behind a real
@@ -24,18 +28,25 @@
 #   RTC_MIN_PORT / RTC_MAX_PORT       mapped below. 32 ports is enough to try
 #                                     the product; widen for real use.
 #
-# On Linux you can skip all of that by giving the `roomler` service
-# `network_mode: host` and deleting its `ports:` block — then the full
-# 40000-49999 range is reachable and ANNOUNCED_IP is just the host's IP. That is
-# how the hosted service runs. It is not available on Docker Desktop for
-# macOS/Windows, which is why it is not the default here.
+# Don't give the `roomler` service `network_mode: host` to get past this: the
+# server finds its datastores by service name, those names stop resolving on the
+# host's network, and it loops on `mongo:27017` while port 80 answers 502.
 #
 # Remote desktop, tunnels, SSH and the overlay mesh do NOT use mediasoup and are
 # unaffected by any of the above — they are peer-to-peer with a relay fallback.
 
+# ── Why the images are pinned ─────────────────────────────────────────────────
+# Each image below names an exact version, and all but our own name a digest, so
+# `pull` gets the bytes this file was tested with. A moving tag broke fresh installs
+# twice: `minio/minio` left Docker Hub (#2034), and a new `coturn/coturn:latest`
+# dropped a flag used below (#3287). A digest names the multi-architecture index,
+# so amd64 and arm64 hosts both resolve it. The cost is yours to know: upstream
+# patches reach you only when this file moves, through `git pull` and then `pull`.
+# docs/self-hosting.md has the table, and how to move one yourself.
+
 services:
   mongo:
-    image: mongo:7
+    image: mongo:7.0.45@sha256:8bb4442761a63a8dda452744082cdac9644b429807eb977b42324a63cef59ca4
     restart: unless-stopped
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?set MONGO_ROOT_USERNAME in .env.selfhost}
@@ -50,7 +61,7 @@ services:
     networks: [roomler]
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.12-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
     restart: unless-stopped
     command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
     volumes:
@@ -111,10 +122,31 @@ services:
   # TURN relay. Only needed when two peers can punch no direct path AND you want
   # a relay you own; the DERP floor over the API's own :443 already guarantees
   # connectivity without it. Comment the service out if you don't want it —
-  # nothing else depends on it.
+  # nothing else depends on it, and its ports on `roomler` can go with it.
+  #
+  # Pinned by digest because `latest` once moved to a release that exits on a flag
+  # this file passed, and the only symptom was a relay that never answered. Before
+  # you move the pin, and whenever you wonder if it is healthy:
+  #   bash scripts/selfhost-coturn-check.sh       (docs/self-hosting.md, "The TURN relay")
+  #
+  # It runs in the server's network namespace, because a browser asks the relay for
+  # the SFU at the public address, and coturn rewrites that address to its own before
+  # it sends. Only when the SFU listens on coturn's own address does that packet
+  # reach a call. So its ports are published by `roomler`, below, and `up -d` runs for
+  # the whole file: `up -d roomler` replaces the server and leaves coturn stopped.
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.18.0-r0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     restart: unless-stopped
+    network_mode: service:roomler
+    # When the server's process dies, Docker brings it back in a new namespace and
+    # leaves coturn in the old one, with no address, still `running`. So coturn ends
+    # itself, and its restart policy brings it back into the new one. `init` makes
+    # PID 1 a process that always takes that signal and passes it on.
+    init: true
+    healthcheck:
+      test: ["CMD-SHELL", "hostname -I | grep -q '[0-9]' || { kill 1; exit 1; }"]
+      interval: 10s
+      timeout: 5s
     command:
       - --listening-port=3478
       - --fingerprint
@@ -122,21 +154,29 @@ services:
       - --static-auth-secret=${ROOMLER_TURN_SECRET:?set ROOMLER_TURN_SECRET in .env.selfhost}
       - --realm=${ROOMLER_TURN_REALM:-roomler.local}
       - --no-tls
-      - --no-dtls
+      # The image's own default command sets this; a `command:` here replaces it.
+      - --log-file=stdout
       - --no-multicast-peers
+      # A relay can only be UDP. Browsers and the agent's TURN client never ask for
+      # anything else, and TCP to this server stays. A TCP relay would reach every
+      # TCP listener on the address allowed below, the API included.
+      - --no-tcp-relay
       # Refuse to relay to private ranges — an open TURN server that can reach
       # your LAN is a proxy into your LAN for anyone who obtains a credential.
       - --denied-peer-ip=10.0.0.0-10.255.255.255
       - --denied-peer-ip=172.16.0.0-172.31.255.255
       - --denied-peer-ip=192.168.0.0-192.168.255.255
+      # The same for the range overlay meshes use, this product's included.
+      - --denied-peer-ip=100.64.0.0-100.127.255.255
       - --external-ip=${ROOMLER_PUBLIC_IP:-127.0.0.1}
+      # The one exception to those lines: this namespace's own address, computed at
+      # each start because it moves. It is what coturn rewrites the public address
+      # to. On it, UDP reaches only ports published above. Docker's other containers
+      # and its gateway stay refused.
+      - --relay-ip=$$(hostname -I | grep -oE '[0-9]+([.][0-9]+){3}' | head -1)
+      - --allowed-peer-ip=$$(hostname -I | grep -oE '[0-9]+([.][0-9]+){3}' | head -1)
       - --min-port=49152
       - --max-port=49252
-    ports:
-      - "3478:3478/udp"
-      - "3478:3478/tcp"
-      - "49152-49252:49152-49252/udp"
-    networks: [roomler]
 
   roomler:
     # Two ways to get this running, and the fast one is the default:
@@ -151,8 +191,11 @@ services:
     # minutes this image exists to save.
     #
     # `build:` stays because it is the AGPL promise in practice: the published
-    # image must never be the only way to run the server.
-    image: ${ROOMLER_IMAGE:-ghcr.io/gjovanov/roomler-ai:latest}
+    # image must never be the only way to run the server. It is also why this
+    # image has an exact tag and no digest: `up -d --build` cannot tag a build with
+    # one (`failed to solve: build tag cannot contain a digest`). A release moves
+    # this default in a commit, so `git pull` then `pull` is the upgrade.
+    image: ${ROOMLER_IMAGE:-ghcr.io/gjovanov/roomler-ai:v0.4.197}
     build:
       context: .
       args:
@@ -174,6 +217,10 @@ services:
       # Conference media. Must match RTC_MIN_PORT/RTC_MAX_PORT below.
       - "40000-40031:40000-40031/udp"
       - "40000-40031:40000-40031/tcp"
+      # TURN and the ports it relays on: coturn runs in this service's namespace.
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49152-49252:49152-49252/udp"
     environment:
       # ── identity + security ────────────────────────────────────────────────
       # `production` makes the server REFUSE to boot on the built-in default
@@ -223,7 +270,7 @@ services:
       # The first start runs schema migrations behind a lease, so give it room
       # before a failing probe starts counting against `retries`.
       start_period: 45s
-    networks: [roomler]
+    networks: { roomler: { aliases: [coturn] } }
 
 volumes:
   mongo_data:

@@ -25,7 +25,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use roomler_ai_remote_control::signaling::IceServer;
+use roomler_ai_remote_control::signaling::{IceServer, RcOverlayAutoWire};
 use serde::{Deserialize, Serialize};
 use tunnel_core::overlay_footprint as footprint;
 
@@ -35,6 +35,26 @@ pub struct RcOverlay {
     /// The device's `AccessPolicy.rc_overlay`. `false`, the default, keeps the
     /// session off the overlay.
     pub allow: bool,
+    /// FR-128 — the device's policy is `auto`. The session decides at its
+    /// offer, in the process that builds the peer ([`Self::decide`]), and
+    /// `allow` then holds the outcome; until then it is `false`. Absent, from
+    /// an older daemon on the delegation channel, reads `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
+    /// FR-128 — the viewer's own devices on the overlay, as the server named
+    /// them: one per relay it hands this session (FR-121 P3b).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<IpAddr>,
+    /// FR-128 — whether both ends' last netcheck reached the far TURN over
+    /// UDP. `None` = not measured, read as "it works".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_turn: Option<bool>,
+    /// FR-128 — the viewer devices an `auto` session that rides the mesh
+    /// still keeps off it: their mesh link is worse than the best viewer's,
+    /// so a relay behind it would carry the video on that worse link.
+    /// Decided at the offer, in the process that builds the peer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<IpAddr>,
     /// The overlay's v4 blocks, snapshotted by the DAEMON when the session is
     /// requested. Carried rather than re-read so a delegated session's GUI
     /// worker, which runs no overlay of its own, filters the same addresses.
@@ -42,12 +62,37 @@ pub struct RcOverlay {
     pub v4_nets: Vec<(Ipv4Addr, u8)>,
 }
 
+/// FR-128 — `ROOMLERD_RC_OVERLAY_AUTO=0` makes `auto` behave as `off`.
+pub fn auto_enabled() -> bool {
+    tunnel_core::env::flag("RC_OVERLAY_AUTO", true)
+}
+
 impl RcOverlay {
     /// The decision for a session THIS process resolves: the device's policy,
     /// plus this process's overlay blocks when they are needed.
     pub fn resolve(allow: bool) -> Self {
+        Self::resolve_mode(allow, None)
+    }
+
+    /// [`Self::resolve`] with FR-128's third value, `auto` (the server's
+    /// hints present). It stands only while `allow` is off and
+    /// [`auto_enabled`] holds; it starts as off, and the offer decides.
+    pub fn resolve_mode(allow: bool, auto: Option<&RcOverlayAutoWire>) -> Self {
+        let auto = auto.filter(|_| !allow && auto_enabled());
+        let mut viewers: Vec<IpAddr> = Vec::new();
+        for v in auto.map(|a| a.viewers.as_slice()).unwrap_or_default() {
+            if let Ok(ip) = v.parse()
+                && !viewers.contains(&ip)
+            {
+                viewers.push(ip);
+            }
+        }
         Self {
             allow,
+            auto: auto.is_some(),
+            viewers,
+            far_turn: auto.and_then(|a| a.far_turn),
+            exclude: Vec::new(),
             v4_nets: if allow {
                 Vec::new()
             } else {
@@ -56,8 +101,90 @@ impl RcOverlay {
         }
     }
 
+    /// FR-128 — make an `auto` session's decision, at its offer: the live
+    /// carrier to each of the viewer's devices ([`mesh_carriers_of`]), the
+    /// server's far-TURN hint, and this machine's own reach (D8,
+    /// [`own_far_turn`]). The best carrier decides ([`auto_allows`]); a
+    /// session that rides the mesh then leaves off every viewer device whose
+    /// carrier is worse (`exclude`), so ICE cannot pick a relay behind it.
+    /// Anything that is not `auto` comes back as it went in. One line in the
+    /// log names the inputs.
+    pub async fn decide(self, session: impl std::fmt::Display) -> Self {
+        self.decide_with(session, mesh_carriers_of, own_far_turn)
+            .await
+    }
+
+    /// [`Self::decide`] with both lookups passed in, for tests. The carrier
+    /// lookup answers one carrier per address, in order; `own` answers this
+    /// machine's own far-TURN reach. They run side by side.
+    pub async fn decide_with<F, Fut, G, GFut>(
+        self,
+        session: impl std::fmt::Display,
+        lookup: F,
+        own: G,
+    ) -> Self
+    where
+        F: FnOnce(Vec<IpAddr>) -> Fut,
+        Fut: std::future::Future<Output = Vec<MeshCarrier>>,
+        G: FnOnce() -> GFut,
+        GFut: std::future::Future<Output = Option<bool>>,
+    {
+        if !self.auto {
+            return self;
+        }
+        let (carriers, own_far_turn) = if self.viewers.is_empty() {
+            (Vec::new(), None)
+        } else {
+            tokio::join!(lookup(self.viewers.clone()), own())
+        };
+        let best = carriers
+            .iter()
+            .copied()
+            .max_by_key(|c| c.rank())
+            .unwrap_or(MeshCarrier::Unknown);
+        let far_turn = with_own_reach(self.far_turn, own_far_turn);
+        let allow = auto_allows(best, far_turn.unwrap_or(true));
+        let exclude: Vec<IpAddr> = if allow {
+            self.viewers
+                .iter()
+                .zip(&carriers)
+                .filter(|(_, c)| **c != best)
+                .map(|(ip, _)| *ip)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        tracing::info!(
+            %session,
+            viewers = ?self.viewers,
+            ?carriers,
+            far_turn = ?self.far_turn,
+            ?own_far_turn,
+            allow,
+            ?exclude,
+            "rc ICE: overlay auto (FR-128) — {}",
+            if allow {
+                "the session may ride the mesh"
+            } else {
+                "the session stays off the mesh"
+            }
+        );
+        Self {
+            allow,
+            exclude,
+            v4_nets: if allow { Vec::new() } else { self.v4_nets },
+            ..self
+        }
+    }
+
     fn blocks(&self, ip: IpAddr) -> bool {
-        !self.allow && footprint::is_overlay_addr(&self.v4_nets, ip)
+        (!self.allow && footprint::is_overlay_addr(&self.v4_nets, ip)) || self.exclude.contains(&ip)
+    }
+
+    /// Nothing to filter at all: `on`, or an `auto` session that rides the
+    /// mesh through every viewer device it was named.
+    fn filters_nothing(&self) -> bool {
+        self.allow && self.exclude.is_empty()
     }
 
     /// The `SettingEngine` IP filter: may ICE gather a host candidate on `ip`?
@@ -75,7 +202,7 @@ impl RcOverlay {
     /// The session's ICE servers minus every URL whose host is an overlay
     /// address, and minus any server left with no URL.
     pub fn ice_servers(&self, servers: &[IceServer]) -> Vec<IceServer> {
-        if self.allow {
+        if self.filters_nothing() {
             return servers.to_vec();
         }
         servers
@@ -101,7 +228,7 @@ impl RcOverlay {
     /// gathered first carries them all, and they would be added with no
     /// trickle to filter.
     pub fn strip_sdp(&self, sdp: &str) -> String {
-        if self.allow {
+        if self.filters_nothing() {
             return sdp.to_string();
         }
         sdp.split_inclusive('\n')
@@ -115,11 +242,136 @@ impl RcOverlay {
     /// The decision in words, for the one line a session logs, so "why did
     /// it not take the overlay pair" has an answer in the device's log.
     pub fn describe(&self) -> &'static str {
-        if self.allow {
-            "allowed (device policy rc_overlay=on)"
-        } else {
-            "excluded (device policy rc_overlay=off, the default)"
+        match (self.allow, self.auto) {
+            (true, true) => "allowed (device policy rc_overlay=auto, decided for this session)",
+            (false, true) => "excluded (device policy rc_overlay=auto, decided for this session)",
+            (true, false) => "allowed (device policy rc_overlay=on)",
+            (false, false) => "excluded (device policy rc_overlay=off, the default)",
         }
+    }
+}
+
+/// FR-128 — what carries the mesh link to the viewer's device, as `auto`
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshCarrier {
+    /// LAN, public or hole-punched: the overlay pair is a direct path.
+    Direct,
+    /// DERP, a peer relay or a tunnel: the overlay would carry the video over
+    /// somebody else's TCP.
+    Relayed,
+    /// No answer: an older daemon, a peer that is unknown, blocked or offline,
+    /// or LocalAPI slower than 400 ms.
+    Unknown,
+}
+
+impl MeshCarrier {
+    /// A LocalAPI `peers` answer, read for `auto`. `None`: the peer is not
+    /// in the answer.
+    pub fn of(connection: Option<tunnel_core::localapi::ConnectionType>) -> Self {
+        use tunnel_core::localapi::ConnectionType as C;
+        match connection {
+            Some(C::Direct) => Self::Direct,
+            Some(C::Relay | C::Tunnel) => Self::Relayed,
+            Some(C::Blocked | C::Offline) | None => Self::Unknown,
+        }
+    }
+
+    /// Which of several viewer devices' links is best: direct, then relayed,
+    /// then unknown.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Direct => 2,
+            Self::Relayed => 1,
+            Self::Unknown => 0,
+        }
+    }
+}
+
+/// FR-128 §3.1 — may an `auto` session use the overlay?
+pub fn auto_allows(carrier: MeshCarrier, far_turn: bool) -> bool {
+    match carrier {
+        // The case a Mac's Chrome loses today, where macOS denies its network
+        // helper the LAN: take the mesh, unconstrained.
+        MeshCarrier::Direct => true,
+        // A relayed mesh would put the video on TCP (§2.3), so take the far
+        // TURN over UDP while there is one. With none, the overlay is the
+        // only path (§2.4), and the relay-tier guard clamps the session.
+        MeshCarrier::Relayed => !far_turn,
+        // Fail safe.
+        MeshCarrier::Unknown => false,
+    }
+}
+
+/// FR-128 — the mesh carrier to the peer that owns each of `addrs`, in order:
+/// ONE LocalAPI `peers` call (the `roomler peers` verb) within 400 ms, the
+/// bound the relay-tier guard uses. Ungated, unlike that guard, because any
+/// session can be `auto`. No answer in time reads every address as unknown.
+pub async fn mesh_carriers_of(addrs: Vec<IpAddr>) -> Vec<MeshCarrier> {
+    let query = async {
+        let mut client = tunnel_core::localapi::connect().await.ok()?;
+        client.peers().await.ok()
+    };
+    let peers = tokio::time::timeout(std::time::Duration::from_millis(400), query)
+        .await
+        .ok()
+        .flatten();
+    addrs
+        .iter()
+        .map(|addr| {
+            let addr = addr.to_string();
+            let Some(peers) = &peers else {
+                return MeshCarrier::Unknown;
+            };
+            MeshCarrier::of(
+                peers
+                    .iter()
+                    .find(|p| {
+                        p.overlay_ip.as_deref() == Some(addr.as_str())
+                            || p.overlay_ip6.as_deref() == Some(addr.as_str())
+                    })
+                    .map(|p| p.connection),
+            )
+        })
+        .collect()
+}
+
+/// FR-128 D8 — how old this machine's netcheck may be and still count: the
+/// gate every consumer uses (tunnel-core's `FRESHNESS_MAX_AGE`, the server's
+/// `fresh_caps`), three times its 20-minute cadence.
+const NETCHECK_FRESH_S: u64 = 60 * 60;
+
+/// FR-128 D8 — this machine's own far-TURN reach, by its daemon's last
+/// netcheck: `stun_udp` alone (P2b), behind the freshness gate. ONE LocalAPI
+/// `status` call within the 400 ms the carrier lookup has, run beside it. A
+/// Mac's GUI worker runs no overlay, and its row has no node the server's
+/// hint could measure, so it reads its daemon's vector here (the per-user
+/// half lends it, `person_socket::with_machine_network`). No answer in time,
+/// or no fresh vector, is `None`: not measured.
+pub async fn own_far_turn() -> Option<bool> {
+    let query = async {
+        let mut client = tunnel_core::localapi::connect().await.ok()?;
+        client.status().await.ok()
+    };
+    let status = tokio::time::timeout(std::time::Duration::from_millis(400), query)
+        .await
+        .ok()
+        .flatten()?;
+    status
+        .netcheck
+        .filter(|n| n.age_s < NETCHECK_FRESH_S)
+        .map(|n| n.stun_udp)
+}
+
+/// FR-128 D8 — the server's hint with this machine's own reach folded in: a
+/// target whose netcheck found no UDP out reaches no far TURN, whatever the
+/// server could see. Anything else leaves the hint as the server sent it,
+/// which already holds this machine's vector wherever the server found one.
+fn with_own_reach(hint: Option<bool>, own: Option<bool>) -> Option<bool> {
+    if own == Some(false) {
+        Some(false)
+    } else {
+        hint
     }
 }
 
@@ -152,6 +404,7 @@ mod tests {
         RcOverlay {
             allow: false,
             v4_nets: vec![(Ipv4Addr::new(100, 65, 4, 0), 22)],
+            ..Default::default()
         }
     }
 
@@ -159,6 +412,7 @@ mod tests {
         RcOverlay {
             allow: true,
             v4_nets: vec![(Ipv4Addr::new(100, 65, 4, 0), 22)],
+            ..Default::default()
         }
     }
 
@@ -285,5 +539,271 @@ mod tests {
         let empty: RcOverlay = serde_json::from_str(r#"{"allow":false}"#).unwrap();
         assert_eq!(empty, RcOverlay::default());
         assert!(!RcOverlay::default().allow);
+        // FR-128 — an older daemon's frame, which has no `auto`, reads
+        // not-auto; and a plain off costs no bytes for it.
+        assert!(!empty.auto && empty.viewers.is_empty() && empty.far_turn.is_none());
+        assert!(empty.exclude.is_empty());
+        assert!(!serde_json::to_string(&off()).unwrap().contains("auto"));
+    }
+
+    /// An `auto` session before its offer: off, with the server's hints.
+    fn auto(viewers: &[&str], far_turn: Option<bool>) -> RcOverlay {
+        RcOverlay {
+            auto: true,
+            viewers: viewers.iter().map(|v| v.parse().unwrap()).collect(),
+            far_turn,
+            ..off()
+        }
+    }
+
+    /// The hints cross to a delegated GUI worker, which makes the decision.
+    #[test]
+    fn auto_and_its_hints_cross_the_delegation_channel() {
+        let a = auto(&["100.65.4.33"], Some(false));
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains(r#""auto":true"#), "{json}");
+        assert!(json.contains(r#""viewers":["100.65.4.33"]"#), "{json}");
+        assert_eq!(serde_json::from_str::<RcOverlay>(&json).unwrap(), a);
+    }
+
+    /// `auto` only while the policy is not `on`; it starts off; a viewer that
+    /// is not an address is no viewer, and one named twice counts once.
+    #[test]
+    fn resolve_mode_keeps_auto_only_for_an_off_policy() {
+        let hints = RcOverlayAutoWire {
+            viewers: vec![
+                "100.65.4.33".into(),
+                "100.65.4.33".into(),
+                "100.65.4.40".into(),
+            ],
+            far_turn: Some(true),
+        };
+        let a = RcOverlay::resolve_mode(false, Some(&hints));
+        assert!(a.auto && !a.allow);
+        assert_eq!(a.viewers, vec![ip("100.65.4.33"), ip("100.65.4.40")]);
+        assert_eq!(a.far_turn, Some(true));
+        let on = RcOverlay::resolve_mode(true, Some(&hints));
+        assert!(on.allow && !on.auto && on.viewers.is_empty(), "on wins");
+        assert!(!RcOverlay::resolve_mode(false, None).auto);
+        let junk = RcOverlayAutoWire {
+            viewers: vec!["not-an-address".into()],
+            far_turn: None,
+        };
+        let a = RcOverlay::resolve_mode(false, Some(&junk));
+        assert!(a.auto && a.viewers.is_empty());
+    }
+
+    /// FR-128 §3.1, the whole table.
+    #[test]
+    fn auto_allows_the_mesh_only_when_it_is_direct_or_the_only_path() {
+        assert!(auto_allows(MeshCarrier::Direct, true));
+        assert!(auto_allows(MeshCarrier::Direct, false));
+        assert!(
+            !auto_allows(MeshCarrier::Relayed, true),
+            "the far TURN over UDP wins"
+        );
+        assert!(
+            auto_allows(MeshCarrier::Relayed, false),
+            "the only path (§2.4)"
+        );
+        assert!(!auto_allows(MeshCarrier::Unknown, true));
+        assert!(!auto_allows(MeshCarrier::Unknown, false));
+    }
+
+    #[test]
+    fn a_peers_answer_reads_as_direct_relayed_or_unknown() {
+        use tunnel_core::localapi::ConnectionType as C;
+        assert_eq!(MeshCarrier::of(Some(C::Direct)), MeshCarrier::Direct);
+        assert_eq!(MeshCarrier::of(Some(C::Relay)), MeshCarrier::Relayed);
+        assert_eq!(MeshCarrier::of(Some(C::Tunnel)), MeshCarrier::Relayed);
+        assert_eq!(MeshCarrier::of(Some(C::Blocked)), MeshCarrier::Unknown);
+        assert_eq!(MeshCarrier::of(Some(C::Offline)), MeshCarrier::Unknown);
+        assert_eq!(MeshCarrier::of(None), MeshCarrier::Unknown);
+    }
+
+    /// The decision at the offer, with the lookup stubbed: what each carrier
+    /// and hint makes of the session, and that the outcome is an ordinary
+    /// on/off the filters already know.
+    #[tokio::test]
+    async fn the_offer_decides_from_the_carrier_and_the_far_turn_hint() {
+        let decided = |p: RcOverlay, c: MeshCarrier| async move {
+            p.decide_with(
+                "s",
+                move |addrs: Vec<IpAddr>| async move { vec![c; addrs.len()] },
+                || async { None },
+            )
+            .await
+        };
+        // The same-network Mac Chrome case: a direct mesh carries it.
+        let d = decided(auto(&["100.65.4.33"], None), MeshCarrier::Direct).await;
+        assert!(d.allow && d.auto && d.v4_nets.is_empty(), "{d:?}");
+        assert!(d.exclude.is_empty(), "{d:?}");
+        assert!(d.keeps_local(ip("100.65.4.34")), "on: no filter");
+        assert_eq!(
+            d.describe(),
+            "allowed (device policy rc_overlay=auto, decided for this session)"
+        );
+        // A relayed mesh gives way to a far TURN, measured or assumed.
+        for hint in [Some(true), None] {
+            let d = decided(auto(&["100.65.4.33"], hint), MeshCarrier::Relayed).await;
+            assert!(!d.allow && !d.v4_nets.is_empty(), "{hint:?}");
+            assert!(!d.keeps_local(ip("100.65.4.34")), "off: filtered");
+        }
+        // ... unless the far TURN is measured dead: then the mesh is the path.
+        let d = decided(auto(&["100.65.4.33"], Some(false)), MeshCarrier::Relayed).await;
+        assert!(d.allow);
+        // No answer: off.
+        let d = decided(auto(&["100.65.4.33"], Some(false)), MeshCarrier::Unknown).await;
+        assert!(!d.allow);
+        assert_eq!(
+            d.describe(),
+            "excluded (device policy rc_overlay=auto, decided for this session)"
+        );
+    }
+
+    /// No viewer named: unknown, off, and neither lookup is ever asked.
+    #[tokio::test]
+    async fn no_viewer_is_off_without_a_lookup() {
+        let d = auto(&[], Some(false))
+            .decide_with(
+                "s",
+                |_| async { panic!("no viewer, no lookup") },
+                || async { panic!("no viewer, no netcheck") },
+            )
+            .await;
+        assert!(!d.allow && d.auto);
+    }
+
+    /// FR-128 D8 — the target's own netcheck, read at the offer. One that
+    /// found no UDP out makes a relayed mesh the only path, whatever the
+    /// server could see: for a Mac's GUI worker, whose row has no node, the
+    /// server's hint reads `None`. Anything else leaves the hint as sent.
+    #[tokio::test]
+    async fn the_targets_own_netcheck_folds_into_the_hint() {
+        let decided = |c: MeshCarrier, hint: Option<bool>, own: Option<bool>| async move {
+            auto(&["100.65.4.33"], hint)
+                .decide_with(
+                    "s",
+                    move |addrs: Vec<IpAddr>| async move { vec![c; addrs.len()] },
+                    move || async move { own },
+                )
+                .await
+                .allow
+        };
+        use MeshCarrier::*;
+        assert!(
+            decided(Relayed, None, Some(false)).await,
+            "a Mac target with no UDP out: the mesh is the only path"
+        );
+        assert!(
+            decided(Relayed, Some(true), Some(false)).await,
+            "its own read wins toward dead"
+        );
+        assert!(!decided(Relayed, None, Some(true)).await);
+        assert!(
+            !decided(Relayed, None, None).await,
+            "nothing measured: the far TURN is assumed"
+        );
+        assert!(
+            decided(Relayed, Some(false), Some(true)).await,
+            "the browser's end measured dead stands"
+        );
+        assert!(decided(Direct, Some(true), Some(true)).await);
+        assert!(!decided(Unknown, None, Some(false)).await, "fail safe");
+        assert_eq!(with_own_reach(Some(true), None), Some(true));
+        assert_eq!(with_own_reach(None, Some(true)), None);
+    }
+
+    /// FR-121 P3b — one computer, two agents, two relays: Windows direct to
+    /// the target, WSL on DERP. The best link decides, and the relay behind
+    /// the worse one is left off every filter, so ICE cannot pick it.
+    #[tokio::test]
+    async fn two_viewer_devices_ride_only_the_best_link() {
+        use MeshCarrier::*;
+        let (win, wsl) = ("100.65.4.33", "100.65.4.40");
+        let decided = |p: RcOverlay, cs: Vec<MeshCarrier>| async move {
+            p.decide_with(
+                "s",
+                move |addrs: Vec<IpAddr>| async move {
+                    assert_eq!(addrs.len(), cs.len(), "one carrier per viewer");
+                    cs
+                },
+                || async { None },
+            )
+            .await
+        };
+        let d = decided(auto(&[win, wsl], None), vec![Direct, Relayed]).await;
+        assert!(d.allow, "{d:?}");
+        assert_eq!(d.exclude, vec![ip(wsl)]);
+        assert!(d.keeps_local(ip("100.65.4.34")), "our own overlay is fine");
+        let via = |addr: &str| format!("candidate:2 1 udp 41885439 {addr} 61000 typ relay");
+        assert!(d.keeps_remote_candidate(&via(win)));
+        assert!(!d.keeps_remote_candidate(&via(wsl)));
+        let servers = vec![
+            IceServer {
+                urls: vec![format!("turn:{win}:47989")],
+                username: Some("w".into()),
+                credential: Some("w".into()),
+            },
+            IceServer {
+                urls: vec![format!("turn:{wsl}:47990")],
+                username: Some("l".into()),
+                credential: Some("l".into()),
+            },
+            IceServer {
+                urls: vec!["turn:turn.roomler.ai:3478?transport=udp".into()],
+                username: Some("u".into()),
+                credential: Some("c".into()),
+            },
+        ];
+        let urls: Vec<String> = d
+            .ice_servers(&servers)
+            .into_iter()
+            .flat_map(|s| s.urls)
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                format!("turn:{win}:47989"),
+                "turn:turn.roomler.ai:3478?transport=udp".to_string()
+            ]
+        );
+        let sdp = format!(
+            "v=0\r\na=candidate:{}\r\na=candidate:{}\r\n",
+            &via(win)[10..],
+            &via(wsl)[10..]
+        );
+        let out = d.strip_sdp(&sdp);
+        assert!(out.contains(win) && !out.contains(wsl), "{out}");
+
+        // The order does not matter, and two direct links leave nothing out.
+        let d = decided(auto(&[wsl, win], None), vec![Relayed, Direct]).await;
+        assert!(d.allow && d.exclude == vec![ip(wsl)], "{d:?}");
+        let d = decided(auto(&[win, wsl], None), vec![Direct, Direct]).await;
+        assert!(d.allow && d.exclude.is_empty(), "{d:?}");
+        assert_eq!(d.ice_servers(&servers).len(), 3, "nothing to filter");
+        // With the far TURN dead, a relayed link is the path, and a device with
+        // no link at all is still left off.
+        let d = decided(auto(&[win, wsl], Some(false)), vec![Relayed, Unknown]).await;
+        assert!(d.allow && d.exclude == vec![ip(wsl)], "{d:?}");
+        // Both relayed, the far TURN alive: off, and nothing to exclude.
+        let d = decided(auto(&[win, wsl], None), vec![Relayed, Relayed]).await;
+        assert!(!d.allow && d.exclude.is_empty(), "{d:?}");
+    }
+
+    /// Not `auto`: the offer leaves the decision exactly as it was.
+    #[tokio::test]
+    async fn a_session_that_is_not_auto_is_left_as_it_was() {
+        for p in [off(), on()] {
+            let d = p
+                .clone()
+                .decide_with(
+                    "s",
+                    |_| async { panic!("not auto, no lookup") },
+                    || async { panic!("not auto, no netcheck") },
+                )
+                .await;
+            assert_eq!(d, p);
+        }
     }
 }

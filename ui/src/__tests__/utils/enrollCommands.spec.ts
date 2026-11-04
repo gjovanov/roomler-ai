@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 import { describe, it, expect } from 'vitest'
-import { DEVICE_ID_PLACEHOLDER, enrollCommands, installCards, type OsCommands } from '@/utils/enrollCommands'
+import {
+  DEVICE_ID_PLACEHOLDER,
+  enrollCommands,
+  installCards,
+  LINUX_ARM64_LABEL,
+  LINUX_WIZARD_NEEDS,
+  type EnrollOptions,
+  type OsCommands,
+} from '@/utils/enrollCommands'
 
 /**
  * Locks the enrollment command templates to the shipped installer
@@ -21,16 +29,25 @@ describe('enrollCommands', () => {
   it('covers all three OSes for both kinds and every scope', () => {
     for (const kind of ['agent', 'tunnel'] as const) {
       for (const scope of SCOPES) {
-        const all = enrollCommands(kind, ORIGIN, TOKEN, scope)
-        expect(all.map((o) => o.os)).toEqual(['windows', 'linux', 'macos'])
-        for (const os of all) {
-          // Script, wizard, manual — less the wizard where it cannot install
-          // an agent (FR-97 D5, below).
-          const wizardInstallsIt = kind === 'tunnel' || os.os === 'windows'
-          expect(os.blocks).toHaveLength(wizardInstallsIt ? 3 : 2)
-          for (const block of os.blocks) {
-            if (!block.isDownload) expect(block.command).toContain(TOKEN)
-            expect(block.command).toContain(ORIGIN)
+        for (const [wizardLinuxDaemon, wizardMacosDaemon] of [
+          [false, false],
+          [true, false],
+          [false, true],
+          [true, true],
+        ] as Array<[boolean, boolean]>) {
+          const all = enrollCommands(kind, ORIGIN, TOKEN, scope, false, { wizardLinuxDaemon, wizardMacosDaemon })
+          expect(all.map((o) => o.os)).toEqual(['windows', 'linux', 'macos'])
+          for (const os of all) {
+            // Script, wizard, manual — less the wizard where it cannot install
+            // an agent (FR-97 D5), until the server says it can on that OS
+            // (FR-129 B1-s, B1-s2, below).
+            const serverSaysSo = os.os === 'linux' ? wizardLinuxDaemon : wizardMacosDaemon
+            const wizardInstallsIt = kind === 'tunnel' || os.os === 'windows' || serverSaysSo
+            expect(os.blocks, `${kind} ${scope} ${os.os}`).toHaveLength(wizardInstallsIt ? 3 : 2)
+            for (const block of os.blocks) {
+              if (!block.isDownload) expect(block.command).toContain(TOKEN)
+              expect(block.command).toContain(ORIGIN)
+            }
           }
         }
       }
@@ -137,16 +154,89 @@ describe('enrollCommands', () => {
   it('offers the wizard for an agent only where it installs one (FR-97 D5)', () => {
     // Off Windows, Roomler Setup installs the tunnel client and nothing else
     // (`agents/roomler-setup`): offered for an agent there, it could not
-    // enroll the device the token was minted for.
-    for (const scope of SCOPES) {
-      const offered = enrollCommands('agent', ORIGIN, TOKEN, scope)
+    // enroll the device the token was minted for. FR-129 B1 teaches it the
+    // daemon there, and the SERVER says when the released wizard is that one
+    // (below); until it has, this rule stands.
+    const offered = (scope: (typeof SCOPES)[number], options?: EnrollOptions) =>
+      enrollCommands('agent', ORIGIN, TOKEN, scope, false, options)
         .filter((o) => o.blocks.some((b) => b.isDownload))
         .map((o) => o.os)
-      expect(offered, scope).toEqual(['windows'])
+    for (const scope of SCOPES) {
+      expect(offered(scope), scope).toEqual(['windows'])
+      expect(offered(scope, {}), scope).toEqual(['windows'])
+      expect(offered(scope, { wizardLinuxDaemon: false, wizardMacosDaemon: false }), scope).toEqual(['windows'])
     }
   })
 
-  it('the homepages offer the wizard by the same rule (FR-97 P0c-4)', () => {
+  // FR-129 B1-s2 — the daemon switch per OS (`wizard_linux_daemon`,
+  // `wizard_macos_daemon` on `GET /api/setup/features`, each read by the
+  // store with the older `wizard_unix_daemon`): Linux goes live without macOS.
+  it('offers it on each of Linux and macOS by that OS’s own switch (FR-129 B1-s2)', () => {
+    const offered = (options: EnrollOptions) =>
+      enrollCommands('agent', ORIGIN, TOKEN, 'user', false, options)
+        .filter((o) => o.blocks.some((b) => b.isDownload))
+        .map((o) => o.os)
+    expect(offered({ wizardLinuxDaemon: true })).toEqual(['windows', 'linux'])
+    expect(offered({ wizardLinuxDaemon: true, wizardMacosDaemon: false })).toEqual(['windows', 'linux'])
+    expect(offered({ wizardMacosDaemon: true })).toEqual(['windows', 'macos'])
+    expect(offered({ wizardLinuxDaemon: false, wizardMacosDaemon: true })).toEqual(['windows', 'macos'])
+    expect(offered({ wizardLinuxDaemon: true, wizardMacosDaemon: true })).toEqual(['windows', 'linux', 'macos'])
+  })
+
+  // FR-129 B1-s — once the server advertises the daemon on an OS.
+  it('offers it on Linux and macOS in the Windows card’s layout once the server says so (FR-129 B1-s)', () => {
+    for (const scope of SCOPES) {
+      for (const os of enrollCommands('agent', ORIGIN, TOKEN, scope, false, {
+        wizardLinuxDaemon: true,
+        wizardMacosDaemon: true,
+      })) {
+        // The Windows card's layout on every OS: script, wizard, manual — the
+        // wizard block in the same place, with the same label and the same
+        // proxy URL shape, not a fork of the card.
+        expect(os.blocks.map((b) => b.id), `${scope} ${os.os}`).toEqual([
+          `agent-${os.os}-script`,
+          `agent-${os.os}-wizard`,
+          `agent-${os.os}-manual`,
+        ])
+        const wizard = os.blocks[1]!
+        expect(wizard.isDownload).toBe(true)
+        expect(wizard.label).toBe('Graphical installer (Roomler Setup)')
+        expect(wizard.command).toBe(`${ORIGIN}/api/setup/${os.os}`)
+      }
+    }
+  })
+
+  it('the switch changes nothing else: off, or unknown, is exactly what the commands were before it existed', () => {
+    for (const kind of ['agent', 'tunnel'] as const) {
+      for (const scope of SCOPES) {
+        for (const anchor of [false, true]) {
+          const before = enrollCommands(kind, ORIGIN, TOKEN, scope, anchor)
+          expect(enrollCommands(kind, ORIGIN, TOKEN, scope, anchor, {})).toEqual(before)
+          expect(
+            enrollCommands(kind, ORIGIN, TOKEN, scope, anchor, { wizardLinuxDaemon: false, wizardMacosDaemon: false }),
+          ).toEqual(before)
+          // Only the blocks the switches add differ when they are on.
+          const without = (all: OsCommands[]) =>
+            all.map((o) => ({ ...o, blocks: o.blocks.filter((b) => !b.isDownload) }))
+          for (const options of [
+            { wizardLinuxDaemon: true },
+            { wizardMacosDaemon: true },
+            { wizardLinuxDaemon: true, wizardMacosDaemon: true },
+          ]) {
+            const on = enrollCommands(kind, ORIGIN, TOKEN, scope, anchor, options)
+            expect(without(on), JSON.stringify(options)).toEqual(without(before))
+          }
+        }
+      }
+    }
+    // A tunnel client's wizard was always offered everywhere: the switches
+    // are about the daemon, so for a tunnel they are a no-op in every state.
+    expect(
+      enrollCommands('tunnel', ORIGIN, TOKEN, 'user', false, { wizardLinuxDaemon: true, wizardMacosDaemon: true }),
+    ).toEqual(enrollCommands('tunnel', ORIGIN, TOKEN))
+  })
+
+  it('the homepages offer the wizard by the same rule (FR-97 P0c-4, FR-129 B1-s)', () => {
     // They kept their own per-OS map until P0c-4 and offered Roomler Setup on
     // every card, where off Windows it could install only the tunnel client.
     const cards = installCards(ORIGIN)
@@ -155,12 +245,74 @@ describe('enrollCommands', () => {
       ['linux', null],
       ['macos', null],
     ])
+    // The switches off, or not yet known, are the same page.
+    expect(installCards(ORIGIN, {})).toEqual(cards)
+    expect(installCards(ORIGIN, { wizardLinuxDaemon: false, wizardMacosDaemon: false })).toEqual(cards)
+    // Both on: every card gets the button, and nothing else moves.
+    const on = installCards(ORIGIN, { wizardLinuxDaemon: true, wizardMacosDaemon: true })
+    expect(on.map((c) => [c.os, c.wizardUrl])).toEqual([
+      ['windows', `${ORIGIN}/api/setup/windows`],
+      ['linux', `${ORIGIN}/api/setup/linux`],
+      ['macos', `${ORIGIN}/api/setup/macos`],
+    ])
+    expect(on.map((c) => [c.os, c.title, c.command])).toEqual(cards.map((c) => [c.os, c.title, c.command]))
+    // FR-129 B1-s2 — Linux on alone: the Linux card's button, not the Mac's.
+    const linux = installCards(ORIGIN, { wizardLinuxDaemon: true })
+    expect(linux.map((c) => [c.os, c.wizardUrl])).toEqual([
+      ['windows', `${ORIGIN}/api/setup/windows`],
+      ['linux', `${ORIGIN}/api/setup/linux`],
+      ['macos', null],
+    ])
     // Each card's terminal form is the agent's one-line install, never a download.
-    for (const card of cards) {
+    for (const card of [...cards, ...on, ...linux]) {
       expect(card.command, card.os).toBe(
         enrollCommands('agent', ORIGIN, null).find((o) => o.os === card.os)!.blocks[0]!.command,
       )
     }
+  })
+
+  it('says what the Linux wizard needs first, wherever it is offered, and only there (#3202)', () => {
+    const on: EnrollOptions = { wizardLinuxDaemon: true, wizardMacosDaemon: true }
+    for (const kind of ['agent', 'tunnel'] as const) {
+      for (const scope of SCOPES) {
+        for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope, false, on)) {
+          const wizard = os.blocks.find((b) => b.isDownload)
+          expect(wizard?.hint, `${kind} ${scope} ${os.os}`).toBe(os.os === 'linux' ? LINUX_WIZARD_NEEDS : undefined)
+        }
+      }
+    }
+    // The library and both package names, so a person can act on the line.
+    for (const words of ['WebKitGTK 4.1', 'libwebkit2gtk-4.1-0', 'webkit2gtk4.1']) {
+      expect(LINUX_WIZARD_NEEDS).toContain(words)
+    }
+    expect(installCards(ORIGIN, on).map((c) => [c.os, c.wizardHint])).toEqual([
+      ['windows', null],
+      ['linux', LINUX_WIZARD_NEEDS],
+      ['macos', null],
+    ])
+    // No button, no line.
+    expect(installCards(ORIGIN).map((c) => c.wizardHint)).toEqual([null, null, null])
+  })
+
+  it('offers the ARM64 Linux wizard beside the x86_64 one, and only there (#3247 item 13)', () => {
+    const on: EnrollOptions = { wizardLinuxDaemon: true, wizardMacosDaemon: true }
+    const arm64 = { label: LINUX_ARM64_LABEL, url: `${ORIGIN}/api/setup/linux-aarch64` }
+    for (const kind of ['agent', 'tunnel'] as const) {
+      for (const scope of SCOPES) {
+        for (const os of enrollCommands(kind, ORIGIN, TOKEN, scope, false, on)) {
+          const wizard = os.blocks.find((b) => b.isDownload)
+          expect(wizard?.alt, `${kind} ${scope} ${os.os}`).toEqual(os.os === 'linux' ? arm64 : undefined)
+          if (os.os === 'linux') expect(wizard?.command).toBe(`${ORIGIN}/api/setup/linux`)
+        }
+      }
+    }
+    expect(installCards(ORIGIN, on).map((c) => [c.os, c.wizardAlt])).toEqual([
+      ['windows', null],
+      ['linux', arm64],
+      ['macos', null],
+    ])
+    // No button, no link.
+    expect(installCards(ORIGIN).map((c) => c.wizardAlt)).toEqual([null, null, null])
   })
 
   it('never emits the retired binary names or a hardcoded server', () => {

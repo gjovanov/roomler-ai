@@ -630,6 +630,32 @@ pub fn index_unique_partial(keys: bson::Document, filter: bson::Document) -> Ind
         .build()
 }
 
+/// [`index_unique_partial`] under an explicit `name`.
+///
+/// Needed when the plan REPLACES an index on the same key pattern with one of
+/// different options — Mongo derives the default name from the keys alone, so
+/// the replacement would inherit the old name, and a `DropIndexIfPresent`
+/// pre-op keyed on that name would then drop the replacement on every boot
+/// and recreate it, leaving a window with no guard on each roll. A distinct
+/// name makes the pre-op a one-time migration: it finds the legacy index
+/// once, and "not found" (tolerated) ever after.
+pub fn index_unique_partial_named(
+    keys: bson::Document,
+    filter: bson::Document,
+    name: &'static str,
+) -> IndexModel {
+    IndexModel::builder()
+        .keys(keys)
+        .options(
+            IndexOptions::builder()
+                .unique(true)
+                .partial_filter_expression(filter)
+                .name(name.to_string())
+                .build(),
+        )
+        .build()
+}
+
 async fn create_indexes(
     db: &Database,
     collection: &str,

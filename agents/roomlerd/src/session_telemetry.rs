@@ -15,7 +15,7 @@
 //! reporter reads them. Entries are dropped with their `AgentPeer`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bson::oid::ObjectId;
 use dashmap::DashMap;
@@ -59,6 +59,15 @@ pub struct SessionCounters {
     /// Keyframes the viewer asked for (PLI/FIR + our own resync pulses).
     /// A session with a high count spent it recovering from loss.
     pub keyframe_requests: AtomicU32,
+    /// FR-132 P1 (§3b) — decode errors the viewer reported (`rc:decode-error`,
+    /// one per error, sent before it falls back to `<video>`). Read through
+    /// [`Self::decode_errors`], never directly: a zero means something only
+    /// once [`Self::decode_errors_counted`] is set.
+    decode_errors: AtomicU32,
+    /// FR-132 P1 — the viewer said it counts decode errors (`de` on its
+    /// `rc:decodestat`, or a reported error). Without it a session's zero is
+    /// "not counted": an older viewer, or one that never decoded in a worker.
+    decode_errors_counted: AtomicBool,
     /// Input events accepted for injection (post-suppression).
     pub input_events: AtomicU64,
     /// FR-101 P4b-2 — every input event the controller SENT, suppressed or
@@ -145,6 +154,48 @@ impl SessionCounters {
 
     pub fn note_keyframe(&self) {
         self.keyframe_requests.fetch_add(1, Ordering::Relaxed);
+    }
+    /// FR-132 P1 — one decode error the viewer reported. Returns the count
+    /// including this one, so the caller can tell the first few (logged, and
+    /// sent at once) from a flood. Saturating: a viewer that sends billions
+    /// pins the count rather than wrapping it back to a clean-looking zero.
+    pub fn note_decode_error(&self) -> u32 {
+        self.decode_errors_counted.store(true, Ordering::Relaxed);
+        let prev = self
+            .decode_errors
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            })
+            .unwrap_or(u32::MAX);
+        prev.saturating_add(1)
+    }
+    /// FR-132 P1 — the viewer said it counts decode errors (see
+    /// [`Self::decode_errors_counted`]). `true` the first time, so the caller
+    /// can send one sample at once: a short session with no errors then
+    /// records its measured zero, rather than nothing, before it ends.
+    pub fn note_decode_errors_counted(&self) -> bool {
+        !self.decode_errors_counted.swap(true, Ordering::Relaxed)
+    }
+    /// FR-132 P1 — what `rc:session.stats` carries: the count once the
+    /// viewer counts (so `Some(0)` is a measured zero), `None` before.
+    pub fn decode_errors(&self) -> Option<u32> {
+        self.decode_errors_counted
+            .load(Ordering::Relaxed)
+            .then(|| self.decode_errors.load(Ordering::Relaxed))
+    }
+    /// FR-132 P1 — carry a session's previous peer's decode-error reading
+    /// (its [`Self::decode_errors`]) into this entry, as
+    /// [`Self::carry_transfers`] carries the tallies: the old peer's drop
+    /// forgets its counters, and the next sample's `$set` would put the
+    /// server's live count back below the errors it already recorded.
+    pub fn carry_decode_errors(&self, reading: Option<u32>) {
+        let Some(n) = reading else { return };
+        self.decode_errors_counted.store(true, Ordering::Relaxed);
+        let _ = self
+            .decode_errors
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_add(n))
+            });
     }
     pub fn note_input(&self) {
         self.input_events.fetch_add(1, Ordering::Relaxed);
@@ -256,6 +307,54 @@ mod tests {
         assert_eq!(counters(a).keyframe_requests.load(Ordering::Relaxed), 0);
         forget(a);
         forget(b);
+    }
+
+    /// FR-132 P1 — a session's decode errors read as "not counted" until the
+    /// viewer says it counts, then as a count that a zero can be; each error
+    /// adds one and marks the session counted; a flood pins rather than wraps;
+    /// and a renegotiated session's new entry carries the old reading.
+    #[test]
+    fn decode_errors_are_not_counted_until_the_viewer_counts() {
+        let s = ObjectId::new();
+        let c = counters(s);
+        assert_eq!(
+            c.decode_errors(),
+            None,
+            "an older viewer: no count, not zero"
+        );
+        assert!(c.note_decode_errors_counted(), "the first time says so");
+        assert!(!c.note_decode_errors_counted(), "once only");
+        assert_eq!(c.decode_errors(), Some(0), "a measured zero");
+        assert_eq!(c.note_decode_error(), 1);
+        assert_eq!(c.note_decode_error(), 2);
+        assert_eq!(c.decode_errors(), Some(2));
+        forget(s);
+
+        // An error alone marks the session counted (a configure failure can
+        // come before the first `rc:decodestat`).
+        let t = ObjectId::new();
+        assert_eq!(counters(t).note_decode_error(), 1);
+        assert_eq!(counters(t).decode_errors(), Some(1));
+
+        // The carry across a re-offer: the old peer's drop forgets, the new
+        // entry gets the reading back; an uncounted reading carries nothing.
+        let reading = counters(t).decode_errors();
+        forget(t);
+        assert_eq!(counters(t).decode_errors(), None);
+        counters(t).carry_decode_errors(reading);
+        assert_eq!(counters(t).decode_errors(), Some(1));
+        counters(t).carry_decode_errors(None);
+        assert_eq!(counters(t).decode_errors(), Some(1));
+        forget(t);
+        let u = ObjectId::new();
+        counters(u).carry_decode_errors(None);
+        assert_eq!(counters(u).decode_errors(), None, "nothing to carry");
+
+        // Saturating.
+        counters(u).carry_decode_errors(Some(u32::MAX));
+        assert_eq!(counters(u).note_decode_error(), u32::MAX);
+        assert_eq!(counters(u).decode_errors(), Some(u32::MAX));
+        forget(u);
     }
 
     // FR-101 P3 — the clipboard tallies are cumulative (a sample never

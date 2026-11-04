@@ -49,6 +49,7 @@ use roomler_core::{
 pub mod agent_socket;
 pub mod controller;
 pub mod extauth;
+pub mod extauth_notice;
 pub mod relay;
 pub mod routes;
 pub mod session_policy;

@@ -7,7 +7,7 @@ billing (P1+P2), the concurrent-session cap (P3, counted cluster-wide by P3b sin
 2026-10-22 and on the regional PoPs' since 2026-10-23 (P4b-2). TURN has counted toward the
 allowance, and an over-allowance org's mesh has left TURN for the DERP floor (P4c), since
 2026-10-23, with the operator's own orgs exempt. Exit nodes are on every plan (P4d). Claims
-were checked against the code at `8ab970586`, and the relay allowance section at `d4eb310a9`
+were checked against the code at `09ed1474a`, and the relay allowance section at `f0f4a6df9`
 plus this change.
 
 The price list and the reasoning behind it are in [business-model.md](business-model.md) §4.
@@ -84,14 +84,14 @@ staged by the mode.
 
 | Limit | Checked at | Refusal |
 |---|---|---|
-| devices | enrollment (`crates/modules/fleet/src/agent.rs:234`) | 403, before the single-use token is claimed |
-| tunnel clients | `crates/modules/network/src/routes/tunnel.rs:138` | 403 |
+| devices | enrollment (`crates/modules/fleet/src/agent.rs:245`) | 403, before the single-use token is claimed |
+| tunnel clients | `crates/modules/network/src/routes/tunnel.rs:143` | 403 |
 | members | invite and admin add (`crates/api/src/routes/invite.rs:199`) | 403 naming the counts |
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
 | meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:286`) | `media:error`; a rejoining participant keeps their seat |
 | meeting length | the sweep (`crates/modules/conference/src/meeting_cap.rs:100`) | `room:call_ending_soon` at 55, `room:call_ended {reason: plan_limit}` at 60 |
-| concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1621`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
-| relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:620`) and on every PoP (`crates/derp-relay/src/main.rs:148`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
+| concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1717`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
+| relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:620`) and on every PoP (`crates/derp-relay/src/main.rs:154`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
 | recordings, exit nodes, MagicDNS | `require_feature` at each route | 403 in feature wording ("not available on the Free plan"). Every plan has exit nodes (since P4d) and MagicDNS, so of these three only recordings is refused today |
 
 The two fences that are not a request — a meeting that runs long, a session started on
@@ -117,7 +117,7 @@ another pod — are where the design is unusual:
 An org past its month's `relay_bytes_per_month` (§1) is never disconnected. Its mesh keeps
 the DERP floor, the path that always connects, and only that floor's **bulk** frames slow
 down: to 1 Mbit/s on Free and 4 Mbit/s on a paid plan (`relay_allowance.free_rate_kbps` and
-`paid_rate_kbps`, `crates/config/src/settings.rs:400`). A WireGuard handshake and disco are
+`paid_rate_kbps`, `crates/config/src/settings.rs:406`). A WireGuard handshake and disco are
 never held. A throttle that delayed a handshake past its retry window would turn "slow" into
 "down" for exactly the hosts that have no other path.
 
@@ -150,13 +150,13 @@ flowchart LR
 | Piece | Where | What it does |
 |---|---|---|
 | The numbers | `crates/services/src/relay_allowance.rs:25` (`allowance_bytes`), `:52` (`rate_for`) | the allowance for the plan and seats, and the rate for an org past it |
-| Who it never applies to | `crates/services/src/relay_allowance.rs:42` (`is_exempt`), asked by the job (`crates/modules/network/src/relay_allowance.rs:144`) and the org's page (`crates/api/src/routes/cost.rs:553`) | an org named in `relay_allowance.exempt_tenants` (`crates/config/src/settings.rs:427`), the operator's own, is never throttled and is shown no allowance (`exempt`). Enterprise has no allowance at all (§1) |
-| Month to date | `crates/services/src/dao/stats.rs:208` (`relay_month_to_date`) | `derp_bytes` from the hourly rollups since the month began, plus the current hour's raw buckets. With `count_turn` (P4c-0, `crates/config/src/settings.rs:415`), `turn_bytes` beside them, for the throttle and the org's page alike |
+| Who it never applies to | `crates/services/src/relay_allowance.rs:42` (`is_exempt`), asked by the job (`crates/modules/network/src/relay_allowance.rs:144`) and the org's page (`crates/api/src/routes/cost.rs:553`) | an org named in `relay_allowance.exempt_tenants` (`crates/config/src/settings.rs:433`), the operator's own, is never throttled and is shown no allowance (`exempt`). Enterprise has no allowance at all (§1) |
+| Month to date | `crates/services/src/dao/stats.rs:208` (`relay_month_to_date`) | `derp_bytes` from the hourly rollups since the month began, plus the current hour's raw buckets. With `count_turn` (P4c-0, `crates/config/src/settings.rs:421`), `turn_bytes` beside them, for the throttle and the org's page alike |
 | The job | `crates/modules/network/src/relay_allowance.rs:122` (`compute`), every 5 min (`:42`) | one pod (a Redis claim), only where plans are sold, publishes the networks of every org past its allowance, each with its rate, for 15 min (`:45`) |
 | The refresh | `crates/modules/network/src/relay_allowance.rs:278`, every 60 s (`:47`) | every pod's own copy of the set. An absent or unreadable set is an empty one, so a stopped job, a Redis outage and the kill switch all fail open |
 | The bucket on the API pods | `crates/modules/network/src/derp.rs:620` | a bulk frame of a network in the set takes tokens (`relay_allowance.rs:86`). Without one it is dropped, and the TCP inside the tunnel settles at the rate |
-| The bucket on the PoPs | `crates/derp-relay/src/main.rs:148`, the set arriving on `POST /stats` (`:529`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:219`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:156`). A PoP that holds no set throttles nothing |
-| The mesh leaves TURN (P4c-1) | `crates/modules/network/src/overlay.rs:2350` (`turn_withheld`, behind `crates/config/src/settings.rs:421`), the relay request (`overlay.rs:931`, decided by `:2360` `keeps_pair_on_derp`), the warm creds (`:207`), the verdict (`:2312`), and the re-stamp (`:1329` `refan_networks`, from `crates/modules/network/src/relay_allowance.rs:208`) | an over-allowance org's overlay pair gets no TURN grant and a DERP verdict, and a node too old for verdicts gets a forced-DERP pin. Only a pair with a DERP floor at both ends: any other keeps its grant, since withholding it would refuse the pair. An org relay still wins. When the set changes, the network's pairs are re-stamped at once |
+| The bucket on the PoPs | `crates/derp-relay/src/main.rs:154`, the set arriving on `POST /stats` (`:653`) | the same bucket, fed by the set the API signs and pushes on its `/stats` poll (`crates/core/src/relay_load.rs:219`). It goes only to endpoints whose last `/stats` reported an `allowance` (`:156`). A PoP that holds no set throttles nothing |
+| The mesh leaves TURN (P4c-1) | `crates/modules/network/src/overlay.rs:2413` (`turn_withheld`, behind `crates/config/src/settings.rs:427`), the relay request (`overlay.rs:963`, decided by `:2423` `keeps_pair_on_derp`), the warm creds (`:207`), the verdict (`:2375`), and the re-stamp (`:1361` `refan_networks`, from `crates/modules/network/src/relay_allowance.rs:208`) | an over-allowance org's overlay pair gets no TURN grant and a DERP verdict, and a node too old for verdicts gets a forced-DERP pin. Only a pair with a DERP floor at both ends: any other keeps its grant, since withholding it would refuse the pair. An org relay still wins. When the set changes, the network's pairs are re-stamped at once, and an agent from 0.4.175 on moves a pair already riding TURN onto DERP while it is live, once a probe over `/derp` proves the peer can be reached there; a peer that cannot be keeps the pair on TURN. One end on 0.4.175 is enough, since an older peer follows it onto DERP; a pair whose two ends are both older keeps TURN until it re-establishes (#2820: `stamp_to_derp` in `crates/tunnel-core/src/overlay/relay_link.rs`, and `docs/overlay-nat-traversal.md`, *Phase D*) |
 | What the org sees | `crates/api/src/routes/cost.rs:531` (`relay_quota`), on `GET /api/tenant/{tid}/stats/resources` | `quota.relay`: used, allowance, rate, `enforced`, `throttled`, and `counts_turn` (P4c-0) |
 | TURN bytes per org (P4b) | the cluster's collector `crates/modules/network/src/turn_usage.rs:81`, the PoP pull `crates/core/src/relay_load.rs:314`, both booking through `crates/core/src/turn_bytes.rs:86`; the username from `crates/remote_control/src/turn_creds.rs:388` | coturn's end-of-allocation totals become `turn_bytes` for the org the username names, recorded once across pods. A PoP keeps its coturn's totals for an hour and the API pulls them (P4b-2), with a request the PoP checks against the ticket key. With `count_turn` they count toward the allowance (P4c-0) |
 
@@ -216,7 +216,7 @@ org anything. `Core::plans_sold` (`crates/core/src/state.rs:131`) is true only w
 hosted `saas` module is compiled in and switched on (`crates/api/src/state.rs:323`); the
 published self-host image and the compose build both leave it out. With it false,
 `roomler_core::quota` refuses nothing and counts nothing (`crates/core/src/quota.rs:49`), and
-the session cap (`crates/modules/remote/src/controller.rs:745`) and the meeting sweep
+the session cap (`crates/modules/remote/src/controller.rs:824`) and the meeting sweep
 (`crates/modules/conference/src/meeting_cap.rs:104`) stand down.
 
 ⚠️ Until FR-115 found it, nothing exempted a self-hosted server: the device cap had always
@@ -241,7 +241,10 @@ Each fence now has an integration test on a server without `saas`.
 
 ## 8. Not built yet
 
-- **What one meeting room carries is published, not measured** (FR-115 O4). Pro's 50 and
-  Business's 100 people stand until a synthetic-participant load test measures what one
-  mediasoup worker's room holds. Then either a room spans workers, or the published numbers
-  come down to the measured one.
+- **A meeting room carries fewer people than Pro and Business sell** (FR-115 O4, measured
+  2026-10-26 with production's worker settings and codecs): one room is one mediasoup worker,
+  which delivers to about 20 people with cameras on, or about 40 on audio alone, against Pro's
+  50 and Business's 100. On 2026-10-27 the operator chose to scale the room rather than lower
+  the numbers. [FR-127](fr/FR-127-meeting-room-scales-past-one-worker.md) builds it (receiving
+  only the visible tiles, simulcast, a room across workers) and measures again, and the
+  published caps follow that measurement. Until then they stand as published.

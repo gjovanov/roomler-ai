@@ -33,6 +33,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ─── What a pull request changed (FR-6 wave 35, #773, 2026-10-30) ─────────
+  #
+  # A pull request that touches only docs skips the thirteen heavy jobs: the
+  # five Rust lanes, the macOS overlay check, the four Windows jobs, both
+  # FFmpeg jobs and the profiles build. "Docs" is `docs/**`, a top-level
+  # `*.md` and `.claude/**`. No Rust build, test or link reads them. The jobs
+  # that do read them run on every PR: frontend builds the docs site and
+  # tests the UI that uses docs/assets, machine-names and commit-identity run
+  # .claude's self-tests, and the docs audits read docs/. 22 of the last 60
+  # runs on 2026-10-30 were docs by title, and each took all 20 jobs, ~10 GB
+  # of cache downloads and up to 44 min.
+  #
+  # It fails safe every way. A push to master skips this job, and the heavy
+  # jobs then run, so a superseded run can never leave a code commit
+  # unverified. A PR whose file list does not load in full (an API error, or
+  # 3,000 files or more) runs everything. A renamed file counts by its old
+  # path too. If this job fails, the heavy jobs skip and "Rust checks" fails,
+  # so a broken gate shows red, never green.
+  changes:
+    name: What changed
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      heavy: ${{ steps.files.outputs.heavy }}
+    steps:
+      - name: Docs only, or not
+        id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Every status is checked by hand: a grep that counts 0 exits 1.
+          set +e
+          set -uo pipefail
+          heavy=true
+          docs='^(docs/|\.claude/)|^[^/]+\.md$'
+          if files=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=100" \
+                       --jq '.[] | .filename, (.previous_filename // empty)'); then
+            n=$(printf '%s\n' "$files" | grep -c .)
+            other=$(printf '%s\n' "$files" | grep . | grep -vE "$docs")
+            echo "${n} paths changed; outside the docs:"
+            printf '%s\n' "$other" | head -20
+            if [ "$n" -gt 0 ] && [ "$n" -lt 3000 ] && [ -z "$other" ]; then heavy=false; fi
+          else
+            echo "::warning::the PR's file list did not load, so every job runs"
+          fi
+          echo "heavy=${heavy}" >> "$GITHUB_OUTPUT"
+          if [ "$heavy" = false ]; then
+            echo "::notice title=Docs-only change::the Rust, macOS, Windows, FFmpeg and profiles jobs skip on this PR (FR-6 wave 35)"
+          fi
+
   # ─── The Rust lanes (FR-6 wave 14, #773, 2026-09-27) ──────────────────────
   #
   # These five jobs were ONE job, "Rust checks", until it grew to ~35 serial
@@ -58,8 +113,15 @@ jobs:
   #     the key run 36331413828 restored with a full match at 15:58 returned
   #     `No cache found` at 18:15 (run 36339984289, 36.8 min). PR runs now
   #     restore master's caches read-only.
+  #   * since wave 34, keeps that cache on the seed-cache release, not in the
+  #     Actions cache: rust-lint's restore step says why.
   rust-lint:
     name: Rust lint (fmt, clippy)
+    # FR-6 wave 35: skipped on a docs-only PR; see the `changes` job. On a
+    # push `changes` is skipped, and `!cancelled()` keeps that from skipping
+    # this job too. The same two lines head every heavy job.
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     # History of the single "Rust checks" job these lanes replaced (its
     # cache-key premise is corrected at the end):
     #
@@ -81,13 +143,20 @@ jobs:
     #
     # ⚠️ Correction (2026-09-28): the premise above is wrong. rust-cache
     # ignores `key` when `shared-key` is set, so an edit to this file never
-    # rotated the key, and those cold runs had another cause. The cache step
-    # below says what does rotate it, and what starts a lane cold.
+    # rotated the key, and those cold runs had another cause. Since wave 34
+    # the key is ci-seed-restore's, which a step change here does rotate (the
+    # salt step), and the restore step below says what starts a lane cold.
     #
     # Wave 14: every lane runs well under 10 min warm; 30 leaves a cold lane
     # (after an eviction, a toolchain bump or a new cache family) room to
     # finish without letting a hung step idle for most of an hour.
-    timeout-minutes: 30
+    #
+    # Wave 36 (2026-10-30): 40. Wave 34's first master run (41107105820)
+    # built this lane cold and published its cache in 27 min 19 s, 91 % of
+    # the old ceiling. A cold run cut off before it publishes leaves the next
+    # run cold as well, so each ceiling is about 1.5 times its lane's measured
+    # cold run: 40 here, 45 for rust-unit.
+    timeout-minutes: 40
     runs-on: ubuntu-latest
     # Warm baseline is 4-5 min; the only step that can blow past it is an
     # Ubuntu-mirror stall inside apt (2026-08-18 evening: 14/19/20/29-min
@@ -95,6 +164,13 @@ jobs:
     # caches below take the mirror out of the hot path; this timeout turns
     # any residual pathological stall into a fast, loud, retryable failure
     # instead of a silent half-hour merge blocker.
+    # FR-6 wave 34: the cargo cache publishes as a release asset, which needs
+    # `contents: write`; see macos-overlay-check.
+    permissions:
+      contents: write
+    env:
+      # rust-cache set this for the job; with it gone, set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -130,56 +206,29 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # Swatinem prunes workspace-member artifacts + stale registry
-        # entries before saving — ~1–1.5 GB instead of the ~4 GB
-        # actions/cache tars (full ~/.cargo + target) this step used to
-        # write per Cargo.lock hash. Two of those were standing at once,
-        # blowing the repo's 10 GB Actions-cache budget and LRU-evicting
-        # the release lane's caches (agent-v0.3.0-rc.176 rebuilt FFmpeg
-        # from source for 29 min because of it).
-        #
-        # FR-6 wave 14: one family per lane, and only a master push saves
-        # (`save-if`). The note above this lane says why.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34 (#773): the Linux lanes' cargo caches live on the
+        # seed-cache release, as the Windows and macOS lanes' have since wave
+        # 22, no longer in the Actions cache (Swatinem). On 2026-10-30 the
+        # Actions cache began refusing downloads ("Failed to restore: Egress
+        # is over the account limit."), and a refused restore built the whole
+        # lane cold: the unit lane compiled 1,795 crates in 27 min against
+        # ~8. Release assets are not behind that limit. One family per lane;
+        # only a master push publishes (this job's last step); the key, the
+        # prune and the parts over 2 GiB are .github/actions/ci-seed-restore's
+        # and ci-seed-save's. The salt step above still rotates the key when
+        # this job's steps change. Each lane's cap is ~1.5x its expected
+        # pruned target (the Actions-cache archive x the integration lane's
+        # 4.3 unpack ratio); a cold build over its cap would rebuild cold on
+        # every run (wave 33), and the save warns if one does.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-lint
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-          # ⚠️ What rotates this key (corrected 2026-09-28, FR-6 #773). It is
-          # `v0-rust-<shared-key>-<os>-<arch>-<env hash>-<lockfile hash>`:
-          #   * the lockfile hash moves when a member crate's Cargo.toml
-          #     changes (a dependency, a feature), when Cargo.lock's
-          #     third-party entries change, or with rust-toolchain.toml or a
-          #     .cargo/config.toml. A version bump does NOT move it:
-          #     rust-cache blanks member versions and skips the workspace's
-          #     own Cargo.lock entries. On master on 09-27/28, four bumps
-          #     (0.4.108 → 0.4.113) kept one key, while three member-manifest
-          #     edits each rotated it (#1741 and #1752 added a dependency,
-          #     #1744 changed a feature);
-          #   * the env hash moves on the rustc version or any CARGO*, RUST*,
-          #     CC*, CFLAGS*, CXX* or CMAKE* env var (the job's environment,
-          #     not the workflow file's text). The rustc version is that of
-          #     EVERY installed toolchain, the runner image's own `stable`
-          #     included, so the salt step removes all but the pinned one
-          #     (wave 23): an image rollout that moved it made each family
-          #     flip between two keys, and every flip built cold.
-          # A new lockfile hash restores the newest older generation (the
-          # prefix match) and compiles only the delta. A new env hash,
-          # shared-key or prefix-key starts the lane cold.
-          # A `key:` input used to sit here with `hashFiles(ci.yml)`, claiming
-          # an edit to this file rotated the key. rust-cache reads `key` only
-          # when `shared-key` is unset (its src/config.ts, v2.9.2), so it was
-          # ignored: #1728, #1735 (+95 lines) and #1736 each edited this file
-          # on 09-27, and each master run restored the same key with a full
-          # match and saved nothing, so a new step's dependency builds stayed
-          # out of the cache. Since wave 16 the salt step above does what that
-          # input claimed, per job and without going cold: it writes one of
-          # the `.cargo/config.toml` files the lockfile hash covers, holding a
-          # hash of this job's own definition. A changed or added step here
-          # rotates this key; a comment edit or another job's edit does not.
+          family: lint
+          max-target-mb: "10000"
 
       - name: Check formatting
         run: cargo fmt --check --all
@@ -317,8 +366,13 @@ jobs:
       # mistake nothing else does: a `mod x_tests;` added to `lib.rs` WITHOUT its
       # `#[cfg(test)]` gate compiles the module's helpers into the lib target as
       # dead code, which only `--all-targets` surfaces.
+      #
+      # `roomler-ai-mod-conference` joined with FR-115 O4: it carries the
+      # room-capacity bench (`examples/room_capacity.rs`), which no other step
+      # compiles, so without this it would break unseen the first time the
+      # mediasoup API or the worker settings moved. Checked green first.
       - name: Run clippy on the audited crates (incl. test targets)
-        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core --all-targets -- -D warnings
+        run: cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests -p roomler-core -p roomler-ai-mod-conference --all-targets -- -D warnings
 
       # The integration crate cannot RUN here (it needs MongoDB + Redis), but
       # it can still be compiled — and compiling it is what was missing. It sat
@@ -395,10 +449,35 @@ jobs:
         # default --workspace clippy never sees it. Lint it explicitly.
         run: cargo clippy -p roomlerd --features overlay-l3 -- -D warnings
 
+      # FR-6 wave 34 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: lint
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   rust-unit:
     name: Rust unit tests (server + crates)
-    timeout-minutes: 30
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    # FR-6 wave 36: 45, not 30. Cold (1,795 crates, then a 2.6 GB cache in two
+    # parts), wave 34's first master run (41107105820) was cut off at 30 min
+    # 15 s with its second part still uploading, and "Rust checks" failed.
+    # That part happened to land; one that does not leaves every later run
+    # cold too. See rust-lint.
+    timeout-minutes: 45
     runs-on: ubuntu-latest
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -412,16 +491,17 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes. This
+        # family is the largest, ~2.5 GB packed, so its target goes up in parts.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-unit
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: unit
+          max-target-mb: "16000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -488,6 +568,12 @@ jobs:
       # `roomler-ai-mod-knowhow` (FR-90 P4-1) the same way: a key, a kind and
       # an attribute have one spelling, and a person's change to one fact
       # keeps every other fact's provenance.
+      # `roomler-ai-mod-conference` (FR-127 P1) with its first unit tests: a
+      # viewer's view keeps `None` (a legacy client, everything flows) apart
+      # from `Some(empty)` (a view client showing nothing), an older report
+      # is dropped, and the plan reads only the viewer's own pause flag. It
+      # links the mediasoup worker, which this job already builds for the
+      # api crate's unit tests above (the api crate depends on it).
       - name: Run the remaining crates' unit tests
         run: >-
           cargo test --lib
@@ -498,6 +584,7 @@ jobs:
           -p tcp-turn-conn -p roomler-setup-core -p roomler-setup
           -p roomler-hive-node -p roomler-ai-mod-hive -p roomler-ai-mod-remote
           -p roomler-ai-mod-vault -p roomler-ai-mod-knowhow
+          -p roomler-ai-mod-conference
 
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above
@@ -520,10 +607,29 @@ jobs:
       - name: Test the desktop companion (roomler-desktop)
         run: cargo test -p roomler-desktop --bins
 
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: unit
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   rust-agent:
     name: Agent tests (vp9-444, overlay, kernel TUN)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -537,16 +643,16 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-agent
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: agent
+          max-target-mb: "7000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -686,10 +792,27 @@ jobs:
           cat derp-tests.txt
           grep -E 'test result: ok\. [1-9][0-9]* passed' derp-tests.txt
 
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: agent
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   rust-recorder:
     name: Recorder tests (FR-85)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    env:
+      # rust-cache set this for the job; with it gone, set it here.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -703,7 +826,7 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
+      - name: Restore the cargo cache (release-asset store)
         # FR-6 wave 21 (#773): restores rust-recorder-audio's family and never
         # saves one of its own; a second copy cost ~600 MB of the free 10 GB
         # pool. That lane builds these features plus `audio`, and `cargo tree`
@@ -713,15 +836,16 @@ jobs:
         # `cargo build -p roomlerd` (no dev-dependency features under resolver
         # v2) needs tokio and ~25 dependents in a variant the audio lane never
         # builds, and rebuilds them. Measured on #1939: 273 s for the lane
-        # against 221-295 s on master, off the CI critical path. Same workflow
-        # env ⇒ same env hash ⇒ the prefix restore finds the family.
-        # rust-lint's cache step carries the general notes.
+        # against 221-295 s on master, off the CI critical path. Since wave 34
+        # the family is a seed-cache asset that restores by name, so this job
+        # has no publish step; rust-lint's restore step carries the notes.
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-recorder-audio
-          save-if: false
+          family: recorder-audio
+          max-target-mb: "5000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -770,8 +894,15 @@ jobs:
         #
         # FR-6 wave 14: the WITH-`audio` half of this step now runs in the
         # `rust-recorder-audio` lane, in parallel with this one.
+        #
+        # FR-130 P1 — `encode::openh264_backend::`: the live encoder's SPS VUI
+        # carries the colour description (and nothing with the switch off), the
+        # recording profile's keeps its own. #3245 — `peer::codec_cap_tests::`: the
+        # RTP pump holds that encoder's ceiling. No other lane builds the feature
+        # without a `recording::` filter, and this one built the test binary above.
         run: |
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib recording::
+          cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --lib -- encode::openh264_backend:: peer::codec_cap_tests::
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test recorder
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test control_dc_record
           cargo test -p roomlerd --features recording,openh264-encoder,synthetic-frame-source --test export
@@ -1004,8 +1135,15 @@ jobs:
 
   rust-recorder-audio:
     name: Recorder tests with audio + X11 pointer (FR-85)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -1019,16 +1157,17 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
-        # rust-lint's cache step carries the notes: this lane's own family,
-        # saved only from a master push, keyed on Cargo.lock + the env.
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes. The plain
+        # recorder lane restores this family too and never publishes it.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-recorder-audio
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: recorder-audio
+          max-target-mb: "5000"
 
       # The GTK/WebKit set (workspace clippy, the tray and wizard crates) and
       # the libvpx / xcb / alsa / cmake / libclang set (vp9-444, capture,
@@ -1115,7 +1254,7 @@ jobs:
           set -o pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb xauth
-          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::pointer capture::x11_cursor keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 input::layout_x11 clipboard::x11_gate_tests --nocapture --test-threads=1 2>&1 | tee /tmp/x11-tests.log
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" env ROOMLERD_TEST_X11=1 cargo test -p roomlerd --features scrap-capture,enigo-input,viewer-indicator-x11,clipboard --lib -- capture::pointer capture::x11_cursor keep_busy::host_x11 capture::xwayland_probe_tests indicator::x11 input::layout_x11 clipboard::x11_gate_tests virtual_desktop::wm_nudge_tests --nocapture --test-threads=1 2>&1 | tee /tmp/x11-tests.log
           grep -q "x11-real: XTest motion reset the idle counter" /tmp/x11-tests.log
           grep -q "x11-real: ran with idle" /tmp/x11-tests.log
           grep -q "x11-real: Xvfb does not advertise XWAYLAND" /tmp/x11-tests.log
@@ -1124,6 +1263,19 @@ jobs:
           grep -q "x11-real: the X11 pointer reached the cursor channel" /tmp/x11-tests.log
           grep -q "x11-real: the layouts .* read back, and the switch to de-DE and back took" /tmp/x11-tests.log
           grep -q "x11-real: the clipboard gate counted an owner change" /tmp/x11-tests.log
+          grep -q "x11-real: a nudge woke a root listener" /tmp/x11-tests.log
+
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: recorder-audio
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
 
   rust:
     # The name the five lanes above shared when they were one job. It builds
@@ -1131,18 +1283,34 @@ jobs:
     # answers "is Rust green?" for people, `gh pr checks`, and the autopilot
     # board. `!cancelled()` rather than `always()`: a superseded PR run that
     # the concurrency group cancels should not start a runner just to fail.
+    # FR-6 wave 35: a docs-only PR skips every lane, and that passes. On a PR
+    # the `changes` job must have succeeded, so a broken gate can never turn
+    # the lanes' skips green.
     name: Rust checks
     if: ${{ !cancelled() }}
-    needs: [rust-lint, rust-unit, rust-agent, rust-recorder, rust-recorder-audio]
+    needs: [changes, rust-lint, rust-unit, rust-agent, rust-recorder, rust-recorder-audio]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Every Rust lane succeeded
+      - name: Every Rust lane succeeded, or a docs-only PR skipped them
         env:
           NEEDS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
         run: |
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          bad=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(" ")')
+          gate=$(echo "$NEEDS" | jq -r '.changes.result')
+          heavy=$(echo "$NEEDS" | jq -r '.changes.outputs.heavy // ""')
+          if [ "$EVENT" = pull_request ] && [ "$gate" != success ]; then
+            echo "::error::the changes job did not succeed ($gate), so nothing says the lanes may skip"
+            exit 1
+          fi
+          ok='"success"'
+          if [ "$EVENT" = pull_request ] && [ "$heavy" = false ]; then
+            ok='"success", "skipped"'
+            echo "a docs-only PR: the Rust lanes skip (FR-6 wave 35)"
+          fi
+          bad=$(echo "$NEEDS" | jq -r "[to_entries[] | select(.key != \"changes\")
+                 | select(.value.result | IN($ok) | not) | .key] | join(\" \")")
           if [ -n "$bad" ]; then
             echo "::error::Rust lanes that did not succeed: $bad"
             exit 1
@@ -1161,8 +1329,15 @@ jobs:
     # not a full build — the goal is "does the cfg tree compile on this
     # target", which is the entire class of break this catches.
     name: macOS overlay compile check
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: macos-latest
-    timeout-minutes: 25
+    # FR-6 wave 37: 35, not 25. This job's cache crossed its cap on 2026-10-30
+    # (republished at 6,159 MB by 41069134834), so the next master run dropped
+    # it and built cold: 1,954 units in 22 min 33 s (41072792020), 90 % of the
+    # old ceiling. A cold run cut off before it publishes leaves every later
+    # run cold too (see rust-unit). 35 is about 1.5 times that cold run.
+    timeout-minutes: 35
     # FR-6 wave 22 (#773): this job's cargo cache lives on the seed-cache
     # release, not in the Actions cache (see .github/actions/ci-seed-restore),
     # and publishing a release asset needs `contents: write`. Only a master
@@ -1263,12 +1438,30 @@ jobs:
       # FR-97 P2f-2: and `macos_spawn::`, a child started as its own
       # responsible process: the private call is there, and a real
       # posix_spawn's pipes carry both ways, with the extra environment.
+      # #3018: and `thread_dump::`, a stall's thread stacks: `/usr/bin/sample`
+      # reads this test process, and its real report must parse.
+      # FR-112 P3: and `encode::clock::`, a thread's QoS class: it reads back,
+      # and a thread it starts does not inherit it, which only a Mac can say.
       - name: cargo check + test agent sessions on macOS (FR-90 P1h — `hive`)
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins --features hive,vault
-          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn::
+          cargo test -p roomlerd --lib --features hive,vault,clipboard,enigo-input -- hive:: vault:: vault_proxy:: macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock::
+
+      # #3304 — what macOS SHIPS is `hive` with no `vault` (release-agent.yml), and
+      # `vault` is what turns on `cfg(worker_calls)` (agents/roomlerd/build.rs). The
+      # step above builds both, so this flavour's macOS arms compiled nowhere before a
+      # release tag. Windows has the same gap: windows-shipped-flavour, below.
+      # On a warm cache the check costs 43 s and the tests 2 min 42 s (run 41522300303),
+      # on the job that is each run's floor. The tests earn that: Linux's unit tests
+      # build `hive,vault` too, so this is the one Unix run of these tests without it.
+      - name: cargo check agent as macOS ships it (hive, no vault)
+        run: cargo check -p roomlerd --lib --bins --features hive
+      - name: Agent sessions as macOS ships them, unit tests (hive, no vault)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test -p roomlerd --lib --features hive -- hive:: vault::
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the
@@ -1291,6 +1484,24 @@ jobs:
       # Settings pane) exist on exactly this target.
       - name: cargo check the desktop companion
         run: cargo check -p roomler-desktop
+
+      # FR-129 B1 — the setup wizard installs the daemon on macOS now (the
+      # `osascript` half, `agents/roomler-setup/src/unix_daemon.rs`), and its
+      # macOS arms compiled NOWHERE before a `setup-v*` tag: release-setup.yml
+      # is the wizard's only macOS build, and it runs after the agent release
+      # it follows (FR-84 S1), so a macOS-only error there would leave
+      # `/api/setup/macos` serving the previous wizard. Check only, `--bins` for
+      # main.rs's window guard.
+      - name: cargo check the setup wizard (the macOS daemon install)
+        run: cargo check -p roomler-setup --lib --bins
+
+      # FR-129 B2 — the macOS root half's machine id comes from the hardware
+      # (`crates/agent-core/src/machine.rs`): `ioreg`'s IOPlatformUUID, and on
+      # a virtual Mac the VM's own en0 address. The parsers are tested on
+      # every lane against a Mac's output; only a Mac runs the real commands,
+      # and this runner is itself a VM, so it reads the virtual-Mac branch.
+      - name: cargo test the root half's machine id on a real Mac (FR-129 B2)
+        run: cargo test -p roomler-node-core --lib -- machine::tests --nocapture
 
       - name: Lint the macOS packaging
         # A malformed plist or postinstall only fails at INSTALL time, on
@@ -1387,6 +1598,8 @@ jobs:
     # `--all-targets`/`--tests` included: test-only code is where the
     # first fix wave's lints lived (constant asserts, guard-across-await).
     name: Windows overlay clippy
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
@@ -1413,6 +1626,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           family: windows-clippy
+          # #3116's wizard step took its pruned target to 4,440 MB, over the
+          # default 4000: every restore dropped it and every run built cold.
+          max-target-mb: "6000"
       - name: Clippy tunnel-core (overlay-l3 + overlay-netstack, all targets)
         run: cargo clippy -p roomler-ai-tunnel-core --features overlay-l3,overlay-netstack --all-targets -- -D warnings
       # `ssh-server` is in the set because this is the ONLY lane that lints the
@@ -1433,11 +1649,41 @@ jobs:
       # the named pipe the person's tray and CLI dial, the peer read from the
       # OS at accept time, and (P10b) the token probe that refuses a SYSTEM
       # caller keep busy's On.
+      # #3292 — the launcher is Windows-only code, and every Linux lane compiles
+      # its stub. The rolling log's stderr capture is `cfg(windows)` too, in a crate
+      # whose tests otherwise run only on Linux and on the Mac's machine id.
+      - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomler-localapi --all-targets -- -D warnings
           cargo test -p roomler-localapi --lib
+      # #3116 — the setup wizard's Windows half ran in NO lane: its unit tests
+      # run on Linux and its `cargo check` on macOS, so every
+      # `#[cfg(target_os = "windows")]` arm of the daemon pipeline (the MSI,
+      # the SystemContext preflight, the restart onto a reinstall's enrollment
+      # over the LocalAPI) first compiled at a `setup-v*` tag. `--lib` tests
+      # only: its bin is `test = false` by the UAC lib-naming rule.
+      # FR-129 C3 — its mechanics crate too: `roomler-setup-core` holds the
+      # wizard's Win32 calls (the elevated relaunch, the MSI wait), and its
+      # Windows tests compiled out on the Linux step that runs its others.
+      - name: The setup wizard on Windows — clippy + unit tests (#3116)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomler-setup -p roomler-setup-core --all-targets -- -D warnings
+          cargo test -p roomler-setup -p roomler-setup-core --lib
+      # FR-129 C — the linker flag that keeps the wizard's own imports out of the
+      # person's Downloads, read back from the file the linker wrote: a string in
+      # build.rs says nothing about the EXE. The release lane reads the signed one.
+      - name: The setup wizard's EXE loads its imports from System32 alone
+        if: ${{ !cancelled() }}
+        run: |
+          cargo build -p roomler-setup --bin roomler-setup
+          pwsh scripts/signing/pe-dependent-load-flags.ps1 -Path target/debug/roomler-setup.exe -Expect 0x800 -NotImported 'secur32.dll,wintrust.dll,wtsapi32.dll'
       # FR-90 P1i's agent-session tests run in their own job,
       # windows-agent-sessions, below (FR-6 wave 27).
 
@@ -1474,6 +1720,8 @@ jobs:
     # step. Its own cache family, since it builds a test binary whose
     # dependencies the clippy job's check builds do not share.
     name: Windows agent sessions (FR-90 P1i)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
     # A master push publishes this job's cargo cache as a release asset
@@ -1529,7 +1777,7 @@ jobs:
       # this very binary, neither feature-gated — ran on Windows nowhere, and
       # two Windows-only failures went unseen until #2889. The filter was the
       # only thing dropping them; removing it costs no compile. Measured by the
-      # FR-6 session on master 0831dd289: 5.5–7.2 min a run, about 8 s of it
+      # FR-6 session on master dfa9fa178: 5.5–7.2 min a run, about 8 s of it
       # tests — the rest is building the test binary from the restored cache.
       # Locally (32 threads) the full suite is 2422 tests in about 42 s.
       #
@@ -1566,6 +1814,81 @@ jobs:
           key: ${{ steps.seed.outputs.key }}
           exact: ${{ steps.seed.outputs.exact }}
 
+  windows-shipped-flavour:
+    # #3304 — the flavour Windows ships had no lane. release-agent.yml builds
+    # `hive` WITHOUT `vault`, and `vault` is what turns on `cfg(worker_calls)`
+    # (agents/roomlerd/build.rs), so the two flavours differ by far more than a
+    # few items, and every FR-90 P8 step widens that. Both Windows lanes above
+    # build `hive,vault`, so nothing linted or tested what actually ships.
+    #
+    # The release's list, less its media half (`full-hw`, `vp9-444`,
+    # `ffmpeg-encoder`), for the reason windows-agent-sessions gives. Its
+    # `overlay-netstack` is implied by `ssh-server`.
+    #
+    # A job of its own, for FR-6 wave 27's reason. Its two lines cost about what
+    # their `hive,vault` twins do: clippy 2.2 min, the test binary 6.7 (master
+    # run 41510413293). As steps they would take windows-overlay-clippy to 15 min
+    # and windows-agent-sessions to 14, both over FR-6's 10. Beside them this job
+    # adds a runner but no wall time: macOS is each run's floor. Its own cache
+    # family, because it needs a check build and a test build of the same deps,
+    # and neither family above holds both. Both builds together came to 2.8 GB
+    # locally (with the local crates a publish prunes), under the default cap.
+    name: Windows as shipped (hive, no vault)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    # A master push publishes this job's cargo cache as a release asset
+    # (ci-seed-save), which needs `contents: write`.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+
+      - name: Salt the cargo cache key with this job's definition
+        uses: ./.github/actions/cargo-cache-salt
+
+      - name: Restore the cargo cache (release-asset store)
+        id: seed
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-shipped
+
+      - name: Clippy roomlerd as Windows ships it (incl. tests)
+        run: cargo clippy -p roomlerd --features overlay-l3,ssh-server,hive,system-context --tests -- -D warnings
+
+      # Runs even when clippy failed: the two prove different halves, and one
+      # red must not hide the other's evidence. `hive::` and `vault::` only:
+      # every test whose code changes with `vault` is in those two, and the
+      # whole suite already runs on Windows in the job above.
+      - name: Agent sessions as Windows ships them, unit tests
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,system-context --no-fail-fast -- hive:: vault::
+
+      # FR-6 wave 22 (#773): the job's LAST step. Only a master push
+      # publishes, and an unchanged cache is not re-uploaded; see the action.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: windows-shipped
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   windows-recorder:
     # FR-85 P1e — the recorder's identity rule is Windows code that no other
     # lane compiles: every recorder test step above runs on Linux, and the
@@ -1583,6 +1906,8 @@ jobs:
     # openh264 build does not spend that job's timeout, and without `audio`:
     # audiopus pulls cmake, which is why the Windows lanes avoid it.
     name: Windows recorder identity (FR-85)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 45
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
@@ -1622,6 +1947,15 @@ jobs:
       - name: The installer's SystemContext record — unit tests (#1727)
         if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- win_service::system_context_attempt --nocapture
+      # #3073 — a SystemContext host's first healthy run hardens the
+      # machine-global dir. Proven here on a real tree someone else owns (the
+      # elevated runner hands it to SYSTEM): with the owner taken and the grant
+      # made before inheritance goes, SYSTEM keeps full control of the
+      # directory and of every child. The other lane that runs
+      # `roomler-node-core` is Linux, where the test does not exist.
+      - name: The machine-global hardening keeps SYSTEM in (#3073)
+        if: ${{ !cancelled() }}
+        run: cargo test -p roomler-node-core --lib -- config::tests::harden --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
@@ -1634,11 +1968,14 @@ jobs:
       # `scrap-capture` bring them in. The units: a recording's WGC session
       # draws the pointer and the live one does not (unless
       # ROOMLERD_WGC_CURSOR=1), and the pointer's placement.
+      # FR-118 P2-1 — and the GPU frame (`capture::gpu_frame`): a texture on a
+      # WARP device reads back the bytes it holds, once, on any thread, and
+      # goes back to its pool. The same features compile it.
       - name: The recorder's pointer — Windows capture compiles, lints, and its units pass
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerd --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture --tests -- -D warnings
-          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer
+          cargo test -p roomlerd --lib --features recording,openh264-encoder,wgc-capture,mf-encoder,scrap-capture -- capture::pointer capture::wgc_backend::tests::only_a_recording_or_the_escape_hatch_bakes_the_pointer capture::wgc_backend::tests::the_mta_outlives_a_wgc_worker capture::gpu_frame
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
@@ -1670,10 +2007,15 @@ jobs:
     # Bolting a from-source FFmpeg-linked compile onto it would spend that
     # headroom and make the timeout meaningless.
     name: ffmpeg-encoder compile + dispatch locks
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
     permissions:
-      contents: read
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -1682,12 +2024,16 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: ci-ffmpeg-encoder
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: ffmpeg-encoder
+          max-target-mb: "5000"
       # Same ordering requirement as the Rust lanes' system-deps composite
       # (./.github/actions/ci-linux-system-deps): the index must be fresh
       # BEFORE the cached-apt step, or a cache miss resolves superseded
@@ -1799,6 +2145,18 @@ jobs:
         # They need the library present, not a GPU.
         run: cargo test -p roomlerd --features ffmpeg-encoder --lib
 
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: ffmpeg-encoder
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
+
   recording-ffmpeg:
     # FR-85 P4 — the recorder and the export engine against the vendored
     # FFmpeg that carries the AAC encoder and the H.264 decoder (the
@@ -1820,11 +2178,15 @@ jobs:
     # Until P4c flips the release assets, this lane is the only thing that
     # runs the AAC path, or FFmpeg's H.264 decoder, at all.
     name: Recording with FFmpeg — AAC and H.264 decode (FR-85 P4)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
     permissions:
-      contents: read
+      contents: write
     env:
+      CARGO_INCREMENTAL: 0
       # ⚠️ `vp9-444` rides along ON PURPOSE, as in `ffmpeg-encoder-check`:
       # every shipped build that has `ffmpeg-encoder` has it, and without it
       # clippy reports `dead_code` on items that ARE used — from call sites
@@ -1842,12 +2204,16 @@ jobs:
         # FR-6 wave 16 (#773): rotates this job's cargo cache when its own
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
-      - uses: Swatinem/rust-cache@v2
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          shared-key: ci-recording-ffmpeg
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: recording-ffmpeg
+          max-target-mb: "5000"
       - name: Configure apt retries and refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
@@ -1913,6 +2279,18 @@ jobs:
           cargo test -p roomlerd --features "$REC_FEATURES" --lib recording::
           cargo test -p roomlerd --features "$REC_FEATURES" --test recorder
           cargo test -p roomlerd --features "$REC_FEATURES" --test export
+
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: recording-ffmpeg
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}
 
   fr-registry:
     name: FR registry integrity
@@ -2270,6 +2648,20 @@ jobs:
           grep -q '<loc>https://roomler.ai/</loc>' dist/sitemap-docs.xml || { echo "::error::docs: / is missing from dist/sitemap-docs.xml"; exit 1; }
           exit "$docs_rc"
 
+      - name: Type-check as the hosted image does (bun's runtime)
+        # The Dockerfile's `bun run build` runs vue-tsc in `oven/bun`, which has
+        # no `node`, so vue-tsc runs on bun and types every `.vue` import through
+        # env.d.ts's shim. A spec's `setProps({ realProp })` then fails the
+        # excess-property check there and nowhere else: the build step above
+        # runs vue-tsc on the runner's Node, where the real SFC types resolve.
+        # That gap broke every hosted-image build on master six times since
+        # 2026-10-11, after #1977, #2174, #2499, #2586, #2949 and #3176 (#2586's
+        # was a named `{ type X }` import from a `.vue` file), each found only
+        # after the merge. `--bun` type-checks the image's way, so the PR fails
+        # instead (bun 1.3.12 reproduces #3176's error). In a spec, the cure is
+        # the cast VideoTileFr124.spec.ts uses, or the type from a `.ts` file.
+        run: cd ui && bun --bun x vue-tsc --noEmit
+
       - name: Run unit tests
         run: cd ui && bun run test:unit
 
@@ -2285,8 +2677,15 @@ jobs:
   # same result.
   profiles:
     name: Build profiles (FR-69)
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # FR-6 wave 34: the cargo cache publishes as a release asset; see rust-lint.
+    permissions:
+      contents: write
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -2298,14 +2697,16 @@ jobs:
         # steps change. After checkout, before the cache; see the action.
         uses: ./.github/actions/cargo-cache-salt
 
-      - name: Rust cache
+      - name: Restore the cargo cache (release-asset store)
+        # FR-6 wave 34: rust-lint's restore step carries the notes.
+        id: seed
         continue-on-error: true
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/ci-seed-restore
+        env:
+          GH_TOKEN: ${{ github.token }}
         with:
-          workspaces: '. -> target'
-          shared-key: ci-profiles
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          family: profiles
+          max-target-mb: "5000"
 
       # `collab` is the only reduced profile that links mediasoup, whose worker
       # build wants cmake + libclang; the others need nothing beyond the
@@ -2348,3 +2749,15 @@ jobs:
           printf '%s\n' "$F" | grep -qx 'mediasoup' || { echo "::error::positive control failed: full does not list mediasoup"; fail=1; }
           printf '%s\n' "$F" | grep -qx 'roomler-ai-tunnel-core' || { echo "::error::positive control failed: full does not list roomler-ai-tunnel-core"; fail=1; }
           exit $fail
+
+      # FR-6 wave 34: the job's LAST step; see rust-lint's.
+      - name: Publish the cargo cache (release-asset store)
+        if: github.ref == 'refs/heads/master' && steps.seed.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/ci-seed-save
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          family: profiles
+          key: ${{ steps.seed.outputs.key }}
+          exact: ${{ steps.seed.outputs.exact }}

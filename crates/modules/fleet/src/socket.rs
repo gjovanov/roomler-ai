@@ -290,9 +290,20 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_honours_lock_on_end(agent_id, caps.has_rpc(RpcCap::LockOnEnd));
+    // FR-128 — whether it decides `rc_overlay = auto` itself, so `auto` is
+    // sent only where the device can take it. Equality-matched.
+    state
+        .rc_hub
+        .set_agent_honours_rc_overlay_auto(agent_id, caps.has_rpc(RpcCap::RcOverlayAuto));
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
+    // FR-132 P1b — whether a saved desired config can be pushed to it. Before
+    // the row read below, so a save that finds this unset is one that read
+    // carries. Equality-matched through `has_rpc`.
+    state
+        .rc_hub
+        .set_agent_config_support(agent_id, caps.has_rpc(RpcCap::Config));
     state.rc_hub.set_agent_hive_support(agent_id, runs_hive);
     state
         .rc_hub
@@ -402,17 +413,19 @@ pub async fn handle_agent_socket(
         let _ = registered_tx.try_send(ServerMsg::RelayRegions { regions, rev });
     }
 
-    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is the only
-    // delivery path, deliberately: a device that was offline for a week and one
-    // that was online when an admin hit save converge through the same code,
-    // so the offline case is exercised on every connect rather than only when
-    // nobody is watching.
+    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is what a
+    // device converges by, deliberately: a device that was offline for a week
+    // and one that missed a save converge through the same code, so the offline
+    // case is exercised on every connect rather than only when nobody is
+    // watching. FR-132 P1b — a save also nudges a connected device with this
+    // same frame (`remote_config::set_desired_config`), through the same hub
+    // call, which keeps the two from racing. A nudge that is lost costs nothing
+    // but the wait for this one.
     if let Some(desired) = desired_config {
         if caps.has_rpc(RpcCap::Config) {
-            let _ = registered_tx.try_send(ServerMsg::ConfigPush {
-                revision: desired.revision,
-                desired,
-            });
+            let _ = state
+                .rc_hub
+                .push_desired_config(agent_id, tenant_id, desired);
         } else {
             // Unlike `Goodbye`/`UpdateNow`, this one must not be sent blind.
             // A pre-feature agent drops the unknown tag in its `debug!` branch
@@ -519,7 +532,7 @@ pub async fn handle_agent_socket(
         input_mode: None,
         tenant_name: None,
         may_record: false,
-        rc_overlay: false,
+        rc_overlay: roomler_ai_remote_control::models::RcOverlayMode::Off,
         session_policy: crate::hub::OrgPolicy::Unavailable,
         max_duration: None,
         idle_secs: None,
@@ -544,6 +557,10 @@ pub async fn handle_agent_socket(
     ));
     liveness.tick().await; // arm; first tick fires immediately
     let mut last_rx = std::time::Instant::now();
+    // FR-55 P4 — the device's goodbye before a sleep, when it said one: the
+    // teardown's offline transition carries it, so a dashboard learns why the
+    // device went in the same event that tells it the device went.
+    let mut announced_sleep: Option<roomler_ai_remote_control::models::SleepView> = None;
 
     // Read loop. rc.53: wrapped in `tokio::select!` so the Hub's
     // displacement-cancel notify exits this loop within milliseconds
@@ -700,6 +717,50 @@ pub async fn handle_agent_socket(
                                     });
                                     continue;
                                 }
+                                // FR-55 P4 — the device is going to sleep. It is
+                                // a goodbye: record why, then leave the loop so
+                                // the ordinary teardown runs NOW (the Hub
+                                // unregistration, the Offline write, the offline
+                                // transition), instead of the device reading
+                                // online until the receive deadline reaps a
+                                // socket nobody will answer. The agent closes its
+                                // side as well, so a server that cannot decode
+                                // the notice still sees the close.
+                                //
+                                // Inline, not spawned: the record must be on the
+                                // row before the offline event tells a dashboard
+                                // to look. ⚠️ `agent_id` is the authenticated
+                                // socket's, and the write is keyed by this
+                                // connection's hello (`conn_id`): a displaced
+                                // connection cannot mark a reconnected device
+                                // asleep.
+                                ClientMsg::AgentSleeping { power } => {
+                                    info!(
+                                        %agent_id,
+                                        policy = %power.policy,
+                                        on_ac = ?power.on_ac,
+                                        held = power.held,
+                                        "agent is going to sleep — closing its socket as the goodbye (FR-55 P4)"
+                                    );
+                                    let notice = roomler_ai_remote_control::models::SleepNotice {
+                                        at: bson::DateTime::now(),
+                                        power,
+                                    };
+                                    match state.agents.record_sleep(agent_id, &conn_id, &notice).await {
+                                        Ok(true) => {
+                                            announced_sleep = roomler_ai_remote_control::models::SleepView::of(
+                                                Some(&notice),
+                                                false,
+                                            );
+                                        }
+                                        Ok(false) => debug!(
+                                            %agent_id,
+                                            "sleep notice from a connection that no longer holds the row — not recorded"
+                                        ),
+                                        Err(e) => warn!(%agent_id, %e, "agent record_sleep failed"),
+                                    }
+                                    break;
+                                }
                                 other => other,
                             };
                             // Phase 7: refresh last_seen_at on every heartbeat. Hub
@@ -720,6 +781,7 @@ pub async fn handle_agent_socket(
                                 companion_version,
                                 caps,
                                 keep_busy,
+                                power,
                                 ..
                             } = &parsed
                             {
@@ -730,7 +792,7 @@ pub async fn handle_agent_socket(
                                     warm_relay.clone(),
                                     companion_version.clone(),
                                     caps.clone(),
-                                    keep_busy.clone(),
+                                    (keep_busy.clone(), power.clone()),
                                 ))
                             } else {
                                 None
@@ -745,7 +807,7 @@ pub async fn handle_agent_socket(
                                 warm_relay,
                                 companion_version,
                                 caps,
-                                keep_busy,
+                                (keep_busy, power),
                             )) = heartbeat_sessions
                             {
                                 // FR-43 P2c — an agent announces changed
@@ -807,6 +869,11 @@ pub async fn handle_agent_socket(
                                         agent_id,
                                         caps.has_rpc(RpcCap::LockOnEnd),
                                     );
+                                    // FR-128 — and its `auto` word.
+                                    state.rc_hub.set_agent_honours_rc_overlay_auto(
+                                        agent_id,
+                                        caps.has_rpc(RpcCap::RcOverlayAuto),
+                                    );
                                     // FR-94 — the SYSTEM service came up, was
                                     // anchored, or went away while this worker
                                     // stayed connected: route the next command
@@ -849,6 +916,7 @@ pub async fn handle_agent_socket(
                                         warm_relay.as_deref(),
                                         companion_version.as_deref(),
                                         keep_busy.as_ref(),
+                                        power.as_ref(),
                                     )
                                     .await
                                 {
@@ -1025,12 +1093,14 @@ pub async fn handle_agent_socket(
                 .remove_if(&agent_id, |_, stored| stored == token);
         }
         if !foreign_claim {
-            crate::presence::note_transition(
+            // FR-55 P4 — with the reason, when the device gave one.
+            crate::presence::note_transition_with(
                 &state,
                 tenant_id,
                 agent_id,
                 &machine_name,
                 crate::presence::OFFLINE,
+                announced_sleep,
             )
             .await;
         }

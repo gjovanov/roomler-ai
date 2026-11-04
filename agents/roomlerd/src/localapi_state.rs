@@ -55,11 +55,20 @@ pub trait NetstackPinger: Send + Sync {
 /// OWN reported round-trip (subprocess spawn cost never pollutes the number).
 /// The overlay ICMP path is exactly what a user's own `ping 100.64.x.y`
 /// exercises, so the column now shows the same truth they'd measure.
+/// FR-134: Windows makes `ping.exe`'s own calls instead of starting it, because
+/// a probe per peer every 15 s was a process a second. `ROOMLERD_PING_SUBPROCESS=1`
+/// puts the subprocess back.
 pub struct OsPinger;
 
 #[async_trait]
 impl NetstackPinger for OsPinger {
     async fn ping(&self, dst: IpAddr, timeout: Duration) -> Result<Duration, String> {
+        #[cfg(windows)]
+        if tunnel_core::env::node_env("PING_SUBPROCESS").as_deref() != Some("1") {
+            return tokio::task::spawn_blocking(move || crate::icmp_win::echo(dst, timeout))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let target = dst.to_string();
         let mut cmd = tokio::process::Command::new("ping");
         #[cfg(windows)]
@@ -159,6 +168,11 @@ pub struct DaemonState {
     /// config). Surfaces in `status()` so `roomler status` can say the device
     /// removes itself.
     ephemeral: bool,
+    /// FR-43 P3a — this process is a one-row Mac's GUI worker: it holds no
+    /// enrollment, and its hub and its `self_view` have only the stand-in
+    /// control plane behind them ([`crate::unenrolled`]). The root half holds
+    /// the machine's server and its host roles.
+    no_enrollment: bool,
     /// FR-27 — live remote-control sessions, written by every signalling
     /// loop through its `ViewerIndicator`. `None` in tests and in any daemon
     /// shape that never runs signalling.
@@ -383,6 +397,77 @@ impl RestartHandle {
         );
         Ok(plan)
     }
+
+    /// #3164 — macOS asked this process to quit with a Quit AppleEvent: System
+    /// Settings' "Quit & Reopen" after a Screen Recording grant, or a script
+    /// (`crate::macos_quit` has the table, and why Activity Monitor's Quit is
+    /// not here). Under a supervisor that relaunches it, that is a restart:
+    /// armed here with that supervisor's code and recorded as the verb records
+    /// one; the caller then [`Self::commit`]s it, so it leaves through the same
+    /// graceful door (no crash counted, no ephemeral unenroll).
+    ///
+    /// Not the verb's gates. The process quits either way (AppKit exits 0 when
+    /// this returns `None`), so the only choice here is whether the device comes
+    /// back. `local_restart_enabled` is the owner's switch for restarts LOCAL
+    /// CLIENTS ask for, and the 30 s window bounds a client's re-sends; a quit
+    /// is neither, and refusing it would be the offline device #3164 is about.
+    /// Only something outside the daemon sends a quit, and launchd's own
+    /// `ThrottleInterval` (10 s) spaces any relaunches it causes.
+    ///
+    /// Synchronous: AppKit calls it on the main thread. `None` when nothing
+    /// relaunches this process ([`Supervision::None`]): there a quit is a stop.
+    ///
+    /// [`Supervision::None`]: crate::supervision::Supervision::None
+    pub fn arm_for_quit(&self, reason: &str) -> Option<i32> {
+        use crate::supervision as sup;
+        let inner = &self.inner;
+        if !inner.supervision.is_supervised() {
+            return None;
+        }
+        // A restart already accepted (the verb's, or an earlier quit's) keeps
+        // its code; the commit after this is idempotent.
+        let exit_code = *inner
+            .accepted
+            .get_or_init(|| inner.supervision.restart_exit_code());
+        let reason = sup::sanitize_reason(reason);
+        let record = sup::RestartRecord {
+            at_ms: unix_now_ms(),
+            pid: std::process::id(),
+            supervisor: inner.supervision.wire().to_string(),
+            reason: reason.clone(),
+        };
+        // Recorded for "why did it restart" and the verb's window; a failure
+        // costs only that, never the restart.
+        if let Err(e) = sup::write_record(&inner.record_path, &record) {
+            tracing::warn!(error = %e, "restart for a quit: not recorded; restarting anyway");
+        }
+        tracing::info!(
+            %reason,
+            supervisor = inner.supervision.wire(),
+            exit_code,
+            "restart armed for a Quit AppleEvent (#3164)"
+        );
+        Some(exit_code)
+    }
+}
+
+/// #3164 — the two macOS grants as this process holds them
+/// ([`NodeStatus::macos_grants`]). `None` off macOS, and in a process with no
+/// GUI session (a Mac's root half), where neither grant could do anything.
+/// Three cheap TCC/WindowServer reads, made only when a client asks.
+fn macos_grants_now() -> Option<tunnel_core::localapi::MacosGrants> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::tcc;
+        tcc::has_gui_session().then(|| tunnel_core::localapi::MacosGrants {
+            screen_recording: tcc::screen_recording_granted(),
+            accessibility: tcc::accessibility_trusted(),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
 }
 
 /// Wall-clock ms since the epoch — the restart record is compared across
@@ -487,6 +572,7 @@ impl DaemonState {
             remote_config: None,
             self_view: None,
             ephemeral: false,
+            no_enrollment: false,
             #[cfg(feature = "recording")]
             recorder: None,
             restart: None,
@@ -554,6 +640,26 @@ impl DaemonState {
     pub fn with_ephemeral(mut self, ephemeral: bool) -> Self {
         self.ephemeral = ephemeral;
         self
+    }
+
+    /// FR-43 P3a — this daemon is a GUI worker with no enrollment
+    /// ([`Self::no_enrollment`], the field).
+    pub fn with_no_enrollment(mut self, no_enrollment: bool) -> Self {
+        self.no_enrollment = no_enrollment;
+        self
+    }
+
+    /// FR-43 P3a — the answer to a verb only the root half can serve, on a
+    /// worker with no enrollment. At once: a verb that needs a server would
+    /// otherwise reach the stand-in, which discards it, and hang until its
+    /// deadline.
+    fn root_half_only(&self, what: &str) -> Option<Response> {
+        self.no_enrollment.then(|| Response::Error {
+            message: format!(
+                "on this Mac the root daemon holds the device's connection to the server, so \
+                 {what} goes to it: run this with `sudo`"
+            ),
+        })
     }
 
     /// FR-27 — attach the live remote-control session registry, so a thin
@@ -652,6 +758,25 @@ impl DaemonState {
 #[async_trait]
 impl LocalApiState for DaemonState {
     fn status(&self) -> NodeStatus {
+        // #2551 — ONE borrow of the overlay view, dropped before the literal.
+        // A field that borrowed it would hold that read guard until the whole
+        // literal was built, so ten such fields took ten nested read locks.
+        // tokio's watch lock parks a new reader once a writer waits: the
+        // overlay runtime publishing between two of them deadlocked this
+        // thread and the runtime, and every later borrow (the heartbeat's
+        // included) parked behind them until the watchdog killed the worker.
+        let view = self.overlay.borrow();
+        let overlay_ip = view.self_ip.clone();
+        let overlay_ip6 = view.self_ip6.clone();
+        let exit_node = view.exit_node.clone();
+        let route_offer_withheld = view.route_offer_withheld.clone();
+        let host_firewall = view.host_firewall.clone();
+        let dns = view.dns.clone();
+        let srflx = view.srflx.clone();
+        let warm_relay = view.warm_relay.clone();
+        let direct_socks = view.direct_socks.clone();
+        let derp_inbound_drops = view.derp_inbound_drops;
+        drop(view);
         NodeStatus {
             node_id: self.node_id.clone(),
             name: self.name.lock().map(|n| n.clone()).unwrap_or_default(),
@@ -661,19 +786,21 @@ impl LocalApiState for DaemonState {
             tenant_id: self.tenant_id.clone(),
             // The overlay IP the runtime last assigned us — a stable identity,
             // so it's kept even across a brief disconnect.
-            overlay_ip: self.overlay.borrow().self_ip.clone(),
-            overlay_ip6: self.overlay.borrow().self_ip6.clone(),
+            overlay_ip,
+            overlay_ip6,
             // #2892 — its own, until `person_socket::with_machine_network`
             // lends a Mac's per-user half the root half's and says so.
             network_from: None,
             connected: self.connected.load(Ordering::Relaxed),
+            // FR-55 P4 — what the power keeper holds right now.
+            power: crate::power::local_status(),
             // FR-51 P4 — the primary enrollment's nature, stamped at startup.
             ephemeral: self.ephemeral,
             // P5/S4 — exit-node routing status the overlay runtime published.
-            exit_node: self.overlay.borrow().exit_node.clone(),
+            exit_node,
             // FR-97 P0b — why this node offers no routes it was configured to.
-            route_offer_withheld: self.overlay.borrow().route_offer_withheld.clone(),
-            host_firewall: self.overlay.borrow().host_firewall.clone(),
+            route_offer_withheld,
+            host_firewall,
             // S1b — the config file this daemon actually loaded, so the
             // desktop stops guessing which copy is live.
             config_path: self
@@ -681,10 +808,10 @@ impl LocalApiState for DaemonState {
                 .as_ref()
                 .map(|(p, _)| p.display().to_string()),
             // S2 — MagicDNS status the overlay runtime published.
-            dns: self.overlay.borrow().dns.clone(),
+            dns,
             // NAT-traversal — the srflx gather outcome. Empty candidates means
             // this node can't hole-punch and reads as UDP-blocked to every peer.
-            srflx: self.overlay.borrow().srflx.clone(),
+            srflx,
             // FR-33 — captured LAN prefixes, from the process-wide netstate
             // snapshot (a HOST property, like netcheck). `None` when the
             // monitor is not running — and, since 2026-09-06, also when the
@@ -729,7 +856,7 @@ impl LocalApiState for DaemonState {
             #[cfg(not(any(feature = "overlay-l3", feature = "overlay-netstack")))]
             join_refusal: None,
             // C4 stage 1 — the warm TURN/UDP allocation's state.
-            warm_relay: self.overlay.borrow().warm_relay.clone(),
+            warm_relay,
             // B4 — the measured capability vector, read straight from the
             // process-wide netcheck slot (a HOST property; no runtime
             // threading needed). The slot lives behind tunnel-core's
@@ -783,10 +910,10 @@ impl LocalApiState for DaemonState {
                 })
                 .unwrap_or_default(),
             // PR-B1 — per-socket receive liveness + band-walk tripwire.
-            direct_socks: self.overlay.borrow().direct_socks.clone(),
+            direct_socks,
             // #32 — the `/derp` inbound-drop counters, verbatim from the
             // overlay view. `None` when the overlay is not running.
-            derp_inbound_drops: self.overlay.borrow().derp_inbound_drops,
+            derp_inbound_drops,
             direct_bind_walks: Some(
                 tunnel_core::evidence::DIRECT_BIND_WALKS.load(Ordering::Relaxed),
             ),
@@ -852,6 +979,8 @@ impl LocalApiState for DaemonState {
             // refreshed off this thread — this is a sync read on the async
             // dispatch, and the honest answer needs the disk.
             files_dir: crate::files::effective_files_dir(),
+            // #3164 — this process's own grants, for the menu-bar app's card.
+            macos_grants: macos_grants_now(),
         }
     }
 
@@ -984,7 +1113,7 @@ impl LocalApiState for DaemonState {
     fn rc_sessions(&self) -> Vec<tunnel_core::localapi::RcSessionInfo> {
         self.rc_sessions
             .as_ref()
-            .map(|r| r.list())
+            .map(|r| r.list_for_client())
             .unwrap_or_default()
     }
 
@@ -1048,6 +1177,9 @@ impl LocalApiState for DaemonState {
         transport: &str,
         start_transport: &str,
     ) -> Response {
+        if let Some(refused) = self.root_half_only("a forward") {
+            return refused;
+        }
         match self
             .tunnel_hub
             .create_forward(node, local, remote, transport, start_transport)
@@ -1059,6 +1191,9 @@ impl LocalApiState for DaemonState {
     }
 
     async fn create_socks5(&self, node: &str, local: u16, transport: &str) -> Response {
+        if let Some(refused) = self.root_half_only("a SOCKS5 listener") {
+            return refused;
+        }
         match self.tunnel_hub.create_socks5(node, local, transport).await {
             Ok(id) => Response::FlowCreated { id },
             Err(message) => Response::Error { message },
@@ -1074,6 +1209,9 @@ impl LocalApiState for DaemonState {
     }
 
     async fn route_add(&self, route: tunnel_core::localapi::RouteDescriptor) -> Response {
+        if let Some(refused) = self.root_half_only("a declared route") {
+            return refused;
+        }
         let Some(routes) = self.routes.as_ref() else {
             return Response::Error {
                 message: "declared routes are not available on this daemon".into(),
@@ -1086,6 +1224,9 @@ impl LocalApiState for DaemonState {
     }
 
     async fn set_device_name(&self, name: &str) -> Response {
+        if let Some(refused) = self.root_half_only("the device's name") {
+            return refused;
+        }
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Response::Error {
@@ -1158,6 +1299,9 @@ impl LocalApiState for DaemonState {
     /// FR-84 D1 — the atomic route edit; the reconciler's `replace` owns the
     /// validation and the one-write persistence.
     async fn route_update(&self, route: tunnel_core::localapi::RouteDescriptor) -> Response {
+        if let Some(refused) = self.root_half_only("a declared route") {
+            return refused;
+        }
         let Some(routes) = self.routes.as_ref() else {
             return Response::Error {
                 message: "declared routes are not available on this daemon".into(),
@@ -1319,6 +1463,9 @@ impl LocalApiState for DaemonState {
     /// for this argument alone while the line buffer in `serve_connection`
     /// holds the same bytes would claim a property the code does not have.
     async fn external_password_set(&self, password: &Secret) -> Response {
+        if let Some(refused) = self.root_half_only("the device's external-access password") {
+            return refused;
+        }
         let Some((path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
                 message: "config editing is not available on this daemon".into(),
@@ -1386,6 +1533,9 @@ impl LocalApiState for DaemonState {
     /// setup that a later set would silently reuse — reviving the OPAQUE
     /// identity of a credential the operator believed they had destroyed.
     async fn external_password_clear(&self) -> Response {
+        if let Some(refused) = self.root_half_only("the device's external-access password") {
+            return refused;
+        }
         let Some((path, lock)) = self.config_persist.as_ref() else {
             return Response::Error {
                 message: "config editing is not available on this daemon".into(),
@@ -1423,6 +1573,11 @@ impl LocalApiState for DaemonState {
     /// startup is exactly what the operator is checking for, and a snapshot
     /// would answer with the state they are trying to change.
     async fn external_password_status(&self) -> Response {
+        // FR-43 P3a — the person's file would answer "none set" for a device
+        // whose root half may hold one.
+        if let Some(refused) = self.root_half_only("the device's external-access password") {
+            return refused;
+        }
         let Some((path, lock)) = self.config_persist.as_ref() else {
             // No config path: report the build's capability truthfully and the
             // rest as unknown-but-closed. An `Error` here would make "is this
@@ -1737,6 +1892,9 @@ impl LocalApiState for DaemonState {
         asker: &tunnel_core::localapi::Asker,
         args: &tunnel_core::localapi::ConnectArgs,
     ) -> Response {
+        if let Some(refused) = self.root_half_only("`roomler connect`") {
+            return refused;
+        }
         match crate::hive::person_connect::open(asker, args).await {
             Ok((id, endpoint)) => Response::Connected { id, endpoint },
             Err(message) => Response::Error { message },
@@ -1779,6 +1937,9 @@ impl LocalApiState for DaemonState {
         command: &str,
         timeout_ms: u64,
     ) -> Response {
+        if let Some(refused) = self.root_half_only("a remote command") {
+            return refused;
+        }
         let Some(sink) = self.tunnel_hub.sink_now() else {
             return Response::Error {
                 message: "not connected to the server — remote commands need the control \
@@ -1847,6 +2008,9 @@ impl LocalApiState for DaemonState {
     /// The public key is the CALLER's; the daemon never sees the private half,
     /// so a grant observed anywhere along this path is useless on its own.
     async fn ssh_session(&self, node: &str, public_key: &str, session_secs: u64) -> Response {
+        if let Some(refused) = self.root_half_only("an SSH grant") {
+            return refused;
+        }
         let Some(sink) = self.tunnel_hub.sink_now() else {
             return Response::Error {
                 message: "not connected to the server — SSH grants need the control \
@@ -1917,14 +2081,6 @@ impl LocalApiState for DaemonState {
     /// the root half's, asked over its person socket
     /// ([`crate::person_socket::or_machine_view`]).
     async fn devices(&self, org: &str, query: &tunnel_core::localapi::DevicesQuery) -> Response {
-        let own = match &self.self_view {
-            Some(view) => view.devices(org, query).await,
-            None => Response::Upstream {
-                code: "unsupported".into(),
-                message: "this daemon was started without a server identity to ask".into(),
-                status: None,
-            },
-        };
         let req = tunnel_core::localapi::Request::Devices {
             org: org.to_string(),
             page: query.page,
@@ -1933,12 +2089,32 @@ impl LocalApiState for DaemonState {
             sort: query.sort.clone(),
             dir: query.dir.clone(),
         };
+        // FR-43 P3a — on a one-row Mac the worker has no server to ask, and its
+        // `self_view` holds the stand-in. The root half's answer is the only one.
+        if self.no_enrollment {
+            return crate::person_socket::machine_view(req).await;
+        }
+        let own = match &self.self_view {
+            Some(view) => view.devices(org, query).await,
+            None => Response::Upstream {
+                code: "unsupported".into(),
+                message: "this daemon was started without a server identity to ask".into(),
+                status: None,
+            },
+        };
         crate::person_socket::or_machine_view(own, req).await
     }
 
     /// FR-84 D5b — the mesh graph for the same set (and, FR-97 P2g, the
     /// machine's on a Mac's per-user half, as [`Self::devices`]).
     async fn mesh(&self, org: &str) -> Response {
+        let req = tunnel_core::localapi::Request::Mesh {
+            org: org.to_string(),
+        };
+        // FR-43 P3a — as [`Self::devices`].
+        if self.no_enrollment {
+            return crate::person_socket::machine_view(req).await;
+        }
         let own = match &self.self_view {
             Some(view) => view.mesh(org).await,
             None => Response::Upstream {
@@ -1947,9 +2123,6 @@ impl LocalApiState for DaemonState {
                 status: None,
             },
         };
-        let req = tunnel_core::localapi::Request::Mesh {
-            org: org.to_string(),
-        };
         crate::person_socket::or_machine_view(own, req).await
     }
 
@@ -1957,10 +2130,13 @@ impl LocalApiState for DaemonState {
     /// network fields of the status (overlay addresses, exit, MagicDNS) are the
     /// root half's ([`crate::person_socket::or_machine_status`]). Everywhere
     /// else, and on a half with a node of its own, the status is its own.
+    ///
+    /// FR-43 P3a — on a one-row Mac's worker, so are the identity and the link:
+    /// this process holds neither.
     async fn status_view(&self) -> NodeStatus {
         #[cfg(target_os = "macos")]
         {
-            crate::person_socket::or_machine_status(self.status()).await
+            crate::person_socket::or_machine_status(self.status(), self.no_enrollment).await
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2322,6 +2498,64 @@ mod tests {
         assert_eq!(s.mode, DaemonMode::Service);
     }
 
+    /// #2551 — `status` survives the overlay runtime publishing its view
+    /// while it reads. tokio's watch lock parks a new reader once a writer
+    /// waits, so a `status` that took the view's read lock twice deadlocked
+    /// when a publish landed between the two: it waited on the writer, the
+    /// writer waited on its first guard, and every later borrow, the
+    /// heartbeat's included, waited on both (`signaling=95s@heartbeat.sys`,
+    /// 0.4.177). A writer spinning on `send_replace` keeps that window
+    /// covered, so a deadlocking `status` fails here at the timeout; the
+    /// old one failed every run.
+    #[tokio::test]
+    async fn status_survives_a_view_publish_mid_read() {
+        let (tx, rx) = watch::channel(view());
+        let st = DaemonState::new(
+            "aid".into(),
+            "host".into(),
+            DaemonMode::Service,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            rx,
+            consent_broker("view-publish"),
+            None,
+            crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+            empty_rtt_cache(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    tx.send_replace(view());
+                }
+            })
+        };
+        // `status` starts the process-wide netstate monitor on its first
+        // call, which spawns a task: the reader needs the test's runtime.
+        let rt = tokio::runtime::Handle::current();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _rt = rt.enter();
+            for _ in 0..20_000 {
+                assert_eq!(st.status().overlay_ip.as_deref(), Some("100.64.0.2"));
+            }
+            let _ = done_tx.send(());
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+        // A deadlocked reader never reports and its writer never returns, so
+        // neither is joined. A reader that panicked fails with its own panic.
+        assert!(
+            !matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "status() deadlocked against the overlay view's writer (#2551)"
+        );
+        writer.join().unwrap();
+        if let Err(panic) = reader.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[tokio::test]
     async fn resolve_targets_and_ping_without_pinger_errors() {
         let (_tx, rx) = watch::channel(view());
@@ -2479,6 +2713,116 @@ mod tests {
         assert!(matches!(
             bare.set_device_name("x").await,
             Response::Error { .. }
+        ));
+    }
+
+    /// FR-43 P3a — a worker with no enrollment answers every verb that needs a
+    /// server at once, with the way to reach the root half. The control is the
+    /// same verbs on an enrolled daemon: its rename lands in the file.
+    #[tokio::test]
+    async fn a_worker_with_no_enrollment_sends_a_server_verb_to_the_root_half() {
+        fn state(tag: &str, path: &std::path::Path) -> DaemonState {
+            let (_tx, rx) = watch::channel(view());
+            DaemonState::new(
+                String::new(),
+                "mac".into(),
+                DaemonMode::Service,
+                None,
+                Arc::new(AtomicBool::new(true)),
+                rx,
+                consent_broker(tag),
+                None,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                empty_rtt_cache(),
+            )
+            .with_config_persist(path.to_path_buf(), Arc::new(tokio::sync::Mutex::new(())))
+        }
+        fn is_refusal(r: &Response) -> bool {
+            matches!(r, Response::Error { message } if message.contains("`sudo`"))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = crate::config::test_fixture();
+        cfg.machine_name = "from-the-file".into();
+        crate::config::save(&path, &cfg).unwrap();
+
+        let worker = state("p3a-worker", &path).with_no_enrollment(true);
+        assert!(is_refusal(
+            &worker.create_forward("n", 1, "r:1", "auto", "").await
+        ));
+        assert!(is_refusal(&worker.create_socks5("n", 1, "auto").await));
+        assert!(is_refusal(&worker.set_device_name("renamed").await));
+        assert!(is_refusal(&worker.exec_remote("n", "sh", "id", 1000).await));
+        assert!(is_refusal(&worker.ssh_session("n", "key", 60).await));
+        assert!(is_refusal(&worker.external_password_status().await));
+        assert!(is_refusal(&worker.external_password_clear().await));
+        assert_eq!(
+            crate::config::load(&path).unwrap().machine_name,
+            "from-the-file",
+            "a refused verb writes nothing"
+        );
+
+        let enrolled = state("p3a-enrolled", &path);
+        assert!(matches!(
+            enrolled.set_device_name("renamed").await,
+            Response::DeviceNameSet { .. }
+        ));
+        assert_eq!(crate::config::load(&path).unwrap().machine_name, "renamed");
+        assert!(matches!(
+            enrolled.external_password_status().await,
+            Response::ExternalPassword(_)
+        ));
+    }
+
+    /// FR-43 P3a — Devices and Mesh never reach the worker's own `self_view`,
+    /// whose row points at the stand-in. Off a Mac there is no root half to ask,
+    /// so the answer says the server is out of reach; the same label on the
+    /// same registry with the flag off is resolved against the worker's own row.
+    #[tokio::test]
+    #[cfg(not(target_os = "macos"))]
+    async fn a_worker_with_no_enrollment_never_asks_its_own_server() {
+        fn state(tag: &str, no_enrollment: bool) -> DaemonState {
+            let (_tx, rx) = watch::channel(view());
+            let registry: crate::self_view::OrgHttpRegistry =
+                Arc::new(Mutex::new(vec![crate::self_view::OrgHttp {
+                    label: "primary".into(),
+                    server_url: "http://127.0.0.1:9".into(),
+                    token: crate::token_slot::TokenSlot::new("stand-in-secret"),
+                    primary: true,
+                    enabled: true,
+                }]));
+            DaemonState::new(
+                String::new(),
+                "mac".into(),
+                DaemonMode::Service,
+                None,
+                Arc::new(AtomicBool::new(true)),
+                rx,
+                consent_broker(tag),
+                None,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                empty_rtt_cache(),
+            )
+            .with_org_http(registry)
+            .with_no_enrollment(no_enrollment)
+        }
+        let q = tunnel_core::localapi::DevicesQuery::default();
+
+        let worker = state("p3a-views", true);
+        for answer in [
+            worker.devices("ghost", &q).await,
+            worker.mesh("ghost").await,
+        ] {
+            assert!(
+                matches!(answer, Response::Upstream { ref code, .. } if code == "server_unreachable"),
+                "{answer:?}"
+            );
+        }
+
+        let enrolled = state("p3a-views-control", false);
+        assert!(matches!(
+            enrolled.devices("ghost", &q).await,
+            Response::Upstream { ref code, .. } if code == "unknown_org"
         ));
     }
 
@@ -2921,6 +3265,76 @@ mod tests {
         );
         let why = refusal(st.restart_daemon("again").await);
         assert!(why.contains("already under way"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3164 — a Quit AppleEvent under launchd: armed with the code launchd
+    /// relaunches (never 0, which `KeepAlive {SuccessfulExit: false}` reads as
+    /// "stay down"), recorded, and the commit starts the same internal
+    /// shutdown as the verb's. Against master's code there was no such arm:
+    /// AppKit's quit ended the process with 0.
+    #[tokio::test]
+    async fn a_quit_under_launchd_is_armed_with_the_code_launchd_relaunches() {
+        let dir = restart_dir("quit-launchd", true);
+        let (_st, restart, shutdown) = restart_state(&dir, Supervision::Launchd);
+        let code = restart.arm_for_quit("macOS asked roomlerd to quit (a Quit AppleEvent)");
+        assert_eq!(code, Some(crate::watchdog::RESTART_REQUESTED_EXIT_CODE));
+        assert_ne!(code, Some(0), "launchd never relaunches a 0");
+        assert_eq!(restart.accepted_exit_code(), code);
+        let record = std::fs::read_to_string(dir.join(RESTART_RECORD_FILE)).unwrap();
+        assert!(record.contains("Quit AppleEvent"), "{record}");
+        assert!(!*shutdown.borrow(), "armed, not yet committed");
+        restart.commit();
+        assert!(
+            *shutdown.borrow(),
+            "the commit starts the internal shutdown"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3164 — a quit is honoured where a client's restart is refused: the
+    /// owner's `local_restart_enabled = false`, the 30 s window after another
+    /// restart, a young FR-43 worker. The process quits either way, so a
+    /// refusal would only leave the device offline.
+    #[tokio::test]
+    async fn a_quit_restarts_where_the_verb_would_refuse() {
+        let dir = restart_dir("quit-gates", false);
+        // A restart moments ago, by the verb's record.
+        crate::supervision::write_record(
+            &dir.join(RESTART_RECORD_FILE),
+            &crate::supervision::RestartRecord {
+                at_ms: unix_now_ms(),
+                pid: 1,
+                supervisor: "macos-supervisor".into(),
+                reason: "earlier".into(),
+            },
+        )
+        .unwrap();
+        let (st, restart, shutdown) = restart_state(&dir, Supervision::MacosSupervisor);
+        let why = refusal(st.restart_daemon("apply").await);
+        assert!(why.contains("local_restart_enabled = false"), "{why}");
+        let code = restart.arm_for_quit("quit");
+        assert_eq!(code, Some(crate::watchdog::RESTART_REQUESTED_EXIT_CODE));
+        restart.commit();
+        assert!(*shutdown.borrow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3164 — nothing relaunches a hand-run `roomlerd run`: a quit stays the
+    /// stop it always was there, and nothing is armed, recorded or shut down
+    /// by this path (AppKit ends the process itself).
+    #[tokio::test]
+    async fn a_quit_nothing_relaunches_arms_nothing() {
+        let dir = restart_dir("quit-orphan", true);
+        let (_st, restart, shutdown) = restart_state(&dir, Supervision::None);
+        assert_eq!(restart.arm_for_quit("quit"), None);
+        assert_eq!(restart.accepted_exit_code(), None);
+        assert!(!dir.join(RESTART_RECORD_FILE).exists());
+        restart.commit();
+        assert!(
+            !*shutdown.borrow(),
+            "nothing was accepted, so nothing commits"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

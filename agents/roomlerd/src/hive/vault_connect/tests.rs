@@ -73,6 +73,7 @@ fn a_call_names_a_secret_an_engine_and_an_upstream() {
             auth: None,
             user: None,
             ttl: DEFAULT_TTL,
+            dial: crate::vault_proxy::Dial::Direct,
         }
     );
     let field = |s: &str, f: &str| Handle {
@@ -95,6 +96,21 @@ fn a_call_names_a_secret_an_engine_and_an_upstream() {
     .unwrap();
     assert_eq!(full.database.as_deref(), Some("orders"));
     assert_eq!(full.ttl, 900);
+    // FR-90 P4-6-1b-2 — a call's own arguments never say where its endpoint
+    // dials: only `call_through` does.
+    let steered = parse(&json!({
+        "handle": "db/main",
+        "engine": "postgres",
+        "upstream": "db.internal:5432",
+        "dial": "127.0.0.1:1",
+        "through": "127.0.0.1:1",
+    }))
+    .unwrap();
+    assert_eq!(
+        steered.dial,
+        crate::vault_proxy::Dial::Direct,
+        "a dial named in the call is not read"
+    );
     assert_eq!(
         full.handles(),
         [
@@ -418,6 +434,71 @@ async fn a_session_listener_admits_its_account_alone() {
     let theirs = endpoint::loopback::session_admit(other).unwrap();
     assert!(theirs(&accepted, local).is_err(), "another account's");
     drop(client);
+}
+
+/// FR-90 P4-6-1b-2 — a connect's flow through another device admits this
+/// daemon alone while no worker runs its session: a connection held by this
+/// process (Windows) or its account (Unix) is served, and one held by any
+/// other is refused, so the session's account is never handed a raw pipe
+/// past the proxy.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_connects_flow_admits_this_daemon_alone() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    let client = tokio::net::TcpStream::connect(local).await.unwrap();
+    let (accepted, _) = listener.accept().await.unwrap();
+    // No worker is registered for this made-up session, on any system, so
+    // this is the common `hive_worker = false` case.
+    let ours = endpoint::loopback::daemon_admit(ObjectId::new(), 0)
+        .expect("this system says who connects");
+    assert_eq!(ours(&accepted, local), Ok(()));
+    let other = endpoint::loopback::own().wrapping_add(4242);
+    let theirs = endpoint::loopback::admit_only(other).unwrap();
+    assert!(
+        theirs(&accepted, local).is_err(),
+        "another process or account"
+    );
+    drop(client);
+}
+
+/// FR-90 P8-2b-4 — once a session's proxies run in a Windows worker, a
+/// connect's flow through another device admits that worker's pid too, not
+/// only the daemon's own, and a pid that is neither is still refused:
+/// [`held_by_daemon_or_worker`] is the comparison `daemon_admit` makes on
+/// every connection, once it has read the connection's real pid and
+/// `worker::pid_of`'s own live answer — fixed here instead, since the
+/// comparison itself takes no socket, so no real connection is needed to
+/// prove it. Unix needs no counterpart: P8-0's point 6 leaves it unchanged,
+/// a worker there already running as the daemon's own account.
+#[cfg(windows)]
+#[test]
+fn a_connects_flow_admits_the_sessions_worker_too() {
+    use endpoint::loopback::held_by_daemon_or_worker as admits;
+    let (pid, daemon, worker) = (1000, 2000, 3000);
+    assert_eq!(
+        admits(pid, pid, None),
+        Ok(()),
+        "the daemon's own pid, no worker up"
+    );
+    assert_eq!(
+        admits(pid, daemon, Some(pid)),
+        Ok(()),
+        "the worker's pid, independent of the daemon's"
+    );
+    assert_eq!(
+        admits(pid, pid, Some(worker)),
+        Ok(()),
+        "the daemon's own pid, independent of the worker's"
+    );
+    assert!(
+        admits(pid, daemon, Some(worker)).is_err(),
+        "a pid that is neither the daemon's nor the worker's"
+    );
+    assert!(
+        admits(pid, daemon, None).is_err(),
+        "a pid that is not the daemon's, no worker up"
+    );
 }
 
 /// P3-5e-2 — a `kubernetes` call names an API server's origin, and `bearer`

@@ -151,6 +151,21 @@ pub struct NetworkOrigin {
     pub name: String,
 }
 
+/// FR-55 P4 — the power keeper's posture, as `roomler status` shows it. The
+/// leaf mirror of the server wire's `PowerBrief` (this crate depends on no
+/// wire crate): the same three fields, the same omission rule.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PowerStatus {
+    /// `never` · `on-ac` · `always`, as the keeper parsed `power_policy`.
+    pub policy: String,
+    /// `Some(true)` on mains, `Some(false)` on battery, `None` = cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_ac: Option<bool>,
+    /// The keeper holds the machine awake right now (the policy, or a live
+    /// session).
+    pub held: bool,
+}
+
 /// Snapshot of the local node.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct NodeStatus {
@@ -186,6 +201,14 @@ pub struct NodeStatus {
     pub network_from: Option<NetworkOrigin>,
     /// Connected to the coordination server.
     pub connected: bool,
+    /// FR-55 P4 — this device's power posture: the standing `power_policy`,
+    /// the power source, and whether the keeper holds the machine awake.
+    /// What tells an operator, before it happens, whether this device will
+    /// read "asleep by policy" when it sleeps. `None` from a daemon that
+    /// predates the field, or whose keeper has not decided yet; an older CLI
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power: Option<PowerStatus>,
     /// FR-51 P4 — this daemon's PRIMARY enrollment is ephemeral: the server
     /// reaps the device after silence, and the daemon de-enrolls itself on a
     /// clean stop. Additive both ways: an older daemon omits it (⇒ false),
@@ -423,6 +446,27 @@ pub struct NodeStatus {
     /// "Change…" / "Use default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_dir: Option<String>,
+    /// #3164 — the two macOS grants as THIS daemon process holds them, for the
+    /// menu-bar app's permission card. That card used to ask TCC about its own
+    /// process (`ai.roomler.agent-tray`), so it never saw the agent's grants:
+    /// it kept asking for both after the person had granted them, and its
+    /// Grant button registered the menu-bar app itself in the pane (the
+    /// "Roomler" entry that changes nothing). `None` off macOS, from a daemon
+    /// with no GUI session (a Mac's root half), and from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos_grants: Option<MacosGrants>,
+}
+
+/// #3164 — what [`NodeStatus::macos_grants`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MacosGrants {
+    /// Screen Recording, as this process can use it. macOS applies a new grant
+    /// to a freshly started process only, so this stays `false` after the
+    /// person turns it on, until the daemon restarts.
+    pub screen_recording: bool,
+    /// Accessibility, read live: a grant shows here at once, and input works
+    /// from the next event without a restart.
+    pub accessibility: bool,
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -2271,6 +2315,12 @@ impl ClientPeer {
         peer_may_start_keep_busy(self, scope, console_session_id(), own_uid())
     }
 
+    /// FR-85 P2e — may this peer start, stop or delete a recording, on
+    /// `scope`'s endpoint? [`peer_may_record`].
+    pub fn may_record(&self, scope: Scope) -> bool {
+        peer_may_record(self, scope, console_session_id(), own_uid())
+    }
+
     /// FR-90 P3-9-2b — may this peer run `roomler connect` here (decision
     /// 26)? [`peer_may_connect`].
     pub fn may_connect(&self) -> bool {
@@ -2388,6 +2438,27 @@ pub fn peer_may_start_keep_busy(
     match scope {
         Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
         Scope::Full => matches!((peer.uid, own_uid), (Some(p), Some(o)) if p == o),
+    }
+}
+
+/// FR-85 P2e — the pure decision behind [`ClientPeer::may_record`].
+///
+/// The daemon's own endpoints keep [`peer_is_console_user`]. On the person
+/// socket of a system install that gate cannot pass: it compares the peer with
+/// this daemon, which is root, and the person at the seat is not. There the
+/// listener has already taken the kernel's word that the peer is that person
+/// or root ([`person_peer_ok`]), and the same check is made again here, as for
+/// every per-peer gate on that socket (#2871's review), so the decision does
+/// not rest on the listener's one call site.
+pub fn peer_may_record(
+    peer: &ClientPeer,
+    scope: Scope,
+    console_session: Option<u32>,
+    own_uid: Option<u32>,
+) -> bool {
+    match scope {
+        Scope::Person { owner_uid } => person_peer_ok(peer, owner_uid),
+        Scope::Full => peer_is_console_user(peer, console_session, own_uid),
     }
 }
 
@@ -3106,8 +3177,9 @@ pub enum Scope {
     Full,
     /// The person-at-the-device socket of a Linux system install, and of a
     /// Mac's root half ([`serve_person_socket`]): only what that person needs
-    /// to see who is viewing their screen, end it, answer a consent prompt, and
-    /// see the devices the machine's private network lets it see.
+    /// to see who is viewing their screen, end it, answer a consent prompt,
+    /// record it, see the devices the machine's private network lets it see,
+    /// and set the keys that are that person's own call (#2871).
     ///
     /// `owner_uid` is the person it was made for (#2871's review): the
     /// listener drops any connection whose kernel-read uid is neither theirs
@@ -3166,10 +3238,11 @@ pub struct ConsoleKey {
     /// review): a prefix that is a fail-safe restriction on the daemon's own
     /// endpoint would be a fail-OPEN allowlist here, admitting every future
     /// `record_*` / `external_*` key without anyone deciding it is the seat
-    /// person's on a root install. Empty keeps the entry's keys root's on a
-    /// root-mode install, with `why_not_person_socket` saying why.
+    /// person's on a root install. A key of the entry left out stays root's
+    /// on a root-mode install, with `why_not_person_socket` saying why.
     pub person_socket: &'static [&'static str],
-    /// Why `person_socket` is empty, for the one entry where it is.
+    /// Why a key of this entry is left out of `person_socket`; empty when
+    /// none is.
     pub why_not_person_socket: &'static str,
 }
 
@@ -3196,15 +3269,19 @@ pub struct ConsoleKey {
 pub const CONSOLE_PERSON_KEYS: &[ConsoleKey] = &[
     // FR-85 — where recordings of this console's screen are written, and
     // whether a remote controller may record it, with its audio. The
-    // recorder writes as the console user, never as root. A prefix: the
-    // whole surface is one decision.
+    // recorder writes as the console user, never as root. A prefix: on the
+    // daemon's own endpoint the whole surface is one decision. On the person
+    // socket the two remote switches are the person's, and `record_dir` is
+    // not (#2871): on a root-mode install it is the whole device's folder.
     ConsoleKey {
         keys: KeyMatch::Prefix("record_"),
         fr: "FR-85",
         refusal: "only the person at this device's console can start, stop or delete a \
                   recording, or change where recordings are saved",
-        person_socket: &["record_dir", "record_remote_enabled", "record_remote_audio"],
-        why_not_person_socket: "",
+        person_socket: &["record_remote_enabled", "record_remote_audio"],
+        why_not_person_socket: "`record_dir` is where every recording on the device is saved: on \
+                                a root-mode install it stays root's, pending a check of the \
+                                folder each time a recording starts",
     },
     // FR-84 D4 — where files dropped into the console user's session land:
     // one must not steer another person's incoming files (say, into their
@@ -3369,9 +3446,10 @@ fn console_key_refusal(key: &str) -> Response {
 /// the service is up, the sessions behind the "Being viewed by …" banner, its
 /// Disconnect, the consent prompt and its answer, and whether a recording is
 /// running (the tray turns red). FR-97 P2g adds the companion's Devices page,
-/// and P2h the live links its Connection column and Overview read. #2871
-/// (design A) adds the configuration: the listing, read-only but for the keys
-/// that are the console person's call, and `ConfigSet` of exactly those
+/// and P2h the live links its Connection column and Overview read. FR-85 P2e
+/// adds recording that person's own screen, and #2871 (design A) the
+/// configuration: the listing, read-only but for the keys that are the
+/// console person's call, and `ConfigSet` of exactly those
 /// ([`person_socket_admits_key`]).
 pub fn person_may(req: &Request) -> bool {
     match req {
@@ -3403,6 +3481,17 @@ pub fn person_may(req: &Request) -> bool {
         // Connection column and Overview's count read. Read-only, and served
         // without the endpoints and probe detail (`person_view`).
         | Request::Peers
+        // FR-85 P2e — this person's own screen, into this person's own folder.
+        // The recorder runs as them and the daemon lists and deletes as them
+        // (`RecordingManager`), so this reaches nothing they could not reach
+        // themselves. The Recordings view needs the list to show anything,
+        // and the start is gated again, on the peer, in the dispatcher. Whether
+        // a controller may make one is the console person's key, set below by
+        // name (#2871); where recordings go stays root's on a root-mode install.
+        | Request::RecordStart { .. }
+        | Request::RecordStop
+        | Request::RecordingsList
+        | Request::RecordingDelete { .. }
         // #2871 (design A) — the configuration listing. Secrets are never on
         // this surface (`config_surface`), Windows serves it to every
         // interactive user, and the companion needs it to show the root
@@ -3412,10 +3501,11 @@ pub fn person_may(req: &Request) -> bool {
         // `read_only` on the way out (`person_view`).
         | Request::ConfigGet => true,
         // #2871 (design A) — and `ConfigSet` of exactly the keys that are the
-        // console person's call (`CONSOLE_PERSON_KEYS`): where their files and
-        // recordings land, what a remote session may use on their screen,
-        // privacy, lock on end, display match, the browser check, external
-        // access. Not the device-owned gates, not the overlay, SSH or the
+        // console person's call (`CONSOLE_PERSON_KEYS`): where their incoming
+        // files land, whether a controller may record their screen, what a
+        // remote session may use on it, privacy, lock on end, display match,
+        // the browser check, external access. Not where recordings are saved,
+        // not the device-owned gates, not the overlay, SSH or the
         // updater, and not an unknown key — each refused with the key's name
         // and the `sudo` command (`not_on_the_person_socket_for_key`). The
         // dispatcher gates the peer again (`may_set_console_key`), and the
@@ -3444,10 +3534,6 @@ pub fn person_may(req: &Request) -> bool {
         | Request::TailLog { .. }
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
-        | Request::RecordStart { .. }
-        | Request::RecordStop
-        | Request::RecordingsList
-        | Request::RecordingDelete { .. }
         | Request::RestartDaemon { .. }
         | Request::EncoderCaps
         | Request::HiveUpdateHold
@@ -3501,9 +3587,11 @@ pub fn person_view(resp: Response) -> Response {
 fn not_on_the_person_socket() -> Response {
     Response::Error {
         message: "this is the person-at-the-device socket of a system install: it shows who is \
-                  viewing this screen, ends it, answers consent prompts, and lists the devices \
-                  this machine's private network reaches and its links to them. Everything else \
-                  goes to the daemon's own socket — run `sudo roomler …`"
+                  viewing this screen, ends it, answers consent prompts, records this screen, \
+                  lists the devices this machine's private network reaches and its links to \
+                  them, and shows this device's settings, changing only the ones that are the \
+                  person at the device's own call. Everything else goes to the daemon's own \
+                  socket — run `sudo roomler …`"
             .into(),
     }
 }
@@ -3519,9 +3607,9 @@ fn not_on_the_person_socket_for_key(key: &str) -> Response {
         message: format!(
             "`{key}` is an administrator's on this device: this is the person-at-the-device \
              socket of a system install, which serves that key read-only. Only the settings \
-             that are the person at the device's own call change here (where files and \
-             recordings go, what a remote session may use, privacy, external access). Run \
-             `sudo roomler config set {key} <value>`"
+             that are the person at the device's own call change here (where incoming files \
+             land, whether a controller may record, what a remote session may use, privacy, \
+             external access). Run `sudo roomler config set {key} <value>`"
         ),
     }
 }
@@ -3797,7 +3885,7 @@ where
                     Request::RecordStart { .. }
                     | Request::RecordStop
                     | Request::RecordingDelete { .. },
-                ) if !peer.is_console_user() => not_the_console_user(),
+                ) if !peer.may_record(scope) => not_the_console_user(),
                 Ok(Request::RecordStart { opts }) => state.record_start(opts).await,
                 Ok(Request::RecordStop) => state.record_stop().await,
                 Ok(Request::RecordingDelete { name }) => state.recording_delete(&name).await,
@@ -4501,7 +4589,7 @@ pub fn person_socket_path(uid: u32) -> std::path::PathBuf {
 /// neither. A pure decision, built on every platform so the Windows lane
 /// tests it too. The listener drops every other caller with it, and #2871's
 /// per-peer gates on a [`Scope::Person`] connection decide by it again
-/// (`peer_may_set_console_key`, `peer_may_start_keep_busy`).
+/// (`peer_may_set_console_key`, `peer_may_start_keep_busy`, `peer_may_record`).
 pub fn person_peer_ok(peer: &ClientPeer, owner_uid: u32) -> bool {
     matches!(peer.uid, Some(u) if u == owner_uid || u == 0)
 }
@@ -4916,7 +5004,9 @@ pub fn own_person_socket_path() -> Option<std::path::PathBuf> {
 
 /// #2891 — does this process run as root? A companion that does reaches a
 /// root daemon's own socket; one that does not reaches, at most, that
-/// daemon's person socket ([`person_may`]), where no config verb is served.
+/// daemon's person socket ([`person_may`]), which sets only the console
+/// person's own keys (#2871, design A) and, on a daemon older than that,
+/// serves no config verb at all.
 /// That is how its Device configuration page tells a refusal it must explain
 /// (a Linux system install) from a daemon that is down.
 #[cfg(unix)]
@@ -5994,6 +6084,7 @@ mod tests {
                 overlay_ip6: None,
                 network_from: None,
                 connected: true,
+                power: None,
                 ephemeral: false,
                 exit_node: None,
                 route_offer_withheld: None,
@@ -6022,6 +6113,7 @@ mod tests {
                 netcheck: None,
                 pid: None,
                 started_at_ms: None,
+                macos_grants: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -7075,6 +7167,34 @@ mod tests {
         assert_eq!(back.files_dir, None);
     }
 
+    /// #3164 — `NodeStatus.macos_grants` is additive both ways: an older
+    /// daemon's status (and every non-Mac one) parses to `None`, the field is
+    /// left out when there is nothing to say, and a Mac's per-user half's two
+    /// grants round-trip as written.
+    #[test]
+    fn node_status_macos_grants_is_additive() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("macos_grants"), "{without}");
+        assert_eq!(
+            serde_json::from_str::<NodeStatus>(&without)
+                .unwrap()
+                .macos_grants,
+            None
+        );
+        st.macos_grants = Some(MacosGrants {
+            screen_recording: false,
+            accessibility: true,
+        });
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""macos_grants":{"screen_recording":false,"accessibility":true}"#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&with).unwrap();
+        assert_eq!(back.macos_grants, st.macos_grants);
+    }
+
     #[tokio::test]
     async fn route_verbs_dispatch_and_lock_wire_shape() {
         let s = Mock;
@@ -7941,10 +8061,15 @@ mod tests {
             r#"{"t":"mesh","d":{"org":"primary"}}"#,
             // FR-97 P2h — and its live links, without the endpoints.
             r#"{"t":"peers"}"#,
+            // FR-85 P2e — recording their own screen into their own folder
+            // (the peer is gated again on top).
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recordings_list"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
             // #2871 — the configuration listing (marked read-only per key on
             // the way out), and the keys that are the console person's call.
             r#"{"t":"config_get"}"#,
-            r#"{"t":"config_set","d":{"key":"record_dir","value":"/home/a/Videos"}}"#,
             r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
             r#"{"t":"config_set","d":{"key":"files_dir"}}"#,
             r#"{"t":"config_set","d":{"key":"keep_busy_enabled","value":"false"}}"#,
@@ -8004,6 +8129,13 @@ mod tests {
                 key: "allow_plaintext_server".into(),
                 value: Some("true".into()),
             },
+            // Where every recording on the device is saved: root's on a
+            // root-mode install, though the remote switches beside it are the
+            // person's.
+            Request::ConfigSet {
+                key: "record_dir".into(),
+                value: Some("/home/a/Videos".into()),
+            },
             Request::ConfigSet {
                 key: "files_dir_x".into(),
                 value: Some("1".into()),
@@ -8013,16 +8145,11 @@ mod tests {
                 value: None,
             },
             Request::ConfigCleanupStale,
-            Request::RecordStop,
-            Request::RecordingsList,
             Request::EncoderCaps,
             Request::HiveUpdateHold,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
-            Request::RecordingDelete {
-                name: "x.mp4".into(),
-            },
             // FR-90 P3-9-2b — the owner's grants, never the seat's.
             Request::Connect {
                 args: ConnectArgs::default(),
@@ -8140,7 +8267,10 @@ mod tests {
     fn the_console_person_key_table_is_the_person_sockets_allowlist() {
         // The classification, key by key, with the FR that made it so.
         let expected: &[(&str, &str, bool)] = &[
-            ("record_dir", "FR-85", true),
+            // Console-gated on the daemon's own endpoint, and NOT the
+            // person's on a root-mode install: there it is where every
+            // recording on the device is saved.
+            ("record_dir", "FR-85", false),
             ("record_remote_enabled", "FR-85", true),
             ("record_remote_audio", "FR-85", true),
             ("files_dir", "FR-84 D4", true),
@@ -8171,19 +8301,25 @@ mod tests {
                 "{key}'s refusal names the console person: {}",
                 k.refusal
             );
-            // The one entry kept off the person socket says why.
-            assert_eq!(
-                k.why_not_person_socket.is_empty(),
-                !k.person_socket.is_empty(),
-                "{key}"
-            );
+            // A key kept off the person socket has its entry say why.
+            if !on_person_socket {
+                assert!(!k.why_not_person_socket.is_empty(), "{key}: say why");
+            }
+        }
+        // ...and an entry says why only when it does keep a key off.
+        for k in CONSOLE_PERSON_KEYS {
+            let kept_off = expected
+                .iter()
+                .any(|(key, _, on)| !on && k.keys.matches(key));
+            assert_eq!(!k.why_not_person_socket.is_empty(), kept_off, "{k:?}");
         }
         // #2871 (review) — what the person socket admits is a LIST of exact
         // keys, each under the entry that console-gates it, and it is exactly
         // this one. A new key here is a security decision: is it the person
         // at the seat's own call on a ROOT install, where the setting is the
-        // whole device's? Where files and recordings land and what a session
-        // may take from their screen are; the device's server link is not.
+        // whole device's? Where their incoming files land and what a session
+        // may take from their screen are; where every recording is saved and
+        // the device's server link are not.
         let admitted: Vec<&str> = CONSOLE_PERSON_KEYS
             .iter()
             .flat_map(|k| {
@@ -8196,7 +8332,6 @@ mod tests {
         assert_eq!(
             admitted,
             [
-                "record_dir",
                 "record_remote_enabled",
                 "record_remote_audio",
                 "files_dir",
@@ -8369,7 +8504,7 @@ mod tests {
         // Their own keys reach the state (the mock has no config surface: a
         // DIFFERENT error, so both gates demonstrably passed).
         for line in [
-            r#"{"t":"config_set","d":{"key":"record_dir","value":"/Users/a/Movies"}}"#,
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
             r#"{"t":"config_set","d":{"key":"files_dir"}}"#,
             r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"false"}}"#,
             r#"{"t":"config_set","d":{"key":"privacy_mode_allowed","value":"true"}}"#,
@@ -8390,6 +8525,7 @@ mod tests {
             "remote_config_enabled",
             "overlay_enabled",
             "allow_plaintext_server",
+            "record_dir",
             "auto_grant_session",
             "no_such_key",
         ] {
@@ -8411,7 +8547,7 @@ mod tests {
         // A peer the OS said nothing about never passes, on this socket either.
         let r = ask_scoped(
             SEAT,
-            r#"{"t":"config_set","d":{"key":"record_dir","value":"/tmp/x"}}"#,
+            r#"{"t":"config_set","d":{"key":"record_remote_enabled","value":"true"}}"#,
         )
         .await;
         assert!(is_console_refusal(&r), "{r:?}");
@@ -8567,6 +8703,7 @@ mod tests {
         let listing = vec![
             entry("exec_enabled"),
             entry("record_dir"),
+            entry("record_remote_enabled"),
             entry("overlay_enabled"),
             entry("files_dir"),
             entry("allow_plaintext_server"),
@@ -8586,6 +8723,7 @@ mod tests {
             marked,
             [
                 "exec_enabled",
+                "record_dir",
                 "overlay_enabled",
                 "allow_plaintext_server",
                 "ssh_enabled"
@@ -8608,6 +8746,79 @@ mod tests {
             entry: entry("record_dir"),
         };
         assert_eq!(person_view(updated.clone()), updated);
+    }
+
+    /// FR-85 P2e — who may start, stop or delete a recording. The daemon's own
+    /// endpoints keep the console gate. On a system install's person socket
+    /// that gate can never pass: it compares the peer with the daemon, which
+    /// is root, and the person is not root.
+    #[test]
+    fn the_recording_decision_table() {
+        let unix = |u| ClientPeer {
+            uid: Some(u),
+            ..ClientPeer::UNKNOWN
+        };
+        let win = |s| ClientPeer {
+            session_id: Some(s),
+            ..ClientPeer::UNKNOWN
+        };
+        let full = Scope::Full;
+        let person = Scope::Person { owner_uid: 1000 };
+        // The person at the seat of a system install, on their own socket.
+        assert!(peer_may_record(&unix(1000), person, None, Some(0)));
+        assert!(
+            !peer_is_console_user(&unix(1000), None, Some(0)),
+            "the gate this one widens"
+        );
+        // Another account is not the seat's person, even on the socket made
+        // for one (#2871's review: the uid is checked here, not only by the
+        // listener).
+        assert!(!peer_may_record(&unix(1001), person, None, Some(0)));
+        // Root passes there as it does on its own socket.
+        assert!(peer_may_record(&unix(0), person, None, Some(0)));
+        // The daemon's own endpoints: nothing moved. A root daemon's socket
+        // refuses anyone else, and a per-user daemon's serves its owner.
+        assert!(peer_may_record(&unix(0), full, None, Some(0)));
+        assert!(!peer_may_record(&unix(1000), full, None, Some(0)));
+        assert!(peer_may_record(&unix(501), full, None, Some(501)));
+        assert!(!peer_may_record(&unix(502), full, None, Some(501)));
+        // Windows: the console session, RDP refused.
+        assert!(peer_may_record(&win(1), full, Some(1), None));
+        assert!(!peer_may_record(&win(2), full, Some(1), None));
+        // Fail closed.
+        for scope in [full, person] {
+            assert!(!peer_may_record(
+                &ClientPeer::UNKNOWN,
+                scope,
+                Some(1),
+                Some(0)
+            ));
+        }
+    }
+
+    /// FR-85 P2e — the person at a system install's seat works their own
+    /// recordings on their own socket, past both gates, and a peer the listener
+    /// could not name still is not them.
+    #[tokio::test]
+    async fn the_person_at_the_seat_records_on_their_own_socket() {
+        let person = || ClientPeer {
+            uid: Some(1000),
+            ..ClientPeer::UNKNOWN
+        };
+        let seat = Scope::Person { owner_uid: 1000 };
+        for line in [
+            r#"{"t":"record_start","d":{}}"#,
+            r#"{"t":"record_stop"}"#,
+            r#"{"t":"recording_delete","d":{"name":"x.mp4"}}"#,
+        ] {
+            let r = ask_scoped_as(seat, person(), line).await;
+            assert!(!is_person_refusal(&r), "{line} → {r:?}");
+            assert!(!is_console_refusal(&r), "{line} → {r:?}");
+            let r = ask_scoped_as(seat, ClientPeer::UNKNOWN, line).await;
+            assert!(is_console_refusal(&r), "{line} → {r:?}");
+        }
+        let r = ask_scoped_as(seat, person(), r#"{"t":"recordings_list"}"#).await;
+        assert!(!is_person_refusal(&r), "{r:?}");
     }
 
     /// FR-97 P2h — the person's view of the peers keeps the link and drops
@@ -8782,7 +8993,7 @@ mod tests {
         // to the state (the mock has no config surface: a different error);
         // a device-owned gate is refused by name, before any handler.
         wr.write_all(
-            b"{\"t\":\"config_set\",\"d\":{\"key\":\"record_dir\",\"value\":\"/tmp/r\"}}\n",
+            b"{\"t\":\"config_set\",\"d\":{\"key\":\"record_remote_enabled\",\"value\":\"true\"}}\n",
         )
         .await
         .unwrap();

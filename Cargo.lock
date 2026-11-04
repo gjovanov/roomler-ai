@@ -2633,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "derp-relay"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -8854,7 +8854,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-api"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8909,7 +8909,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-config"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "config",
  "serde",
@@ -8919,7 +8919,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-db"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "bson",
  "chrono",
@@ -8934,7 +8934,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-chat"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8955,7 +8955,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-conference"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8966,6 +8966,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "mediasoup",
+ "rand 0.9.4",
  "roomler-ai-config",
  "roomler-ai-db",
  "roomler-ai-mod-chat",
@@ -8977,16 +8978,18 @@ dependencies = [
  "sha1 0.10.6",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "roomler-ai-mod-fleet"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bson",
  "chrono",
  "dashmap",
@@ -8995,6 +8998,7 @@ dependencies = [
  "ipnet",
  "mongodb",
  "parking_lot 0.12.5",
+ "rand 0.9.4",
  "reqwest 0.12.28",
  "roomler-ai-config",
  "roomler-ai-db",
@@ -9011,7 +9015,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-hive"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9035,7 +9039,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-knowhow"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9059,7 +9063,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-network"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9088,7 +9092,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-remote"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9109,7 +9113,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-saas"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "axum",
@@ -9132,7 +9136,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-mod-vault"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "age",
  "anyhow",
@@ -9161,7 +9165,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-remote-control"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.1",
@@ -9185,7 +9189,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-services"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "argon2 0.5.3",
@@ -9228,10 +9232,11 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tests"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "age",
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bson",
@@ -9280,7 +9285,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-ai-tunnel-core"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9317,6 +9322,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "tracing-subscriber",
  "tun",
  "turn",
  "webrtc",
@@ -9326,7 +9332,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-cli"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9366,7 +9372,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-cli-shim"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "embed-resource",
  "libc",
@@ -9375,7 +9381,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-core"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9406,7 +9412,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-desktop"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "gethostname 0.5.0",
@@ -9433,7 +9439,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-hive-node"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "blake3",
  "rusqlite",
@@ -9446,7 +9452,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-localapi"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "async-trait",
  "libc",
@@ -9459,7 +9465,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-node-core"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "bson",
@@ -9472,6 +9478,7 @@ dependencies = [
  "roomler-ai-tunnel-core",
  "roomler-localapi",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -9486,19 +9493,22 @@ dependencies = [
 
 [[package]]
 name = "roomler-setup"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "directories",
  "gethostname 0.5.0",
+ "quote",
  "reqwest 0.12.28",
  "roomler-ai-remote-control",
  "roomler-cli",
+ "roomler-localapi",
  "roomler-node-core",
  "roomler-setup-core",
  "roomlerd",
  "serde",
  "serde_json",
+ "syn 2.0.117",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
@@ -9515,7 +9525,7 @@ dependencies = [
 
 [[package]]
 name = "roomler-setup-core"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9538,7 +9548,7 @@ dependencies = [
 
 [[package]]
 name = "roomlerd"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "anyhow",
  "arboard",
@@ -9620,6 +9630,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-appender",
+ "tracing-core",
  "tracing-subscriber",
  "webrtc",
  "windows 0.58.0",
@@ -9631,6 +9642,14 @@ dependencies = [
  "zbus",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "roomlerdw"
+version = "0.4.199"
+dependencies = [
+ "embed-resource",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10369,6 +10388,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -11874,7 +11903,7 @@ dependencies = [
 
 [[package]]
 name = "tcp-turn-conn"
-version = "0.4.174"
+version = "0.4.199"
 dependencies = [
  "async-trait",
  "log",

@@ -9,6 +9,13 @@ edition.workspace = true
 name = "roomler_ai_tests"
 path = "src/lib.rs"
 
+# #3280 — the probe spawns `current_exe()`, so this binary has to be the child as
+# well as the test, and its `main` has to be its own.
+[[test]]
+name = "caps_probe_retry"
+path = "tests/caps_probe_retry.rs"
+harness = false
+
 [dependencies]
 roomler-ai-config = { path = "../config" }
 roomler-ai-db = { path = "../db" }
@@ -65,6 +72,8 @@ tempfile = { workspace = true }
 tokio-test = "0.4"
 tokio-tungstenite = "0.26"
 futures.workspace = true
+# #2552 — a test lifecycle on the agent socket holds a teardown at one step.
+async-trait.workspace = true
 # FR-90 P0f — the canary test's browser writes binary DataChannel frames.
 bytes = "1"
 # FR-102 P5 — the newsletter tests sign SendGrid Event Webhook batches with a

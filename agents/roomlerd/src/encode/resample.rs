@@ -458,16 +458,16 @@ pub(crate) fn apply_target_resolution(
     }
     let scale = (tw as f32 / frame.width as f32).min(th as f32 / frame.height as f32);
     let downscaled = if use_lanczos_for_scale(scale, lanczos_min_scale(), lanczos_enabled()) {
-        rs.lanczos3(&frame.data, frame.width, frame.height, frame.stride, tw, th)
+        rs.lanczos3(frame.cpu(), frame.width, frame.height, frame.stride, tw, th)
     } else {
-        downscale_bgra_box(&frame.data, frame.width, frame.height, frame.stride, tw, th)
+        downscale_bgra_box(frame.cpu(), frame.width, frame.height, frame.stride, tw, th)
     };
     Arc::new(Frame {
         width: tw,
         height: th,
         stride: tw * 4,
         pixel_format: PixelFormat::Bgra,
-        data: downscaled,
+        data: downscaled.into(),
         monotonic_us: frame.monotonic_us,
         monitor: frame.monitor,
         // P8a — damage survives the resample (it used to be dropped
@@ -582,7 +582,7 @@ mod tests {
             height: h,
             stride: w * 4,
             pixel_format: PixelFormat::Bgra,
-            data: vec![0u8; (w * h * 4) as usize],
+            data: vec![0u8; (w * h * 4) as usize].into(),
             monotonic_us: 0,
             monitor: 0,
             damage: Damage::Unknown,

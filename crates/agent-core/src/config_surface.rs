@@ -400,6 +400,14 @@ const KEYS: &[KeyMeta] = &[
         description: "macOS only. Let the root daemon spawn and babysit the GUI-session worker (FR-43 P1). Stands down whenever the LaunchAgent is loaded, so one enrollment is never served twice. Default: OFF.",
     },
     KeyMeta {
+        key: "macos_one_row",
+        group: Group::Device,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "macOS only. One device row: the root daemon's GUI worker runs with no enrollment of its own, and a person's enrollment on this Mac is ignored (FR-43 P3). Needs macos_supervise_gui_worker. Default: OFF.",
+    },
+    KeyMeta {
         key: "power_policy",
         group: Group::Device,
         tier: Tier::Essential,
@@ -623,6 +631,14 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "bool",
         description: "FR-90 - run every agent session on this device in Claude Code's sandbox: its commands reach only the hosts the organization's vault allows the session's role (net:egress), through a proxy in this daemon, and write only to their working directory, temp, and the session's own cache. A session is refused where the sandbox cannot run: Linux without bubblewrap and socat, Claude Code before 2.1.285. On Windows, where no sandbox runs, every session gets the proxy named in its environment, advisory. Only with vault_enabled. Never settable by the server. Default: OFF.",
+    },
+    KeyMeta {
+        key: "hive_worker",
+        group: Group::Access,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "bool",
+        description: "FR-90 - run a worker beside each agent session on this device, and one for the device itself (roomlerd hive-worker, the daemon's own supervised child), so a fault in what one serves costs that worker and never the daemon. Builds with the vault run the device's. Read as the daemon starts. Never settable by the server. Default: OFF.",
     },
     // FR-90 P4-3b-1 — what a knowhow scan reads (decision 38): the device's,
     // like every Hive key, and absent from `DesiredConfig`, since a server
@@ -893,6 +909,14 @@ const KEYS: &[KeyMeta] = &[
         description: "LEGACY ReplacedByNewer escalation: exit the process after 3 displacements in the window instead of backing off in-process. Built-in default: off (W4d — zombie-WS storms must not tear down the overlay).",
     },
     KeyMeta {
+        key: "ws_flat_redial",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-28: while the front load balancer answers 502 (a pod roll: its pin has no process behind it), redial the control WS and the central /derp WS every 0.5-1 s instead of climbing the backoff ladder, so a socket is back within a second of the replacement pod listening. Default OFF. Only a 502 at the upgrade is flat: every other failure, and a server that accepts and drops, keeps the ladder. Bounded at 30 flat redials per outage per socket, refilled by a connection that lived 30 s or a network change; a 502 that outlasts them climbs the ladder from where it stood. Regional relays keep their ladder. Env: ROOMLERD_WS_FLAT_REDIAL. Restart required.",
+    },
+    KeyMeta {
         key: "overlay_warm_relay",
         group: Group::NetworkCarriers,
         tier: Tier::Advanced,
@@ -982,6 +1006,16 @@ const KEYS: &[KeyMeta] = &[
         kind: "number",
         description: "netstate - debounce window in ms coalescing OS signal bursts (a VPN connect \
          injects dozens of routes) into one delta (100-5000). Built-in default: 750.",
+    },
+    KeyMeta {
+        key: "overlay_netchange_poke_quiet_secs",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "number",
+        description: "Seconds a network signal that changed nothing waits behind the last forced \
+         rekey of the direct peers (0-3600). A real network move never waits. 0 lets every such \
+         signal rekey, as it did before. Built-in default: 60.",
     },
     KeyMeta {
         key: "netstack_socks_port",
@@ -1365,7 +1399,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing agent-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
+        description: "FR-56 P4 - capture ONE application window instead of the whole monitor (the RAIL-shaped half of Remote Apps: the viewer sees one app, not the desktop). Built-in default: OFF. ** ATTENDED BY CONSTRUCTION - the portal answers this by showing the person at the screen a WINDOW PICKER, and nothing agent-side can name a window (GNOME refuses Introspect.GetWindows), so on an unattended host the capture never starts.** Needs portal_capture on as well, and drm_capture not on: DRM is tried first. Env: ROOMLERD_WINDOW_CAPTURE. Restart required.",
     },
     KeyMeta {
         key: "wayland_aware",
@@ -1613,7 +1647,7 @@ const KEYS: &[KeyMeta] = &[
         tier: Tier::Advanced,
         live: false,
         kind: "tribool",
-        description: "Pump stall watch (2026-09-03, FR-65 P0). Default ON: a send-pump iteration slower than pump_stall_warn_ms is logged once with its phase breakdown (capture/scale/encode/apply/send), and the per-heartbeat apply_us / apply_us_max / iter_us_max / pump_stalls counters are published. Costs two Instant::now() per iteration (~20-40ns against a 16.7ms budget at 60fps) and logs nothing until an iteration actually overruns. It exists because a 2s blocking encoder open hid for months: the pump measured capture/scale/encode/send and the stall appeared in NONE of them - the apply/rebuild phase was untimed, and a per-heartbeat AVERAGE cannot represent a single outlier even where it is counted. false = no timing, no counters. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
+        description: "Pump stall watch (FR-65 P0). Default ON: a send-pump pass whose WORK (time not spent waiting for a frame or a pacing slot) reaches pump_stall_warn_ms is logged at most every 2 s with its 17-phase breakdown and the untimed remainder (other_ms); each heartbeat publishes iter_ms_max, pump_stalls and passes, and the rate governor's FR-79 gate reads the stall count. Its cost is measured, not estimated: `roomlerd stall-watch-cost` A/Bs it on the host (NEO16, 2026-10-30: at most 1.09 us a pass, 0.035% of the frame budget at the fleet's busiest pass rate). It exists because a 2s blocking encoder open hid for months: the pump timed capture/scale/encode/send and the stall was in NONE of them. false = no pass marks, no verdict, none of the watch-only timers - AND the governor's agent_stalled gate goes blind (it reads 0 stalls on every window), so this is not a pure instrument switch. Env: ROOMLERD_PUMP_STALL_WATCH. Restart required.",
     },
     KeyMeta {
         key: "pump_stall_warn_ms",
@@ -1808,12 +1842,28 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-77 P3 - cache the hardware encoder probe across daemon restarts, keyed by GPU + driver + OS build + roomlerd build; re-probed on any change or after 7 days. Built-in default: on. Env: ROOMLERD_CAPS_CACHE.",
     },
     KeyMeta {
+        key: "caps_learn_deny",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "#3267 - when the encoder probe's child dies inside one encoder cell, run it again and cost that cell rather than every hardware encoder on the host. Off: one child, and its death means no hardware. Built-in default: on. Env: ROOMLERD_CAPS_LEARN_DENY. Restart required.",
+    },
+    KeyMeta {
+        key: "caps_probe_retry",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "#3280 - when the encoder probe's first answer ran short of time, try again by itself, with more time and no restart, giving way to any session. Off: that answer stands until the next start. Built-in default: on. Env: ROOMLERD_CAPS_PROBE_RETRY. Restart required.",
+    },
+    KeyMeta {
         key: "encoder_cells_deny",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
         live: false,
         kind: "string",
-        description: "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
+        description: "FR-77 - encoder cells this device must not open or advertise: comma-separated name:chroma entries (e.g. hevc_qsv:yuv444). Empty = the built-in list (hevc_qsv:yuv444, hevc_vaapi:yuv444, vp9_qsv:yuv444, vp9_vaapi:yuv444); `none` = deny nothing. A cell the encoder probe learned to deny stays denied on top of this list (caps_learn_deny). Env: ROOMLERD_ENCODER_CELLS_DENY. Pushable through remote config. Restart required.",
     },
     KeyMeta {
         key: "fps_high",
@@ -1830,6 +1880,30 @@ const KEYS: &[KeyMeta] = &[
         live: false,
         kind: "string",
         description: "FR-119 - frame rates above 60 this device must not grant: comma-separated name:fps entries (e.g. hevc_qsv:120), `*` for every encoder (e.g. *:144). Empty or `none` = deny nothing. Env: ROOMLERD_FPS_DENY. Pushable through remote config. Restart required.",
+    },
+    KeyMeta {
+        key: "zero_copy",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-118 - keep a captured frame on the GPU until the encoder takes it, without a CPU copy, once the capability probe has proven that encoder's GPU-input form: the SystemContext DXGI capture's frames go to QSV (hevc_qsv, av1_qsv, h264_qsv), the WGC capture's to NVENC (hevc_nvenc, av1_nvenc, h264_nvenc), and on macOS the display stream's to VideoToolbox (hevc_videotoolbox, h264_videotoolbox). Built-in default: off. Env: ROOMLERD_ZERO_COPY. Restart required.",
+    },
+    KeyMeta {
+        key: "color_description",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-130 - every encoder writes the colour description it converted with (the BT.601 matrix at limited range) into its stream: the H.264/HEVC SPS VUI, the AV1 sequence header, the VP9 header. Without it a browser decodes an HD picture as BT.709 and shifts every saturated colour. Built-in default: on; off writes the undescribed stream of earlier agents. Env: ROOMLERD_COLOR_DESCRIPTION. Pushable through remote config. Restart required.",
+    },
+    KeyMeta {
+        key: "zero_copy_deny",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "string",
+        description: "FR-118 - GPU-input cells this device must not open, by the probe or by a session: comma-separated name:gpu entries (e.g. hevc_qsv:gpu). Empty or `none` = deny nothing. Env: ROOMLERD_ZERO_COPY_DENY. Pushable through remote config (FR-132). Restart required.",
     },
     KeyMeta {
         key: "nvenc_split",
@@ -2072,6 +2146,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "files_dir" => cfg.files_dir.clone(),
         "exec_enabled" => Some(fmt_bool(cfg.exec_enabled)),
         "macos_supervise_gui_worker" => Some(fmt_bool(cfg.macos_supervise_gui_worker)),
+        "macos_one_row" => Some(fmt_bool(cfg.macos_one_row)),
         "power_policy" => Some(if cfg.power_policy.is_empty() {
             "never".to_string()
         } else {
@@ -2108,6 +2183,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "hive_net" => Some(fmt_bool(cfg.hive_net)),
         "hive_ssh" => Some(fmt_bool(cfg.hive_ssh)),
         "hive_egress" => Some(fmt_bool(cfg.hive_egress)),
+        "hive_worker" => Some(fmt_bool(cfg.hive_worker)),
         "knowhow_scan_roots" => Some(cfg.knowhow_scan_roots.join(",")),
         "knowhow_scan_listeners" => Some(fmt_bool(cfg.knowhow_scan_listeners)),
         "knowhow_probe_reach" => Some(cfg.knowhow_probe_reach.join(",")),
@@ -2139,6 +2215,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_init_auth_first" => cfg.overlay_init_auth_first.map(fmt_bool),
         "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
+        "ws_flat_redial" => cfg.ws_flat_redial.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage.map(fmt_bool),
@@ -2150,6 +2227,9 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_route_tick_secs" => cfg.overlay_route_tick_secs.map(|v| v.to_string()),
         "overlay_netmon" => cfg.overlay_netmon.map(fmt_bool),
         "overlay_netmon_debounce_ms" => cfg.overlay_netmon_debounce_ms.map(|v| v.to_string()),
+        "overlay_netchange_poke_quiet_secs" => {
+            cfg.overlay_netchange_poke_quiet_secs.map(|v| v.to_string())
+        }
         "netstack_socks_port" => cfg.netstack_socks_port.map(|v| v.to_string()),
         "localapi_pipe_pool" => cfg.localapi_pipe_pool.map(|v| v.to_string()),
         "rc_max_sessions" => cfg.rc_max_sessions.map(|v| v.to_string()),
@@ -2259,9 +2339,14 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "relay_probe" => cfg.relay_probe.map(fmt_bool),
         "text_mod_neutralize" => cfg.text_mod_neutralize.map(fmt_bool),
         "caps_cache" => cfg.caps_cache.map(fmt_bool),
+        "caps_learn_deny" => cfg.caps_learn_deny.map(fmt_bool),
+        "caps_probe_retry" => cfg.caps_probe_retry.map(fmt_bool),
         "fps_high" => cfg.fps_high.map(fmt_bool),
         "encoder_cells_deny" => cfg.encoder_cells_deny.clone(),
         "fps_deny" => cfg.fps_deny.clone(),
+        "zero_copy" => cfg.zero_copy.map(fmt_bool),
+        "color_description" => cfg.color_description.map(fmt_bool),
+        "zero_copy_deny" => cfg.zero_copy_deny.clone(),
         "nvenc_split" => cfg.nvenc_split.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
@@ -2342,6 +2427,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "macos_supervise_gui_worker" => {
             cfg.macos_supervise_gui_worker = parse_bool_or(value, false)?
         }
+        "macos_one_row" => cfg.macos_one_row = parse_bool_or(value, false)?,
         // FR-55 — validated HERE rather than at read time, so a typo is
         // refused when it is made instead of silently becoming `never` weeks
         // later on a device nobody is looking at.
@@ -2469,6 +2555,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "hive_net" => cfg.hive_net = parse_bool_or(value, false)?,
         "hive_ssh" => cfg.hive_ssh = parse_bool_or(value, false)?,
         "hive_egress" => cfg.hive_egress = parse_bool_or(value, false)?,
+        "hive_worker" => cfg.hive_worker = parse_bool_or(value, false)?,
         // Clearing empties the list: nothing is read, the fail-safe direction.
         "knowhow_scan_roots" => {
             cfg.knowhow_scan_roots = parse_absolute_list("knowhow_scan_roots", value)?
@@ -2616,6 +2703,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_init_auth_first" => cfg.overlay_init_auth_first = parse_tribool(value)?,
         "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
+        "ws_flat_redial" => cfg.ws_flat_redial = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage = parse_tribool(value)?,
@@ -2685,6 +2773,25 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                         );
                     }
                     Some(ms)
+                }
+            }
+        }
+        "overlay_netchange_poke_quiet_secs" => {
+            cfg.overlay_netchange_poke_quiet_secs = match value
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => None,
+                Some(v) => {
+                    let s: u32 = v.parse().map_err(|_| {
+                        format!("overlay_netchange_poke_quiet_secs must be a number (got {v:?})")
+                    })?;
+                    if s > 3600 {
+                        return Err(
+                            "overlay_netchange_poke_quiet_secs must be between 0 and 3600".into(),
+                        );
+                    }
+                    Some(s)
                 }
             }
         }
@@ -2888,7 +2995,11 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "relay_probe" => cfg.relay_probe = parse_tribool(value)?,
         "text_mod_neutralize" => cfg.text_mod_neutralize = parse_tribool(value)?,
         "caps_cache" => cfg.caps_cache = parse_tribool(value)?,
+        "caps_learn_deny" => cfg.caps_learn_deny = parse_tribool(value)?,
+        "caps_probe_retry" => cfg.caps_probe_retry = parse_tribool(value)?,
         "fps_high" => cfg.fps_high = parse_tribool(value)?,
+        "zero_copy" => cfg.zero_copy = parse_tribool(value)?,
+        "color_description" => cfg.color_description = parse_tribool(value)?,
         "vaapi_device" => {
             cfg.vaapi_device = value
                 .map(str::trim)
@@ -2931,6 +3042,15 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 None => None,
                 Some(v) => {
                     validate_fps_denylist(v)?;
+                    Some(v.to_string())
+                }
+            }
+        }
+        "zero_copy_deny" => {
+            cfg.zero_copy_deny = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    validate_zero_copy_denylist(v)?;
                     Some(v.to_string())
                 }
             }
@@ -3144,6 +3264,39 @@ pub fn validate_fps_denylist(v: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// FR-118 — `zero_copy_deny` entries are `name:gpu`: a plain FFmpeg encoder
+/// name and the input path, which is `gpu` (the only one a denylist can take
+/// away). Validated for the reason `validate_denylist` is: an entry that
+/// matches nothing is inert, and the operator would read it as in force. The
+/// single word `none` denies nothing.
+pub fn validate_zero_copy_denylist(v: &str) -> Result<(), String> {
+    if v.trim().eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+    for entry in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((name, path)) = entry.split_once(':') else {
+            return Err(format!(
+                "zero_copy_deny entry {entry:?} must be name:gpu (e.g. hevc_qsv:gpu)"
+            ));
+        };
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(format!(
+                "zero_copy_deny entry {entry:?}: the encoder name must be a plain FFmpeg name (lowercase, digits, underscores)"
+            ));
+        }
+        if path != "gpu" {
+            return Err(format!(
+                "zero_copy_deny entry {entry:?}: the input path must be gpu"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn fmt_bool(b: bool) -> String {
     if b { "true" } else { "false" }.to_string()
 }
@@ -3350,6 +3503,29 @@ mod tests {
             let echoed = entry_for(&cfg, &e.key).expect("known key");
             assert_eq!(echoed.value, e.value, "roundtrip for {}", e.key);
         }
+    }
+
+    /// FR-55 AC6 — the macOS clamshell limit is said where the policy is set.
+    /// This description is what the companion's settings row shows
+    /// (`settings.js` renders `entry.description`) and what
+    /// `roomler config set power_policy` prints its ⚠️ sentence from on a Mac
+    /// (`config_set_note`). A rewrite that drops the warning fails here, not
+    /// on a Mac whose lid-closed sleep seems to ignore the setting.
+    #[test]
+    fn the_power_policy_says_a_closed_lid_still_sleeps_a_mac() {
+        let m = KEYS
+            .iter()
+            .find(|m| m.key == "power_policy")
+            .expect("power_policy is listed");
+        let d = m.description;
+        let warning = &d[d.find("⚠️").expect("a ⚠️ sentence")..];
+        assert!(warning.starts_with("⚠️ macOS clamshell sleep"), "{d}");
+        assert!(
+            warning.contains("lid closed") && warning.contains("ignores it"),
+            "{d}"
+        );
+        // `config_set_note` cuts the sentence at its ". ".
+        assert!(warning.contains(". "), "{d}");
     }
 
     /// FR-84 D2 — `restart_required` is the truth PER KEY, not a blanket.
@@ -4134,6 +4310,30 @@ mod tests {
         );
     }
 
+    /// FR-28 — the flat redial is opt-in, reaches the daemon through the env
+    /// bridge under the spelling `FlatRedial` reads, and clears back to the
+    /// built-in default.
+    #[test]
+    fn ws_flat_redial_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(cfg.ws_flat_redial, None, "built-in default is OFF");
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("WS_FLAT_REDIAL"),
+            "an unset key must not reach the daemon's env at all"
+        );
+        apply(&mut cfg, "ws_flat_redial", Some("on")).unwrap();
+        assert_eq!(cfg.ws_flat_redial, Some(true));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("WS_FLAT_REDIAL")
+                .map(String::as_str),
+            Some("1"),
+            "what the bridge writes for true, which FlatRedial's gate reads as on"
+        );
+        apply(&mut cfg, "ws_flat_redial", None).unwrap();
+        assert_eq!(cfg.ws_flat_redial, None, "clear → built-in default");
+    }
+
     /// W4(d) — the legacy ReplacedByNewer process-exit escalation is
     /// opt-in via `ws_replaced_exit`; the built-in default (cleared) is
     /// the in-process backoff ladder.
@@ -4443,6 +4643,30 @@ mod tests {
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("1")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("301")).is_err());
         assert!(apply(&mut cfg, "overlay_route_tick_secs", Some("fast")).is_err());
+    }
+
+    /// FR-65 P3 — `0` is the kill switch, so it has to survive the round trip
+    /// and reach the env bridge as a value, not as an unset key.
+    #[test]
+    fn overlay_netchange_poke_quiet_secs_set_echo_clear_and_validate() {
+        let key = "overlay_netchange_poke_quiet_secs";
+        let mut cfg = crate::config::test_fixture();
+        apply(&mut cfg, key, Some("0")).unwrap();
+        assert_eq!(cfg.overlay_netchange_poke_quiet_secs, Some(0));
+        assert_eq!(entry_for(&cfg, key).unwrap().value.as_deref(), Some("0"));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+                .map(String::as_str),
+            Some("0")
+        );
+        apply(&mut cfg, key, None).unwrap();
+        assert_eq!(cfg.overlay_netchange_poke_quiet_secs, None);
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("OVERLAY_NETCHANGE_POKE_QUIET_SECS")
+        );
+        assert!(apply(&mut cfg, key, Some("3601")).is_err());
+        assert!(apply(&mut cfg, key, Some("soon")).is_err());
     }
 
     #[test]
@@ -4953,6 +5177,23 @@ mod tests {
         assert!(apply(&mut cfg, "hive_egress", Some("sometimes")).is_err());
     }
 
+    /// FR-90 P8-2a-1 — whether a session here gets a worker beside it: off
+    /// until the owner says so, off again when cleared, and read at start.
+    #[test]
+    fn hive_worker_defaults_off_and_clears_off() {
+        let mut cfg = crate::config::test_fixture();
+        assert!(!cfg.hive_worker);
+        let e = entry_for(&cfg, "hive_worker").unwrap();
+        assert_eq!(e.default.as_deref(), Some("false"));
+        assert_eq!(e.group, Group::Access.wire());
+        assert!(e.restart_required, "the hive snapshot is read at start");
+        apply(&mut cfg, "hive_worker", Some("true")).unwrap();
+        assert!(cfg.hive_worker);
+        apply(&mut cfg, "hive_worker", None).unwrap();
+        assert!(!cfg.hive_worker, "cleared is off");
+        assert!(apply(&mut cfg, "hive_worker", Some("sometimes")).is_err());
+    }
+
     /// FR-90 P3-8-2b-2 — so is whether a session here may run a command on
     /// another device: off until the owner says so, off again when cleared,
     /// and read at start.
@@ -5233,7 +5474,6 @@ mod tests {
                 "external_access_enabled",
                 "external_consent_mode",
                 "external_max_permissions",
-                "record_dir",
                 "record_remote_enabled",
                 "record_remote_audio",
                 "keep_busy_enabled",
@@ -5246,8 +5486,8 @@ mod tests {
                 "rc_audio",
             ],
             "the keys the person-at-the-device socket of a ROOT install lets the person at the \
-             seat set changed. Does the new one belong to that person — where their files and \
-             recordings land, what a session may take from their screen — or to the device, \
+             seat set changed. Does the new one belong to that person — where their incoming \
+             files land, what a session may take from their screen — or to the device, \
              which on a root install everyone who sits there later shares? Only the first kind \
              goes in `localapi::CONSOLE_PERSON_KEYS`' `person_socket` lists"
         );
@@ -5427,6 +5667,41 @@ mod tests {
         assert_eq!(cfg.caps_cache, None);
     }
 
+    /// #3267 — the learned deny's kill switch reaches the daemon the same way,
+    /// and unset publishes nothing (on).
+    #[test]
+    fn caps_learn_deny_is_a_tribool_that_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "caps_learn_deny").unwrap().kind, "tribool");
+        apply(&mut cfg, "caps_learn_deny", Some("0")).unwrap();
+        assert_eq!(cfg.caps_learn_deny, Some(false));
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(s, v)| *s == "CAPS_LEARN_DENY" && *v == Some(false)),
+            "the kill switch must reach the daemon through the S2 bridge"
+        );
+        apply(&mut cfg, "caps_learn_deny", None).unwrap();
+        assert_eq!(cfg.caps_learn_deny, None);
+    }
+
+    /// #3280 — and so does the retry's.
+    #[test]
+    fn caps_probe_retry_is_a_tribool_that_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "caps_probe_retry").unwrap().kind, "tribool");
+        apply(&mut cfg, "caps_probe_retry", Some("0")).unwrap();
+        assert_eq!(cfg.caps_probe_retry, Some(false));
+        assert!(
+            crate::config::env_bridge_bools(&cfg)
+                .iter()
+                .any(|(s, v)| *s == "CAPS_PROBE_RETRY" && *v == Some(false)),
+            "the kill switch must reach the daemon through the S2 bridge"
+        );
+        apply(&mut cfg, "caps_probe_retry", None).unwrap();
+        assert_eq!(cfg.caps_probe_retry, None);
+    }
+
     /// FR-119 — `fps_high` is a tribool that reaches the daemon as
     /// `ROOMLERD_FPS_HIGH`, and unset publishes nothing (off).
     #[test]
@@ -5445,6 +5720,137 @@ mod tests {
         assert_eq!(bridged(&cfg), Some(Some(true)));
         apply(&mut cfg, "fps_high", None).unwrap();
         assert_eq!(cfg.fps_high, None);
+    }
+
+    /// FR-118 — `zero_copy` is a tribool that reaches the daemon (and the probe
+    /// child) as `ROOMLERD_ZERO_COPY`, unset publishing nothing (off), and
+    /// `zero_copy_deny` sets, echoes, clears and refuses an entry that could
+    /// only ever deny nothing. Both shipped env-only in P2-1/P2-2; this closes
+    /// that gap (the every-new-env-gets-a-config-key rule).
+    #[test]
+    fn zero_copy_and_its_denylist_set_echo_clear_and_bridge() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(entry_for(&cfg, "zero_copy").unwrap().kind, "tribool");
+        let bridged = |cfg: &crate::config::AgentConfig| {
+            crate::config::env_bridge_bools(cfg)
+                .iter()
+                .find(|(s, _)| *s == "ZERO_COPY")
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(bridged(&cfg), Some(None), "unset: bridged as nothing");
+        apply(&mut cfg, "zero_copy", Some("on")).unwrap();
+        assert_eq!(cfg.zero_copy, Some(true));
+        assert_eq!(bridged(&cfg), Some(Some(true)));
+        apply(&mut cfg, "zero_copy", None).unwrap();
+        assert_eq!(cfg.zero_copy, None);
+
+        assert_eq!(current_value(&cfg, "zero_copy_deny"), None);
+        apply(
+            &mut cfg,
+            "zero_copy_deny",
+            Some(" hevc_qsv:gpu, av1_qsv:gpu "),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.zero_copy_deny.as_deref(),
+            Some("hevc_qsv:gpu, av1_qsv:gpu")
+        );
+        assert_eq!(
+            entry_for(&cfg, "zero_copy_deny").unwrap().value.as_deref(),
+            Some("hevc_qsv:gpu, av1_qsv:gpu")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("ZERO_COPY_DENY")
+                .map(String::as_str),
+            Some("hevc_qsv:gpu, av1_qsv:gpu")
+        );
+        apply(&mut cfg, "zero_copy_deny", Some("none")).unwrap();
+        assert_eq!(cfg.zero_copy_deny.as_deref(), Some("none"));
+        apply(&mut cfg, "zero_copy_deny", Some("")).unwrap();
+        assert_eq!(cfg.zero_copy_deny, None, "blank clears: deny nothing");
+        for bad in [
+            "hevc_qsv",
+            "hevc_qsv:cpu",
+            "hevc_qsv:yuv420",
+            "HEVC_QSV:gpu",
+            ":gpu",
+            "a b:gpu",
+            "*:gpu",
+        ] {
+            assert!(
+                apply(&mut cfg, "zero_copy_deny", Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// FR-130 — `color_description` is a tribool that reaches the daemon (and
+    /// the probe and recorder children) as `ROOMLERD_COLOR_DESCRIPTION`: unset
+    /// publishes nothing (the built-in on), and the off that matters is
+    /// published as `0`.
+    #[test]
+    fn color_description_sets_echoes_clears_and_bridges() {
+        let mut cfg = crate::config::test_fixture();
+        let entry = entry_for(&cfg, "color_description").unwrap();
+        assert_eq!(entry.kind, "tribool");
+        assert!(
+            entry.restart_required,
+            "an encoder reads it at its open: a restart"
+        );
+        let bridged = |cfg: &crate::config::AgentConfig| {
+            crate::config::env_bridge_bools(cfg)
+                .iter()
+                .find(|(s, _)| *s == "COLOR_DESCRIPTION")
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(bridged(&cfg), Some(None), "unset: bridged as nothing");
+        assert_eq!(current_value(&cfg, "color_description"), None);
+        apply(&mut cfg, "color_description", Some("off")).unwrap();
+        assert_eq!(cfg.color_description, Some(false));
+        assert_eq!(bridged(&cfg), Some(Some(false)));
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("COLOR_DESCRIPTION")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            entry_for(&cfg, "color_description")
+                .unwrap()
+                .value
+                .as_deref(),
+            current_value(&cfg, "color_description").as_deref()
+        );
+        apply(&mut cfg, "color_description", None).unwrap();
+        assert_eq!(cfg.color_description, None);
+        assert!(apply(&mut cfg, "color_description", Some("maybe")).is_err());
+    }
+
+    /// FR-130 P1b — a pushed `color_description` means on the device what
+    /// `roomler config set color_description <word>` means: the push's one
+    /// reading (`parse_pushed_tribool`, which the server also refuses words
+    /// with) and this surface's take every word alike and refuse the same
+    /// ones, blank included (a clear on both).
+    #[test]
+    fn a_pushed_colour_description_reads_as_config_set_reads_it() {
+        for word in [
+            "on", "off", "", "  ", "true", "false", "1", "0", "yes", "no", "ON", " Off ", "maybe",
+            "default", "2", "o n",
+        ] {
+            let mut cfg = crate::config::test_fixture();
+            let local =
+                apply(&mut cfg, "color_description", Some(word)).map(|()| cfg.color_description);
+            let pushed = roomler_ai_remote_control::models::parse_pushed_tribool(word);
+            assert_eq!(
+                local.is_ok(),
+                pushed.is_ok(),
+                "{word:?}: {local:?} vs {pushed:?}"
+            );
+            if let (Ok(l), Ok(p)) = (local, pushed) {
+                assert_eq!(l, p, "{word:?}");
+            }
+        }
     }
 
     /// The chroma column keys ride the numeric bridge like the codec factors.

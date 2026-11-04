@@ -56,6 +56,35 @@
 //! and a `hevc_vaapi` dims replacement opened at the old frame's rate — the
 //! shadow's first genuine finding.
 //!
+//! # Lags and the first tick (M3a.3)
+//!
+//! A week of fleet reads (AC10, 2026-10-21 → 28) found two more things the
+//! counters treated as bugs and were not:
+//!
+//! - **A lag.** The plan is produced at the top of the pass; the inline
+//!   geometry is decided after the capture, from inputs read again. When an
+//!   input moves between the two reads — the host's display mode switched
+//!   under a live session (the snapshot's native dims are the LAST frame's), an
+//!   `rc:resolution` or a Priority write landing in between, a viewer joining
+//!   a shared pipeline — the two disagree for a frame, and M3b's loop, reading
+//!   the plan, would do the same. M3a's design listed these as legitimate
+//!   one-frame lags. So [`Shadow::check_dims`] takes the inline INPUTS as well
+//!   as the inline dims: a geometry difference whose inputs moved is a lag
+//!   ([`Shadow::lags`], logged once with the input that moved), and one whose
+//!   inputs held is still a `dims` divergence. An inline open built from moved
+//!   inputs is judged the same way at the tick.
+//! - **The first tick after an adoption.** A replacement adopted while the
+//!   plan held is judged against the controller's first target after it. When
+//!   the controller moves on that very tick, within the ceiling the loop knew —
+//!   the field's cases were congestion decreases, often set off by the
+//!   replacement's own IDR — the re-rate is the plan's own movement one tick
+//!   later: M3a.1's stale adoption, a tick on. Counted apart
+//!   ([`Shadow::stale_ticks`]). A replacement built ABOVE that ceiling is
+//!   still a divergence: the loop could have known it, which is exactly the
+//!   `hevc_vaapi` finding above. An inline open is never exempt — the loop can
+//!   consult the controller before it opens, and the pump now does on a
+//!   persisted transport flip (the field's other finding).
+//!
 //! # Knobs are read once
 //!
 //! Every env/config knob the inline arithmetic reads per frame
@@ -329,6 +358,57 @@ pub(crate) struct StaleSwap {
     pub now_dims: (u32, u32),
 }
 
+/// M3a.3 — a geometry difference whose inputs moved between the plan's
+/// snapshot and the inline read, for the pump to log once per session. Not a
+/// divergence: the plan was produced from the facts of its moment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanLag {
+    /// The first input that differs: `native`, `target`, `priority_cap`,
+    /// `slow_link_cap`, `refine` or `soft_cap`.
+    pub moved: &'static str,
+    pub plan_dims: (u32, u32),
+    pub inline_dims: (u32, u32),
+}
+
+/// The first of [`DimsInputs`]'s fields that differs, by name; `None` when
+/// they are equal. The order is the order a field read would ask in.
+fn moved_input(plan: &DimsInputs, inline: &DimsInputs) -> Option<&'static str> {
+    if (plan.native_w, plan.native_h) != (inline.native_w, inline.native_h) {
+        Some("native")
+    } else if plan.merged_target != inline.merged_target {
+        Some("target")
+    } else if plan.merged_priority_cap != inline.merged_priority_cap {
+        Some("priority_cap")
+    } else if plan.slow_link_cap != inline.slow_link_cap {
+        Some("slow_link_cap")
+    } else if plan.refined != inline.refined || plan.refined_cap != inline.refined_cap {
+        Some("refine")
+    } else if plan.soft_cap != inline.soft_cap {
+        Some("soft_cap")
+    } else {
+        None
+    }
+}
+
+/// An encoder the loop built since the controller last ticked, judged at the
+/// next [`Shadow::after_tick`].
+#[derive(Debug, Clone, Copy)]
+struct Built {
+    /// The rate it was built at (raw; laddered at the comparison).
+    rate_bps: u32,
+    /// Its dims, when they are the loop's decision (an inline open, a dims
+    /// replacement); `None` for a rate replacement, whose dims are the live
+    /// encoder's.
+    dims: Option<(u32, u32)>,
+    /// A make-before-break replacement adopted while the plan held, rather
+    /// than the inline open. Only a replacement's first-tick re-rate can be a
+    /// stale tick: the inline open could have consulted the controller.
+    swap: bool,
+    /// The inline open's geometry inputs had moved from the plan's snapshot
+    /// (M3a.3): a dims difference at the tick is then a lag.
+    lagged: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Field {
     Budget,
@@ -366,15 +446,32 @@ pub(crate) struct Shadow {
     counts: PlanDivergences,
     /// Fields already reported this session (one log line per field).
     reported: u8,
-    /// The latest encoder the loop built since the last tick: the rate it was
-    /// built at (raw; laddered at the comparison) and, when they are the
-    /// loop's decision, its dims. A build the loop replaced before a tick is
-    /// superseded, not judged.
-    built: Option<(u32, Option<(u32, u32)>)>,
+    /// The latest encoder the loop built since the last tick. A build the
+    /// loop replaced before a tick is superseded, not judged.
+    built: Option<Built>,
     /// Replacements adopted after the plan moved while they opened.
     stale_swaps: u32,
     /// Whether this session's first stale adoption has been reported.
     stale_reported: bool,
+    /// M3a.3 — the geometry inputs the current plan was produced from.
+    inputs: Option<DimsInputs>,
+    /// M3a.3 — the geometry inputs the inline arithmetic read last
+    /// ([`Self::check_dims`]); the inline open of the same pass builds from
+    /// them.
+    inline_inputs: Option<DimsInputs>,
+    /// M3a.3 — geometry differences whose inputs moved between the two reads.
+    lags: u32,
+    /// The session's first lag, waiting for the pump to log it.
+    lag_pending: Option<PlanLag>,
+    /// Whether this session's first lag has been handed out.
+    lag_reported: bool,
+    /// M3a.3 — replacements the controller re-rated on its first tick after
+    /// the adoption, within the ceiling the loop knew.
+    stale_ticks: u32,
+    /// The session's first stale tick, waiting for the pump to log it.
+    stale_tick_pending: Option<StaleSwap>,
+    /// Whether this session's first stale tick has been handed out.
+    stale_tick_reported: bool,
 }
 
 impl Shadow {
@@ -382,6 +479,7 @@ impl Shadow {
     pub(crate) fn produce(&mut self, inputs: &PlanInputs, knobs: &PlanKnobs) -> Plan {
         let plan = produce(inputs, knobs, self.plan.as_ref());
         self.plan = Some(plan);
+        self.inputs = Some(inputs.dims);
         plan
     }
 
@@ -498,24 +596,74 @@ impl Shadow {
         out
     }
 
-    /// The dims this frame's plan produces. Skipped (no count) while the plan
-    /// has no geometry — before the first frame.
-    pub(crate) fn check_dims(&mut self, inline_dims: (u32, u32)) -> Vec<FirstDivergence> {
+    /// The dims this frame's plan produces, against the dims the inline
+    /// arithmetic decided from `inline_inputs`. Skipped (no count) while the
+    /// plan has no geometry — before the first frame. M3a.3: when the two
+    /// disagree and an input moved between the plan's snapshot and the inline
+    /// read, it is a lag ([`Self::lags`]), not a divergence.
+    pub(crate) fn check_dims(
+        &mut self,
+        inline_dims: (u32, u32),
+        inline_inputs: &DimsInputs,
+    ) -> Vec<FirstDivergence> {
+        self.inline_inputs = Some(*inline_inputs);
         let mut out = Vec::new();
         let Some(plan) = self.plan else {
             return out;
         };
-        if !plan.has_dims() {
+        if !plan.has_dims() || plan.dims == inline_dims {
+            return out;
+        }
+        if let Some(moved) = self.inputs_moved() {
+            self.note_lag(moved, plan.dims, inline_dims);
             return out;
         }
         self.diverge(Field::Dims, plan.dims, inline_dims, &mut out);
         out
     }
 
+    /// The first geometry input that differs between the plan's snapshot and
+    /// the inline read; `None` when they agree or either is missing.
+    fn inputs_moved(&self) -> Option<&'static str> {
+        match (self.inputs.as_ref(), self.inline_inputs.as_ref()) {
+            (Some(plan), Some(inline)) => moved_input(plan, inline),
+            _ => None,
+        }
+    }
+
+    fn note_lag(&mut self, moved: &'static str, plan_dims: (u32, u32), inline_dims: (u32, u32)) {
+        self.lags = self.lags.saturating_add(1);
+        if !self.lag_reported {
+            self.lag_reported = true;
+            self.lag_pending = Some(PlanLag {
+                moved,
+                plan_dims,
+                inline_dims,
+            });
+        }
+    }
+
+    /// The session's first lag, once, for the pump to log.
+    pub(crate) fn take_lag(&mut self) -> Option<PlanLag> {
+        self.lag_pending.take()
+    }
+
+    /// Geometry differences whose inputs moved between the two reads.
+    pub(crate) fn lags(&self) -> u32 {
+        self.lags
+    }
+
     /// The loop's inline open built an encoder at `rate_bps` and `dims`;
-    /// judged at the next [`Self::after_tick`].
+    /// judged at the next [`Self::after_tick`]. It built from the inputs
+    /// [`Self::check_dims`] saw this pass, so whether they had moved from the
+    /// plan's is recorded with it.
     pub(crate) fn note_built(&mut self, rate_bps: u32, dims: (u32, u32)) {
-        self.built = Some((rate_bps, Some(dims)));
+        self.built = Some(Built {
+            rate_bps,
+            dims: Some(dims),
+            swap: false,
+            lagged: self.inputs_moved().is_some(),
+        });
     }
 
     /// The controller ticked: its target becomes the plan's `bitrate_bps` (an
@@ -524,27 +672,82 @@ impl Shadow {
     /// against the plan: built at its rate, and at its dims. A `bitrate`
     /// divergence here is an encoder the controller re-rates on its very next
     /// tick — on a rebuild-bound backend, a second open.
-    pub(crate) fn after_tick(&mut self, target_bps: u32) -> Vec<FirstDivergence> {
+    ///
+    /// M3a.3: `ceiling_bps` is the ceiling the loop planned this frame at. A
+    /// REPLACEMENT whose rate this very tick moved away from, while its rate
+    /// sat within that ceiling, is a stale tick ([`Self::stale_ticks`]): the
+    /// controller's own movement one tick after the adoption. Above the
+    /// ceiling it stays a divergence (the loop could have known), and an
+    /// inline open is never exempt. An inline open built from geometry inputs
+    /// that had moved from the plan's is a lag on its dims, not a divergence.
+    pub(crate) fn after_tick(&mut self, target_bps: u32, ceiling_bps: u32) -> Vec<FirstDivergence> {
         let mut out = Vec::new();
         let Some(mut plan) = self.plan else {
             self.built = None;
             return out;
         };
+        let before = plan.bitrate_bps;
         let bitrate = ladder(target_bps);
         if bitrate != plan.bitrate_bps {
             plan.bitrate_bps = bitrate;
             plan.epoch += 1;
             self.plan = Some(plan);
         }
-        if let Some((rate, dims)) = self.built.take() {
-            self.diverge(Field::Bitrate, plan.bitrate_bps, ladder(rate), &mut out);
-            if let Some(dims) = dims
+        if let Some(built) = self.built.take() {
+            let built_rung = ladder(built.rate_bps);
+            if built_rung != plan.bitrate_bps {
+                let moved_this_tick = plan.bitrate_bps != before;
+                if built.swap && moved_this_tick && built_rung <= ladder(ceiling_bps) {
+                    self.note_stale_tick(&built, before, &plan);
+                } else {
+                    self.diverge(Field::Bitrate, plan.bitrate_bps, built_rung, &mut out);
+                }
+            }
+            if let Some(dims) = built.dims
                 && plan.has_dims()
+                && dims != plan.dims
             {
-                self.diverge(Field::Dims, plan.dims, dims, &mut out);
+                if built.lagged
+                    && let Some(moved) = self.inputs_moved()
+                {
+                    self.note_lag(moved, plan.dims, dims);
+                } else {
+                    self.diverge(Field::Dims, plan.dims, dims, &mut out);
+                }
             }
         }
         out
+    }
+
+    fn note_stale_tick(&mut self, built: &Built, plan_before_bps: u32, now: &Plan) {
+        self.stale_ticks = self.stale_ticks.saturating_add(1);
+        if self.stale_tick_reported {
+            return;
+        }
+        self.stale_tick_reported = true;
+        self.stale_tick_pending = Some(StaleSwap {
+            kind: if built.dims.is_some() {
+                "dims-first-tick"
+            } else {
+                "rate-first-tick"
+            },
+            built_bps: built.rate_bps,
+            spawned_bps: plan_before_bps,
+            now_bps: now.bitrate_bps,
+            spawned_dims: built.dims.unwrap_or(now.dims),
+            now_dims: now.dims,
+        });
+    }
+
+    /// The session's first stale tick, once, for the pump to log.
+    pub(crate) fn take_stale_tick(&mut self) -> Option<StaleSwap> {
+        self.stale_tick_pending.take()
+    }
+
+    /// Replacements the controller re-rated on its first tick after the
+    /// adoption, within the ceiling.
+    pub(crate) fn stale_ticks(&self) -> u32 {
+        self.stale_ticks
     }
 
     /// The plan in force when a replacement spawns; `None` before the first
@@ -614,7 +817,12 @@ impl Shadow {
             _ => false,
         };
         if !moved {
-            self.built = Some((rate_bps, dims));
+            self.built = Some(Built {
+                rate_bps,
+                dims,
+                swap: true,
+                lagged: false,
+            });
             return None;
         }
         let (spawned, now) = (spawned?, self.plan?);
@@ -645,6 +853,10 @@ mod tests {
     use crate::peer::TargetResolution;
 
     const NOMINAL: u32 = 3_000_000;
+    /// A ceiling above every rate these tests build at (FR-74 P1's CORPLAP-1
+    /// direct ceiling): the M3a.3 first-tick rule then turns only on whether
+    /// the tick moved the target.
+    const CEIL: u32 = 43_000_000;
 
     fn knobs() -> PlanKnobs {
         PlanKnobs {
@@ -976,14 +1188,17 @@ mod tests {
             },
             &knobs(),
         );
-        assert!(s.check_dims((1920, 1200)).is_empty());
+        assert!(s.check_dims((1920, 1200), &dims(1920, 1200)).is_empty());
         assert_eq!(s.counts().dims, 0);
         s.produce(&constrained(None), &knobs());
-        assert!(s.check_dims((1920, 1200)).is_empty());
-        let first = s.check_dims((1280, 800));
+        assert!(s.check_dims((1920, 1200), &dims(1920, 1200)).is_empty());
+        // The inputs held and the dims did not: the divergence M3a.3 keeps.
+        let first = s.check_dims((1280, 800), &dims(1920, 1200));
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].field, "dims");
         assert_eq!(s.counts().dims, 1);
+        assert_eq!(s.lags(), 0);
+        assert_eq!(s.take_lag(), None);
     }
 
     #[test]
@@ -999,17 +1214,17 @@ mod tests {
         assert_eq!(plan.bitrate_bps, 2_000_000);
         // Built at the controller's rate (a raw 2.1 M is the same rung): clean.
         s.note_built(2_100_000, (1920, 1200));
-        assert!(s.after_tick(2_000_000).is_empty());
+        assert!(s.after_tick(2_000_000, CEIL).is_empty());
         assert_eq!(s.counts(), PlanDivergences::default());
         // The controller moved mid-pass: an epoch move, not a divergence...
         let epoch = s.epoch();
-        assert!(s.after_tick(2_600_000).is_empty());
+        assert!(s.after_tick(2_600_000, CEIL).is_empty());
         assert_eq!(s.epoch(), epoch + 1);
         assert_eq!(s.plan().unwrap().bitrate_bps, 3_000_000);
         // ...and an encoder built at the OLD rung is the finding: the
         // controller re-rates it on its first tick (a second open on QSV).
         s.note_built(2_000_000, (1920, 1200));
-        let first = s.after_tick(2_600_000);
+        let first = s.after_tick(2_600_000, CEIL);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].field, "bitrate");
         assert_eq!(first[0].plan, "3000000");
@@ -1017,7 +1232,7 @@ mod tests {
         assert_eq!(s.counts().bitrate, 1);
         // Built at the plan's rate but not its dims: a dims divergence.
         s.note_built(3_000_000, (1280, 800));
-        let first = s.after_tick(3_000_000);
+        let first = s.after_tick(3_000_000, CEIL);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].field, "dims");
         assert_eq!(
@@ -1029,7 +1244,7 @@ mod tests {
             }
         );
         // A build is judged once.
-        assert!(s.after_tick(3_000_000).is_empty());
+        assert!(s.after_tick(3_000_000, CEIL).is_empty());
         assert_eq!(s.counts().dims, 1);
     }
 
@@ -1045,9 +1260,9 @@ mod tests {
             },
             &knobs(),
         );
-        assert!(s.after_tick(10_708_885).is_empty());
+        assert!(s.after_tick(10_708_885, CEIL).is_empty());
         let spawned = s.swap_spawn();
-        assert!(s.after_tick(5_396_362).is_empty());
+        assert!(s.after_tick(5_396_362, CEIL).is_empty());
         spawned
     }
 
@@ -1068,7 +1283,7 @@ mod tests {
             })
         );
         // Not judged at the next tick: the re-rate is the plan's own movement.
-        assert!(s.after_tick(2_744_302).is_empty());
+        assert!(s.after_tick(2_744_302, CEIL).is_empty());
         assert_eq!(s.counts(), PlanDivergences::default());
         assert_eq!(s.stale_swaps(), 1);
     }
@@ -1081,7 +1296,7 @@ mod tests {
         let mut s = Shadow::default();
         qsv_cascade(&mut s);
         s.note_built(12_000_000, (1920, 1200));
-        let first = s.after_tick(2_744_302);
+        let first = s.after_tick(2_744_302, CEIL);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].field, "bitrate");
         assert_eq!(first[0].plan, "3000000");
@@ -1111,7 +1326,7 @@ mod tests {
             None,
             "the plan held: not stale"
         );
-        let first = s.after_tick(9_873_281);
+        let first = s.after_tick(9_873_281, 9_873_281);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].field, "bitrate");
         assert_eq!(first[0].plan, "8000000");
@@ -1130,12 +1345,12 @@ mod tests {
             &knobs(),
         );
         assert_eq!(s.note_rate_swap_adopted(3_000_000, s.swap_spawn()), None);
-        assert!(s.after_tick(3_000_000).is_empty());
+        assert!(s.after_tick(3_000_000, CEIL).is_empty());
         assert_eq!(
             s.note_dims_swap_adopted(3_000_000, plan.dims, s.swap_spawn()),
             None
         );
-        assert!(s.after_tick(3_000_000).is_empty());
+        assert!(s.after_tick(3_000_000, CEIL).is_empty());
         assert_eq!(s.counts(), PlanDivergences::default());
         assert_eq!(s.stale_swaps(), 0);
     }
@@ -1155,7 +1370,7 @@ mod tests {
             s.note_dims_swap_adopted(3_000_000, (1280, 800), s.swap_spawn()),
             None
         );
-        let first = s.after_tick(3_000_000);
+        let first = s.after_tick(3_000_000, CEIL);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].field, "dims");
         // A plan whose geometry moves while a dims replacement opens: stale,
@@ -1171,7 +1386,7 @@ mod tests {
         );
         let stale = s.note_dims_swap_adopted(3_000_000, plan.dims, spawned);
         assert_eq!(stale.map(|x| x.kind), Some("dims"));
-        assert!(s.after_tick(3_000_000).is_empty());
+        assert!(s.after_tick(3_000_000, CEIL).is_empty());
         // A RATE replacement's geometry is the live encoder's (M2's pin), not
         // its decision: moved geometry alone neither stales nor judges it.
         let rate_spawned = s.swap_spawn();
@@ -1183,7 +1398,7 @@ mod tests {
             &knobs(),
         );
         assert_eq!(s.note_rate_swap_adopted(3_000_000, rate_spawned), None);
-        assert!(s.after_tick(3_000_000).is_empty());
+        assert!(s.after_tick(3_000_000, CEIL).is_empty());
         assert_eq!(s.counts().dims, 1);
         assert_eq!(s.stale_swaps(), 1);
     }
@@ -1194,7 +1409,7 @@ mod tests {
         assert_eq!(s.swap_spawn(), None);
         // No plan at the tick either: nothing to judge against.
         assert_eq!(s.note_rate_swap_adopted(12_000_000, None), None);
-        assert!(s.after_tick(12_000_000).is_empty());
+        assert!(s.after_tick(12_000_000, CEIL).is_empty());
         // A plan by the tick: judged there, as an inline open is.
         s.produce(
             &PlanInputs {
@@ -1204,7 +1419,7 @@ mod tests {
             &knobs(),
         );
         assert_eq!(s.note_rate_swap_adopted(12_000_000, None), None);
-        let first = s.after_tick(3_000_000);
+        let first = s.after_tick(3_000_000, CEIL);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].inline, "12000000");
         assert_eq!(s.stale_swaps(), 0);
@@ -1217,8 +1432,164 @@ mod tests {
         assert!(s.note_rate_swap_adopted(12_000_000, spawned).is_some());
         assert!(s.note_rate_swap_adopted(12_000_000, spawned).is_none());
         assert_eq!(s.stale_swaps(), 2);
-        assert!(s.after_tick(2_744_302).is_empty());
+        assert!(s.after_tick(2_744_302, CEIL).is_empty());
         assert_eq!(s.counts(), PlanDivergences::default());
+    }
+
+    /// M3a.3, the field's D1 (FR-108's display match switching the host's mode
+    /// under a live session): the snapshot's native dims are the LAST frame's,
+    /// this frame is the first at the new mode. A lag at the check and at the
+    /// tick of the open built for it, never a divergence; the next pass's plan
+    /// agrees again.
+    #[test]
+    fn a_native_change_between_the_snapshot_and_the_check_is_a_lag() {
+        let mut s = Shadow::default();
+        s.produce(&constrained(None), &knobs());
+        assert!(s.check_dims((1024, 768), &dims(1024, 768)).is_empty());
+        assert_eq!(s.counts(), PlanDivergences::default());
+        assert_eq!(s.lags(), 1);
+        assert_eq!(
+            s.take_lag(),
+            Some(PlanLag {
+                moved: "native",
+                plan_dims: (1920, 1200),
+                inline_dims: (1024, 768),
+            })
+        );
+        assert_eq!(s.take_lag(), None, "handed out once");
+        // The inline open builds for the new mode in the same pass.
+        s.note_built(3_000_000, (1024, 768));
+        assert!(s.after_tick(3_000_000, CEIL).is_empty());
+        assert_eq!(s.counts(), PlanDivergences::default());
+        assert_eq!(s.lags(), 2, "counted every time");
+        assert_eq!(s.take_lag(), None, "reported once a session");
+        // The next pass's snapshot carries the new native: no lag, no divergence.
+        s.produce(
+            &PlanInputs {
+                dims: dims(1024, 768),
+                ..constrained(None)
+            },
+            &knobs(),
+        );
+        assert!(s.check_dims((1024, 768), &dims(1024, 768)).is_empty());
+        assert_eq!(s.lags(), 2);
+        assert_eq!(s.counts(), PlanDivergences::default());
+    }
+
+    /// M3a.3, the field's D2 and D3: an `rc:resolution` applied between the
+    /// snapshot and the check, or a viewer joining a shared pipeline (the
+    /// merged target moves), names the input that moved.
+    #[test]
+    fn a_target_write_between_the_snapshot_and_the_check_is_a_lag_named_by_its_input() {
+        let mut s = Shadow::default();
+        s.produce(&constrained(None), &knobs());
+        let inline = DimsInputs {
+            merged_target: TargetResolution::Fixed {
+                width: 944,
+                height: 590,
+            },
+            ..dims(1920, 1200)
+        };
+        assert!(s.check_dims((944, 590), &inline).is_empty());
+        assert_eq!(s.take_lag().map(|l| l.moved), Some("target"));
+        assert_eq!(s.counts().dims, 0);
+        // A Priority write in between is named as such.
+        let mut s = Shadow::default();
+        s.produce(&constrained(None), &knobs());
+        let inline = DimsInputs {
+            merged_priority_cap: Some(1280),
+            ..dims(1920, 1200)
+        };
+        assert!(s.check_dims((1280, 800), &inline).is_empty());
+        assert_eq!(s.take_lag().map(|l| l.moved), Some("priority_cap"));
+    }
+
+    /// The lag rule's negative control: an inline open whose inputs HELD and
+    /// whose dims are not the plan's is still the divergence it always was.
+    #[test]
+    fn an_open_built_from_held_inputs_at_other_dims_is_still_a_divergence() {
+        let mut s = Shadow::default();
+        s.produce(&constrained(None), &knobs());
+        assert!(s.check_dims((1920, 1200), &dims(1920, 1200)).is_empty());
+        s.note_built(3_000_000, (1280, 800));
+        let first = s.after_tick(3_000_000, CEIL);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].field, "dims");
+        assert_eq!(s.lags(), 0);
+    }
+
+    /// M3a.3, the field's B2: a 6 M replacement adopted while the plan held,
+    /// and the controller's first tick after it a congestion decrease to
+    /// 1.5 M. Within the ceiling: the plan's own movement one tick on.
+    #[test]
+    fn the_first_tick_after_an_adoption_moving_within_the_ceiling_is_a_stale_tick() {
+        let mut s = Shadow::default();
+        s.produce(
+            &PlanInputs {
+                target_bps: 6_000_000,
+                ..direct(CEIL, 100)
+            },
+            &knobs(),
+        );
+        let spawned = s.swap_spawn();
+        assert_eq!(
+            s.note_rate_swap_adopted(6_000_000, spawned),
+            None,
+            "the plan held while it opened"
+        );
+        assert!(s.after_tick(1_500_000, CEIL).is_empty());
+        assert_eq!(s.counts(), PlanDivergences::default());
+        assert_eq!(s.stale_ticks(), 1);
+        assert_eq!(
+            s.stale_swaps(),
+            0,
+            "a different count from the open-time stale"
+        );
+        assert_eq!(
+            s.take_stale_tick(),
+            Some(StaleSwap {
+                kind: "rate-first-tick",
+                built_bps: 6_000_000,
+                spawned_bps: ladder(6_000_000),
+                now_bps: ladder(1_500_000),
+                spawned_dims: (1920, 1200),
+                now_dims: (1920, 1200),
+            })
+        );
+        assert_eq!(s.take_stale_tick(), None, "handed out once");
+    }
+
+    /// The stale-tick rule's two negative controls: an INLINE open re-rated
+    /// on its first tick is a divergence (the loop can tick before it opens),
+    /// and a replacement whose rate the tick did NOT move is judged as before.
+    #[test]
+    fn an_inline_open_or_an_unmoved_tick_is_never_a_stale_tick() {
+        let mut s = Shadow::default();
+        s.produce(
+            &PlanInputs {
+                target_bps: 3_000_000,
+                ..direct(CEIL, 100)
+            },
+            &knobs(),
+        );
+        // The field's B1: an inline open at the old transport's rate, the
+        // controller raising the target under the new ceiling on that tick.
+        s.note_built(3_000_000, (1920, 1200));
+        let first = s.after_tick(12_000_000, CEIL);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].field, "bitrate");
+        assert_eq!(s.stale_ticks(), 0);
+        // A replacement built off the plan, judged on a tick that held.
+        let spawned = s.swap_spawn();
+        assert_eq!(s.note_rate_swap_adopted(3_000_000, spawned), None);
+        let first = s.after_tick(12_000_000, CEIL);
+        assert_eq!(s.counts().bitrate, 2);
+        assert_eq!(
+            first.len(),
+            0,
+            "the field's second divergence is counted, not logged"
+        );
+        assert_eq!(s.stale_ticks(), 0);
     }
 
     /// The knobs the producer takes once are the numbers the per-frame readers

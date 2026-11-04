@@ -200,18 +200,23 @@ pub async fn anchor(
     let service_token = state
         .auth
         .issue_agent_service_token(agent_id, tid, &anchor_id)?;
-    let anchor = bson::to_bson(&ExecAnchor {
+    let anchor = ExecAnchor {
         anchored_at: DateTime::now(),
         anchored_by: admin_uid,
         anchor_id,
-    })
-    .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?;
-    state
+    };
+    // `false`: the removal won the race with the lookup above, and it ends the
+    // anchor, so this one must not land on the tombstone (#2133).
+    if !state
         .agents
-        .base
-        .update_by_id(agent_id, doc! { "$set": { "exec_anchor": anchor } })
+        .set_exec_anchor(tid, agent_id, &anchor)
         .await
-        .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?;
+        .map_err(|e| ApiError::Internal(format!("anchor record: {e}")))?
+    {
+        return Err(ApiError::NotFound(
+            "No such device in this organization".to_string(),
+        ));
+    }
     info!(
         agent = %agent_id, tenant = %tid, admin = %admin_uid,
         with_enrolling_token = second_use,

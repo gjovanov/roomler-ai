@@ -25,6 +25,8 @@ roomler-ai-remote-control = { path = "../../remote_control" }
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+# FR-129 A1 — the device code on the wire (base64url of 32 CSPRNG bytes).
+base64.workspace = true
 bson.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
@@ -33,6 +35,8 @@ hex.workspace = true
 # Static-endpoint / subnet validation in the agent routes (not a workspace dep).
 ipnet = "2"
 parking_lot.workspace = true
+# FR-129 A1 — the two pairing codes come from the thread CSPRNG.
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

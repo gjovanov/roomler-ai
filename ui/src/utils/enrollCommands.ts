@@ -43,7 +43,34 @@ export interface CommandBlock {
   command: string
   /** True when `command` is a URL to download, not a shell command. */
   isDownload?: boolean
+  /** #3202 — a line under a download: what it needs before it can run. */
+  hint?: string
+  /** #3247 item 13 — the same download for another CPU, as a second link. */
+  alt?: DownloadAlt
 }
+
+/** A second link beside a download: its words, and where it points. */
+export interface DownloadAlt {
+  label: string
+  url: string
+}
+
+/**
+ * #3247 item 13 — `/api/setup/linux` serves the x86_64 wizard, so an ARM64
+ * visitor downloaded one that cannot run. The server has served the ARM64
+ * build on its own name since FR-97 P7b; a browser does not say its CPU
+ * reliably (Chromium's Linux user agent always reads x86_64), so both are
+ * offered and the person picks.
+ */
+export const LINUX_ARM64_LABEL = 'For ARM64 (aarch64)'
+
+/**
+ * #3202 — the Linux wizard links WebKitGTK 4.1, which not every desktop has
+ * (the Fedora KDE lab image did not), and a missing library stops it before
+ * its window can say anything. So every Linux download of it says so.
+ */
+export const LINUX_WIZARD_NEEDS =
+  'Needs WebKitGTK 4.1: libwebkit2gtk-4.1-0 on Ubuntu and Debian, webkit2gtk4.1 on Fedora. The one-line install needs nothing first.'
 
 export interface OsCommands {
   os: EnrollOs
@@ -68,6 +95,26 @@ const PS_ROLE: Record<DaemonScope, string> = {
 export const DEVICE_ID_PLACEHOLDER = '<device-id>'
 
 /**
+ * FR-129 B1-s — what the server advertises on `GET /api/setup/features`
+ * (`stores/setupFeatures.ts`), as far as the commands care: one switch per
+ * OS (B1-s2), so Linux can go live without macOS.
+ */
+export interface EnrollOptions {
+  /**
+   * The released Roomler Setup installs the full daemon on Linux (FR-129
+   * B1), so the Linux wizard block is offered for an agent too: the store's
+   * `wizardLinuxDaemon`, which reads `wizard_linux_daemon` or an older
+   * server's `wizard_unix_daemon`. `false` or absent — the server has not
+   * answered, failed to, or said no — keeps the FR-97 D5 rule: for an agent,
+   * no wizard on Linux. The output is then exactly what it was before the
+   * option existed.
+   */
+  wizardLinuxDaemon?: boolean
+  /** The same for macOS: the store's `wizardMacosDaemon`. */
+  wizardMacosDaemon?: boolean
+}
+
+/**
  * Build the per-OS command matrix for one enrollment kind. `token` may
  * be null while the token is still being issued — the placeholder keeps
  * the layout stable and nothing secret renders. `scope` only applies to
@@ -78,9 +125,13 @@ export const DEVICE_ID_PLACEHOLDER = '<device-id>'
  * elevated `roomlerd anchor create` with the same token, for the script
  * and manual paths; Roomler Setup runs it itself.
  *
- * FR-97 D5: Roomler Setup installs the agent on Windows only — on Linux and
- * macOS it installs the tunnel client (`agents/roomler-setup`), so an agent
- * enrollment there offers the script and the manual path, never the wizard.
+ * FR-97 D5: Roomler Setup installed the agent on Windows only — on Linux and
+ * macOS it installed the tunnel client (`agents/roomler-setup`), so an agent
+ * enrollment there offered the script and the manual path, never the wizard.
+ * FR-129 B1 teaches it the daemon there, and the SERVER says, per OS, when
+ * the released wizard is that one: `options.wizardLinuxDaemon` and
+ * `options.wizardMacosDaemon`, from `GET /api/setup/features` (B1-s2), off by
+ * default and read as false whenever the server did not send a JSON `true`.
  */
 export function enrollCommands(
   kind: EnrollKind,
@@ -88,6 +139,7 @@ export function enrollCommands(
   token: string | null,
   scope: DaemonScope = 'system',
   anchor = false,
+  options: EnrollOptions = {},
 ): OsCommands[] {
   const base = origin.replace(/\/+$/, '')
   const tok = token || TOKEN_PLACEHOLDER
@@ -131,10 +183,24 @@ export function enrollCommands(
     label: 'Graphical installer (Roomler Setup)',
     command: `${base}/api/setup/${platform}`,
     isDownload: true,
+    ...(os === 'linux'
+      ? {
+          hint: LINUX_WIZARD_NEEDS,
+          alt: { label: LINUX_ARM64_LABEL, url: `${base}/api/setup/linux-aarch64` },
+        }
+      : {}),
   })
-  // FR-97 D5 — off Windows the wizard has no agent role to install.
-  const wizardUnlessAgent = (os: EnrollOs, platform: string): CommandBlock[] =>
-    kind === 'agent' ? [] : [wizard(os, platform)]
+  // FR-97 D5 — off Windows the wizard had no agent role to install, so an
+  // agent got the script and the manual path only. FR-129 B1-s: the server
+  // says when the released wizard installs the daemon there, and since B1-s2
+  // it says so per OS; until it has said `true` for this OS, the D5 rule
+  // stands. A tunnel client it always installed everywhere.
+  const serverOffersDaemon: Record<'linux' | 'macos', boolean> = {
+    linux: options.wizardLinuxDaemon === true,
+    macos: options.wizardMacosDaemon === true,
+  }
+  const wizardWhereItInstalls = (os: 'linux' | 'macos', platform: string): CommandBlock[] =>
+    kind === 'agent' && !serverOffersDaemon[os] ? [] : [wizard(os, platform)]
 
   return [
     {
@@ -173,7 +239,7 @@ export function enrollCommands(
       note: machineWide
         ? "Installs a root systemd system service (sudo will prompt). Screen capture needs a logged-in session — pick 'This user only' for desktops."
         : undefined,
-      blocks: [shOneLiner('linux'), ...wizardUnlessAgent('linux', 'linux'), manual('linux')],
+      blocks: [shOneLiner('linux'), ...wizardWhereItInstalls('linux', 'linux'), manual('linux')],
     },
     {
       os: 'macos',
@@ -189,7 +255,7 @@ export function enrollCommands(
         kind === 'agent'
           ? 'Installs the per-user half (screen sharing + input). To also join the overlay mesh, mint a second enrollment token and append --daemon-token <token> — that adds a root LaunchDaemon and a second device row for this Mac.'
           : undefined,
-      blocks: [shOneLiner('macos'), ...wizardUnlessAgent('macos', 'macos'), manual('macos')],
+      blocks: [shOneLiner('macos'), ...wizardWhereItInstalls('macos', 'macos'), manual('macos')],
     },
   ]
 }
@@ -201,21 +267,36 @@ export interface InstallCard {
   /** The one-line install: the card's terminal form. */
   command: string
   /**
-   * The graphical installer where it installs the agent, else null. FR-97 D5,
-   * read from the same blocks as the enroll dialog: off Windows Roomler Setup
-   * has only the tunnel client to install. The homepages kept their own per-OS
-   * map until P0c-4, so they offered a visitor on a Mac or Linux a wizard that
-   * could not set up the device they came for.
+   * The graphical installer where it installs the agent, else null — read
+   * from the same blocks as the enroll dialog. Windows always (FR-97 D5: off
+   * Windows Roomler Setup had only the tunnel client to install); Linux and
+   * macOS each once the server advertises that OS on
+   * `GET /api/setup/features` (FR-129 B1-s, per OS since B1-s2), which
+   * decides it now. The homepages kept their own per-OS map until P0c-4, so
+   * they offered a visitor on a Mac or Linux a wizard that could not set up
+   * the device they came for — the same mistake the server's switches now
+   * prevent while a released wizard is not field-proven on that OS.
    */
   wizardUrl: string | null
+  /** #3202 — what the wizard needs first, where that OS says so, else null. */
+  wizardHint: string | null
+  /** #3247 item 13 — the same wizard for another CPU, where that OS has one. */
+  wizardAlt: DownloadAlt | null
 }
 
-/** The homepages' install cards, one per OS, from the agent's commands. */
-export function installCards(origin: string): InstallCard[] {
-  return enrollCommands('agent', origin, null).map((os) => ({
-    os: os.os,
-    title: os.title,
-    command: os.blocks.find((b) => !b.isDownload)!.command,
-    wizardUrl: os.blocks.find((b) => b.isDownload)?.command ?? null,
-  }))
+/** The homepages' install cards, one per OS, from the agent's commands. With
+ *  no `options` (the server unknown, or every switch off) the cards are
+ *  exactly what they were before FR-129. */
+export function installCards(origin: string, options: EnrollOptions = {}): InstallCard[] {
+  return enrollCommands('agent', origin, null, 'system', false, options).map((os) => {
+    const download = os.blocks.find((b) => b.isDownload)
+    return {
+      os: os.os,
+      title: os.title,
+      command: os.blocks.find((b) => !b.isDownload)!.command,
+      wizardUrl: download?.command ?? null,
+      wizardHint: download?.hint ?? null,
+      wizardAlt: download?.alt ?? null,
+    }
+  })
 }

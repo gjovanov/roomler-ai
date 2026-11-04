@@ -217,6 +217,11 @@ describe('RegisterView — attribution (FR-88)', () => {
     expect(plain.w.find('a[href^="/login"]').attributes('href')).toBe('/login')
   })
 
+  it('offers the way back to a sign-up that never activated, whose address answers 409 here (#3199)', async () => {
+    const { w } = await mountAt('/register')
+    expect(w.find('[data-test="register-activation-help"]').attributes('href')).toBe('/auth/activate')
+  })
+
   it('writes nothing to the device: no localStorage, no sessionStorage, no cookie', async () => {
     const { w } = await mountAt('/register?utm_source=youtube&utm_campaign=c1')
     w.findComponent({ name: 'VSelect' }).vm.$emit('update:modelValue', 'reddit')

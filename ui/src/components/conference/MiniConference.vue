@@ -74,7 +74,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch, nextTick, onMounted } from 'vue'
+import { computed, ref, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { useConferenceStore } from '@/stores/conference'
 import { useRoomStore } from '@/stores/rooms'
 import { useCallControls } from '@/composables/useCallControls'
@@ -144,11 +144,55 @@ watch(
   },
 )
 
+// FR-127 P1 — receive what is visible. While the call page is away this
+// widget is the only thing showing remote video, and its tiles are plain
+// `<video>`s, not VideoTiles, so they report themselves. Without this the
+// call page's tiles unmounted, the store sent an empty view, the server
+// paused every camera, and the widget showed frozen last frames while the
+// speaker outline still moved (found in review). The store counts reporters
+// per key, so this report overlapping a tile's during the page switch is
+// harmless: the key stays on screen until both have let go.
+const reportedOnScreen = new Set<string>()
+
+function syncOnScreenReports() {
+  const shown = new Set(visibleStreams.value.map(([key]) => key))
+  for (const key of [...reportedOnScreen]) {
+    if (shown.has(key)) continue
+    reportedOnScreen.delete(key)
+    conferenceStore.reportTileVisible(key, { visible: false, w: 0, h: 0 })
+  }
+  const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+  for (const key of shown) {
+    if (reportedOnScreen.has(key)) continue
+    reportedOnScreen.add(key)
+    const rect = remoteVideoRefs.get(key)?.getBoundingClientRect()
+    conferenceStore.reportTileVisible(key, {
+      visible: true,
+      w: rect ? Math.round(rect.width * dpr) : 0,
+      h: rect ? Math.round(rect.height * dpr) : 0,
+    })
+  }
+}
+
+watch(visibleStreams, async () => {
+  await nextTick()
+  syncOnScreenReports()
+})
+
 onMounted(async () => {
   await nextTick()
   if (localVideoRef.value && conferenceStore.localStream) {
     localVideoRef.value.srcObject = conferenceStore.localStream
   }
+  syncOnScreenReports()
+})
+
+onBeforeUnmount(() => {
+  // While the store still listens: what this widget showed leaves the view.
+  for (const key of reportedOnScreen) {
+    conferenceStore.reportTileVisible(key, { visible: false, w: 0, h: 0 })
+  }
+  reportedOnScreen.clear()
 })
 </script>
 

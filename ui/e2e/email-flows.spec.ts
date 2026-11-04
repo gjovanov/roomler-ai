@@ -34,9 +34,9 @@ test.describe('Email-related flows', () => {
       expect(mail.activationUrl).toBeTruthy()
       // Activation URL targets the configured FRONTEND_URL (http://roomler2
       // in cluster) plus the /auth/activate path. It carries a 24-char
-      // hex userId and a 7-char nanoid token.
+      // hex userId and a 21-char nanoid token.
       expect(mail.activationUrl).toMatch(
-        /^https?:\/\/[^/]+\/auth\/activate\?userId=[a-f0-9]{24}&token=[A-Za-z0-9_-]{7}$/,
+        /^https?:\/\/[^/]+\/auth\/activate\?userId=[a-f0-9]{24}&token=[A-Za-z0-9_-]{21}$/,
       )
     })
 

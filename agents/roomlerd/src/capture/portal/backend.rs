@@ -524,7 +524,7 @@ fn read_frame(r: &mut impl std::io::Read) -> Result<Option<Frame>> {
         height: h.height,
         stride: h.stride,
         pixel_format: pixel_format_of(h.video_format)?,
-        data,
+        data: data.into(),
         monotonic_us: now_us(),
         monitor: 0,
         // ⚠️ The portal reports no damage, so every frame is "assume
@@ -707,10 +707,10 @@ mod tests {
 
         let a = read_frame(&mut cur).unwrap().unwrap();
         assert_eq!((a.width, a.height, a.stride), (4, 2, 16));
-        assert!(a.data.iter().all(|b| *b == 0xAB));
+        assert!(a.cpu().iter().all(|b| *b == 0xAB));
 
         let b = read_frame(&mut cur).unwrap().unwrap();
-        assert!(b.data.iter().all(|b| *b == 0xCD));
+        assert!(b.cpu().iter().all(|b| *b == 0xCD));
 
         assert!(
             read_frame(&mut cur).unwrap().is_none(),

@@ -29,14 +29,14 @@ use roomler_ai_remote_control::consent::{
 };
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{
-    AgentCaps, AuditKind, ConsentMode, EndReason, ExecOutcome, FeaturePolicy, LockOnEnd, OsKind,
-    RecordCap, RpcCap, SessionPhase, SessionPolicy,
+    AgentCaps, AuditKind, ConsentMode, DesiredConfig, EndReason, ExecOutcome, FeaturePolicy,
+    LockOnEnd, OsKind, RcOverlayMode, RecordCap, RpcCap, SessionPhase, SessionPolicy,
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
 use roomler_ai_remote_control::signaling::{
-    AgentCloseReason, ClientMsg, IceServer, LIMIT_NO_COMMON_CODEC, LocalRelayDescriptor,
-    LocalRelayRefusal, Role, ServerMsg,
+    AgentCloseReason, ClientMsg, IceServer, LIMIT_NO_COMMON_CODEC, LOCAL_RELAYS_MAX,
+    LocalRelayDescriptor, LocalRelayRefusal, RcOverlayAutoWire, Role, ServerMsg,
 };
 use roomler_ai_remote_control::turn_creds::{
     self, RelayLoadMap, TurnConfig, TurnMap, ice_servers_for_session, pick_region_with_load,
@@ -79,16 +79,82 @@ fn is_overlay_relay_ip(ip: &str) -> bool {
 /// FR-121 — what `rc:session.created` tells a browser about its own device's
 /// relay: the descriptor when the request named the device and the session
 /// holds one, the refusal when it was refused, nothing when it did not ask.
+/// P3b (#2774) — with several named, the first relay held, the rest as
+/// `local_relay_also`, and the refusal only when none is held.
 fn local_relay_reply(
     answer: Option<std::result::Result<(), LocalRelayRefusal>>,
-    held: Option<LocalRelayDescriptor>,
-) -> (Option<LocalRelayDescriptor>, Option<String>) {
-    match (answer, held) {
-        (None, _) => (None, None),
-        (Some(_), Some(relay)) => (Some(relay), None),
-        (Some(Err(why)), None) => (None, Some(why.wire().to_string())),
-        (Some(Ok(())), None) => (None, None),
+    held: &[LocalRelayDescriptor],
+) -> (
+    Option<LocalRelayDescriptor>,
+    Vec<LocalRelayDescriptor>,
+    Option<String>,
+) {
+    match (answer, held.split_first()) {
+        (None, _) => (None, Vec::new(), None),
+        (Some(_), Some((first, rest))) => (Some(first.clone()), rest.to_vec(), None),
+        (Some(Err(why)), None) => (None, Vec::new(), Some(why.wire().to_string())),
+        (Some(Ok(())), None) => (None, Vec::new(), None),
     }
+}
+
+/// FR-121 P3b (#2774) — the relays one session keeps: the first of each
+/// `turn:` address, and at most [`LOCAL_RELAYS_MAX`]. Each one is another
+/// TURN allocation for the target's agent, and a probed list is whatever the
+/// browser sent. FR-128 D8: `remote`'s far-TURN hint counts the same ones.
+pub fn bounded_relays(
+    relays: impl IntoIterator<Item = LocalRelayDescriptor>,
+) -> Vec<LocalRelayDescriptor> {
+    let mut kept: Vec<LocalRelayDescriptor> = Vec::new();
+    for relay in relays {
+        if kept.len() == LOCAL_RELAYS_MAX {
+            break;
+        }
+        let seen = kept
+            .iter()
+            .any(|k| k.overlay_ip == relay.overlay_ip && k.turn_port == relay.turn_port);
+        if !seen {
+            kept.push(relay);
+        }
+    }
+    kept
+}
+
+/// FR-121 P3b (#2774) — the devices a request names, each once, in order, at
+/// most [`LOCAL_RELAYS_MAX`]: `local_relay_from`, then
+/// `local_relay_from_also`. FR-128 D8: `remote`'s far-TURN hint reads them.
+pub fn named_devices(first: ObjectId, also: Vec<ObjectId>) -> Vec<ObjectId> {
+    let mut named = vec![first];
+    for device in also {
+        if named.len() == LOCAL_RELAYS_MAX {
+            break;
+        }
+        if !named.contains(&device) {
+            named.push(device);
+        }
+    }
+    named
+}
+
+/// FR-128 — `rc:request`'s `rc_overlay_auto` for a session in `mode`: `None`
+/// unless `auto`. The viewers are the overlay addresses of the relays this
+/// session holds, each once: the browser's own devices, which `forward_offer`
+/// hands the agent as TURN servers over the mesh. Only addresses in the
+/// overlay range count, as `forward_offer` requires before it hands one out.
+/// No relay, no viewer, and the agent then reads the carrier as unknown (off).
+fn rc_overlay_auto_wire(
+    mode: RcOverlayMode,
+    relays: &[LocalRelayDescriptor],
+) -> Option<RcOverlayAutoWire> {
+    let RcOverlayMode::Auto { far_turn } = mode else {
+        return None;
+    };
+    let mut viewers: Vec<String> = Vec::new();
+    for relay in relays {
+        if is_overlay_relay_ip(&relay.overlay_ip) && !viewers.contains(&relay.overlay_ip) {
+            viewers.push(relay.overlay_ip.clone());
+        }
+    }
+    Some(RcOverlayAutoWire { viewers, far_turn })
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -196,10 +262,24 @@ pub struct ConnectedAgent {
     /// CONNECTION; `false` ⇒ the ask is not sent, and the audit row records
     /// it as not enforced.
     pub honours_lock_on_end: bool,
+    /// FR-128 — the agent advertises `rc-overlay-auto` in `AgentCaps.rpc`: it
+    /// decides `Request.rc_overlay_auto` at its offer. Per CONNECTION;
+    /// `false` ⇒ a device policy of `auto` reads as `off` for it (D1): no
+    /// `rc_overlay_auto` on its request, and no viewer relay handed out.
+    pub honours_rc_overlay_auto: bool,
     /// FR-92 — the agent advertises `keep-busy` in `AgentCaps.input`: it
     /// parses `rc:agent.keep_busy_policy`. Per CONNECTION; a pre-FR-92 agent
     /// would log every policy frame as an unknown `rc:*` at WARN.
     pub supports_keep_busy: bool,
+    /// FR-132 P1b — the agent advertises `config` in `AgentCaps.rpc`: it
+    /// parses `rc:agent.config`. Per CONNECTION; a frame sent to a build
+    /// before that vanishes at its parser, and the dashboard would show a
+    /// change that never landed.
+    pub supports_config: bool,
+    /// FR-132 P1b — the newest desired-config revision sent on THIS
+    /// connection, and the reason a stale one is never sent after it
+    /// ([`Hub::push_desired_config`]).
+    pub config_revision_sent: Option<u64>,
     /// FR-90 — the agent advertises `hive`: it answers `rc:hive.start` with
     /// `rc:hive.start_ack` and reports sessions with `rc:hive.state`. Per
     /// CONNECTION, for [`Self::supports_ssh_grant_ack`]'s reason — a stored
@@ -898,9 +978,18 @@ impl Hub {
             // FR-99 P3b — set by `set_agent_honours_lock_on_end`; `false` (no
             // lock ask sent) until it is.
             honours_lock_on_end: false,
+            // FR-128 — set by `set_agent_honours_rc_overlay_auto`; `false`
+            // (`auto` reads as `off`) until it is.
+            honours_rc_overlay_auto: false,
             // FR-92 — set by `set_agent_keep_busy_support`; `false` = no
             // policy frame is ever pushed to this connection.
             supports_keep_busy: false,
+            // FR-132 P1b — set by `set_agent_config_support`; `false` = no
+            // desired config is ever pushed to this connection.
+            supports_config: false,
+            // FR-132 P1b — nothing sent yet, so a new connection takes
+            // whichever revision the connect path reads.
+            config_revision_sent: None,
             // FR-90 — set by `set_agent_hive_support`; `false` = no session
             // frame is ever pushed to this connection.
             supports_hive: false,
@@ -1404,8 +1493,8 @@ impl Hub {
             audio_enabled,
             consent_mode,
             override_reason,
-            local_relay,
-            false,
+            local_relay.into_iter().collect(),
+            RcOverlayMode::Off,
             input_mode,
             tenant_name,
             false,
@@ -1439,11 +1528,15 @@ impl Hub {
         audio_enabled: bool,
         consent_mode: ConsentMode,
         override_reason: Option<String>,
-        local_relay: Option<LocalRelayDescriptor>,
+        // FR-121 P3b (#2774) — every relay of the browser's computer, the
+        // first first; empty when it has none.
+        local_relays: Vec<LocalRelayDescriptor>,
         // #1882 — the device's `AccessPolicy.rc_overlay`, resolved by the
         // authz gate. Rides `ServerMsg::Request`, and gates whether
-        // `forward_offer` hands the agent `local_relay` at all.
-        rc_overlay: bool,
+        // `forward_offer` hands the agent `local_relays` at all. FR-128 —
+        // `auto` already `off` for an agent that does not decide it
+        // ([`Self::effective_rc_overlay`]).
+        rc_overlay: RcOverlayMode,
         input_mode: Option<roomler_ai_remote_control::models::InputMode>,
         // Multi-org — display name of the requesting org, for the host's
         // consent prompt. See `ServerMsg::Request::tenant_name`.
@@ -1478,9 +1571,11 @@ impl Hub {
         // (a refusal, or a coalesced duplicate that returned another id).
         slot: Option<Lease>,
         // FR-121 — `Some` when the request named the browser's own device
-        // (`local_relay_from`): `Ok` when `local_relay` is that device's
+        // (`local_relay_from`): `Ok` when `local_relays` holds that device's
         // reported relay, `Err` with why not. `rc:session.created` echoes the
         // relay, or the refusal, to the browser; `None` sends neither.
+        // P3b (#2774) — with several named, `Ok` when any of them got one,
+        // and otherwise the first one's refusal.
         local_relay_answer: Option<std::result::Result<(), LocalRelayRefusal>>,
     ) -> Result<ObjectId> {
         // rc.185 — self-heal the fast connect→disconnect race. A controller
@@ -1554,7 +1649,7 @@ impl Hub {
                     s.features_refused.clone(),
                     s.idle_secs,
                     s.consent_mode,
-                    s.local_relay.clone(),
+                    s.local_relays.clone(),
                 )
             })
         });
@@ -1566,14 +1661,14 @@ impl Hub {
             existing_features_refused,
             existing_idle_secs,
             existing_consent_mode,
-            existing_local_relay,
+            existing_local_relays,
         )) = existing
         {
-            // FR-121 — a retry that named its device gets the relay the live
+            // FR-121 — a retry that named its device gets the relays the live
             // session holds (the first `rc:session.created` may be the one the
             // retry lost), or this request's refusal.
-            let (echo_relay, echo_refused) =
-                local_relay_reply(local_relay_answer, existing_local_relay);
+            let (echo_relay, echo_also, echo_refused) =
+                local_relay_reply(local_relay_answer, &existing_local_relays);
             info!(
                 "coalescing duplicate rc:session.request from controller {} to agent {} onto live \
                  session {} (same connection; no second consent prompt)",
@@ -1609,6 +1704,7 @@ impl Hub {
                 consent_asks: existing_consent_mode.asks(),
                 local_relay: echo_relay,
                 local_relay_refused: echo_refused,
+                local_relay_also: echo_also,
             });
             return Ok(existing_id);
         }
@@ -1799,8 +1895,12 @@ impl Hub {
         // relay it reaches over the overlay. Validated at use, not here.
         // FR-121 — and, when the request named the browser's device, the
         // same descriptor goes back to the browser on `rc:session.created`.
-        let (echo_relay, echo_refused) = local_relay_reply(local_relay_answer, local_relay.clone());
-        live.local_relay = local_relay;
+        let (echo_relay, echo_also, echo_refused) =
+            local_relay_reply(local_relay_answer, &local_relays);
+        // FR-128 — under `auto`, the agent decides from its mesh carrier to
+        // each device these relays are on: their own overlay addresses.
+        let rc_overlay_auto = rc_overlay_auto_wire(rc_overlay, &local_relays);
+        live.local_relays = local_relays;
         live.rc_overlay = rc_overlay;
         // FR-27 — `deliver_consent` needs the mode to know whether a host-side
         // timeout ends the session or hands over to the owner's emailed link.
@@ -1818,6 +1918,8 @@ impl Hub {
         // older agent ignores would be a promise nothing keeps.
         let idle_told = idle_secs.filter(|_| agent_enforces_idle);
         live.idle_secs = idle_told;
+        // FR-52 P5 — what a revocation ends (`terminate_external_of`).
+        live.external = external.is_some();
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -1868,6 +1970,7 @@ impl Hub {
             consent_asks: consent_mode.asks(),
             local_relay: echo_relay,
             local_relay_refused: echo_refused,
+            local_relay_also: echo_also,
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -1916,7 +2019,9 @@ impl Hub {
             // Multi-org — so the host prompt names the asking organization.
             tenant_name,
             // #1882 — may this session's ICE use the overlay (default off).
-            rc_overlay,
+            rc_overlay: rc_overlay.is_on(),
+            // FR-128 — `auto`, with what the agent decides it from.
+            rc_overlay_auto,
             // FR-101 P2 — the org's policy, for an agent that names `ask`
             // features on its prompt and enforces the rest. Left off the
             // frame when it restricts nothing, as before the field.
@@ -2184,14 +2289,14 @@ impl Hub {
         // device signs its answer against. The hub never reads it.
         peer_auth: Option<roomler_ai_remote_control::signaling::PeerAuthOffer>,
     ) -> Result<()> {
-        let (agent_id, local_relay, rc_overlay, region, org) =
+        let (agent_id, local_relays, rc_overlay, region, org) =
             self.with_session(session_id, |s| {
                 // Also what stands the negotiating reaper down: once an offer
                 // exists, the ICE layer owns liveness.
                 s.admit_offer()?;
                 Ok((
                     s.agent_id,
-                    s.local_relay.clone(),
+                    s.local_relays.clone(),
                     s.rc_overlay,
                     s.relay_region.clone(),
                     s.tenant_id,
@@ -2215,8 +2320,17 @@ impl Hub {
         // The relay IS an overlay path (the agent reaches it over the mesh), so
         // with the device's `rc_overlay` off it would be a candidate the agent
         // only discards; withholding it here also covers agents too old to.
-        if let Some(lr) = local_relay {
-            if !rc_overlay {
+        //
+        // FR-121 P3b (#2774) — every relay of the browser's computer, in the
+        // request's order: two agents on one computer can reach the target by
+        // different paths (a WSL agent on DERP, the Windows one direct), and
+        // nothing here knows which. ICE checks a pair through each; the browser
+        // ranks them in this order (FR-121 open decision 4).
+        //
+        // FR-128 — under `auto` they are handed out too: the agent decides at
+        // this offer, and filters out itself whichever it leaves off the mesh.
+        for lr in local_relays {
+            if !rc_overlay.hands_out_relay() {
                 info!(
                     session = %session_id.to_hex(),
                     relay = %format!("turn:{}:{}", lr.overlay_ip, lr.turn_port),
@@ -2226,6 +2340,7 @@ impl Hub {
                 info!(
                     session = %session_id.to_hex(),
                     relay = %format!("turn:{}:{}", lr.overlay_ip, lr.turn_port),
+                    rc_overlay = rc_overlay.wire(),
                     "loopback-TURN: adding local-agent overlay relay to agent ICE"
                 );
                 ice.push(IceServer {
@@ -2424,6 +2539,58 @@ impl Hub {
             },
         );
         Ok(())
+    }
+
+    /// FR-52 P5 — end every session this pod holds that `principal` opened on
+    /// `agent_id` through an external login: what a revocation owes a person who
+    /// is already in. Any pod may run it, and only the one holding the session
+    /// finds anything. A session the same account holds as a member stands: that
+    /// door has its own gates. Returns how many ended.
+    ///
+    /// The tenant check is the `terminate` envelope's: a forged or mismatched
+    /// envelope cannot end another org's session.
+    pub fn terminate_external_of(
+        &self,
+        agent_id: ObjectId,
+        principal: ObjectId,
+        tenant_id: ObjectId,
+    ) -> usize {
+        self.terminate_external(tenant_id, |s| {
+            s.agent_id == agent_id && s.controller_user_id == principal
+        })
+    }
+
+    /// FR-52 decision 16 — the same for everyone on one device: its approval was
+    /// cleared (gate 2), so nobody's session there has any standing left.
+    pub fn terminate_external_on(&self, agent_id: ObjectId, tenant_id: ObjectId) -> usize {
+        self.terminate_external(tenant_id, |s| s.agent_id == agent_id)
+    }
+
+    /// FR-52 decision 16 — the same for everyone in one org: its switch went off
+    /// (gate 1).
+    pub fn terminate_external_in(&self, tenant_id: ObjectId) -> usize {
+        self.terminate_external(tenant_id, |_| true)
+    }
+
+    fn terminate_external(
+        &self,
+        tenant_id: ObjectId,
+        covers: impl Fn(&LiveSession) -> bool,
+    ) -> usize {
+        // Collected first: `terminate` writes to the map this iterates.
+        let ended: Vec<ObjectId> = self
+            .inner
+            .sessions
+            .iter()
+            .filter_map(|e| {
+                let s = e.value().lock();
+                (s.external && s.tenant_id == tenant_id && covers(&s)).then_some(*e.key())
+            })
+            .collect();
+        for session_id in &ended {
+            let _ = self.terminate(*session_id, EndReason::AdminTerminated);
+        }
+        ended.len()
     }
 
     // ─── helpers ─────────────────────────────────────────────────────
@@ -2653,6 +2820,39 @@ impl Hub {
         }
     }
 
+    /// FR-128 — record whether the agent decides `auto` itself (its hello's,
+    /// or a heartbeat's, `AgentCaps.rpc` has `rc-overlay-auto`).
+    pub fn set_agent_honours_rc_overlay_auto(&self, agent_id: ObjectId, honours: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.honours_rc_overlay_auto = honours;
+        }
+    }
+
+    /// FR-128 — the device's mode as this connection can take it: `auto` for
+    /// an agent that does not decide it is `off` (D1), so it gets no
+    /// `rc_overlay_auto` and no viewer relay. Every other mode as it is, and
+    /// an agent not connected here keeps it too: `create_session` answers
+    /// that one.
+    pub fn effective_rc_overlay(&self, agent_id: ObjectId, mode: RcOverlayMode) -> RcOverlayMode {
+        if !matches!(mode, RcOverlayMode::Auto { .. }) {
+            return mode;
+        }
+        // Copied out, so no guard is held past this line.
+        let honours = self
+            .inner
+            .agents
+            .get(&agent_id)
+            .map(|e| e.honours_rc_overlay_auto);
+        if honours == Some(false) {
+            info!(
+                agent = %agent_id.to_hex(),
+                "rc_overlay=auto, but the device does not decide it (no rc-overlay-auto): read as off"
+            );
+            return RcOverlayMode::Off;
+        }
+        mode
+    }
+
     /// FR-101 P2b — record the device owner's floor (its hello's, or a
     /// heartbeat's, `AgentCaps.session_policy`).
     pub fn set_agent_device_session_policy(
@@ -2697,6 +2897,74 @@ impl Hub {
                     .is_ok()
             })
             .count()
+    }
+
+    /// FR-132 P1b — record whether this connection parses `rc:agent.config`
+    /// (`config` in its hello's `AgentCaps.rpc`, equality-matched). Set right
+    /// after registration and BEFORE the connect path reads the row: a save
+    /// that finds `false` here stored its revision before that read, so the
+    /// connect path carries it.
+    pub fn set_agent_config_support(&self, agent_id: ObjectId, supports: bool) {
+        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
+            entry.supports_config = supports;
+        }
+    }
+
+    /// FR-132 P1b — send a desired config down an agent's socket. The one way
+    /// `rc:agent.config` leaves the server: the connect path's reconcile and a
+    /// save's nudge both come through here.
+    ///
+    /// ⚠️ The revision check is load-bearing, and it lives HERE because the
+    /// device has none: `apply` writes whatever frame arrived last, and every
+    /// released agent behaves that way. Two frames can race on one connection.
+    /// The connect path reads the row, a save stores a newer revision and
+    /// pushes it, and the older read goes out second; and two pods can deliver
+    /// a pair of saves out of order. So a connection never carries a revision
+    /// at or below one it already carried: a lower one would put the device
+    /// back on a config the operator replaced, and an equal one would draw a
+    /// `noop` over the `needs_restart` the first frame earned.
+    ///
+    /// The check and the send are one step under the entry's lock, which is
+    /// why this calls `try_send` itself: [`Self::send_to_agent`] would take the
+    /// same shard's lock again. `try_send` never waits.
+    ///
+    /// A skipped frame is `Ok`, since the connection already holds a document
+    /// at least this new. Offline or another tenant's is
+    /// [`Error::AgentOffline`]; a connection without `config` is
+    /// [`Error::ExecUnsupported`] and receives nothing.
+    pub fn push_desired_config(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        desired: DesiredConfig,
+    ) -> Result<()> {
+        let mut entry = self
+            .inner
+            .agents
+            .get_mut(&agent_id)
+            .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
+        if entry.tenant_id != tenant_id {
+            return Err(Error::AgentOffline(agent_id.to_hex()));
+        }
+        if !entry.supports_config {
+            return Err(Error::ExecUnsupported(agent_id.to_hex()));
+        }
+        let revision = desired.revision;
+        if entry
+            .config_revision_sent
+            .is_some_and(|sent| sent >= revision)
+        {
+            return Ok(());
+        }
+        entry
+            .tx
+            .try_send(ServerMsg::ConfigPush { revision, desired })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => Error::SendFailed,
+                mpsc::error::TrySendError::Closed(_) => Error::AgentOffline(agent_id.to_hex()),
+            })?;
+        entry.config_revision_sent = Some(revision);
+        Ok(())
     }
 
     /// FR-90 — record whether this connection runs Hive sessions (`hive`),
@@ -3322,7 +3590,8 @@ impl Hub {
     /// `user` is opening on `target`: the device must be connected here, be
     /// `user`'s own, be in `target`'s organization (whose overlay the target
     /// would have to reach it over), the target must let remote desktop use
-    /// the overlay, and the device must have reported a relay.
+    /// the overlay (`on`, or FR-128's `auto`), and the device must have
+    /// reported a relay.
     ///
     /// Owner-only (FR-121 open decision 1): a member who may control a device
     /// does not thereby get to relay through someone else's.
@@ -3331,7 +3600,7 @@ impl Hub {
         from: ObjectId,
         target: ObjectId,
         user: ObjectId,
-        rc_overlay: bool,
+        rc_overlay: RcOverlayMode,
     ) -> std::result::Result<LocalRelayDescriptor, LocalRelayRefusal> {
         if from == target {
             return Err(LocalRelayRefusal::SameDevice);
@@ -3353,7 +3622,7 @@ impl Hub {
         if !same_org {
             return Err(LocalRelayRefusal::OtherNetwork);
         }
-        if !rc_overlay {
+        if !rc_overlay.hands_out_relay() {
             return Err(LocalRelayRefusal::RcOverlayOff);
         }
         relay.ok_or(LocalRelayRefusal::DeviceOffline)
@@ -3807,9 +4076,11 @@ pub struct DispatchCtx {
     /// #1882 — the device's `AccessPolicy.rc_overlay`, resolved by the API WS
     /// layer's authz gate (the Hub has no DB access). Forwarded to the agent
     /// in `ServerMsg::Request`; `forward_offer` withholds the overlay
-    /// `local_relay` TURN when it is `false`. Ignored for non-request messages
-    /// and agent-role dispatch.
-    pub rc_overlay: bool,
+    /// `local_relay` TURN when it is `off`. FR-128 — `auto` carries the gate's
+    /// far-TURN hint, and reads as `off` for an agent that does not decide it
+    /// ([`Hub::effective_rc_overlay`]). Ignored for non-request messages and
+    /// agent-role dispatch.
+    pub rc_overlay: RcOverlayMode,
     /// FR-101 P2 — the org's session policy for clipboard, files and audio,
     /// read by the API WS layer's authz gate from the tenant row it already
     /// loads. `create_session` strips what it refuses (see [`feature_grant`])
@@ -3904,6 +4175,10 @@ impl Hub {
                     // FR-121 — or the browser's own device, whose reported
                     // relay this hub holds.
                     local_relay_from,
+                    // FR-121 P3b (#2774) — and the rest of each, when the
+                    // browser's computer runs more than one agent.
+                    local_relay_also,
+                    local_relay_from_also,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -3917,25 +4192,55 @@ impl Hub {
                 let user_id = ctx.user_id.ok_or(Error::PermissionDenied("no user"))?;
                 let name = ctx.controller_name.clone().unwrap_or_default();
                 let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;
+                // FR-128 — the device's mode as this agent can take it, once,
+                // for the relays below and the session alike.
+                let rc_overlay = self.effective_rc_overlay(agent_id, ctx.rc_overlay);
                 // FR-121 — a probed descriptor is the browser's own evidence
                 // and wins; otherwise the device it named, resolved here.
-                let (local_relay, local_relay_answer) = match (local_relay, local_relay_from) {
-                    (Some(probed), _) => (Some(probed), None),
+                // P3b (#2774) — every one of each: each named device is
+                // resolved on its own, and the answer is `Ok` when any of them
+                // got a relay, else the first one's refusal.
+                let (local_relays, local_relay_answer) = match (local_relay, local_relay_from) {
+                    (Some(probed), _) => (
+                        bounded_relays(std::iter::once(probed).chain(local_relay_also)),
+                        None,
+                    ),
+                    // P3b — the target's own switch first: with `rc_overlay` off
+                    // no named device's relay is any use to it, and saying so
+                    // beats the first device's reason (an offline one would
+                    // otherwise hide the switch that matters).
+                    (None, Some(_)) if !rc_overlay.hands_out_relay() => {
+                        info!(
+                            agent = %agent_id.to_hex(),
+                            reason = LocalRelayRefusal::RcOverlayOff.wire(),
+                            "loopback-TURN: the browser's own device's relay not handed out"
+                        );
+                        (Vec::new(), Some(Err(LocalRelayRefusal::RcOverlayOff)))
+                    }
                     (None, Some(from)) => {
-                        match self.resolve_local_relay(from, agent_id, user_id, ctx.rc_overlay) {
-                            Ok(relay) => (Some(relay), Some(Ok(()))),
-                            Err(why) => {
-                                info!(
-                                    agent = %agent_id.to_hex(),
-                                    from = %from.to_hex(),
-                                    reason = why.wire(),
-                                    "loopback-TURN: the browser's own device's relay not handed out"
-                                );
-                                (None, Some(Err(why)))
+                        let mut relays = Vec::new();
+                        let mut first_refusal = None;
+                        for device in named_devices(from, local_relay_from_also) {
+                            match self.resolve_local_relay(device, agent_id, user_id, rc_overlay) {
+                                Ok(relay) => relays.push(relay),
+                                Err(why) => {
+                                    info!(
+                                        agent = %agent_id.to_hex(),
+                                        from = %device.to_hex(),
+                                        reason = why.wire(),
+                                        "loopback-TURN: the browser's own device's relay not handed out"
+                                    );
+                                    first_refusal.get_or_insert(why);
+                                }
                             }
                         }
+                        let answer = match first_refusal {
+                            Some(why) if relays.is_empty() => Err(why),
+                            _ => Ok(()),
+                        };
+                        (bounded_relays(relays), Some(answer))
                     }
-                    (None, None) => (None, None),
+                    (None, None) => (Vec::new(), None),
                 };
                 self.create_session_full(
                     agent_id,
@@ -3950,8 +4255,8 @@ impl Hub {
                     audio_enabled,
                     ctx.consent_mode,
                     ctx.override_reason.clone(),
-                    local_relay,
-                    ctx.rc_overlay,
+                    local_relays,
+                    rc_overlay,
                     ctx.input_mode,
                     ctx.tenant_name.clone(),
                     ctx.may_record,
@@ -4091,13 +4396,15 @@ impl Hub {
                 _,
                 ClientMsg::AgentHello { .. }
                 | ClientMsg::AgentHeartbeat { .. }
+                | ClientMsg::AgentSleeping { .. }
                 | ClientMsg::RelayProbeReport { .. }
                 | ClientMsg::SessionStats { .. }
                 | ClientMsg::DerpTicketRequest {},
             ) => {
-                // Hello is handled at registration time; heartbeat and
-                // session stats are consumed by the WS layer (they need
-                // AppState/Mongo, which the Hub deliberately doesn't hold).
+                // Hello is handled at registration time; heartbeat, the sleep
+                // notice (FR-55 P4) and session stats are consumed by the WS
+                // layer (they need AppState/Mongo, which the Hub deliberately
+                // doesn't hold).
                 Ok(())
             }
             (role, msg) => {
@@ -4290,8 +4597,8 @@ mod tests {
             false,
             ConsentMode::Prompt,
             None,
-            None,
-            false, // rc_overlay
+            Vec::new(),
+            RcOverlayMode::Off, // rc_overlay
             None,
             None,
             false, // may_record
@@ -4681,8 +4988,8 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
-                false,
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 false,
@@ -4761,8 +5068,8 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
-                false,
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 false,
@@ -4822,7 +5129,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             may_record: false,
-            rc_overlay: false,
+            rc_overlay: RcOverlayMode::Off,
             session_policy: OrgPolicy::Unavailable,
             max_duration: None,
             idle_secs: None,
@@ -4974,7 +5281,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             may_record: false,
-            rc_overlay: false,
+            rc_overlay: RcOverlayMode::Off,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
             idle_secs: None,
@@ -5093,7 +5400,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             may_record: false,
-            rc_overlay: false,
+            rc_overlay: RcOverlayMode::Off,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
             idle_secs: None,
@@ -5266,7 +5573,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             may_record: false,
-            rc_overlay: false,
+            rc_overlay: RcOverlayMode::Off,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
             idle_secs: None,
@@ -5411,8 +5718,8 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
-                false, // rc_overlay
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 may_record,
@@ -5520,8 +5827,8 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
-                false, // rc_overlay
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 true,
@@ -5595,8 +5902,8 @@ mod tests {
                     false,
                     mode,
                     None,
-                    None,
-                    false, // rc_overlay
+                    Vec::new(),
+                    RcOverlayMode::Off, // rc_overlay
                     None,
                     None,
                     false,
@@ -5764,8 +6071,8 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 override_reason.map(str::to_string),
-                None,
-                false, // rc_overlay
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 false,
@@ -6107,8 +6414,8 @@ mod tests {
                 true, // audio_enabled
                 ConsentMode::Prompt,
                 None,
-                None,
-                false, // rc_overlay
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 false,
@@ -6187,8 +6494,8 @@ mod tests {
             true,
             ConsentMode::Prompt,
             None,
-            None,
-            false,
+            Vec::new(),
+            RcOverlayMode::Off, // rc_overlay
             None,
             None,
             false,
@@ -6630,8 +6937,8 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                None,
-                false,
+                Vec::new(),
+                RcOverlayMode::Off, // rc_overlay
                 None,
                 None,
                 false,
@@ -6811,11 +7118,15 @@ mod tests {
         );
     }
 
-    /// A session whose controller forwarded a loopback-TURN descriptor at
-    /// `overlay_ip`, on a device whose `rc_overlay` is as given, offered once.
-    /// Returns what the agent was told in `rc:request` and the `turn:` URLs
-    /// its `rc:sdp.offer` carried.
-    async fn session_with_local_relay(overlay_ip: &str, rc_overlay: bool) -> (bool, Vec<String>) {
+    /// A session whose controller forwarded a loopback-TURN descriptor at each
+    /// of `overlay_ips` (ports 47989, 47990, …), on a device whose
+    /// `rc_overlay` is as given, offered once. Returns what the agent was told
+    /// in `rc:request` (the bool, and FR-128's `rc_overlay_auto`) and the
+    /// `turn:` URLs its `rc:sdp.offer` carried.
+    async fn session_with_local_relays(
+        overlay_ips: &[&str],
+        rc_overlay: RcOverlayMode,
+    ) -> (bool, Option<RcOverlayAutoWire>, Vec<String>) {
         let hub = test_hub().await;
         let agent_id = ObjectId::new();
         let (_agent_tx, _cancel, mut agent_rx) = hub.register_agent(
@@ -6842,13 +7153,17 @@ mod tests {
                 false,
                 ConsentMode::Prompt,
                 None,
-                Some(LocalRelayDescriptor {
-                    turn_port: 47989,
-                    overlay_ip: overlay_ip.into(),
-                    username: "1700000600:uid".into(),
-                    credential: "abcd1234".into(),
-                    agent_id: None,
-                }),
+                overlay_ips
+                    .iter()
+                    .zip(47989u16..)
+                    .map(|(ip, port)| LocalRelayDescriptor {
+                        turn_port: port,
+                        overlay_ip: (*ip).into(),
+                        username: "1700000600:uid".into(),
+                        credential: "abcd1234".into(),
+                        agent_id: None,
+                    })
+                    .collect(),
                 rc_overlay,
                 None,
                 None, // tenant_name
@@ -6873,7 +7188,11 @@ mod tests {
         let mut turn_urls: Option<Vec<String>> = None;
         while let Ok(msg) = agent_rx.try_recv() {
             match msg {
-                ServerMsg::Request { rc_overlay, .. } => told = Some(rc_overlay),
+                ServerMsg::Request {
+                    rc_overlay,
+                    rc_overlay_auto,
+                    ..
+                } => told = Some((rc_overlay, rc_overlay_auto)),
                 ServerMsg::SdpOffer { ice_servers, .. } => {
                     turn_urls = Some(
                         ice_servers
@@ -6886,10 +7205,8 @@ mod tests {
                 _ => {}
             }
         }
-        (
-            told.expect("the agent got its rc:request"),
-            turn_urls.expect("the offer reached the agent"),
-        )
+        let (told, auto) = told.expect("the agent got its rc:request");
+        (told, auto, turn_urls.expect("the offer reached the agent"))
     }
 
     /// Loopback-TURN corp-relay (Phase 2): a session that forwarded a local
@@ -6901,11 +7218,13 @@ mod tests {
     /// told in the same session's `rc:request`.
     #[tokio::test]
     async fn forward_offer_appends_overlay_local_relay_to_agent_ice() {
-        let (told, turn_urls) = session_with_local_relay("100.64.0.9", true).await;
+        let (told, auto, turn_urls) =
+            session_with_local_relays(&["100.64.0.9"], RcOverlayMode::On).await;
         assert!(
             told,
             "rc:request must tell the agent the overlay is allowed"
         );
+        assert_eq!(auto, None, "`on` is not `auto`");
         assert_eq!(
             turn_urls,
             vec!["turn:100.64.0.9:47989".to_string()],
@@ -6917,8 +7236,10 @@ mod tests {
     /// keeps remote desktop off the overlay never gets it, and is told so.
     #[tokio::test]
     async fn forward_offer_withholds_the_overlay_relay_when_rc_overlay_is_off() {
-        let (told, turn_urls) = session_with_local_relay("100.64.0.9", false).await;
+        let (told, auto, turn_urls) =
+            session_with_local_relays(&["100.64.0.9"], RcOverlayMode::Off).await;
         assert!(!told, "rc:request must tell the agent the overlay is off");
+        assert_eq!(auto, None, "and nothing about `auto`");
         assert!(
             turn_urls.is_empty(),
             "an overlay relay must not reach a device with rc_overlay off: {turn_urls:?}"
@@ -6933,11 +7254,69 @@ mod tests {
     #[tokio::test]
     async fn forward_offer_rejects_non_overlay_local_relay() {
         // public — must be rejected
-        let (_, turn_urls) = session_with_local_relay("8.8.8.8", true).await;
+        let (_, _, turn_urls) = session_with_local_relays(&["8.8.8.8"], RcOverlayMode::On).await;
         assert!(
             turn_urls.is_empty(),
             "a non-overlay relay must be rejected, not forwarded to the agent's TURN client"
         );
+    }
+
+    /// FR-128 — under `auto` every relay is handed out as under `on`, because
+    /// the agent may yet take any of them. The `rc:request` bool still says
+    /// no, so an agent that knows only the bool reads `off`, while
+    /// `rc_overlay_auto` names every viewer device by its relay's overlay
+    /// address (FR-121 P3b: one per agent on the viewer's computer), each
+    /// once, and carries the gate's far-TURN hint unchanged.
+    #[tokio::test]
+    async fn forward_offer_hands_out_every_relay_under_auto_and_names_each_viewer() {
+        let (told, auto, turn_urls) = session_with_local_relays(
+            &["100.64.0.9", "100.64.0.10", "100.64.0.9"],
+            RcOverlayMode::Auto {
+                far_turn: Some(false),
+            },
+        )
+        .await;
+        assert!(!told, "auto rides beside rc_overlay: false (D1)");
+        assert_eq!(
+            auto,
+            Some(RcOverlayAutoWire {
+                viewers: vec!["100.64.0.9".into(), "100.64.0.10".into()],
+                far_turn: Some(false),
+            })
+        );
+        assert_eq!(
+            turn_urls,
+            [
+                "turn:100.64.0.9:47989",
+                "turn:100.64.0.10:47990",
+                "turn:100.64.0.9:47991"
+            ]
+        );
+    }
+
+    /// FR-128 — a relay outside the overlay range names no viewer, and the
+    /// range guard still keeps that relay itself from the agent under `auto`.
+    /// With none left, the agent reads the carrier as unknown and stays off.
+    #[tokio::test]
+    async fn auto_names_no_viewer_for_a_relay_outside_the_overlay() {
+        let (told, auto, turn_urls) = session_with_local_relays(
+            &["8.8.8.8", "100.64.0.9"],
+            RcOverlayMode::Auto { far_turn: None },
+        )
+        .await;
+        assert!(!told);
+        assert_eq!(
+            auto,
+            Some(RcOverlayAutoWire {
+                viewers: vec!["100.64.0.9".into()],
+                far_turn: None,
+            })
+        );
+        assert_eq!(turn_urls, ["turn:100.64.0.9:47990"]);
+        let (_, auto, turn_urls) =
+            session_with_local_relays(&["8.8.8.8"], RcOverlayMode::Auto { far_turn: None }).await;
+        assert_eq!(auto, Some(RcOverlayAutoWire::default()), "no viewer at all");
+        assert!(turn_urls.is_empty(), "{turn_urls:?}");
     }
 
     fn reported_relay(port: u16) -> LocalRelayDescriptor {
@@ -6973,7 +7352,7 @@ mod tests {
         let _e = hub.register_agent(elsewhere, other_org, me, OsKind::Linux, 3, false, false);
 
         assert_eq!(
-            hub.resolve_local_relay(mine, target, me, true),
+            hub.resolve_local_relay(mine, target, me, RcOverlayMode::On),
             Err(DeviceOffline),
             "connected, but nothing reported yet"
         );
@@ -6981,34 +7360,40 @@ mod tests {
         hub.set_agent_local_relay(theirs, Some(reported_relay(47990)));
         hub.set_agent_local_relay(elsewhere, Some(reported_relay(47991)));
         assert_eq!(
-            hub.resolve_local_relay(mine, target, me, true)
+            hub.resolve_local_relay(mine, target, me, RcOverlayMode::On)
                 .map(|r| r.turn_port),
             Ok(47989)
         );
         assert_eq!(
-            hub.resolve_local_relay(theirs, target, me, true),
+            hub.resolve_local_relay(theirs, target, me, RcOverlayMode::On),
             Err(NotYourDevice)
         );
         assert_eq!(
-            hub.resolve_local_relay(elsewhere, target, me, true),
+            hub.resolve_local_relay(elsewhere, target, me, RcOverlayMode::On),
             Err(OtherNetwork)
         );
         assert_eq!(
-            hub.resolve_local_relay(mine, target, me, false),
+            hub.resolve_local_relay(mine, target, me, RcOverlayMode::Off),
             Err(RcOverlayOff)
         );
+        // FR-128 — `auto` hands it out as `on` does: the agent decides.
         assert_eq!(
-            hub.resolve_local_relay(target, target, colleague, true),
+            hub.resolve_local_relay(mine, target, me, RcOverlayMode::Auto { far_turn: None })
+                .map(|r| r.turn_port),
+            Ok(47989)
+        );
+        assert_eq!(
+            hub.resolve_local_relay(target, target, colleague, RcOverlayMode::On),
             Err(SameDevice)
         );
         assert_eq!(
-            hub.resolve_local_relay(ObjectId::new(), target, me, true),
+            hub.resolve_local_relay(ObjectId::new(), target, me, RcOverlayMode::On),
             Err(DeviceOffline),
             "not connected to this hub"
         );
         hub.set_agent_local_relay(mine, None);
         assert_eq!(
-            hub.resolve_local_relay(mine, target, me, true),
+            hub.resolve_local_relay(mine, target, me, RcOverlayMode::On),
             Err(DeviceOffline)
         );
     }
@@ -7040,7 +7425,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             may_record: false,
-            rc_overlay: true,
+            rc_overlay: RcOverlayMode::On,
             session_policy: OrgPolicy::Read(SessionPolicy::default()),
             max_duration: None,
             idle_secs: None,
@@ -7068,6 +7453,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: Some(from),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: Vec::new(),
         };
 
         hub.dispatch(&ctx_for(Role::Controller, Some(me), None), request(mine))
@@ -7118,6 +7505,543 @@ mod tests {
             }
             other => panic!("expected rc:session.created, got {other:?}"),
         }
+    }
+
+    fn relay_at(overlay_ip: &str, port: u16) -> LocalRelayDescriptor {
+        LocalRelayDescriptor {
+            overlay_ip: overlay_ip.into(),
+            ..reported_relay(port)
+        }
+    }
+
+    /// The `turn:` URLs the target's agent was handed with its offer.
+    fn offered_turn_urls(agent_rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<String> {
+        let mut turn_urls = Vec::new();
+        while let Ok(msg) = agent_rx.try_recv() {
+            if let ServerMsg::SdpOffer { ice_servers, .. } = msg {
+                turn_urls.extend(
+                    ice_servers
+                        .iter()
+                        .flat_map(|s| s.urls.iter().cloned())
+                        .filter(|u| u.starts_with("turn:")),
+                );
+            }
+        }
+        turn_urls
+    }
+
+    /// FR-121 P3b (#2774) — a browser on a computer that runs two agents (the
+    /// field case: Windows and WSL) names both. Each is resolved on its own,
+    /// the browser gets every relay back (the first as `local_relay`, the rest
+    /// as `local_relay_also`), the target's agent gets every `turn:` with its
+    /// offer in the request's order (here neither port nor address order), and
+    /// a duplicate or an offline device costs nothing. A retry on the same
+    /// connection gets the same relays.
+    #[tokio::test]
+    async fn every_named_device_s_relay_reaches_the_browser_and_the_target() {
+        let hub = test_hub().await;
+        let (org, me, colleague) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (target, windows, wsl, gone) = (
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        );
+        let (_a, _c, mut agent_rx) =
+            hub.register_agent(target, org, colleague, OsKind::Linux, 3, false, false);
+        let _w = hub.register_agent(windows, org, me, OsKind::Windows, 3, false, false);
+        let _l = hub.register_agent(wsl, org, me, OsKind::Linux, 3, false, false);
+        hub.set_agent_local_relay(windows, Some(relay_at("100.64.0.2", 47989)));
+        hub.set_agent_local_relay(wsl, Some(relay_at("100.64.0.33", 47990)));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(me),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: RcOverlayMode::On,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let request = || ClientMsg::SessionRequest {
+            agent_id: target,
+            permissions: Permissions::default(),
+            browser_caps: Vec::new(),
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: Some(wsl),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: vec![windows, wsl, gone],
+        };
+        let created = |msg: ServerMsg| match msg {
+            ServerMsg::SessionCreated {
+                session_id,
+                local_relay,
+                local_relay_also,
+                local_relay_refused,
+                ..
+            } => (
+                session_id,
+                local_relay.map(|r| r.turn_port),
+                local_relay_also
+                    .iter()
+                    .map(|r| r.turn_port)
+                    .collect::<Vec<_>>(),
+                local_relay_refused,
+            ),
+            other => panic!("expected rc:session.created, got {other:?}"),
+        };
+
+        hub.dispatch(&ctx, request()).unwrap();
+        let (sid, first, also, refused) = created(ctl_rx.try_recv().expect("created"));
+        assert_eq!(first, Some(47990), "the first named device's relay");
+        assert_eq!(also, vec![47989], "then the other one, once");
+        assert_eq!(refused, None, "an offline extra is no refusal");
+
+        // A retry on the same connection is coalesced onto the live session
+        // and told the same relays.
+        hub.dispatch(&ctx, request()).unwrap();
+        let (again, first, also, refused) = created(ctl_rx.try_recv().expect("coalesced"));
+        assert_eq!(again, sid);
+        assert_eq!((first, also, refused), (Some(47990), vec![47989], None));
+
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        assert_eq!(
+            offered_turn_urls(&mut agent_rx),
+            vec![
+                "turn:100.64.0.33:47990".to_string(),
+                "turn:100.64.0.2:47989".to_string(),
+            ],
+            "the target gets every relay, in the request's order"
+        );
+    }
+
+    /// FR-121 P3b (#2774) — a probed list reaches the target in the order the
+    /// browser sent it, each address once; a list with no first field beside it
+    /// (`local_relay_also` without `local_relay`, `local_relay_from_also`
+    /// without `local_relay_from`) is not a request for a relay at all.
+    #[tokio::test]
+    async fn a_probed_list_reaches_the_target_and_an_orphan_list_is_dropped() {
+        let hub = test_hub().await;
+        let (org, me, colleague) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (target, mine) = (ObjectId::new(), ObjectId::new());
+        let (_a, _c, mut agent_rx) =
+            hub.register_agent(target, org, colleague, OsKind::Linux, 3, false, false);
+        let _m = hub.register_agent(mine, org, me, OsKind::Windows, 3, false, false);
+        hub.set_agent_local_relay(mine, Some(relay_at("100.64.0.2", 47989)));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(me),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: RcOverlayMode::On,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let request = |local_relay: Option<LocalRelayDescriptor>,
+                       local_relay_also: Vec<LocalRelayDescriptor>,
+                       local_relay_from_also: Vec<ObjectId>| {
+            ClientMsg::SessionRequest {
+                agent_id: target,
+                permissions: Permissions::default(),
+                browser_caps: Vec::new(),
+                preferred_transport: None,
+                chroma_pref: None,
+                chunk_framing: None,
+                audio_enabled: false,
+                override_reason: None,
+                local_relay,
+                local_relay_from: None,
+                local_relay_also,
+                local_relay_from_also,
+            }
+        };
+        let session_and_echo = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| match ctl_rx.try_recv() {
+            Ok(ServerMsg::SessionCreated {
+                session_id,
+                local_relay,
+                local_relay_also,
+                local_relay_refused,
+                ..
+            }) => (
+                session_id,
+                local_relay.is_some()
+                    || !local_relay_also.is_empty()
+                    || local_relay_refused.is_some(),
+            ),
+            other => panic!("expected rc:session.created, got {other:?}"),
+        };
+
+        // Probed: the browser's own evidence, passed on in its order.
+        hub.dispatch(
+            &ctx,
+            request(
+                Some(relay_at("100.64.0.33", 47990)),
+                vec![
+                    relay_at("100.64.0.2", 47989),
+                    relay_at("100.64.0.33", 47990),
+                ],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let (sid, echoed) = session_and_echo(&mut ctl_rx);
+        assert!(!echoed, "a probed relay is never echoed back");
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        assert_eq!(
+            offered_turn_urls(&mut agent_rx),
+            vec![
+                "turn:100.64.0.33:47990".to_string(),
+                "turn:100.64.0.2:47989".to_string(),
+            ]
+        );
+        hub.terminate(sid, EndReason::ControllerHangup).ok();
+        while ctl_rx.try_recv().is_ok() {}
+        while agent_rx.try_recv().is_ok() {}
+
+        // Orphan lists: no relay, no answer about one.
+        hub.dispatch(
+            &ctx,
+            request(None, vec![relay_at("100.64.0.33", 47990)], vec![mine]),
+        )
+        .unwrap();
+        let (sid, echoed) = session_and_echo(&mut ctl_rx);
+        assert!(!echoed, "an orphan list asks for nothing");
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        assert!(offered_turn_urls(&mut agent_rx).is_empty());
+    }
+
+    /// FR-121 P3b (#2774) — with several named, a refusal is told only when
+    /// none of them got a relay, and it is the first one's: one device of
+    /// someone else's (or offline) beside one of the requester's own still
+    /// hands over the own one.
+    #[tokio::test]
+    async fn a_refusal_is_told_only_when_no_named_device_got_a_relay() {
+        let hub = test_hub().await;
+        let (org, me, colleague) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (target, mine, theirs, gone) = (
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+            ObjectId::new(),
+        );
+        let _t = hub.register_agent(target, org, colleague, OsKind::Linux, 3, false, false);
+        let _m = hub.register_agent(mine, org, me, OsKind::Linux, 3, false, false);
+        let _o = hub.register_agent(theirs, org, colleague, OsKind::Linux, 3, false, false);
+        hub.set_agent_local_relay(mine, Some(relay_at("100.64.0.2", 47989)));
+        hub.set_agent_local_relay(theirs, Some(relay_at("100.64.0.3", 47990)));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(me),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: RcOverlayMode::On,
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let request = |from: ObjectId, also: Vec<ObjectId>| ClientMsg::SessionRequest {
+            agent_id: target,
+            permissions: Permissions::default(),
+            browser_caps: Vec::new(),
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: Some(from),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: also,
+        };
+        let answer = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| match ctl_rx.try_recv() {
+            Ok(ServerMsg::SessionCreated {
+                session_id,
+                local_relay,
+                local_relay_also,
+                local_relay_refused,
+                ..
+            }) => (
+                session_id,
+                local_relay.map(|r| r.turn_port),
+                local_relay_also.len(),
+                local_relay_refused,
+            ),
+            other => panic!("expected rc:session.created, got {other:?}"),
+        };
+
+        // Someone else's first, then mine: mine is handed over, no refusal.
+        hub.dispatch(&ctx, request(theirs, vec![mine])).unwrap();
+        let (sid, first, also, refused) = answer(&mut ctl_rx);
+        assert_eq!((first, also, refused), (Some(47989), 0, None));
+        hub.terminate(sid, EndReason::ControllerHangup).ok();
+        while ctl_rx.try_recv().is_ok() {}
+
+        // Nothing handed over: the first one's reason, not the last one's.
+        hub.dispatch(&ctx, request(gone, vec![theirs])).unwrap();
+        let (sid, first, also, refused) = answer(&mut ctl_rx);
+        assert_eq!(
+            (first, also, refused.as_deref()),
+            (None, 0, Some("device_offline"))
+        );
+        hub.terminate(sid, EndReason::ControllerHangup).ok();
+        while ctl_rx.try_recv().is_ok() {}
+
+        // A target with `rc_overlay` off: that is the reason, whichever device
+        // comes first, an offline one included.
+        let overlay_off = DispatchCtx {
+            rc_overlay: RcOverlayMode::Off,
+            ..ctx
+        };
+        hub.dispatch(&overlay_off, request(gone, vec![mine]))
+            .unwrap();
+        let (_, first, also, refused) = answer(&mut ctl_rx);
+        assert_eq!(
+            (first, also, refused.as_deref()),
+            (None, 0, Some("rc_overlay_off"))
+        );
+    }
+
+    /// FR-121 P3b (#2774) — a probed list is whatever the browser sent, so the
+    /// hub keeps one relay per `turn:` address and at most
+    /// `LOCAL_RELAYS_MAX` of them, in order; the named list stops at the same
+    /// number. Each is one more TURN allocation for the target's agent.
+    #[test]
+    fn a_session_carries_at_most_local_relays_max_relays_each_once() {
+        let probed: Vec<LocalRelayDescriptor> = [
+            ("100.64.0.2", 47989),
+            ("100.64.0.33", 47990),
+            ("100.64.0.2", 47989),
+            ("100.64.0.4", 47991),
+            ("100.64.0.5", 47992),
+            ("100.64.0.6", 47993),
+        ]
+        .iter()
+        .map(|&(ip, port)| relay_at(ip, port))
+        .collect();
+        let kept: Vec<(String, u16)> = bounded_relays(probed)
+            .into_iter()
+            .map(|r| (r.overlay_ip, r.turn_port))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("100.64.0.2".to_string(), 47989),
+                ("100.64.0.33".to_string(), 47990),
+                ("100.64.0.4".to_string(), 47991),
+                ("100.64.0.5".to_string(), 47992),
+            ]
+        );
+
+        let ids: Vec<ObjectId> = (0..6).map(|_| ObjectId::new()).collect();
+        let named = named_devices(ids[0], vec![ids[1], ids[0], ids[2], ids[3], ids[4], ids[5]]);
+        assert_eq!(named, ids[..4].to_vec(), "each once, the first four");
+    }
+
+    /// FR-121 P3b (#2774) — what `rc:session.created` says: nothing when the
+    /// request named no device, the first relay held and the rest beside it,
+    /// and the refusal only when none is held.
+    #[test]
+    fn local_relay_reply_tells_the_first_relay_the_rest_and_a_refusal_only_alone() {
+        let (a, b) = (
+            relay_at("100.64.0.2", 47989),
+            relay_at("100.64.0.33", 47990),
+        );
+        let held = [a.clone(), b.clone()];
+        assert_eq!(local_relay_reply(None, &held), (None, vec![], None));
+        assert_eq!(
+            local_relay_reply(Some(Ok(())), &held),
+            (Some(a.clone()), vec![b], None)
+        );
+        assert_eq!(
+            local_relay_reply(Some(Ok(())), &held[..1]),
+            (Some(a), vec![], None)
+        );
+        assert_eq!(
+            local_relay_reply(Some(Err(LocalRelayRefusal::DeviceOffline)), &[]),
+            (None, vec![], Some("device_offline".to_string()))
+        );
+        assert_eq!(local_relay_reply(Some(Ok(())), &[]), (None, vec![], None));
+    }
+
+    /// FR-128 — through `dispatch`, `auto` reaches only an agent that
+    /// advertises `rc-overlay-auto`. To any other it is `off` (D1): the
+    /// browser is refused its relays as `rc_overlay_off`, and the agent gets
+    /// neither `rc_overlay_auto` nor a relay with its offer. Once the agent
+    /// says the verb, the same request hands both of the browser's devices'
+    /// relays to both ends (FR-121 P3b) and names both as viewers, with the
+    /// gate's far-TURN hint.
+    #[tokio::test]
+    async fn auto_reaches_only_an_agent_that_decides_it() {
+        let hub = test_hub().await;
+        let (org, me, colleague) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (target, win, wsl) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let (_a, _c, mut agent_rx) =
+            hub.register_agent(target, org, colleague, OsKind::Linux, 3, false, false);
+        let _w = hub.register_agent(win, org, me, OsKind::Windows, 3, false, false);
+        let _l = hub.register_agent(wsl, org, me, OsKind::Linux, 3, false, false);
+        let relay_at = |ip: &str, port: u16| LocalRelayDescriptor {
+            turn_port: port,
+            overlay_ip: ip.into(),
+            username: "1700000600:uid".into(),
+            credential: "abcd1234".into(),
+            agent_id: None,
+        };
+        hub.set_agent_local_relay(win, Some(relay_at("100.64.0.9", 47989)));
+        hub.set_agent_local_relay(wsl, Some(relay_at("100.64.0.10", 47990)));
+        let (ctl_tx, mut ctl_rx) = mpsc::channel(8);
+        let ctx = DispatchCtx {
+            role: Role::Controller,
+            user_id: Some(me),
+            agent_id: None,
+            controller_name: None,
+            controller_tx: Some(ctl_tx.clone()),
+            consent_mode: ConsentMode::Prompt,
+            override_reason: None,
+            input_mode: None,
+            tenant_name: None,
+            may_record: false,
+            rc_overlay: RcOverlayMode::Auto {
+                far_turn: Some(true),
+            },
+            session_policy: OrgPolicy::Read(SessionPolicy::default()),
+            max_duration: None,
+            idle_secs: None,
+            lock_on_end: None,
+            org_session_cap: None,
+            slot: None,
+        };
+        let request = || ClientMsg::SessionRequest {
+            agent_id: target,
+            permissions: Permissions::default(),
+            browser_caps: Vec::new(),
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: Some(win),
+            local_relay_also: Vec::new(),
+            local_relay_from_also: vec![wsl],
+        };
+        // One session: what the browser was told on `rc:session.created`.
+        let open = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| {
+            hub.dispatch(&ctx, request()).unwrap();
+            let created = ctl_rx.try_recv().expect("rc:session.created");
+            let ServerMsg::SessionCreated {
+                session_id,
+                local_relay,
+                local_relay_also,
+                local_relay_refused,
+                ..
+            } = created
+            else {
+                panic!("expected rc:session.created, got {created:?}");
+            };
+            let mut relays: Vec<u16> = local_relay.iter().map(|r| r.turn_port).collect();
+            relays.extend(local_relay_also.iter().map(|r| r.turn_port));
+            (session_id, relays, local_relay_refused)
+        };
+        // What the agent was told, and its `turn:` URLs once the offer is
+        // through.
+        let told = |agent_rx: &mut mpsc::Receiver<ServerMsg>| {
+            let mut req = None;
+            let mut turn_urls = Vec::new();
+            while let Ok(msg) = agent_rx.try_recv() {
+                match msg {
+                    ServerMsg::Request {
+                        rc_overlay,
+                        rc_overlay_auto,
+                        ..
+                    } => req = Some((rc_overlay, rc_overlay_auto)),
+                    ServerMsg::SdpOffer { ice_servers, .. } => turn_urls.extend(
+                        ice_servers
+                            .iter()
+                            .flat_map(|s| s.urls.iter().cloned())
+                            .filter(|u| u.starts_with("turn:")),
+                    ),
+                    _ => {}
+                }
+            }
+            (req.expect("the agent got its rc:request"), turn_urls)
+        };
+
+        // The agent has not said `rc-overlay-auto` (the default).
+        let (sid, relays, refused) = open(&mut ctl_rx);
+        assert!(relays.is_empty(), "no relay while auto reads as off");
+        assert_eq!(refused.as_deref(), Some("rc_overlay_off"));
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        let ((on, auto), turn_urls) = told(&mut agent_rx);
+        assert!(!on);
+        assert_eq!(
+            auto, None,
+            "an agent that does not decide auto is not sent it"
+        );
+        assert!(turn_urls.is_empty(), "{turn_urls:?}");
+        hub.terminate(sid, EndReason::ControllerHangup).ok();
+        while ctl_rx.try_recv().is_ok() {}
+        while agent_rx.try_recv().is_ok() {}
+
+        // It says it now.
+        hub.set_agent_honours_rc_overlay_auto(target, true);
+        let (sid, relays, refused) = open(&mut ctl_rx);
+        assert_eq!(relays, vec![47989, 47990]);
+        assert_eq!(refused, None);
+        grant_and_await_ready(&hub, sid, &mut ctl_rx).await;
+        hub.forward_offer(sid, "v=0".into(), None, None).unwrap();
+        let ((on, auto), turn_urls) = told(&mut agent_rx);
+        assert!(!on, "auto rides beside rc_overlay: false (D1)");
+        assert_eq!(
+            auto,
+            Some(RcOverlayAutoWire {
+                viewers: vec!["100.64.0.9".into(), "100.64.0.10".into()],
+                far_turn: Some(true),
+            })
+        );
+        assert_eq!(
+            turn_urls,
+            ["turn:100.64.0.9:47989", "turn:100.64.0.10:47990"]
+        );
     }
 
     /// Consent granted, and the controller told so: the one state in which
@@ -7808,6 +8732,196 @@ mod tests {
             true,
         );
         assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), None);
+    }
+
+    /// FR-132 P1b — the document a test pushes: a managed key at `revision`,
+    /// provenance included, because the ctrl lane carries it as JSON.
+    fn desired_at(revision: u64, deny: &str) -> DesiredConfig {
+        DesiredConfig {
+            zero_copy_deny: Some(deny.to_string()),
+            revision,
+            updated_by: Some(ObjectId::new()),
+            updated_at: Some(bson::DateTime::now()),
+            ..DesiredConfig::default()
+        }
+    }
+
+    /// What the connection received, in order: (revision, deny).
+    fn config_frames(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<(u64, Option<String>)> {
+        let mut frames = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let ServerMsg::ConfigPush { revision, desired } = msg {
+                frames.push((revision, desired.zero_copy_deny));
+            }
+        }
+        frames
+    }
+
+    /// FR-132 P1b — the device has no revision check of its own: `apply` writes
+    /// whatever arrived last. So the connection carries each revision once, and
+    /// never one below a revision it already carried.
+    ///
+    /// The order below is the race itself. A device connects and the connect
+    /// path reads revision 1; a save stores revision 2 and pushes it; then the
+    /// connect path sends what it read. The device must stay on 2, and it must
+    /// hear 2 only once: a second frame would answer `noop` and overwrite the
+    /// `needs_restart` the first one earned.
+    #[tokio::test]
+    async fn a_connection_never_goes_back_to_an_older_desired_config() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        hub.set_agent_config_support(agent_id, true);
+
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "new"))
+            .expect("the save's push");
+        hub.push_desired_config(agent_id, tenant, desired_at(1, "old"))
+            .expect("skipped, not an error: the connection holds something newer");
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "new"))
+            .expect("the same revision again, skipped");
+        assert_eq!(
+            config_frames(&mut rx),
+            vec![(2, Some("new".to_string()))],
+            "one frame, the newest"
+        );
+
+        hub.push_desired_config(agent_id, tenant, desired_at(3, "newer"))
+            .expect("a newer save still goes out");
+        assert_eq!(config_frames(&mut rx), vec![(3, Some("newer".to_string()))]);
+    }
+
+    /// A reconnect is a new connection, and reconcile-on-connect re-delivers
+    /// the standing document on every one: the record of what was sent cannot
+    /// outlive the socket it describes.
+    #[tokio::test]
+    async fn a_new_connection_takes_the_standing_desired_config_again() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                true,
+            )
+        };
+        let (_tx, _cancel, mut rx) = register();
+        hub.set_agent_config_support(agent_id, true);
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "deny"))
+            .expect("first connection");
+        assert_eq!(config_frames(&mut rx).len(), 1);
+
+        let (_tx2, _cancel2, mut rx2) = register();
+        hub.set_agent_config_support(agent_id, true);
+        hub.push_desired_config(agent_id, tenant, desired_at(2, "deny"))
+            .expect("second connection");
+        assert_eq!(config_frames(&mut rx2).len(), 1, "delivered again");
+    }
+
+    /// A device on another tenant, one that is offline here and one that
+    /// never said it reads the frame all receive nothing, and the two kinds
+    /// of "no" stay apart: the save goes on to the ctrl lane only for the
+    /// first, because another pod may hold that socket.
+    #[tokio::test]
+    async fn a_desired_config_goes_only_to_its_tenants_connection_that_reads_it() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+
+        let err = hub
+            .push_desired_config(agent_id, tenant, desired_at(1, "deny"))
+            .expect_err("no `config` advertised");
+        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
+
+        hub.set_agent_config_support(agent_id, true);
+        let err = hub
+            .push_desired_config(agent_id, ObjectId::new(), desired_at(1, "deny"))
+            .expect_err("another tenant's");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        let err = hub
+            .push_desired_config(ObjectId::new(), tenant, desired_at(1, "deny"))
+            .expect_err("not on this pod");
+        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
+        assert!(config_frames(&mut rx).is_empty(), "nothing was sent");
+
+        // The refusals recorded nothing: the real frame still goes out.
+        hub.push_desired_config(agent_id, tenant, desired_at(1, "deny"))
+            .expect("the device's own tenant");
+        assert_eq!(config_frames(&mut rx).len(), 1);
+    }
+
+    /// FR-132 P1b — fleet's `config_push` control event, as every pod applies
+    /// it: the PUT can land on a pod that does not hold the socket. The
+    /// document survives the JSON round trip, another tenant's envelope pushes
+    /// nothing, and a late envelope cannot undo a newer revision.
+    #[tokio::test]
+    async fn a_desired_config_from_another_pod_reaches_its_tenants_connection() {
+        let hub = test_hub().await;
+        let tenant = ObjectId::new();
+        let agent_id = ObjectId::new();
+        let (_tx, _cancel, mut rx) = hub.register_agent(
+            agent_id,
+            tenant,
+            ObjectId::new(),
+            OsKind::Linux,
+            3,
+            false,
+            true,
+        );
+        hub.set_agent_config_support(agent_id, true);
+        let envelope = |tid: ObjectId, desired: &DesiredConfig| {
+            serde_json::json!({
+                "class": "rc",
+                "evt": "config_push",
+                "agent_id": agent_id.to_hex(),
+                "tenant_id": tid.to_hex(),
+                "desired": desired,
+            })
+        };
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(ObjectId::new(), &desired_at(1, "deny")));
+        assert!(
+            config_frames(&mut rx).is_empty(),
+            "another tenant's envelope pushes nothing"
+        );
+
+        let sent = desired_at(2, "deny");
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &sent));
+        match rx.try_recv() {
+            Ok(ServerMsg::ConfigPush { revision, desired }) => {
+                assert_eq!(revision, 2);
+                assert_eq!(desired, sent, "unchanged by the trip through JSON");
+            }
+            other => panic!("expected the frame, got {other:?}"),
+        }
+
+        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &desired_at(1, "old")));
+        assert!(
+            config_frames(&mut rx).is_empty(),
+            "a late envelope cannot undo a newer revision"
+        );
     }
 
     /// FR-90 P2g-3b — fleet's `hive_purge` control event, as every pod

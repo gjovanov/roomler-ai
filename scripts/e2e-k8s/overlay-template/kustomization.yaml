@@ -54,7 +54,10 @@ images:
   # Dockerfile.agent-e2e. FR-114: pinned to the DATED tag that was pushed,
   # never `latest` (install-overlay.sh pins it from AGENT_E2E_TAG), so a
   # night's agent is a known build. The placeholder fails a pull loudly
-  # rather than run an unknown agent.
+  # rather than run an unknown agent. FR-126: the nightly keeps the LIVE
+  # StatefulSet on the newest agent release (`agent-e2e-v<version>`), the
+  # way it keeps the server on prod's image; this pin is the fallback a full
+  # apply uses.
   - name: gjovanov/roomlerd-e2e
     newName: registry.roomler.ai/roomlerd-e2e
     newTag: set-by-AGENT_E2E_TAG

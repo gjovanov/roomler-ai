@@ -118,6 +118,14 @@
                   <span class="text-caption text-medium-emphasis ml-2">
                     then paste the token into the wizard
                   </span>
+                  <!-- #3202: what the download needs before it can run. -->
+                  <p v-if="block.hint" class="text-caption text-medium-emphasis mt-1 mb-0">
+                    {{ block.hint }}
+                  </p>
+                  <!-- #3247 item 13: the same download for another CPU. -->
+                  <p v-if="block.alt" class="text-caption mt-1 mb-0">
+                    <a :href="block.alt.url" target="_blank">{{ block.alt.label }}</a>
+                  </p>
                 </template>
                 <template v-else>
                   <pre class="enroll-cmd text-caption pa-2 rounded" @click="copy(block.id, block.command)">{{ block.command }}</pre>
@@ -147,8 +155,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
+import { useSetupFeaturesStore } from '@/stores/setupFeatures'
 import {
   enrollCommands,
   type DaemonScope,
@@ -199,6 +208,20 @@ const scopeHint = computed(() => SCOPE_HINTS[scope.value])
 // FR-104 — only a machine-wide Windows install has a SYSTEM service to anchor.
 const anchorOffered = computed(() => props.kind === 'agent' && scope.value !== 'user')
 
+// FR-129 B1-s — the wizard block off Windows follows the server's switch for
+// that tab's OS (`wizard_linux_daemon`, `wizard_macos_daemon` since B1-s2;
+// `GET /api/setup/features`), fetched once, when the dialog first opens, and
+// read as false until the server has said true: a Linux or macOS tab then
+// shows the script and the manual path only, as before FR-129.
+const setupFeatures = useSetupFeaturesStore()
+watch(
+  () => props.modelValue,
+  (open) => {
+    if (open) void setupFeatures.load()
+  },
+  { immediate: true },
+)
+
 const commands = computed(() =>
   enrollCommands(
     props.kind,
@@ -206,6 +229,7 @@ const commands = computed(() =>
     props.token,
     scope.value,
     props.anchor === true,
+    { wizardLinuxDaemon: setupFeatures.wizardLinuxDaemon, wizardMacosDaemon: setupFeatures.wizardMacosDaemon },
   ),
 )
 

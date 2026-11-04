@@ -38,9 +38,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
-use super::super::super::placeholder::{self, Bound};
-use super::super::Values;
-use super::{Conn, aws_signed};
+use super::super::super::placeholder::Bound;
+use super::super::Valued;
+use super::{Conn, aws_signed, value_in};
 use crate::vault_proxy::http::{Body, BoxError};
 use crate::vault_proxy::sigv4::{self, Signed};
 
@@ -85,8 +85,13 @@ fn boxed(req: Request<Incoming>) -> Request<Body> {
 /// `req` as it goes on: signed again with the value where its
 /// `Authorization` is AWS's and names a placeholder this audience holds, and
 /// as it came otherwise. Err where it names one and is not signed again: the
-/// request is then never sent.
-pub(super) async fn resign(req: Request<Incoming>, conn: &Conn) -> Result<Request<Body>, Refused> {
+/// request is then never sent. `valued`: this audience's placeholders, each
+/// with its value as it was read for this request.
+pub(super) async fn resign(
+    req: Request<Incoming>,
+    conn: &Conn,
+    valued: &[Valued],
+) -> Result<Request<Body>, Refused> {
     let written: Vec<&HeaderValue> = req
         .headers()
         .get_all(header::AUTHORIZATION)
@@ -100,7 +105,7 @@ pub(super) async fn resign(req: Request<Incoming>, conn: &Conn) -> Result<Reques
     if aws.is_empty() {
         return Ok(boxed(req));
     }
-    let bound = placeholder::bound(conn.run.0, conn.run.1, &conn.target.host, conn.target.port);
+    let bound: Vec<Bound> = valued.iter().map(|(b, _)| b.clone()).collect();
     let Some(auth) = aws
         .iter()
         .find(|a| bound.iter().any(|b| a.contains(b.token.as_str())))
@@ -190,7 +195,6 @@ pub(super) async fn resign(req: Request<Incoming>, conn: &Conn) -> Result<Reques
                  botocore signs",
             )
         })?;
-    let values = &*conn.seams.values;
     let gone = || {
         refused(
             StatusCode::FORBIDDEN,
@@ -206,7 +210,7 @@ pub(super) async fn resign(req: Request<Incoming>, conn: &Conn) -> Result<Reques
         .and_then(|v| v.to_str().ok())
         .and_then(|sent| pair.tokens.iter().find(|t| t.token == sent));
     if let Some(token) = token {
-        let value = Values::value(values, &token.lease_id).ok_or_else(gone)?;
+        let value = value_in(valued, &token.lease_id).ok_or_else(gone)?;
         let mut header = HeaderValue::from_bytes(&value).map_err(|_| {
             refused(
                 StatusCode::BAD_GATEWAY,
@@ -217,7 +221,7 @@ pub(super) async fn resign(req: Request<Incoming>, conn: &Conn) -> Result<Reques
         header.set_sensitive(true);
         parts.headers.insert(TOKEN_HEADER, header);
     }
-    let id = Values::value(values, &pair.id.lease_id).ok_or_else(gone)?;
+    let id = value_in(valued, &pair.id.lease_id).ok_or_else(gone)?;
     let id = std::str::from_utf8(&id)
         .ok()
         .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric()))
@@ -231,7 +235,7 @@ pub(super) async fn resign(req: Request<Incoming>, conn: &Conn) -> Result<Reques
                 ),
             )
         })?;
-    let secret = Values::value(values, &key.lease_id).ok_or_else(gone)?;
+    let secret = value_in(valued, &key.lease_id).ok_or_else(gone)?;
     // Signed again, the token's value in where it is signed.
     let sts = sigv4::string_to_sign(
         &amz_date,

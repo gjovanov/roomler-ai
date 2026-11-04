@@ -14,7 +14,7 @@
  * newsletter form, and live prices. Without JavaScript the page is complete:
  * every section renders, and the newsletter block points at sign-up.
  */
-import { installCards } from '../../src/utils/enrollCommands.ts'
+import { installCards, type DownloadAlt } from '../../src/utils/enrollCommands.ts'
 import {
   CAPABILITIES,
   CTA,
@@ -140,17 +140,53 @@ export function renderHome(ctx: HomeCtx): string {
       `</div></div>`,
   ).join('')
 
-  // The wizard only where it installs the agent (FR-97 D5), as the SPA's copy.
+  // The wizard only where it installs the agent, as the SPA's copy: Windows
+  // (FR-97 D5), and Linux and macOS each once the server advertises that OS on
+  // `/api/setup/features` (FR-129 B1-s; per OS since B1-s2). This page is
+  // written at BUILD time, so it ships the Windows-only layout and carries the
+  // other two cards' button hidden — the Windows card's markup exactly, with
+  // the URL the switch unlocks, and `data-wizard-unix` naming the OS whose
+  // switch shows it — for `home.js` to show when the server says so. With
+  // JavaScript off, or on an older server, the page is as it was.
+  const unlocked = new Map(
+    installCards(SITE_ORIGIN, { wizardLinuxDaemon: true, wizardMacosDaemon: true }).map((card) => [
+      card.os,
+      card,
+    ]),
+  )
+  // #3202 — what the wizard needs first goes inside the button's own `<p>`, so
+  // `home.js` shows the two together.
+  // #3247 item 13: the ARM64 link rides in the same `<p>`, for the same reason.
+  const wizardButton = (
+    url: string,
+    gatedOn: string | null,
+    hint: string | null,
+    alt: DownloadAlt | null,
+  ) =>
+    `<p${gatedOn ? ` data-wizard-unix="${gatedOn}" hidden` : ''}><a class="btn btn--tonal" href="${escapeHtml(url)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a>` +
+    (hint ? `<small class="home-hint">${escapeHtml(hint)}</small>` : '') +
+    (alt
+      ? `<small class="home-hint home-alt"><a href="${escapeHtml(alt.url)}">${escapeHtml(alt.label)}</a></small>`
+      : '') +
+    `</p>`
   const downloads = installCards(SITE_ORIGIN)
-    .map(
-      (card) =>
-        `<div class="home-card home-card--os"><h3 class="home-card__title home-os">${icon(OS_ICON[card.os]!, { size: 22 })}<span>${escapeHtml(card.title)}</span></h3>` +
+    .map((card) => {
+      const gated = card.wizardUrl ? null : (unlocked.get(card.os) ?? null)
+      const gatedUrl = gated?.wizardUrl ?? null
+      return (
+        `<div class="home-card home-card--os" data-os="${card.os}"><h3 class="home-card__title home-os">${icon(OS_ICON[card.os]!, { size: 22 })}<span>${escapeHtml(card.title)}</span></h3>` +
         (card.wizardUrl
-          ? `<p><a class="btn btn--tonal" href="${escapeHtml(card.wizardUrl)}">${icon('download', { size: 17 })}<span>Roomler Setup</span></a></p>`
-          : '') +
-        `<p class="home-muted">${card.wizardUrl ? 'Or from a terminal:' : 'From a terminal:'}</p><pre class="home-cmd"><code>${escapeHtml(card.command)}</code></pre>` +
-        `</div>`,
-    )
+          ? wizardButton(card.wizardUrl, null, card.wizardHint, card.wizardAlt)
+          : gatedUrl
+            ? wizardButton(gatedUrl, card.os, gated?.wizardHint ?? null, gated?.wizardAlt ?? null)
+            : '') +
+        (card.wizardUrl
+          ? `<p class="home-muted">Or from a terminal:</p>`
+          : `<p class="home-muted" data-terminal-label data-with-wizard="Or from a terminal:">From a terminal:</p>`) +
+        `<pre class="home-cmd"><code>${escapeHtml(card.command)}</code></pre>` +
+        `</div>`
+      )
+    })
     .join('')
 
   const main = `<main id="main" class="home">
@@ -188,7 +224,7 @@ ${
   <section id="download" class="home-section home-section--soft">
     <div class="home-wrap">
       <h2 class="home-h2">${escapeHtml(DOWNLOAD.title)}</h2>
-      <p class="home-sub">${escapeHtml(DOWNLOAD.lead)}</p>
+      <p class="home-sub" data-download-lead data-pairing-lead="${escapeHtml(DOWNLOAD.leadPairing)}">${escapeHtml(DOWNLOAD.lead)}</p>
       <div class="home-cards">${downloads}</div>
       <p class="home-more"><a href="${BASE}/start/quickstart/">The complete getting-started guide for every platform</a></p>
     </div>

@@ -424,7 +424,7 @@ flowchart TD
 | Rule | Where |
 |---|---|
 | The setting: comma-separated CIDRs (`203.0.113.0/24`, `2001:db8::/32`) or bare addresses (their own `/32` / `/128`). A CIDR with host bits set, or a prefix shorter than /8 (IPv4) or /16 (IPv6), is refused, never widened. An IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) is compared as the IPv4 it carries | `InternalNetworks::parse` / `contains` ([`growth.rs:171`](../crates/core/src/growth.rs), [`:221`](../crates/core/src/growth.rs)) |
-| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:160`](../crates/modules/fleet/src/lib.rs)) |
+| Parsed once at boot. An entry it cannot use (not an address, host bits set, a prefix too short) is echoed in one warning with its reason and skipped, and the rest still apply. The networks in effect are logged as CIDRs | `internal_networks_from` ([`fleet/src/lib.rs:199`](../crates/modules/fleet/src/lib.rs)) |
 | **One client-address rule.** The `X-Forwarded-For` entry just left of our trusted hops' own (`app.rate_limit_trusted_hops`, 1 in production), the client the edge recorded, else the socket peer; `X-Real-IP` is never read. It moved from the api crate to core so `fleet` reads it exactly as the per-IP governor and the credential gate do. A client that seeds `X-Forwarded-For` with a lab address moves nobody: that entry sits left of the one our hop recorded | `client_ip_or_peer` ([`client_ip.rs:67`](../crates/core/src/client_ip.rs)); the handlers take `PeerAddr` ([`:90`](../crates/core/src/client_ip.rs)), an extractor that never refuses |
 | The class becomes `internal`; the asset and OS stay. The updater rule comes first, so a `roomlerd/` fetch from the lab still writes nothing | `fetch_dims` ([`install_trace.rs:188`](../crates/modules/fleet/src/install_trace.rs)), `count_fetch` ([`:211`](../crates/modules/fleet/src/install_trace.rs)) |
 | **Still no IP, anywhere.** The address is compared in memory and dropped; the row stays three enum-like dimensions and a count. The integration test scans every row for each address it used (the lab's, the outsider's, our hop's, the peer's) | `install_trace_tests::fetches_from_internal_networks_count_as_internal_and_store_no_address` |
@@ -492,6 +492,24 @@ Compatibility, both directions, is what the shape is built around:
 The row is shown on the device (`GET …/agent/{id}` → `install`), which is what a field check
 reads (AC9).
 
+### A paired install (FR-129)
+
+A pairing ([device-pairing.md](device-pairing.md)) changes how the token reaches the installer,
+not what the trace records. The token is minted at delivery by the admin route's own call:
+`pairing::deliver` mints with `issue_enrollment_token_with` and writes
+`enroll_tokens.record_issued(jti, tenant_id, approver, now)`
+(`crates/modules/fleet/src/pairing.rs:992-1011`), the same call `POST …/agent/enroll-token`
+makes (`agent.rs:139-150`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
+approver>, issued_at, kind: standard}`, one per half, and "tokens issued → redeemed" counts a
+paired token like any other. The tunnel kind writes no ledger row, as the tunnel route never
+has. The enroll is the ordinary one, so `agents.install` says who installed: `method: wizard`
+for the wizard's paired install (A3 runs the same `cmd_install`), and the scripts' own methods
+once A4 lands. The fetch counters see the wizard's User-Agent as before, and
+`GET /api/setup/features` is deliberately not counted (the SPA reads it on every homepage
+view). What says a token was *paired* rather than pasted is not on this plane: it is the
+`deliver` row in `pairing_audit` (by tenant and approver) and the `device_pairings` row's
+`client` and `client_version`, neither of which the digest reads.
+
 ### The wizard's opt-in diagnostics (P3b)
 
 Where a wizard run gets to, and where it stops — **only for runs whose operator ticked the
@@ -530,7 +548,7 @@ sequenceDiagram
   · `enroll` · `companion` · `anchor` (the two best-effort steps, recorded only where they
   apply) · `done`; `outcome` is `ok` · `failed` · `cancelled`; `error_code` is a **code from a
   fixed vocabulary** (`advanced_options`, `unsupported_platform`, `preflight`, `resolve`,
-  `download`, `sha256_mismatch`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
+  `download`, `sha256_mismatch`, `signature_refused`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
   `msi_another_install`, `msi_fatal`, `msi_other`, `extract`, `integrate`, `enroll_rejected`,
   `enroll_network`, `config_write`, `companion`, `anchor`, `other`) — never the error text, a
   path, a hostname or a user name; `os` is the family; `wizard_version` the crate's version.
@@ -1029,7 +1047,7 @@ A digest stored before P7 reads both halves as `arrives_with: P7`.
 
 | Setting | Env | Default | Effect |
 |---|---|---|---|
-| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:896`](../crates/config/src/settings.rs)) |
+| `growth.github_repo` | `ROOMLER__GROWTH__GITHUB_REPO` | `gjovanov/roomler-ai` | the repository read; anything that is not `owner/name` (GitHub's characters only) switches the puller off ([`settings.rs:902`](../crates/config/src/settings.rs)) |
 | `growth.github_api_url` | `ROOMLER__GROWTH__GITHUB_API_URL` | `https://api.github.com` | only a test changes it |
 | `growth.github_token` | `ROOMLER__GROWTH__GITHUB_TOKEN` | empty | the traffic's token, sent on the three traffic requests and nothing else; never logged, never in a pull row's error; empty ⇒ traffic "not measured" |
 
@@ -1256,9 +1274,10 @@ flowchart LR
   `not_measured` ("no Search Console key configured", "no final Search Console day pulled yet");
   a post nobody inspected yet says so. A post that had none of it in the window is a measured 0.
 
-> ⚠️ **Sign-ups by landing path are a lower bound.** The site writes `landing_path` only on a
-> journey that began on a campaign link (FR-88's carry, `ui/docs/theme/attribution.js`); an
-> organic reader of a post who signs up carries none until FR-91 P3 builds the organic carry.
+> ⚠️ **Sign-ups by landing path are a lower bound.** The site writes `landing_path` on a journey
+> that began on a campaign link (FR-88's carry, `ui/docs/theme/attribution.js`) or on the blog,
+> from another site (FR-91's organic carry, [public-site.md §11.5](public-site.md)). A reader
+> whose browser sent no referrer carries none.
 > Every sign-up cell carries that note, and the tab says it in text under the table and in the
 > column's own header ("Sign-ups (lower bound)"), not only on hover.
 
@@ -2009,7 +2028,7 @@ addresses.
 ⚠️ **An overlay pair needs the device to allow it.** #1882's `access_policy.rc_overlay` is off unless
 the device opts in, and with it off the agent drops every overlay candidate. With it on, an agent
 whose overlay interface is named `roomler*` still never gathers on it: the interface-name rule
-(`is_overlay_iface`, [`peer.rs:12840`](../agents/roomlerd/src/peer.rs)) applies whatever
+(`is_overlay_iface`, [`peer.rs:13330`](../agents/roomlerd/src/peer.rs)) applies whatever
 `rc_overlay` says. So an overlay carrier comes from `rc_overlay` on AND either a macOS agent, whose
 `utunN` the name rule cannot see, or a controller whose route to the agent runs through the mesh.
 Measured on 2026-10-19 (FR-102 §8): a controller on the vmtest org's mesh viewing a Linux agent
@@ -2127,7 +2146,7 @@ everyone, and the viewer has no strip.
 | Cost & usage | per-org metered cost and the list-price MRR estimate ([relay-cost-metering.md](relay-cost-metering.md)) | `/api/admin/stats/cost` |
 | Orgs, machines, calls, users | platform-wide inventories and series | `/api/admin/stats/{orgs,machines,calls,users}` |
 | Usage | per-user minutes and bytes across every org | `/api/admin/stats/usage*` |
-| Attribution (FR-88) | sign-ups by campaign key and how many activated | `/api/admin/stats/attribution` |
+| Attribution (FR-88) | sign-ups by campaign key and by blog landing page, and how many activated | `/api/admin/stats/attribution` |
 | **Growth** (FR-102) | the daily digest (P1d), the account funnel, cohorts and org views (P2), the Campaigns table (P6), the Channels table with the machine keys (P8, P10), the Newsletter tab (P5), the Revenue tab (P4), the Quality tab (P9a), the Weekly tab and the Alerts panel (P10); the digest's `quality.ratings` from the viewer's post-session prompt (P9b); the digest's and the weekly's `github` section (P7a); the Content tab and the digest's and the weekly's `search` section (P7c) | `/api/admin/growth/*` |
 
 ## Field verification

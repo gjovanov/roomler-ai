@@ -37,6 +37,9 @@ pub(crate) struct Upstream {
     pub(crate) user: String,
     pub(crate) password: Zeroizing<String>,
     pub(crate) tls: tokio_rustls::TlsConnector,
+    /// FR-90 P4-6-1b-2 — where the TCP goes: `host:port`, or a flow's end
+    /// toward it; TLS is verified against `host` either way.
+    pub(crate) dial: super::Dial,
 }
 
 pub(super) const SSL_REQUEST: u32 = 80_877_103;
@@ -430,18 +433,11 @@ pub(crate) async fn terminate(mut s: TlsStream<TcpStream>) {
 /// TCP to the upstream, its `SSLRequest` accepted, and TLS verified.
 async fn connect(up: &Upstream) -> Result<TlsStream<TcpStream>, String> {
     let name = tls::server_name(&up.host)?;
-    let mut tcp = tokio::time::timeout(
-        CONNECT_DEADLINE,
-        TcpStream::connect((up.host.as_str(), up.port)),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "{}:{} did not answer within {CONNECT_DEADLINE:?}",
-            up.host, up.port
-        )
-    })?
-    .map_err(|e| format!("{}:{}: {e}", up.host, up.port))?;
+    let to = super::dialled(&up.host, up.port, up.dial);
+    let mut tcp = tokio::time::timeout(CONNECT_DEADLINE, super::tcp_to(&up.host, up.port, up.dial))
+        .await
+        .map_err(|_| format!("{to} did not answer within {CONNECT_DEADLINE:?}"))?
+        .map_err(|e| format!("{to}: {e}"))?;
     let mut ssl = 8u32.to_be_bytes().to_vec();
     ssl.extend(SSL_REQUEST.to_be_bytes());
     tcp.write_all(&ssl)
@@ -604,7 +600,41 @@ mod tests {
             user: "app".into(),
             password: Zeroizing::new(password.into()),
             tls: tls::connector(ca).unwrap(),
+            dial: crate::vault_proxy::Dial::Direct,
         }
+    }
+
+    /// FR-90 P4-6-1b-2 — through another device the TCP goes to the flow's
+    /// end, never to `host:port`, and TLS is still verified against `host`:
+    /// a session starts on an upstream reached only through the end it is
+    /// given, while the same upstream dialled directly at a port nothing
+    /// listens on is no session.
+    #[tokio::test]
+    async fn through_a_flow_the_tcp_goes_to_its_end_and_tls_to_the_host() {
+        let pw = made();
+        let (ca, port, _saw) = fake(Upstreams::Scram(pw.clone())).await;
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut through = upstream(Some(&ca), closed, &pw);
+        through.dial = crate::vault_proxy::Dial::Through(([127, 0, 0, 1], port).into());
+        let (mut c, _session) = client_of(through);
+        c.write_all(&startup(&[("database", "orders")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            next(&mut c).await,
+            (b'R', vec![0, 0, 0, 0]),
+            "a session, through the end"
+        );
+        let (mut c, session) = client_of(upstream(Some(&ca), closed, &pw));
+        c.write_all(&startup(&[("database", "orders")]))
+            .await
+            .unwrap();
+        let err = session.await.unwrap().unwrap_err();
+        assert!(err.contains(&format!("localhost:{closed}")), "{err}");
     }
 
     /// Serve one client of `up` over a pipe; the client's end, and the

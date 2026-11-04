@@ -46,6 +46,20 @@
  * never arrived is undecodable anyway and the gap is what asks for the IDR
  * that repairs the chain.
  *
+ * ⚠️ `gap` IS the counter, made visible: it is true on exactly the
+ * messages that make `gaps` grow, on every path, and the test "raises the
+ * flag exactly when the counter moves" holds every path to that. The
+ * workers act on the flag alone — reset the byte assembler, ask for the
+ * resync IDR — and read the counter only into their stats, so a path that
+ * counts an abandonment without raising the flag is a frame written off
+ * with no repair asked for. Two such paths shipped in #1169 and stood
+ * until 2026-10-29: an overtaken frame abandoned as the overtaking one
+ * COMPLETED (only the eviction path said so), and a `chunk_count`
+ * collision. Under the unordered opt-in with `maxRetransmits: 0` a lost
+ * chunk never arrives, so the first was the common loss case: the next
+ * frame reached the decoder as a delta against a reference that never
+ * came, and nothing asked for the IDR.
+ *
  * ⚠️ At most [`MAX_PARTIAL_FRAMES`] frames are held. Unbounded buffering
  * on a lossy link is a memory leak with a slow fuse: every frame that
  * loses a chunk would be retained forever, on the exact link where frames
@@ -121,11 +135,12 @@ export interface ChunkFramingResult {
    *  complete one. */
   payload: Uint8Array | null
   /** True when this message revealed that a frame can no longer be
-   *  completed. The caller must reset its byte assembler and request a
-   *  keyframe. Reported ONCE per abandoned frame, not once per discarded
-   *  message, so a long loss doesn't look like a burst of independent
-   *  failures — each `gap` costs a keyframe request, and an IDR is the
-   *  largest frame on the thinnest pipe. */
+   *  completed — equivalently, exactly when it made `gaps` grow. The
+   *  caller must reset its byte assembler and request a keyframe.
+   *  Reported ONCE per message, not once per discarded message or per
+   *  abandoned frame, so a long loss doesn't look like a burst of
+   *  independent failures — each `gap` costs a keyframe request, and an
+   *  IDR is the largest frame on the thinnest pipe. */
   gap: boolean
 }
 
@@ -234,17 +249,19 @@ export function stripChunkPrefix(
       // report the loss and keep assembling, because dropping the new
       // frame too would turn one lost frame into two.
       placeChunk(st, partial, idx, payload)
-      const done = finish(st, seq, partial)
-      return { payload: done, gap: true }
+      return { ...finish(st, seq, partial), gap: true }
     }
   } else if (partial.slots.length !== count) {
     // The same seq announcing a different chunk_count is not a frame we
     // can trust; two different frames are colliding on one sequence
     // number, and guessing which is right would splice their bytes.
+    // The frame is written off: what we held of it never reaches the
+    // decoder and the next frame is a delta against it, so the caller is
+    // told, as on an eviction — not only the counter.
     st.partials.delete(seq)
     st.lastSeq = seq
     st.gaps++
-    return { payload: null, gap: false }
+    return { payload: null, gap: true }
   }
 
   if (partial.slots[idx] !== null) {
@@ -254,8 +271,7 @@ export function stripChunkPrefix(
     return { payload: null, gap: false }
   }
   placeChunk(st, partial, idx, payload)
-  const done = finish(st, seq, partial)
-  return { payload: done, gap: false }
+  return finish(st, seq, partial)
 }
 
 function placeChunk(
@@ -274,23 +290,30 @@ function placeChunk(
 
 /** Emit `seq` if it is now complete, abandoning any OLDER partials — they
  *  can no longer be delivered in order, and the codec's delta chain is
- *  broken past them regardless. Returns the assembled bytes, or null. */
+ *  broken past them regardless. `gap` is set when anything was abandoned:
+ *  `seq` is about to reach the decoder as a delta against a frame that
+ *  will never arrive, and only the caller can ask for the IDR that repairs
+ *  that. This is the ONE place the completion path's flag comes from —
+ *  a `false` written at the call site is how it went unreported for eight
+ *  weeks (header, "`gap` IS the counter"). */
 function finish(
   st: ChunkFramingState,
   seq: number,
   partial: PartialFrame,
-): Uint8Array | null {
-  if (partial.filled < partial.slots.length) return null
+): ChunkFramingResult {
+  if (partial.filled < partial.slots.length) return { payload: null, gap: false }
   const out = assemble(partial)
   st.partials.delete(seq)
+  let abandoned = false
   for (const older of [...st.partials.keys()]) {
     if (!isNewer(older, seq)) {
       st.partials.delete(older)
       st.gaps++
+      abandoned = true
     }
   }
   st.lastSeq = seq
-  return out
+  return { payload: out, gap: abandoned }
 }
 
 /** An unclassifiable message: nothing in flight can be trusted.

@@ -24,7 +24,7 @@ fn attribution_on(s: &mut roomler_ai_config::Settings) {
 }
 
 /// The database's `turn_bytes` for `tenant`, summed over its buckets.
-async fn turn_bytes(app: &TestApp, tenant: ObjectId) -> i64 {
+pub(crate) async fn turn_bytes(app: &TestApp, tenant: ObjectId) -> i64 {
     let mut cursor = app
         .db
         .collection::<Document>("stats_usage")
@@ -40,7 +40,7 @@ async fn turn_bytes(app: &TestApp, tenant: ObjectId) -> i64 {
 
 /// coturn's two total channels for one allocation: the client leg, and the
 /// relay ↔ peer leg.
-fn channels(username: &str, allocation: u64) -> (String, String) {
+pub(crate) fn channels(username: &str, allocation: u64) -> (String, String) {
     let client =
         format!("turn/realm/roomler.ai/user/{username}/allocation/{allocation:018}/total_traffic");
     let peer = format!("{client}/peer");

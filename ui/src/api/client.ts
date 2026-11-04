@@ -18,13 +18,16 @@ class ApiError extends Error {
   constructor(
     public status: number,
     public data: unknown,
+    message?: string,
   ) {
     // Prefer the server's explanation. Every ApiError variant serialises as
     // `{error, message}` (crates/api/src/error.rs), and call sites almost
     // universally render `(e as Error).message` straight into a form error —
     // so without this the user sees "API error 403" where the server took the
-    // trouble to say WHICH permission it refused.
-    super((data as Record<string, string> | null)?.message || `API error ${status}`)
+    // trouble to say WHICH permission it refused. `message` lets the one
+    // branch that has a better explanation than the body (a 429's
+    // `Retry-After`) carry it to the page.
+    super(message || (data as Record<string, string> | null)?.message || `API error ${status}`)
   }
 }
 
@@ -154,9 +157,13 @@ async function request<T>(path: string, options: RequestOptions = {}, retried = 
       // Being throttled says nothing about the session, so never treat it
       // as an auth failure — the 401 branch below would log the user out
       // and bounce them to a login page that is itself throttled.
+      const text = rateLimitMessage(resp, data)
       const { showError } = useSnackbar()
-      showError(rateLimitMessage(resp, data))
-      throw new ApiError(resp.status, data)
+      showError(text)
+      // The same words on the error: a page that shows the refusal inline
+      // (FR-129's `/pair`) then says what the snackbar said, `Retry-After`
+      // included, instead of a bare "API error 429".
+      throw new ApiError(resp.status, data, text)
     }
 
     if (

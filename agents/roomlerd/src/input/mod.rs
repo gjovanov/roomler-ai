@@ -389,6 +389,9 @@ pub enum InputMsg {
     Key {
         code: u32,
         down: bool,
+        /// What the viewer says is down with this key: 0x01 Ctrl, 0x02 Shift,
+        /// 0x04 Alt, 0x08 Meta. The arbiter reads it (#3046, `chord_tap`) and
+        /// turns what no frame pressed into frames, so no backend reads it.
         mods: u8,
     },
     KeyText {
@@ -493,6 +496,23 @@ pub(crate) fn stale(inj: &dyn InputInjector) -> bool {
     {
         let _ = inj;
         false
+    }
+}
+
+/// #3164 — does the OS grant THIS process input injection right now? macOS:
+/// Accessibility, read live (`AXIsProcessTrusted` sees a grant at once, no
+/// restart). #2066 — elsewhere no grant is waited on, so `true`: what has no
+/// permission there is a Noop (enigo, SystemContext and uinput all report
+/// permission once open), and only opening one tells whether a backend can open
+/// now. The arbiter backs these opens off.
+pub(crate) fn os_grants_input() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::tcc::accessibility_trusted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
     }
 }
 

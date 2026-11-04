@@ -469,6 +469,9 @@ impl RecordingManager {
     /// the capability probe does, or the gate would be a courtesy.
     fn child_env(&self) -> Vec<(String, String)> {
         let mut env = tunnel_core::env::config_fallbacks_for_child();
+        // #3267 — and a cell this host learned kills its process: a recorder
+        // opens the same drivers from the same cascade.
+        env.extend(crate::encode::cells::learned_for_child());
         env.extend(self.child_env.iter().cloned());
         // FR-97 P2f-1b — a supervised Mac's GUI worker was started by the ROOT
         // daemon, which stays its recorder's responsible process unless the
@@ -1204,6 +1207,18 @@ pub fn list_recordings(dir: &Path) -> Vec<RecordingItem> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #3280 — a local recording's child opens the same encoders a session does, so
+    /// a later caps try gives way to it, with no session in the registry.
+    #[test]
+    fn a_recording_holds_a_later_caps_try_back() {
+        let live =
+            crate::signaling::live_on_this_host(crate::rc_sessions::RcSessionRegistry::new());
+        RECORDING.fetch_add(1, Ordering::Relaxed);
+        let while_recording = live();
+        RECORDING.fetch_sub(1, Ordering::Relaxed);
+        assert!(while_recording);
+    }
 
     #[test]
     fn events_fold_into_the_state_and_mark_the_end() {

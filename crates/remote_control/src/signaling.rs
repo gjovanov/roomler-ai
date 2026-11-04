@@ -474,6 +474,15 @@ pub enum OverlayJoinRefusal {
     NetworkUnavailable,
     /// A transient persistence failure. Retryable.
     StoreUnavailable,
+    /// FR-40 P2 — the presented WireGuard key was retired on this network (the
+    /// device rotated away from it), and the org refuses retired keys. Not
+    /// retryable under the same key: a device that advertises `key-rotate` is
+    /// ordered to rotate, and the join under its new key is admitted.
+    ///
+    /// Agents from 0.4.41 decode this as [`Unknown`](Self::Unknown), which they
+    /// log with the `detail` and never retry; older agents are never sent the
+    /// frame (`supports_join_refusal`).
+    KeyRetired,
     /// A reason this build does not know.
     Unknown,
 }
@@ -488,6 +497,7 @@ impl<'de> Deserialize<'de> for OverlayJoinRefusal {
             "address_space_exhausted" => OverlayJoinRefusal::AddressSpaceExhausted,
             "network_unavailable" => OverlayJoinRefusal::NetworkUnavailable,
             "store_unavailable" => OverlayJoinRefusal::StoreUnavailable,
+            "key_retired" => OverlayJoinRefusal::KeyRetired,
             _ => OverlayJoinRefusal::Unknown,
         })
     }
@@ -695,7 +705,33 @@ pub enum ClientMsg {
         /// speak for its GUI worker). Additive like `companion_version`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keep_busy: Option<crate::models::KeepBusyBrief>,
+        /// FR-55 P4 — the device's power posture: its `power_policy`, its
+        /// power source, and whether its keeper holds the machine awake.
+        /// Shown on the device list, never enforced on. `None` = nothing to
+        /// report (a pre-P4 agent, or a keeper that has not decided yet).
+        /// Additive like `keep_busy`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        power: Option<crate::models::PowerBrief>,
     },
+
+    /// FR-55 P4 — this device is going to sleep NOW: the OS said so (logind's
+    /// `PrepareForSleep`, Windows' `PBT_APMSUSPEND`, macOS'
+    /// `kIOMessageSystemWillSleep`). Sent on every live org connection, and
+    /// followed at once by the agent closing that connection, so a server
+    /// that cannot decode it still sees a clean close. A server that can
+    /// records it ([`crate::models::SleepNotice`]) and treats it as the
+    /// goodbye: the device reads offline at once, with the reason, instead
+    /// of green until the receive deadline reaps a socket nobody answers.
+    ///
+    /// `power` is the posture at that moment, so the reader can tell a sleep
+    /// the policy allowed (`held: false`) from one that happened past the
+    /// hold (`held: true`: a closed lid, a person, the OS).
+    ///
+    /// ⚠️ A notice is a promise, not a fact: a suspend can still fail or be
+    /// cancelled. The connection closes either way, and the agent reconnects
+    /// at the wake or the cancel, whose hello clears the record.
+    #[serde(rename = "rc:agent.sleeping")]
+    AgentSleeping { power: crate::models::PowerBrief },
 
     /// Multi-region relay PoPs: the agent's timed STUN probe results for the
     /// regions last pushed in [`ServerMsg::RelayRegions`]. The server derives
@@ -744,6 +780,16 @@ pub enum ClientMsg {
         /// direct**. Additive: an older server ignores the key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         carrier: Option<String>,
+        /// FR-132 P1 (§3b) — the decode errors the viewer reported in this
+        /// session (`rc:decode-error` on the control channel, one per error,
+        /// sent before the viewer falls back to `<video>`). Cumulative, like
+        /// `keyframe_requests`. `Some` once the viewer has said it counts (its
+        /// `rc:decodestat` carries `de`, or it reported an error), so `Some(0)`
+        /// is a measured zero; absent is **not counted**, never zero: an older
+        /// viewer or agent, or a session that never decoded in a worker.
+        /// Additive: an older server ignores the key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decode_errors: Option<u32>,
     },
 
     /// Multi-region DERP: request an EdDSA admission ticket for the regional
@@ -1819,6 +1865,27 @@ pub enum ClientMsg {
         probe: String,
     },
 
+    /// FR-90 P4-6-1a — a session on this device asks how an entity of the
+    /// map is reached, by its kind and key: the engine, the upstream and the
+    /// credential its facts say (decision 59), and the paths the devices'
+    /// findings measured (decision 60). Believed and held as
+    /// [`ClientMsg::KnowhowSearch`] is, and answered with
+    /// [`ServerMsg::KnowhowAccess`] or [`ServerMsg::KnowhowRefused`]. It
+    /// grants nothing: the device asks the vault and the network for each
+    /// piece. Absent, the strings read as empty and are refused
+    /// `bad_request`, so the frame is always answered.
+    #[serde(rename = "rc:knowhow.connect")]
+    KnowhowConnect {
+        req_id: String,
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        fence: u64,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        key: String,
+    },
+
     /// FR-90 P4-5 — the device's answer to a [`ServerMsg::KnowhowProbe`]: how
     /// the probe ended, the round trip of its connect, the address it
     /// connected to (one it resolved and checked), and for `tls` what the
@@ -2004,6 +2071,23 @@ pub enum ClientMsg {
             with = "option_oid_hex"
         )]
         local_relay_from: Option<ObjectId>,
+        /// FR-121 P3b (#2774) — the further relays the probe found, in probe
+        /// order, after `local_relay`. One computer can run several enrolled
+        /// agents (Windows and WSL, a container), each with its own relay and
+        /// its own overlay path to the target, so the first to answer is no
+        /// better than the rest: the Hub hands the target every one, and ICE
+        /// checks a pair through each. Read only beside a `local_relay`, at most
+        /// [`LOCAL_RELAYS_MAX`] in all. Absent from older viewers; an older
+        /// server ignores it and hands over the first alone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        local_relay_also: Vec<LocalRelayDescriptor>,
+        /// FR-121 P3b (#2774) — the further devices of the requester's own that
+        /// this browser runs on, after `local_relay_from`, each resolved as
+        /// that one is. Read only beside a `local_relay_from`, at most
+        /// [`LOCAL_RELAYS_MAX`] in all. Absent from older viewers; an older
+        /// server ignores it and hands over the first device's relay alone.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "vec_oid_hex")]
+        local_relay_from_also: Vec<ObjectId>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -2766,6 +2850,7 @@ impl ClientMsg {
         match self {
             ClientMsg::AgentHello { .. } => "rc:agent.hello",
             ClientMsg::AgentHeartbeat { .. } => "rc:agent.heartbeat",
+            ClientMsg::AgentSleeping { .. } => "rc:agent.sleeping",
             ClientMsg::RelayProbeReport { .. } => "rc:relay.probe_report",
             ClientMsg::SessionStats { .. } => "rc:session.stats",
             ClientMsg::DerpTicketRequest { .. } => "rc:relay.derp_ticket_request",
@@ -2814,6 +2899,7 @@ impl ClientMsg {
             ClientMsg::KnowhowPropose { .. } => "rc:knowhow.propose",
             ClientMsg::KnowhowProbed { .. } => "rc:knowhow.probed",
             ClientMsg::KnowhowVerify { .. } => "rc:knowhow.verify",
+            ClientMsg::KnowhowConnect { .. } => "rc:knowhow.connect",
             ClientMsg::SdpAnswer { .. } => "rc:sdp.answer",
             ClientMsg::Consent { .. } => "rc:consent",
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
@@ -2862,6 +2948,7 @@ impl ClientMsg {
         match self {
             ClientMsg::AgentHello { .. }
             | ClientMsg::AgentHeartbeat { .. }
+            | ClientMsg::AgentSleeping { .. }
             | ClientMsg::RpcResult { .. }
             | ClientMsg::RpcExecRequest { .. }
             | ClientMsg::ConfigStatus { .. }
@@ -2951,7 +3038,8 @@ impl ClientMsg {
             | ClientMsg::KnowhowGet { .. }
             | ClientMsg::KnowhowPropose { .. }
             | ClientMsg::KnowhowProbed { .. }
-            | ClientMsg::KnowhowVerify { .. } => Owner::Knowhow,
+            | ClientMsg::KnowhowVerify { .. }
+            | ClientMsg::KnowhowConnect { .. } => Owner::Knowhow,
         }
     }
 }
@@ -2964,6 +3052,7 @@ impl ClientMsg {
 pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:agent.hello", Owner::Fleet),
     ("rc:agent.heartbeat", Owner::Fleet),
+    ("rc:agent.sleeping", Owner::Fleet),
     ("rc:relay.probe_report", Owner::Network),
     ("rc:session.stats", Owner::Remote),
     ("rc:recording.activity", Owner::Remote),
@@ -3012,6 +3101,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:knowhow.propose", Owner::Knowhow),
     ("rc:knowhow.probed", Owner::Knowhow),
     ("rc:knowhow.verify", Owner::Knowhow),
+    ("rc:knowhow.connect", Owner::Knowhow),
     ("rc:sdp.answer", Owner::Remote),
     ("rc:consent", Owner::Fleet),
     ("rc:consent.pending", Owner::Fleet),
@@ -3289,15 +3379,23 @@ pub enum ServerMsg {
         /// FR-121 — the answer to the request's `local_relay_from`: the
         /// browser's own device's relay, which the viewer adds as
         /// `turn:127.0.0.1:{turn_port}` before its offer. Sent only to a
-        /// request that named its device; absent otherwise.
+        /// request that named its device; absent otherwise. With several
+        /// named (P3b), the first one that got a relay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_relay: Option<LocalRelayDescriptor>,
         /// FR-121 — why `local_relay_from` got no relay: `not_your_device`,
         /// `other_network`, `device_offline`, `rc_overlay_off` or
         /// `same_device` ([`LocalRelayRefusal`]). The viewer shows an unknown
-        /// word as it came.
+        /// word as it came. With several named (P3b), sent only when none got
+        /// a relay, and it is the first one's reason.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_relay_refused: Option<String>,
+        /// FR-121 P3b (#2774) — the further relays handed over, after
+        /// `local_relay`, when the request named several devices
+        /// (`local_relay_from_also`). The viewer adds each as it adds that one.
+        /// Absent otherwise; an older viewer never names more than one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        local_relay_also: Vec<LocalRelayDescriptor>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -3399,6 +3497,13 @@ pub enum ServerMsg {
         /// so the default costs nothing on the wire.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         rc_overlay: bool,
+        /// FR-128 — the device's policy is `auto`: the agent decides per
+        /// session whether its ICE may use the overlay, from the live mesh
+        /// carrier to the viewer's device and whether a far TURN path exists.
+        /// Present = auto. Sent with `rc_overlay: false`, so an agent older
+        /// than the field takes the policy default, off (D1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rc_overlay_auto: Option<RcOverlayAutoWire>,
         /// FR-101 P2 — the org's session policy for clipboard, files and
         /// audio. The hub has already taken out of `permissions` (and
         /// `audio_enabled`) what the policy refuses here; an agent that
@@ -5175,6 +5280,18 @@ pub enum ServerMsg {
         probe: serde_json::Value,
     },
 
+    /// FR-90 P4-6-1a — how an entity is reached, for a session's
+    /// `roomler_connect`: the engine, the upstream and the credential handle
+    /// its `active` and `stale` facts say, what is `missing` for those, and
+    /// the paths the devices' findings measured, this device's first. Raw
+    /// JSON, as a card is. It grants nothing: the vault and the network
+    /// decide every piece the device then asks for.
+    #[serde(rename = "rc:knowhow.access")]
+    KnowhowAccess {
+        req_id: String,
+        access: serde_json::Value,
+    },
+
     /// FR-90 P4-5 — a probe, asked of a device whose last hello advertised
     /// [`crate::models::RpcCap::KnowhowProbe`]: reach `host` on `port` as
     /// `kind` says ([`crate::knowhow::ProbeKind`], decision 55), but only when
@@ -5438,6 +5555,28 @@ pub struct FileNote {
     pub bytes: u64,
 }
 
+/// FR-128 — what an `auto` session needs from the server, beside the policy
+/// itself: [`ServerMsg::Request::rc_overlay_auto`]. Both fields are hints the
+/// agent may lack; every one it lacks makes it more careful, never less.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct RcOverlayAutoWire {
+    /// The viewer's own devices on the overlay: the `overlay_ip` of each
+    /// [`LocalRelayDescriptor`] the Hub hands the browser, at most
+    /// [`LOCAL_RELAYS_MAX`] (FR-121 P3b: Windows and WSL on one computer each
+    /// run a relay). The agent asks its daemon which carrier holds each of
+    /// those peers; the best one decides, and a device behind a worse one is
+    /// left off. Empty (the browser's device sent no relay, or is in another
+    /// network) = unknown, so off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub viewers: Vec<String>,
+    /// Whether BOTH ends' last netcheck reached the far TURN over UDP
+    /// ([`CapVectorWire::stun_udp`] and not `relay_band_udp: Some(false)`).
+    /// `Some(false)` makes a relayed mesh the only path (§2.4). `None` = not
+    /// measured, which the agent reads as "the far TURN works".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub far_turn: Option<bool>,
+}
+
 /// Loopback-TURN corp-relay descriptor (loopback-TURN Phase 2). Minted + served
 /// by the controller host's LOCAL enrolled agent on its loopback probe endpoint
 /// (`http://127.0.0.1:47989/rc-local-turn`); the browser forwards it verbatim in
@@ -5470,6 +5609,17 @@ pub struct LocalRelayDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
+
+/// FR-121 P3b (#2774) — the most relays one session carries: `local_relay` (or
+/// the device `local_relay_from` names) and the `_also` lists together. A
+/// probe finds one per enrolled agent on the browser's computer, and every one
+/// is a TURN allocation the target's agent makes, so the Hub keeps the first
+/// this many and drops the rest. Two is the case in the field (Windows and
+/// WSL); a container or a second test agent makes three.
+///
+/// ⚠️ The viewer stops at the same number (`LOCAL_RELAYS_MAX` in
+/// `useRemoteControl.ts`).
+pub const LOCAL_RELAYS_MAX: usize = 4;
 
 /// FR-121 — why a request's `local_relay_from` got no relay, the words
 /// `rc:session.created`'s `local_relay_refused` carries.
@@ -7425,6 +7575,46 @@ mod tests {
         );
     }
 
+    /// FR-90 P4-6-1a — a session's connect and its answer: the entity by its
+    /// kind and key, a bare one still decoding so it is answered
+    /// `bad_request`; `access` carrying the compiled access as raw JSON.
+    #[test]
+    fn knowhow_connect_frames_wire_shape_is_locked() {
+        let session = ObjectId::new();
+        let connect = ClientMsg::KnowhowConnect {
+            req_id: "c1".into(),
+            session_id: session,
+            fence: 3,
+            kind: "database".into(),
+            key: "prod-mongo".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&connect).unwrap(),
+            serde_json::json!({"t": "rc:knowhow.connect", "req_id": "c1",
+                               "session_id": session.to_hex(), "fence": 3,
+                               "kind": "database", "key": "prod-mongo"})
+        );
+        assert_eq!(connect.namespace(), Owner::Knowhow);
+        assert_eq!(connect.wire_tag(), "rc:knowhow.connect");
+        let bare = serde_json::json!({"t": "rc:knowhow.connect", "req_id": "c2",
+                                      "session_id": session.to_hex(), "fence": 3});
+        match serde_json::from_value::<ClientMsg>(bare).unwrap() {
+            ClientMsg::KnowhowConnect { kind, key, .. } => {
+                assert!(kind.is_empty() && key.is_empty())
+            }
+            other => panic!("not a connect: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(ServerMsg::KnowhowAccess {
+                req_id: "c1".into(),
+                access: serde_json::json!({"engine": "mongodb"}),
+            })
+            .unwrap(),
+            serde_json::json!({"t": "rc:knowhow.access", "req_id": "c1",
+                               "access": {"engine": "mongodb"}})
+        );
+    }
+
     /// FR-90 P4-4-1 — a session's questions and their answers: the session
     /// and its fence in the frame, never the organization or the device;
     /// empty filters left out; a `get` missing its name still decoding, so
@@ -8349,6 +8539,56 @@ mod tests {
         assert_eq!(back, on, "an absent reason stays absent");
     }
 
+    /// FR-85 AC10 — what a device may say about a remote recording is the
+    /// claim, never the recording. A frame that smuggles content beside the
+    /// claim (the bytes, a frame, a link to either) decodes to the claim
+    /// alone: the extra keys are dropped at the wire, before any handler, and
+    /// the server builds its row from these six fields only
+    /// (`agent_socket.rs`, `RecordingActivityEvent`).
+    #[test]
+    fn a_recording_activity_frame_carries_the_claim_and_nothing_else() {
+        let smuggled = serde_json::json!({
+            "t": "rc:recording.activity",
+            "session_id": "6ad0e0359836bb5de09f59f4",
+            "kind": "stopped",
+            "name": "Roomler Recording 2026-10-31 00-12-00.mp4",
+            "bytes": 5_759_995,
+            "duration_ms": 26_000,
+            "reason": "requested",
+            "content": "AAAAGGZ0eXBpc29t",
+            "data": [0, 0, 0, 24],
+            "frames": ["AAAAAWdkAB+s"],
+            "url": "https://example.invalid/r.mp4",
+            "recording_url": "https://example.invalid/r.mp4",
+        });
+        let msg: ClientMsg = serde_json::from_value(smuggled).unwrap();
+        assert!(
+            matches!(msg, ClientMsg::RecordingActivity { .. }),
+            "{msg:?}"
+        );
+        let back = serde_json::to_value(&msg).unwrap();
+        let mut keys: Vec<&str> = back
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bytes",
+                "duration_ms",
+                "kind",
+                "name",
+                "reason",
+                "session_id",
+                "t"
+            ],
+            "only the claim crosses: {back}"
+        );
+    }
+
     #[test]
     fn ssh_response_carries_the_host_key_on_the_device_leg() {
         // `roomler ssh` originates on THIS leg, and the dialling device has no
@@ -9184,6 +9424,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: from,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&request(Some(device))).unwrap();
         assert!(
@@ -9211,6 +9453,7 @@ mod tests {
             consent_asks: None,
             local_relay,
             local_relay_refused,
+            local_relay_also: vec![],
         };
         let s = serde_json::to_string(&created(Some(relay), None)).unwrap();
         assert!(
@@ -9252,6 +9495,92 @@ mod tests {
         );
     }
 
+    /// FR-121 P3b (#2774) — the further relays and devices ride beside the
+    /// single fields, a device as raw hex, and only when there are any: an
+    /// older viewer's frame parses with both lists empty, and an older reader
+    /// never sees a key it does not know unless there is something in it.
+    #[test]
+    fn several_local_relays_are_additive_on_the_wire() {
+        let target = ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap();
+        let mine = ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap();
+        let wsl = ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap();
+        let relay = |port: u16| LocalRelayDescriptor {
+            turn_port: port,
+            overlay_ip: "100.64.0.7".into(),
+            username: "u".into(),
+            credential: "c".into(),
+            agent_id: None,
+        };
+        let request =
+            |also: Vec<LocalRelayDescriptor>, from_also: Vec<ObjectId>| ClientMsg::SessionRequest {
+                agent_id: target,
+                permissions: Permissions::VIEW,
+                browser_caps: vec![],
+                preferred_transport: None,
+                chroma_pref: None,
+                chunk_framing: None,
+                audio_enabled: false,
+                override_reason: None,
+                local_relay: Some(relay(47989)),
+                local_relay_from: Some(mine),
+                local_relay_also: also,
+                local_relay_from_also: from_also,
+            };
+
+        let s = serde_json::to_string(&request(vec![relay(47990)], vec![wsl])).unwrap();
+        assert!(
+            s.contains(r#""local_relay_also":[{"turn_port":47990"#),
+            "{s}"
+        );
+        assert!(
+            s.contains(r#""local_relay_from_also":["507f1f77bcf86cd799439014"]"#),
+            "{s}"
+        );
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::SessionRequest {
+                local_relay_also,
+                local_relay_from_also,
+                ..
+            } => {
+                assert_eq!(local_relay_also, vec![relay(47990)]);
+                assert_eq!(local_relay_from_also, vec![wsl]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let s = serde_json::to_string(&request(vec![], vec![])).unwrap();
+        assert!(!s.contains("_also"), "an empty list is never written: {s}");
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::SessionRequest {
+                local_relay_also,
+                local_relay_from_also,
+                ..
+            } => assert!(local_relay_also.is_empty() && local_relay_from_also.is_empty()),
+            other => panic!("{other:?}"),
+        }
+
+        let created = |also: Vec<LocalRelayDescriptor>| ServerMsg::SessionCreated {
+            session_id: target,
+            agent_id: target,
+            permissions: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: None,
+            idle_secs: None,
+            consent_asks: None,
+            local_relay: Some(relay(47989)),
+            local_relay_refused: None,
+            local_relay_also: also,
+        };
+        let s = serde_json::to_string(&created(vec![relay(47990)])).unwrap();
+        assert!(
+            s.contains(r#""local_relay_also":[{"turn_port":47990"#),
+            "{s}"
+        );
+        let s = serde_json::to_string(&created(vec![])).unwrap();
+        assert!(!s.contains("local_relay_also"), "{s}");
+    }
+
     #[test]
     fn object_ids_serialise_as_raw_hex_on_wire() {
         // Lock-in: no `$oid` wrapping anywhere in the WS protocol envelope.
@@ -9269,6 +9598,7 @@ mod tests {
             consent_asks: None,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -9289,6 +9619,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -9313,6 +9645,8 @@ mod tests {
             override_reason: None,
             local_relay: None,
             local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
@@ -9341,6 +9675,8 @@ mod tests {
                 agent_id: None,
             }),
             local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
         };
         let s = serde_json::to_string(&req_lr).unwrap();
         assert!(
@@ -9366,7 +9702,7 @@ mod tests {
     /// skipped so the default costs nothing on the wire; `true` round-trips.
     #[test]
     fn request_rc_overlay_is_off_when_absent_and_round_trips_when_on() {
-        let req = |rc_overlay| ServerMsg::Request {
+        let req = |rc_overlay, rc_overlay_auto| ServerMsg::Request {
             session_id: ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap(),
             controller_user_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
             controller_name: "Alice".into(),
@@ -9382,28 +9718,62 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay,
+            rc_overlay_auto,
             session_policy: None,
             idle_secs: None,
             lock_on_end: None,
             external: None,
         };
-        let off = serde_json::to_string(&req(false)).unwrap();
+        let off = serde_json::to_string(&req(false, None)).unwrap();
         assert!(
             !off.contains("rc_overlay"),
             "false is the default and must not reach the wire: {off}"
         );
         match serde_json::from_str::<ServerMsg>(&off).unwrap() {
-            ServerMsg::Request { rc_overlay, .. } => {
-                assert!(!rc_overlay, "absent (an older server) must read OFF")
+            ServerMsg::Request {
+                rc_overlay,
+                rc_overlay_auto,
+                ..
+            } => {
+                assert!(!rc_overlay, "absent (an older server) must read OFF");
+                assert_eq!(rc_overlay_auto, None, "and not auto");
             }
             _ => panic!("expected Request"),
         }
-        let on = serde_json::to_string(&req(true)).unwrap();
+        let on = serde_json::to_string(&req(true, None)).unwrap();
         assert!(on.contains("\"rc_overlay\":true"), "{on}");
         match serde_json::from_str::<ServerMsg>(&on).unwrap() {
             ServerMsg::Request { rc_overlay, .. } => assert!(rc_overlay),
             _ => panic!("expected Request"),
         }
+        // FR-128 D1 — `auto` travels as its own field beside `rc_overlay:
+        // false`, which is skipped: an agent that knows only `rc_overlay`
+        // reads OFF, the policy default.
+        let hints = RcOverlayAutoWire {
+            viewers: vec!["100.65.4.33".into(), "100.65.4.40".into()],
+            far_turn: Some(false),
+        };
+        let auto = serde_json::to_string(&req(false, Some(hints.clone()))).unwrap();
+        assert!(auto.contains("\"rc_overlay_auto\":{"), "{auto}");
+        assert!(
+            auto.contains("\"viewers\":[\"100.65.4.33\",\"100.65.4.40\"]"),
+            "{auto}"
+        );
+        assert!(
+            !auto.contains("\"rc_overlay\":"),
+            "an older agent reads off: {auto}"
+        );
+        match serde_json::from_str::<ServerMsg>(&auto).unwrap() {
+            ServerMsg::Request {
+                rc_overlay,
+                rc_overlay_auto,
+                ..
+            } => assert!(!rc_overlay && rc_overlay_auto == Some(hints)),
+            _ => panic!("expected Request"),
+        }
+        // Auto with no hints at all is still auto, and costs two bytes.
+        let bare = serde_json::to_string(&req(false, Some(RcOverlayAutoWire::default()))).unwrap();
+        assert!(bare.contains("\"rc_overlay_auto\":{}"), "{bare}");
     }
 
     /// FR-101 P2 — `session_policy` on `rc:request`: absent (an older server,
@@ -9429,6 +9799,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay: false,
+            rc_overlay_auto: None,
             session_policy,
             idle_secs: None,
             lock_on_end: None,
@@ -9478,6 +9849,7 @@ mod tests {
             consent_asks: None,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let none = serde_json::to_string(&mk(None)).unwrap();
         assert!(!none.contains("features_refused"), "{none}");
@@ -9525,6 +9897,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay: false,
+            rc_overlay_auto: None,
             session_policy: None,
             idle_secs,
             lock_on_end: None,
@@ -9550,6 +9923,7 @@ mod tests {
             consent_asks: None,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("idle_secs"), "{none}");
@@ -9603,6 +9977,7 @@ mod tests {
             consent_asks,
             local_relay: None,
             local_relay_refused: None,
+            local_relay_also: vec![],
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("consent_asks"), "{none}");
@@ -9658,6 +10033,7 @@ mod tests {
             input_mode: None,
             tenant_name: None,
             rc_overlay: false,
+            rc_overlay_auto: None,
             session_policy: None,
             idle_secs: None,
             lock_on_end,
@@ -9707,6 +10083,7 @@ mod tests {
             warm_relay: Some("5.9.157.221:12586".into()),
             companion_version: Some("0.4.16".into()),
             keep_busy: None,
+            power: None,
             // FR-43 P2c — absent means "no news", which is the steady state.
             caps: None,
         };
@@ -9731,6 +10108,7 @@ mod tests {
                 companion_version,
                 caps,
                 keep_busy,
+                power,
             } => {
                 // FR-43 P2c — the steady state is ABSENT, and that is the
                 // property worth asserting: caps ride the heartbeat only when
@@ -9740,6 +10118,9 @@ mod tests {
                 // busy says nothing: the key is absent on the wire.
                 assert!(keep_busy.is_none());
                 assert!(!s.contains("keep_busy"), "{s}");
+                // FR-55 P4 — nor about power.
+                assert!(power.is_none());
+                assert!(!s.contains("\"power\""), "{s}");
                 assert_eq!(rss_mb, 142);
                 assert!((cpu_pct - 3.25).abs() < f32::EPSILON);
                 assert_eq!(active_sessions, 2);
@@ -9839,6 +10220,7 @@ mod tests {
             // mean "nothing to show").
             companion_version: None,
             keep_busy: None,
+            power: None,
             caps: None,
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -11091,6 +11473,28 @@ mod tests {
         }
     }
 
+    /// FR-40 P2 — `key_retired` round-trips under its own wire string and is
+    /// not retryable: the same key is refused again, and the way out is the
+    /// rotation order, not another join. Every fielded agent from 0.4.41 on
+    /// runs the decoder above without this arm, so for them it is exactly the
+    /// `quota_exceeded_v9` case: `Unknown`, logged with the detail, no retry.
+    #[test]
+    fn key_retired_roundtrips_and_is_not_retryable() {
+        let m = ServerMsg::OverlayJoinRefused {
+            reason: OverlayJoinRefusal::KeyRetired,
+            detail: "this overlay key was retired".into(),
+        };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.contains(r#""reason":"key_retired""#), "{s}");
+        match serde_json::from_str::<ServerMsg>(&s).unwrap() {
+            ServerMsg::OverlayJoinRefused { reason, .. } => {
+                assert_eq!(reason, OverlayJoinRefusal::KeyRetired);
+                assert!(!reason.is_retryable());
+            }
+            other => panic!("expected OverlayJoinRefused, got {other:?}"),
+        }
+    }
+
     #[test]
     fn overlay_join_roundtrip() {
         let m = ClientMsg::OverlayJoin {
@@ -11368,6 +11772,7 @@ mod tests {
             caps: None,
             companion_version: None,
             keep_busy: Some(brief.clone()),
+            power: None,
         };
         let v: serde_json::Value = serde_json::to_value(&hb).unwrap();
         assert_eq!(v["keep_busy"]["phase"], "paused");
@@ -11387,6 +11792,92 @@ mod tests {
             serde_json::to_string(&off).unwrap(),
             r#"{"on":false,"phase":"off"}"#
         );
+    }
+
+    /// FR-55 P4 — the power brief rides the heartbeat both ways, and a
+    /// heartbeat from an agent that predates it still parses, as "nothing to
+    /// say". An unknown power source is absent from the wire, never `false`:
+    /// "on battery" and "cannot tell" stay two answers.
+    #[test]
+    fn power_brief_rides_the_heartbeat_and_is_optional() {
+        use crate::models::PowerBrief;
+        let old = r#"{"t":"rc:agent.heartbeat","rss_mb":0,"cpu_pct":0.0,"active_sessions":0}"#;
+        match serde_json::from_str::<ClientMsg>(old).unwrap() {
+            ClientMsg::AgentHeartbeat { power, .. } => assert!(power.is_none()),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+        let brief = PowerBrief {
+            policy: "on-ac".into(),
+            on_ac: Some(true),
+            held: true,
+        };
+        let hb = ClientMsg::AgentHeartbeat {
+            rss_mb: 0,
+            cpu_pct: 0.0,
+            active_sessions: 0,
+            sys: None,
+            srflx_count: None,
+            warm_relay: None,
+            caps: None,
+            companion_version: None,
+            keep_busy: None,
+            power: Some(brief.clone()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&hb).unwrap();
+        assert_eq!(v["power"]["policy"], "on-ac");
+        assert_eq!(v["power"]["on_ac"], true);
+        assert_eq!(v["power"]["held"], true);
+        match serde_json::from_value::<ClientMsg>(v).unwrap() {
+            ClientMsg::AgentHeartbeat { power, .. } => assert_eq!(power, Some(brief)),
+            other => panic!("expected a heartbeat, got {other:?}"),
+        }
+        let unknown = PowerBrief {
+            policy: "never".into(),
+            on_ac: None,
+            held: false,
+        };
+        assert_eq!(
+            serde_json::to_string(&unknown).unwrap(),
+            r#"{"policy":"never","held":false}"#
+        );
+    }
+
+    /// FR-55 P4 — the suspend announcement: one fixed tag, the posture at the
+    /// moment of sleep, owned by fleet (whose socket loop treats it as the
+    /// goodbye). `by_policy` is the reading the dashboard words: nothing held
+    /// means the policy let the device sleep.
+    #[test]
+    fn the_sleep_announcement_carries_the_posture_and_belongs_to_fleet() {
+        use crate::models::PowerBrief;
+        let m = ClientMsg::AgentSleeping {
+            power: PowerBrief {
+                policy: "never".into(),
+                on_ac: Some(false),
+                held: false,
+            },
+        };
+        assert_eq!(m.wire_tag(), "rc:agent.sleeping");
+        assert_eq!(m.namespace(), Owner::Fleet);
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            s,
+            r#"{"t":"rc:agent.sleeping","power":{"policy":"never","on_ac":false,"held":false}}"#
+        );
+        match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+            ClientMsg::AgentSleeping { power } => {
+                assert!(power.by_policy(), "nothing held: the policy let it sleep");
+                assert_eq!(power.on_ac, Some(false));
+            }
+            other => panic!("expected the sleep announcement, got {other:?}"),
+        }
+        // A sleep past the hold (a closed lid, a person, the OS) is not one
+        // the policy allowed.
+        let past_the_hold = PowerBrief {
+            policy: "on-ac".into(),
+            on_ac: Some(true),
+            held: true,
+        };
+        assert!(!past_the_hold.by_policy());
     }
 
     #[test]
@@ -12451,6 +12942,7 @@ mod tests {
             warm_relay: None,
             companion_version: None,
             keep_busy: None,
+            power: None,
             caps: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
@@ -12469,6 +12961,7 @@ mod tests {
             warm_relay: None,
             companion_version: None,
             keep_busy: None,
+            power: None,
             caps: Some(Box::new(AgentCaps {
                 permissions: Some(vec!["screen-capture".into(), "input".into()]),
                 has_input_permission: true,
@@ -12528,8 +13021,48 @@ mod tests {
             mixed_dial_seconds: 0,
             transfers: Transfers::default(),
             carrier: None,
+            decode_errors: None,
         };
         assert!(!serde_json::to_string(&none).unwrap().contains("carrier"));
+    }
+
+    /// FR-132 P1 — the decode-error count is additive both ways, and a zero
+    /// the viewer measured is not the same as no count: a sample from an
+    /// agent older than the field parses with none, a sample whose viewer did
+    /// not count serialises without the key (an older server never sees it),
+    /// and a counted zero travels as a zero.
+    #[test]
+    fn session_stats_decode_errors_tell_a_counted_zero_from_no_count() {
+        let older = r#"{"t":"rc:session.stats","session_id":"a","bytes_sent":1,"bytes_recv":2,
+            "fps":30.0,"rtt_ms":4.0,"keyframe_requests":0,"input_events":0}"#;
+        match serde_json::from_str::<ClientMsg>(older).unwrap() {
+            ClientMsg::SessionStats { decode_errors, .. } => assert_eq!(decode_errors, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let sample = |decode_errors: Option<u32>| ClientMsg::SessionStats {
+            session_id: "a".into(),
+            bytes_sent: 0,
+            bytes_recv: 0,
+            fps: 0.0,
+            rtt_ms: 0.0,
+            keyframe_requests: 0,
+            input_events: 0,
+            shared_seconds: 0,
+            mixed_dial_seconds: 0,
+            transfers: Transfers::default(),
+            carrier: None,
+            decode_errors,
+        };
+        let s = serde_json::to_string(&sample(None)).unwrap();
+        assert!(!s.contains("decode_errors"), "{s}");
+        for n in [0, 3] {
+            let s = serde_json::to_string(&sample(Some(n))).unwrap();
+            assert!(s.contains(&format!(r#""decode_errors":{n}"#)), "{s}");
+            match serde_json::from_str::<ClientMsg>(&s).unwrap() {
+                ClientMsg::SessionStats { decode_errors, .. } => assert_eq!(decode_errors, Some(n)),
+                other => panic!("wrong variant: {other:?}"),
+            }
+        }
     }
 
     /// has none, parses with none; and the wire names are a compatibility
@@ -12555,6 +13088,7 @@ mod tests {
             mixed_dial_seconds: 0,
             transfers: Transfers::default(),
             carrier: None,
+            decode_errors: None,
         };
         let s = serde_json::to_string(&quiet).unwrap();
         assert!(!s.contains("transfers"), "{s}");
@@ -12582,6 +13116,7 @@ mod tests {
                 }],
             },
             carrier: None,
+            decode_errors: None,
         };
         let v = serde_json::to_value(&busy).unwrap();
         let t = &v["transfers"];

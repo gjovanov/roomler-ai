@@ -83,7 +83,9 @@ pub async fn cmd_status() -> StatusReport {
 fn status_report() -> StatusReport {
     let (service_kind, service_running) = probe_service_state();
     let is_scm = service_kind == "scmService";
-    let cfg = load_optional_config(is_scm);
+    // FR-43 P3a — a person's file on a one-row Mac holds their settings and no
+    // enrollment. That reads as no file, so `cmd_status` asks the daemon.
+    let cfg = load_optional_config(is_scm).filter(AgentConfig::has_primary_enrollment);
     // S1b — read BOTH sentinel locations (per-user + machine-global) and
     // parse message/reason; the old path-only read missed a SystemContext
     // host's machine-global sentinel entirely.
@@ -167,6 +169,11 @@ fn apply_daemon_identity(report: &mut StatusReport, id: DaemonIdentity) {
 async fn daemon_node_status() -> Option<NodeStatus> {
     let mut client = localapi::connect().await.ok()?;
     client.status().await.ok()
+}
+
+/// [`daemon_node_status`], for code on the blocking pool.
+fn daemon_node_status_blocking() -> Option<NodeStatus> {
+    tauri::async_runtime::block_on(daemon_node_status())
 }
 
 /// The daemon log directory to show / open. `logging::log_dir()` only works IN
@@ -467,6 +474,14 @@ pub async fn cmd_re_enroll(token: String) -> Result<StatusReport, String> {
     let path = active_config_path(is_scm)?;
     let machine_global = is_machine_global(&path);
     let existing = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
+    // FR-43 P3a — this file has nothing to refresh.
+    if !existing.has_primary_enrollment() {
+        return Err(
+            "The root daemon holds this Mac's enrollment. Refresh it with \
+             `sudo roomlerd re-enroll --token <token>`."
+                .to_string(),
+        );
+    }
     let fresh = enrollment::enroll(EnrollInputs {
         server_url: &existing.server_url,
         enrollment_token: &trimmed,
@@ -1066,12 +1081,12 @@ fn root_only_note(daemon: &DaemonBrief) -> String {
     format!(
         "This computer's Roomler service runs as root ({}, {}) — a machine-wide install — and \
          its settings are read from {}. The ones that are the person at this computer's own \
-         call change here: where incoming files and recordings land, what a remote session may \
-         use (clipboard, files, audio), privacy mode, lock on end, display match, the browser \
-         check, external access. The rest — the device-owned switches (exec_enabled, \
-         ssh_enabled, remote_config_enabled), the private network, Roomler SSH, the updater — \
-         are marked administrator's and are changed in a terminal: `sudo roomler config set \
-         <key> <value>`.",
+         call change here: where incoming files land, whether a controller may record, what a \
+         remote session may use (clipboard, files, audio), privacy mode, lock on end, display \
+         match, the browser check, external access. The rest — the device-owned switches \
+         (exec_enabled, ssh_enabled, remote_config_enabled), the private network, Roomler SSH, \
+         the updater, the recordings folder — are marked administrator's and are changed in a \
+         terminal: `sudo roomler config set <key> <value>`.",
         daemon.name,
         daemon.version,
         root_config_file_of(daemon)
@@ -1102,7 +1117,8 @@ fn root_only_legacy_note(daemon: &DaemonBrief) -> String {
 
 /// #2891 — does this companion run as root? Only then does `connect()` reach
 /// a root daemon's own socket; otherwise a root daemon it reaches is behind
-/// its person socket, where no config verb is served.
+/// its person socket, which sets only the console person's own keys (#2871,
+/// design A) and, on a daemon older than that, serves no config verb at all.
 fn process_is_root() -> bool {
     #[cfg(unix)]
     {
@@ -1116,7 +1132,8 @@ fn process_is_root() -> bool {
 
 /// #2891 — did a config verb's refusal come from a ROOT daemon this
 /// unprivileged companion reached — a Linux system install's person socket,
-/// which serves `Status` and refuses every config verb? Then the per-user file
+/// which serves `Status` and refuses a config verb it does not serve (every
+/// one, on a daemon older than #2871's design A)? Then the per-user file
 /// the callers would fall back to is not that daemon's, and may be a stale
 /// copy no daemon reads: writing it reports a success the daemon refused
 /// (#2871's failure, on Linux). One `Status` on the same connection.
@@ -1754,9 +1771,20 @@ fn no_handler_message(scheme: &str) -> String {
 pub fn server_origin_blocking() -> Result<String, String> {
     let is_scm = probe_service_state().0 == "scmService";
     let path = active_config_path(is_scm)?;
-    let cfg = config::load(&path)
-        .map_err(|_| "This device isn't enrolled yet — no server to open.".to_string())?;
-    let server = cfg.server_url.trim().trim_end_matches('/').to_string();
+    let not_enrolled = || "This device isn't enrolled yet — no server to open.".to_string();
+    let cfg = config::load(&path).map_err(|_| not_enrolled())?;
+    // FR-43 P3a — on a one-row Mac the server is in the root daemon's enrollment,
+    // not in the person's file.
+    let server = if cfg.has_primary_enrollment() {
+        cfg.server_url
+    } else {
+        daemon_node_status_blocking()
+            .as_ref()
+            .and_then(daemon_identity)
+            .and_then(|id| id.server_url)
+            .ok_or_else(not_enrolled)?
+    };
+    let server = server.trim().trim_end_matches('/').to_string();
     if !server.starts_with("https://") && !server.starts_with("http://") {
         return Err("this device's config has no valid server URL".to_string());
     }
@@ -1785,6 +1813,9 @@ pub async fn cmd_open_roomler(app: tauri::AppHandle) -> Result<(), String> {
 /// org's server and tenant, which are read from this device's own
 /// `[[orgs]]` entry — still never from anything the page or a peer supplied.
 /// Absent / empty / `primary` = the primary enrollment, as before.
+///
+/// FR-43 P3a — a person's file on a one-row Mac holds no enrollment, so the same
+/// fields come from this machine's root daemon ([`daemon_remote_target`]).
 #[tauri::command]
 pub async fn cmd_open_remote(
     app: tauri::AppHandle,
@@ -1799,7 +1830,13 @@ pub async fn cmd_open_remote(
         let is_scm = probe_service_state().0 == "scmService";
         let path = active_config_path(is_scm)?;
         let cfg = config::load(&path).map_err(|e| format!("Loading config: {e}"))?;
-        let (server, tid) = remote_target(&cfg, org.as_deref())?;
+        let (server, tid) = if cfg.has_primary_enrollment() {
+            remote_target(&cfg, org.as_deref())?
+        } else {
+            let status = daemon_node_status_blocking()
+                .ok_or_else(|| "The Roomler service isn't answering.".to_string())?;
+            daemon_remote_target(&status, org.as_deref())?
+        };
         Ok::<String, String>(format!("{server}/tenant/{tid}/agent/{aid}/remote"))
     })
     .await
@@ -1812,10 +1849,7 @@ pub async fn cmd_open_remote(
 /// entry's. Both validated: an http(s) origin and a 24-hex tenant id. Pure
 /// over the loaded config, so the resolution is unit-tested.
 fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String), String> {
-    let label = org
-        .map(str::trim)
-        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL);
-    let (server, tid) = match label {
+    let (server, tid) = match secondary_label(org) {
         None => (cfg.server_url.as_str(), cfg.tenant_id.as_str()),
         Some(label) => {
             let entry = cfg
@@ -1826,6 +1860,39 @@ fn remote_target(cfg: &AgentConfig, org: Option<&str>) -> Result<(String, String
             (entry.server_url.as_str(), entry.tenant_id.as_str())
         }
     };
+    checked_target(server, tid)
+}
+
+/// FR-43 P3a — [`remote_target`] from the daemon's own `orgs`, for a person's file
+/// that holds no enrollment. Still this machine's word, and validated the same.
+fn daemon_remote_target(
+    status: &NodeStatus,
+    org: Option<&str>,
+) -> Result<(String, String), String> {
+    let entry = match secondary_label(org) {
+        None => status
+            .orgs
+            .iter()
+            .find(|o| o.primary)
+            .ok_or_else(|| "this device has no primary enrollment".to_string())?,
+        Some(label) => status
+            .orgs
+            .iter()
+            .find(|o| o.label == label)
+            .ok_or_else(|| format!("this device has no enrollment labelled {label:?}"))?,
+    };
+    checked_target(&entry.server_url, entry.tenant_id.as_deref().unwrap_or(""))
+}
+
+/// The `[[orgs]]` label `org` names, if it names one and not the primary.
+fn secondary_label(org: Option<&str>) -> Option<&str> {
+    org.map(str::trim)
+        .filter(|o| !o.is_empty() && *o != config::PRIMARY_ORG_LABEL)
+}
+
+/// An http(s) origin and a 24-hex tenant id, or a refusal: what a "View screen"
+/// may open.
+fn checked_target(server: &str, tid: &str) -> Result<(String, String), String> {
     let tid = tid.trim().to_ascii_lowercase();
     if tid.len() != 24 || !tid.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("this device's config has no valid tenant id for that organization".into());
@@ -1947,8 +2014,18 @@ pub fn cmd_default_device_name() -> String {
 /// Spawn `roomlerd self-update --check-only` and parse the
 /// stdout — looks for the "Update available" sentinel line and
 /// extracts the version pair.
+///
+/// #2936 — `async`, the wait on a blocking thread: a synchronous command runs
+/// on the app's main thread, and this one spawns `roomlerd` and waits for a
+/// network round-trip, which froze the window for the whole check.
 #[tauri::command]
-pub fn cmd_check_update() -> Result<String, String> {
+pub async fn cmd_check_update() -> Result<String, String> {
+    tokio::task::spawn_blocking(check_update_blocking)
+        .await
+        .map_err(|e| format!("task join: {e}"))?
+}
+
+fn check_update_blocking() -> Result<String, String> {
     let exe = agent_exe_path()?;
     let output = no_window_command(&exe)
         .args(["self-update", "--check-only"])
@@ -2289,41 +2366,54 @@ fn spawn_no_inherit_and_wait(
 /// That is the entire reason this panel exists.
 #[derive(serde::Serialize)]
 pub struct PermissionState {
-    /// False on platforms with no permission model, so the UI can hide the
-    /// whole panel rather than showing two permanently-green rows.
+    /// False where there is nothing to show: a platform with no permission
+    /// model, and (#3164) a Mac whose agent did not say what it holds.
     pub applicable: bool,
     pub screen_recording: bool,
     pub accessibility: bool,
 }
 
-#[tauri::command]
-pub fn cmd_permissions() -> PermissionState {
-    #[cfg(target_os = "macos")]
-    {
-        use roomler_node_core::tcc;
-        PermissionState {
+/// #3164 — the AGENT's grants, as its own status reports them
+/// (`NodeStatus::macos_grants`). This used to ask TCC about THIS process,
+/// `ai.roomler.agent-tray`, which never holds either grant and never needs to,
+/// so the card asked for both after the person had granted them to `roomlerd`.
+/// No answer (an agent that predates the field, one not running, a root half
+/// with no GUI session) shows no card: this app's own grants say nothing about
+/// the agent's, and "Service offline" already says the rest.
+pub(crate) fn permission_state(grants: Option<roomler_localapi::MacosGrants>) -> PermissionState {
+    match grants {
+        Some(g) => PermissionState {
             applicable: true,
-            screen_recording: tcc::screen_recording_granted(),
-            accessibility: tcc::accessibility_trusted(),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        PermissionState {
+            screen_recording: g.screen_recording,
+            accessibility: g.accessibility,
+        },
+        None => PermissionState {
             applicable: false,
             screen_recording: true,
             accessibility: true,
-        }
+        },
     }
 }
 
-/// Ask for a permission: pop the system prompt if it has never been answered,
-/// and open the Settings pane either way.
+/// ASYNC: it asks the agent over the LocalAPI, which must stay off the UI
+/// thread (`cmd_status`'s reason).
+#[tauri::command]
+pub async fn cmd_permissions() -> PermissionState {
+    let grants = if cfg!(target_os = "macos") {
+        daemon_node_status().await.and_then(|s| s.macos_grants)
+    } else {
+        None
+    };
+    permission_state(grants)
+}
+
+/// Open the Settings pane where the agent's permission is switched on.
 ///
-/// Both are needed. The prompt only ever appears ONCE per binary — after a
-/// denial macOS never shows it again — and the pane is the only route back,
-/// but landing the user on the right pane with the app already listed is the
-/// difference between one toggle and a hunt through Settings.
+/// #3164 — only the pane. This used to ask for the permission first, FROM THIS
+/// APP: that registered the menu-bar app itself in the pane (the "Roomler"
+/// entry, whose grant changes nothing), beside the agent's own `roomlerd`
+/// entry, which the agent registers itself when it starts
+/// (`macos_permission_preflight`). One entry to switch on is the whole point.
 ///
 /// `which` is `"screen"` or `"input"`.
 #[tauri::command]
@@ -2333,12 +2423,10 @@ pub fn cmd_request_permission(which: String) -> Result<(), String> {
         use roomler_node_core::tcc;
         match which.as_str() {
             "screen" => {
-                let _ = tcc::request_screen_recording();
                 tcc::open_settings_pane(tcc::PANE_SCREEN_RECORDING);
                 Ok(())
             }
             "input" => {
-                let _ = tcc::request_accessibility();
                 tcc::open_settings_pane(tcc::PANE_ACCESSIBILITY);
                 Ok(())
             }
@@ -3492,6 +3580,57 @@ mod tests {
         .expect("a NodeStatus the daemon could send")
     }
 
+    /// #3164 — the card shows the AGENT's grants, as its status reports them.
+    /// No answer (an agent that predates the field, none running, a root half
+    /// with no GUI session) shows no card: this app's own TCC state is not the
+    /// agent's, and reading it asked for both grants after the person had
+    /// given them to `roomlerd`.
+    #[test]
+    fn the_permission_card_reads_the_agents_own_grants() {
+        let st: NodeStatus = serde_json::from_str(
+            r#"{"node_id":"n","name":"mac","version":"0.4.189","mode":"service","connected":true,
+                "macos_grants":{"screen_recording":false,"accessibility":true}}"#,
+        )
+        .unwrap();
+        let p = permission_state(st.macos_grants);
+        assert!(p.applicable);
+        assert!(
+            !p.screen_recording,
+            "not yet in force: the agent restarts first"
+        );
+        assert!(p.accessibility, "live, no restart");
+        let older = daemon_status("n", Some("t"));
+        assert!(!permission_state(older.macos_grants).applicable);
+        assert!(!permission_state(None).applicable);
+    }
+
+    /// #3164 — the card's Restart sits beside the Screen Recording row and
+    /// goes through the app's one restart flow (`restartDaemon`, LocalAPI
+    /// `RestartDaemon`), and its words name the entry the pane shows. Master
+    /// said "restart the agent for it to take effect" with no control at all.
+    #[test]
+    fn the_permission_card_restarts_the_agent_and_names_roomlerd() {
+        let html = include_str!("front/index.html");
+        let js = include_str!("front/overview.js");
+        assert!(
+            html.contains(r#"id="ov-btn-perm-restart""#),
+            "no restart control"
+        );
+        assert!(html.contains(r#"id="ov-perm-restart""#));
+        assert!(html.contains("turn on <strong>roomlerd</strong>"));
+        assert!(html.contains("Quit &amp; Reopen"));
+        assert!(!html.contains("restart the agent for it to take effect"));
+        assert!(
+            js.contains("$('ov-btn-perm-restart')"),
+            "the control is not wired"
+        );
+        assert!(
+            js.contains("R.restartDaemon("),
+            "not the app's restart flow"
+        );
+        assert!(js.contains("restartRow.hidden = p.screen_recording"));
+    }
+
     fn report(enrolled: bool) -> StatusReport {
         StatusReport {
             enrolled,
@@ -3857,9 +3996,13 @@ mod tests {
             "exec_enabled",
             "ssh_enabled",
             "remote_config_enabled",
+            // #2871 — where recordings are saved stays root's on a root-mode
+            // install; the note must not offer it.
+            "the recordings folder",
         ] {
             assert!(note.contains(must), "the note must say {must:?}: {note}");
         }
+        assert!(!note.contains("recordings land"), "{note}");
         let legacy = root_only_legacy_note(&root);
         for must in [
             "mac-d",
@@ -3989,7 +4132,7 @@ mod tests {
             entry("rc_clipboard", "remote_desktop", "true", None),
             entry("ssh_enabled", "ssh", "true", Some("root_only")),
             entry("external_access_enabled", "access", "false", None),
-            entry("record_dir", "files", "/var/root/Movies", None),
+            entry("record_dir", "files", "/var/root/Movies", Some("root_only")),
         ];
         let merged = merge_two_halves(worker, root);
         let keys: Vec<&str> = merged.iter().map(|e| e.key.as_str()).collect();
@@ -4332,6 +4475,59 @@ mod tests {
         assert!(unknown.contains("no enrollment labelled"), "{unknown}");
         // A malformed entry is refused, never opened.
         assert!(remote_target(&cfg, Some("broken")).is_err());
+    }
+
+    /// FR-43 P3a — a one-row Mac's person file names no server, so "View screen"
+    /// takes its origin and tenant from the root daemon's rows, by the same rules
+    /// as the file's: the org follows the device, and a bad row is never opened.
+    #[test]
+    fn a_daemons_rows_give_the_same_target_as_a_file() {
+        let status: NodeStatus = serde_json::from_value(serde_json::json!({
+            "node_id": "d", "name": "mac", "version": "0.4.199", "mode": "service",
+            "connected": true,
+            "orgs": [
+                { "label": "primary", "server_url": "https://roomler.ai/",
+                  "tenant_id": "AAAAAAAAAAAAAAAAAAAAAAAA", "primary": true,
+                  "enabled": true, "connected": true },
+                { "label": "acme", "server_url": "https://acme.example",
+                  "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "primary": false,
+                  "enabled": true, "connected": true },
+                { "label": "no-tenant", "server_url": "https://acme.example",
+                  "primary": false, "enabled": true, "connected": true },
+                { "label": "bad-origin", "server_url": "file:///etc/passwd",
+                  "tenant_id": "bbbbbbbbbbbbbbbbbbbbbbbb", "primary": false,
+                  "enabled": true, "connected": true }
+            ]
+        }))
+        .unwrap();
+        let primary = (
+            "https://roomler.ai".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        );
+        assert_eq!(daemon_remote_target(&status, None).unwrap(), primary);
+        assert_eq!(daemon_remote_target(&status, Some("")).unwrap(), primary);
+        assert_eq!(
+            daemon_remote_target(&status, Some("primary")).unwrap(),
+            primary
+        );
+        assert_eq!(
+            daemon_remote_target(&status, Some("acme")).unwrap(),
+            (
+                "https://acme.example".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbb".to_string()
+            )
+        );
+        let unknown = daemon_remote_target(&status, Some("ghost")).unwrap_err();
+        assert!(unknown.contains("no enrollment labelled"), "{unknown}");
+        assert!(daemon_remote_target(&status, Some("no-tenant")).is_err());
+        assert!(daemon_remote_target(&status, Some("bad-origin")).is_err());
+
+        // A daemon with no rows (no answer from the root half) opens nothing.
+        let empty = NodeStatus {
+            orgs: Vec::new(),
+            ..status
+        };
+        assert!(daemon_remote_target(&empty, None).is_err());
     }
 
     /// FR-84 D5c — a rejected `cmd_devices` is `{code, message, status?}`,

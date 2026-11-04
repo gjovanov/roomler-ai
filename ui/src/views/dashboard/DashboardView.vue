@@ -37,7 +37,7 @@
           <v-card-text>
             <v-form ref="formRef" @submit.prevent="handleCreate">
               <v-text-field v-model="name" label="Workspace Name" :rules="[rules.required]" />
-              <v-text-field v-model="slug" label="Slug" hint="URL-friendly identifier" :rules="[rules.required, rules.slug]" />
+              <v-text-field v-model="slug" label="Short name" hint="Lowercase letters, digits and dashes, used in links" :rules="[rules.required, rules.slug]" />
               <v-btn type="submit" color="primary" class="mt-2">Create</v-btn>
             </v-form>
           </v-card-text>
@@ -82,7 +82,7 @@
         <v-card-text>
           <v-form ref="formRef" @submit.prevent="handleCreate">
             <v-text-field v-model="name" label="Name" :rules="[rules.required]" @update:model-value="autoSlug" />
-            <v-text-field v-model="slug" label="Slug" hint="URL-friendly identifier, globally unique" :rules="[rules.required, rules.slug]" @update:model-value="slugTouched = true" />
+            <v-text-field v-model="slug" label="Short name" hint="Lowercase letters, digits and dashes, used in links. Unique on this server." :rules="[rules.required, rules.slug]" @update:model-value="slugTouched = true" />
           </v-form>
         </v-card-text>
         <v-card-actions>
@@ -98,6 +98,7 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { ApiError } from '@/api/client'
 import { useAuthStore } from '@/stores/auth'
 import { useTenantStore } from '@/stores/tenant'
 import { useNewsletterPref } from '@/composables/useNewsletterPref'
@@ -170,10 +171,10 @@ async function handleCreate() {
     router.push(`/tenant/${tenant.id}`)
   } catch (e) {
     const msg = e instanceof Error ? e.message : 'Failed to create workspace'
-    // tenants.slug is globally unique — put the dup-key case in words.
+    // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showError(
-      msg.includes('duplicate') || msg.includes('E11000')
-        ? 'That slug is already taken — pick another'
+      e instanceof ApiError && e.status === 409
+        ? 'That short name is already taken — pick another'
         : msg,
     )
   }

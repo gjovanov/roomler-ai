@@ -105,7 +105,10 @@ fn present_or_null<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D:
 /// are the wizard's pages (measured by the SPA), the rest the install
 /// pipeline's (measured by the orchestrators). Not every run has every
 /// step: the MSI steps are the daemon roles', extract and integrate the
-/// tunnel role's, the companion and the anchor are conditional.
+/// tunnel role's, the companion and the anchor are conditional. On Linux
+/// and macOS (FR-129 B1) `msi` is the embedded `install.sh`'s privileged
+/// half — the package placed under the administrator prompt — and the
+/// resolve, download and verify happen inside it, unrecorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Step {
     Welcome,
@@ -218,15 +221,20 @@ pub enum ErrorCode {
     Download,
     /// The downloaded artifact's SHA-256 did not match.
     Sha256Mismatch,
+    /// The downloaded artifact is not signed by the publisher (#3246).
+    SignatureRefused,
     /// msiexec could not be started.
     MsiSpawn,
     /// Waiting for msiexec failed (never its exit code).
     MsiWait,
-    /// The operator declined the UAC prompt (exit 1602).
+    /// The operator declined the UAC prompt (exit 1602) — or, on Linux and
+    /// macOS, dismissed the `pkexec` / `osascript` administrator prompt of the
+    /// embedded `install.sh`'s privileged half (FR-129 B1).
     MsiUserCancel,
     /// Another Windows Installer operation was running (exit 1618).
     MsiAnotherInstall,
-    /// The MSI failed (exit 1603).
+    /// The MSI failed (exit 1603) — or the privileged `install.sh` half
+    /// exited non-zero (FR-129 B1).
     MsiFatal,
     /// msiexec exited with another code.
     MsiOther,
@@ -249,13 +257,14 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 20] = [
+    pub const ALL: [ErrorCode; 21] = [
         ErrorCode::AdvancedOptions,
         ErrorCode::UnsupportedPlatform,
         ErrorCode::Preflight,
         ErrorCode::Resolve,
         ErrorCode::Download,
         ErrorCode::Sha256Mismatch,
+        ErrorCode::SignatureRefused,
         ErrorCode::MsiSpawn,
         ErrorCode::MsiWait,
         ErrorCode::MsiUserCancel,
@@ -280,6 +289,7 @@ impl ErrorCode {
             ErrorCode::Resolve => "resolve",
             ErrorCode::Download => "download",
             ErrorCode::Sha256Mismatch => "sha256_mismatch",
+            ErrorCode::SignatureRefused => "signature_refused",
             ErrorCode::MsiSpawn => "msi_spawn",
             ErrorCode::MsiWait => "msi_wait",
             ErrorCode::MsiUserCancel => "msi_user_cancel",

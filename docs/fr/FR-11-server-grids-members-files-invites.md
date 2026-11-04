@@ -30,8 +30,8 @@ distinguish "default" from explicit `sort=name`. Change: keep the param as
 (the sidebar's exact order); `Some(k)` → the existing whitelist (`:114-129`)
 unchanged. `cmp_rows` (`:377-401`) gains the compound arm; the id tiebreak
 (`:219-223`) stays. UI needs **zero change**: an untouched grid emits
-`sortBy: []` → no `sort` param (`AgentsSection.vue:1581-1591`,
-`stores/devices.ts:77-78`). `device_list_tests.rs:280`'s comment updates
+`sortBy: []` → no `sort` param (`AgentsSection.vue:1583-1593`,
+`stores/devices.ts:82-83`). `device_list_tests.rs:280`'s comment updates
 (order itself survives — the three fixture agents share one presence bucket).
 
 ### 2. Mesh names — server-side, deliberately
@@ -49,14 +49,14 @@ decision).
 - **List** (`user.rs:43-94`): becomes the devices-style in-memory compose
   (members per tenant are tens): fetch the tenant's members + batch the user
   rows (display_name/username/**email** — widen the projection beside
-  `dao/user.rs:362-395`), filter `q` over name+username+email, sort whitelist
+  `dao/user.rs:428-461`), filter `q` over name+username+email, sort whitelist
   `name | email | joined_at` (default joined_at asc, as today), slice,
   envelope. Flat `MemberListQuery` — never `#[serde(flatten)]`
   (`device.rs:30-34` postmortem). `MemberResponse` (`user.rs:11-21`) gains
   `email`.
 - **Add by email, no invite**: `AddMemberRequest` (`invite.rs:73-78`) gains
   `email: Option<String>` (exactly one of user_id/email); resolved via
-  `users.find_by_email` (`dao/user.rs:87-92` — the address is a *proven
+  `users.find_by_email` (`dao/user.rs:105-110` — the address is a *proven
   reservation*, so adding by it is adding a verified account). Unknown
   address → 404 with "no account with that address — use Invites". Gate
   unchanged: `INVITE_MEMBERS` + `check_grant_roles` (`invite.rs:441`).
@@ -87,7 +87,7 @@ over `code`/`target_email`) + optional `status` exact filter to
 
 ### P2 UI (all three pages)
 The devices-grid kit verbatim: `v-data-table-server` + `@update:options` as
-the single fetch trigger (`AgentsSection.vue:1578-1591`), 300ms debounced
+the single fetch trigger (`AgentsSection.vue:1580-1593`), 300ms debounced
 search with page-1 reset (`:1468-1477`), h-scroll CSS (nowrap +
 `width:max-content` wrapper), `useGridColumns` +
 `GridColumnPickerDialog` (`composables/useGridColumns.ts:34-163`,

@@ -41,13 +41,125 @@ use roomler_ai_remote_control::models::DesiredConfig;
 pub struct Applied {
     /// Keys that changed and are ALREADY in force.
     pub live: Vec<&'static str>,
-    /// Keys that changed on disk but need a daemon restart to take effect.
+    /// Keys on disk that need a daemon restart to take effect: the ones this
+    /// process does not run, or with no process to speak for
+    /// ([`RemoteConfigServices::running_on`]) the ones this frame changed.
     pub needs_restart: Vec<&'static str>,
+    /// This frame changed the file. The lists cannot say so on their own: a key
+    /// written back to the value this process runs leaves nothing waiting, and
+    /// that is not the `noop` of a device that already matched.
+    pub wrote: bool,
 }
 
 impl Applied {
     pub fn is_noop(&self) -> bool {
-        self.live.is_empty() && self.needs_restart.is_empty()
+        !self.wrote && self.live.is_empty() && self.needs_restart.is_empty()
+    }
+}
+
+/// FR-132 P1c — the keys the daemon reads once per process, as THIS process
+/// read them. It is what separates "written" from "in force": a key the file
+/// holds and this process does not is waiting on a restart, however many
+/// reconnects have since found the file already matching.
+#[derive(Debug, PartialEq, Eq)]
+struct RunningKeys {
+    ssh_enabled: bool,
+    ssh_authorized_keys: Vec<String>,
+    ssh_account_mode: Option<String>,
+    ssh_port: Option<u16>,
+    encoder_cells_deny: Option<String>,
+    fps_deny: Option<String>,
+    color_description: Option<bool>,
+    zero_copy_deny: Option<String>,
+}
+
+impl RunningKeys {
+    fn of(cfg: &crate::config::AgentConfig) -> Self {
+        Self {
+            ssh_enabled: cfg.ssh_enabled,
+            ssh_authorized_keys: cfg.ssh_authorized_keys.clone(),
+            ssh_account_mode: cfg.ssh_account_mode.clone(),
+            ssh_port: cfg.ssh_port,
+            encoder_cells_deny: cfg.encoder_cells_deny.clone(),
+            fps_deny: cfg.fps_deny.clone(),
+            color_description: cfg.color_description,
+            zero_copy_deny: cfg.zero_copy_deny.clone(),
+        }
+    }
+
+    /// The keys `desired` manages whose value in `cfg`, the file, this process
+    /// is not running. A key nobody pushed is left out: a local edit waiting
+    /// on a restart is the owner's, and this report is about the push.
+    fn waiting_on_restart(
+        &self,
+        desired: &DesiredConfig,
+        cfg: &crate::config::AgentConfig,
+    ) -> Vec<&'static str> {
+        // Destructured EXHAUSTIVELY, as `DesiredConfig::same_ssh_as` is: a new
+        // pushable key must say here whether it is read once before this
+        // compiles. One that fell outside the list would read `applied` while
+        // the daemon still ran the old value.
+        let DesiredConfig {
+            // Live: `apply` puts it in force itself.
+            exec_enabled: _,
+            ssh_enabled,
+            ssh_authorized_keys,
+            ssh_account_mode,
+            ssh_port,
+            encoder_cells_deny,
+            fps_deny,
+            color_description,
+            zero_copy_deny,
+            revision: _,
+            updated_by: _,
+            updated_at: _,
+        } = desired;
+        [
+            (
+                "ssh_enabled",
+                ssh_enabled.is_some(),
+                cfg.ssh_enabled != self.ssh_enabled,
+            ),
+            (
+                "ssh_authorized_keys",
+                ssh_authorized_keys.is_some(),
+                cfg.ssh_authorized_keys != self.ssh_authorized_keys,
+            ),
+            (
+                "ssh_account_mode",
+                ssh_account_mode.is_some(),
+                cfg.ssh_account_mode != self.ssh_account_mode,
+            ),
+            (
+                "ssh_port",
+                ssh_port.is_some(),
+                cfg.ssh_port != self.ssh_port,
+            ),
+            (
+                "encoder_cells_deny",
+                encoder_cells_deny.is_some(),
+                cfg.encoder_cells_deny != self.encoder_cells_deny,
+            ),
+            (
+                "fps_deny",
+                fps_deny.is_some(),
+                cfg.fps_deny != self.fps_deny,
+            ),
+            (
+                "color_description",
+                color_description.is_some(),
+                cfg.color_description != self.color_description,
+            ),
+            (
+                "zero_copy_deny",
+                zero_copy_deny.is_some(),
+                cfg.zero_copy_deny != self.zero_copy_deny,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, managed, differs)| *managed && *differs)
+        .map(|(key, _, _)| key)
+        .collect()
     }
 }
 
@@ -55,6 +167,8 @@ impl Applied {
 pub struct RemoteConfigServices {
     path: PathBuf,
     lock: crate::config::WriteLock,
+    /// FR-132 P1c — what this process started on ([`Self::running_on`]).
+    running: Option<Arc<RunningKeys>>,
     /// The LIVE `exec_enabled`, read by the `rc:rpc.exec` gate. Seeded from
     /// the startup config and the only copy that decides anything.
     exec_enabled: Arc<AtomicBool>,
@@ -117,6 +231,7 @@ impl RemoteConfigServices {
         Self {
             path,
             lock,
+            running: None,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
             #[cfg(feature = "external-access")]
@@ -126,6 +241,16 @@ impl RemoteConfigServices {
                 crate::peer_auth::PeerAuthPolicy::Audit,
             ))),
         }
+    }
+
+    /// FR-132 P1c — record what this process started on, from the config it
+    /// loaded. Called once, where the daemon starts, and deliberately not by
+    /// [`Self::adopt_local`]: a local save writes a value this process still
+    /// does not run. Without it there is no process to speak for, and
+    /// `needs_restart` says only that the file changed.
+    pub fn running_on(mut self, cfg: &crate::config::AgentConfig) -> Self {
+        self.running = Some(Arc::new(RunningKeys::of(cfg)));
+        self
     }
 
     /// FR-100 P1c — the device's `peer_auth` policy at this moment.
@@ -255,11 +380,15 @@ impl RemoteConfigServices {
     /// live keys into force.
     ///
     /// Idempotent by construction: a desired state that already matches writes
-    /// NOTHING and returns an empty [`Applied`]. That matters more than it
-    /// looks — delivery is reconcile-on-connect, so this runs on every single
-    /// reconnect, and a version that wrote unconditionally would rewrite
-    /// config.toml (and later, restart the daemon) every time a flaky link
-    /// bounced.
+    /// NOTHING. That matters more than it looks — delivery is
+    /// reconcile-on-connect, so this runs on every single reconnect, and a
+    /// version that wrote unconditionally would rewrite config.toml (and later,
+    /// restart the daemon) every time a flaky link bounced.
+    ///
+    /// A matching FILE is not yet a matching daemon, though: until this process
+    /// runs a key, the key stays in `needs_restart`, so a reconnect cannot turn
+    /// a device waiting on a restart into one that reports itself converged
+    /// (FR-132 P1c). The returned [`Applied`] is empty only when both match.
     ///
     /// Reloads from DISK rather than mutating the startup snapshot: another
     /// writer (the CLI, the desktop companion) may have changed the file since
@@ -269,6 +398,7 @@ impl RemoteConfigServices {
         let path = self.path.clone();
         let desired = desired.clone();
         let exec_flag = self.exec_enabled.clone();
+        let running = self.running.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut cfg =
@@ -330,16 +460,70 @@ impl RemoteConfigServices {
                     applied.needs_restart.push("fps_deny");
                 }
             }
-
-            if applied.is_noop() {
-                return Ok(applied);
+            // FR-130 P1b — the colour-description switch, a tribool pushed as
+            // a word: `off` / `on` set it, a blank push clears it back to the
+            // built-in default (on). It reaches the encoders through the
+            // config fallbacks, registered once per process, hence
+            // `needs_restart`. A word this build cannot read leaves the key
+            // as it is and never fails the keys beside it; the server
+            // refuses such a word, so only another server could send one.
+            if let Some(want) = desired.color_description.as_deref() {
+                match roomler_ai_remote_control::models::parse_pushed_tribool(want) {
+                    Ok(next) => {
+                        if cfg.color_description != next {
+                            cfg.color_description = next;
+                            applied.needs_restart.push("color_description");
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "rc:agent.config — color_description left as it is"
+                    ),
+                }
             }
-            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            // FR-132 P1 — the GPU-input denylist, FR-118's kill switch, the
+            // shape of the two above: a blank push clears it (deny nothing),
+            // `none` denies nothing, and an entry the gate cannot read denies
+            // nothing either (`cells::parse_denylist` keeps it, `is_denied`
+            // never matches it). The probe reads it once per process and the
+            // encoders through the config fallbacks, registered once per
+            // process, hence `needs_restart`.
+            if let Some(want) = desired.zero_copy_deny.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.zero_copy_deny != next {
+                    cfg.zero_copy_deny = next;
+                    applied.needs_restart.push("zero_copy_deny");
+                }
+            }
+
+            applied.wrote = !applied.live.is_empty() || !applied.needs_restart.is_empty();
+            if applied.wrote {
+                crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            }
             // AFTER the durable write, never before: a live flag that is on
             // while the file says off would survive a crash as a device
-            // running exec that its own config denies.
-            if applied.live.contains(&"exec_enabled") {
-                exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
+            // running exec that its own config denies. And whenever the
+            // document manages the key, not only on a change: a file edited by
+            // hand already matches, and the gate would stay on what this
+            // process started with while the report read `noop`. A gate that
+            // moves is always in `live`, so the report and the log say it did.
+            if let Some(want) = desired.exec_enabled
+                && exec_flag.swap(want, Ordering::Relaxed) != want
+                && !applied.live.contains(&"exec_enabled")
+            {
+                applied.live.push("exec_enabled");
+            }
+            // FR-132 P1c — the lists above say what changed in the FILE, and
+            // the report means what this process does not run yet. On a later
+            // frame nothing changes, and the report used to go out as `noop`,
+            // which reads `applied` while the daemon still runs the old value;
+            // a pod roll did that to every such device at once. A key written
+            // back to the value this process runs is the other way round: it
+            // changed, and nothing is waiting on it.
+            if let Some(running) = running.as_deref() {
+                applied.needs_restart = running.waiting_on_restart(&desired, &cfg);
             }
             Ok(applied)
         })
@@ -521,6 +705,53 @@ mod tests {
         )
     }
 
+    /// FR-52 — a compromised server can put anything it likes in a frame, so
+    /// what stops an `external_*` key is THIS side: the frame's type cannot hold
+    /// one. The raw frame goes through the real decode and the real `apply`. The
+    /// key beside them lands, so a frame that was dropped whole cannot pass, and
+    /// gate 3 and every other `external_*` value stay as the owner left them.
+    #[tokio::test]
+    async fn a_pushed_external_key_never_reaches_the_device() {
+        let dir = std::env::temp_dir().join(format!("fr52-push-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let frame = r#"{"t":"rc:agent.config","revision":9,"desired":{
+            "fps_deny":"hevc_qsv:120",
+            "external_access_enabled":true,
+            "external_access_setup":"fr52-pushed-marker",
+            "external_access_verifier":"fr52-pushed-marker",
+            "external_consent_mode":"auto",
+            "external_max_permissions":"VIEW | INPUT | FILES",
+            "external_added_next_year":true
+        }}"#;
+        let roomler_ai_remote_control::signaling::ServerMsg::ConfigPush { desired, .. } =
+            serde_json::from_str(frame).expect("an unknown key must not fail the frame")
+        else {
+            panic!("the frame decoded as something else");
+        };
+        let applied = svc.apply(&desired).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["fps_deny"]);
+        assert!(applied.live.is_empty());
+
+        let cfg = crate::config::load(&path).unwrap();
+        assert_eq!(cfg.fps_deny.as_deref(), Some("hevc_qsv:120"));
+        assert!(!cfg.external_access_enabled, "gate 3 is the owner's");
+        assert_eq!(cfg.external_access_setup, None);
+        assert_eq!(cfg.external_access_verifier, None);
+        assert_eq!(cfg.external_consent_mode, None);
+        assert_eq!(cfg.external_max_permissions, None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("fr52-pushed-marker"), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// FR-119 P2b — a pushed frame-rate denylist is written and reported as
     /// needing a restart; the same push again changes nothing; a blank push
     /// clears it.
@@ -547,6 +778,384 @@ mod tests {
         assert!(svc.apply(&push("hevc_qsv:120")).await.unwrap().is_noop());
         svc.apply(&push("")).await.unwrap();
         assert_eq!(crate::config::load(&path).unwrap().fps_deny, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-130 P1b — a pushed `color_description` is written and reported as
+    /// needing a restart, and the same push again changes nothing. Leaving
+    /// the key unmanaged keeps what the device has (it is not a revert); a
+    /// blank push is the revert, back to the built-in default; a word this
+    /// build cannot read leaves the key as it is and does not stop a key
+    /// beside it.
+    #[tokio::test]
+    async fn a_pushed_colour_description_is_written_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr130-color-desc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            color_description: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().color_description;
+        assert_eq!(on_disk(), None, "the fixture leaves the key unset");
+
+        let applied = svc.apply(&push("off")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert!(applied.live.is_empty(), "read once per process: never live");
+        assert_eq!(on_disk(), Some(false));
+        assert!(svc.apply(&push("off")).await.unwrap().is_noop());
+
+        // Not managed: the device keeps its `off`.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(on_disk(), Some(false), "unmanaged is not a revert");
+
+        // A word it cannot read: the key stays, and the key beside it lands.
+        let mixed = DesiredConfig {
+            color_description: Some("maybe".into()),
+            fps_deny: Some("hevc_qsv:120".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            svc.apply(&mixed).await.unwrap().needs_restart,
+            vec!["fps_deny"]
+        );
+        assert_eq!(on_disk(), Some(false), "never guessed");
+
+        let applied = svc.apply(&push("on")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), Some(true));
+
+        // The revert: cleared, so the built-in default (on) decides again.
+        let applied = svc.apply(&push("")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["color_description"]);
+        assert_eq!(on_disk(), None);
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-132 P1 — a pushed GPU-input denylist is written and reported as
+    /// needing a restart, the same push again changes nothing, an unmanaged
+    /// key is left alone, and a blank push clears it. And it reaches the gate:
+    /// the restarted daemon's config fallbacks carry it as
+    /// `ROOMLERD_ZERO_COPY_DENY`, which parses to the exact `name:gpu` entry
+    /// `gpu_hint::is_denied` matches — the step AC2's field read takes after
+    /// the restart (`input_reason=denied`).
+    #[tokio::test]
+    async fn a_pushed_gpu_input_denylist_is_written_reaches_the_gate_and_a_blank_clears_it() {
+        let dir = std::env::temp_dir().join(format!("fr132-zc-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        crate::config::save(&path, &crate::config::test_fixture()).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        );
+        let push = |v: &str| DesiredConfig {
+            zero_copy_deny: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().zero_copy_deny;
+        assert_eq!(on_disk(), None, "the fixture denies nothing");
+
+        let applied = svc
+            .apply(&push(" hevc_qsv:gpu, av1_nvenc:gpu "))
+            .await
+            .unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert!(applied.live.is_empty(), "read once per process: never live");
+        assert_eq!(on_disk().as_deref(), Some("hevc_qsv:gpu, av1_nvenc:gpu"));
+        assert!(
+            svc.apply(&push("hevc_qsv:gpu, av1_nvenc:gpu"))
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        // What the next process reads: the fallback, then the gate's parse.
+        let restarted = crate::config::load(&path).unwrap();
+        let fallbacks = crate::config::env_fallbacks(&restarted);
+        let raw = fallbacks
+            .get("ZERO_COPY_DENY")
+            .expect("the pushed denylist rides the config fallbacks");
+        let deny = crate::encode::cells::parse_denylist(raw);
+        assert!(deny.iter().any(|d| d == "hevc_qsv:gpu"), "{deny:?}");
+        assert!(deny.iter().any(|d| d == "av1_nvenc:gpu"), "{deny:?}");
+        #[cfg(feature = "ffmpeg-encoder")]
+        {
+            use crate::encode::ffmpeg::gpu_hint::is_denied;
+            assert!(is_denied(&deny, "hevc_qsv") && is_denied(&deny, "av1_nvenc"));
+            assert!(!is_denied(&deny, "h264_qsv"), "only the named cells");
+        }
+
+        // Not managed: the device keeps its list.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert_eq!(on_disk().as_deref(), Some("hevc_qsv:gpu, av1_nvenc:gpu"));
+
+        // `none` is stored as written (the gate reads it as deny nothing)...
+        let applied = svc.apply(&push("none")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert_eq!(on_disk().as_deref(), Some("none"));
+        assert!(crate::encode::cells::parse_denylist("none").is_empty());
+
+        // ...and a blank clears the key.
+        let applied = svc.apply(&push("  ")).await.unwrap();
+        assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
+        assert_eq!(on_disk(), None);
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-132 P1c — `needs_restart` says the daemon is not on the value, and a
+    /// reconnect does not change that. The document is re-delivered on every
+    /// connect, the file already matches, and this used to read as nothing to
+    /// do: the row went from `needs_restart` to `applied` while the daemon
+    /// still ran the old value. For a kill switch that is the wrong way to be
+    /// wrong, and a pod roll did it to every such device at once.
+    #[tokio::test]
+    async fn a_pushed_key_waits_for_a_restart_across_reconnects() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let process = |cfg: &crate::config::AgentConfig| {
+            RemoteConfigServices::new(
+                path.clone(),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                true,
+            )
+            .running_on(cfg)
+        };
+        let svc = process(&started);
+        let deny = DesiredConfig {
+            zero_copy_deny: Some("hevc_qsv:gpu".to_string()),
+            ..Default::default()
+        };
+
+        let delivered = svc.apply(&deny).await.unwrap();
+        assert_eq!(delivered.needs_restart, vec!["zero_copy_deny"]);
+        let written = std::fs::read(&path).unwrap();
+
+        // A reconnect: the same document to the same process.
+        let reconnect = svc.apply(&deny).await.unwrap();
+        assert_eq!(
+            reconnect.needs_restart,
+            vec!["zero_copy_deny"],
+            "the file matches, the daemon does not"
+        );
+        assert!(reconnect.live.is_empty());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            written,
+            "and a reconnect still writes nothing"
+        );
+
+        // A key the document stopped managing is not this report's to raise.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        // The restart: a process that loaded the file.
+        let restarted = process(&crate::config::load(&path).unwrap());
+        assert!(
+            restarted.apply(&deny).await.unwrap().is_noop(),
+            "in force now, so nothing is waiting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key `apply` calls `needs_restart` is one this process tracks, in
+    /// the order `apply` lists them, so the first report and a reconnect's
+    /// read the same. `exec_enabled` is live: once in force it is not waiting.
+    #[tokio::test]
+    async fn every_read_once_key_waits_and_a_live_key_does_not() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            started.exec_enabled,
+            true,
+        )
+        .running_on(&started);
+        let desired = DesiredConfig {
+            exec_enabled: Some(!started.exec_enabled),
+            ssh_enabled: Some(!started.ssh_enabled),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA test".to_string()]),
+            ssh_account_mode: Some("console_user".to_string()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("hevc_qsv:yuv444".to_string()),
+            fps_deny: Some("hevc_qsv:120".to_string()),
+            color_description: Some("off".to_string()),
+            zero_copy_deny: Some("hevc_qsv:gpu".to_string()),
+            ..Default::default()
+        };
+        let every_key = vec![
+            "ssh_enabled",
+            "ssh_authorized_keys",
+            "ssh_account_mode",
+            "ssh_port",
+            "encoder_cells_deny",
+            "fps_deny",
+            "color_description",
+            "zero_copy_deny",
+        ];
+
+        let first = svc.apply(&desired).await.unwrap();
+        assert_eq!(first.needs_restart, every_key);
+        assert_eq!(first.live, vec!["exec_enabled"]);
+
+        let reconnect = svc.apply(&desired).await.unwrap();
+        assert_eq!(reconnect.needs_restart, every_key);
+        assert!(reconnect.live.is_empty(), "exec is in force, not waiting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deny lifted before the restart that would have applied it: the file
+    /// moves back to what this process runs, so nothing is waiting and a restart
+    /// would change nothing. The file did change, so it is no `noop` either, and
+    /// a key still off the running value keeps its place in the list.
+    #[tokio::test]
+    async fn a_save_back_to_the_running_value_leaves_nothing_waiting() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut started = crate::config::test_fixture();
+        started.zero_copy_deny = Some("none".to_string());
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        )
+        .running_on(&started);
+        let deny = |value: &str| DesiredConfig {
+            zero_copy_deny: Some(value.to_string()),
+            ..Default::default()
+        };
+
+        let denied = svc.apply(&deny("hevc_qsv:gpu")).await.unwrap();
+        assert_eq!(denied.needs_restart, vec!["zero_copy_deny"]);
+
+        let lifted = svc.apply(&deny("none")).await.unwrap();
+        assert_eq!(
+            lifted,
+            Applied {
+                wrote: true,
+                ..Applied::default()
+            },
+            "written, and nothing waits on it"
+        );
+        assert!(!lifted.is_noop(), "the file changed");
+        assert_eq!(
+            crate::config::load(&path)
+                .unwrap()
+                .zero_copy_deny
+                .as_deref(),
+            Some("none")
+        );
+
+        // A reconnect after that: this time nothing changes at all.
+        assert!(svc.apply(&deny("none")).await.unwrap().is_noop());
+
+        // One key back on the running value, one still off it.
+        let mixed = svc
+            .apply(&DesiredConfig {
+                zero_copy_deny: Some("none".to_string()),
+                fps_deny: Some("hevc_qsv:120".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(mixed.needs_restart, vec!["fps_deny"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live gate follows the document even when the file needs no write. A
+    /// hand edit changed the file and this process still ran the old value, so
+    /// a push saying the same found the file matching. Before, the report read
+    /// `noop`, the row read `applied`, and the gate stayed where it was. A gate
+    /// that moves is in `live` either way, because this one grants root.
+    #[tokio::test]
+    async fn a_push_moves_the_exec_gate_when_the_file_already_matches_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut started = crate::config::test_fixture();
+        started.exec_enabled = true;
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            true,
+            true,
+        )
+        .running_on(&started);
+
+        let hand_edit = |value: bool| {
+            let mut edited = started.clone();
+            edited.exec_enabled = value;
+            crate::config::save(&path, &edited).unwrap();
+        };
+        let exec = |value: bool| DesiredConfig {
+            exec_enabled: Some(value),
+            ..Default::default()
+        };
+
+        // Closing.
+        hand_edit(false);
+        assert!(svc.exec_enabled(), "a hand edit is not in force yet");
+        let closed = svc.apply(&exec(false)).await.unwrap();
+        assert_eq!(closed.live, vec!["exec_enabled"], "the gate moved");
+        assert!(!closed.wrote, "the file already said so");
+        assert!(!svc.exec_enabled());
+        assert!(svc.apply(&exec(false)).await.unwrap().is_noop());
+
+        // Opening, which is the direction a reader of the log cares about.
+        hand_edit(true);
+        assert!(!svc.exec_enabled());
+        let opened = svc.apply(&exec(true)).await.unwrap();
+        assert_eq!(opened.live, vec!["exec_enabled"], "the gate moved");
+        assert!(!opened.wrote);
+        assert!(svc.exec_enabled());
+        assert!(svc.apply(&exec(true)).await.unwrap().is_noop());
+
+        // A document that does not manage the key leaves the gate alone.
+        hand_edit(false);
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert!(svc.exec_enabled(), "not this document's to move");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -691,6 +1300,7 @@ mod tests {
         let applied = Applied {
             live: vec!["exec_enabled"],
             needs_restart: vec!["ssh_enabled"],
+            wrote: true,
         };
         assert!(!applied.is_noop());
         assert!(!applied.live.contains(&"ssh_enabled"));

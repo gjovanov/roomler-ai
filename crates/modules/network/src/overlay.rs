@@ -35,11 +35,14 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, oid::ObjectId};
-use roomler_ai_remote_control::models::{OverlayAclMode, OverlayPolicy};
+use roomler_ai_remote_control::models::{
+    KEY_ROTATION_TRIGGER_KEY_RETIRED, OverlayAclMode, OverlayIdentity, OverlayPolicy, RetiredKey,
+    RetiredKeyMode, RetiredKeyReason, order_in_flight, order_is_satisfied,
+};
 use roomler_ai_remote_control::{
     models::{AgentStatus, NodeRef, OverlayNode},
     signaling::{
-        ClientMsg, IceServer, NetmapPeer, OverlayJoinRefusal, OverlayNetworkInfo,
+        CapVectorWire, ClientMsg, IceServer, NetmapPeer, OverlayJoinRefusal, OverlayNetworkInfo,
         RelayStrategyWire, ServerMsg,
     },
     turn_creds,
@@ -293,12 +296,38 @@ async fn handle_overlay_join(
             }
         }
     };
-    let Some((tenant_id, machine_id, display_name)) =
-        resolve_tenant_and_machine(state, ident).await
+    let Some(NodeOrigin {
+        tenant_id,
+        machine_id,
+        display_name,
+        removed,
+    }) = resolve_tenant_and_machine(state, ident).await
     else {
         warn!(?ident, "overlay.join from an unknown node; ignoring");
         return;
     };
+    // #1829, #1821 — a removed device or tunnel client takes no lease. Its socket
+    // can outlive its row by the kick's trip or the 60 s revocation poll, and a
+    // node leased now has no owner to release it: the routes that would are 404s
+    // on the tombstone, which leaves only an admin evicting it by hand. Nothing on
+    // the wire, because the goodbye that says why is already on its way.
+    if removed {
+        warn!(?ident, "overlay.join from a removed node; ignoring");
+        return;
+    }
+    // #3042 — and an archived org's mesh takes no new member. Archiving tombstones
+    // its devices and quarantines its block, so this is for a live row that slipped
+    // past that sweep. A failed read goes on: the arms below answer a blip.
+    if state
+        .tenants
+        .base
+        .find_by_id(tenant_id)
+        .await
+        .is_ok_and(|t| t.is_archived)
+    {
+        warn!(%tenant_id, ?ident, "overlay.join into an archived org; ignoring");
+        return;
+    }
     // Phase 0 — the DNS-safe base label from the node's display name.
     let base_name = dns_label(&display_name, &machine_id);
     // Phase 1 — drop malformed CIDRs so a bad advertisement can't poison state.
@@ -346,6 +375,50 @@ async fn handle_overlay_join(
         }
     }
 
+    // FR-40 P2 — a RETIRED key: one some node of this network moved away from
+    // (a `.prev` rollback, a restored backup, or a holder of both the old key
+    // and the agent token). Read only when the org switched the check on, so
+    // `off` is the pre-P2 join byte for byte.
+    if network.retired_key_mode != RetiredKeyMode::Off {
+        let enforce = network.retired_key_mode == RetiredKeyMode::Enforce;
+        match state
+            .overlay_nodes
+            .retired_key_in_network(network_id, &wg_public_key)
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(retired)) if enforce => {
+                refuse(OverlayJoinRefusal::KeyRetired, retired_key_detail(&retired)).await;
+                // A device that can rotate is ordered to, instead of being
+                // left on the control plane and off the mesh.
+                if let NodeIdentity::Agent(agent_id) = ident {
+                    order_rotation_for_retired_key(state, tenant_id, agent_id, &wg_public_key)
+                        .await;
+                }
+                return;
+            }
+            Ok(Some(retired)) => {
+                warn!(
+                    %tenant_id, %machine_id, detail = %retired_key_detail(&retired),
+                    "overlay.join: would refuse — key_retired (retired_key_mode=warn; admitted)"
+                );
+            }
+            // Fail CLOSED under `enforce`, like the uniqueness check above;
+            // `warn` never refuses.
+            Err(e) if enforce => {
+                refuse(
+                    OverlayJoinRefusal::StoreUnavailable,
+                    format!("the retired-key check failed: {e}"),
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                warn!(%tenant_id, %e, "overlay.join: retired-key check failed (warn; admitted)");
+            }
+        }
+    }
+
     let self_node = match state
         .overlay_nodes
         .find_live_by_tenant_and_machine(tenant_id, &machine_id)
@@ -360,6 +433,22 @@ async fn handle_overlay_join(
             } else {
                 existing.name.clone()
             };
+            // FR-40 P2 — the key this join replaces enters the node's ledger
+            // in the same write that replaces it. This accepted join IS the
+            // verified identity change, the only moment a key retires (never
+            // a device's report, which is a claim). Recorded in every mode,
+            // so the ledger is full before anything enforces it.
+            let retire =
+                if !existing.wg_public_key.is_empty() && existing.wg_public_key != wg_public_key {
+                    Some(RetiredKey {
+                        public_key: existing.wg_public_key.clone(),
+                        key_epoch: existing.key_epoch,
+                        retired_at: DateTime::now(),
+                        reason: retire_reason(state, ident, tenant_id, &wg_public_key).await,
+                    })
+                } else {
+                    None
+                };
             match state
                 .overlay_nodes
                 .rehydrate(
@@ -379,6 +468,7 @@ async fn handle_overlay_join(
                     supports_org_relay,
                     &advertised_routes,
                     route_offer_withheld.as_deref(),
+                    retire.as_ref(),
                 )
                 .await
             {
@@ -693,6 +783,140 @@ async fn handle_overlay_join(
     repush_forced_pairs_on_join(state, &self_node).await;
 }
 
+/// FR-40 P2 — the words a `key_retired` refusal carries: to the device's log
+/// (0.4.41+ prints them beside the reason, which a build before P2 decodes as
+/// `unknown`) and to the server's. No key in them: the device knows its own,
+/// and the server's log has no use for one.
+fn retired_key_detail(retired: &RetiredKey) -> String {
+    let at = retired
+        .retired_at
+        .try_to_rfc3339_string()
+        .unwrap_or_else(|_| "an earlier join".to_string());
+    let why = match retired.reason {
+        RetiredKeyReason::Rotate => "rotated away from",
+        RetiredKeyReason::Rejoin => "replaced at a later join",
+    };
+    format!(
+        "this overlay key was retired on this network at {at} ({why}, epoch {}); \
+         a device holding it must rotate to rejoin — the server orders one that \
+         supports key rotation to",
+        retired.key_epoch
+    )
+}
+
+/// FR-40 P2 — why the key a join replaces leaves the node, for the ledger:
+/// `rotate` when THIS join is the one that satisfies the device's standing
+/// rotation order (an operator's, or the server's own), `rejoin` for every
+/// other change. Forensic only; a failed read says `rejoin`.
+async fn retire_reason(
+    state: &NetworkState,
+    ident: NodeIdentity,
+    tenant_id: ObjectId,
+    presented: &str,
+) -> RetiredKeyReason {
+    let NodeIdentity::Agent(agent_id) = ident else {
+        return RetiredKeyReason::Rejoin;
+    };
+    let Ok(agent) = state
+        .fleet
+        .agents
+        .find_live_in_tenant(tenant_id, agent_id)
+        .await
+    else {
+        return RetiredKeyReason::Rejoin;
+    };
+    let Some(order) = agent.key_rotation.as_ref() else {
+        return RetiredKeyReason::Rejoin;
+    };
+    let now = OverlayIdentity {
+        public_key: presented.to_string(),
+        key_epoch: 0,
+        joined_at: DateTime::now(),
+    };
+    if !order_is_satisfied(order, agent.overlay_identity.as_ref())
+        && order_is_satisfied(order, Some(&now))
+    {
+        RetiredKeyReason::Rotate
+    } else {
+        RetiredKeyReason::Rejoin
+    }
+}
+
+/// FR-40 P2 — the self-heal: a device refused `key_retired` is ordered to
+/// rotate instead of being left on the control plane and off the mesh.
+///
+/// Through the route's own order path (`place_order`): the per-device ceiling
+/// it shares with operators' orders, the capability gate (a device without
+/// `key-rotate` is audited `agent_unsupported` and ordered nothing), the
+/// desired state on the row, and ONE audit row, placed by the server
+/// (`trigger: key_retired`, the zero user id). The order snapshots the key the
+/// device PRESENTED, so the join under any other key satisfies it.
+///
+/// ⚠️ The loop guard is the order already on the row: one being executed (the
+/// P1b window) holds off a second, so a device that keeps presenting the key
+/// while it rotates gets one order, not a storm. Past that, the 60 s ceiling
+/// bounds it — and a device that refused (its kill switch is off, say) is
+/// ordered again only at a later join, which only a reconnect sends.
+async fn order_rotation_for_retired_key(
+    state: &NetworkState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    presented: &str,
+) {
+    let agent = match state
+        .fleet
+        .agents
+        .find_live_in_tenant(tenant_id, agent_id)
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(%tenant_id, %agent_id, %e, "overlay.join: key_retired — agent row unreadable; no rotation ordered");
+            return;
+        }
+    };
+    if let Some(order) = agent.key_rotation.as_ref()
+        && order_in_flight(
+            order,
+            agent.key_rotation_report.as_ref(),
+            agent.overlay_identity.as_ref(),
+            DateTime::now(),
+        )
+    {
+        tracing::info!(
+            %tenant_id, %agent_id, request_id = %order.request_id,
+            "overlay.join: key_retired — a rotation order is already in flight; not ordering another"
+        );
+        return;
+    }
+    match crate::routes::overlay_key::place_order(
+        state,
+        tenant_id,
+        agent_id,
+        &agent,
+        crate::routes::overlay_key::OrderedBy::Server(KEY_ROTATION_TRIGGER_KEY_RETIRED),
+        Some(presented.to_string()),
+    )
+    .await
+    {
+        Ok(placed) => match placed.outcome {
+            Ok(dispatch) => tracing::info!(
+                %tenant_id, %agent_id, request_id = %placed.request_id,
+                dispatch = dispatch.wire(),
+                "overlay.join: key_retired — the device was ordered to rotate"
+            ),
+            Err(reason) => tracing::info!(
+                %tenant_id, %agent_id, request_id = %placed.request_id,
+                reason = reason.wire(),
+                "overlay.join: key_retired — no rotation ordered; the device stays off the mesh"
+            ),
+        },
+        Err(e) => {
+            warn!(%tenant_id, %agent_id, %e, "overlay.join: key_retired — the rotation order could not be written");
+        }
+    }
+}
+
 /// Trickle: update the node's candidates → fan an upsert delta so peers
 /// learn the new endpoints.
 async fn handle_overlay_endpoints(
@@ -806,7 +1030,7 @@ async fn handle_overlay_netcheck(
 /// Phase B — the freshness gate: a vector older than 3× the measurement
 /// cadence (20 min) is surfaced as ABSENT, so a stalled prober can never
 /// stay fleet-authoritative (consumers then fall back to presence rules).
-fn fresh_caps(node: &OverlayNode) -> Option<roomler_ai_remote_control::signaling::CapVectorWire> {
+pub(crate) fn fresh_caps(node: &OverlayNode) -> Option<CapVectorWire> {
     const CAPS_FRESH_MS: i64 = 60 * 60 * 1000; // 3 × the 20-min cadence
     let at = node.caps_measured_at?;
     let age_ms = bson::DateTime::now().timestamp_millis() - at.timestamp_millis();
@@ -881,6 +1105,12 @@ async fn handle_overlay_relay_request(
 
     // Cross-tenant gate: the peer must be in the requester's tenant.
     let peer = match state.overlay_nodes.base.find_by_id(peer_node_id).await {
+        // #1829 — by id, so this also finds a released peer: no grant for it and
+        // no org relay minted for the pair. Its address may be someone else's now.
+        Ok(p) if p.tenant_id == self_node.tenant_id && p.deleted_at.is_some() => {
+            debug!(%self_id, peer = %peer_node_id, "overlay.relay_request: peer was released");
+            return;
+        }
         Ok(p) if p.tenant_id == self_node.tenant_id => p,
         Ok(p) => {
             warn!(%self_id, peer = %peer_node_id, peer_tenant = %p.tenant_id,
@@ -1927,30 +2157,54 @@ pub async fn send_to_node_ref(state: &NetworkState, node_ref: &NodeRef, msg: Ser
     }
 }
 
-/// Resolve the underlying `(tenant_id, machine_id)` for a node identity.
-/// Returns `(tenant_id, machine_id, display_name)` for the identity — the
-/// display name is the underlying agent/tunnel-client `name` (Phase 0, for the
-/// overlay node name / MagicDNS).
+/// What a node identity's agent or tunnel-client row says about it.
+struct NodeOrigin {
+    tenant_id: ObjectId,
+    machine_id: String,
+    /// The agent/tunnel-client `name` (Phase 0, for the overlay node name /
+    /// MagicDNS).
+    display_name: String,
+    /// The row is a tombstone. A join refuses on it (#1829).
+    removed: bool,
+}
+
+/// Resolve the underlying agent or tunnel client for a node identity, whatever
+/// state its row is in: a join and [`current_node`] ask different things of a
+/// tombstone.
 async fn resolve_tenant_and_machine(
     state: &NetworkState,
     ident: NodeIdentity,
-) -> Option<(ObjectId, String, String)> {
+) -> Option<NodeOrigin> {
     match ident {
-        NodeIdentity::Agent(id) => state
-            .fleet
-            .agents
-            .base
-            .find_by_id(id)
-            .await
-            .ok()
-            .map(|a| (a.tenant_id, a.machine_id, a.name)),
-        NodeIdentity::TunnelClient(id) => state
-            .tunnel_clients
-            .base
-            .find_by_id(id)
-            .await
-            .ok()
-            .map(|c| (c.tenant_id, c.machine_id, c.name)),
+        NodeIdentity::Agent(id) => {
+            state
+                .fleet
+                .agents
+                .base
+                .find_by_id(id)
+                .await
+                .ok()
+                .map(|a| NodeOrigin {
+                    tenant_id: a.tenant_id,
+                    machine_id: a.machine_id,
+                    display_name: a.name,
+                    removed: a.deleted_at.is_some(),
+                })
+        }
+        NodeIdentity::TunnelClient(id) => {
+            state
+                .tunnel_clients
+                .base
+                .find_by_id(id)
+                .await
+                .ok()
+                .map(|c| NodeOrigin {
+                    tenant_id: c.tenant_id,
+                    machine_id: c.machine_id,
+                    display_name: c.name,
+                    removed: c.deleted_at.is_some(),
+                })
+        }
     }
 }
 
@@ -1960,8 +2214,15 @@ async fn resolve_tenant_and_machine(
 /// relay_request, DERP registration) silently no-ops for a RELEASED node — which
 /// is correct: the release already fanned its `removes`. The `deleted_at` filter
 /// below is redundant now that the lookup is scoped; kept as belt and braces.
+///
+/// It is the NODE that has to be live here, not its owner: a node leaked by a join
+/// that raced a removal must still be able to leave.
 pub async fn current_node(state: &NetworkState, ident: NodeIdentity) -> Option<OverlayNode> {
-    let (tenant_id, machine_id, _name) = resolve_tenant_and_machine(state, ident).await?;
+    let NodeOrigin {
+        tenant_id,
+        machine_id,
+        ..
+    } = resolve_tenant_and_machine(state, ident).await?;
     state
         .overlay_nodes
         .find_live_by_tenant_and_machine(tenant_id, &machine_id)
@@ -3009,6 +3270,7 @@ mod tests {
             overlay_ip: ip.into(),
             wg_public_key: "cHVia2V5".into(),
             key_epoch: 0,
+            retired_keys: Vec::new(),
             endpoints: vec!["1.2.3.4:1234".into()],
             lan_endpoints: vec!["192.168.1.5:41641".into()],
             srflx_endpoints: vec!["5.6.7.8:5678".into()],

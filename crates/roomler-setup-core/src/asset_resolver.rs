@@ -309,6 +309,18 @@ pub fn current_platform() -> &'static str {
 /// shape forwarded by the backend) or as bare hex. Hex is
 /// case-insensitive.
 pub fn verify_sha256(staged: &Path, expected_digest: &str) -> Result<bool> {
+    let hex = digest_hex(expected_digest)?;
+    let bytes = std::fs::read(staged).with_context(|| format!("reading {}", staged.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual = hasher.finalize();
+    let actual_hex = hex_encode(&actual);
+    Ok(actual_hex.eq_ignore_ascii_case(hex))
+}
+
+/// The 64 hex characters of a digest, `"sha256:<hex>"` or bare; `Err` on
+/// anything else.
+pub(crate) fn digest_hex(expected_digest: &str) -> Result<&str> {
     let hex = expected_digest
         .strip_prefix("sha256:")
         .unwrap_or(expected_digest);
@@ -317,12 +329,42 @@ pub fn verify_sha256(staged: &Path, expected_digest: &str) -> Result<bool> {
             "expected sha256 digest as 64 hex chars (optional sha256: prefix); got {expected_digest:?}"
         ));
     }
-    let bytes = std::fs::read(staged).with_context(|| format!("reading {}", staged.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual = hasher.finalize();
-    let actual_hex = hex_encode(&actual);
-    Ok(actual_hex.eq_ignore_ascii_case(hex))
+    Ok(hex)
+}
+
+/// #3246 — `name`, when it is one plain file or folder name. A release tag and
+/// an asset name arrive from the server and become a path on this machine, and
+/// they do so BEFORE any check of the bytes: `..\..\Startup\x.exe` as a filename
+/// would have the download written there, whatever a signature then said. So no
+/// separator, no drive or stream colon, no `.` or `..`, none of the characters a
+/// Windows name cannot hold, no trailing dot or space (Windows drops them, so the
+/// name written is not the name checked), and no device name.
+pub fn plain_name(name: &str) -> Result<&str> {
+    let stem = name.split('.').next().unwrap_or(name);
+    let device = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+    ) || (stem.len() == 4
+        && (stem[..3].eq_ignore_ascii_case("COM") || stem[..3].eq_ignore_ascii_case("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit());
+    let fit = !name.is_empty()
+        && name.len() <= 255
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
+        && !name.ends_with(['.', ' '])
+        && !device;
+    if fit {
+        Ok(name)
+    } else {
+        Err(anyhow!("{name:?} is not a plain file name"))
+    }
+}
+
+/// Where a download named by a manifest is staged under `root`:
+/// `root\<tag>\<filename>`, each checked by [`plain_name`].
+pub fn staged_path(root: &Path, tag: &str, filename: &str) -> Result<std::path::PathBuf> {
+    Ok(root.join(plain_name(tag)?).join(plain_name(filename)?))
 }
 
 /// Lowercase hex encoder. The `hex` crate would suffice but the
@@ -400,6 +442,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("hex"));
+    }
+
+    /// #3246 — what a real release names, and what a hostile manifest might.
+    #[test]
+    fn only_a_plain_name_becomes_a_path() {
+        for ok in [
+            "agent-v0.4.197",
+            "tunnel-v0.4.197",
+            "roomlerd-0.4.197-perMachine-x86_64-pc-windows-msvc.msi",
+            // RETIRED-NAME-ANCHOR(3): names a PUBLISHED release asset (FR-21 D6).
+            "roomler-tunnel-0.4.197-x86_64-pc-windows-msvc.zip",
+            "roomler-desktop-0.4.197-x86_64-pc-windows-msvc.exe",
+            "roomler-tunnel-0.4.197-universal-apple-darwin.tar.gz",
+            // Only the whole stem is a device.
+            "console.msi",
+            "COM.msi",
+            "COMX.msi",
+        ] {
+            assert_eq!(plain_name(ok).unwrap(), ok);
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x.msi",
+            r"..\x.msi",
+            r"..\..\..\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\x.exe",
+            r"C:\Windows\System32\x.dll",
+            "C:x.msi",
+            "/etc/cron.d/x",
+            r"\\host\share\x.msi",
+            "x.msi:stream",
+            "x.msi.",
+            "x.msi ",
+            "new\nline.msi",
+            "star*.msi",
+            "CON",
+            "nul.msi",
+            "COM1.msi",
+            "lpt9",
+        ] {
+            assert!(plain_name(bad).is_err(), "{bad:?}");
+        }
+        assert!(plain_name(&"a".repeat(256)).is_err());
+        assert!(plain_name(&"a".repeat(255)).is_ok());
+    }
+
+    /// Both parts are checked, and a good pair lands under the root.
+    #[test]
+    fn a_staged_path_stays_under_its_root() {
+        let root = Path::new("staging");
+        assert_eq!(
+            staged_path(root, "agent-v1", "a.msi").unwrap(),
+            root.join("agent-v1").join("a.msi")
+        );
+        assert!(staged_path(root, "..", "a.msi").is_err());
+        assert!(staged_path(root, "agent-v1", "../a.msi").is_err());
     }
 
     #[test]

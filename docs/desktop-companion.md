@@ -39,7 +39,7 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2009`): any person
+and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:2053`): any person
 logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
@@ -69,7 +69,7 @@ on one connection) and closes. Five things poll it at once in a running companio
 |---|---|---|---|
 | service status | `src/front/app.js:166` | 10 s | 0 (reads config, runs `roomlerd service status`) |
 | device view (`Status` + `Peers`) | `src/front/app.js:168` → `cmd_device_view`, `src/commands.rs:323` | 2 s | 1 |
-| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:1884` | 2 s, visible only | 1 |
+| Routes (`RouteList` + `Flows`) | `src/front/tunnels.js:512` → `cmd_tunnels_view`, `src/commands.rs:2181` | 2 s, visible only | 1 |
 | consent (in-window) | `src/front/consent.js:157` | 1.5 s | 1 |
 | consent watcher (Rust) | `src/main.rs` | 750 ms | 1 |
 
@@ -110,13 +110,13 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2102`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:2146`)
    binds the first instance (retrying while another process holds the name), then runs a
-   pool of accept tasks (`accept_pipe`, `:1976`), each owning one listening instance and
+   pool of accept tasks (`accept_pipe`, `:1989`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
    (`DEFAULT_PIPE_POOL`, `:1725`); config `localapi_pipe_pool` (1–16) — **`1` is the kill
    switch** and reproduces the old single-instance behaviour.
-3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:2299`) retries a
+3. **The client backs off instead of giving up.** `pipe_busy_backoff` (`:2319`) retries a
    busy pipe at 5, 10, 20, 40, 80, 160 ms (≤ 315 ms in total); any other error (the daemon
    is not running) returns at once.
 
@@ -124,7 +124,7 @@ A route can now be **edited** in place: `RouteUpdate` replaces the descriptor in
 under the config write lock and restarts its flow; an invalid replacement is refused and the
 old route keeps running (`agents/roomlerd/src/tunnel/route_reconciler.rs:437`). A daemon
 that predates the verb answers "bad request", which the companion shows as *"The device
-service predates route editing"* (`src/commands.rs:1935`), never as a blank page.
+service predates route editing"* (`src/commands.rs:2232`), never as a blank page.
 
 ⚠️ A route whose edit keeps the **same local port** restarts its listener on that port. If
 the old listener is still held (the #1035 class — a listener outliving the flow that owned
@@ -183,7 +183,7 @@ compile.
   (#2871, the operator, 2026-10-25):** the root half's person socket now serves the
   configuration — the listing, with every key it will not set marked
   `read_only = "root_only"`, and `ConfigSet` of exactly the keys that are the console
-  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3196`;
+  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3269`;
   the device-owned gates are not among them) — and the page shows the Mac as one device:
   each row comes from, and a change goes to, the half that READS the key. The split is the
   key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`):
@@ -193,23 +193,23 @@ compile.
   | **session** — the per-user half, which serves the remote-desktop session | Remote desktop · Capture & input · Video encoding · Video rate · Files | the worker's row, edited on the worker as before | `rc_clipboard`, `privacy_mode_allowed`, `lock_on_end`, `display_match`, `peer_auth`, `keep_busy_enabled`, `record_*`, `files_dir`, `encoder_preference` |
   | **machine** — the root half, the device `roomler ssh` / `roomler exec` reach | Access & consent · Private network · Carriers · Routing · Tunnels · Roomler SSH · Device & service | the root half's row, over its person socket: editable where that socket sets the key (`external_*`), otherwise read-only with the administrator's command | `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `overlay_enabled`, `auto_grant_session`, `auto_update`, `external_access_enabled` |
 
-  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:620`) builds the rows —
+  `merge_two_halves` (`agents/roomler-desktop/src/commands.rs:635`) builds the rows —
   machine-side keys from the root half's listing, in the worker's order — and
-  `cmd_config_set` (`:813`) sends a machine-side key to the root half
-  (`root_half_config_set_beside`, `:738`), whose answer is final: the worker's copy of
+  `cmd_config_set` (`:828`) sends a machine-side key to the root half
+  (`root_half_config_set_beside`, `:753`), whose answer is final: the worker's copy of
   such a key is a file the Mac's device never reads, so it is not written. The worker's
   own copies of machine keys stay reachable with `roomler config …` in a terminal, and
   the CLI's note says so. ⚠️ Two caveats the split cannot express, both P3's to dissolve:
   the root half forwards its own value of a few session knobs to the worker as a floor
   (FR-43's `WORKER_ENV_FORWARD`), and a delegated session's policies are judged by both
   halves' configs, so the worker's copy — the one this edits — can only tighten the
-  root's. The banner (`cmd_config_target`, `:1168`; `two_halves_note`, `:992`) names both
+  root's. The banner (`cmd_config_target`, `:1185`; `two_halves_note`, `:1007`) names both
   halves' files and says which rows change here. It is shown only when the reached daemon
   says it runs unprivileged AND a root daemon of another identity answers `Status` over the
-  person socket (`two_halves`, `:975`) — one daemon behind both sockets, a root daemon's
+  person socket (`two_halves`, `:990`) — one daemon behind both sockets, a root daemon's
   legacy per-user bind, is not two halves. A root half older than design A still refuses
   the listing; the rows are then the worker's alone and the banner carries the #2879 words
-  (`two_halves_legacy_note`, `:1013`): the root half's switches are
+  (`two_halves_legacy_note`, `:1028`): the root half's switches are
   `sudo roomler config set <key> <value>`.
 - **A Linux system install, and a Mac with a root half alone (#2891, #2871).** There the
   daemon the page reaches runs as root and this app does not: `connect()`'s first candidate
@@ -221,19 +221,19 @@ compile.
   written, a file no daemon reads (#2871's failure, on Linux). #2891 made a root daemon's
   refusal final for `cmd_config_entries`, `cmd_config_set` and `cmd_set_device_name`: none
   falls back to the file (`refused_by_root_daemon`,
-  `agents/roomler-desktop/src/commands.rs:1123`). Since design A the same socket serves the
-  listing, marked: `cmd_config_target` (`:1168`) reports `root_only` (`root_daemon_only`,
-  `:1038`, pure: the reached daemon says it runs as root, this process does not, and the OS
+  `agents/roomler-desktop/src/commands.rs:1140`). Since design A the same socket serves the
+  listing, marked: `cmd_config_target` (`:1185`) reports `root_only` (`root_daemon_only`,
+  `:1053`, pure: the reached daemon says it runs as root, this process does not, and the OS
   is not Windows, whose pipe admits interactive users to those verbs), the person's own keys
   are editable, and the rest — the device-owned gates, the network, SSH, the updater — show
   the root daemon's value with "administrator's" and `sudo roomler config set <key> <value>`
-  (`settings.js`, the `read_only` row; `root_only_note`, `:1065`). From a daemon older than
+  (`settings.js`, the `read_only` row; `root_only_note`, `:1080`). From a daemon older than
   design A the card still shows the daemon, its file (`Status.config_path`:
   `/etc/roomler/config.toml`) and the administrator's commands in place of rows
-  (`root_only_legacy_note`, `:1087`).
+  (`root_only_legacy_note`, `:1102`).
 - **The Service line on Linux and macOS (#2871).** `probe_service_state` reads the root
   daemon's own `--as-service` answer — `com.roomler.daemon: running, enabled`,
-  `roomlerd.service: active, enabled` (`system_answer`, `:3298`) — as
+  `roomlerd.service: active, enabled` (`system_answer`, `:3386`) — as
   `service_kind = "systemDaemon"`, rendered "System daemon (root) · running". It only ever
   read Windows' `Roomler:` line before, so a supervised Mac, whose LaunchAgent FR-43 P2d
   boots out, said "not installed" while its root daemon served the mesh.
@@ -268,7 +268,7 @@ flowchart TD
 ```
 
 - **The same code decides both.** `shape_full_netmap`
-  (`crates/modules/network/src/overlay.rs:2492`) was extracted from the overlay join and is
+  (`crates/modules/network/src/overlay.rs:2555`) was extracted from the overlay join and is
   what the join itself now calls, so the list can never show a peer the netmap withholds:
   ACL `off` / `warn` list every live node, `enforce` only the shaped set.
 - ⚠️ **The device's node is found before any ACL read.** Loading the ACL can create the
@@ -276,7 +276,7 @@ flowchart TD
 - **What never leaves the server:** machine ids, owner ids, WireGuard keys and key epochs,
   consent settings, codecs. Those fields are blanked *before* search runs, so `q` cannot be
   used to probe them. Search, sort and paging are the web grid's own
-  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:289`, `:331`), so the two
+  (`parse_query` / `apply_query`, `crates/api/src/routes/device.rs:295`, `:337`), so the two
   grids cannot drift.
 - Proven by a negative control: with visibility taken from every live node instead of the
   shaped netmap, the enforce test leaks a withheld peer and fails
@@ -362,7 +362,7 @@ sequenceDiagram
     direct or relayed and over what, round trip) without any endpoint;
   - `Status` with its own name, version and server link, plus the root half's overlay
     addresses, exit status and MagicDNS (`person_socket::with_machine_network`) — and, since
-    #2892, **`network_from`** (`crates/localapi/src/lib.rs:186`): the root half's node id and
+    #2892, **`network_from`** (`crates/localapi/src/lib.rs:201`): the root half's node id and
     name, set only when those fields were lent. Nothing on the wire said so before, and `roomler status` as the console user
     printed the root half's address as this half's, right above this half's own "overlay OFF"
     enrollments. The CLI now marks `overlay ip` / `overlay ip6` "(the root daemon's)", adds a
@@ -379,7 +379,7 @@ sequenceDiagram
   (§5), so the person always knows which daemon answered; the per-user half's own
   `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
   the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:4880`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:4968`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -390,7 +390,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1384`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1428`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -404,7 +404,7 @@ unsupervised `roomlerd run` would take the device offline for good:
 | the macOS supervisor (FR-43) | the worker's `--supervised` flag | `9` | the supervisor |
 | anything else | — | **refused** | — |
 
-`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:190`); it is outside
+`9` is `RESTART_REQUESTED_EXIT_CODE` (`agents/roomlerd/src/watchdog.rs:199`); it is outside
 systemd's `RestartPreventExitStatus=7 8`, and the SCM host maps it to *respawn* as well.
 
 ```mermaid
@@ -425,7 +425,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/main.rs:1639`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:1832`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -465,6 +465,27 @@ sequenceDiagram
   persisted and reported as *applied-pending-restart*, and there is no server message that
   restarts anything (`docs/remote-config.md` §7b).
 
+### 7.1 The macOS permission card's Restart (#3164)
+
+macOS applies a Screen Recording grant to a freshly started process only, so a Mac's card offers
+**Restart roomlerd** beside its Screen Recording row: the same flow as *Apply now*
+(`window.Roomler.restartDaemon`, the LocalAPI `RestartDaemon` verb, the agent's own supervisor
+relaunches it). Accessibility needs none: the agent reads it live and opens its input backend
+again once it is granted.
+
+The card shows the **agent's** grants, as the agent reports them in its status
+(`NodeStatus.macos_grants`, read from its own process). Before #3164 it asked TCC about the
+menu-bar app's own process, `ai.roomler.agent-tray`, which never holds either grant: the card
+kept asking for both after the person had granted them to `roomlerd`, and its button registered
+the menu-bar app itself in the pane, as the "Roomler" entry that changes nothing. The buttons now
+only open the pane. An agent that does not report its grants (older than #3164, not running, or a
+root half with no GUI session) shows no card.
+
+macOS's own **Quit & Reopen** restarts the agent too (`agents/roomlerd/src/macos_quit.rs`): a
+Quit AppleEvent from anyone but `loginwindow` ends it with the supervisor's restart code instead
+of AppKit's exit 0. Up to 0.4.189 that button left the agent offline (`docs/installation.md`,
+the macOS grants).
+
 ## 8. What this device can encode
 
 The Overview's **Hardware video encoding** card is a codec × backend matrix — H.264, HEVC,
@@ -473,7 +494,7 @@ the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), de
 struck through, and how long the probe took.
 
 - It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
-  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:48`). The capability probe runs in
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:68`). The capability probe runs in
   child processes (vendor driver code) at the first server hello; a control-surface poll
   must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
 - Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the
@@ -687,9 +708,11 @@ tries first:
   consent, the recording state and keep busy (FR-92); and, since FR-97 P2g, the Devices page
   and the mesh, read-only (§6); since P2h, the peers too, without the endpoints of either end
   or of a relay, the carrier snapshot, the path decision or the probes (`localapi::person_view`);
-  and since #2871 (design A) the configuration — the listing, with every key the socket will
-  not set marked `read_only`, and `ConfigSet` of exactly the keys that are the person's own
-  call (`localapi::CONSOLE_PERSON_KEYS`, §5), never the device-owned gates.
+  since FR-85 P2e, recording: the Recordings view's start, stop, list and delete, and the
+  **Stop recording** on the banner and the tray; and since #2871 (design A) the
+  configuration — the listing, with every key the socket will not set marked `read_only`,
+  and `ConfigSet` of exactly the keys that are the person's own call
+  (`localapi::CONSOLE_PERSON_KEYS`, §5), never the device-owned gates.
 
 Everything else on it — a config key that is not the person's own included, refused by name
 with the `sudo` command — is refused with a pointer to `sudo roomler …`, so the companion's
@@ -720,9 +743,9 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5590`, `AskingMark`
-`agents/roomlerd/src/rc_sessions.rs:42`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1163`), and the banner comes up only for a session that sees the
+dialog is the wait (`agents/roomlerd/src/peer.rs:5753`, `AskingMark`
+`agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
+`crates/localapi/src/lib.rs:1207`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
@@ -741,7 +764,7 @@ also keeps a system install's Wayland capture opt-in.
 | Shown | when a session starts, for at least `FIRST_SHOW` (4 s), **without taking focus** | `panels.rs:127`, `:416` |
 | Hides | 2.5 s after the pointer leaves it (`HIDE_DELAY`) | `panels.rs:54` |
 | Comes back | after the pointer rests within 4 px of the top edge for 1.2 s (`TOP_ZONE`, `REVEAL_DWELL`) — the Windows badge's numbers | `panels.rs:50-52` |
-| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:239` |
+| Stays | while a recording runs, this device's or a controller's (`tray::recording_now`) | `tray.rs:380` |
 | Moves | by dragging its body (`data-tauri-drag-region`, unchanged) | `front/panel-viewing.html` |
 | Frame | a 2 px red frame round the main screen for the whole session — four click-through strips (macOS) | `panels.rs:513` |
 
@@ -851,7 +874,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1244`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1267`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -902,6 +925,40 @@ flowchart TD
   (`forget_installed_version`, `companion.rs:322`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
   the Windows retry. Windows' refresh at start is older and stays.
+
+### 13.1 Checking for updates: one click from the tray (#2936)
+
+The tray's **Check for Updates** and the Overview's **Updates** card run one routine. A tray click
+shows the window at once and hands the rest to the page:
+
+```mermaid
+sequenceDiagram
+    participant T as tray.rs check_updates
+    participant P as overview.js
+    participant C as cmd_check_update
+    T->>T: show and focus the main window
+    T->>P: raise the pending flag, fire roomler-tray-check-update
+    P->>P: clear the flag, show "Checking for updates…" in the card
+    P->>P: switch to Overview, scroll the card into view (instant), ring it once
+    P->>C: invoke (off the main thread)
+    Note over P: the page becomes visible: scroll again
+    C-->>P: what roomlerd self-update --check-only said
+    P->>P: after at least 0.7 s, the answer and "Checked at 21:45:25."
+    P->>P: "Install update" when one is available, scroll again
+```
+
+| Piece | Where | Why |
+|---|---|---|
+| the tray's half | `check_updates`, `src/tray.rs:588` | it used to run the check on the menu thread and show the window only afterwards, at the top of Overview. So: seconds of nothing, then a result in the last card, below the fold, and people scrolled down and clicked again |
+| the event and the flag | `tray_check_update_js`, `src/tray.rs:574` | the flag covers a page that is not listening yet. A test pins the event name on both sides (`the_tray_update_check_fires_what_the_overview_listens_for`) |
+| one check | `runUpdateCheck`, `src/front/overview.js:184` | the card's button and the tray share it: a stale "Install update" is hidden first, the button is disabled while it runs, and a failure lands in the card |
+| a check you can see | `MIN_CHECKING_MS`, `src/front/overview.js:173` | "Checking for updates…" stays up at least 0.7 s, and the answer carries the time it was asked ("Checked at 21:45:25."). On 0.4.177 an answer that came back at once read as no check at all (field, a Mac, 2026-10-26) |
+| into view | `scrollToUpdates`, `src/front/overview.js:214`; `revealUpdates`, `:234` | the Updates card is the last one on Overview, and `#content` is what scrolls. The scroll is INSTANT and repeated: once the page is visible, and when the answer lands. On 0.4.177 a smooth scroll never happened on a Mac: it is driven by animation frames, and the tray runs it while the window is still coming up |
+| the ring | `flashUpdates`, `src/front/overview.js:220`; `.card.flash` in `styles.css` | draws the eye to the card. A static outline instead when the OS asks for reduced motion |
+| off the main thread | `cmd_check_update`, `agents/roomler-desktop/src/commands.rs:1957` | a synchronous Tauri command runs on the app's main thread, and this one waits for a spawned `roomlerd` and a network round-trip |
+
+⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
+**Install update** queues the root update helper (FR-27).
 
 ## 14. Opening links: View screen and Open Roomler (#2713)
 

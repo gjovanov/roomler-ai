@@ -43,12 +43,14 @@ use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
 use wizard_shared::extract;
+use wizard_shared::held_file::HeldFile;
 use wizard_shared::integration;
 use wizard_shared::progress::{ProgressEvent, replay_log};
 use wizard_shared::tunnel_enroll::{self, EnrollResult};
 
 use crate::commands::DoneReport;
 use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
+use crate::package_step;
 use crate::role::Role;
 
 /// Drive a full tunnel-client install end-to-end. Streams
@@ -170,10 +172,13 @@ async fn run_install_inner(
             total_bytes: health.size,
         },
     );
-    let staged = std::env::temp_dir()
-        .join("roomler-setup")
-        .join(&health.tag)
-        .join(&health.filename);
+    // #3246 — a name from the server becomes a path only if it is one plain name,
+    // and on an elevated run only under a folder of its own.
+    let staging = package_step::Staging::for_this_run()
+        .map_err(|e| failed(ErrorCode::Download, format!("staging folder: {e}")))?;
+    let staged = staging
+        .path_for(&health.tag, &health.filename)
+        .map_err(package_step::Refusal::fail)?;
     let url = format!(
         "{}{}",
         crate::proxy::origin_of(&crate::proxy::tunnel_base()),
@@ -197,30 +202,60 @@ async fn run_install_inner(
     .map_err(|e| failed(ErrorCode::Download, format!("download installer: {e}")))?;
     diag.ok();
 
-    // --- Step 4: verify SHA256 ------------------------------------------
+    // --- Step 4: verify the digest, and on Windows the publisher ---------
+    //
+    // #3246 — on Windows the program inside is signed, and that decides with or
+    // without a digest. Elsewhere the digest is all there is, so no digest is a
+    // refusal, as it is for the daemon there (FR-129 AC12).
     diag.begin(Step::Verify);
     check_cancel()?;
-    let sha256_match = match health.digest.as_deref() {
-        Some(digest) => asset_resolver::verify_sha256(&staged, digest)
-            .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?,
-        None => {
+    let refuse = |refusal: package_step::Refusal| {
+        let _ = std::fs::remove_file(&staged);
+        refusal.fail()
+    };
+    let mut held = HeldFile::open(&staged)
+        .map_err(|e| refuse(package_step::Refusal::CouldNotCheck(e.to_string())))?;
+    match health.digest.as_deref() {
+        Some(digest) => {
+            let sha256_match = held
+                .sha256_matches(digest)
+                .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?;
+            emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
+            if !sha256_match {
+                drop(held);
+                return Err(refuse(package_step::Refusal::DigestMismatch));
+            }
+        }
+        None if cfg!(target_os = "windows") => {
             tracing::warn!(
                 tag = %health.tag,
-                "wizard archive lacks sha256 digest — skipping verification"
+                "wizard archive lacks sha256 digest — the publisher check alone decides"
             );
-            true
+            emit(
+                on_event,
+                ProgressEvent::PreflightWarning {
+                    message: format!(
+                        "Release {} published no checksum for this download, so only the \
+                         signatures inside it can be checked.",
+                        health.tag
+                    ),
+                },
+            );
         }
-    };
-    emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
-    if !sha256_match {
-        let _ = std::fs::remove_file(&staged);
-        return Err(failed(
-            ErrorCode::Sha256Mismatch,
-            format!(
-                "SHA256 mismatch for {} — staged file deleted; please retry",
-                staged.display()
-            ),
-        ));
+        None => {
+            drop(held);
+            return Err(refuse(package_step::Refusal::NoDigest));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        match package_step::check_archive(&staged, staging.root()) {
+            Ok(signer) => emit(on_event, ProgressEvent::PublisherVerified { signer }),
+            Err(refusal) => {
+                drop(held);
+                return Err(refuse(refusal));
+            }
+        }
     }
     diag.ok();
 
@@ -237,6 +272,7 @@ async fn run_install_inner(
         .map_err(|e| failed(ErrorCode::Extract, format!("install root: {e}")))?;
     extract::extract_archive(&staged, &install_root)
         .map_err(|e| failed(ErrorCode::Extract, format!("extract archive: {e}")))?;
+    drop(held);
     let tunnel_binary = extract::find_tunnel_binary(&install_root)
         .map_err(|e| failed(ErrorCode::Extract, format!("locate tunnel binary: {e}")))?;
     emit(
@@ -315,6 +351,8 @@ async fn run_install_inner(
         desktop_installed: None,
         // FR-104 — a tunnel client has no SYSTEM service to anchor.
         anchored: None,
+        // FR-129 B2 — nor a root half.
+        root_half: None,
     })
 }
 

@@ -35,10 +35,10 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+
+mod dc_stage;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Loopback PC pair harness
@@ -179,6 +179,7 @@ impl DcSide {
 /// Turn-key for tokio CI runners; no STUN/TURN traffic.
 async fn open_files_dc() -> Result<DcSide> {
     let (browser_pc, agent_pc) = mk_pc_pair().await?;
+    let stages = dc_stage::Stages::watch(&browser_pc, &agent_pc);
 
     // Browser opens the `files` DC. Agent receives it via on_data_channel
     // and immediately attaches the production dispatcher.
@@ -217,39 +218,58 @@ async fn open_files_dc() -> Result<DcSide> {
         })
     }));
 
-    // SDP offer/answer exchange — direct function calls, no network.
+    // SDP offer/answer exchange — direct function calls, no network, and
+    // every candidate in the SDP (no trickle); see `privacy_dc.rs`'s
+    // `exchange` for the race that trickling lost.
     let offer = browser_pc
         .create_offer(None)
         .await
         .context("create_offer")?;
+    let mut gathered = browser_pc.gathering_complete_promise().await;
     browser_pc
-        .set_local_description(offer.clone())
+        .set_local_description(offer)
         .await
         .context("browser set_local")?;
+    let _ = gathered.recv().await;
+    let offer = browser_pc
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow!("no local offer"))?;
+    stages.gathered("offer", &offer);
     agent_pc
         .set_remote_description(offer)
         .await
         .context("agent set_remote")?;
+    stages.mark("the agent has the offer");
     let answer = agent_pc
         .create_answer(None)
         .await
         .context("create_answer")?;
+    let mut gathered = agent_pc.gathering_complete_promise().await;
     agent_pc
-        .set_local_description(answer.clone())
+        .set_local_description(answer)
         .await
         .context("agent set_local")?;
+    let _ = gathered.recv().await;
+    let answer = agent_pc
+        .local_description()
+        .await
+        .ok_or_else(|| anyhow!("no local answer"))?;
+    stages.gathered("answer", &answer);
     browser_pc
         .set_remote_description(answer)
         .await
         .context("browser set_remote")?;
+    stages.mark("the browser has the answer");
 
     // Wait for agent to accept the DC, then attach the production
     // dispatcher. The session_id is a fresh ObjectId — the dispatcher
     // uses it only for log lines, not for any state lookup.
-    let agent_dc = tokio::time::timeout(Duration::from_secs(30), agent_dc_rx)
-        .await
-        .map_err(|_| anyhow!("agent on_data_channel timed out"))?
-        .map_err(|e| anyhow!("agent_dc_rx: {e}"))?;
+    // ⚠️ 10 s, not the other harnesses' 30: every test here runs inside a
+    // 15 s timeout, which would cancel a longer wait before it could say
+    // which stage the pair is stuck at (#3078).
+    let agent_dc =
+        dc_stage::agent_channel(agent_dc_rx, &stages, &browser_dc, Duration::from_secs(10)).await?;
     let session_id = bson::oid::ObjectId::new();
     roomlerd::peer::attach_files_handler(
         agent_dc,
@@ -269,10 +289,14 @@ async fn open_files_dc() -> Result<DcSide> {
             }
         })
     }));
-    tokio::time::timeout(Duration::from_secs(10), open_rx)
-        .await
-        .map_err(|_| anyhow!("browser DC open timed out"))?
-        .map_err(|e| anyhow!("open_rx: {e}"))?;
+    match tokio::time::timeout(Duration::from_secs(10), open_rx).await {
+        Ok(opened) => opened.map_err(|e| anyhow!("open_rx: {e}"))?,
+        Err(_) => {
+            return Err(stages
+                .timed_out("browser DC open timed out", &browser_dc)
+                .await);
+        }
+    }
 
     let _ = (strings_tx, bytes_tx); // closures still hold the live ones
 
@@ -284,9 +308,8 @@ async fn open_files_dc() -> Result<DcSide> {
     })
 }
 
-/// Build a pair of `RTCPeerConnection`s wired so each one's local ICE
-/// candidates are added as remote candidates on the other. No STUN /
-/// TURN — host-only candidates, instant gathering.
+/// Build a pair of `RTCPeerConnection`s. No STUN / TURN — host-only
+/// candidates, instant gathering, all of them in the SDP.
 async fn mk_pc_pair() -> Result<(Arc<RTCPeerConnection>, Arc<RTCPeerConnection>)> {
     let mut me_browser = MediaEngine::default();
     me_browser
@@ -317,44 +340,8 @@ async fn mk_pc_pair() -> Result<(Arc<RTCPeerConnection>, Arc<RTCPeerConnection>)
             .context("agent new_pc")?,
     );
 
-    // Cross-feed ICE candidates. Each on_ice_candidate fires once
-    // per gathered candidate then once with `None` when gathering
-    // ends — we only forward the Some side.
-    let agent_pc_for_browser_ice = agent_pc.clone();
-    browser_pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-        let agent_pc = agent_pc_for_browser_ice.clone();
-        Box::pin(async move {
-            if let Some(c) = c
-                && let Ok(json) = c.to_json()
-            {
-                let _ = agent_pc.add_ice_candidate(json).await;
-            }
-        })
-    }));
-    let browser_pc_for_agent_ice = browser_pc.clone();
-    agent_pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-        let browser_pc = browser_pc_for_agent_ice.clone();
-        Box::pin(async move {
-            if let Some(c) = c
-                && let Ok(json) = c.to_json()
-            {
-                let _ = browser_pc.add_ice_candidate(json).await;
-            }
-        })
-    }));
-
-    // Optional: log connection state transitions for CI debugging.
-    browser_pc.on_peer_connection_state_change(Box::new(|s: RTCPeerConnectionState| {
-        Box::pin(async move {
-            tracing::debug!(state = ?s, "browser PC state");
-        })
-    }));
-    agent_pc.on_peer_connection_state_change(Box::new(|s: RTCPeerConnectionState| {
-        Box::pin(async move {
-            tracing::debug!(state = ?s, "agent PC state");
-        })
-    }));
-
+    // The connection-state transitions go on `dc_stage`'s timeline, which a
+    // setup timeout prints whole.
     Ok((browser_pc, agent_pc))
 }
 

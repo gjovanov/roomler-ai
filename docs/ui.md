@@ -94,13 +94,22 @@ flowchart TB
 ```
 
 - **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker`, `rc-hevc-worker`,
-  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation.
+  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation. Each
+  tells its decoder the agent's BT.601 limited colour space through
+  `rc-decoder-config` (FR-130 P2; kill switch `roomler-rc-colorspace=off`):
+  [remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
-  its frame-skip rate control), agent-local loopback-TURN probe for fast relayed
+  its frame-skip rate control), one `rc:decode-error` per decode error, counted into
+  the session's stats (FR-132 P1,
+  [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
+  a data-channel decoder that fails after its first frame replaced in place, off with
+  `roomler-rc-decode-recover=0` (FR-135 R1,
+  [remote-control.md §11.11](remote-control.md#1111-a-decode-error-recovers-in-place-fr-135-r1)),
+  agent-local loopback-TURN probe for fast relayed
   paths on the same LAN.
 - **Input**: HID-mapped keyboard (keyboard-lock, Ctrl-Alt-Del / SAS chord),
   letterboxed + direct coordinate normalization, multi-monitor layout + display
@@ -134,6 +143,83 @@ flowchart TB
 - **Diagnostics**: stats polling, jank detector, long-task observer, inbound-RTP
   diagnostics, agent-log fetch — surfaced in an opt-in HUD.
 - **Resilience**: reconnect with backoff, decode-pressure shedding.
+
+### The frame-rate picker (FR-119)
+
+The Video tab of the viewer's settings offers **Frame rate**, with 60, 120 and
+144, only for an agent whose hello carries `fps-high`
+(`views/remote/RemoteControl.vue:1783`). The agent's side, the grant and its
+step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119).
+
+- **The options** (`frameRateOptions`, `composables/frameRate.ts:52`): 60 is
+  always on. 120 and 144 are disabled, with the reason as text, when the host
+  reported a screen slower than the rate ("the host's screen refreshes at
+  60 Hz").
+- **The pick** is stored per browser (`roomler-rc-fps`,
+  `composables/frameRate.ts:30`) and sent again each time the control channel
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7714`), so
+  a reload asks again without a click.
+- **The hint under it is the agent's answer**, from `rc:video-info`
+  (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
+  trial until this host has shown it can keep up"; "60 fps (144 fps not granted:
+  this host hasn't shown it can sustain that rate yet)"; or, while the rate
+  below a refused ask runs as a trial, "120 fps on trial (144 fps not granted:
+  …)". A reason word from a newer agent is shown as it came. With no session
+  open, the hint reads "Above 60 only where this device has shown it can sustain
+  it".
+- **"Try N fps again"** (`views/remote/RemoteControl.vue:1793`) appears under
+  the picker for an `unproven` refusal, from an agent that advertises
+  `fps-retry` (`frameRateCanRetry`, `composables/frameRate.ts:166`). It re-sends
+  the pick with `retry: true`, and the agent trials the step-down again from the
+  top. ⚠️ It is a text button inside the Video tab. The page's own blue "Try
+  again", shown after a session fails, has the same icon and reconnects
+  instead.
+
+### A session says what it got (FR-135 R2)
+
+An agent that advertises `media-plan` states its plan on the control channel
+(`rc:media-plan`, [`remote-control.md` §5.1h](remote-control.md#51h-a-session-says-what-it-got-fr-135-r2)).
+An older agent sends none, and its sessions read as they did. The reading and the
+wording are pure, in `composables/mediaPlan.ts`, and `useRemoteControl` holds the
+refs: `mediaPlan`, `mediaStop`, `mediaSilent`, `mediaDataArrived`, `viewerHz`.
+
+| On the page | `data-testid` | When | Says |
+|---|---|---|---|
+| Overlay | `rc-media-stop` | The plan carries `stopped` | "This device could not open a video encoder. It tried h264_nvenc, h264_amf and h264_vulkan.", the device's word, and the backend's own words. The list spans the session's opens, so a failed rebuild lists the cell it ran on, and the words hold for that too |
+| Overlay | `rc-media-silent` | A plan, no `stopped`, never painted, 6 s (`nextMediaSilent`) | "This device is set to send H.265 over the data channel, and no frame has arrived." With a decode worker's byte count above zero (`mediaDataArrived`), "Data has arrived, and no picture has decoded from it." instead, because that is not a device that sent nothing. This overlay is what a page has on the two pumps that are not instrumented |
+| Stats pill | `rc-media-ladder` | The plan has at least one step down | The last arrow and the count, every arrow on hover |
+
+- **The overlays sit below `rc.mediaUnavailable` and `rc.mediaWaiting`**, because
+  those name a cause and a fix, and above "waiting for agent to publish a video
+  track", which this replaces when there is more to say
+  (`views/remote/RemoteControl.vue`).
+- **The words outlive the watchdog's re-create.** `scheduleReconnect` keeps the stop,
+  the silence and the plan across its `teardown`, or the page's one sentence would
+  blink every 10 s. A new session's first plan knows only the transport and the codec,
+  so it leaves the words alone (`mediaPlanAction`). An opened encoder clears them, and
+  so does the first picture. For a stop, that means the first frame past the settle
+  (`mediaStopAfterTick`): `encoder_fault` only follows frames and they ride another
+  channel, so a frame counted just after the stop may have been sent before it. Without
+  the wait, that frame took the sentence down and the plan never said it again.
+- **The overlays live on the connected stage, so the redial has a stage of its own**
+  (`noPictureWhileRedialling`, the same shape as FR-93 P5j's `rc-host-asleep`). It says
+  the same words under the same `data-testid`, with the attempt's own phase in its
+  caption: a consent prompt on the device still reads as one. Without it, every
+  re-create read "Connection lost", which is false because the device answered, and
+  from the fourth attempt the dead-air backoff holds that stage for minutes.
+- **The backoff stays and stops blaming the network** (`deadAirNotice`). Three frameless
+  sessions still slow the retries to minutes, whatever keeps the frames away. A plan
+  came over the control channel, so "its network may be blocking the connection" is
+  left off for an attempt that heard one. A plan the redial kept from an earlier attempt
+  does not count: the path has to be working now.
+- **A plan is kept by `epoch`.** The next session's plan starts at 1 again, so the page
+  counts apart from the plan it shows and resets on `teardown`.
+- **A plan that says `webrtc` while a data-channel path runs stops that path**, so
+  `<video>` shows. Nothing is coming on a channel the agent is not writing to.
+- **`viewerHz`** comes from the decode worker (`workers/rc-viewer-hz.ts`), and
+  `sendViewerHz` sends it only to an agent with the verb, again at each control
+  channel `onopen`. The picker does not read it yet: it waits with the agent's cap,
+  past FR-135 §7.1's gates.
 
 ## Observability components
 
@@ -192,12 +278,97 @@ master and P1 screenshot to the same pixels at 1300 and 2400 px.
 set, else the machine name — in every list, card, dialog title and notice a person reads. The technical `name`
 stays wherever a machine reads it back: a MagicDNS label, an `overlay_exit_node = "…"` line, a CLI selector.
 
+## Calls: a black tile says why (FR-124)
+
+A call tile that shows black says why, on the screen of the person who can fix it
+([FR-124](fr/FR-124-black-call-tile-says-why.md), #2945). Two causes looked identical before, a black square
+with no reason given:
+
+| cause | what the tile does | where else it shows |
+|---|---|---|
+| **The camera sends a black picture**: a covered lens, a closed privacy shutter, a camera-off key that blanks the sensor while the device stays attached | a notice over the picture, in text. Your own tile: *"Your camera is sending a black picture · Is the lens covered?"*. A peer's: *"Black picture from this camera · Its lens may be covered"*. A compact tile: *"Black picture"* | for YOUR camera only, a closable warning over the call (`call.blackPicture`): you are the one who can uncover it |
+| **The browser refused to start the tile** (its autoplay policy: audible playback before the page has had a gesture) | the picture plays muted at once, with *"Tap for sound"*; if even muted playback is refused, *"Tap to play"* | — the next click or key anywhere on the page brings the sound back |
+
+Found on 2026-10-26: a covered webcam on neo16 was reported as the *MacBook's* camera not working. Both devices
+were signed in to one account, so both tiles carried the same name, and nothing on screen said which picture was
+black. Every layer under it was healthy. The hour that took is in the FR's §2.1.
+
+### The black-picture detector
+
+```mermaid
+flowchart TB
+    T["every second, per tile<br/>(watchBlackPicture)"] --> H{"page hidden?"}
+    H -->|yes| KEEP["skip — the verdict stays"]
+    H -->|no| A{"judgeable?<br/>a camera track that is enabled, live and receiving,<br/>no FR-30 camera-off, not a screen share"}
+    A -->|no| RESET["no verdict — the run starts again,<br/>a black verdict clears"]
+    A -->|yes| S["draw the &lt;video&gt; into 16×12,<br/>mean and peak luma (0–255)"]
+    S --> B{"mean ≤ 4 and peak ≤ 16?"}
+    B -->|no| CLEAR["a picture — not black"]
+    B -->|yes| RUN{"3 in a row?"}
+    RUN -->|not yet| WAIT["keep counting"]
+    RUN -->|yes| BLACK["black: the tile's notice,<br/>emit picture-black(true)"]
+    BLACK --> L["layout → ConferenceView:<br/>count per stream key"]
+    L --> W{"the 'local' key?"}
+    W -->|yes| WARN["the call page's warning<br/>(closable for this black spell)"]
+```
+
+- **The bar is "no light at all", not "dim".** A covered lens measured mean luma 0 and peak 1–3 over the 16×12
+  sample. A dim room under auto-exposure reads far brighter, and a dark screen with text has bright peaks.
+  `utils/blackPicture.ts:22-28` holds the three numbers. `blackPicture.spec.ts` pins each of them with a case on
+  either side.
+- **The samples never leave the tab**, and nothing goes on the wire. The sender judges its own picture and each
+  viewer judges what it decodes, so an older client changes nothing for anyone.
+- ⚠️ **A camera that is OFF is not a covered camera.** A disabled track (your own camera turned off) still paints
+  black at full size, so the tile's own `hasVideoTrack` stays true. Only `cameraTrackLive()`
+  (`VideoTile.vue:446`) stands between "camera off" and "lens covered": it requires the track to be `enabled`,
+  `live` and not `muted`. A peer's own word that their camera is off (FR-30's `videoPaused`) also wins: the avatar
+  shows, never the notice. A shared screen is never judged, because a black slide is not a lens.
+- ⚠️ **A count per stream key, not a flag** (`composables/useBlackPictureTiles.ts:15`). Alone in a call with a
+  floating self-view you are on two tiles at once. When someone joins, the spotlight tile unmounts and reports
+  `false` while the floating one is still black, so a flag would drop your warning there. Each tile reports
+  changes only, and `false` on unmount if it was black (`VideoTile.vue:466`), so the count stays honest.
+
+### A refused start
+
+```mermaid
+sequenceDiagram
+    participant T as VideoTile
+    participant B as browser
+    participant P as the person
+    T->>B: play() (unmuted: a peer's tile carries their audio)
+    B-->>T: NotAllowedError (no gesture on the page yet)
+    T->>T: soundBlocked = true → :muted binds true
+    T->>B: play() again, muted
+    B-->>T: playing — the picture is on screen
+    T->>P: "Tap for sound" on the tile
+    P->>B: a click or a key anywhere on the page
+    Note over T: capture-phase listener, armed once
+    T->>T: soundBlocked = false → unmuted
+    T->>B: play() inside the gesture
+    B-->>T: playing with sound
+```
+
+- `startPlayback()` (`VideoTile.vue:317`) replaces the two `play().catch(() => {})` calls that swallowed the
+  refusal. Before FR-124, a refused tile stayed black until its stream changed.
+- `AbortError` (a newer `srcObject` or `play()` took over) is not a refusal and is ignored. Anything else is
+  logged with `console.warn` and never hidden.
+- ⚠️ **`:muted="isLocal || soundBlocked"`** (`VideoTile.vue:29`): a binding, not just an assignment, so a
+  re-render can't unmute the element behind the browser's back.
+- ⚠️ **`click`, not `pointerdown`** (`armGestureRetry`, `VideoTile.vue:368`): on a touch screen the activation
+  comes with the pointer's release, so a `play()` at `pointerdown` would be refused again. The listener sits in the
+  capture phase, so a click that a control stops on its way still counts, and it is removed once used and on
+  unmount.
+
+Not covered by FR-124: `MiniConference.vue`'s own `<video>` elements. They never call `play()`, and the mini view
+is reached only after a Join click. A related gap, read from the code and left for its own fix: remote audio plays
+only through a rendered tile, so a participant whose tile is hidden or past the tiled maximum is not heard.
+
 ## Everything else
 
 - **Chat**: TipTap v3 editor (markdown, mentions, emoji via emoji-mart, Giphy
   picker), threads, reactions, pins.
 - **Conference**: mediasoup-client composables + `VideoTile`, layout modes,
-  active-speaker tracking, PiP.
+  active-speaker tracking, PiP. A black tile says why (above).
 - **Theming**: Vuetify light/dark with localStorage persistence.
 - **API client**: `ui/src/api/client.ts` — token injection + refresh handling.
 - **Dev proxy**: Vite proxies `/api` + `/ws` to `http://localhost:5001`.
@@ -219,6 +390,32 @@ The fix is route meta, not per-view watchers: `meta.remountOn: '<param>'`
 (`plugins/router.ts`), read by `components/layout/KeyedRouterView.vue`, keys the view by
 that one param. Every other route stays unkeyed on purpose — several views rewrite
 `route.query` in place and must not remount — so never key by `fullPath`.
+
+**The call page remounts by room, and asks before it leaves a call (#1637).** The app
+bar's Active Calls menu and the "Call started in …" snackbar push another room's call
+onto the call page in place. Until `room-call` carried `remountOn: 'roomId'`
+(`plugins/router.ts:243`), the page in room A's call kept A's call, chat and name under
+room B's URL: a message typed there went to B, and Leave left B, a call it was never in,
+while the server still listed the person in A. A remount alone would leave A's call
+running with nothing on the page to say so, because the mini-call widget hides on every
+call page. So the page settles its own call first, in `onBeforeRouteUpdate`
+(`views/conference/ConferenceView.vue:689`), with the question the Join button asks:
+
+| The page, when another room's call is pushed onto it | What happens |
+|---|---|
+| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:642`), then the page for the other room joins that room's call |
+| in its room's call, **Cancel**, Escape or a click outside | the navigation is refused. The call and the URL stay where they were |
+| in no call here | it remounts for the other room with no question, and joins nothing |
+
+The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
+taken at `ConferenceView.vue:772`). It is for that one room, spent by the next mount
+whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
+or a back-and-forward cannot put a camera into a call nobody just asked to join.
+`ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
+`e2e/conference-room-switch.spec.ts` drives the three rows in a browser against a real API
+and reads the outcome from the server's participant list for each room. Its join waits for
+the page's socket: a join sent before the socket has its connection id opens a call session
+with none, and a leave from that page, which names its connection, does not close it.
 
 **A link clicked inside the app never takes a tab away from a live session (#2841).** A
 page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,
@@ -290,6 +487,7 @@ its desktop height** for the same data.
 | **A tab window over wide content takes `:touch="false"`; a tab row that can overflow takes `show-arrows`** | `GrowthView.vue`, `AnalyticsView.vue`, the viewer's Settings tabs | a sideways swipe across a wide table switched the **tab**; and below 1280 px Vuetify hides the arrows unless asked, so tabs past the edge gave no sign of themselves |
 | **A number or caption that must be read never sits at the end of a card title** on a phone — it moves into the card's text | `GrowthView.vue` (the weekly-active-orgs north star) | a title never wraps: at 360 px the caption pushed the number off the card |
 | **While a session runs, the remote viewer's toolbar holds only Back, the device's name, Disconnect and Fullscreen**, at every width; the session's state chips and every tool ride their own row under it (`#rc-tb-strip`, one `<Teleport>`: one instance of each control, moved, never copied), state first, scrolling sideways; from 960 px the stats readout comes last, in whole pills only, so it never pushes a tool out of view. Connect's phases keep the one row (below 960 px its items in flex `order`). The stage's alerts overlay the stage | `RemoteControl.vue` (`rc-tb-*`, `sessionToolsOnStrip`, `.rc-stage-alerts`) | the title went to 0 px and Disconnect started off-screen; with every tool still in that one row, the row overflowed and the name was held at its 96 px minimum on a phone ("FR-…" at 360 px) and at 0 px on a 1300 px desktop, with the state chips past the edge or squeezed to stubs (FR-116 P5c); each alert's coming and going resized the frame, re-sent `rc:resolution` and rebuilt the agent's encoder |
+| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:440`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2690`; the pull-tab, `:934`; `.rc-immersive`, `:5758`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
 | **Text that cannot break still wraps** (`overflow-wrap: anywhere`) | message content (`MessageBubble.vue`), stacked table values | one long URL or email widened a whole list past the screen |
 | **Sign-in fields say what they are**: `autocapitalize="none"`, `autocorrect="off"`, `spellcheck="false"` on the username, `autocomplete` on every credential | `LoginView.vue`, `RegisterView.vue` | iOS capitalised the username, and the server matches it exactly |
 | **The public landing page's sections are a ☰ menu below 960 px**, and its wordmark never shrinks (`flex-0-0` on the title) | `LandingView.vue` | the links were hidden below 600 px with no other way to them, and the wordmark was clipped to "Roo" |
@@ -297,6 +495,23 @@ its desktop height** for the same data.
 | **A title row with buttons wraps** (`flex-wrap ga-2`), and its caption is a `v-card-subtitle class="text-wrap"`, never text inside the title | e.g. `OverlayAclSection.vue` | `v-card-title` and `v-card-subtitle` never wrap: Overlay ACL's caption pushed **New rule** off the card below ~800 px |
 | **A row of form fields wraps**: `flex-wrap` on the row and a `flex: 1 1 <basis>` on each field | the ACL editors | without wrap a Vuetify field shrinks instead — the Tunnel ACL host field rendered 0 px wide |
 | **An overlay node, or an audit row's device, is named by `useNodeLabel()`** — joined on the wire's `agent_id` / `tunnel_client_id`, never on the node's name | `composables/useNodeLabel.ts` | `OverlayNode.name` is a lossy DNS label, and audit rows carry the stored machine name: the device a person had just tapped on Devices came back under another name |
+
+The remote viewer on a phone held sideways (FR-125) moves between three states. Revealing the bars
+never resizes the stage, because a resized stage re-sends `rc:resolution`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Normal
+    Normal --> Immersive: session connected + coarse pointer + sideways + page under 500 px + setting on
+    Immersive --> Normal: held upright · session ends · setting off
+    Immersive --> Revealed: tap the pull-tab
+    Revealed --> Immersive: 4 s without a touch · tap on the stage
+    Revealed --> Normal: held upright · session ends
+    note right of Revealed
+        toolbar + tools strip slide down OVER the stage,
+        which keeps its size
+    end note
+```
 
 A list or a table on a phone goes through one decision:
 

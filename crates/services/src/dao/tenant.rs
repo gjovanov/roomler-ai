@@ -510,6 +510,12 @@ impl TenantDao {
         self.members.find_by_id(id).await
     }
 
+    /// #3247 — would `create` refuse this slug? The unique index on `slug`
+    /// is not partial, so a deleted organization still holds its slug.
+    pub async fn slug_taken(&self, slug: &str) -> DaoResult<bool> {
+        Ok(self.base.count(doc! { "slug": slug }).await? > 0)
+    }
+
     pub async fn find_by_slug(&self, slug: &str) -> DaoResult<Tenant> {
         self.base
             .find_one(doc! { "slug": slug, "deleted_at": null })
@@ -630,6 +636,43 @@ impl TenantDao {
             .await?
             .map(|m| m.role_ids)
             .unwrap_or_default())
+    }
+
+    /// FR-129 A1 — every member holding `flag` in `tenant_id`, in two
+    /// queries (the members, the tenant's roles) rather than one
+    /// [`Self::get_member_permissions`] per member: the "device paired"
+    /// notice goes to the org's other `MANAGE_AGENTS` holders, and an org
+    /// can have hundreds of members. The same fold as
+    /// `get_member_permissions`, so the two cannot disagree on who holds a
+    /// bit (`permissions::has` carries the `ADMINISTRATOR` bypass).
+    pub async fn members_with_permission(
+        &self,
+        tenant_id: ObjectId,
+        flag: u64,
+    ) -> DaoResult<Vec<ObjectId>> {
+        let members = self
+            .members
+            .find_many(doc! { "tenant_id": tenant_id }, None)
+            .await?;
+        let roles = self
+            .roles
+            .find_many(doc! { "tenant_id": tenant_id }, None)
+            .await?;
+        let masks: std::collections::HashMap<ObjectId, u64> = roles
+            .iter()
+            .filter_map(|r| r.id.map(|id| (id, r.permissions)))
+            .collect();
+        Ok(members
+            .into_iter()
+            .filter(|m| {
+                let combined = m
+                    .role_ids
+                    .iter()
+                    .fold(0u64, |acc, id| acc | masks.get(id).copied().unwrap_or(0));
+                role::permissions::has(combined, flag)
+            })
+            .map(|m| m.user_id)
+            .collect())
     }
 
     /// P4 — every member's user id for one tenant, in one query. The

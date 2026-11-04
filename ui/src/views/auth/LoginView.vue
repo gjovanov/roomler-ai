@@ -17,7 +17,7 @@
                  "Goran" and was refused as invalid credentials. -->
             <v-text-field
               v-model="username"
-              :label="$t('auth.username')"
+              :label="$t('auth.usernameOrEmail')"
               prepend-inner-icon="mdi-account"
               :rules="[rules.required]"
               autofocus
@@ -73,6 +73,10 @@
           <v-card-text class="text-center">
             {{ $t('auth.noAccount') }}
             <router-link :to="{ path: '/register', query: onward }">{{ $t('auth.register') }}</router-link>
+            <div class="mt-2">
+              {{ $t('auth.activationHelp') }}
+              <router-link to="/auth/activate" data-test="login-activation-help">{{ $t('auth.activationHelpLink') }}</router-link>
+            </div>
           </v-card-text>
         </v-card>
       </v-col>
@@ -89,6 +93,7 @@ import { useWsStore } from '@/stores/ws'
 import { useValidation } from '@/composables/useValidation'
 import { useBrand } from '@/composables/useBrand'
 import { carriedQuery, signupAttribution, startOAuth, type Landing } from '@/utils/attribution'
+import { PAIR_PATH, takePendingPair } from '@/utils/pairing'
 
 const auth = useAuthStore()
 // Provider buttons are a real touch target on a phone (28 px at `small`).
@@ -149,6 +154,11 @@ async function handleLogin() {
     ) {
       sessionStorage.removeItem('pending_redirect')
       router.push(pendingRedirect)
+    } else if (takePendingPair()) {
+      // FR-129 A2 — a pairing started in this browser is waiting; this is
+      // the tab an email activation came back in, where sessionStorage
+      // carried nothing. A literal path, never a stored one.
+      router.push(PAIR_PATH)
     } else {
       router.push({ name: 'dashboard' })
     }

@@ -111,6 +111,12 @@ pub struct DeviceRow {
     /// permanent device omit it).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// FR-55 P4 — an agent that is not online and announced it was going to
+    /// sleep: since when, and its power posture then (`held: false` = the
+    /// policy let it sleep). Omitted otherwise — on every online row, every
+    /// tunnel client, and every device that went offline without a word.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<roomler_ai_remote_control::models::SleepView>,
 }
 
 /// GET /api/tenant/{tenant_id}/device — membership-gated like every other
@@ -386,6 +392,8 @@ pub(crate) fn agent_row(
     dns_domain: Option<&str>,
 ) -> DeviceRow {
     let (overlay_ip, overlay_node_id, magic_dns_name, magic_dns_fqdn) = node_bits(node, dns_domain);
+    // FR-55 P4 — read before `a` is taken apart below.
+    let sleep = roomler_ai_remote_control::models::SleepView::of(a.sleep.as_ref(), is_online);
     DeviceRow {
         kind: "agent",
         id: a.id.map(|i| i.to_hex()).unwrap_or_default(),
@@ -408,6 +416,7 @@ pub(crate) fn agent_row(
         overlay_public_key: node.map(|n| n.wg_public_key.clone()),
         overlay_key_epoch: node.map(|n| n.key_epoch),
         ephemeral: a.ephemeral,
+        sleep,
     }
 }
 
@@ -445,6 +454,8 @@ pub(crate) fn client_row(
         overlay_key_epoch: node.map(|n| n.key_epoch),
         // Tunnel clients have no ephemeral kind (FR-51 P5 decides theirs).
         ephemeral: false,
+        // FR-55 P4 — a tunnel client never announces a sleep.
+        sleep: None,
     }
 }
 

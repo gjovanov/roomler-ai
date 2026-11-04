@@ -165,13 +165,13 @@ fn draw(f: &mut Frame, s: &PointerSample) -> Option<Covered> {
     // stopped halfway would leave part of a pointer that nothing puts back.
     let frame_end = (fy + h - 1) * stride + (fx + w) * 4;
     let shape_end = ((sy + h - 1) * sw + sx + w) * 4;
-    if f.data.len() < frame_end || shape.bgra.len() < shape_end {
+    if f.cpu().len() < frame_end || shape.bgra.len() < shape_end {
         return None;
     }
     let mut pixels = Vec::with_capacity(w * h * 4);
     for row in 0..h {
         let start = (fy + row) * stride + fx * 4;
-        let dst = &mut f.data[start..start + w * 4];
+        let dst = &mut f.cpu_mut()[start..start + w * 4];
         pixels.extend_from_slice(dst);
         let src_start = ((sy + row) * sw + sx) * 4;
         let src = &shape.bgra[src_start..src_start + w * 4];
@@ -203,7 +203,7 @@ fn put_back(f: &mut Frame, c: &Covered) {
     for row in 0..c.h {
         let start = (c.y + row) * stride + c.x * 4;
         let src = &c.pixels[row * c.w * 4..(row + 1) * c.w * 4];
-        if let Some(dst) = f.data.get_mut(start..start + c.w * 4) {
+        if let Some(dst) = f.cpu_mut().get_mut(start..start + c.w * 4) {
             dst.copy_from_slice(src);
         }
     }
@@ -226,7 +226,7 @@ mod tests {
             height: H,
             stride,
             pixel_format: PixelFormat::Bgra,
-            data: vec![fill; (stride * H) as usize],
+            data: vec![fill; (stride * H) as usize].into(),
             monotonic_us: 0,
             monitor: 0,
             damage: Damage::Unknown,
@@ -254,7 +254,7 @@ mod tests {
 
     fn px(f: &Frame, x: u32, y: u32) -> [u8; 4] {
         let i = (y * f.stride + x * 4) as usize;
-        [f.data[i], f.data[i + 1], f.data[i + 2], f.data[i + 3]]
+        [f.cpu()[i], f.cpu()[i + 1], f.cpu()[i + 2], f.cpu()[i + 3]]
     }
 
     /// A source that answers from a script and counts its polls.
@@ -345,20 +345,20 @@ mod tests {
         // The same pointer drawn once, at the new place, on a clean frame.
         let mut reference = layer_on(base);
         let expect = reference.frame_with(at(10, 6, 1, &s));
-        assert_eq!(moved.data, expect.data);
+        assert_eq!(moved.cpu(), expect.cpu());
     }
 
     #[test]
     fn hiding_the_pointer_gives_back_the_frame_exactly() {
         let mut f = frame(0, 0);
-        for (i, b) in f.data.iter_mut().enumerate() {
+        for (i, b) in f.cpu_mut().iter_mut().enumerate() {
             *b = (i * 7 % 251) as u8;
         }
-        let original = f.data.clone();
+        let original = f.cpu().to_vec();
         let mut l = layer_on(f);
         let _ = l.frame_with(at(2, 2, 1, &square(4)));
         let hidden = l.frame_with(None);
-        assert_eq!(hidden.data, original);
+        assert_eq!(hidden.cpu(), original);
     }
 
     #[test]
@@ -384,7 +384,7 @@ mod tests {
         let mut l = layer_on(frame(0x40, 0));
         for (x, y) in [(-4, 0), (16, 0), (0, -4), (0, 12), (i32::MIN, i32::MAX)] {
             let out = l.frame_with(at(x, y, 1, &s));
-            assert!(out.data.iter().all(|&b| b == 0x40), "at ({x}, {y})");
+            assert!(out.cpu().iter().all(|&b| b == 0x40), "at ({x}, {y})");
         }
     }
 
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(px(&out, 1, 1)[..3], [0xFF; 3]);
         assert_eq!(px(&out, 2, 1)[..3], [0x40; 3]);
         let pad = (W * 4) as usize;
-        assert!(out.data[pad..pad + 12].iter().all(|&b| b == 0x40));
+        assert!(out.cpu()[pad..pad + 12].iter().all(|&b| b == 0x40));
     }
 
     #[test]
@@ -421,10 +421,11 @@ mod tests {
         let mut l = layer_on(frame(0x40, 0));
         let s = square(3);
         let held = l.frame_with(at(1, 1, 1, &s));
-        let before = held.data.clone();
+        let before = held.cpu().to_vec();
         let next = l.frame_with(at(9, 5, 1, &s));
         assert_eq!(
-            held.data, before,
+            held.cpu(),
+            before,
             "a frame the encoder holds was changed under it"
         );
         assert_eq!(px(&next, 9, 5)[..3], [0xFF; 3]);
@@ -464,7 +465,7 @@ mod tests {
         f.pixel_format = PixelFormat::Nv12;
         let mut l = layer_on(f);
         let out = l.frame_with(at(0, 0, 1, &square(3)));
-        assert!(out.data.iter().all(|&b| b == 0x40));
+        assert!(out.cpu().iter().all(|&b| b == 0x40));
     }
 
     #[test]

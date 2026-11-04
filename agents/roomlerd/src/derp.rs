@@ -63,26 +63,149 @@ const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
 /// (possibly TLS-wrapped) WebSocket. Best-effort by design: an OS may clamp or
 /// ignore the request, and a carrier that works with a big buffer must not fail
 /// to start because we could not shrink it.
+///
+/// AC4 — so the size is read back, and one line says what the kernel holds. A
+/// set that returns `Ok` proves only that the OS took the call: Linux clamps at
+/// `net.core.wmem_max` without an error, and before Linux 6.18 that defaults to
+/// 212992, below the request.
 fn cap_send_buffer(
     ws: &tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     relay: &str,
-) {
-    use socket2::SockRef;
+) -> SndbufCap {
     use tokio_tungstenite::MaybeTlsStream;
-    let tcp = match ws.get_ref() {
-        MaybeTlsStream::Plain(s) => s,
-        MaybeTlsStream::Rustls(s) => s.get_ref().0,
+    let cap = match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => cap_tcp(s, DERP_SNDBUF_BYTES),
+        MaybeTlsStream::Rustls(s) => cap_tcp(s.get_ref().0, DERP_SNDBUF_BYTES),
         // `MaybeTlsStream` is `#[non_exhaustive]`; an unknown wrapper just
         // keeps the OS default rather than blocking the connection.
-        _ => {
-            debug!(%relay, "overlay derp: unrecognised TLS wrapper — send buffer left at the OS default");
-            return;
-        }
+        _ => SndbufCap::NoSocket,
     };
-    if let Err(e) = SockRef::from(tcp).set_send_buffer_size(DERP_SNDBUF_BYTES) {
-        debug!(%relay, %e, "overlay derp: set_send_buffer_size failed — OS default retained");
+    cap.log(relay, DERP_SNDBUF_BYTES);
+    cap
+}
+
+/// Ask for `requested` on `tcp`, then read back what the kernel holds.
+fn cap_tcp(tcp: &tokio::net::TcpStream, requested: usize) -> SndbufCap {
+    let sock = socket2::SockRef::from(tcp);
+    let set = sock.set_send_buffer_size(requested);
+    SndbufCap::read_back(
+        requested,
+        set,
+        sock.send_buffer_size(),
+        KERNEL_DOUBLES_SNDBUF,
+    )
+}
+
+/// FR-18 AC4 — Linux doubles a `SO_SNDBUF` request for its own bookkeeping,
+/// and `getsockopt` returns the doubled figure (socket(7); `sk_setsockopt` in
+/// `net/core/sock.c`). Windows and macOS return the size in force.
+const KERNEL_DOUBLES_SNDBUF: bool = cfg!(target_os = "linux");
+
+/// FR-18 AC4 — how the cap on one `/derp` socket ended, as
+/// `getsockopt(SO_SNDBUF)` reads it back after the set, in the request's units.
+///
+/// One read, straight after the set, is the size the connection keeps: on all
+/// three OSes the set turns that socket's send-buffer autotuning off (Linux
+/// sets `SOCK_SNDBUF_LOCK`; on Windows, dynamic send buffering "is enabled
+/// unless an application sets the SO_SNDBUF socket option"; XNU clears
+/// `SB_AUTOSIZE`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SndbufCap {
+    /// The kernel holds the size asked for.
+    Applied(usize),
+    /// It holds less, and the set still returned `Ok`: Linux clamps at
+    /// `net.core.wmem_max`, and Winsock "can succeed even if the implementation
+    /// did not provide the whole amount requested". A tighter cap is still a cap.
+    Clamped(usize),
+    /// It holds more than asked: the cap did not take.
+    Exceeded(usize),
+    /// The OS refused the request. It keeps its own size, when that reads back.
+    Refused { kept: Option<usize>, error: String },
+    /// The set took, but the size could not be read back.
+    Unread { error: String },
+    /// No TCP socket under the WebSocket to cap (an unknown TLS wrapper).
+    NoSocket,
+}
+
+impl SndbufCap {
+    /// Judge a set by what `getsockopt` `reported` after it. `doubles`: this
+    /// kernel reports twice the size in force ([`KERNEL_DOUBLES_SNDBUF`]).
+    fn read_back(
+        requested: usize,
+        set: std::io::Result<()>,
+        reported: std::io::Result<usize>,
+        doubles: bool,
+    ) -> Self {
+        use std::cmp::Ordering;
+        let in_force = |r: usize| if doubles { r / 2 } else { r };
+        match (set, reported) {
+            (Err(e), reported) => Self::Refused {
+                kept: reported.ok().map(in_force),
+                error: e.to_string(),
+            },
+            (Ok(()), Err(e)) => Self::Unread {
+                error: e.to_string(),
+            },
+            (Ok(()), Ok(r)) => {
+                let applied = in_force(r);
+                match applied.cmp(&requested) {
+                    Ordering::Equal => Self::Applied(applied),
+                    Ordering::Less => Self::Clamped(applied),
+                    Ordering::Greater => Self::Exceeded(applied),
+                }
+            }
+        }
+    }
+
+    /// The connect's line: INFO while the kernel holds the cap or a tighter
+    /// one, WARN when it does not. Every message opens "overlay derp: send
+    /// buffer", so one grep reads a host's log.
+    fn log(&self, relay: &str, requested: usize) {
+        match self {
+            Self::Applied(applied) => info!(
+                %relay,
+                requested,
+                applied,
+                clamped = false,
+                "overlay derp: send buffer capped — the kernel holds the requested size (FR-18)"
+            ),
+            Self::Clamped(applied) => info!(
+                %relay,
+                requested,
+                applied,
+                clamped = true,
+                "overlay derp: send buffer capped below the request — the OS clamped it \
+                 (FR-18; on Linux, net.core.wmem_max)"
+            ),
+            Self::Exceeded(applied) => warn!(
+                %relay,
+                requested,
+                applied,
+                clamped = false,
+                "overlay derp: send buffer not capped — the kernel holds more than requested (FR-18)"
+            ),
+            Self::Refused { kept, error } => warn!(
+                %relay,
+                requested,
+                applied = *kept,
+                %error,
+                "overlay derp: send buffer cap refused — the OS keeps its own size (FR-18)"
+            ),
+            Self::Unread { error } => warn!(
+                %relay,
+                requested,
+                %error,
+                "overlay derp: send buffer cap set but not read back — the size in force is unknown \
+                 (FR-18)"
+            ),
+            Self::NoSocket => warn!(
+                %relay,
+                requested,
+                "overlay derp: send buffer left at the OS default — unrecognised TLS wrapper (FR-18)"
+            ),
+        }
     }
 }
 
@@ -156,6 +279,7 @@ pub fn spawn(
         reg_frame,
         weak,
         outbound_rx,
+        crate::ws_connect::FlatRedial::from_config(),
     ));
 }
 
@@ -199,6 +323,8 @@ pub fn spawn_regional(
         reg_frame,
         weak,
         outbound_rx,
+        // FR-28 — no pod rolls under a regional relay: its ladder stays as it is.
+        crate::ws_connect::FlatRedial::off(),
     ));
 }
 
@@ -208,6 +334,7 @@ async fn run(
     reg_frame: Vec<u8>,
     mux: Weak<DerpMux>,
     mut outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
+    mut flat_redial: crate::ws_connect::FlatRedial,
 ) {
     // FR-18 — resolved once: the queue-age bound is a deployment knob, not a
     // per-frame decision, and re-reading the env per frame would be the hot
@@ -241,6 +368,7 @@ async fn run(
         match tokio::time::timeout(DERP_CONNECT_TIMEOUT, crate::ws_connect::connect(&url)).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1);
+                let connected_at = std::time::Instant::now();
                 // FR-18 — bound the KERNEL's send buffer too. Shedding stale
                 // frames above is pointless if a frame we did choose to send
                 // then sits for seconds in a socket buffer the age check can no
@@ -391,8 +519,26 @@ async fn run(
                     m.mark_down();
                 }
                 warn!(%relay, "overlay derp: /derp WS closed; reconnecting");
+                // FR-28 — only a socket that lived earns the next outage its
+                // flat redials. This loop's own ladder restarts on any accept,
+                // as it always has (see the top of this arm).
+                flat_redial.connection_ended(connected_at.elapsed());
             }
-            Ok(Err(e)) => warn!(%relay, %e, "overlay derp: /derp connect failed"),
+            Ok(Err(e)) => {
+                warn!(%relay, %e, "overlay derp: /derp connect failed");
+                // FR-28 — the load balancer answered 502: this tenant's pod is
+                // rolling. A flat wait, and the ladder stays where it is.
+                if let Some(wait) = flat_redial.step(crate::ws_connect::is_lb_502(&e)) {
+                    info!(
+                        %relay,
+                        wait_ms = wait.as_millis() as u64,
+                        left = flat_redial.left(),
+                        "overlay derp: the load balancer has no pod for this org yet; redialling flat (FR-28)"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            }
             Err(_) => warn!(%relay, "overlay derp: /derp connect timed out"),
         }
         tokio::time::sleep(backoff).await;
@@ -497,6 +643,7 @@ mod tests {
             mux.registration_frame(),
             Arc::downgrade(mux),
             outbound_rx,
+            crate::ws_connect::FlatRedial::off(),
         ))
     }
 
@@ -543,5 +690,445 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         task.abort();
+    }
+
+    /// FR-28 — what a scripted front does with one dial.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// Refuse the upgrade with this HTTP status line.
+        Status(&'static str),
+        /// Upgrade, keep the socket this long, then drop it with no close.
+        Accept(Duration),
+    }
+
+    const LB_502: Answer = Answer::Status("502 Bad Gateway");
+
+    /// FR-28 — the front load balancer in one process: `answer` picks the reply
+    /// from the dial's index. Hands back the `ws://…/ws` base and when each dial
+    /// arrived, in order.
+    async fn scripted_front(
+        answer: impl Fn(usize) -> Answer + Send + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<std::time::Instant>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}/ws", listener.local_addr().unwrap());
+        let dials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = dials.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(std::time::Instant::now());
+                    seen.len() - 1
+                };
+                let this = answer(n);
+                tokio::spawn(async move {
+                    match this {
+                        Answer::Status(line) => {
+                            let mut buf = [0u8; 4096];
+                            let _ = s.read(&mut buf).await;
+                            let reply = format!(
+                                "HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = s.write_all(reply.as_bytes()).await;
+                        }
+                        Answer::Accept(keep) => {
+                            let ws = tokio_tungstenite::accept_async(s).await;
+                            tokio::time::sleep(keep).await;
+                            drop(ws);
+                        }
+                    }
+                });
+            }
+        });
+        (base, dials)
+    }
+
+    /// FR-28 — the real dialer against `base`, with `flat`. Hold the mux for as
+    /// long as it should run: a dropped one stops it.
+    fn dialing_with(
+        base: &str,
+        flat: crate::ws_connect::FlatRedial,
+    ) -> (tokio::task::JoinHandle<()>, Arc<DerpMux>) {
+        let (mux, outbound_rx) = DerpMux::new([9u8; 32]);
+        let slot = crate::token_slot::TokenSlot::new("live");
+        let task = tokio::spawn(run(
+            "central".to_string(),
+            central_url_per_attempt(base, slot, "t1"),
+            mux.registration_frame(),
+            Arc::downgrade(&mux),
+            outbound_rx,
+            flat,
+        ));
+        (task, mux)
+    }
+
+    fn dial_count(dials: &std::sync::Mutex<Vec<std::time::Instant>>) -> usize {
+        dials.lock().unwrap().len()
+    }
+
+    /// The wait between dial `n` and the one after it.
+    fn gap_after(dials: &std::sync::Mutex<Vec<std::time::Instant>>, n: usize) -> Duration {
+        let dials = dials.lock().unwrap();
+        dials[n + 1] - dials[n]
+    }
+
+    /// Hold until `n` dials have arrived; a dialer that stops fails here.
+    async fn until_dialled(dials: &std::sync::Mutex<Vec<std::time::Instant>>, n: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while dial_count(dials) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {n} dials",
+                dial_count(dials)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// FR-28 — the roll in one process: the front answers 502 until the
+    /// replacement listens, which it does just past the ladder's +3 s dial. That
+    /// is the case that costs a socket a whole step in the field, and flat lands
+    /// within a second of it. The ladder's own landing is pinned by the next test.
+    #[tokio::test]
+    async fn flat_lands_within_a_second_of_the_replacement_listening() {
+        let listens_at = Duration::from_millis(3200);
+        let started = std::time::Instant::now();
+        let (base, dials) = scripted_front(move |_| {
+            if started.elapsed() < listens_at {
+                LB_502
+            } else {
+                Answer::Accept(Duration::from_secs(60))
+            }
+        })
+        .await;
+        let (task, _mux) = dialing_with(&base, crate::ws_connect::FlatRedial::on());
+        // Dials at about 0.75 s apart: the replacement has been up for at most
+        // 1 s by the landing, with 500 ms of slack for a loaded runner.
+        let deadline = started + listens_at + Duration::from_millis(1500);
+        let mut landed = None;
+        while std::time::Instant::now() < deadline && landed.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let last = dials.lock().unwrap().last().copied();
+            landed = last.filter(|t| t.duration_since(started) >= listens_at);
+        }
+        task.abort();
+        assert!(
+            landed.is_some(),
+            "no dial within 1.5 s of the pod listening: {} dial(s)",
+            dial_count(&dials)
+        );
+    }
+
+    /// FR-28 — off is today: the same front, and the socket waits out the step.
+    #[tokio::test]
+    async fn off_the_same_roll_waits_out_the_ladder() {
+        let listens_at = Duration::from_millis(3200);
+        let started = std::time::Instant::now();
+        let (base, dials) = scripted_front(move |_| {
+            if started.elapsed() < listens_at {
+                LB_502
+            } else {
+                Answer::Accept(Duration::from_secs(60))
+            }
+        })
+        .await;
+        let (task, _mux) = dialing_with(&base, crate::ws_connect::FlatRedial::off());
+        until_dialled(&dials, 4).await;
+        task.abort();
+        let dials = dials.lock().unwrap();
+        // 0, 1 and 3 s, then the 4 s step: 3.8 s past the pod listening.
+        assert_eq!(dials.len(), 4);
+        for (i, want) in [0u64, 1000, 3000, 7000].into_iter().enumerate() {
+            let at = dials[i].duration_since(started).as_millis() as u64;
+            assert!(
+                at + 300 >= want && at <= want + 1500,
+                "dial {i} at {at} ms, the ladder says {want} ms"
+            );
+        }
+    }
+
+    /// FR-28 — only the load balancer's 502 is flat. A Mongo blip (500), an
+    /// unmounted module (503), a node that cannot be reached (504) and a refused
+    /// token (401) all keep the ladder, with the switch on.
+    #[tokio::test]
+    async fn only_a_502_is_redialled_flat() {
+        let mut runs = Vec::new();
+        for line in [
+            "401 Unauthorized",
+            "500 Internal Server Error",
+            "503 Service Unavailable",
+            "504 Gateway Time-out",
+        ] {
+            let (base, dials) = scripted_front(move |_| Answer::Status(line)).await;
+            let dialer = dialing_with(&base, crate::ws_connect::FlatRedial::on());
+            runs.push((line, dials, dialer));
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        for (line, dials, (task, _mux)) in runs {
+            task.abort();
+            assert_eq!(
+                dial_count(&dials),
+                3,
+                "{line} must climb: dials at 0, 1 and 3 s, the next at 7 s"
+            );
+        }
+    }
+
+    /// FR-28 — the allowance is real on the real loop: two flat redials, and then
+    /// the ladder from the step it stood on, not a stop and not more flat.
+    #[tokio::test]
+    async fn a_502_that_outlasts_the_allowance_climbs_the_ladder() {
+        let (base, dials) = scripted_front(|_| LB_502).await;
+        let flat = crate::ws_connect::FlatRedial::with_limits(2, Duration::from_secs(30));
+        let (task, _mux) = dialing_with(&base, flat);
+        tokio::time::sleep(Duration::from_millis(6500)).await;
+        task.abort();
+        // Two flat waits of 0.5 to 1 s, then 1, 2 and 4 s: the fifth dial by 5 s at
+        // the latest, the sixth at 8 s at the earliest. Still flat would be 7 or
+        // more dials by now, and never flat would be 3.
+        assert_eq!(dial_count(&dials), 5);
+    }
+
+    /// FR-28 and #2221 — a server that accepts and drops earns no more flat
+    /// redials. The one allowed goes on the first 502; the accepted socket that
+    /// follows does not last, so the 502 after it takes the ladder's step.
+    #[tokio::test]
+    async fn a_socket_that_does_not_last_refills_nothing() {
+        let (base, dials) = scripted_front(|n| match n {
+            1 => Answer::Accept(Duration::ZERO),
+            _ => LB_502,
+        })
+        .await;
+        let flat = crate::ws_connect::FlatRedial::with_limits(1, Duration::from_secs(30));
+        let (task, _mux) = dialing_with(&base, flat);
+        until_dialled(&dials, 4).await;
+        task.abort();
+        // The accept restarted the ladder at 1 s, and its close doubled it, so
+        // the 502 after it waits 2 s. Refilled, it would have waited at most 1 s.
+        assert!(
+            gap_after(&dials, 2) >= Duration::from_millis(1800),
+            "{:?}",
+            gap_after(&dials, 2)
+        );
+    }
+
+    /// FR-28 — a socket that lived past the bar gives the next outage its
+    /// redials back. The bar is the real one's job in production; here it is
+    /// 300 ms, so this does not wait out 30 s.
+    #[tokio::test]
+    async fn a_socket_that_lived_refills_the_allowance() {
+        let (base, dials) = scripted_front(|n| match n {
+            1 => Answer::Accept(Duration::from_millis(600)),
+            _ => LB_502,
+        })
+        .await;
+        let flat = crate::ws_connect::FlatRedial::with_limits(1, Duration::from_millis(300));
+        let (task, _mux) = dialing_with(&base, flat);
+        until_dialled(&dials, 4).await;
+        task.abort();
+        // Unrefilled, this 502 would have waited the ladder's 2 s.
+        assert!(
+            gap_after(&dials, 2) <= Duration::from_millis(1500),
+            "{:?}",
+            gap_after(&dials, 2)
+        );
+    }
+
+    /// FR-18 AC4 — a cap is judged by what the kernel reports after the set,
+    /// in the request's units. Linux reports twice the size in force, and
+    /// clamps at `net.core.wmem_max` with no error (212992 before Linux 6.18).
+    #[test]
+    fn a_cap_is_judged_by_what_the_kernel_reports_after_the_set() {
+        let req = DERP_SNDBUF_BYTES;
+        let judge = |reported: usize, doubles: bool| {
+            SndbufCap::read_back(req, Ok(()), Ok(reported), doubles)
+        };
+        // Windows and macOS report the size in force.
+        assert_eq!(judge(req, false), SndbufCap::Applied(req));
+        // Linux: the doubled figure is the request, applied...
+        assert_eq!(judge(2 * req, true), SndbufCap::Applied(req));
+        // ...or the clamp, which the set never mentions.
+        assert_eq!(judge(2 * 212_992, true), SndbufCap::Clamped(212_992));
+        // Winsock may provide less than asked and still return success.
+        assert_eq!(judge(64 * 1024, false), SndbufCap::Clamped(64 * 1024));
+        // On an OS that reports the size in force, Linux's doubled figure would
+        // be a buffer twice the cap.
+        assert_eq!(judge(2 * req, false), SndbufCap::Exceeded(2 * req));
+    }
+
+    /// A refused set and an unreadable size are outcomes of their own, never
+    /// a cap.
+    #[test]
+    fn a_refused_or_unread_cap_is_never_read_as_applied() {
+        let req = DERP_SNDBUF_BYTES;
+        let err = |m: &str| std::io::Error::other(m.to_string());
+        assert_eq!(
+            SndbufCap::read_back(req, Err(err("no buffer space")), Ok(4 << 20), false),
+            SndbufCap::Refused {
+                kept: Some(4 << 20),
+                error: "no buffer space".into()
+            }
+        );
+        assert_eq!(
+            SndbufCap::read_back(req, Err(err("refused")), Err(err("bad fd")), true),
+            SndbufCap::Refused {
+                kept: None,
+                error: "refused".into()
+            }
+        );
+        assert_eq!(
+            SndbufCap::read_back(req, Ok(()), Err(err("bad fd")), true),
+            SndbufCap::Unread {
+                error: "bad fd".into()
+            }
+        );
+    }
+
+    /// A loopback TCP connection: the dialled end and the accepted one.
+    async fn loopback_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (dialled, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        (dialled.unwrap(), accepted.unwrap().0)
+    }
+
+    /// What the kernel under this test should hold after a `requested` cap:
+    /// the request, or on Linux `net.core.wmem_max` where that is lower. `None`
+    /// when the clamp cannot be read: the sysctl lives in the initial network
+    /// namespace only, so a container may not see it.
+    fn this_kernel_holds(requested: usize) -> Option<SndbufCap> {
+        if !cfg!(target_os = "linux") {
+            return Some(SndbufCap::Applied(requested));
+        }
+        let max: usize = std::fs::read_to_string("/proc/sys/net/core/wmem_max")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(if max < requested {
+            SndbufCap::Clamped(max)
+        } else {
+            SndbufCap::Applied(requested)
+        })
+    }
+
+    /// FR-18 AC4 — through a WebSocket like the dialler's, the cap reaches the
+    /// socket under it and reads back as this kernel applies it.
+    #[tokio::test]
+    async fn a_derp_socket_reads_its_cap_back_as_this_kernel_applies_it() {
+        let (dialled, _accepted) = loopback_pair().await;
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(dialled),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let cap = cap_send_buffer(&ws, "test");
+        // The kernel's answer, for a run with `--nocapture` (a container
+        // cannot read its clamp, so this is all it can show).
+        eprintln!("requested {DERP_SNDBUF_BYTES}: {cap:?}");
+        match this_kernel_holds(DERP_SNDBUF_BYTES) {
+            Some(want) => assert_eq!(cap, want),
+            None => assert!(
+                matches!(
+                    cap,
+                    SndbufCap::Applied(DERP_SNDBUF_BYTES) | SndbufCap::Clamped(_)
+                ),
+                "{cap:?}"
+            ),
+        }
+    }
+
+    /// The set turns the socket's send-buffer autotuning off, so the size read
+    /// back at connect is the one the carrier keeps: filling the socket until
+    /// the kernel takes no more leaves it where the cap put it.
+    #[tokio::test]
+    async fn a_full_socket_keeps_the_size_its_cap_read_back() {
+        // The accepted end never reads, so both buffers fill.
+        let (dialled, _accepted) = loopback_pair().await;
+        let capped = cap_tcp(&dialled, DERP_SNDBUF_BYTES);
+        let chunk = vec![0u8; 64 * 1024];
+        let mut sent = 0usize;
+        // Full = not writable for 250 ms.
+        while let Ok(ready) =
+            tokio::time::timeout(Duration::from_millis(250), dialled.writable()).await
+        {
+            ready.unwrap();
+            match dialled.try_write(&chunk) {
+                Ok(n) => sent += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("write failed after {sent} bytes: {e}"),
+            }
+            assert!(sent < 1 << 30, "the socket never filled");
+        }
+        let after = SndbufCap::read_back(
+            DERP_SNDBUF_BYTES,
+            Ok(()),
+            socket2::SockRef::from(&dialled).send_buffer_size(),
+            KERNEL_DOUBLES_SNDBUF,
+        );
+        assert!(sent > 0, "nothing was written");
+        assert_eq!(after, capped, "the cap moved after {sent} bytes");
+    }
+
+    /// What `f` logs, as the daemon's log file writes it.
+    fn logged(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        // Two dispatchers, never one (`hive::view`'s tests: with one, a
+        // callsite's interest is taken once for every thread).
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let subscriber = tracing_subscriber::fmt()
+            .with_target(false)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned()
+    }
+
+    /// FR-18 AC4 — the line a field read greps for names the request, what the
+    /// kernel applied and whether it clamped, at INFO. A cap that did not take
+    /// is a WARN.
+    #[test]
+    fn the_cap_line_names_requested_applied_and_clamped() {
+        let line = logged(|| SndbufCap::Clamped(212_992).log("central", DERP_SNDBUF_BYTES));
+        for want in [
+            "INFO",
+            "overlay derp: send buffer capped below the request",
+            "relay=central",
+            "requested=262144",
+            "applied=212992",
+            "clamped=true",
+        ] {
+            assert!(line.contains(want), "{want:?} is not in {line:?}");
+        }
+        let line =
+            logged(|| SndbufCap::Applied(DERP_SNDBUF_BYTES).log("central", DERP_SNDBUF_BYTES));
+        for want in ["INFO", "applied=262144", "clamped=false"] {
+            assert!(line.contains(want), "{want:?} is not in {line:?}");
+        }
+        let line = logged(|| SndbufCap::Exceeded(1 << 20).log("central", DERP_SNDBUF_BYTES));
+        for want in [
+            "WARN",
+            "overlay derp: send buffer not capped",
+            "applied=1048576",
+        ] {
+            assert!(line.contains(want), "{want:?} is not in {line:?}");
+        }
     }
 }

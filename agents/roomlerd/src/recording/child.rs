@@ -243,13 +243,51 @@ fn stop_reason_from(word: Option<&str>) -> StopReason {
 }
 
 /// Register the encoder knobs the record child reads from config, exactly the
-/// keys `main.rs` registers for the daemon's own encoders (`ENCODER_CELLS_DENY`
-/// and the pinned hardware devices). An env var set by a parent still wins —
-/// that is `node_env`'s precedence.
+/// keys `main.rs` registers for the daemon's own encoders (`ENCODER_CELLS_DENY`,
+/// FR-130's `COLOR_DESCRIPTION` and the pinned hardware devices). An env var
+/// set by a parent still wins — that is `node_env`'s precedence.
 pub fn register_encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) {
+    let m = encoder_fallbacks(cfg);
+    if !m.is_empty() {
+        tunnel_core::env::register_config_fallbacks(m);
+    }
+}
+
+/// [`register_encoder_fallbacks`] for `roomlerd media export`, which opens a
+/// recording encoder too and is run by the companion as the person. FR-130
+/// AC4: the export honours the device's switch, denylist and pinned devices
+/// like a hand-run recorder.
+pub fn register_encoder_fallbacks_at(config_path: &std::path::Path) {
+    let m = encoder_fallbacks_at(config_path);
+    if !m.is_empty() {
+        tunnel_core::env::register_config_fallbacks(m);
+    }
+}
+
+/// The map [`register_encoder_fallbacks_at`] registers. The config is read and
+/// never written (`read_if_present`; `load` self-heals). One this process
+/// cannot read, such as a machine config read by a person, gives an empty map,
+/// which leaves env and the built-in defaults.
+fn encoder_fallbacks_at(config_path: &std::path::Path) -> HashMap<String, String> {
+    roomler_node_core::config::read_if_present(&config_path.to_path_buf())
+        .map(|cfg| encoder_fallbacks(&cfg))
+        .unwrap_or_default()
+}
+
+/// The map [`register_encoder_fallbacks`] registers.
+fn encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) -> HashMap<String, String> {
     let mut m: HashMap<String, String> = HashMap::new();
     if let Some(v) = &cfg.encoder_cells_deny {
         m.insert("ENCODER_CELLS_DENY".into(), v.clone());
+    }
+    // FR-130 — the colour description's kill switch: an FFmpeg-encoded
+    // recording writes the description too, so a hand-run recorder honours the
+    // switch the daemon's recorders inherit. Bools bridge as `1` / `0`.
+    if let Some(on) = cfg.color_description {
+        m.insert(
+            "COLOR_DESCRIPTION".into(),
+            if on { "1" } else { "0" }.into(),
+        );
     }
     if let Some(v) = &cfg.vaapi_device {
         m.insert("VAAPI_DEVICE".into(), v.clone());
@@ -260,9 +298,7 @@ pub fn register_encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) 
     if let Some(v) = &cfg.vulkan_device {
         m.insert("VULKAN_DEVICE".into(), v.clone());
     }
-    if !m.is_empty() {
-        tunnel_core::env::register_config_fallbacks(m);
-    }
+    m
 }
 
 /// Every protocol line starts with this, like the probe children's
@@ -520,6 +556,52 @@ pub async fn run(args: RecordArgs, config_path: &std::path::Path) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-130 — a hand-run recorder reads the colour description's switch
+    /// from the config, as the daemon's recorders inherit it: an explicit off
+    /// is published as `0`, and unset publishes nothing (the built-in on).
+    #[test]
+    fn a_hand_run_recorder_reads_the_colour_switch_from_the_config() {
+        let mut cfg = roomler_node_core::config::test_fixture();
+        assert!(!encoder_fallbacks(&cfg).contains_key("COLOR_DESCRIPTION"));
+        cfg.color_description = Some(false);
+        cfg.encoder_cells_deny = Some("h264_nvenc:yuv420".into());
+        let m = encoder_fallbacks(&cfg);
+        assert_eq!(m.get("COLOR_DESCRIPTION").map(String::as_str), Some("0"));
+        assert_eq!(
+            m.get("ENCODER_CELLS_DENY").map(String::as_str),
+            Some("h264_nvenc:yuv420")
+        );
+        cfg.color_description = Some(true);
+        assert_eq!(
+            encoder_fallbacks(&cfg)
+                .get("COLOR_DESCRIPTION")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    /// FR-130 AC4 — `media export` reads the same keys from the config file:
+    /// a config with the switch off gives `0`, and a config that is not there
+    /// gives nothing, leaving env and the built-in defaults.
+    #[test]
+    fn an_export_reads_the_colour_switch_from_the_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        assert!(encoder_fallbacks_at(&path).is_empty(), "no config: no keys");
+
+        let mut cfg = roomler_node_core::config::test_fixture();
+        cfg.color_description = Some(false);
+        cfg.encoder_cells_deny = Some("h264_nvenc:yuv420".into());
+        roomler_node_core::config::save(&path, &cfg).expect("save");
+        let m = encoder_fallbacks_at(&path);
+        assert_eq!(m.get("COLOR_DESCRIPTION").map(String::as_str), Some("0"));
+        assert_eq!(
+            m.get("ENCODER_CELLS_DENY").map(String::as_str),
+            Some("h264_nvenc:yuv420")
+        );
+        assert_eq!(m, encoder_fallbacks(&cfg), "the hand-run recorder's map");
+    }
 
     #[test]
     fn stdin_stop_reasons_map_to_the_closed_set() {

@@ -44,6 +44,11 @@
 //! without endpoints, and its own status with the root half's network fields
 //! ([`with_machine_network`]).
 //!
+//! **And one row (FR-43 P3a).** A one-row Mac's GUI worker holds no enrollment
+//! at all, so its identity and its link to the server come from the root half
+//! the same way ([`with_machine_identity`]), and `Devices` and `Mesh` go there
+//! directly ([`machine_view`]): the person's own view is the machine's.
+//!
 //! Kill switch: `ROOMLERD_PERSON_SOCKET=0` (or `false` / `off` / `no`) — the
 //! pre-P11 behaviour, and on a Mac the pre-P2g one, since with no socket the
 //! per-user half keeps its own answer.
@@ -164,6 +169,29 @@ pub async fn or_machine_view(own: Response, req: tunnel_core::localapi::Request)
     own
 }
 
+/// FR-43 P3a — the answer a one-row Mac's GUI worker gives to `req`: the root
+/// half's, whatever it says, because this process has no server of its own to
+/// ask. A root half that does not answer is a server out of reach from here.
+pub async fn machine_view(req: tunnel_core::localapi::Request) -> Response {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: geteuid never fails.
+        let euid = unsafe { libc::geteuid() };
+        if let Some(machine) = machine_answer(euid, &req, SERVER_ANSWER).await {
+            return machine;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = req;
+    Response::Upstream {
+        code: "server_unreachable".into(),
+        message: "the root daemon, which holds this Mac's connection to the server, did not \
+                  answer"
+            .into(),
+        status: None,
+    }
+}
+
 /// How long the root half has to answer a question it asks its server first
 /// (Devices, Mesh: one HTTP round trip, cached).
 #[cfg(target_os = "macos")]
@@ -213,12 +241,17 @@ pub fn network_view_wanted(own_overlay_ip: Option<&str>, euid: u32) -> bool {
 /// without that, `roomler status` as the console user printed the root half's
 /// address as this half's, right above this half's own "overlay OFF"
 /// enrollments, and the companion's Overview showed it as the device's own.
+///
+/// FR-128 D8 — and the machine's netcheck: this half runs no overlay, so it
+/// measures nothing, and an `auto` session it builds reads the far-TURN reach
+/// of its own machine from here (`rc_overlay::own_far_turn`).
 pub fn with_machine_network(mut own: NodeStatus, machine: &NodeStatus) -> NodeStatus {
     if machine.overlay_ip.is_some() {
         own.overlay_ip = machine.overlay_ip.clone();
         own.overlay_ip6 = machine.overlay_ip6.clone();
         own.exit_node = machine.exit_node.clone();
         own.dns = machine.dns.clone();
+        own.netcheck = machine.netcheck.clone();
         own.network_from = Some(tunnel_core::localapi::NetworkOrigin {
             node_id: machine.node_id.clone(),
             name: machine.name.clone(),
@@ -227,19 +260,62 @@ pub fn with_machine_network(mut own: NodeStatus, machine: &NodeStatus) -> NodeSt
     own
 }
 
-/// FR-97 P2h — the status a Mac's per-user half answers: its own, with the
-/// root half's network fields where [`network_view_wanted`] says so.
-#[cfg(target_os = "macos")]
-pub async fn or_machine_status(own: NodeStatus) -> NodeStatus {
-    // SAFETY: geteuid never fails.
-    let euid = unsafe { libc::geteuid() };
-    if network_view_wanted(own.overlay_ip.as_deref(), euid)
-        && let Some(Response::Status(machine)) =
-            machine_answer(euid, &tunnel_core::localapi::Request::Status, LIVE_ANSWER).await
-    {
-        return with_machine_network(own, &machine);
+/// FR-43 P3a — the status a one-row Mac's GUI worker answers: the device's, which
+/// the root half holds. Its name, its row, its orgs and its link to the server
+/// replace this process's blanks, and its version, mode, account and config path
+/// stay this process's own. There is one row, so nothing here is lent:
+/// `network_from` goes, and the addresses read as the device's.
+///
+/// With no answer from the root half, `own` says so: the stand-in always reads
+/// connected and is no server, and an `orgs` row naming it must not reach the
+/// companion, which opens a row's server in a browser.
+pub fn with_machine_identity(mut own: NodeStatus, machine: Option<&NodeStatus>) -> NodeStatus {
+    match machine {
+        Some(machine) => {
+            own.node_id = machine.node_id.clone();
+            own.name = machine.name.clone();
+            own.tenant_id = machine.tenant_id.clone();
+            own.connected = machine.connected;
+            own.ephemeral = machine.ephemeral;
+            own.orgs = machine.orgs.clone();
+            own.network_from = None;
+        }
+        None => {
+            own.connected = false;
+            own.orgs = Vec::new();
+        }
     }
     own
+}
+
+/// FR-97 P2h — the status a Mac's per-user half answers: its own, with the
+/// root half's network fields where [`network_view_wanted`] says so.
+///
+/// FR-43 P3a — and with `no_enrollment`, a flag and not a blank field, its
+/// identity and its link too ([`with_machine_identity`]).
+#[cfg(target_os = "macos")]
+pub async fn or_machine_status(own: NodeStatus, no_enrollment: bool) -> NodeStatus {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    let network_wanted = network_view_wanted(own.overlay_ip.as_deref(), euid);
+    let mut machine = None;
+    if network_wanted || no_enrollment {
+        machine = match machine_answer(euid, &tunnel_core::localapi::Request::Status, LIVE_ANSWER)
+            .await
+        {
+            Some(Response::Status(machine)) => Some(*machine),
+            _ => None,
+        };
+    }
+    let own = match &machine {
+        Some(machine) if network_wanted => with_machine_network(own, machine),
+        _ => own,
+    };
+    if no_enrollment {
+        with_machine_identity(own, machine.as_ref())
+    } else {
+        own
+    }
 }
 
 /// FR-97 P2h — the peers a Mac's per-user half answers: the root half's where
@@ -524,13 +600,18 @@ mod tests {
             r#"{"node_id":"d","name":"mac-d","version":"0.4.149","mode":"service","connected":true,
                 "overlay_ip":"100.64.0.9","overlay_ip6":"fd7a:115c:a1e0::9",
                 "dns":{"magic_domain":"vmtest.roomler.ai","resolver_bound":true,
-                       "os_steer_active":true,"upstream":"192.0.2.53:53","answer_aaaa":true}}"#,
+                       "os_steer_active":true,"upstream":"192.0.2.53:53","answer_aaaa":true},
+                "netcheck":{"stun_udp":false,"relay_band_udp":false,"derp_ws_ok":true,"age_s":90}}"#,
         );
         let merged = with_machine_network(own.clone(), &machine);
         assert_eq!(merged.overlay_ip.as_deref(), Some("100.64.0.9"));
         assert_eq!(merged.overlay_ip6.as_deref(), Some("fd7a:115c:a1e0::9"));
         assert!(merged.dns.is_some());
         assert_eq!(merged.dns, machine.dns);
+        // FR-128 D8 — the machine's netcheck, which this half cannot measure.
+        assert!(own.netcheck.is_none());
+        assert_eq!(merged.netcheck, machine.netcheck);
+        assert!(merged.netcheck.as_ref().is_some_and(|n| !n.stun_udp));
         // #2892 — and the answer names the daemon those fields belong to.
         assert_eq!(
             merged.network_from,
@@ -557,5 +638,75 @@ mod tests {
         );
         assert_eq!(with_machine_network(own.clone(), &off), own);
         assert_eq!(own.network_from, None);
+    }
+
+    fn worker_status() -> NodeStatus {
+        status(
+            r#"{"node_id":"","name":"mac","version":"0.4.199","mode":"user","privileged":false,
+                "tenant_id":"","connected":true,"config_path":"/Users/p/config.toml",
+                "orgs":[{"label":"primary","server_url":"http://127.0.0.1:50123","primary":true,
+                         "enabled":true,"connected":true}]}"#,
+        )
+    }
+
+    fn root_status() -> NodeStatus {
+        status(
+            r#"{"node_id":"d","name":"MacBook","version":"0.4.198","mode":"service",
+                "privileged":true,"tenant_id":"t1","connected":false,"ephemeral":true,
+                "overlay_ip":"100.64.0.9",
+                "orgs":[{"label":"primary","server_url":"https://roomler.ai","tenant_id":"t1",
+                         "agent_id":"d","primary":true,"enabled":true,"connected":false}]}"#,
+        )
+    }
+
+    /// FR-43 P3a — a worker with no enrollment shows the device: the root half's
+    /// identity and link, whatever those say, and this process's own build and
+    /// account. Nothing reads as lent, because there is only the one row.
+    #[test]
+    fn a_worker_with_no_enrollment_shows_the_roots_identity_and_link() {
+        let own = worker_status();
+        let machine = root_status();
+        let merged =
+            with_machine_identity(with_machine_network(own.clone(), &machine), Some(&machine));
+
+        assert_eq!(merged.node_id, "d");
+        assert_eq!(merged.name, "MacBook");
+        assert_eq!(merged.tenant_id.as_deref(), Some("t1"));
+        assert!(merged.ephemeral);
+        assert_eq!(merged.orgs, machine.orgs);
+        assert_eq!(merged.overlay_ip.as_deref(), Some("100.64.0.9"));
+        assert_eq!(merged.network_from, None);
+        // The stand-in reads connected, and the root half's link is the truth.
+        assert!(own.connected);
+        assert!(!merged.connected);
+        // What this process really is stays its own.
+        assert_eq!(merged.version, own.version);
+        assert_eq!(merged.mode, own.mode);
+        assert_eq!(merged.privileged, own.privileged);
+        assert_eq!(merged.config_path, own.config_path);
+    }
+
+    /// FR-43 P3a — and with no root half it claims nothing: not the stand-in's
+    /// `connected`, and no `orgs` row whose server is the stand-in's port.
+    #[test]
+    fn a_worker_with_no_root_half_claims_no_link_and_names_no_stand_in() {
+        let merged = with_machine_identity(worker_status(), None);
+        assert!(!merged.connected);
+        assert!(merged.orgs.is_empty());
+        let wire = serde_json::to_string(&merged).unwrap();
+        assert!(!wire.contains("127.0.0.1"), "{wire}");
+    }
+
+    /// FR-43 P3a — off a Mac there is no root half: a server out of reach, by its
+    /// named code, which a client can tell from "no devices".
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn the_machine_view_with_no_root_half_is_a_server_out_of_reach() {
+        let answer =
+            machine_view(tunnel_core::localapi::Request::Mesh { org: String::new() }).await;
+        assert!(
+            matches!(answer, Response::Upstream { ref code, .. } if code == "server_unreachable"),
+            "{answer:?}"
+        );
     }
 }

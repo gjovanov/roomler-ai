@@ -81,6 +81,14 @@
 mod checkpointer;
 #[cfg(unix)]
 mod child;
+/// FR-90 P4-6-1b-1 — `roomler_connect`, the device's half: what the
+/// organization's map says reaching an entity takes, opened from this device
+/// when a probe from here found it.
+mod connect_tool;
+/// FR-90 P8-2d-0 — the device's own parts (the replica store and stream, the
+/// viewer's peer, the prober's measure), and the seams they reach the daemon
+/// through, ahead of their worker.
+mod device;
 /// FR-90 P3b-1b-1 — a session's egress proxy: the fronts Claude Code's
 /// sandbox sends its commands through, each host decided by the vault. No
 /// run starts one before P3b-1b-2.
@@ -152,6 +160,9 @@ mod vault_render;
 #[cfg(feature = "vault")]
 mod vault_request;
 pub mod view;
+/// FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's worker, the
+/// daemon's supervised child (P8-2b-1: on Windows too; P8-2d-1: the device's).
+mod worker;
 mod workspace;
 
 pub use checkpointer::{CHECKPOINT_SUBCOMMAND, checkpoint_args, checkpoint_main};
@@ -178,3 +189,4 @@ pub use view::{
     SearchGrant, ViewGrant, handle_search_grant, handle_view_close, handle_view_grant,
     handle_view_ice, handle_view_offer, handle_view_renew,
 };
+pub use worker::{worker_args, worker_main};

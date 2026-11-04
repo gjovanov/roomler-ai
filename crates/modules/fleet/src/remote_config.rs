@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! `PUT /api/tenant/{tenant_id}/agent/{agent_id}/desired-config` — record the
 //! device config an operator wants, for the agent to reconcile when it next
-//! connects. Step 2 of `docs/remote-config.md`.
+//! connects, and nudge it now if it is connected. Step 2 of
+//! `docs/remote-config.md`.
 //!
 //! This route writes an INTENT, never a fact. The device is free to ignore it
 //! (and does, unless it has opted in via `remote_config_enabled`), so nothing
@@ -12,9 +13,10 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::models::DesiredConfig;
+use roomler_ai_remote_control::models::{DesiredConfig, parse_pushed_tribool, pushed_tribool_wire};
+use roomler_ai_services::dao::base::DaoError;
 use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -37,6 +39,18 @@ pub struct DesiredConfigBody {
     pub encoder_cells_deny: Option<String>,
     #[serde(default)]
     pub fps_deny: Option<String>,
+    /// FR-130 P1b — `on`, `off`, or blank (back to the device's default).
+    #[serde(default)]
+    pub color_description: Option<String>,
+    /// FR-132 P1 — `name:gpu` entries, `none`, or blank (clear the device's
+    /// key). Passed on unread, as the two denylists above are.
+    #[serde(default)]
+    pub zero_copy_deny: Option<String>,
+    /// Every other key in the body, kept only to be refused if it is a device
+    /// owner's ([`names_a_device_owned_key`]). Dropped silently, an `external_*`
+    /// key would answer 200 as if the push had taken. Never stored or logged.
+    #[serde(flatten)]
+    pub rest: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// ⚠️ `desired` is the SAME projection the listing returns
@@ -66,6 +80,8 @@ pub enum ConfigDenyReason {
     CannotGrantExec,
     /// Asked to change SSH without holding `SSH_DEVICE`.
     CannotGrantSsh,
+    /// FR-52 — the body names an `external_*` key, which no server may push.
+    DeviceOwnedKey,
 }
 
 impl ConfigDenyReason {
@@ -74,6 +90,7 @@ impl ConfigDenyReason {
             Self::NotDeviceAdmin => "not_device_admin",
             Self::CannotGrantExec => "cannot_grant_exec",
             Self::CannotGrantSsh => "cannot_grant_ssh",
+            Self::DeviceOwnedKey => "device_owned_key",
         }
     }
 
@@ -87,6 +104,10 @@ impl ConfigDenyReason {
             Self::CannotGrantSsh => {
                 "Changing SSH access on a device requires SSH_DEVICE — you cannot open a door \
                  you cannot walk through"
+            }
+            Self::DeviceOwnedKey => {
+                "External access is the device owner's to set, on the device: no server can \
+                 push an external_* key"
             }
         }
     }
@@ -142,6 +163,83 @@ pub fn decide(
     Ok(())
 }
 
+/// FR-52 — does a desired-config body name an `external_*` key?
+///
+/// [`DesiredConfig`] cannot hold one (`no_external_key_is_server_pushable_via_desired_config`),
+/// so nothing here could reach a device either way. This is the honest answer
+/// to whoever asked: gate 3 is the device owner's opt-in, and a 200 would say a
+/// push took that never will. The prefix, not a list: the key that matters is
+/// the one added after this was written.
+fn names_a_device_owned_key(rest: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+    rest.keys().any(|k| k.starts_with("external_"))
+}
+
+/// FR-130 P1b — a pushed tribool, spelled the one way the device and the
+/// dialog read it (`on`, `off`, or blank to clear the device's key), or a 400
+/// naming the key. The words `roomler config set` takes are accepted too.
+///
+/// Unlike the two denylists, which the server passes on unread, a tribool has
+/// three meaningful values and nothing else: there is no entry for a device
+/// to skip while it applies the rest of the value.
+fn pushed_tribool(key: &str, v: &str) -> Result<String, ApiError> {
+    parse_pushed_tribool(v)
+        .map(|b| pushed_tribool_wire(b).to_string())
+        .map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))
+}
+
+/// FR-132 P1b — tell a connected device about a save now, with the frame the
+/// connect path sends, so a kill switch does not wait for the socket to drop.
+///
+/// Called after the document is stored, which is what makes a miss harmless: a
+/// device that connects at any point after that reads this revision. Best
+/// effort for the same reason. Reconcile-on-connect is still what a device
+/// converges by, so a lost nudge costs only the wait for it, and nothing here
+/// changes what the device will accept: gate 4 is its own to keep, and the
+/// report still comes back over its socket.
+///
+/// Local first; the ctrl lane covers a device homed on another pod, as for a
+/// cross-org join. Only "not on this pod" goes that way: a connection that
+/// does not read the frame says so here as it does on every connect.
+async fn nudge_connected_device(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    desired: &DesiredConfig,
+) {
+    // The connect path's rule: a cleared form is nothing to reconcile.
+    if desired.is_empty() {
+        return;
+    }
+    match state
+        .rc_hub
+        .push_desired_config(agent_id, tenant_id, desired.clone())
+    {
+        Err(roomler_ai_remote_control::error::Error::AgentOffline(_)) => {
+            let desired = match serde_json::to_value(desired) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(%e, "desired config did not serialise for the ctrl lane");
+                    return;
+                }
+            };
+            crate::ctrl::publish_rc_ctrl(
+                state,
+                "config_push",
+                serde_json::json!({
+                    "agent_id": agent_id.to_hex(),
+                    "tenant_id": tenant_id.to_hex(),
+                    "desired": desired,
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::info!(agent = %agent_id, %e, "desired config not pushed on save");
+        }
+        Ok(()) => {}
+    }
+}
+
 pub async fn set_desired_config(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -152,6 +250,15 @@ pub async fn set_desired_config(
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+    // FR-130 P1b — a word no device can read is a malformed body, refused
+    // before anything is decided, as a mistyped field is. Recorded, it would
+    // leave the device's key as it is, and the device would report the push
+    // applied.
+    let color_description = body
+        .color_description
+        .as_deref()
+        .map(|v| pushed_tribool("color_description", v))
+        .transpose()?;
 
     // Membership first: `get_member_permissions` is the membership check too,
     // so a non-member never reaches the policy below.
@@ -173,6 +280,8 @@ pub async fn set_desired_config(
         ssh_port: body.ssh_port,
         encoder_cells_deny: body.encoder_cells_deny,
         fps_deny: body.fps_deny,
+        color_description,
+        zero_copy_deny: body.zero_copy_deny,
         revision: agent.desired_config.revision + 1,
         updated_by: Some(auth.user_id),
         updated_at: Some(DateTime::now()),
@@ -181,7 +290,13 @@ pub async fn set_desired_config(
     // ONE call site records both arms. `decide` returning a Result rather than
     // a bool is what makes "a new refusal that forgets to audit itself"
     // unrepresentable — the same shape as `agent_ssh::dispatch`.
-    let verdict = decide(perms, &agent.desired_config, &requested);
+    let verdict = decide(perms, &agent.desired_config, &requested).and_then(|()| {
+        if names_a_device_owned_key(&body.rest) {
+            Err(ConfigDenyReason::DeviceOwnedKey)
+        } else {
+            Ok(())
+        }
+    });
     if let Err(e) = state
         .config_audit
         .record(
@@ -199,16 +314,25 @@ pub async fn set_desired_config(
     }
 
     if let Err(reason) = verdict {
+        if reason == ConfigDenyReason::DeviceOwnedKey {
+            tracing::warn!(
+                tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
+                "desired-config: an external_* key was pushed — refused, it is the device's"
+            );
+        }
         return Err(ApiError::Forbidden(reason.message().to_string()));
     }
 
-    let bson = bson::to_bson(&requested)
-        .map_err(|e| ApiError::Internal(format!("serialising desired_config: {e}")))?;
-    state
+    // `false`: the removal won the race with the lookup above, and nothing was
+    // stored.
+    if !state
         .agents
-        .base
-        .update_by_id(aid, doc! { "$set": { "desired_config": bson } })
-        .await?;
+        .set_desired_config(tid, aid, &requested)
+        .await?
+    {
+        return Err(DaoError::NotFound.into());
+    }
+    nudge_connected_device(&state, tid, aid, &requested).await;
 
     Ok(Json(DesiredConfigResponse {
         revision: requested.revision,
@@ -356,6 +480,9 @@ mod tests {
     fn the_put_response_is_the_same_shape_the_listing_returns() {
         let requested = DesiredConfig {
             exec_enabled: Some(true),
+            // FR-130 P1b — a clear, which must reach the client as `""`: an
+            // absent key would read as "not managed", a different request.
+            color_description: Some(String::new()),
             revision: 1,
             updated_by: Some(bson::oid::ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -382,6 +509,11 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains('T') && s.ends_with('Z')),
             "updated_at must be an RFC3339 string: {json}"
+        );
+        assert_eq!(
+            v["desired"]["color_description"].as_str(),
+            Some(""),
+            "a clear must stay a clear in the projection: {json}"
         );
     }
 
@@ -519,5 +651,91 @@ mod tests {
             decide(0, &DesiredConfig::default(), &deny),
             Err(ConfigDenyReason::NotDeviceAdmin)
         );
+    }
+
+    /// FR-132 P1 — the GPU-input denylist is FR-118's kill switch, the same
+    /// way: it only ever REMOVES a GPU form a device would otherwise open, so
+    /// `MANAGE_AGENTS` alone may push it, a clear included, and nothing less
+    /// may push any of it.
+    #[test]
+    fn the_gpu_input_denylist_needs_only_manage_agents() {
+        for value in ["hevc_qsv:gpu,av1_nvenc:gpu", "none", ""] {
+            let deny = DesiredConfig {
+                zero_copy_deny: Some(value.into()),
+                ..Default::default()
+            };
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &deny)
+                .unwrap_or_else(|e| panic!("MANAGE_AGENTS alone may push {value:?}: {e:?}"));
+            assert!(!deny.touches_exec() && !deny.touches_ssh(), "{value:?}");
+            assert!(
+                !deny.is_empty(),
+                "{value:?}: a denylist-only request is a request"
+            );
+            for short in [0, DEFAULT_MEMBER] {
+                assert_eq!(
+                    decide(short, &DesiredConfig::default(), &deny),
+                    Err(ConfigDenyReason::NotDeviceAdmin),
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    /// FR-130 P1b — the colour-description switch is no gate either: `off`
+    /// only removes metadata from the stream, and `on` or a clear writes what
+    /// the built-in default writes. So `MANAGE_AGENTS` alone may push any of
+    /// the three, a clear included, and nothing less may push any.
+    #[test]
+    fn the_colour_description_switch_needs_only_manage_agents() {
+        for word in ["off", "on", ""] {
+            let push = DesiredConfig {
+                color_description: Some(word.into()),
+                ..Default::default()
+            };
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &push)
+                .unwrap_or_else(|e| panic!("MANAGE_AGENTS alone may push {word:?}: {e:?}"));
+            assert!(!push.touches_exec() && !push.touches_ssh(), "{word:?}");
+            assert!(!push.is_empty(), "{word:?}: a clear is a request too");
+            for short in [0, DEFAULT_MEMBER] {
+                assert_eq!(
+                    decide(short, &DesiredConfig::default(), &push),
+                    Err(ConfigDenyReason::NotDeviceAdmin),
+                    "{word:?}"
+                );
+            }
+        }
+    }
+
+    /// FR-130 P1b — the route stores the one spelling the device and the
+    /// dialog read, takes the words `roomler config set` takes, and refuses
+    /// a word no device could read, naming the key.
+    #[test]
+    fn a_pushed_tribool_is_stored_in_one_spelling_or_refused() {
+        for (given, stored) in [
+            ("off", "off"),
+            (" OFF ", "off"),
+            ("false", "off"),
+            ("0", "off"),
+            ("on", "on"),
+            ("True", "on"),
+            ("1", "on"),
+            ("yes", "on"),
+            ("", ""),
+            ("  ", ""),
+        ] {
+            match pushed_tribool("color_description", given) {
+                Ok(s) => assert_eq!(s, stored, "{given:?}"),
+                Err(e) => panic!("{given:?} must be stored as {stored:?}: {e}"),
+            }
+        }
+        for unread in ["maybe", "default", "2", "o n"] {
+            match pushed_tribool("color_description", unread) {
+                Err(ApiError::BadRequest(m)) => {
+                    assert!(m.starts_with("color_description: "), "{unread:?}: {m}")
+                }
+                Err(other) => panic!("{unread:?} must be a 400, got {other}"),
+                Ok(s) => panic!("{unread:?} must be refused, got {s:?}"),
+            }
+        }
     }
 }

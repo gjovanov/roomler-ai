@@ -79,10 +79,14 @@ pub enum ProgressEvent {
     /// into the replay log.
     #[serde(rename_all = "camelCase")]
     DownloadProgress { received_bytes: u64 },
-    /// Download complete; SHA256 verified (or `digest=None` and
-    /// verification was skipped with `sha256_match=true`).
+    /// Download complete, and compared with the digest the release
+    /// published. Not sent when the release published none.
     #[serde(rename_all = "camelCase")]
     DownloadVerified { sha256_match: bool },
+    /// #3246 — the download carries a valid signature from Roomler's
+    /// publisher, and `signer` is the name on it.
+    #[serde(rename_all = "camelCase")]
+    PublisherVerified { signer: String },
 
     /// msiexec launched (daemon roles, Windows). `pid` is the OS PID
     /// for operator diagnostics. SPA relabels Cancel to "Force-kill
@@ -138,6 +142,57 @@ pub enum ProgressEvent {
     /// command. `reason` is for the operator and never carries the token.
     #[serde(rename_all = "camelCase")]
     AnchorSkipped { reason: String },
+
+    /// #3174 — a limited wizard on a machine-wide install leaves the companion
+    /// to the service, and the EXE is not there yet.
+    CompanionWaiting,
+    /// #3174 — `roomler-desktop.exe` is there after the step, whoever placed it.
+    CompanionPresent,
+    /// #3174 — it is not. Never fatal: `message` says what happens next.
+    #[serde(rename_all = "camelCase")]
+    CompanionAbsent { message: String },
+
+    /// #3116 — a Windows reinstall: the daemon the installer restarted loaded
+    /// the config from before it, so it is asked to restart onto the one this
+    /// install just wrote, as `install.sh` restarts the Linux unit. A remote
+    /// session to the device drops for a few seconds.
+    DaemonRestartStarted,
+    /// #3116 — the daemon runs on the new enrollment; `pid` is the process
+    /// that answered, when it said.
+    #[serde(rename_all = "camelCase")]
+    DaemonRestartOk { pid: Option<u32> },
+    /// #3116 — the daemon was not restarted onto the new enrollment. Never
+    /// fatal: the config is written, and no startup save of the running daemon
+    /// writes over it (`config::StartupWrites`), so the enrollment takes effect
+    /// at its next start. `reason` says why, and what to do.
+    #[serde(rename_all = "camelCase")]
+    DaemonRestartSkipped { reason: String },
+
+    /// FR-129 B1 — a half of the embedded `install.sh` started (a daemon
+    /// role on Linux or macOS). `half` is `privileged` or `user`; `tool` is
+    /// what runs it: `pkexec` or `osascript` (the desktop's own administrator
+    /// prompt), `terminal` (the person runs the command themselves), `sh`
+    /// (the user half, as the person).
+    #[serde(rename_all = "camelCase")]
+    ScriptHalfStarted { half: String, tool: String },
+    /// FR-129 B1 — one line a half printed, stdout or stderr, as it printed
+    /// it. The halves take no token, so a line never carries one.
+    #[serde(rename_all = "camelCase")]
+    ScriptLine { half: String, line: String },
+    /// FR-129 B1 — a half exited; `code` is its exit status, `0` done.
+    #[serde(rename_all = "camelCase")]
+    ScriptHalfDone { half: String, code: i32 },
+    /// FR-129 B1 — the person dismissed the administrator prompt. Nothing was
+    /// installed and nothing is wrong with the package; the install ends.
+    #[serde(rename_all = "camelCase")]
+    ElevationCancelled { half: String },
+    /// FR-129 B1 — no administrator prompt could be shown or it refused
+    /// (`pkexec` absent, no polkit agent, the password not accepted): the SPA
+    /// shows `command` for the person to run in a terminal — it carries no
+    /// secret — and the pipeline waits until they say it ran. `reason` is for
+    /// the person.
+    #[serde(rename_all = "camelCase")]
+    ElevationUnavailable { command: String, reason: String },
 
     /// Whole install finished. SPA transitions to the Done step.
     Done,
@@ -321,6 +376,27 @@ mod tests {
         );
         assert!(
             skipped.contains(r#""reason":"the administrator prompt was declined""#),
+            "got {skipped}"
+        );
+    }
+
+    /// #3116 — the restart onto a reinstall's enrollment, as the SPA reads it.
+    #[test]
+    fn daemon_restart_events_serialise_as_the_spa_reads_them() {
+        let ok =
+            serde_json::to_string(&ProgressEvent::DaemonRestartOk { pid: Some(4242) }).unwrap();
+        assert!(ok.contains(r#""type":"DaemonRestartOk""#), "got {ok}");
+        assert!(ok.contains(r#""pid":4242"#), "got {ok}");
+        let skipped = serde_json::to_string(&ProgressEvent::DaemonRestartSkipped {
+            reason: "the service declined".to_string(),
+        })
+        .unwrap();
+        assert!(
+            skipped.contains(r#""type":"DaemonRestartSkipped""#),
+            "got {skipped}"
+        );
+        assert!(
+            skipped.contains(r#""reason":"the service declined""#),
             "got {skipped}"
         );
     }

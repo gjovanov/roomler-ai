@@ -1,0 +1,87 @@
+# The daemon and companion packages, packaged the way the release lane packages
+# them and installed on bare images, on the PR that changes what they declare
+# (#3204). The release lane runs the same script on what it is about to publish
+# (`verify-linux-debs`); this is how a packaging change hears about it first.
+#
+# Nothing here compiles the agent. The payload is the latest release's and the
+# control file is this checkout's, which is the whole of what such a PR changes,
+# and `cargo deb --no-build --no-strip` is the lane's own command.
+#
+# ⚠️ If a new file changes what a package declares or how it installs, add its
+# path here, or this stops covering the change that needed it most.
+name: deb-bare-image
+
+on:
+  pull_request:
+    paths:
+      - 'agents/roomlerd/Cargo.toml'
+      - 'agents/roomler-desktop/Cargo.toml'
+      - 'agents/roomlerd/packaging/linux/**'
+      - 'agents/roomler-desktop/packaging/linux/**'
+      - 'scripts/install.sh'
+      - 'scripts/deb-bare-check.sh'
+      - 'scripts/deb-stage-release.sh'
+      - '.github/workflows/deb-bare-image.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-bare-image-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  packages:
+    name: Packages on bare images (${{ matrix.triple }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            triple: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Download the latest agent release's packages
+        run: |
+          tag=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 20 \
+            --json tagName -q '[.[].tagName | select(startswith("agent-v"))][0]')
+          echo "payload: $tag"
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -D released \
+            -p "roomlerd-*-${{ matrix.triple }}.deb" \
+            -p "roomler-desktop-*-${{ matrix.triple }}.deb"
+
+      - name: Package them as the release lane does
+        run: |
+          bash scripts/deb-stage-release.sh target released/roomlerd-*.deb released/roomler-desktop-*.deb
+          (cd agents/roomlerd && cargo deb --no-build --no-strip)
+          (cd agents/roomler-desktop && cargo deb --no-build --no-strip)
+          mkdir built
+          mv target/debian/roomlerd_*.deb target/debian/roomler-desktop_*.deb built/
+
+      - name: Install them on bare images and start them
+        run: bash scripts/deb-bare-check.sh --install-sh scripts/install.sh built/*.deb
+
+      - name: Control — the check refuses a package known not to start
+        # agent-v0.4.190 is #3204 itself: on Ubuntu 24.04 apt gives it a stub ALSA
+        # and the daemon dies at load. A check that passed it would prove nothing.
+        run: |
+          gh release download agent-v0.4.190 -R "$GITHUB_REPOSITORY" -D control \
+            -p "roomlerd-0.4.190-${{ matrix.triple }}.deb"
+          if bash scripts/deb-bare-check.sh --image ubuntu:24.04 control/*.deb; then
+            echo "::error::the check passed a package that cannot start, so its passes mean nothing"
+            exit 1
+          fi

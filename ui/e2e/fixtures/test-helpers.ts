@@ -372,7 +372,7 @@ export async function fetchActivationEmail(
         if (full.ok) {
           const body = (await full.json()) as { HTML: string; Text: string; Subject: string }
           // Activation URL lands in the HTML as
-          //   <a href="<frontend_url>/auth/activate?userId=<hex>&token=<7-char-nanoid>">
+          //   <a href="<frontend_url>/auth/activate?userId=<hex>&token=<21-char-nanoid>">
           const m = /href="(https?:\/\/[^"]*\/auth\/activate\?userId=[a-f0-9]{24}&token=[^"]+)"/i.exec(
             body.HTML,
           )

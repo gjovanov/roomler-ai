@@ -30,6 +30,22 @@
 //! actually useful to an operator reading `ps`; only the secret is on the
 //! pipe.
 //!
+//! ## The pipe is also the lifeline (#2987)
+//!
+//! After the secret, a supervisor of this release writes
+//! `macos_supervisor::LIFELINE_LINE` and keeps its end of the pipe open for as
+//! long as the worker lives. The worker therefore reads stdin on a thread of
+//! its own until the pipe closes, which happens when the daemon is gone,
+//! however it ended. The worker then stops through its own graceful door, so
+//! the next daemon's worker finds the person's single-instance lock free.
+//! Before this, a daemon that died without `stop_worker` (the watchdog's
+//! `exit(2)`) left its worker running on the old release, holding the lock,
+//! for good.
+//!
+//! The thread does not use tokio's `stdin`: tokio reads it on a blocking task
+//! that cannot be cancelled, and the runtime's shutdown waits for that task. A
+//! read that lasts the whole life of the process would hold every exit hostage.
+//!
 //! ## Why a DEDICATED socket, and not the LocalAPI one
 //!
 //! Because an unprivileged worker cannot open the control socket, and must not
@@ -64,6 +80,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::delegate::DelegateFrame;
 use crate::delegate::WorkerInbound;
 use crate::delegate::write_frame;
+use crate::macos_supervisor::{LIFELINE_BACKSTOP, LinkEnd};
 use roomler_ai_remote_control::signaling::ClientMsg;
 
 /// How often the worker proves the channel is alive.
@@ -134,6 +151,13 @@ async fn gates_changed(w: &mut GateWatch) {
 /// launchd-owned workers, a hand-run `roomlerd run`, and the daemon.
 pub async fn run(
     supervised: bool,
+    // FR-43 P3a — this worker holds no enrollment, so this channel is all it
+    // can serve, and without it the process is of no use to anyone.
+    unenrolled: bool,
+    // FR-43 P3a — and its own log lines, which go to the daemon over the
+    // channel because this process has no row to upload them on. `None` for
+    // every other worker, which uploads its own.
+    mut logs: Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
@@ -142,6 +166,9 @@ pub async fn run(
         tokio::sync::mpsc::Receiver<ClientMsg>,
     )>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    // #2987 — the agent's internal shutdown, which the stdin thread sends when
+    // the daemon holding the other end of the pipe is gone.
+    stop: tokio::sync::watch::Sender<bool>,
 ) {
     if !supervised {
         tracing::debug!("delegation: not a supervised worker; not attaching");
@@ -151,7 +178,7 @@ pub async fn run(
         tracing::warn!("delegation: --supervised but no signalling channels; not attaching");
         return;
     };
-    let Some(secret) = read_secret_from_stdin().await else {
+    let Some(secret) = read_secret(start_stdin_link(stop)).await else {
         // LOUD, not silent: `--supervised` with no secret means the supervisor
         // and the worker disagree about how the secret travels, which is
         // exactly the failure that made P1's env marker a no-op for three
@@ -159,13 +186,27 @@ pub async fn run(
         tracing::warn!(
             "delegation: started with --supervised but no secret arrived on stdin; not attaching"
         );
+        // FR-43 P3a — an enrolled worker still serves its own row. One with no
+        // enrollment would run on, serving nothing, and read as healthy: leave,
+        // and the supervisor's bound on fast exits applies.
+        if unenrolled {
+            std::process::exit(1);
+        }
         return;
     };
 
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(&secret, &to_signaling, &mut from_signaling, &mut shutdown).await {
+        match attach_once(
+            &secret,
+            &to_signaling,
+            &mut from_signaling,
+            &mut logs,
+            &mut shutdown,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -203,6 +244,7 @@ async fn attach_once(
     secret: &str,
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
@@ -373,7 +415,8 @@ async fn attach_once(
                         Ok(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
-                            | DelegateFrame::KeepBusyTold { .. },
+                            | DelegateFrame::KeepBusyTold { .. }
+                            | DelegateFrame::WorkerLogs { .. },
                         ) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
@@ -399,6 +442,17 @@ async fn attach_once(
                     None => return Ok(()),
                 }
             }
+            // FR-43 P3a — this worker's own log lines, for the daemon to upload
+            // on its row. What is queued goes in one frame, so a burst is one
+            // write; lines logged while detached wait in the queue, which drops
+            // the newest when full, as it would for any uploader.
+            line = next_log_line(logs) => match line {
+                Some(first) => {
+                    let lines = log_batch(first, logs);
+                    write_frame(&mut wr, &DelegateFrame::WorkerLogs { lines }).await?;
+                }
+                None => *logs = None,
+            },
             _ = tokio::time::sleep(PING_EVERY) => {
                 write_frame(&mut wr, &DelegateFrame::Ping).await?;
             }
@@ -428,35 +482,165 @@ async fn attach_once(
     }
 }
 
-/// Read the attach secret: one line on stdin, bounded.
+/// FR-43 P3a — the next of this worker's log lines, or never when it forwards
+/// none. `None` when the layer's sender has gone.
+async fn next_log_line(
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Option<crate::logs_upload::LogLine> {
+    match logs {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// FR-43 P3a — `first` and whatever else is queued behind it, up to one frame's
+/// worth, each trimmed to what a frame carries.
+fn log_batch(
+    first: crate::logs_upload::LogLine,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Vec<crate::logs_upload::LogLine> {
+    let mut lines = vec![first];
+    if let Some(rx) = logs.as_mut() {
+        while lines.len() < crate::delegate::WORKER_LOG_LINES_PER_FRAME {
+            match rx.try_recv() {
+                Ok(line) => lines.push(line),
+                Err(_) => break,
+            }
+        }
+    }
+    for line in &mut lines {
+        crate::delegate::trim_worker_line(line);
+    }
+    lines
+}
+
+/// Start the thread that owns stdin (#2987). It reads the attach secret, then
+/// watches the pipe for the close of the end the daemon holds. Returns where
+/// the secret arrives.
+fn start_stdin_link(
+    stop: tokio::sync::watch::Sender<bool>,
+) -> tokio::sync::oneshot::Receiver<Option<String>> {
+    let (secret_tx, secret_rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-lifeline".into())
+        .spawn(move || {
+            let end = crate::macos_supervisor::stdin_link(std::io::stdin().lock(), |secret| {
+                // The attach side may have stopped waiting; nothing to do then.
+                let _ = secret_tx.send(secret);
+            });
+            match end {
+                LinkEnd::Cut => daemon_gone(&stop),
+                LinkEnd::NotOffered => tracing::info!(
+                    "delegation: the supervisor closed our stdin after the secret (a daemon \
+                     from before #2987), so this worker cannot notice the daemon ending"
+                ),
+                LinkEnd::Unknown => tracing::warn!(
+                    "delegation: the supervisor offered a lifeline this worker does not know; \
+                     not watching stdin"
+                ),
+                LinkEnd::Lost(e) => tracing::warn!(
+                    error = %e,
+                    "delegation: lost the watch on stdin; this worker will not notice the \
+                     daemon ending"
+                ),
+                // `run` reports it: it is the side that waited for a secret.
+                LinkEnd::NoSecret => {}
+            }
+        });
+    if let Err(e) = spawned {
+        // The closure is dropped with the sender in it, and the attach side
+        // reads that as no secret.
+        tracing::warn!(error = %e, "delegation: could not start the stdin thread");
+    }
+    secret_rx
+}
+
+/// The daemon that held the other end of our stdin is gone (#2987).
+///
+/// Leave through the agent's own graceful door, the internal shutdown an
+/// update uses. A stop that completes marks the run clean, so the
+/// crash-and-rollback ladder never counts it. It is not an OS stop, so an
+/// ephemeral device does not unenroll: the next daemon spawns a fresh worker
+/// on the same enrollment. The backstop's exit is unclean, and is meant to
+/// be: it fires only when the stop wedged. The next daemon's reap waits longer
+/// than the backstop ([`crate::macos_supervisor::REAP_GRACE`]), so it never
+/// cuts a stop that is still running.
+fn daemon_gone(stop: &tokio::sync::watch::Sender<bool>) -> ! {
+    tracing::warn!(
+        "delegation: our daemon is gone (its end of our stdin closed); stopping, so the next \
+         daemon's worker finds the single-instance lock free (#2987)"
+    );
+    let _ = stop.send(true);
+    std::thread::sleep(LIFELINE_BACKSTOP);
+    tracing::error!(
+        backstop_secs = LIFELINE_BACKSTOP.as_secs(),
+        "delegation: the graceful stop did not finish; forcing the exit (#2987)"
+    );
+    std::process::exit(1);
+}
+
+/// Wait for the attach secret, bounded.
 ///
 /// Bounded because a worker that hangs waiting for a line that will never come
 /// is worse than one that gives up — the supervisor would see a process that
 /// starts and does nothing, and the operator would see a remote-desktop half
 /// that is running and useless. Five seconds is far longer than a parent that
 /// already has the secret in hand needs.
-async fn read_secret_from_stdin() -> Option<String> {
-    use tokio::io::AsyncBufReadExt;
-    let mut line = String::new();
-    let read = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::io::BufReader::new(tokio::io::stdin())
-            .read_line(&mut line)
-            .await
-    })
-    .await;
-    match read {
-        Ok(Ok(n)) if n > 0 => {
-            let secret = line.trim().to_string();
-            (!secret.is_empty()).then_some(secret)
-        }
-        Ok(Ok(_)) => None,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "delegation: could not read the secret from stdin");
-            None
-        }
+async fn read_secret(secret: tokio::sync::oneshot::Receiver<Option<String>>) -> Option<String> {
+    match tokio::time::timeout(Duration::from_secs(5), secret).await {
+        Ok(Ok(secret)) => secret,
+        // The stdin thread never started.
+        Ok(Err(_)) => None,
         Err(_) => {
             tracing::warn!("delegation: timed out waiting for the secret on stdin");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegate::{WORKER_LOG_LINES_PER_FRAME, WORKER_LOG_MSG_MAX};
+
+    fn line(msg: String) -> crate::logs_upload::LogLine {
+        crate::logs_upload::LogLine {
+            ts: bson::DateTime::now(),
+            level: crate::logs_upload::LogLevel::Info,
+            target: "roomlerd".into(),
+            msg,
+            fields: bson::Document::new(),
+        }
+    }
+
+    /// FR-43 P3a — a burst of the worker's log lines leaves in frames of at most
+    /// one frame's worth, in order, none lost between frames, and a message too
+    /// long for a frame is cut.
+    #[tokio::test]
+    async fn queued_log_lines_leave_in_bounded_trimmed_frames() {
+        let total = WORKER_LOG_LINES_PER_FRAME * 2 + 7;
+        let (tx, rx) = tokio::sync::mpsc::channel(total + 1);
+        for i in 0..total {
+            tx.try_send(line(i.to_string())).unwrap();
+        }
+        tx.try_send(line("x".repeat(WORKER_LOG_MSG_MAX + 100)))
+            .unwrap();
+        drop(tx);
+
+        let mut logs = Some(rx);
+        let mut seen = Vec::new();
+        let mut frames = 0;
+        while let Some(first) = next_log_line(&mut logs).await {
+            let batch = log_batch(first, &mut logs);
+            assert!(batch.len() <= WORKER_LOG_LINES_PER_FRAME);
+            seen.extend(batch);
+            frames += 1;
+        }
+        assert_eq!(frames, 3);
+        assert_eq!(seen.len(), total + 1);
+        for (i, l) in seen.iter().take(total).enumerate() {
+            assert_eq!(l.msg, i.to_string());
+        }
+        assert_eq!(seen[total].msg.len(), WORKER_LOG_MSG_MAX);
     }
 }

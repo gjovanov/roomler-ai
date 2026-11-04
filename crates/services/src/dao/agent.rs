@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use bson::{DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecPolicy,
-    ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, RpcCap, SshPolicy,
+    AccessPolicy, Agent, AgentCaps, AgentStatus, DesiredConfig, DisplayInfo, ExecAnchor,
+    ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, RpcCap, SshPolicy,
 };
 
 use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
@@ -146,6 +146,10 @@ impl AgentDao {
             // reason as the host key below: enrolment never reaches the machine.
             companion_version: None,
             keep_busy: None,
+            // FR-55 P4 — the heartbeat reports the posture and the device
+            // announces its sleeps; enrolment does neither.
+            power: None,
+            sleep: None,
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
@@ -507,7 +511,37 @@ impl AgentDao {
             set.insert("arch", arch);
             set.insert("arch_emulated", arch_emulated);
         }
-        self.base.update_by_id(agent_id, doc! { "$set": set }).await
+        // FR-55 P4 — a hello is the device awake again: whatever it last
+        // said about going to sleep is over ([`Self::record_sleep`]).
+        self.base
+            .update_by_id(agent_id, doc! { "$set": set, "$unset": { "sleep": "" } })
+            .await
+    }
+
+    /// FR-55 P4 — the device said it is going to sleep (`rc:agent.sleeping`):
+    /// record when, and its power posture, for the device lists to show why it
+    /// is offline. Answers whether it wrote.
+    ///
+    /// Keyed by `conn_id` like [`Self::mark_offline_if_conn`], and for the same
+    /// reason: only the connection that wrote the row's hello speaks for the
+    /// device. A displaced connection's late notice matches nothing, so it can
+    /// never mark a device that has already reconnected as asleep.
+    pub async fn record_sleep(
+        &self,
+        agent_id: ObjectId,
+        conn_id: &str,
+        notice: &roomler_ai_remote_control::models::SleepNotice,
+    ) -> DaoResult<bool> {
+        // The posture at the moment of sleep is also the freshest one the
+        // device has given, so it replaces the last heartbeat's.
+        let power = bson::to_bson(&notice.power)?;
+        let notice = bson::to_bson(notice)?;
+        self.base
+            .update_one(
+                doc! { "_id": agent_id, "conn_id": conn_id },
+                doc! { "$set": { "sleep": notice, "power": power } },
+            )
+            .await
     }
 
     /// #2552 — a connection's teardown: `Offline`, but only while the row
@@ -572,6 +606,7 @@ impl AgentDao {
         warm_relay: Option<&str>,
         companion_version: Option<&str>,
         keep_busy: Option<&roomler_ai_remote_control::models::KeepBusyBrief>,
+        power: Option<&roomler_ai_remote_control::models::PowerBrief>,
     ) -> DaoResult<Option<HeartbeatBefore>> {
         // C4 stage 2 — the standing warm allocation's relayed address rides
         // the same per-heartbeat write: stored pair-less so a peer can be
@@ -617,6 +652,16 @@ impl AgentDao {
             }
             None => {
                 unset.insert("keep_busy", "");
+            }
+        }
+        // FR-55 P4 — the power posture, by the same rule: an agent that stops
+        // reporting it (a rollback to a pre-P4 build) reads as unknown.
+        match power.and_then(|p| bson::to_bson(p).ok()) {
+            Some(p) => {
+                set.insert("power", p);
+            }
+            None => {
+                unset.insert("power", "");
             }
         }
         // `update_one` would stamp this; a raw find-and-update must itself.
@@ -857,8 +902,45 @@ impl AgentDao {
         let policy_bson = bson::to_bson(policy).unwrap_or(bson::Bson::Null);
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": { "external_access_policy": policy_bson } },
+            )
+            .await
+    }
+
+    /// FR-94 — record the device's anchor, replacing any earlier one: the fresh
+    /// `anchor_id` is what revokes the credentials an earlier anchor minted.
+    ///
+    /// Through [`Self::live_row`] because a removal ends the anchor (#2133) and a
+    /// tombstone revives whole: one written after the removal would come back
+    /// with the machine's next enrollment, and with it SYSTEM exec.
+    pub async fn set_exec_anchor(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        anchor: &ExecAnchor,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "exec_anchor": bson::to_bson(anchor)? } },
+            )
+            .await
+    }
+
+    /// Store the config an admin wants this device to apply
+    /// (`docs/remote-config.md`). Through [`Self::live_row`], so a push that races
+    /// the removal does not wait on the row for the machine's next enrollment.
+    pub async fn set_desired_config(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        desired: &DesiredConfig,
+    ) -> DaoResult<bool> {
+        self.base
+            .update_one(
+                Self::live_row(tenant_id, agent_id),
+                doc! { "$set": { "desired_config": bson::to_bson(desired)? } },
             )
             .await
     }
@@ -881,7 +963,7 @@ impl AgentDao {
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": agent_id, "tenant_id": tenant_id },
+                Self::live_row(tenant_id, agent_id),
                 doc! { "$set": {
                     "connect_code": code,
                     "connect_code_rotated_at": DateTime::now(),

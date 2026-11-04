@@ -7,6 +7,7 @@ use axum::{
 };
 use nanoid::nanoid;
 use roomler_ai_db::models::{TutorialState, User};
+use roomler_ai_services::dao::base::{DaoError, duplicate_key_is_on};
 use roomler_core::attribution::{self, AttributionInput};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -119,6 +120,11 @@ pub struct ActivateRequest {
     pub token: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResendActivationRequest {
+    pub email: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MessageResponse {
     pub message: String,
@@ -168,6 +174,15 @@ pub async fn register(
     State(state): State<Core>,
     Json(mut body): Json<RegisterRequest>,
 ) -> Result<(StatusCode, HeaderMap, Json<RegisterResponse>), ApiError> {
+    // #3247 — answered before anything exists. The organization used to be
+    // created last, so a taken slug left the account and its activation mail
+    // behind, and pressing Register again answered 409 on the address.
+    if let Some(slug) = body.tenant_slug.as_deref()
+        && state.tenants.slug_taken(slug).await?
+    {
+        return Err(slug_taken());
+    }
+
     let password_hash = state.auth.hash_password(&body.password)?;
 
     // FR-88 — sanitised here, stored with the row, never touched again. Not
@@ -184,7 +199,8 @@ pub async fn register(
             password_hash,
             signup_attribution,
         )
-        .await?;
+        .await
+        .map_err(register_conflict)?;
 
     let user_id = user.id.unwrap();
 
@@ -207,52 +223,38 @@ pub async fn register(
         );
     }
 
-    // Generate activation code and send email.
-    //
-    // Email send is fire-and-forget: a fresh SMTP connection (e2e overlay
-    // hits Mailpit on first register) can take 5-6s on the initial
-    // handshake, which would block the register HTTP response past the
-    // frontend's redirect timeout. The activation code is persisted
-    // synchronously above, so the user can still click the email link
-    // when it arrives; the response can return tokens immediately.
-    let token = nanoid!(7);
-    if let Err(e) = state
-        .activation_codes
-        .create(
-            user_id,
-            token.clone(),
-            state.settings.email.activation_token_ttl_minutes,
-        )
-        .await
+    // Create a default tenant if requested
+    if let (Some(tenant_name), Some(tenant_slug)) = (body.tenant_name, body.tenant_slug)
+        && let Err(e) = state
+            .tenants
+            .create(tenant_name, tenant_slug, user_id)
+            .await
     {
-        warn!("Failed to create activation code: {:?}", e);
-    } else if let Some(email_svc) = state.email.clone() {
-        let activation_url = format!(
-            "{}/auth/activate?userId={}&token={}",
-            state.settings.app.frontend_url,
-            user_id.to_hex(),
-            token
-        );
-        let to_email = body.email.clone();
-        let display_name = body.display_name.clone();
-        let ttl = state.settings.email.activation_token_ttl_minutes;
-        tokio::spawn(async move {
-            if let Err(e) = email_svc
-                .send_activation(&to_email, &display_name, &activation_url, ttl)
-                .await
-            {
-                warn!("Failed to send activation email: {:?}", e);
+        return Err(match e {
+            // #3247 — the race the check above can lose: two sign-ups for one
+            // slug. Nothing was created for this account yet, so it goes too.
+            DaoError::DuplicateKey(msg) if duplicate_key_is_on(&msg, "slug") => {
+                if let Err(e) = state
+                    .users
+                    .base
+                    .hard_delete(bson::doc! { "_id": user_id })
+                    .await
+                {
+                    warn!("a sign-up that lost its slug stays behind: {:?}", e);
+                }
+                slug_taken()
             }
+            e => e.into(),
         });
     }
 
-    // Create a default tenant if requested
-    if let (Some(tenant_name), Some(tenant_slug)) = (body.tenant_name, body.tenant_slug) {
-        state
-            .tenants
-            .create(tenant_name, tenant_slug, user_id)
-            .await?;
-    }
+    send_activation_link(
+        &state,
+        user_id,
+        body.email.clone(),
+        body.display_name.clone(),
+    )
+    .await;
 
     // Auto-accept invite if invite_code provided
     if let Some(ref invite_code) = body.invite_code {
@@ -324,12 +326,131 @@ pub async fn register(
     ))
 }
 
+/// The words a sign-up gets when its address or username is taken.
+///
+/// The index's own message used to go out as it was, so the page showed a
+/// person `E11000 duplicate key error…` with their address quoted in it. #3199:
+/// that person is usually someone whose first sign-up never activated, so the
+/// answer names the way out.
+fn slug_taken() -> ApiError {
+    ApiError::Conflict("That organization short name is already taken. Pick another.".to_string())
+}
+
+fn register_conflict(e: DaoError) -> ApiError {
+    match e {
+        DaoError::DuplicateKey(msg) if duplicate_key_is_on(&msg, "email") => ApiError::Conflict(
+            "This email address already has an account. If you never activated it, \
+             ask for a new activation link."
+                .to_string(),
+        ),
+        DaoError::DuplicateKey(msg) if duplicate_key_is_on(&msg, "username") => {
+            ApiError::Conflict("This username is taken.".to_string())
+        }
+        e => e.into(),
+    }
+}
+
+/// Mint an activation code, replacing any earlier one, and mail its link.
+///
+/// Email send is fire-and-forget: a fresh SMTP connection (e2e overlay
+/// hits Mailpit on first register) can take 5-6s on the initial
+/// handshake, which would block the register HTTP response past the
+/// frontend's redirect timeout. The activation code is persisted
+/// synchronously here, so the user can still click the email link
+/// when it arrives; the response can return tokens immediately.
+async fn send_activation_link(
+    state: &Core,
+    user_id: bson::oid::ObjectId,
+    to_email: String,
+    display_name: String,
+) {
+    // #3199 — nanoid's default 21 characters, up from 7. Redeeming this token
+    // is what proves an address, and every resend opens a new window to guess
+    // it in, where sign-up only ever opened one.
+    let token = nanoid!();
+    let ttl = state.settings.email.activation_token_ttl_minutes;
+    if let Err(e) = state
+        .activation_codes
+        .create(user_id, token.clone(), ttl)
+        .await
+    {
+        warn!("Failed to create activation code: {:?}", e);
+    } else if let Some(email_svc) = state.email.clone() {
+        let activation_url = format!(
+            "{}/auth/activate?userId={}&token={}",
+            state.settings.app.frontend_url,
+            user_id.to_hex(),
+            token
+        );
+        tokio::spawn(async move {
+            if let Err(e) = email_svc
+                .send_activation(&to_email, &display_name, &activation_url, ttl)
+                .await
+            {
+                warn!("Failed to send activation email: {:?}", e);
+            }
+        });
+    }
+}
+
+/// `POST /api/auth/resend-activation` — #3199, the way back from an expired
+/// activation link, and for every account stuck before this route existed.
+///
+/// Rate-limited per client address by `ip_rate_limit` on the route and per
+/// account by [`roomler_ai_services::dao::user::UserDao::claim_activation_resend`].
+pub async fn resend_activation(
+    State(state): State<Core>,
+    Json(body): Json<ResendActivationRequest>,
+) -> (StatusCode, Json<MessageResponse>) {
+    accept_resend(state, body.email)
+}
+
+/// All a caller ever learns: one 202 and one sentence, for an address that is
+/// unknown, waiting for activation, already active or inside the cooldown. A
+/// difference between any two is an oracle for `users.email`, a unique index
+/// and the key account-linking resolves against.
+///
+/// ⚠️ Deliberately not `async`: it cannot await the lookup, so the answer's
+/// timing cannot depend on the row either. Detaching only the mail, as
+/// `subscribe` does, would not do here, because a known address also costs
+/// more Mongo round trips than an unknown one before anything is sent.
+fn accept_resend(state: Core, email: String) -> (StatusCode, Json<MessageResponse>) {
+    tokio::spawn(resend_after_answering(state, email));
+    (
+        StatusCode::ACCEPTED,
+        Json(MessageResponse {
+            message: "If that address is waiting for activation, a new link is on its way."
+                .to_string(),
+        }),
+    )
+}
+
+async fn resend_after_answering(state: Core, email: String) {
+    match state.users.claim_activation_resend(email.trim()).await {
+        Ok(Some(user)) => {
+            if let Some(user_id) = user.id {
+                send_activation_link(&state, user_id, user.email, user.display_name).await;
+            }
+        }
+        Ok(None) => {}
+        // Without the address, and only here: nobody is waiting on this.
+        Err(e) => warn!("Activation resend failed: {:?}", e),
+    }
+}
+
 pub async fn login(
     State(state): State<Core>,
     Json(body): Json<LoginRequest>,
 ) -> Result<(HeaderMap, Json<AuthResponse>), ApiError> {
     let lookup = if let Some(ref username) = body.username {
-        state.users.find_by_username(username).await
+        match state.users.find_by_username(username).await {
+            // #3247 — the sign-in page has one box, and most people type their
+            // address into it. Same answer either way when there is no account.
+            Err(DaoError::NotFound) if username.contains('@') => {
+                state.users.find_by_email(username.trim()).await
+            }
+            found => found,
+        }
     } else if let Some(ref email) = body.email {
         state.users.find_by_email(email).await
     } else {
@@ -585,7 +706,10 @@ pub async fn activate(
             .find_by_id(user_id)
             .await
             .map_err(|e| ApiError::Internal(format!("User not found: {}", e)))?;
-        let login_url = format!("{}/auth/login", state.settings.app.frontend_url);
+        // #3029 — the SPA's sign-in page is `/login`; this linked `/auth/login`,
+        // which never existed, so the "you can now sign in" email 404'd. The SPA
+        // keeps `/auth/login` as a redirect for the emails already sent.
+        let login_url = format!("{}/login", state.settings.app.frontend_url);
         let to_email = user.email.clone();
         let display_name = user.display_name.clone();
         tokio::spawn(async move {
@@ -704,6 +828,7 @@ mod tests {
                 captured_at: Some(now),
                 ..Default::default()
             }),
+            activation_resent_at: Some(now),
             created_at: now,
             updated_at: now,
             deleted_at: None,

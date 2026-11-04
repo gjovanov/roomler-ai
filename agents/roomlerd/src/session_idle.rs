@@ -215,7 +215,7 @@ pub fn signatures(frame: &Frame) -> Option<Vec<u64>> {
                 for lx in 0..LATTICE {
                     let x = x0 + (2 * lx + 1) * (x1 - x0) / (2 * LATTICE);
                     let at = y * stride + x * bpp;
-                    for b in frame.data.get(at..at + hashed)? {
+                    for b in frame.cpu().get(at..at + hashed)? {
                         sig ^= u64::from(*b);
                         sig = sig.wrapping_mul(FNV_PRIME);
                     }
@@ -479,7 +479,7 @@ mod tests {
             height: h,
             stride: w * 4,
             pixel_format: PixelFormat::Bgra,
-            data: vec![40u8; (w * h * 4) as usize],
+            data: vec![40u8; (w * h * 4) as usize].into(),
             monotonic_us: 0,
             monitor: 0,
             damage: crate::capture::Damage::Unknown,
@@ -492,7 +492,7 @@ mod tests {
         for row in y..(y + h).min(f.height) {
             for col in x..(x + w).min(f.width) {
                 let at = (row * f.stride + col * 4) as usize;
-                f.data[at..at + 3].copy_from_slice(&[v, v, v]);
+                f.cpu_mut()[at..at + 3].copy_from_slice(&[v, v, v]);
             }
         }
     }
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn a_malformed_frame_is_skipped() {
         let mut short = bgra(W, H);
-        short.data.truncate(1000);
+        short.cpu_mut().truncate(1000);
         assert_eq!(signatures(&short), None);
         assert_eq!(signatures(&bgra(64, 32)), None);
         let mut nv12 = bgra(W, H);
