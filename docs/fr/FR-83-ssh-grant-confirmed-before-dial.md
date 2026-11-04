@@ -138,7 +138,7 @@ is of `ssh-consent`, and `starts_with` would mark every `ssh` agent ack-capable 
 server would then wait 10 s on every grant to an agent that never answers.
 
 ⚠️ The server reads it from the **Hub entry** (distilled at registration,
-`crates/modules/fleet/src/socket.rs:191`, like `supports_ssh`), never from the stored
+`crates/modules/fleet/src/socket.rs:171`, like `supports_ssh`), never from the stored
 agent row. The row reflects the last hello, which after a rollback promises an ack the
 running agent never sends — every grant to that device would wait out the bound and then
 be refused.
@@ -172,14 +172,14 @@ caller hears the server's reason rather than its own timeout; and it leaves ≥ 
 
 ### 4. The agent — acknowledge after recording, and every refusal
 
-The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4270`) acknowledges **after**
+The `rc:ssh.grant` arm (`agents/roomlerd/src/signaling.rs:4292`) acknowledges **after**
 `record_grant` returns: the grant is in `GRANTS` — the table the auth path reads — before
 the frame leaves, so "confirmed" means "redeemable". `record_grant`'s `Result<(), String>`
 becomes a typed rejection so the arm can say *which* refusal it was; the log text is
 unchanged.
 
 The ack is sent unconditionally by an ack-capable build. An older server cannot parse the
-frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:804`) — harmless, and
+frame and drops it at `debug!` (`crates/modules/fleet/src/socket.rs:712`) — harmless, and
 one small frame per grant.
 
 ### Compatibility, both directions

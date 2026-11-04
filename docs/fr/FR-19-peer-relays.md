@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2156`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1739`).
+(`agents/roomlerd/src/signaling.rs:1753`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -435,7 +435,7 @@ match a `UserId`/`RoleId`-scoped grant with no log — against `feedback_log_eve
 
 **Permissions.** ⚠️ Exit-node approval requires `MANAGE_AGENTS`
 (`crates/api/src/routes/overlay_route.rs:310`, checked at `:328`), which **is** in `DEFAULT_ADMIN`
-(`crates/db/src/models/role.rs:104`), and writes no audit row. Nominating a relay makes a
+(`crates/db/src/models/role.rs:153`), and writes no audit row. Nominating a relay makes a
 device a traffic chokepoint and a metadata observation point for the whole tenant (§12), so
 it belongs in the class `role.rs` already draws a line around — *"an admin should see every
 command the fleet ran without silently gaining the power to run one"*, which is why
@@ -726,12 +726,12 @@ Verified against `origin/master`, 2026-08-28.
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
 | SSRF validator to reuse | `crates/api/src/routes/push.rs:20` `validate_push_endpoint` |
-| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:104`, `:146` |
+| Permission bits + `ALL` bump | `crates/db/src/models/role.rs:153`, `:183` |
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3302`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3334`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 

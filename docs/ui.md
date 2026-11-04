@@ -394,28 +394,30 @@ that one param. Every other route stays unkeyed on purpose — several views rew
 **The call page remounts by room, and asks before it leaves a call (#1637).** The app
 bar's Active Calls menu and the "Call started in …" snackbar push another room's call
 onto the call page in place. Until `room-call` carried `remountOn: 'roomId'`
-(`plugins/router.ts:243`), the page in room A's call kept A's call, chat and name under
+(`plugins/router.ts:242`), the page in room A's call kept A's call, chat and name under
 room B's URL: a message typed there went to B, and Leave left B, a call it was never in,
 while the server still listed the person in A. A remount alone would leave A's call
 running with nothing on the page to say so, because the mini-call widget hides on every
 call page. So the page settles its own call first, in `onBeforeRouteUpdate`
-(`views/conference/ConferenceView.vue:689`), with the question the Join button asks:
+(`views/conference/ConferenceView.vue:693`), with the question the Join button asks:
 
 | The page, when another room's call is pushed onto it | What happens |
 |---|---|
-| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:642`), then the page for the other room joins that room's call |
+| in its room's call, **Switch Call** | it leaves that call (`leaveThisCall`, `:646`), then the page for the other room joins that room's call |
 | in its room's call, **Cancel**, Escape or a click outside | the navigation is refused. The call and the URL stay where they were |
 | in no call here | it remounts for the other room with no question, and joins nothing |
 
 The join crosses the remount as a one-shot hand-off (`composables/callSwitch.ts:22`,
-taken at `ConferenceView.vue:772`). It is for that one room, spent by the next mount
+taken at `ConferenceView.vue:776`). It is for that one room, spent by the next mount
 whatever its room, and void after 10 s. It is never a query or `history.state`, so a reload
 or a back-and-forward cannot put a camera into a call nobody just asked to join.
 `ConferenceViewRoomSwitch.spec.ts` runs the real page against the real route record.
 `e2e/conference-room-switch.spec.ts` drives the three rows in a browser against a real API
 and reads the outcome from the server's participant list for each room. Its join waits for
-the page's socket: a join sent before the socket has its connection id opens a call session
-with none, and a leave from that page, which names its connection, does not close it.
+the page's socket, as a person's does. Since #3416 the page waits too: a join sent before
+the socket had its connection id opened a call session with none, which a leave from that
+page, naming its connection, did not close
+([real-time.md](real-time.md#the-call-session-join-leave-socket-close-sweep-3416)).
 
 **A link clicked inside the app never takes a tab away from a live session (#2841).** A
 page that holds one carries `meta.liveSession`: both remote viewers (`agent-remote`,
@@ -487,7 +489,7 @@ its desktop height** for the same data.
 | **A tab window over wide content takes `:touch="false"`; a tab row that can overflow takes `show-arrows`** | `GrowthView.vue`, `AnalyticsView.vue`, the viewer's Settings tabs | a sideways swipe across a wide table switched the **tab**; and below 1280 px Vuetify hides the arrows unless asked, so tabs past the edge gave no sign of themselves |
 | **A number or caption that must be read never sits at the end of a card title** on a phone — it moves into the card's text | `GrowthView.vue` (the weekly-active-orgs north star) | a title never wraps: at 360 px the caption pushed the number off the card |
 | **While a session runs, the remote viewer's toolbar holds only Back, the device's name, Disconnect and Fullscreen**, at every width; the session's state chips and every tool ride their own row under it (`#rc-tb-strip`, one `<Teleport>`: one instance of each control, moved, never copied), state first, scrolling sideways; from 960 px the stats readout comes last, in whole pills only, so it never pushes a tool out of view. Connect's phases keep the one row (below 960 px its items in flex `order`). The stage's alerts overlay the stage | `RemoteControl.vue` (`rc-tb-*`, `sessionToolsOnStrip`, `.rc-stage-alerts`) | the title went to 0 px and Disconnect started off-screen; with every tool still in that one row, the row overflowed and the name was held at its 96 px minimum on a phone ("FR-…" at 360 px) and at 0 px on a 1300 px desktop, with the state chips past the edge or squeezed to stubs (FR-116 P5c); each alert's coming and going resized the frame, re-sent `rc:resolution` and rebuilt the agent's encoder |
-| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:440`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2690`; the pull-tab, `:934`; `.rc-immersive`, `:5758`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
+| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:414`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2690`; the pull-tab, `:934`; `.rc-immersive`, `:5758`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
 | **Text that cannot break still wraps** (`overflow-wrap: anywhere`) | message content (`MessageBubble.vue`), stacked table values | one long URL or email widened a whole list past the screen |
 | **Sign-in fields say what they are**: `autocapitalize="none"`, `autocorrect="off"`, `spellcheck="false"` on the username, `autocomplete` on every credential | `LoginView.vue`, `RegisterView.vue` | iOS capitalised the username, and the server matches it exactly |
 | **The public landing page's sections are a ☰ menu below 960 px**, and its wordmark never shrinks (`flex-0-0` on the title) | `LandingView.vue` | the links were hidden below 600 px with no other way to them, and the wordmark was clipped to "Roo" |

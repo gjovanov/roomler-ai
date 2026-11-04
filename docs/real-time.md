@@ -77,6 +77,85 @@ pod that started the call and died with it on a rolling deploy. The design, its 
 and its one known gap are in
 [FR-115 *Meetings, as built*](fr/FR-115-pricing-reshape.md#meetings-as-built-p5).
 
+### The call session: join, leave, socket close, sweep (#3416)
+
+A call is kept in two places. The room holds `conference_status` and `participant_count`,
+the number of **people** in the call. Each person's `room_members` row holds `sessions[]`,
+one entry per join, open while its `left_at` is null. A session carries the
+`connection_id` of the page's socket, so one person can be in a call from several devices
+and one device's leave closes only its own session. The count rises when a person's first
+open session opens, falls when their last one closes, and the call ends at 0.
+
+```mermaid
+sequenceDiagram
+    participant P as Call page
+    participant S as Server (conference module)
+    participant M as room_members.sessions
+    P->>S: WebSocket upgrade
+    Note over P: Join clicked: callConnectionId() waits for the id, up to 10 s
+    S-->>P: connected {connection_id: C}
+    P->>S: POST call/start, then POST call/join {connection_id: C}
+    S->>M: push {connection_id: C, left_at: null}, the person's first: count +1
+    P->>S: media:join on socket C
+    alt the person leaves
+        P->>S: POST call/leave {connection_id: C}
+    else the tab closes
+        Note over S: on_closed(C): the room from C's media, else from M by C
+    end
+    S->>M: close C's open session, or, if C never held one, the person's sessions with no id
+    S-->>P: room:call_updated, or room:call_ended when the count reaches 0
+```
+
+| Moment | Where | What happens |
+|---|---|---|
+| Join | `ConferenceView.vue:607`, `stores/rooms.ts:193` `callConnectionId`, `:199` `joinCall`; server `call.rs:133`, `dao/room.rs:723` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:183`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:208` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:925`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Socket close | `ws_media.rs:59` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:110`), and the same leave runs naming the socket (`:117`) |
+| A miss | `dao/room.rs:934`, the close itself `close_sessions` (`:1002`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
+| Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
+| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:254`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+
+What a leave naming connection C may close:
+
+| The open session | Closed? |
+|---|---|
+| the person's, connection C | yes |
+| the person's, no connection id | only when C never held a session in that room |
+| the person's, another connection | never: that is their other device |
+| another person's | never: the update is keyed by the leaver's own `user_id` |
+
+**Why a miss closes every session with no id, not only the oldest.** Such a session names
+no device. On a miss the leaver's own session is among them, if it has one, and nothing
+says which. Closing only the oldest would leave the leaver listed whenever an older dead
+one sits beside it, which is the bug itself. Closing them all always takes the leaver out.
+
+**What it does not heal.** Since #3416 the page never sends a join without the id, so
+sessions with no id come only from older cached bundles, and these three cases last only
+while those are in use:
+
+1. A dead session with no id beside a later session of the same person that has one: that
+   later session's leave closes only its own. The boot reset clears it at the next roll.
+   An older bundle leaves exactly this when its first `media:join` finds the socket not
+   open yet. The store's retry (`stores/conference.ts:172`) joins again on the open socket,
+   this time with the id, so the person holds both sessions, and the page's leave closes
+   the scoped one.
+2. Two devices of one person that both joined without an id (both older bundles, both
+   raced): a miss from one closes both, so the other drops off the list while still in the
+   call, and a call the person was alone in ends.
+3. A page whose socket redialled mid-call holds nothing under its new id, because the old
+   socket's close took its session. Its Leave is a miss, and closes the person's sessions
+   with no id in that room: an older bundle's, on another of their devices.
+
+The disconnect cleanup reaches a session only through the socket's media or its own id,
+so a socket that was never in the call, such as another tab of the same person, closes
+nothing.
+
+**Tests.** The #3416 block in `crates/tests/src/conference_tests.rs:2084`: a join with no
+body, then a leave or a socket close; two devices; another person's session; a device that
+already left, leaving again; a repeated leave; a socket never in the call. `ui/src/__tests__/stores/rooms.spec.ts:259`: the wait
+and the refusal. `ui/e2e/conference-fast-join.spec.ts` holds back the socket's frames until after
+the click, against a real API, and reads the outcome from the server's participant list.
+
 ### A meeting receives what is visible (FR-127 P1)
 
 One room is one mediasoup router on one worker thread, and every participant's every

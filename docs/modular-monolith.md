@@ -319,9 +319,9 @@ the row (`conn_id`), and a teardown writes `Offline` only while the row still na
 late write a no-op, in whichever order the two land, on this pod or another.
 The losing order is pinned through the socket handler itself by
 `a_held_teardowns_late_offline_leaves_the_reconnect_online`
-(`crates/tests/src/agent_presence_tests.rs:593`). A test lifecycle holds the old connection's
+(`crates/tests/src/agent_presence_tests.rs:592`). A test lifecycle holds the old connection's
 teardown in `closed`, after its Hub removal and before its write
-(`crates/modules/fleet/src/socket.rs:1065`), while the reconnect's hello lands and registers.
+(`crates/modules/fleet/src/socket.rs:973`), while the reconnect's hello lands and registers.
 Then it lets the write go. With the pre-#2621 `mark_status(Offline)` the row reads `offline`
 under the live connection; with the compare-and-set it stays `online`.
 ⚠️ The pod's shutdown sweep (`mark_status_many`) still writes `Offline` for every agent it held,
