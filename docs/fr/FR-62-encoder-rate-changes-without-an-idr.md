@@ -1,8 +1,86 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · AC2/AC3: a passive relayed session on 0.4.191 made no rate move, so neither is proven · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · AC2/AC3: passive relayed sessions on 0.4.191 and 0.4.199 made no rate move, so neither is proven; the second left three IDRs that nothing it counted explains, and the carrier line logged beside them is ruled out · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
+
+- **2026-11-03 22:23Z — the second relayed read: no rate move again, and three IDRs that nothing
+  the read counted explains. The carrier line logged beside them is not their cause.**
+  CORPLAP-2 on 0.4.199, `hevc_nvenc` 1920×1200, `constrained=true` on all 57 heartbeats over
+  113 s. The viewer's pair was host↔srflx over the overlay, and the overlay link under it was
+  DERP-relayed (`relay:derp/tcp`): relayed by DERP this time, not by TURN. One session from a
+  viewer tab, no config change.
+  - **The motion read did not run.** The operator had approved one exact sequence: a Sticky
+    Notes title-bar drag there and back for 220 s, one keyframe request, one resize to
+    1600×1000 and back. The approval reached the worker through another session, and the
+    automation's permission check refused the drag twice as a write to the remote host. The
+    sequence stopped under the operator's own rule (retry once, then stop). No input reached
+    the laptop.
+  - **`rate_moves` stayed 0, so AC2 and AC3 are still not proven.** `swaps`, `rebuilds`,
+    `dims_swaps` and `frames_dropped_backpressure` stayed 0 as well. The rate memory seeded the
+    opener at 4,046,610, and the encoder opened at 3,439,618.
+  - **`idr_count` read 14 at the first heartbeat** (the opener plus `dc_unopen_drops=13`) and 17
+    at the last. The wire carried 4 keyframes in 3,544 frames: the opener, then one each at
+    22:24:37, 22:25:28 and 22:25:44.
+  - 🔑 **Nothing the read counted explains those three.** Beside each one: no rate move, no
+    `rc:keyframe` from the viewer, no drop, no dims swap, no swap and no rebuild. None of them
+    sits beside a rate move, so none is AC3's RED. But AC3's read has to name every IDR before
+    it can call one rate-caused.
+  - 🔑 **The carrier line is not a source.** Each of the three came 1–3 s after an agent line
+    `overlay carrier under the nominated pair is not direct`. The code read here is master's,
+    and none of these paths has changed since 0.4.199, the build that ran. The line comes from
+    `overlay_remote_is_relay_tier` (`peer.rs:2273`), a LocalAPI read that changes nothing. The
+    FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
+    `peer.rs:2158`; the recheck at `:7661`). The answer goes two places:
+    - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
+      (`:7672`);
+    - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
+      consecutive checks disagree with the state the pump was built for, at least 60 s after
+      the last rebuild, and only when the frame rate changes. That rebuild logs its own line
+      (`peer.rs:7693`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
+      bumps, only the inline open's (`:9010`) can follow from this path, through that rebuild.
+      The others are a dims swap (`:7506`), a rate swap (`:7584`) and a deferred rebuild
+      (`:9571`).
+
+    Neither happened: every heartbeat read `constrained=true`, and `idr_count` never restarted.
+    The 1–3 s is the line's cadence. The heartbeat's `constrained` is the variable the recheck
+    writes, and a recheck that answered `false` would have shown on the next two heartbeats.
+    So 57 of 57 `true` means every recheck took the branch that prints the line: it printed
+    every 5 s for the whole session, and every event in the session fell 0–5 s after one. The
+    WireGuard rekey timeouts and the failed make-before-break probe beside it belong to the
+    overlay. The pump sees the overlay only through the carrier this recheck asks for.
+  - 🔑 **On this cell the encoder never picks an IDR by itself, so each of the three was
+    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2388`).
+    NVENC opens with a 64,800-frame GOP (`:51`, set at `:1905`), over half an hour at this
+    session's 31 fps, and with `rc-lookahead=0` and `bf=0` (`:366`–`:367`). Its scene-cut
+    I-frames need the lookahead, so they are off. A key frame therefore comes from a force
+    (`request_keyframe`, `:3002`) or from frame 0 of an encoder the pump opened or adopted
+    (`:2355`). Every place the FFmpeg DC pump forces one is below, with what shows it. This
+    replaces the 2026-10-31 table further down, which lacked the PLI path, a second viewer and
+    the rebuilds:
+
+    | Source | Site (`peer.rs`) | What shows it |
+    |---|---|---|
+    | the opener, and one force per frame while the video DC is not open | `:9800`, `:9806` | `dc_unopen_drops` |
+    | frame 0 of an adopted dims swap or rate swap | `:7477`, `:7581` | `dims_swaps`, `swaps` |
+    | frame 0 of an inline open: a dims change, the force-ignored fallback (`:9158`) or a persisted transport flip (`:7679`) | `:9051` | the counters restart at zero; the fallback warns (`:9165`), the flip logs `:7693` |
+    | the viewer's `rc:keyframe`: a decode backlog, a rebuilt decoder, or the stall probe after 6 s with no media | `:11164` | the viewer's send on its control channel, and `keyframe_requests` on `rc:session.stats`. The agent's own line is `debug!` (`:11166`) |
+    | a PLI or FIR on the session's RTP video track | `:843` | `PLI/FIR → forcing keyframe` |
+    | a lock or unlock | `:9108` | `lock_state: transition observed` (`lock_state.rs:471`) |
+    | the idle-settle keyframe | `:8293` | `idle-settle keyframe (motion burst ended)`. On a constrained session it is suppressed while `relay_idr_thrift` is on (the default), and counted in `settle_kf_suppressed` |
+    | a second viewer joining, or its video DC going live | `:9122` | `media_share: joined shared encoder pipeline as follower` (`media_share.rs:860`), then `…re-syncing onto a fresh IDR` (`:942`) |
+    | a second viewer's own `rc:keyframe`, or its queue overflowing | `:9122` | nothing on the reading tab. Its join logs |
+    | a force left unanswered for 4 s | `:9134` | `keyframe force retry engaged`, once per pump |
+    | a drop-burst resync: the send channel filled, so the first frame through forces the next | `:9877`, then `:9868` | `frames_dropped_backpressure` |
+
+    `invalidation_requested` is read only by the RTP pump (`:3376`), and no keyframe request
+    travels over the signalling WS.
+  - **What is left.** The three stay open (Open decisions). The read's ledger was the heartbeat
+    counters and the reading tab's own sends. The log lines in the table were not part of it,
+    and a second viewer's requests never show on the reading tab. The next read searches the
+    agent log for every line in the table right after the session ends, because the log
+    listing returns only a device's newest 500 batches
+    (`crates/modules/fleet/src/agent_log.rs:226`).
 
 - **2026-10-31 22:47Z — the first relayed NVENC read: the cell works, and nothing was tested.**
   CORPLAP-2 on 0.4.191, `hevc_nvenc` 1920×1200, `constrained=true` on all 158 heartbeats over
@@ -38,31 +116,32 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7506`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7477`), which
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
     inequality names two sources, and its read counted viewer requests from
     `PLI/FIR → forcing keyframe` lines, which only the RTP path prints (`peer.rs:843`).
     Every NVENC HEVC or AV1 session is on the DataChannel, where a viewer asks with
-    `rc:keyframe`. The FFmpeg DC pump has these sources:
+    `rc:keyframe`. The FFmpeg DC pump has these sources (the 2026-11-03 table above is the
+    complete list):
 
     | IDR source | Site (`peer.rs`) | What shows it |
     |---|---|---|
-    | the opener, and one force per frame while the DC is not open yet | `:9662`, `:9668` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
-    | a dims swap | `:7451` | `dims_swaps` |
-    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:10991` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
-    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9739`, then `:9730` | nothing of its own. `frames_dropped_backpressure` shows the burst |
-    | a lock or unlock | `:8987` | the session's lock state |
-    | a settle keyframe | `:8225` | suppressed on a constrained session (`settle_kf_suppressed`) |
-    | a force unanswered for 4 s | `:9009` | one log line per episode |
+    | the opener, and one force per frame while the DC is not open yet | `:9800`, `:9806` | `dc_unopen_drops`. Baseline the read after the first heartbeat |
+    | a dims swap | `:7505` | `dims_swaps` |
+    | the viewer's `rc:keyframe`, sent when its decode queue backs up | `:11165` | `keyframe_requests` on `rc:session.stats`, every 30 s. Its log line is `debug!` |
+    | a drop-burst resync: the send channel filled, so the next enqueue forces an IDR | `:9877`, then `:9868` | nothing of its own. `frames_dropped_backpressure` shows the burst |
+    | a lock or unlock | `:9108` | the session's lock state |
+    | a settle keyframe | `:8293` | suppressed on a constrained session (`settle_kf_suppressed`) |
+    | a force unanswered for 4 s | `:9134` | one log line per episode |
 
     The drop-burst resync is the one that matters: it is what a congested relay does,
     and it is neither a dims change nor a viewer request. So the read is per window, on
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9057`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9051`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
@@ -73,7 +152,7 @@
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:6960`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:6991`) after a Δ`rate_moves`, on
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on
@@ -247,7 +326,9 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
       rather than assumed; A3 still owns it.
 - [ ] AC2 — On a constrained session the bytes-per-frame ratio is ≈ 1.0 within 2 s of every target change (FR-59's instrument).
       Not read yet: it needs a **relayed** NVENC pair (`constrained=true` in the heartbeat, a public
-      relay candidate in the nominated pair) for five minutes with real desktop motion. The only
+      relay candidate in the nominated pair) for five minutes with real desktop motion. Two passive
+      constrained sessions on CORPLAP-2 made no rate move: 2026-10-31 over a TURN relay,
+      2026-11-03 over the overlay's DERP carrier, with no relay candidate in the pair. The only
       sessions the dev box's agent saw on 2026-10-29 were direct (`constrained=false`), and a direct
       path at a 25 M rung is not the cell. The read: per heartbeat window, Δ`bytes_written` ÷
       Δ`frames_encoded` against the encoder's maxrate ÷ `target_fps` ÷ 8, judged at the first
@@ -257,8 +338,9 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
       operator picks the cell.
 - [ ] AC3 — A 5-minute constrained session's `idr_count` ≤ dims changes + viewer keyframe requests.
       Same session as AC2, read per window: every Δ`idr_count` needs a Δ`dims_swaps`, a
-      Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it, and an
-      unexplained IDR beside a Δ`rate_moves` is the RED (the corrected read, 2026-10-31 above). (The
+      Δ`frames_dropped_backpressure`, a `keyframe_requests` tick, a lock edge or another source
+      from the 2026-11-03 table beside it, and an unexplained IDR beside a Δ`rate_moves` is the RED
+      (the corrected read, 2026-10-31 above). (The
       2026-10-29 direct session read `idr_count=2` with `dims_swaps=1` and the opener — consistent,
       but direct, so not this criterion's cell.) The positive control comes first: a viewer resize
       that moves `dims_swaps` by one must move `idr_count` by exactly one.
@@ -292,12 +374,20 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 | 2026-10-29 10:17 | 0.4.186 | dev box, `av1_nvenc` 1916×1198 @ 144, **direct** | eight AIMD steps 34 → 65 Mbps, `rate_moves=0`: the 25 M top rung swallows every step; `idr_count=2`, `dims_swaps=1` |
 | 2026-10-29 22:36 | this PR's tree, built natively on the same FFmpeg pin | RTX 5090 Laptop `hevc_nvenc`, Radeon 610M `hevc_amf` | the corrected harness, same silicon, same session of readings: NVENC **`pass:true`** (0/20, 0.003–0.004 ms, `basis:idr+apply`, both HRD arms); AMF **`total_rate_idr:20, total_periodic_idr:0`**, `max_set_ms` 54.4, `pass:false` — every rung `rate_idr:1` |
 | 2026-10-31 22:47 | **0.4.191** (released) | CORPLAP-2 `hevc_nvenc` 1920×1200, **relayed**, passive | `constrained=true` on 158 of 158 heartbeats over 318 s; `rate_moves=0`, `rebuilds=0`, `swaps=0`, `dims_swaps=0`; `idr_count` 18 (the opener + `dc_unopen_drops=17`), flat after the first heartbeat; 1 keyframe on the wire in 6,006 frames; bytes per frame p50 0.063, max 0.491 of the cap. No rate move, so it proves neither AC2 nor AC3 |
+| 2026-11-03 22:23 | **0.4.199** (released) | CORPLAP-2 `hevc_nvenc` 1920×1200, **relayed** (the overlay's DERP carrier), passive | `constrained=true` on 57 of 57 heartbeats over 113 s; `rate_moves=0`, `rebuilds=0`, `swaps=0`, `dims_swaps=0`, no drops; `idr_count` 14 (the opener + `dc_unopen_drops=13`) → 17; 4 keyframes on the wire in 3,544 frames, three of them explained by nothing the read counted (open). No rate move, so it proves neither AC2 nor AC3. The approved motion was refused, because the OK reached the worker through another session |
 
 ## Open decisions
 
 - **AC2/AC3's motion** (the operator's): CORPLAP-2 over its VPN is the cell, and a read needs rate
   moves, which need desktop motion. Either the operator plays a video there while an agent only
   reads, or the operator gives an explicit OK for a synthetic window drag and the positive controls.
+  An OK relayed through another session does not clear the automation's permission check
+  (2026-11-03): it has to be typed into the reading session itself.
+- **The three 2026-11-03 IDRs** (an open question, not a decision): key frames at 22:24:37,
+  22:25:28 and 22:25:44 that nothing the read counted explains. The carrier line beside them is
+  ruled out (the 2026-11-03 entry). A read that captures every tell in that entry's table
+  settles it. Until then, a read rules out each of those sources before it calls an IDR
+  rate-caused.
 - **AC2 and AC3's wording.** AC3's inequality omits the opener and the drop-burst resync, and AC2's
   ≈ 1.0 is a CBR's contract. Both keep their wording until the read is in hand; the 2026-10-31 entry
   above says what the read will judge. The operator decides whether they are amended.
