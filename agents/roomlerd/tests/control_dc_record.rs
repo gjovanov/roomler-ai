@@ -477,9 +477,10 @@ impl Rig {
 
     /// P3b-3 — the signalling loop replaces this session's peer, as a
     /// re-offer for a session it has a peer for does (`ServerMsg::SdpOffer`):
-    /// the old peer is closed, and the session goes on, so nothing hides it
-    /// from the banner.
+    /// it says so (#3451), then closes the old peer, and the session goes on,
+    /// so nothing hides it from the banner.
     async fn reoffer(&self) {
+        remote::peer_replaced(self.session_id);
         let _ = self.pcs.1.close().await;
         let _ = self.pcs.0.close().await;
     }

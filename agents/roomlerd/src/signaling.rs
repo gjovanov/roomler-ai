@@ -4206,6 +4206,11 @@ async fn handle_server_msg(
             // exists (controller retry?), close it first so the browser sees
             // a clean answer.
             if let Some(old) = peers.remove(&session_id) {
+                // #3451 — said BEFORE the close: the old peer's `record`
+                // channel ending is not the session's end, and a recording
+                // launching for it carries on under the new peer.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::peer_replaced(session_id);
                 // FR-101 P3 — the session goes on under a new peer, and the
                 // old one's drop forgets its counters: carry the transfer
                 // readings across, so the cumulative tallies never go back.
