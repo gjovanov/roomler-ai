@@ -901,10 +901,10 @@ pub async fn run(
     // `AgentConfig` via `AgentConfig::for_org` for secondaries).
     ctx: OrgCtx,
     // FR-43 P2b — this process's part in delegation. Owned so the reconnect
-    // loop can lend it per attempt. Only the PRIMARY org's loop ever acts on it
-    // (`handle_server_msg` gates on `ctx.is_primary`), but it is passed to all
-    // of them so the gate lives in one place rather than at three call sites
-    // that could each forget it.
+    // loop can lend it per attempt. FR-43 P3b — the gates read whether this
+    // loop holds the host, and `run_cmd` decides who does: the primary's loop,
+    // and a secondary's only on a one-row Mac's daemon
+    // (`Delegation::for_secondary`).
     mut delegation: crate::delegate::Delegation,
     // `mut` for exactly one reason: FR-40 key rotation swaps the overlay
     // secret in this snapshot between two connections (see
@@ -1750,10 +1750,9 @@ async fn connect_once(
     // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
     // worker can record. Saying the root daemon's own list (nothing) would
     // strip RECORD for the 30 s until the first heartbeat corrects it, after
-    // every reconnect. Primary org only, like the heartbeat.
-    if ctx.is_primary
-        && let Some(record) = delegation.host().and_then(|d| d.effective_record())
-    {
+    // every reconnect. Only a loop that holds the host, like the heartbeat:
+    // the primary, and on a one-row Mac every org (FR-43 P3b).
+    if let Some(record) = delegation.host().and_then(|d| d.effective_record()) {
         hello_caps.record = record;
     }
     // FR-97 P2c — and its Remote Apps words, the same way: a delegated
@@ -1762,9 +1761,7 @@ async fn connect_once(
     // root daemon is in none and says `status` alone. Our own words are kept
     // for when no worker is attached (`detect()` memoizes them).
     let own_apps: Vec<String> = hello_caps.apps.clone();
-    if ctx.is_primary
-        && let Some(apps) = delegation.host().and_then(|d| d.effective_apps())
-    {
+    if let Some(apps) = delegation.host().and_then(|d| d.effective_apps()) {
         hello_caps.apps = apps;
     }
     let mut last_announced_apps: Vec<String> = hello_caps.apps.clone();
@@ -1773,9 +1770,7 @@ async fn connect_once(
     // this root daemon says `no-session`. Ours is kept for when no worker is
     // attached.
     let own_audio = crate::encode::caps::AudioWords::of(&hello_caps);
-    if ctx.is_primary
-        && let Some(audio) = delegation.host().and_then(|d| d.effective_audio())
-    {
+    if let Some(audio) = delegation.host().and_then(|d| d.effective_audio()) {
         audio.apply(&mut hello_caps);
     }
     let mut last_announced_audio = crate::encode::caps::AudioWords::of(&hello_caps);
@@ -1908,11 +1903,16 @@ async fn connect_once(
     // Cloned FIRST so its borrow of `delegation` ends here — the worker's
     // receiver below is borrowed for the whole connection, and a process is
     // one role or the other, so only one of these is ever `Some`.
+    //
+    // FR-43 P3b — each org's loop that holds the host points it at its own WS,
+    // and a worker reply goes back on the WS of the org whose session it is.
+    // A secondary holds the host only on a one-row Mac's daemon.
     let delegate = delegation.host().cloned();
-    if let Some(delegate) = delegate.as_ref()
-        && ctx.is_primary
-    {
-        delegate.set_outbound(outbound_tx.clone());
+    if let Some(delegate) = delegate.as_ref() {
+        delegate.set_outbound(
+            crate::delegate::org_key(ctx.is_primary, &ctx.label),
+            outbound_tx.clone(),
+        );
     }
     // FR-43 P2b-2 — the WORKER's ends. The receiver is borrowed for this
     // connection; the sender is cloned so a delegated session can hold it.
@@ -2438,26 +2438,25 @@ async fn connect_once(
                 //
                 // FR-85 P1e-mac — on a supervised Mac, the WORKER's word: a
                 // delegated session records there, with the person's recorder
-                // and gates, while this root daemon can record nothing. PRIMARY
-                // ORG ONLY, like delegation itself: a secondary org's session is
-                // never handed to the worker, so its row keeps our own caps.
-                let record_now = ctx
-                    .is_primary
-                    .then(|| delegate.as_ref().and_then(|d| d.effective_record()))
-                    .flatten()
+                // and gates, while this root daemon can record nothing. Only a
+                // loop that holds the host, like delegation itself: the
+                // primary, and on a one-row Mac every org (FR-43 P3b). Off one
+                // row a secondary org's session is never handed to the worker,
+                // so its row keeps our own caps.
+                let record_now = delegate
+                    .as_ref()
+                    .and_then(|d| d.effective_record())
                     .unwrap_or_else(record_caps);
                 // FR-97 P2c — and its Remote Apps words, the same way: a
                 // worker that attaches after the hello (or leaves) is news.
-                let apps_now = ctx
-                    .is_primary
-                    .then(|| delegate.as_ref().and_then(|d| d.effective_apps()))
-                    .flatten()
+                let apps_now = delegate
+                    .as_ref()
+                    .and_then(|d| d.effective_apps())
                     .unwrap_or_else(|| own_apps.clone());
                 // FR-97 P2a — and its audio offer, the same way.
-                let audio_now = ctx
-                    .is_primary
-                    .then(|| delegate.as_ref().and_then(|d| d.effective_audio()))
-                    .flatten()
+                let audio_now = delegate
+                    .as_ref()
+                    .and_then(|d| d.effective_audio())
                     .unwrap_or_else(|| own_audio.clone());
                 let keep_busy_now = crate::keep_busy::advertised();
                 let sas_now = sas_advertised();
@@ -2473,7 +2472,15 @@ async fn connect_once(
                     .collect();
                 // FR-101 P2b — the owner's floor is live too: a new `off` must
                 // reach the hub's strip (and its reason) within a beat.
-                let session_policy_now = crate::session_policy::caps_policy();
+                //
+                // FR-43 P3b — on a one-row Mac, with the person's floor folded
+                // in, as the `Request` arm enforces it. Elsewhere this is
+                // `caps_policy()`.
+                let session_policy_now =
+                    crate::session_policy::caps_policy_of(crate::delegate::PersonFloor::session_policy(
+                        delegate.as_ref().and_then(|d| d.person_floor()),
+                        crate::session_policy::device_policy(),
+                    ));
                 // #3280 — a later try's answer replaced the probe's: its cells
                 // reach this row within a beat. Read before `stub_caps` below.
                 let caps_generation_now = crate::encode::caps::generation();
@@ -2523,6 +2530,7 @@ async fn connect_once(
                     c.record = record_now;
                     c.apps = apps_now;
                     audio_now.apply(&mut c);
+                    c.session_policy = session_policy_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
                         c.has_input_permission = has_input;
@@ -3518,15 +3526,20 @@ async fn handle_server_msg(
     // failing SOFT is still right, because the alternative is a session that
     // vanishes rather than one that fails the way it always has.
     //
-    // ⚠️ PRIMARY ORG ONLY. The GUI worker is host-global — one screen, one
-    // keyboard — while the server models policy per org, so a secondary org's
-    // admin must not be able to drive it. Same rule, and the same reason, as
-    // `rc:agent.update`, exec and the FR-19 relay: a host-global resource
-    // belongs to the enrollment that owns the host.
+    // ⚠️ ONLY A LOOP THAT HOLDS THE HOST. The GUI worker is host-global — one
+    // screen, one keyboard — while the server models policy per org, so off
+    // one row a secondary org's admin must not be able to drive it: only the
+    // primary's loop is given the host. Same rule, and the same reason, as
+    // `rc:agent.update`, exec and the FR-19 relay.
+    //
+    // FR-43 P3b — on a one-row Mac's daemon every org's loop holds it, because
+    // the person's own row, through which a secondary org used to reach the
+    // screen, is gone. Each org's session still asks that org's consent, and
+    // the prompt names the org (`prompt_org`). The host hands a session over
+    // only for the org whose params crossed, so no org reaches into another's.
     if let Some(delegate) = delegate
-        && ctx.is_primary
         && crate::delegate::delegable_inbound(&msg)
-        && delegate.send_to_worker(&msg)
+        && delegate.send_to_worker(crate::delegate::org_key(ctx.is_primary, &ctx.label), &msg)
     {
         tracing::debug!(
             kind = crate::delegate::server_msg_kind(&msg),
@@ -3699,13 +3712,10 @@ async fn handle_server_msg(
             // an ordinary session keeps the historical opt-in unchanged.
             //
             // FR-97 P2a — on a supervised Mac, the GUI worker's offer: it
-            // captures a delegated session's sound (primary org only, like the
-            // delegation that sends it the session), while this root daemon,
-            // in no window-server session, offers none.
-            let audio_offered = match delegate
-                .filter(|_| ctx.is_primary)
-                .and_then(|d| d.effective_audio())
-            {
+            // captures a delegated session's sound (only for a loop that holds
+            // the host, like the delegation that sends it the session), while
+            // this root daemon, in no window-server session, offers none.
+            let audio_offered = match delegate.and_then(|d| d.effective_audio()) {
                 Some(worker) => !worker.audio.is_empty(),
                 None => !our_caps.audio.is_empty(),
             };
@@ -3814,8 +3824,18 @@ async fn handle_server_msg(
             // the directive simply won — so a device that had set
             // `auto_grant_session = false` was silently overridden by a server
             // `Auto`, inverting the gate-4 property exec and SSH are built on.
-            let effective_mode =
-                crate::consent::strictest_of(directed_mode, consent_broker.mode(), host_window);
+            //
+            // FR-43 P3b — on a one-row Mac the local setting includes the
+            // person's own floor: the row whose broker held their
+            // `auto_grant_session` is gone, so the worker said it to the host,
+            // and the stricter of theirs and the daemon's is the local one.
+            // `None` everywhere else, so the daemon's own stands as before.
+            let person_floor = delegate.and_then(|d| d.person_floor());
+            let effective_mode = crate::consent::strictest_of(
+                directed_mode,
+                crate::delegate::PersonFloor::consent(person_floor, consent_broker.mode()),
+                host_window,
+            );
             // FR-101 P2b — the session policy, the org's (on the request) and
             // the device owner's floor, applied to the grant BEFORE anything
             // below reads it: the stash the channels enforce, the worker's
@@ -3827,7 +3847,12 @@ async fn handle_server_msg(
                 permissions,
                 audio_enabled,
                 session_policy,
-                crate::session_policy::device_policy(),
+                // FR-43 P3b — with the person's `rc_*` floor folded in, the
+                // same way.
+                crate::delegate::PersonFloor::session_policy(
+                    person_floor,
+                    crate::session_policy::device_policy(),
+                ),
                 crate::session_policy::person_asked(
                     consent_mode,
                     matches!(effective_mode, crate::consent::Mode::Prompt { .. }),
@@ -3877,34 +3902,39 @@ async fn handle_server_msg(
             // session's `record` channel refused `unavailable`. Still ahead of
             // the offer that consumes it (the server sends that only after this
             // request is answered), on the same ordered channel.
-            if let Some(delegate) = delegate
-                && ctx.is_primary
-            {
-                let sent = delegate.send_params(crate::delegate::DelegateFrame::SessionParams(
-                    Box::new(crate::delegate::SessionParams {
-                        session_id: session_id.to_hex(),
-                        codec: chosen.clone(),
-                        transport: negotiated_transport.clone(),
-                        chroma: chroma_pref.clone(),
-                        chunk_framing: chunk_framing.unwrap_or(false),
-                        audio: audio_negotiated,
-                        permissions,
-                        controller_name: controller_name.clone(),
-                        input_mode,
-                        asking_org: asking_org.clone(),
-                        record: Some(crate::delegate::DelegatedRecord {
-                            controller_user_id: controller_user_id.to_hex(),
-                            prompt_window_ms: record_prompt_window
-                                .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
-                        }),
-                        rc_overlay: Some(rc_overlay.clone()),
-                        // FR-101 P4b-2 — the worker keeps the idle limit.
-                        idle_secs,
-                        // FR-99 P3b — and takes the lock ask into the lock:
-                        // the session goes live in its process.
-                        lock_on_end,
-                    }),
-                ));
+            //
+            // FR-43 P3b — for the org that asked: the host notes it, and hands
+            // this session's later messages, and returns its replies, for that
+            // org alone.
+            if let Some(delegate) = delegate {
+                let sent = delegate.send_params(
+                    crate::delegate::org_key(ctx.is_primary, &ctx.label),
+                    crate::delegate::DelegateFrame::SessionParams(Box::new(
+                        crate::delegate::SessionParams {
+                            session_id: session_id.to_hex(),
+                            codec: chosen.clone(),
+                            transport: negotiated_transport.clone(),
+                            chroma: chroma_pref.clone(),
+                            chunk_framing: chunk_framing.unwrap_or(false),
+                            audio: audio_negotiated,
+                            permissions,
+                            controller_name: controller_name.clone(),
+                            input_mode,
+                            asking_org: asking_org.clone(),
+                            record: Some(crate::delegate::DelegatedRecord {
+                                controller_user_id: controller_user_id.to_hex(),
+                                prompt_window_ms: record_prompt_window
+                                    .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
+                            }),
+                            rc_overlay: Some(rc_overlay.clone()),
+                            // FR-101 P4b-2 — the worker keeps the idle limit.
+                            idle_secs,
+                            // FR-99 P3b — and takes the lock ask into the lock:
+                            // the session goes live in its process.
+                            lock_on_end,
+                        },
+                    )),
+                );
                 if !sent {
                     // No worker, or its queue is full. Not fatal — the daemon
                     // still serves the session itself, which on macOS means a
