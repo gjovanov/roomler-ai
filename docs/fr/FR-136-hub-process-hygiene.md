@@ -1,7 +1,9 @@
 # FR-136: Hub hygiene — a stopped task leaves nothing running, the host sets the pace, and workers get mail
 
 **Issue:** [#3457](https://github.com/gjovanov/roomler-ai/issues/3457) · **Status:** claimed 2026-11-04.
-P0 shipped the same day. Builds on [FR-131](FR-131-hub-coordinator.md), the hub.
+P0–P7 shipped the same day and P8 is the docs; AC9, the field run, starts as the hubs resume. Builds
+on [FR-131](FR-131-hub-coordinator.md), the hub. The engineering reference is
+[`agent-hub.md` §12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff).
 
 ## Problem / Goal
 
@@ -46,6 +48,18 @@ stopped worker. A session that sits idle hands off before its prompt cache goes 
 | The function-hooks API (2.1.314): `tool.call` wraps every call and can deny it, rewrite it or attach context; `$.env.set` reaches later Bash children; `command.run` sees a plugin's `$.command.run` and can answer in its place; `session.end` shares one 1.5 s bound across every hook; `$.fs` cannot rename | the API's typings |
 | The third-party auto-handoff plugin (0.1.0) fires once per idle period, re-armed only by a person, and dispatches through `$.command.run`; by default it writes `docs/handoffs/` inside the project | its source |
 
+## P1 results — the platform, 2026-11-04
+
+Each check ran in a throwaway session before anything relied on it.
+
+| Check | Result | What the design uses |
+|---|---|---|
+| A plugin in the skills folder loads in a `claude --bg` session started the way `spawn` starts one | pass: a scratch plugin's `session.start` wrote its marker | no `--plugin-dir` needed |
+| `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` holds under `--settings '{"env":…}'` | pass: the `--settings` env merges with the user's | `spawn` passes the flag anyway |
+| `$.env.set("HUB_CALL", …)` before `next(e)` reaches the call's children, and a `$.env.set` `WSLENV` carries it into WSL | pass | the call tags |
+| `$.env.get("CLAUDE_PID")` names the session's own claude process | **fail**: it returned an inherited value, another process's pid | the fallback: the pid from `claude agents --json` for `$.session.id()` |
+| `$.prompt.submit` from a timer works in a `--bg` session with no client attached | pass: the turn ran, and its transcript row reads `origin.kind: plugin` and `promptSource: system` | idle mail delivery; `hub.mjs`'s scan skips such rows |
+
 ## Key design
 
 | Piece | Where | What it does |
@@ -68,14 +82,14 @@ hold a reaper.
 | Phase | Scope | Status | Kill switch |
 |---|---|---|---|
 | P0 | Contain the auto-handoff plugin's defaults: a global git exclude for `docs/handoffs/`, the `hub-handoff` skill, `hub.mjs role`, and the plugin pointed at the skill | shipped 2026-11-04 | the plugin's `command` back to its own, or the plugin disabled |
-| P1 | Prove the platform in throwaway sessions: plugins in a background session, the hooks flag under `--settings`, `$.env.set`, `$.prompt.submit` with no client attached | — | — |
-| P2 | hub-guard cleanup (TaskStop, interrupt, Monitor, subagent end) | — | `~/.claude/hub-guard/off`, or its `cleanup` part alone |
-| P3 | The hub helper: markers, `procs`, `reap` on stop, rotation and tick, the new signals, the host budget with staggered respawn, one FIFO slot pool, the cargo guard | — | `host.json` limits; the guard's `cargo` part |
-| P4 | The rules in the worker protocol and the hub skill | — | — |
-| P5 | The hub view | — | the previous `hub-view` version |
-| P6 | The mailbox | — | the guard's `mail` part; cross-session sends stay the fallback |
-| P7 | The idle-handoff gate, then 45 minutes | — | the guard's `gate` part; `minutes` back to 50 |
-| P8 | Docs: `docs/agent-hub.md` and its `docs/README.md` row | — | — |
+| P1 | Prove the platform in throwaway sessions: plugins in a background session, the hooks flag under `--settings`, `$.env.set`, `$.prompt.submit` with no client attached | passed 2026-11-04, one fallback ([P1 results](#p1-results--the-platform-2026-11-04)) | — |
+| P2 | hub-guard cleanup (TaskStop, interrupt, Monitor, subagent end) | shipped 2026-11-04, hub-guard 0.1.2 | `~/.claude/hub-guard/off`, or its `cleanup` part alone |
+| P3 | The hub helper: markers, `procs`, `reap` on stop, rotation and tick, the new signals, the host budget with staggered respawn, one FIFO slot pool, the cargo guard | shipped 2026-11-04 | `host.json` limits; the guard's `cargo` part |
+| P4 | The rules in the worker protocol and the hub skill | shipped 2026-11-04 | — |
+| P5 | The hub view | shipped 2026-11-04, hub-view 0.3.0 (52 engine-kit tests) | the previous `hub-view` version |
+| P6 | The mailbox | shipped 2026-11-04, hub-guard 0.3.0 | the guard's `mail` part; cross-session sends stay the fallback |
+| P7 | The idle-handoff gate, then 45 minutes | shipped 2026-11-04, hub-guard 0.2.0; `minutes` is 45 | the guard's `gate` part; `minutes` back to 50 |
+| P8 | Docs: `docs/agent-hub.md` and its `docs/README.md` row | the docs PR, 2026-11-04 | — |
 
 ## Acceptance criteria
 
@@ -116,9 +130,11 @@ hold a reaper.
 - [ ] **AC9 — field.** The three hubs resume on it. The first tick shows the host line and the badges,
   respawns are staggered, and a real TaskStop in a worker carries its cleanup line. A day later
   nothing is left behind.
-- [ ] **AC10 — docs.** `docs/agent-hub.md` gains process hygiene, the host budget, the mailbox and the
+- [x] **AC10 — docs.** `docs/agent-hub.md` gains process hygiene, the host budget, the mailbox and the
   idle handoff, in house style (mermaid, tables), and its row in [`docs/README.md`](../README.md)
-  says so.
+  says so. *2026-11-04: [§12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff),
+  with a flowchart and a sequence diagram, the new signals in §5, the view's new parts in §8, and the
+  index row.*
 
 ## Open decisions
 
@@ -148,3 +164,9 @@ Decided by the operator on 2026-11-04:
 | 2026-11-03 23:22 | Found and ended by hand with one process-group kill. |
 | 2026-11-04 | Repro: TaskStop leaves a bounded perl → sh → sleep chain, elevated or not. A `du` that timed out leaves `du` and `tail`. |
 | 2026-11-04 | P0: the idle handoff can no longer write inside a project. |
+| 2026-11-04 | P1: four of the five platform checks pass; `CLAUDE_PID` from the hooks worker is inherited, so the session's pid comes from `claude agents`. |
+| 2026-11-04 | P2, live: a TaskStop on the 2026-11-03 shape, and on a call that timed out into the background, each ended the whole chain, and the transcript read `hub-guard cleanup: ended 4 processes … (sh, perl, sleep, bash)`. The first run caught the reaper killing itself, since it inherited the latest call's tag; it now skips itself, its ancestors and every other run of itself. A native subtree, the tag race between parallel calls (the tree's own tag decides), the never-kill list and WSL `nohup` and `setsid` children were each shown. |
+| 2026-11-04 | P3, live: `hub.mjs stop` on a worker ended 5 processes, one in WSL, in 3.2 s. A worker's bare `cargo check` was refused with the slot command. After the reboot, one hub showed 2 stopped workers as `act` and 5 as `info`, with the host line on its board; the shared slot pool held 2 of 5 waiters. |
+| 2026-11-04 | P7, live: the gate skipped a parked worker's idle handoff with no assistant turn, and let a plain session's through. `minutes` set to 45. |
+| 2026-11-04 07:54–07:59 | P6, live, on a throwaway worker: mail posted while it was idle was delivered in 5 s, as a turn of plugin origin. Posted while it was stopped, mail waited with `MAIL_WAITING` and no respawn; a respawn delivered the waiting message and its RESUME together, 17 s later. `status --json --peek` on the five live hubs differed from the old helper only by the new mail counts. |
+| 2026-11-04 | P5: hub-view 0.3.0, 52 engine-kit tests. A `--bg` session's `/hub-view status` drew the host strip and one questions line across the five live hubs. Attach, Open and Clean up are covered by the kit only, since running them live opens windows on the operator's desktop. |
