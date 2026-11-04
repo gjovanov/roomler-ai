@@ -144,6 +144,30 @@ async fn gates_changed(w: &mut GateWatch) {
     std::future::pending::<()>().await
 }
 
+/// FR-43 P3b — the person's floor as it stands: their `auto_grant_session`,
+/// fixed for the process (the consent broker is built from it at start), and
+/// their live `rc_*` floor.
+fn person_floor(auto_grant_session: bool) -> crate::delegate::PersonFloor {
+    crate::delegate::PersonFloor {
+        auto_grant_session,
+        session_policy: crate::session_policy::device_policy(),
+    }
+}
+
+/// FR-43 P3b — resolves when the person's `rc_*` floor changes; never for a
+/// worker that hands no floor over (or if the sender is ever gone, which a
+/// `static` cannot be — pending beats spinning).
+async fn floor_changed(
+    w: &mut Option<tokio::sync::watch::Receiver<roomler_ai_remote_control::models::SessionPolicy>>,
+) {
+    if let Some(w) = w
+        && w.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await
+}
+
 /// Run the worker's side of the channel for the process lifetime.
 ///
 /// Returns immediately unless this process was started as `run --supervised`,
@@ -154,6 +178,11 @@ pub async fn run(
     // FR-43 P3a — this worker holds no enrollment, so this channel is all it
     // can serve, and without it the process is of no use to anyone.
     unenrolled: bool,
+    // FR-43 P3b — the person's `auto_grant_session`, from their own file. A
+    // worker with no enrollment hands it to the daemon with their `rc_*`
+    // floor ([`DelegateFrame::PersonFloor`]); every other worker's row
+    // enforces its own, and sends nothing.
+    auto_grant_session: bool,
     // FR-43 P3a — and its own log lines, which go to the daemon over the
     // channel because this process has no row to upload them on. `None` for
     // every other worker, which uploads its own.
@@ -195,6 +224,7 @@ pub async fn run(
         return;
     };
 
+    let person = unenrolled.then_some(auto_grant_session);
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
@@ -203,6 +233,7 @@ pub async fn run(
             &to_signaling,
             &mut from_signaling,
             &mut logs,
+            person,
             &mut shutdown,
         )
         .await
@@ -245,6 +276,9 @@ async fn attach_once(
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
     logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+    // FR-43 P3b — `Some(auto_grant_session)` when this worker hands the
+    // person's floor to the daemon.
+    person: Option<bool>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
@@ -336,6 +370,19 @@ async fn attach_once(
         )
         .await?;
     }
+    // FR-43 P3b — and, from a worker with no enrollment, the person's floor:
+    // their row and its broker are gone, so the daemon's `Request` arm is the
+    // only consent there is. Subscribed BEFORE the first frame, so a change in
+    // between is never missed.
+    let mut floor_watch = person.map(|_| crate::session_policy::watch_device_policy());
+    if let Some(auto_grant_session) = person {
+        let floor = person_floor(auto_grant_session);
+        tracing::info!(
+            ?floor,
+            "delegation: handing the person's consent floor to the daemon"
+        );
+        write_frame(&mut wr, &DelegateFrame::PersonFloor(floor)).await?;
+    }
 
     loop {
         tokio::select! {
@@ -416,7 +463,8 @@ async fn attach_once(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
                             | DelegateFrame::KeepBusyTold { .. }
-                            | DelegateFrame::WorkerLogs { .. },
+                            | DelegateFrame::WorkerLogs { .. }
+                            | DelegateFrame::PersonFloor(..),
                         ) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
@@ -472,6 +520,15 @@ async fn attach_once(
                     },
                 )
                 .await?;
+            }
+            // FR-43 P3b — the person changed their `rc_*` floor (a `config
+            // set`): the daemon holds the new one before the next session asks.
+            () = floor_changed(&mut floor_watch) => {
+                if let Some(auto_grant_session) = person {
+                    let floor = person_floor(auto_grant_session);
+                    tracing::info!(?floor, "delegation: the person's consent floor changed");
+                    write_frame(&mut wr, &DelegateFrame::PersonFloor(floor)).await?;
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -642,5 +699,32 @@ mod tests {
             assert_eq!(l.msg, i.to_string());
         }
         assert_eq!(seen[total].msg.len(), WORKER_LOG_MSG_MAX);
+    }
+
+    /// FR-43 P3b — a worker that hands no floor over never wakes for one; one
+    /// that does wakes when the person's `rc_*` floor is set (a `config set`),
+    /// and says their `auto_grant_session` as it was given.
+    #[tokio::test]
+    async fn the_floor_watch_wakes_only_a_worker_that_hands_its_floor_over() {
+        let mut none = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), floor_changed(&mut none))
+                .await
+                .is_err(),
+            "no floor handed over: never"
+        );
+        let mut watching = Some(crate::session_policy::watch_device_policy());
+        // The value it already holds: a change for the watch, none for any
+        // other test reading the floor.
+        crate::session_policy::set_device_policy(crate::session_policy::device_policy());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), floor_changed(&mut watching))
+                .await
+                .is_ok(),
+            "a set wakes it"
+        );
+        let floor = person_floor(false);
+        assert!(!floor.auto_grant_session);
+        assert_eq!(floor.session_policy, crate::session_policy::device_policy());
     }
 }
