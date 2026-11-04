@@ -586,9 +586,19 @@ impl Drop for DnsOsGuard {
 }
 
 /// Run an OS command off the reactor; `true` on exit 0, else logs stderr.
+///
+/// #3291 — every DNS change goes through here, and each waits first for an
+/// exit-DNS purge that is still running ([`purge_exit_dns_within`]): a purge
+/// that ended after a steer would delete the steer.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn run_cmd(args: Vec<String>) -> bool {
     tokio::task::spawn_blocking(move || {
+        if let Some(waited) = EXIT_DNS_PURGES.wait_idle() {
+            info!(
+                waited_ms = waited.as_millis() as u64,
+                "dns: the exit-DNS purge has ended; this DNS change goes on (#3291)"
+            );
+        }
         let prog = args[0].clone();
         match std::process::Command::new(&prog).args(&args[1..]).output() {
             Ok(o) if o.status.success() => true,
@@ -789,6 +799,10 @@ pub async fn unsteer_default_dns(_magic_domain: Option<&str>) -> bool {
 /// `purge_exit_routes` at every pre-`process::exit` site AND at boot. Context-free
 /// (no `self_v4`/domain in hand) — hence the blanket revert on Linux. No-op off
 /// Windows/Linux.
+///
+/// #3291 — the child's stdio is null: nothing reads its output, and a child left
+/// running past [`purge_exit_dns_within`]'s bound must not depend on pipes to a
+/// process that may have gone.
 pub fn purge_exit_dns() {
     #[cfg(target_os = "windows")]
     {
@@ -801,17 +815,142 @@ pub fn purge_exit_dns() {
                      Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
                 ),
             ])
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("resolvectl")
             .args(["revert", DNS_IF_NAME])
-            .output();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
     // macOS (FR-97 P1c): nothing to purge. Every key is a TEMPORARY value of
     // this process's session, so configd removes it when the process ends,
     // whatever the exit — and a new process starts with none of ours.
+}
+
+/// #3291 — [`purge_exit_dns`] for a start, which waits for it for at most
+/// `wait`. Returns whether the purge ended within it.
+///
+/// On Windows the purge is a `powershell` child, and its cmdlets go through
+/// WMI. Both run at Normal priority, so a host kept busy by higher-priority work
+/// holds the purge for as long as the load lasts. A start that waited for it
+/// stayed offline that whole time, minutes on a starved 4-vCPU guest.
+///
+/// Past `wait` the caller goes on and the purge keeps running on a thread of
+/// its own until it ends, however long that takes: a stale `.`-root rule still
+/// goes. Until then every DNS change made through [`run_cmd`] waits for it, so a
+/// late purge can never delete a steer made after it began.
+pub fn purge_exit_dns_within(wait: Duration) -> bool {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        EXIT_DNS_PURGES.run_within(wait, purge_exit_dns)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = wait;
+        purge_exit_dns();
+        true
+    }
+}
+
+/// #3291 — the exit-DNS purges still running on a thread of their own. Every
+/// DNS change made through [`run_cmd`] waits for them.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+static EXIT_DNS_PURGES: PurgeGate = PurgeGate::new();
+
+/// #3291 — how many purges are in flight, and the condition their ends signal.
+/// A purge counts from before its thread starts until it ends, so no DNS change
+/// can slip in between.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+struct PurgeGate {
+    in_flight: std::sync::Mutex<u32>,
+    ended: std::sync::Condvar,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+impl PurgeGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: std::sync::Mutex::new(0),
+            ended: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Run `purge` on a thread of its own and wait for it for up to `wait`.
+    /// Returns whether it ended within `wait`. A purge that panics still ends.
+    fn run_within(&'static self, wait: Duration, purge: impl FnOnce() + Send + 'static) -> bool {
+        /// Counts the purge out when it ends, however it ends.
+        struct Ends(&'static PurgeGate);
+        impl Drop for Ends {
+            fn drop(&mut self) {
+                self.0.end();
+            }
+        }
+
+        *self.lock() += 1;
+        let purge = Arc::new(std::sync::Mutex::new(Some(purge)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let theirs = Arc::clone(&purge);
+        let spawned = std::thread::Builder::new()
+            .name("exit-dns-purge".into())
+            .spawn(move || {
+                let ends = Ends(self);
+                let purge = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(purge) = purge {
+                    purge();
+                }
+                drop(ends);
+                let _ = done_tx.send(());
+            });
+        if spawned.is_err() {
+            // No thread to run it on: run it here, unbounded, as before. The
+            // purge is load-bearing and the bound is not.
+            let _ends = Ends(self);
+            let purge = purge.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(purge) = purge {
+                purge();
+            }
+            return true;
+        }
+        !matches!(
+            done_rx.recv_timeout(wait),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+
+    /// Wait until no purge is in flight. Returns how long that took, or
+    /// `None` when none was.
+    fn wait_idle(&self) -> Option<Duration> {
+        let mut in_flight = self.lock();
+        if *in_flight == 0 {
+            return None;
+        }
+        info!("dns: an exit-DNS purge is still running; DNS changes wait for it (#3291)");
+        let from = std::time::Instant::now();
+        while *in_flight > 0 {
+            in_flight = self
+                .ended
+                .wait(in_flight)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        Some(from.elapsed())
+    }
+
+    fn end(&self) {
+        let mut in_flight = self.lock();
+        *in_flight = in_flight.saturating_sub(1);
+        self.ended.notify_all();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, u32> {
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// FR-97 P1c — macOS DNS through the SCDynamicStore, the way a VPN client
@@ -1296,6 +1435,65 @@ mod tests {
              frees — otherwise one momentary conflict is permanent"
         );
         loser.abort();
+    }
+
+    /// #3291 — a purge past its bound: the start goes on, the purge still runs
+    /// to its end, and a DNS change made meanwhile waits for that end.
+    #[test]
+    fn a_purge_past_its_bound_still_ends_and_dns_changes_wait_for_it() {
+        static GATE: PurgeGate = PurgeGate::new();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&str>::new()));
+
+        let purge_order = Arc::clone(&order);
+        let ended_in_time = GATE.run_within(Duration::from_millis(50), move || {
+            held.recv().unwrap();
+            purge_order.lock().unwrap().push("the purge ended");
+        });
+        assert!(!ended_in_time, "past its bound, the caller goes on");
+
+        let change_order = Arc::clone(&order);
+        let change = std::thread::spawn(move || {
+            let waited = GATE.wait_idle();
+            change_order.lock().unwrap().push("the DNS change");
+            waited
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "a DNS change waits while the purge runs"
+        );
+
+        release.send(()).unwrap();
+        assert!(change.join().unwrap().is_some(), "the change waited");
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["the purge ended", "the DNS change"]
+        );
+        assert_eq!(GATE.wait_idle(), None, "nothing is left in flight");
+    }
+
+    /// #3291 — a purge that ends within its bound is waited for, as before the
+    /// bound, and leaves nothing for a DNS change to wait on.
+    #[test]
+    fn a_purge_within_its_bound_is_waited_for() {
+        static GATE: PurgeGate = PurgeGate::new();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let purge_ran = Arc::clone(&ran);
+        assert!(GATE.run_within(Duration::from_secs(10), move || {
+            purge_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(GATE.wait_idle(), None);
+    }
+
+    /// #3291 — a purge that panics still counts out, so no DNS change waits on
+    /// it forever.
+    #[test]
+    fn a_purge_that_panics_holds_no_dns_change() {
+        static GATE: PurgeGate = PurgeGate::new();
+        assert!(GATE.run_within(Duration::from_secs(10), || { panic!("the purge failed") }));
+        assert_eq!(GATE.wait_idle(), None);
     }
 }
 

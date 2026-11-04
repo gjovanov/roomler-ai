@@ -76,7 +76,7 @@ sequenceDiagram
 
 ### On a 401: recover before backing off
 
-When the server refuses the token at the socket (`signaling.rs:905`), the loop tries two things before its back-off ladder:
+When the server refuses the token at the socket (`signaling.rs:938`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
 2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:116`). On the renew routes only; every other route enforces `exp` as before.
@@ -107,7 +107,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 ### A connected device is told at once (#2267)
 
-A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1238`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1202`).
+A removal ends with a **kick**, run on the pod the request landed on and, through the control channel, on the pod that holds the device's socket (`kick`, `crates/modules/fleet/src/removal.rs:96`). It takes the device out of the hub and queues `rc:goodbye AgentDeleted` on its socket (`Hub::kick_removed_agent`, `crates/modules/fleet/src/hub.rs:1238`). The daemon stops on it exactly as it does when a connection is refused: it closes its peers, raises the needs-attention sentinel, drops any exit-node routes and exits 7 (`agents/roomlerd/src/signaling.rs:1243`).
 
 Before #2267 the kick only took the device out of the hub. The device kept its socket and heard nothing. It learned of its removal at its next connection, after a network change or a pod roll, and on a stable network that could take days. Nothing could be done through that socket, because every action re-checks the row, but the device's own status read "connected" throughout.
 
@@ -141,7 +141,7 @@ What happens after exit 7 depends on how the daemon is installed. The device sta
 
 | Install | After exit 7 | After `roomlerd re-enroll` |
 |---|---|---|
-| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:937`) | the next start connects with the new token, with no hand |
+| Windows, the `Roomler` service (machine installs, attended or not) | its supervisor starts the worker again with a backoff of up to 60 s, for good; each start is refused and exits 7 (`decide_exit_reaction`, `agents/roomlerd/src/win_service/supervisor.rs:975`) | the next start connects with the new token, with no hand |
 | Windows, the per-user Scheduled Task | stays down until the next sign-in: `<RestartOnFailure>` restarts no exit, measured (#3292) | `roomlerd service start` |
 | macOS (launchd, `KeepAlive` on a failed exit) | relaunched at most every 10 s | the next relaunch, with no hand |
 | Linux, the system unit `roomlerd` | stays stopped: `RestartPreventExitStatus=7 8`, because restarting only hammers a server that already said no (`agents/roomlerd/packaging/linux/roomlerd.service:72`) | `sudo systemctl start roomlerd` |

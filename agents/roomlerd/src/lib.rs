@@ -26,8 +26,8 @@ pub mod app;
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
-    appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, pairing, pairing_terminal, token_slot,
+    appdirs, boot_id, config, config_surface, crash_recorder, enrollment, files_dir, logging,
+    logs_upload, machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
@@ -339,6 +339,39 @@ pub fn purge_exit_routes() {
         // (host routes through the PHYSICAL uplink, which outlive the TUN; a
         // leftover pin on the server's address blocks the next start's
         // control WS after a network change). A no-op when it is empty.
+        tunnel_core::overlay::host_ledger::purge();
+    }
+}
+
+/// #3291 — how long a start waits for the exit-DNS purge before it goes on
+/// without it. Unloaded, the purge's `powershell` ended in 1.7–1.8 s on a
+/// 4-vCPU Windows 11 guest; a host kept busy by higher-priority work holds it
+/// for as long as the load lasts.
+pub const START_DNS_PURGE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #3291 — [`purge_exit_routes`] for a start: the same purges in the same order,
+/// but the start waits for the exit-DNS purge for at most
+/// [`START_DNS_PURGE_WAIT`]. Before the bound, a starved Windows host stayed
+/// offline for as long as the purge's `powershell` waited, and nothing came
+/// before the purge that could bring the device online.
+///
+/// Past the bound the purge keeps running on its own thread until it ends, and
+/// every DNS change the overlay makes waits for it
+/// (`tunnel_core::overlay::dns::purge_exit_dns_within`), so it can never delete
+/// a steer made after it began. The route purges stay synchronous: they are
+/// typed calls into the IP helper, with no child process to wait on.
+pub fn purge_exit_routes_at_start() {
+    #[cfg(feature = "overlay-l3")]
+    {
+        tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
+        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        if !tunnel_core::overlay::dns::purge_exit_dns_within(START_DNS_PURGE_WAIT) {
+            tracing::warn!(
+                wait_s = START_DNS_PURGE_WAIT.as_secs(),
+                "boot reconcile: the exit-DNS purge has not ended within its bound, so the start \
+                 goes on; the purge runs to its end on its own, and DNS changes wait for it (#3291)"
+            );
+        }
         tunnel_core::overlay::host_ledger::purge();
     }
 }

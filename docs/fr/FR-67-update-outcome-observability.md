@@ -11,8 +11,8 @@ Today the question has an answer computed for it, and that answer is thrown away
 
 `roomlerd` already computes a verdict for every install: `InstallStatus` is a
 five-state enum (`InProgress | SucceededVerified | SucceededUnverified |
-InstallerFailed | Timeout`, `post_install.rs:130-151`) persisted to
-`<log_dir>/last-install.json` (`post_install.rs:166`).
+InstallerFailed | Timeout`, `post_install.rs:138-166`) persisted to
+`<log_dir>/last-install.json` (`post_install.rs:181`).
 
 Measured on the fleet:
 
@@ -29,11 +29,11 @@ updates, and not one recorded an outcome.
 **1. The watcher waits for its own parent to die, and that death is what kills it.**
 
 `install_tarball_linux` completes the entire install **synchronously** and returns
-`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2237`). That pid is
+`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2247`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
-(`post_install.rs:226`), polling `kill(pid, 0)` for up to 600 s
-(`post_install.rs:1053-1078`).
+(`post_install.rs:293`), polling `kill(pid, 0)` for up to 600 s
+(`post_install.rs:1138-1163`).
 
 So the watcher's only exit condition is the daemon's exit — while the daemon's
 exit is precisely what tears down the cgroup and kills the watcher. There is
@@ -44,7 +44,7 @@ nothing being waited *for*: the install finished before the watcher existed. The
 **2. The cgroup teardown then removes any chance of finishing.** Both packaged
 units ship with no `KillMode` (`packaging/linux/roomlerd.service`,
 `roomler.service`) ⇒ systemd's default `control-group`. `spawn_watcher` launches
-the watcher as a plain child (`updater.rs:2607`) on the reasoning that it "is
+the watcher as a plain child (`updater.rs:2617`) on the reasoning that it "is
 reparented to init and runs to completion on its own" — but reparenting to PID 1
 does not leave the cgroup. `docs/fr/FR-36-wayland-capture.md:371` already recorded
 this exact lesson for a different subsystem.
@@ -55,9 +55,9 @@ mostly moot. Fixing (2) alone would be building a systemd mechanism to support a
 wait that should not exist.
 
 **3. Nothing reads the verdict, on any platform.** `post_install::read_outcome()`
-(`post_install.rs:180`) has **zero callers**. The module doc's claim that "the new
+(`post_install.rs:257`) has **zero callers**. The module doc's claim that "the new
 binary reads `last-install.json` at startup to surface the outcome"
-(`post_install.rs:85-86`, echoed at `:10`, `:115`, `docs/remote-control.md:1256`)
+(`post_install.rs:85-86`, echoed at `:10`, `:123`, `docs/remote-control.md:1256`)
 was never wired. So even on Windows — where the staged watcher does produce a
 verdict — nothing surfaces it.
 
@@ -137,8 +137,8 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:360`); `UpdateRefusal` and `update_refusal()` (`:573`, `:1448`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5030`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3083`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3066`), else `self` |
-| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7362`, `:7375`) |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5095`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:3093`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:3076`), else `self` |
+| Stamped at **every** announcement | `stub_caps` (`signaling.rs:7430`, `:7443`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1457`): a 409 on one device (`:1504`), a `refused` row with its `refused_code` in a bulk (`:1636`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |
 
@@ -197,7 +197,7 @@ sequenceDiagram
 
 ## Out of scope
 
-- A Unix `ensure_service_running` equivalent (`post_install.rs:579`). Windows needs
+- A Unix `ensure_service_running` equivalent (`post_install.rs:664`). Windows needs
   it because the SCM does not auto-restart; Linux has `Restart=always` +
   `RestartPreventExitStatus=7 8`, and a watcher running `systemctl start` would
   fight the supervisor.

@@ -486,8 +486,8 @@ pub struct TokenValidation {
     pub token_type: Option<String>,
     /// `Some(token_type == "tunnel_enrollment")` ONLY when the
     /// operator picked the tunnel-client role — catches "wrong token
-    /// copied" mistakes (agent-enrollment token from Admin → Agents
-    /// pasted instead of the tunnel one from Admin → Tunnels) before
+    /// copied" mistakes (a device's token from Devices → Enroll → Device
+    /// pasted instead of a Tunnel client one) before
     /// the POST. `None` for daemon roles / no role: daemon tokens are
     /// not gated client-side, same as the legacy agent wizard.
     pub audience_matches: Option<bool>,

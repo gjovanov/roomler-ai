@@ -23,10 +23,11 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::{
-    models::{KeyRotationRequest, RpcCap},
+    models::{Agent, KeyRotationRequest, RetiredKeyMode, RpcCap},
     signaling::ServerMsg,
 };
-use serde::Serialize;
+use roomler_ai_services::dao::base::DaoError;
+use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
@@ -108,50 +109,67 @@ pub fn decide(
     })
 }
 
-#[derive(Debug, Serialize)]
-pub struct RotateKeyResult {
-    pub agent_id: String,
-    /// Echoed by the device in its report; the dashboard matches on it.
-    pub request_id: String,
-    /// `pushed` or `queued`.
-    pub dispatch: &'static str,
-    /// `true` when the order reached a live socket. `false` = queued for the
-    /// device's next connect.
-    pub delivered: bool,
+/// Who placed an order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedBy {
+    /// An operator, through the route (which checked `MANAGE_AGENTS`).
+    Operator(ObjectId),
+    /// FR-40 P2 — the server itself, for the reason named: the order's
+    /// `trigger`, today only `key_retired`. No user asked, so the order and
+    /// its audit row carry the zero id.
+    Server(&'static str),
 }
 
-pub async fn rotate_overlay_key(
-    State(state): State<NetworkState>,
-    auth: AuthUser,
-    Path((tenant_id, agent_id)): Path<(String, String)>,
-) -> Result<Json<RotateKeyResult>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    let aid = ObjectId::parse_str(&agent_id)
-        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+impl OrderedBy {
+    /// The `user_id` the order and its audit row carry.
+    pub fn user_id(self) -> ObjectId {
+        match self {
+            Self::Operator(user) => user,
+            Self::Server(_) => ObjectId::from_bytes([0; 12]),
+        }
+    }
 
-    require_permission(
-        &state,
-        tid,
-        auth.user_id,
-        permissions::MANAGE_AGENTS,
-        "MANAGE_AGENTS",
-    )
-    .await?;
+    pub fn trigger(self) -> Option<&'static str> {
+        match self {
+            Self::Operator(_) => None,
+            Self::Server(why) => Some(why),
+        }
+    }
+}
 
-    // Tenant-scoped: a foreign agent id is a 404, not a cross-tenant order —
-    // and LIVE: a rotation order on a removed device would be desired state
-    // written onto a tombstone, with nothing left to reconcile it (#1821).
-    let agent = state.fleet.agents.find_live_in_tenant(tid, aid).await?;
+/// What [`place_order`] did: the order's id, and the decision.
+#[derive(Debug)]
+pub struct Placed {
+    pub request_id: String,
+    pub outcome: Result<Dispatch, KeyRotationDenyReason>,
+}
 
+/// THE path a rotation order takes, whoever places it — the route below for
+/// an operator, the overlay join for a device that presented a retired key
+/// (FR-40 P2): the gates, the desired state on the row, the push, and ONE
+/// audit row for either arm. One function, so an order the server places
+/// cannot skip a gate, or an audit, that an operator's goes through.
+///
+/// `agent` is the LIVE row, already resolved in the tenant;
+/// `public_key_before` is the key the device holds as the order is placed
+/// (P1c: a join under any other key afterwards is the proof it rotated).
+pub async fn place_order(
+    state: &NetworkState,
+    tid: ObjectId,
+    aid: ObjectId,
+    agent: &Agent,
+    by: OrderedBy,
+    public_key_before: Option<String>,
+) -> Result<Placed, DaoError> {
     let request_id = ObjectId::new().to_hex();
     let online = state.fleet.rc_hub.is_agent_online(aid);
     // The hello caps are persisted on the row at every connect, so for a
     // live device this is what it advertised THIS session.
     let supports_rotation = agent.capabilities.has_rpc(RpcCap::KeyRotate);
     // Keyed on the device in both slots: the ceiling is per device, not per
-    // admin — see `AppState::key_rotation_rate_limiter`. Checked AFTER the
-    // identity gates so a refusal is attributable and audited.
+    // admin — see `AppState::key_rotation_rate_limiter` — and the server's
+    // own orders count against it too. Checked AFTER the identity gates so a
+    // refusal is attributable and audited.
     let rate_ok = state
         .key_rotation_rate_limiter
         .check(aid, aid, RATE_LIMIT_PER_MINUTE);
@@ -164,15 +182,11 @@ pub async fn rotate_overlay_key(
         Ok(dispatch) => {
             let request = KeyRotationRequest {
                 request_id: request_id.clone(),
-                requested_by: auth.user_id,
+                requested_by: by.user_id(),
                 requested_at: DateTime::now(),
+                trigger: by.trigger().map(str::to_string),
                 delivered_at: None,
-                // P1c — what the device holds NOW; a join under another key
-                // is the proof the rotation happened, report or no report.
-                public_key_before: agent
-                    .overlay_identity
-                    .as_ref()
-                    .map(|i| i.public_key.clone()),
+                public_key_before,
             };
             state
                 .fleet
@@ -217,7 +231,8 @@ pub async fn rotate_overlay_key(
         .record(
             tid,
             aid,
-            auth.user_id,
+            by.user_id(),
+            by.trigger(),
             &request_id,
             outcome.as_ref().ok().map(|d| d.wire()),
             outcome.as_ref().err().map(|r| r.wire()),
@@ -226,6 +241,66 @@ pub async fn rotate_overlay_key(
     {
         tracing::warn!(%e, "key rotation audit write failed");
     }
+
+    Ok(Placed {
+        request_id,
+        outcome,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateKeyResult {
+    pub agent_id: String,
+    /// Echoed by the device in its report; the dashboard matches on it.
+    pub request_id: String,
+    /// `pushed` or `queued`.
+    pub dispatch: &'static str,
+    /// `true` when the order reached a live socket. `false` = queued for the
+    /// device's next connect.
+    pub delivered: bool,
+}
+
+pub async fn rotate_overlay_key(
+    State(state): State<NetworkState>,
+    auth: AuthUser,
+    Path((tenant_id, agent_id)): Path<(String, String)>,
+) -> Result<Json<RotateKeyResult>, ApiError> {
+    let tid = ObjectId::parse_str(&tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let aid = ObjectId::parse_str(&agent_id)
+        .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
+
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+
+    // Tenant-scoped: a foreign agent id is a 404, not a cross-tenant order —
+    // and LIVE: a rotation order on a removed device would be desired state
+    // written onto a tombstone, with nothing left to reconcile it (#1821).
+    let agent = state.fleet.agents.find_live_in_tenant(tid, aid).await?;
+
+    let Placed {
+        request_id,
+        outcome,
+    } = place_order(
+        &state,
+        tid,
+        aid,
+        &agent,
+        OrderedBy::Operator(auth.user_id),
+        // P1c — what the device holds NOW; a join under another key is the
+        // proof the rotation happened, report or no report.
+        agent
+            .overlay_identity
+            .as_ref()
+            .map(|i| i.public_key.clone()),
+    )
+    .await?;
 
     let dispatch = match outcome {
         Ok(d) => d,
@@ -253,11 +328,89 @@ pub async fn rotate_overlay_key(
     }))
 }
 
+/// FR-40 P2 — the org's retired-key posture, as the switch route answers it.
+#[derive(Debug, Serialize)]
+pub struct RetiredKeyModeView {
+    pub mode: RetiredKeyMode,
+}
+
+/// The body of the switch's `PUT`. A string, parsed strictly by the handler:
+/// the mode's own `Deserialize` is lenient (a stored value a rolled-back build
+/// does not know reads as `off`), and an admin's typo must be a 400 instead.
+#[derive(Debug, Deserialize)]
+pub struct SetRetiredKeyModeBody {
+    pub mode: String,
+}
+
+fn tenant_of(tenant_id: &str) -> Result<ObjectId, ApiError> {
+    ObjectId::parse_str(tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))
+}
+
+/// `GET /api/tenant/{tenant_id}/overlay-retired-keys` — whether this org
+/// refuses retired overlay keys (`off` | `warn` | `enforce`). `MANAGE_AGENTS`,
+/// the permission that orders a rotation.
+pub async fn get_retired_key_mode(
+    State(state): State<NetworkState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<RetiredKeyModeView>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+    let mode = state
+        .overlay_networks
+        .get_or_create(tid)
+        .await?
+        .retired_key_mode;
+    Ok(Json(RetiredKeyModeView { mode }))
+}
+
+/// `PUT /api/tenant/{tenant_id}/overlay-retired-keys` `{ "mode": … }` — the
+/// org's switch. It disturbs no live session: the mode is read at each join
+/// and DERP registration, so it applies from the next one. `MANAGE_AGENTS`:
+/// whoever may order a device's rotation may have the server order it when
+/// the device presents a retired key.
+pub async fn set_retired_key_mode(
+    State(state): State<NetworkState>,
+    auth: AuthUser,
+    Path(tenant_id): Path<String>,
+    Json(body): Json<SetRetiredKeyModeBody>,
+) -> Result<Json<RetiredKeyModeView>, ApiError> {
+    let tid = tenant_of(&tenant_id)?;
+    require_permission(
+        &state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+    let mode = RetiredKeyMode::from_wire(&body.mode).ok_or_else(|| {
+        ApiError::BadRequest("mode must be one of: off, warn, enforce".to_string())
+    })?;
+    state
+        .overlay_networks
+        .set_retired_key_mode(tid, mode)
+        .await?;
+    tracing::warn!(
+        tenant = %tid, admin = %auth.user_id, mode = mode.wire(),
+        "overlay retired keys: org switch changed"
+    );
+    Ok(Json(RetiredKeyModeView { mode }))
+}
+
 // FR-69 P5c — the order predicates moved to the wire crate's models (the agent
 // socket, the fleet module's now, evaluates them on connect); re-exported so
 // this file's tests and any `routes::overlay_key::…` path read as before.
 pub use roomler_ai_remote_control::models::{
-    REDELIVER_AFTER_SECS, order_is_satisfied, should_redeliver,
+    REDELIVER_AFTER_SECS, order_in_flight, order_is_satisfied, should_redeliver,
 };
 
 #[cfg(test)]
@@ -269,6 +422,7 @@ mod tests {
             request_id: "r1".into(),
             requested_by: ObjectId::new(),
             requested_at: now,
+            trigger: None,
             public_key_before: None,
             delivered_at: delivered_secs_ago
                 .map(|s| DateTime::from_millis(now.timestamp_millis() - s * 1000)),
@@ -378,6 +532,61 @@ mod tests {
         // stale (it can update before it reconnects) and the connect-time
         // reconcile gates on the live hello.
         assert_eq!(decide(true, false, false), Ok(Dispatch::Queued));
+    }
+
+    /// FR-40 P2 — the loop guard on the server's own order: a device that
+    /// keeps presenting a retired key while its order is being executed gets
+    /// no second one. Anything else may be ordered again, under the ceiling.
+    #[test]
+    fn only_an_order_being_executed_holds_off_another() {
+        let now = DateTime::now();
+        let later = DateTime::from_millis(now.timestamp_millis() + 5_000);
+        let earlier = DateTime::from_millis(now.timestamp_millis() - 5_000);
+        // The server's order snapshots the key the device PRESENTED (the
+        // retired one); its last accepted join, under the row's key, predates
+        // the order.
+        let mut fresh = req(Some(5), now);
+        fresh.public_key_before = Some("RETIRED==".into());
+        // Delivered seconds ago, unanswered: in flight.
+        assert!(order_in_flight(
+            &fresh,
+            None,
+            Some(&ident("CURRENT==", earlier)),
+            now
+        ));
+        // Answered (whatever the answer): not in flight, the device said.
+        assert!(!order_in_flight(&fresh, Some(&report("r1")), None, now));
+        // ...but an answer to an EARLIER order says nothing about this one.
+        assert!(order_in_flight(&fresh, Some(&report("r0")), None, now));
+        // Satisfied by a join under another key: done, not in flight.
+        assert!(!order_in_flight(
+            &fresh,
+            None,
+            Some(&ident("NEW==", later)),
+            now
+        ));
+        // Queued (never pushed), or delivered past the P1b window: whatever
+        // carried it is gone, so it is not in flight.
+        assert!(!order_in_flight(&req(None, now), None, None, now));
+        assert!(!order_in_flight(
+            &req(Some(REDELIVER_AFTER_SECS), now),
+            None,
+            None,
+            now
+        ));
+    }
+
+    /// FR-40 P2 — an order the server placed names no user and says why;
+    /// an operator's names them and says nothing.
+    #[test]
+    fn the_server_orders_as_nobody_with_a_reason() {
+        let admin = ObjectId::new();
+        assert_eq!(OrderedBy::Operator(admin).user_id(), admin);
+        assert_eq!(OrderedBy::Operator(admin).trigger(), None);
+        let by =
+            OrderedBy::Server(roomler_ai_remote_control::models::KEY_ROTATION_TRIGGER_KEY_RETIRED);
+        assert_eq!(by.user_id(), ObjectId::from_bytes([0; 12]));
+        assert_eq!(by.trigger(), Some("key_retired"));
     }
 
     #[test]

@@ -529,8 +529,8 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:47`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:6848`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2112`).
+heartbeat only read that cache (`signaling.rs:6916`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:2155`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3425`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3466`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -672,7 +672,7 @@ report the modifiers that report ends with. So on a KDE system install "A"
 typed "a", and every shifted symbol came out unshifted: a password with a
 capital in it failed. Shift is now pressed in a report before the key and
 released in one after it, and a shift the viewer holds is left alone
-(`agents/roomlerd/src/input/uinput_backend.rs:677`).
+(`agents/roomlerd/src/input/uinput_backend.rs:679`).
 
 ⚠️ **uinput: typed text on any layout** (FR-97 P3f). evdev carries physical
 keys, so `key_text` (the mobile keyboard, IME composition) has to know which
@@ -700,7 +700,7 @@ backend's 300 ms settle still reached nobody: 2 of 8 fresh devices on KDE on
 real hardware, and the AC4 oracle's first target went missing. The device used
 to be created at the session's first event. The input arbiter now opens it as
 soon as a session that may input has its control channel
-(`warm`, `agents/roomlerd/src/input/arbiter.rs:1018`), which gives it the second
+(`warm`, `agents/roomlerd/src/input/arbiter.rs:1082`), which gives it the second
 or more a viewer takes to send anything. This applies on Linux only, and an
 injector without the OS's permission is never cached. The kill switch is
 `ROOMLERD_INPUT_WARM=0`; `ROOMLERD_UINPUT_SETTLE_MS` (at most 5 s) overrides
@@ -1277,7 +1277,7 @@ deadline. Both fall through to the rest of the cascade with the reason in the
 log. Unattended access on Linux is FR-36's DRM arm (or §5's mutter arm where
 there is no scanout) — never this one. ⚠️ Where the product says so: the spec,
 this page, the `portal_capture` description in the config surface
-(`crates/agent-core/src/config_surface.rs:1265`, which every `roomler config`
+(`crates/agent-core/src/config_surface.rs:1273`, which every `roomler config`
 reader sees) and the helper's own log line. Since FR-93 P2c the web viewer says
 it too: `rc:video-info` carries `capture_arm` and `attended`, and the viewer
 names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b).
@@ -1285,7 +1285,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:6844`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7022`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -1380,10 +1380,15 @@ screen, and the viewer's own watchdog re-creates each one. A sampler on the gues
 | the person answers after the viewer's last session ended | — | dropped: no pump took it. The restore token it left opened the viewer's next session with no dialog |
 
 ⚠️ Two controllers opening the same host at once: the older one is superseded,
-not served, and reads the reason as a `backend_error`. A pump registers its shared
-pipeline (P5, `media_share`) only once its capture has opened, so while the
-request is pending the second viewer has nothing to join. That is acceptable for
-a path where one person at the screen allows one share, but it is a known edge.
+not served, and reads the reason as a `backend_error`. The VP9 pump registers its
+shared pipeline (P5, `media_share`) only once its capture has opened, so while the
+request is pending the second viewer has nothing to join. The FFmpeg pump
+registers before its open, so a second viewer of the same profile follows the
+pending open instead, and since #3423 it is told the wait (§4.7). That holds for
+the open's first 10 s only: the open blocks the owner's loop, so after that the
+pipeline reads stale (rc.443), and the next viewer evicts it and opens its own.
+That is acceptable for a path where one person at the screen allows one share,
+but it is a known edge.
 
 ### 4.7 The viewer is told, and waits (FR-93 P2d-2)
 
@@ -1413,6 +1418,7 @@ sequenceDiagram
 | the hook | `capture::open_default_async` takes an `OnOpenWait`, held for the open's blocking thread by `ParkHook`, which clears it on drop, so a pooled thread never carries one into the next open, not even after a panic | `capture/mod.rs` (`ParkHook`, `tell_open_waiting`) |
 | when it fires | a waiter still parked `TELL_AFTER` (2 s) in fires it once, with the **request's** start, so a session that joins a pending request is told that dialog's deadline, not one counted from its own join | `portal/pending.rs` (`Request::wait`, `TELL_AFTER`) |
 | the message | `rc:media-waiting {"for":"person_at_screen","waits_ms":N,"hint":…}`, retried until the control channel takes it, and never past the dialog's own deadline. A duration, not a time of day, so the viewer reads it on its own clock. From P5b `for` says what is waited for, and the hint follows it: the dialog for the screen, the dialog for remote control (P4b's automatic portal, "or to share just their screen"), `screen_unlock`, GNOME's lock screen (§5.3), (P3e) `display_wake`, a display switched off (§3.3), or (P5f) `session_away`, this user's session in the background (§5.6). A running capture sends the last two, after holding its keepalives for a 2 s quiet spell | `peer.rs` (`media_waiting_payload`, `media_waiting_hook`, P3e's `CaptureWait`) |
+| a viewer sharing the capture | a session that follows another's pipeline (P5) opens no capture, so it has no hook of its own (#3423). The owner's pipeline tells it, under its own session, with the owner's retrying sender: the followers when the owner's viewer is told, a viewer that joins later with the time the wait has left, and nobody once the owner's next frame has arrived. Only an open that runs after the pipeline exists can tell it: the FFmpeg pump's first open, and every reopen | `media_share.rs` (`Pipeline::tell_waiting`, `on_frame`, `try_join`), `peer.rs` (`shared_media_waiting_hook`, `CaptureWait::hold`) |
 | the viewer | the deadline is set at receipt. Until it passes, plus a 10 s grace (`RC_MEDIA_WAITING_GRACE_MS`), the watchdog counts no stall and re-creates nothing. A session that ends while waiting is not dead air | `useRemoteControl.ts` (`agentIsWaiting`, the watchdog tick, `isDeadAir`) |
 | what clears it | the first frame after the notice: from P5f, only media the watchdog counted from 1 s after the notice arrived (`advanceEndsWait`, `RC_MEDIA_WAITING_SETTLE_MS`), because a frame sent just before the notice on the video channel can be counted just after it; `rc:media-unavailable` (the wait ended without an answer, and that message says why); a new connect | the same |
 | kill switch | `ROOMLERD_MEDIA_WAITING=0` sends nothing, and the viewer behaves as before P2d-2. An older viewer ignores the message (an unknown `t`) | `peer.rs` |
@@ -1933,7 +1939,7 @@ remote-control session is live, the daemon holds one. On the signal it tells
 each live session's controller over that session's own control channel, then
 lets go. Each session registers its control channel as it starts
 (`sleep_notice.rs:99`); the watcher (`sleep_notice.rs:534`, the rule
-`:149`) sends `peer.rs:5543`'s notice to all of them at once (`:93`):
+`:149`) sends `peer.rs:5556`'s notice to all of them at once (`:93`):
 
 ```mermaid
 sequenceDiagram
@@ -2037,8 +2043,8 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 ## 7. Configuration
 
 Every key below is `restart required`; env wins over the config file. The
-keys are `crates/agent-core/src/config_surface.rs:1243-1274`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3001`).
+keys are `crates/agent-core/src/config_surface.rs:1259-1282`, and they reach
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:3153`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
@@ -2086,7 +2092,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4395-4412`, `watchdog.rs:550`) and it forced
+watchdog's 90 s window (`app.rs:4504-4521`, `watchdog.rs:550`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

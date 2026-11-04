@@ -218,7 +218,7 @@ fn dispatch<E: Mouse + Keyboard>(enigo: &mut E, msg: InputMsg) -> Result<()> {
         InputMsg::Key {
             code,
             down,
-            mods: _,
+            mods: _, // #3046: the arbiter has already pressed what it names.
         } => {
             // rc.227 — exact layout sampling on key events (cheap: 2
             // syscalls + 1 atomic when unchanged). Catches the remote
@@ -1099,6 +1099,31 @@ mod tests {
             self.calls.push(format!("raw {keycode} {direction:?}"));
             Ok(())
         }
+    }
+
+    /// #3046 — a chord the arbiter tapped reaches the OS as plain keys in the
+    /// order it planned them, with nothing added for the letter's `mods`.
+    #[test]
+    fn a_tapped_chord_reaches_the_os_in_its_order() {
+        let mut r = Recorder::default();
+        for (code, down, mods) in [
+            (0xe0, true, 0),
+            (0x06, true, 1),
+            (0x06, false, 0),
+            (0xe0, false, 0),
+        ] {
+            dispatch(&mut r, InputMsg::Key { code, down, mods }).unwrap();
+        }
+        let (ctrl, c) = (hid_to_key(0xe0).unwrap(), hid_to_key(0x06).unwrap());
+        assert_eq!(
+            r.calls,
+            [
+                format!("key {ctrl:?} Press"),
+                format!("key {c:?} Press"),
+                format!("key {c:?} Release"),
+                format!("key {ctrl:?} Release"),
+            ]
+        );
     }
 
     /// #1945 — the arbiter's release-all lets go where the pointer IS. A

@@ -346,8 +346,8 @@ run the command as root:
 |---|---|---|
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:965`](../crates/modules/fleet/src/agent_exec.rs#L965) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:361`](../crates/modules/fleet/src/agent_exec.rs#L361) |
-| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3814`](../crates/modules/fleet/src/hub.rs#L3814) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5231`](../agents/roomlerd/src/signaling.rs#L5231) |
+| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3832`](../crates/modules/fleet/src/hub.rs#L3832) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5296`](../agents/roomlerd/src/signaling.rs#L5296) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running
@@ -398,7 +398,9 @@ unbounded run (`models::exec_limits`):
   exec-driven update. Under the daemon's own restart it meant 71.6 s offline,
   measured, until the watchdog forced `exit(2)`. The daemon now shuts its runtime down
   within `runtime_exit::SHUTDOWN_BUDGET` (3 s) and logs `runtime shut down at
-  its budget` when it leaves such a read behind.
+  its budget` when it leaves such a read behind. A command here runs in no job,
+  on purpose: it has to outlive the daemon it stopped. A Roomler SSH command is the
+  opposite ([`roomler-ssh.md`](roomler-ssh.md) § What outlives a session).
 
 Output is swept for the agent token(s), `Bearer …` headers and JWT-shaped
 strings **before it leaves the host** — results are persisted in `exec_audit`

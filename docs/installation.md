@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3790`, `crates/agent-core/src/config.rs:4171`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3838`, `crates/agent-core/src/config.rs:4600`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -386,8 +386,8 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3572`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3616`) |
-| `config::read_if_present` (`:3617`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
+| `config::load` (`crates/agent-core/src/config.rs:3740`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:4003`) |
+| `config::read_if_present` (`:4045`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
 flowchart TD
@@ -404,7 +404,7 @@ flowchart TD
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:977`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1015`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -422,9 +422,9 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2634`, `:2656`), at the clean-run promotion
-(`record_clean_run_at`, `:2620`), at every `ConfigSet`, and at enrollment. The daemon, the
-desktop app and the setup wizard all write it through `config::save` (`:4062`). Each save
+`crates/agent-core/src/config.rs:2742`, `:2764`), at the clean-run promotion
+(`record_clean_run_at`, `:2626`), at every `ConfigSet`, and at enrollment. The daemon, the
+desktop app and the setup wizard all write it through `config::save` (`:4592`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
 does not model:
 
@@ -436,7 +436,7 @@ does not model:
   upgrade did not bring them back.
 
 Now `save` writes the struct **plus** every key of the file it replaces that this build
-ignores (`serialise_for`, `:3962`):
+ignores (`serialise_for`, `:4097`):
 
 | In the file being replaced | After the save |
 |---|---|
@@ -462,14 +462,14 @@ flowchart TD
 ```
 
 "Unknown" means exactly what this build's deserializer skipped: `serde_ignored` names the
-keys (`unknown_keys`, `:3799`). A key this build knows is written as this build read it: a
+keys (`unknown_keys`, `:3929`). A key this build knows is written as this build read it: a
 value a newer build wrote that this one cannot represent — `peer_auth = "enforce"`, read as
-`audit` (`:2780`) — is rewritten to that reading, for instance after a rollback. Only the keys
+`audit` (`:2805`) — is rewritten to that reading, for instance after a rollback. Only the keys
 the deserializer skipped are kept as written.
 
 ⚠️ **An array entry is found by its identity, never by its position** (`same_entry`,
-`:3866`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
-array (`entry_identity`, `:3850`), never one read off the entry on disk. A newer build's
+`:3997`): an org by its `tenant_id`, a route by its `id` — this build's own key for that
+array (`entry_identity`, `:3981`), never one read off the entry on disk. A newer build's
 entry can carry a key that looks like an identity (an `id` on an org) which no entry this
 build writes has: keyed on it, the entry is found nowhere, and every key on it is lost, in
 exactly the array the merge exists for. Positions move: removing an org shifts the ones
@@ -490,24 +490,35 @@ keeps it with the new primary, as `preserve_operator_config` keeps every operato
 with the file.
 
 Two guards keep the worst case at the old behaviour. The merged text must read back and
-serialise to exactly what the struct alone would have written (`:3946`), so the merge can only
+serialise to exactly what the struct alone would have written (`:4075`), so the merge can only
 add what this build ignores and never change a key it knows. And any failure writes the struct
 alone, with a WARN that names the keys it could not keep.
 
-`load` names them once per process and file (`note_unknown_keys`, `:4030`), with WARN *"config
+`load` names them once per process and file (`note_unknown_keys`, `:4163`), with WARN *"config
 keys this build does not know: ignored here, and kept in the file through every save"* and the
 key paths. After a rollback, "my setting did nothing" has its answer in the log.
 
 `load`'s recovery keeps them too. It reinstates the `config.toml.prev` copy it loaded over a
-live file that does not parse, and names the copy as the base (`save_with_base`, `:4068`):
-the keys to keep are the copy's, and the live file holds nothing a merge can read. Every
-other save reads the file it replaces, and one over a file that does not parse says so —
-WARN *"the config being replaced does not parse: keys this build does not know in it, if
+live file that does not parse, and names the copy as the base (`save_with_base`): the keys to
+keep are the copy's, and the live file holds nothing a merge can read. Every other save reads
+the file it replaces, and if that does not read as a config, its last good copy (#3087), so
+the wizard's enrollment and `adopt-enrollment`, which recover through `read_merge_base`, keep
+them as well. When neither reads it says so — WARN *"the config being replaced does not read
+as a config, and neither does its last good copy: keys this build does not know in them, if
 any, are NOT kept through this save"*, a fixed string, never the parser's.
 
 ⚠️ **Key paths only, never values.** The file holds the agent token and the overlay keys. A
-TOML parse error quotes the line it stopped at, so the merge reports fixed strings and never
-passes a parser message on.
+TOML parse error quotes the line it stopped at, and its message can quote a value, so the merge
+reports fixed strings and never passes a parser message on.
+
+⚠️ **No error about this file carries anything from it** (#3086). A typo on `agent_token`'s line
+used to print the token into the daemon's log, which uploads to the server, onto the wizard's
+page and into the terminal. The parser's error now ends where it happens (`parse_failure` in
+`crates/agent-core/src/config.rs`, and its copy in `agents/roomler-cli/src/config.rs`): what
+leaves is *"TOML parse error at line 3, column 81"* with no source behind it, so no `{:#}` or
+`{:?}` further up can reach the parser's words. The one message kept is `missing field
+\`name\``, the schema's word for a key it wanted. A key name read off the file is never kept,
+because a broken line can turn a value into one. The person has the file and the line.
 
 ⚠️ **A key a build retires now stays in the file** and is logged as unknown at every start,
 where the next save used to scrub it. Every key retired so far was a knob or a kill switch. A
@@ -586,6 +597,11 @@ Details worth knowing:
 - Daemon installs also place **`roomler-desktop`** (tray companion: status,
   tunnels pane, consent prompts) and **`roomler.exe`** — a small shim that
   re-execs `roomlerd cli`, so CLI and daemon can never version-skew.
+  On a machine-wide install a limited wizard cannot write under `%ProgramFiles%`, so
+  it leaves `roomler-desktop` to the service, waits up to a minute for it
+  (`service_places_companion`, `wait_for_file`) and reports what is there, as Done
+  and the install trace do on every path (#3174). If the EXE is still absent the
+  checklist says so: the service adds it at its next start, or within 4 hours.
 - Terminal alternative: `irm https://roomler.ai/api/setup/install.ps1 | iex`
   runs the script with its defaults (`-Role daemon-system` from an elevated
   shell, nothing enrolled — it asks for nothing). To pass parameters, which
@@ -853,7 +869,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1905`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1915`) launches `msiexec /i … /qn` elevated
 (`:2236`, `:2636`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:593`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -1016,7 +1032,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2329`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2339`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -1309,6 +1325,9 @@ lines through `systemctl --user edit roomler`.
 
 ⚠️ Delegated, and the cgroups cannot be made: no worker runs. A worker that
 cannot have its limits never runs (FR-90 P8-2a-3), and the daemon's log says why.
+A failure that passes, such as a process of the unit still in its exit or
+systemd not answering, is tried again by a later worker's start (#3349). One
+that will not pass stays until the daemon restarts.
 
 ## macOS
 
@@ -1638,7 +1657,7 @@ unprivileged `roomler config set`, changes the per-user half's file and nothing
 the mesh node reads — measured on 0.4.169: the app showed `ssh_enabled = off`
 while the root half served SSH. Since #2871 both surfaces say so. The app's
 Device configuration card carries a banner naming both files
-(`agents/roomler-desktop/src/commands.rs:828`), and `roomler config ls` /
+(`agents/roomler-desktop/src/commands.rs:843`), and `roomler config ls` /
 `config set` print the "a second roomler daemon is running" note that `status`
 and `peers` already printed — a note that had gone silent for the console user,
 because the root socket's `0700` directory refuses their `stat`; the root half's
@@ -1661,7 +1680,7 @@ and a supervised Mac — whose LaunchAgent FR-43 P2d boots out by design — rea
 
 The supervisor starts the GUI worker as `launchctl asuser <uid> sudo -u '#<uid>'
 … roomlerd run --supervised`, in a process group of its own, so that it can stop
-the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:612`). The same
+the whole chain at once (`agents/roomlerd/src/macos_supervisor.rs:641`). The same
 group is why launchd's teardown of the daemon never reaches the worker. Before
 #2987, a daemon that ended any way other than its clean shutdown (the watchdog's
 `exit(2)` after a stall, a crash, a `kill -9`) left its worker running. That
@@ -1688,9 +1707,9 @@ sequenceDiagram
 
 | Mechanism | How | Catches |
 |---|---|---|
-| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:676`, `:555`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:454`, `:502`). | A worker of this release, however its daemon ended |
-| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:845`, `:482`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
-| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:500`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
+| **Lifeline** | After the secret, the daemon writes `roomler-lifeline/1` and keeps its end of the worker's stdin open, holding it for the daemon process's whole life (`macos_supervisor.rs:709`, `:581`). The worker reads stdin on a thread of its own. At end-of-file it leaves through the internal shutdown an update uses, with a 15 s backstop (`agents/roomlerd/src/delegate_worker.rs:520`, `:568`). | A worker of this release, however its daemon ended |
+| **Reap** | A daemon that holds no worker of its own stops every process running exactly `<exe> run --supervised` as a person (`macos_supervisor.rs:878`, `:499`). It sends SIGTERM, waits up to 20 s, then sends SIGKILL. 20 s is longer than the worker's own 15 s backstop, so a worker still in its clean stop is never cut short. The reap runs at start, and again after a worker exits 0 within 30 s. That exit still counts towards giving up. If the LaunchAgent is loaded, a reap that stopped anything also kickstarts launchd's worker. | Workers that older releases left behind, including the ones already stranded in the field, and a lifeline a concurrent spawn leaked |
+| **Diagnosis** | The give-up names its cause from how the last worker ended: 0 means another roomlerd holds the lock, anything else means no per-user enrollment (`macos_supervisor.rs:521`) | A lock holder neither mechanism can identify, such as a hand-run `roomlerd run` |
 
 ⚠️ **Mixed versions are safe in both directions.** The offer is a line of its
 own after the secret. A worker from before #2987 reads one line, as it always
@@ -1728,11 +1747,11 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3428`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3469`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2684`).
+back to the version that is running (`crates/agent-core/src/config.rs:2834`).
 
 ### No pipe can stall the supervisor (#3080)
 
@@ -1769,8 +1788,8 @@ sequenceDiagram
 
 | Side of the race | Since #3080 | Where |
 |---|---|---|
-| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:903`, `:852`; `crates/tunnel-core/src/child.rs:75` |
-| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:642` |
+| **The reader** | The reap reads `ps` until `ps` **exits**, never until end-of-file, within 10 s, on the blocking pool. The child is reaped either way. A `ps` that fails or runs out of time only skips the reap, which leaves things as they were before #2987 | `agents/roomlerd/src/macos_supervisor.rs:936`, `:885`; `crates/tunnel-core/src/child.rs:75` |
+| **The holders** | The two long-lived children spawned at start, `route -n monitor` and the worker chain, mark every descriptor above stderr close-on-exec between `fork` and `exec`. Neither keeps a pipe but its own stdio | `crates/tunnel-core/src/child.rs:216`, `crates/tunnel-core/src/overlay/netstate.rs:1217`, `macos_supervisor.rs:676` |
 | **A second reader** | netstate's `route -n get` is read the same bounded way, within 5 s | `crates/tunnel-core/src/overlay/netstate.rs:927` |
 
 ⚠️ **Restoring a Mac on a release without the fix.** Kill the daemon's own
@@ -1975,7 +1994,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2191`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2211`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

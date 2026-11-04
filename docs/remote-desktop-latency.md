@@ -82,7 +82,7 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
    session and the pump awaits the packets (`thread.rs:387` `encode`, called at
-   `peer.rs:9535`). `block_in_place` remains the inline path, `media_thread = false`.
+   `peer.rs:9613`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -104,7 +104,7 @@ a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
 masked at 1.0 (`governor.rs:1602`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
 reads `governor.paced_fps()` each loop (`governor.rs:1614`; consumed at
-`peer.rs:8084`, logged at `:9906`). FR-112 gave a software encoder a pace of its
+`peer.rs:8155`, logged at `:9984`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
@@ -130,7 +130,7 @@ min-gap has elapsed, else arm one `setTimeout` for the remainder; latest positio
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12637`). The gap is a per-browser knob,
+always queued (`useRemoteControl.ts:12645`). The gap is a per-browser knob,
 0 to 16 ms (`roomler-rc-input-gap`, `:2671` `storedInputGapMs`, from FR-98 C3); the
 same timer drives the relative-pointer path (`:7071`).
 
@@ -149,14 +149,14 @@ built **without a wire-format change**: the 13-byte video header already carried
   send-queue wait is *inside* the measured age.
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3674` `clock_echo_json`, handled at
-  `:11053`). The browser probes it every stats tick and keeps the **lowest-RTT**
+  `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
   sample of the last 8 (`useRemoteControl.ts:6913` `CLOCK_RING`, `:6917`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:213` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:4875` `statsAgeLabel`, rendered at `:289`).
+  (`RemoteControl.vue:4876` `statsAgeLabel`, rendered at `:289`).
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,

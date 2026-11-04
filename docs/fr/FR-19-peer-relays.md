@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2156`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1696`).
+(`agents/roomlerd/src/signaling.rs:1753`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -731,7 +731,7 @@ Verified against `origin/master`, 2026-08-28.
 
 **Config keys** — four wiring points each, per the contract at
 `crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3141`),
+(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3334`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
@@ -998,7 +998,7 @@ Then take mars's relay down and assert re-selection to zeus without a DERP round
 ⚠️ **Not via `roomler config set`.** The first draft claimed that was *"a config change, not
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
 startup, so the whole surface is `restart_required = true`"* (hardcoded `:604`, `:618`,
-asserted by `every_key_gets_and_applies` `:3184`), and the CLI's live-apply allowlist is
+asserted by `every_key_gets_and_applies` `:3194`), and the CLI's live-apply allowlist is
 exactly `exec_enabled | remote_config_enabled` (`localclient.rs:988`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`

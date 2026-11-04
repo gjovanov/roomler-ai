@@ -218,9 +218,9 @@ because this report is about the push. A save back to the value this process run
 leaves nothing waiting, so it reads `applied` at once, and a restart would change
 nothing.
 
-Two limits. A build before P1c still turns the row to `applied` at a reconnect, and
-no capability word marks the difference, so read the row's `agent_version` against
-the release that carries it. And an environment variable beats the file
+Two limits. A build before P1c, which shipped in 0.4.199, still turns the row to
+`applied` at a reconnect, and no capability word marks the difference, so read the
+row's `agent_version`. And an environment variable beats the file
 for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
 daemon's environment reads `applied` after a restart while the environment's value
 is in force, and no restart changes that. A supervised Mac worker gets the root's
@@ -473,7 +473,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:335-394`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:340-399`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -551,7 +551,7 @@ which the daemon still refuses on the same terms as a local request.
    config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3129`), so
    gate 4 on that daemon is an administrator's: `sudo roomler config set
    exec_enabled true`. The pane now says which file it edits and gives that
-   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;
+   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:843`;
    [installation.md](installation.md), "Two configurations") instead of
    showing a switch that changes nothing. Letting the console user flip the
    root daemon's gate 4 from the app would be a **new authorization path on the
@@ -564,7 +564,7 @@ which the daemon still refuses on the same terms as a local request.
    configuration" after falling back to a per-user file a system install does
    not have. It now says whose configuration it is and gives the same command,
    `sudo roomler config set exec_enabled true`, in place of rows
-   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`). Gate 4 on a
+   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:741`). Gate 4 on a
    root daemon is an administrator's on both OSes; nothing was admitted on the
    person socket for it.
 
