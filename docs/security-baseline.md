@@ -496,9 +496,11 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
   made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2506`, by
-  `person_peer_ok`, `:4593`). The listener makes that check before a byte is read; the gate
-  makes it again where the decision is, so the rule no longer rests on one call site that
-  no test could see. An unknown peer is refused;
+  `person_peer_ok`, `:4593`). The listener makes that check before a byte is read, and a
+  test drives the listener itself over a real socket: another account's connection is
+  closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
+  (`serve_person_listener`, `:4657`). The gate makes the check again where the decision
+  is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
   daemon asks once more, fresh, whether that uid is at the seat

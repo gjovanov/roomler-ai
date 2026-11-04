@@ -4639,6 +4639,27 @@ pub async fn serve_person_socket(
         path = %path.display(), uid = owner_uid,
         "localapi: person-at-the-device socket up (FR-27 P11)"
     );
+    let served = serve_person_listener(listener, owner_uid, state, &mut stop).await;
+    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
+        let _ = std::fs::remove_file(&path);
+    }
+    tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
+    served
+}
+
+/// FR-27 P11 — [`serve_person_socket`]'s accept loop, on a listener already
+/// bound: a connection whose kernel-read uid is neither `owner_uid` nor root
+/// is dropped before a byte of it is read ([`person_peer_ok`]), and every
+/// other one is served as [`Scope::Person`] until `stop`. Kept apart from the
+/// bind so a test can hand it a listener of its own and connect as an account
+/// that is not the socket's person (#2871).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn serve_person_listener(
+    listener: tokio::net::UnixListener,
+    owner_uid: u32,
+    state: Arc<dyn LocalApiState>,
+    stop: &mut watch::Receiver<bool>,
+) -> std::io::Result<()> {
     // ⚠️ Connections are held HERE, not detached: when the person at the seat
     // changes this listener is stopped, and a connection the previous person
     // still holds open must not keep answering consent for the new person's
@@ -4683,10 +4704,6 @@ pub async fn serve_person_socket(
         }
     };
     conns.shutdown().await;
-    if matches!(std::fs::symlink_metadata(&path), Ok(m) if m.ino() == bound_ino) {
-        let _ = std::fs::remove_file(&path);
-    }
-    tracing::info!(path = %path.display(), "localapi: person-at-the-device socket down");
     served
 }
 
@@ -9043,6 +9060,159 @@ mod tests {
                 .unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(!std::path::Path::new("/roomler-p11-never.sock").exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2871 — the person socket's own accept loop, over a real unix socket:
+    /// a connection from an account that is neither the socket's person nor
+    /// root is dropped before a byte of it is read. It is closed although it
+    /// sent nothing, where its person's idle connection waits for a request;
+    /// a request it sends anyway is never answered; and nothing it sent
+    /// reaches the state. The test process plays both: the person, on a
+    /// listener made for its own uid, and another account, on one made for a
+    /// uid it is not. Root passes every person socket, so as root only the
+    /// first half runs.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn another_accounts_connection_is_dropped_before_a_byte_is_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        /// Counts every request that reaches it.
+        #[derive(Default)]
+        struct Counted(AtomicUsize);
+        #[async_trait]
+        impl LocalApiState for Counted {
+            fn status(&self) -> NodeStatus {
+                self.0.fetch_add(1, SeqCst);
+                Mock.status()
+            }
+            fn peers(&self) -> Vec<PeerInfo> {
+                self.0.fetch_add(1, SeqCst);
+                Vec::new()
+            }
+            fn flows(&self) -> Vec<FlowInfo> {
+                self.0.fetch_add(1, SeqCst);
+                Vec::new()
+            }
+            async fn config_entries(&self) -> Response {
+                self.0.fetch_add(1, SeqCst);
+                Response::ConfigEntries(Vec::new())
+            }
+            async fn at_the_seat_now(&self, _uid: u32) -> bool {
+                self.0.fetch_add(1, SeqCst);
+                true
+            }
+        }
+
+        /// What one connection heard back.
+        #[derive(Debug, PartialEq)]
+        enum Heard {
+            Answer(String),
+            /// The far end closed (or reset) it.
+            Closed,
+            /// Still open, and nothing came within the wait.
+            Silence,
+        }
+
+        /// `owner_uid`'s person socket, served on a listener this test binds
+        /// at `path`.
+        fn serve(
+            path: &std::path::Path,
+            owner_uid: u32,
+        ) -> (
+            Arc<Counted>,
+            watch::Sender<bool>,
+            tokio::task::JoinHandle<std::io::Result<()>>,
+        ) {
+            let listener = tokio::net::UnixListener::bind(path).unwrap();
+            let counted = Arc::new(Counted::default());
+            let state: Arc<dyn LocalApiState> = counted.clone();
+            let (tx, mut rx) = watch::channel(false);
+            let srv = tokio::spawn(async move {
+                serve_person_listener(listener, owner_uid, state, &mut rx).await
+            });
+            (counted, tx, srv)
+        }
+
+        /// Connect to `path`, send `line` (nothing when it is empty), and
+        /// wait up to `wait` for a line back.
+        async fn exchange(path: &std::path::Path, line: &str, wait: Duration) -> Heard {
+            let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+            let (rd, mut wr) = tokio::io::split(stream);
+            let mut lines = tokio::io::BufReader::new(rd).lines();
+            if !line.is_empty() {
+                // To a connection already dropped a write may fail (EPIPE) or
+                // land in the kernel's buffer first: either way, no answer.
+                let _ = wr.write_all(format!("{line}\n").as_bytes()).await;
+            }
+            match tokio::time::timeout(wait, lines.next_line()).await {
+                Err(_) => Heard::Silence,
+                Ok(Ok(Some(l))) => Heard::Answer(l),
+                Ok(Ok(None) | Err(_)) => Heard::Closed,
+            }
+        }
+
+        let me = own_uid().unwrap();
+        let dir = std::env::temp_dir().join(format!("roomler-p11d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The control: the same client and the same loop, on a socket made
+        // for this process. An idle connection is held open for its request,
+        // and the request is answered by the state.
+        let mine = dir.join("mine.sock");
+        let (counted, tx, srv) = serve(&mine, me);
+        assert_eq!(
+            exchange(&mine, "", Duration::from_millis(300)).await,
+            Heard::Silence,
+            "the person's idle connection waits for its request"
+        );
+        match exchange(&mine, r#"{"t":"status"}"#, Duration::from_secs(5)).await {
+            Heard::Answer(l) => assert!(
+                matches!(
+                    serde_json::from_str::<Response>(&l),
+                    Ok(Response::Status(_))
+                ),
+                "{l}"
+            ),
+            other => panic!("the socket's person is answered: {other:?}"),
+        }
+        assert_eq!(counted.0.load(SeqCst), 1, "its request reached the state");
+        tx.send(true).unwrap();
+        srv.await.unwrap().unwrap();
+
+        if me != 0 {
+            // Another account: this process, on a socket made for a uid it
+            // is not.
+            let other = if me == 4242 { 4243 } else { 4242 };
+            let theirs = dir.join("theirs.sock");
+            let (counted, tx, srv) = serve(&theirs, other);
+            assert_eq!(
+                exchange(&theirs, "", Duration::from_secs(5)).await,
+                Heard::Closed,
+                "closed at accept, without waiting for a byte"
+            );
+            for line in [
+                r#"{"t":"status"}"#,
+                r#"{"t":"config_get"}"#,
+                r#"{"t":"config_set","d":{"key":"rc_clipboard","value":"true"}}"#,
+            ] {
+                assert_eq!(
+                    exchange(&theirs, line, Duration::from_secs(5)).await,
+                    Heard::Closed,
+                    "{line} from another account"
+                );
+            }
+            assert_eq!(
+                counted.0.load(SeqCst),
+                0,
+                "nothing another account sent reached the state"
+            );
+            tx.send(true).unwrap();
+            srv.await.unwrap().unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
