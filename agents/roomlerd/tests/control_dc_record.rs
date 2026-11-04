@@ -245,6 +245,11 @@ fn a_reoffer_while_the_recorder_launches_keeps_the_recording() -> Result<()> {
     rt().block_on(a_reoffer_while_the_recorder_launches_keeps_the_recording_cell())
 }
 
+#[test]
+fn a_recording_that_ends_as_its_session_ends_is_reported_once() -> Result<()> {
+    rt().block_on(a_recording_that_ends_as_its_session_ends_is_reported_once_cell())
+}
+
 /// The owner's two gates, as a local `ConfigSet` would set them.
 fn gates(enabled: bool, audio: bool) {
     let mut cfg = roomler_node_core::config::test_fixture();
@@ -2516,6 +2521,73 @@ async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Res
         .await,
         "the banner outlived the recording"
     );
+    Ok(())
+}
+
+/// #3447 — a recording whose session ends, and which then ends itself before
+/// that session's follower looks again (here the host's Stop, the moment
+/// after the loop ended the session), is reported once. The session's end
+/// put it into the grace, but its follower never handed it on: the follower
+/// reports the ending, and the grace says nothing (red when both speak: two
+/// `stopped` on one session, its banner taken down twice).
+async fn a_recording_that_ends_as_its_session_ends_is_reported_once_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let before = mp4s(&s.out);
+    let (device, _kill) = Device::new();
+    let mut a = rig(Opts {
+        device: Some(device.clone()),
+        ..Default::default()
+    })
+    .await?;
+    a.send(json!({"t": "rc:record.start", "id": "e1"})).await?;
+    let v = a.state(START).await?;
+    // The follower starts as this state goes out, and looks once a second.
+    let started = tokio::time::Instant::now();
+    // Just past one of its looks, the loop ends the session and the host
+    // stops the recording, both before its next look.
+    tokio::time::sleep_until(started + Duration::from_millis(1150)).await;
+    remote::session_ended(a.session_id);
+    let _ = s.manager.stop().await;
+    let stopped = started.elapsed();
+    let st = s.manager.state();
+    // The follower's next look and the grace's, each within a second.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let kinds: Vec<_> = a
+        .reports()
+        .into_iter()
+        .map(|(k, why, _)| (k, why))
+        .collect();
+    let banner_down = eventually(Duration::from_secs(3), || {
+        device.registry.list().iter().all(|e| !e.recording)
+    })
+    .await;
+    // Whatever happened, the next cell starts from an idle recorder and no
+    // stray file.
+    idle(s).await;
+    for f in mp4s(&s.out).into_iter().filter(|f| !before.contains(f)) {
+        let _ = std::fs::remove_file(Sidecar::path_for(&f));
+        let _ = std::fs::remove_file(&f);
+    }
+    a.drop_session().await?;
+    assert_eq!(v["state"], "recording", "{v}");
+    assert!(!st.active, "the host's Stop did not stop it");
+    assert_eq!(
+        st.last.as_ref().map(|l| l.reason.as_str()),
+        Some("host_stopped")
+    );
+    assert_eq!(
+        kinds,
+        vec![
+            (RecordingActivityKind::Started, None),
+            (RecordingActivityKind::Stopped, Some("host_stopped".into())),
+        ],
+        "the ending was not reported once (the session ended and the recording \
+         stopped {stopped:?} after the start)"
+    );
+    assert!(banner_down, "the banner outlived the recording");
     Ok(())
 }
 
