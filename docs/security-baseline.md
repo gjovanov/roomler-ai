@@ -386,6 +386,18 @@ device grid — an *order* the device answers with a locally minted key, never a
 the server chose or saw; the device's re-join under the new key is what the server
 verifies: [`overlay-key-rotation.md`](overlay-key-rotation.md) (FR-40).
 
+**A key a node moved away from cannot rejoin, where the org enforces it** (FR-40 P2).
+Each node row keeps the public halves of the keys it moved away from, written by the
+accepted join that replaced them, never by a device's report. Under the org's
+`retired_key_mode = enforce`, a join or a DERP registration presenting one — a `.prev`
+rollback, a restored backup, a config copied to another machine of the org — is refused
+`key_retired`, checked against every row of the network, tombstones included, so removal
+is not a pardon. A device that supports rotation is ordered to rotate instead of being
+left off the mesh, through the same order path, ceiling and audit as an admin's order,
+with the server named as the actor. The switch defaults to `off`: a refusal fails
+closed, but a wrong one costs a legitimate device the mesh, and `warn` shows what it
+would refuse first: [`overlay-key-rotation.md` § Retired keys](overlay-key-rotation.md#retired-keys).
+
 **The LocalAPI's ACL is the local trust boundary.** The daemon's local control
 endpoint carries administrative verbs: exec, SSH grants, config, routes, restart. On
 Windows it is a named pipe whose security descriptor admits `SYSTEM`,

@@ -405,6 +405,7 @@ before it leaves the host.
 | DELETE | `…/overlay-node/{nid}` | Evict from the mesh + release the address back to the pool |
 | GET/POST | `…/overlay-acl` | Overlay L3 ACL policies |
 | GET/PUT | `…/overlay-acl/mode` | Tenant posture: `off` (default) \| `warn` \| `enforce` |
+| GET/PUT | `…/overlay-retired-keys` | FR-40 P2: `{mode: "off" (default) \| "warn" \| "enforce"}` — whether a join or a DERP registration presenting a RETIRED overlay key (one a node moved away from) is refused `key_retired`. Under `enforce` a refused device that advertises `key-rotate` is ordered to rotate. `MANAGE_AGENTS` for both; a mode outside the three is a 400. Read per join, so a change disturbs no live session — see [overlay-key-rotation.md](overlay-key-rotation.md#retired-keys) |
 | GET/PUT/DELETE | `…/overlay-acl/{pid}` | ACL policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the netmap compiler's set — it is never served, edited (in particular never re-`enabled`) or compiled again, and a repeat DELETE re-fans nobody |
 | GET/PUT | `…/magic-dns` | Tenant MagicDNS domain + upstream resolvers |
 | GET | `…/overlay-block` | The tenant's overlay address block |

@@ -1017,6 +1017,63 @@ within the re-attach grace, P3b-3 below), or with the recorder's own reasons
 answered prompt. A decision recorded against its id, or anything derived from
 it, must not be able to answer this one: the `ssh` / `ssh-consent` lesson.
 
+⚠️ **Armed before it is shown, and withdrawn by its session's end (#3433).**
+The device registers the question with its session and arms it before anything
+shows it: the panel, the marker, a companion it may have to start (up to 3 s),
+a notification. So an answer counts from the moment the question is visible. A
+session that ends after that takes the question with it, and from then on the
+question takes no answer: `ConsentBroker::cancel` takes it off the books before
+it wakes it. A session that ended before then is never asked. The launch checks
+the session's end as well as its channel, so an Allow given just before an end
+that left the channel open starts nothing. The window runs from the show: the
+prompt starts its clock once every surface is up, and each surface counts down
+from when it went up.
+
+⚠️ **One lock for every change to a question (#3433, from review).** The
+broker's books (`BrokerInner.pending`) are held for each one: a question armed
+(its old answers cleared), answered, withdrawn, decided, and released with its
+marker and answers. Each look the prompt takes is made under them too, and
+reads the books before any answer (`PendingGuard::look`). Two files are written
+outside them: the `.pending` marker, by the caller that shows the question, and
+an answer from the CLI's fallback, which checks nothing. The books-first look
+is what keeps the second from deciding a question that has ended.
+
+| A question that is… | now | before, found by review |
+|---|---|---|
+| withdrawn | takes nothing that lands after it, whoever wrote it | the poll read the answer first: an Allow that passed `record_decision`'s check just before a cancel, or one the CLI's fallback wrote with no check at all, was taken |
+| decided | is released in the same step | an answer in the gap between the two was reported taken, and its file left behind |
+| answered | gets the answer checked and written in one step, so it lands only while the question still asks | an answer that passed the check as its question was decided landed after the question had cleared its files |
+| an older one for the same id | leaves the newer one's marker and answers alone | its release unlinked the marker of a question still asking |
+| a newer one for the same id | clears the old answers and takes the id in one step | an answer given in between, for the older question, was taken by the newer one, given before it existed |
+
+A withdrawal before the prompt's next look still wins over an answer that had
+landed: the session it was for is over. ⚠️ A `release` closure runs under the
+books' lock, and the lock is not reentrant: nothing inside one may call
+`record_decision`, `cancel` or `arm`.
+
+⚠️ **The tradeoff: file work under the books.** A look stats two files and may
+unlink three, and an answer creates, writes and renames one, all under the
+books. A withdrawal (`cancel`, which the signalling loop calls on a session's
+end) waits for any of that in progress. That is microseconds on a local disk.
+But a per-user daemon keeps its sentinels under the roaming application-data
+folder, which Folder Redirection can put on a file share, and a stalled share
+then stalls the withdrawal behind it. Accepted: the alternative was an answer
+reported taken by a question that had already ended.
+
+The session's side holds the same line (`recording::remote`):
+- the question is armed before the session's prompt lock is taken, then
+  registered under it. Arming clears old answers off the disk, and
+  `end_session` waits on that lock from the signalling loop. It is as tight:
+  the end marks the session over before it reads the lock;
+- an Allow taken after the session ended is not one. The end marks the session
+  over before it withdraws the question, and an answer can land in between, so
+  nothing is reported for it, as for a withdrawn question;
+- nothing more goes up for a session that ended while its question was going
+  up (a companion can take its whole start budget): no notification, and the
+  marker is not written again;
+- a recorder whose session ended while it launched stops `session_ended`, and is
+  never left to the re-attach grace (P3b-3 below).
+
 ⚠️ **Something on screen says "recording" before the first frame.** On Windows
 the daemon's own badge is pinned open while recording and reads "Recording,
 viewed by …". It is capture-excluded, so it is not in the recording. Everywhere
@@ -1182,6 +1239,17 @@ sequenceDiagram
 - **A re-offer on the same session** (its old peer replaced; the session
   goes on) is picked up like any other, but the banner is left alone: "the
   old banner" is this one.
+- ⚠️ **A recording whose session ended before it began is not detached**
+  (#3433, from review). A recorder takes a while to launch, and a session's
+  end in that time found nothing recording yet, or detached what had just
+  begun. The recording then waited in the grace, and the controller's next
+  session picked up a recording made for a session that was over. The start
+  now looks again once its recorder runs: on the session's end, or its channel
+  gone, it stops it `session_ended`, and that session's follower reports it
+  once, like any stop the session asked for. It sets `ending` first, then takes
+  back under the slot's lock whatever a detach put there, and a detach reads
+  `ending` under that lock: the recording is the start's to stop or the
+  grace's to hold, never both.
 - **Known limit:** a detached recording reports its ending on the queue of
   the connection its session lived on. If the control connection itself was
   lost (a pod roll) and nobody picks the recording up, that last report has
@@ -1655,6 +1723,7 @@ the music in the preview.
 | `rc_sessions` (P3b) | the banner's `recording` follows the session, survives a re-announce, and cannot be set on a session the banner does not show | the default `--lib` step |
 | `rc_sessions`, `indicator` (P3b-3) | a session that ends while RECORDING keeps its banner entry, `reconnecting` on the wire (absent otherwise), with nothing to disconnect; a watcher's goes at once; the kept entry goes with its recording; on a live session the recording's end only clears `recording`. Through the indicator: `hide_session` keeps a recording session's banner, `end_recording` takes it down | every unfiltered `--lib` run |
 | `tests/control_dc_record.rs` (P3b-3) | a session dropped mid-recording the way a network drops it (the DEVICE's peer closed first, so its channel usually stops at `Closing` without `on_close`; then the loop's `hide_session`): the recording goes on, its banner `reconnecting`. The SAME controller's new session asks for the status and gets the same recording (id, file), its banner takes over and the old one goes; the old session reported `started` only, the new one `reattached` then `stopped`. Another controller is told `idle`, the banner stays, and after the grace it ends `session_ended` (reported once, on the dropped session). An unattended one whose session dropped still ends `session_changed` the moment someone signs in (red without the watch in the grace). A Record question whose session drops comes off the host's screen, and an Allow after it starts nothing, over six sessions: a drop that lands on `Closed` fires `on_close` and would pass without the channel watch (one session was red without it in 3 runs of 4). From review: the host's Disconnect stops the recording `host_stopped`, reported once, and the controller's next session finds nothing to pick up (red when it is detached like a drop); a session the loop ends with its channel still OPEN is detached and picked up (red without `session_ended`); the grace, looking again after a second controller's recording began, leaves that one running and reports its own, over, once (red when it looks at "whatever is recording"); a re-offer on the same session keeps its banner (red when the pick-up takes it down) | "Test the recorder (FR-85)", `--test control_dc_record` |
+| `tests/control_dc_record.rs` (#3433); `consent::tests::a_withdrawn_question_takes_no_answer`, `an_answer_the_poll_takes_at_once_still_counts`, `an_answer_that_lands_after_the_withdrawal_is_not_taken`, `a_decided_question_takes_no_more_answers`, `an_older_question_leaves_a_newer_ones_marker`, `a_newer_question_takes_no_answer_given_before_it` | the question is armed before it is shown, with a companion that is up only 2 s after it is asked (`Companion::Starting`). An answer sent once, the moment the question appears, is taken (red when it is shown first: "no active prompt"). A session the signalling loop ends while its question is still going up takes the question down, and an Allow then or after is refused (red: it stood its whole window). An Allow given just before the session ended, its channel still open, starts nothing (red: `[PromptGranted, Started]`). A recorder whose session ends while it launches, spawned and not yet recording, stops `session_ended`, reported once on its own session, and the controller's next session is told `idle` (`a_recorder_whose_session_ended_as_it_launched_stops`; red: `recording`, picked up from the grace). In the broker, an answer after `cancel` is refused and the prompt resolves `Cancelled` (red: `(true, Granted)`), and on unix an answer the poll takes the instant it lands is still reported as counted, the sentinel landing whole by a rename (red: 360 of 5,000 reported refused). From review: an answer written after the withdrawal, as the CLI's fallback writes it, is not taken (red: `Granted`); an answer sent at the moment of the decision is refused, with nothing left behind (red: taken, and a stale `.deny` left); an older question's release leaves a newer one's marker for the same id (red: the marker gone); a newer question for the same id takes no answer given, for the older one, while it was being armed (red: `Granted`) | "Test the recorder (FR-85)", `--test control_dc_record`; "Agent library" (`--lib`) |
 | `recording::remote` unit tests (P3b-3) | the slot hands a detached recording to one party: one the grace is stopping is never picked up, the same session never detaches twice, a detach over another session's recording hands that one back; one speaker per recording: a pick-up's claim silences the dropped session's follower, a NEW recording's claim does not silence the last one's | "Test the recorder (FR-85)" |
 | `recording::remote` unit tests (P3b-2) | a recording is a controller's only when its sidecar says THAT user started it remotely (not a local one, not another controller's, not one with no or a broken sidecar); the list holds exactly those; a directory, and a link at a recording's name, are never opened (the link case where the OS lets a test make one). ⚠️ The link cell stays green with EITHER layer removed, the `symlink_metadata` pre-check or the no-follow open, because each refuses a link on its own; it is red only with both gone. A green run after deleting one is not evidence that the other is redundant: the pre-check also keeps a FIFO from blocking the handler in `open`, and the no-follow open closes the swap between the check and the open | "Test the recorder (FR-85)" |
 | `tests/control_dc_record.rs`, download (P3b-2) | the controller lists its recording, downloads it whole (bytes equal to the file, `sha256` equal to the file's) and resumed from the middle (only the rest sent, the same whole-file `sha256`); `bad_name`, `bad_offset` and `not_found` said by name; both transfers reported `downloaded` with their bytes; a second controller of the same device lists nothing and gets `not_found` for the name | same step, `--test control_dc_record` |

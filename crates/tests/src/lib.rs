@@ -314,6 +314,11 @@ mod relay_region_tests;
 mod remote_control_tests;
 #[cfg(test)]
 mod remote_recording_tests;
+/// FR-40 P2 — a key a device rotated away from cannot be used to rejoin:
+/// refused `key_retired` at join and DERP under the org's `enforce`, the
+/// device with the verb ordered to rotate (once), `warn` and `off` admit.
+#[cfg(test)]
+mod retired_key_tests;
 #[cfg(test)]
 mod role_reconcile_tests;
 #[cfg(test)]
