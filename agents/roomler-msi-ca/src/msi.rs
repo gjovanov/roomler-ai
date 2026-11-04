@@ -230,6 +230,21 @@ fn capture(install: MSIHANDLE) -> u32 {
             return ERROR_SUCCESS;
         }
     };
+    let (entries, left_out) = carry::carriable(entries);
+    if !left_out.is_empty() {
+        log(
+            install,
+            &format!(
+                "capture: leaving out {} entries with no '=' after the name: {}",
+                left_out.len(),
+                left_out.join(" ")
+            ),
+        );
+    }
+    if entries.is_empty() {
+        log(install, "capture: nothing left to carry");
+        return ERROR_SUCCESS;
+    }
     let value = carry::encode(&entries);
     if value.len() > carry::MAX_CARRIED {
         log(

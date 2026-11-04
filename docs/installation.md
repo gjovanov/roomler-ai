@@ -914,9 +914,9 @@ DLL, `agents/roomler-msi-ca`:
 
 | Action | Runs | Does |
 |---|---|---|
-| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:331`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:588`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
+| `CaptureServiceEnvironment` (`agents/roomler-msi-ca/src/msi.rs:346`) | immediate, before `InstallInitialize`, on an upgrade (`main.wxs:588`): before the old product's removal | reads the old service's `Environment` into the hidden private property `RoomlerServiceEnvironment` |
 | `SetRestoreServiceEnvironment` (`main.wxs:621`) | after `RegisterService` | hands that value to the restore as its `CustomActionData` |
-| `RestoreServiceEnvironment` (`msi.rs:341`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:624`) | puts the carried entries back into the new service's `Environment` and writes it once |
+| `RestoreServiceEnvironment` (`msi.rs:356`) | deferred, as LocalSystem, before every SystemContext action (`main.wxs:624`) | puts the carried entries back into the new service's `Environment` and writes it once |
 
 Each SystemContext action restarts the service, so what was carried is in
 effect from its first start. The capture belongs to the NEW package, so the
@@ -940,7 +940,9 @@ and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
 it (`agents/roomlerd/src/app.rs:6182`). A block larger than 64 KiB is not carried
-(`carry.rs:47`).
+(`carry.rs:47`). An entry with no `=` after its name is left out alone, because
+the restore refuses any block that holds one, and the log names it by the name
+characters it starts with, never what follows (`carry.rs:219`, `carriable`).
 
 No value reaches a command line or the MSI's log:
 
@@ -956,14 +958,17 @@ No value reaches a command line or the MSI's log:
 Neither action can fail an upgrade. Both are `Return="ignore"`, and both return
 success after logging a miss: an action that failed here would stop this
 device's updates, and a systematic failure every device's. A DLL that cannot
-load fails with 1723, which `Return="ignore"` may not cover, so the DLL links its
-CRT (`+crt-static`) and imports only what Windows ships. The release lane reads
-it out of the built MSI, checks its imports with a negative control, and checks
-that it carries the payload's signature
-(`.github/workflows/release-agent.yml:2205`). `ROOMLER_TEST_CA_FAIL=capture` or
+load is no exception: it carries nothing and the upgrade completes, where
+`Return="check"` would make it Error 1723 and a rollback (measured on
+2026-11-04 for both actions, with a DLL that cannot load and with one that lacks
+its entry point). What the DLL's build buys is the carry itself: it links its
+CRT (`+crt-static`) and imports only what Windows ships, so it loads on a
+machine with no VC++ runtime. The release lane reads it out of the built MSI,
+checks its imports with a negative control, and checks that it carries the
+payload's signature (`.github/workflows/release-agent.yml:2205`). `ROOMLER_TEST_CA_FAIL=capture` or
 `=restore` (`main.wxs:561`) fails one of the two on purpose; installer-smoke uses
 it to show an upgrade completing through either failure
-(`.github/workflows/installer-smoke.yml:866`). Its only effect is that nothing is
+(`.github/workflows/installer-smoke.yml:870`). Its only effect is that nothing is
 carried.
 
 ```mermaid
@@ -999,6 +1004,23 @@ a change to the product being removed, so it cannot help the update into the
 first release that has it, and it gives the rollback a second path. The carry
 leaves the rollback as it was (#3230): no action has a rollback partner, and the
 restore writes only the new entry's `Environment`.
+
+**The one new way an upgrade can fail.** An entry the old release ran with but
+the new one cannot start with used to be dropped, and the upgrade succeeded. Now
+it is carried, and every SystemContext action restarts the service and waits up
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6056`,
+`agents/roomlerd/src/win_service/environment.rs:409`):
+
+| The run | The action that runs | What that entry does to the upgrade |
+|---|---|---|
+| `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on | `EnableSystemContext`, `Return="check"` (`main.wxs:450`) | fails it, and the MSI rolls the upgrade back |
+| `ENABLE_SYSTEM_CONTEXT=0`, or no property (a hand-run upgrade, or the updater while SystemContext is off) | `DisableSystemContext` or `KeepSystemContext`, both `Return="ignore"` | the upgrade completes, and the service does not reach RUNNING |
+
+The cure in both cases is to remove the entry with
+`roomlerd set-service-env-var --name <NAME>` (no `--value`). An installer
+change has its own rule here: an entry the installer writes itself goes into
+`INSTALLER_OWNED` or is written after the restore, because the restore puts a
+carried entry over any entry of the same name (`carry.rs:190`).
 
 ## Linux
 

@@ -41,6 +41,7 @@ on:
     paths:
       - 'agents/roomlerd/**'
       - 'agents/roomlerdw/**'
+      - 'agents/roomler-msi-ca/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
@@ -85,6 +86,9 @@ on:
       # code that shares the file changes far more often than the installer.
       - 'agents/roomlerd/src/win_service/lifecycle.rs'
       - 'agents/roomlerd/src/win_service/environment.rs'
+      # #3375 — the custom-action DLL the per-Machine MSI loads on every
+      # upgrade: a change to it changes what an update keeps.
+      - 'agents/roomler-msi-ca/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   workflow_dispatch: {}

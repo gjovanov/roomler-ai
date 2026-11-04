@@ -177,7 +177,7 @@ fn unescape(escaped: &str) -> Result<String, CarryError> {
         }
     }
     let entry = String::from_utf8(out).map_err(|_| CarryError::NotUtf8)?;
-    if name_of(&entry).len() == entry.len() || name_of(&entry).is_empty() {
+    if !is_entry(&entry) {
         return Err(CarryError::NotAnEntry);
     }
     Ok(entry)
@@ -205,6 +205,43 @@ pub fn merge(current: Vec<String>, carried: &[String]) -> (Vec<String>, Vec<Stri
         restored.push(name.to_string());
     }
     (merged, restored)
+}
+
+/// Whether the restore takes `entry` back: a name, then an `=`.
+pub fn is_entry(entry: &str) -> bool {
+    let name = name_of(entry);
+    !name.is_empty() && name.len() < entry.len()
+}
+
+/// The entries the capture carries, and the [`label`]s of the ones it leaves
+/// out. One entry with no `=` after its name would make the restore refuse
+/// the whole block ([`CarryError::NotAnEntry`]), so it alone stays behind.
+pub fn carriable(entries: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let (kept, left): (Vec<String>, Vec<String>) = entries.into_iter().partition(|e| is_entry(e));
+    (kept, left.iter().map(|e| label(e)).collect())
+}
+
+/// The most name characters a [`label`] shows.
+pub const LABEL_MAX: usize = 64;
+
+/// How a log line names an entry with no `=`: the name characters it starts
+/// with (letters, digits and `_`, after a leading `=`), at most [`LABEL_MAX`],
+/// then `…` if anything follows. Such an entry holds no value, but a value
+/// typed without its `=` would otherwise reach the log whole.
+pub fn label(entry: &str) -> String {
+    let from = usize::from(entry.starts_with('='));
+    let run = entry[from..]
+        .chars()
+        .take(LABEL_MAX)
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .count();
+    // Every character counted is ASCII, so the count is a byte offset.
+    let end = from + run;
+    let mut out = entry[..end].to_string();
+    if end < entry.len() {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -269,6 +306,71 @@ mod tests {
         assert_eq!(name_of("A="), "A");
         assert_eq!(name_of("=C:=C:\\"), "=C:");
         assert_eq!(name_of("NONE"), "NONE");
+    }
+
+    /// One entry with no `=` used to void the whole carry: the capture
+    /// encoded it, and the restore refuses any block that holds one. Now it
+    /// alone is left out, named without anything past its name, and the rest
+    /// comes back.
+    #[test]
+    fn an_entry_with_no_equals_is_left_out_alone() {
+        let block = entries(&[
+            "ROOMLERD_SFTP_AS_USER=0",
+            "NOEQUALS",
+            "=C:",
+            "ROOMLERD_TOKEN s3cret-value",
+            "ROOMLERD_UPDATE_URL=http://feed",
+            "=C:=C:\\Windows",
+        ]);
+        assert_eq!(decode(&encode(&block)), Err(CarryError::NotAnEntry));
+        let (kept, left) = carriable(block);
+        assert_eq!(
+            kept,
+            entries(&[
+                "ROOMLERD_SFTP_AS_USER=0",
+                "ROOMLERD_UPDATE_URL=http://feed",
+                "=C:=C:\\Windows",
+            ])
+        );
+        assert_eq!(left, ["NOEQUALS", "=C…", "ROOMLERD_TOKEN…"]);
+        assert_eq!(decode(&encode(&kept)), Ok(kept));
+    }
+
+    #[test]
+    fn a_label_stops_where_the_name_does() {
+        assert_eq!(label("NOEQUALS"), "NOEQUALS");
+        assert_eq!(label("ROOMLERD_TOKEN s3cret"), "ROOMLERD_TOKEN…");
+        assert_eq!(label("A:b"), "A…");
+        assert_eq!(label("A\u{e9}b"), "A…");
+        assert_eq!(label("=C:"), "=C…");
+        assert_eq!(label("="), "=");
+        assert_eq!(label(" x"), "…");
+        let long = "A".repeat(LABEL_MAX + 1);
+        assert_eq!(label(&long), format!("{}…", &long[..LABEL_MAX]));
+        assert!(is_entry("A=") && is_entry("A==1") && is_entry("=C:=C:\\"));
+        assert!(!is_entry("A") && !is_entry("=C:") && !is_entry("=") && !is_entry(""));
+    }
+
+    /// The switch is the installer's under every prefix the daemon reads
+    /// (`tunnel_core::env::PREFIXES`). A third prefix there and not here would
+    /// be carried, and its old value would undo a Disable at the next upgrade.
+    /// This crate is a DLL msiexec loads on its own and cannot depend on
+    /// tunnel-core, so the test reads that declaration from its source.
+    #[test]
+    fn the_installers_switch_is_owned_under_every_prefix_the_daemon_reads() {
+        let env = include_str!("../../../crates/tunnel-core/src/env.rs");
+        let at = env
+            .find("pub const PREFIXES:")
+            .expect("tunnel_core::env::PREFIXES is declared");
+        let decl = &env[at..at + env[at..].find("];").expect("and closed")];
+        let owned: Vec<String> = decl
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|prefix| format!("{prefix}ENABLE_SYSTEM_SWAP"))
+            .collect();
+        assert!(!owned.is_empty(), "{decl}");
+        assert_eq!(INSTALLER_OWNED.to_vec(), owned, "{decl}");
     }
 
     /// The merge rule (#3375): the installer's switch is its own decision,

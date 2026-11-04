@@ -551,9 +551,9 @@
           did before #3375.
 
           The DLL is built with +crt-static (release-agent.yml,
-          installer-smoke.yml): msiexec loads it from the Binary table on
-          machines with no VC++ redistributable, and a DLL that cannot load is
-          the one failure Return="ignore" may not cover.
+          installer-smoke.yml) because msiexec loads it from the Binary table
+          on machines with no VC++ redistributable. One that cannot load just
+          carries nothing: under Return="ignore" the upgrade still completes.
         -->
         <Binary Id='RoomlerMsiCa' SourceFile='target\release\roomler_msi_ca.dll' />
         <Property Id='RoomlerServiceEnvironment' Hidden='yes' />

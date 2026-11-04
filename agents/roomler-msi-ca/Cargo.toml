@@ -7,9 +7,9 @@ edition.workspace = true
 description = "The per-Machine MSI's custom actions that carry the Roomler service's Environment across a major upgrade (#3375)."
 
 # msiexec loads this DLL from the MSI's Binary table, on a machine that may have
-# no VC++ redistributable: the release lane and installer-smoke build it with
-# `+crt-static`, in a target dir of their own, and read its imports (system DLLs
-# only). A load failure there is the one failure `Return="ignore"` may not cover.
+# no VC++ redistributable, so the release lane and installer-smoke build it with
+# `+crt-static` in a target dir of their own and read its imports (system DLLs
+# only). Without that the carry fails there, though the upgrade still completes.
 #
 # The lib name keeps dodging "install", "setup", "update" and "patch": cargo
 # names the test binary after it, and Windows UAC's installer detection

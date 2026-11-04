@@ -118,9 +118,15 @@ one** (#3375, `docs/installation.md`). The old product's removal deletes the ser
 `CaptureServiceEnvironment` (`agents/roomler-msi-ca`) reads the block before `InstallInitialize`, and
 `RestoreServiceEnvironment` writes it back after `RegisterService` and before every SystemContext action:
 those restart the service and decide the switch, which is never carried. Both stay `Return="ignore"` and
-return success after a logged miss. The DLL stays `+crt-static` with system imports only, because a DLL
-that cannot load (1723) is the one failure `Return="ignore"` may not cover. No value goes on a command line
-or into the log: the properties are hidden, the lines name entries.
+return success after a logged miss, and a DLL that cannot load is no exception: it carries nothing and the
+upgrade completes (under `"check"` it would be 1723 and a rollback). The DLL stays `+crt-static` with system
+imports only so that the carry works without the VC++ runtime. No value goes on a command line or into the
+log: the properties are hidden, the lines name entries.
+⚠️ **An entry the installer writes into the service's `Environment` goes into `INSTALLER_OWNED`
+(`agents/roomler-msi-ca/src/carry.rs`) or is written after the restore.** The restore puts a carried entry
+over any entry of the same name, so a new installer-written value would lose to the old one on every
+upgrade. And a carried entry the NEW release cannot start with now fails the upgrade where it used to be
+dropped: `EnableSystemContext` is `Return="check"` and waits 120 s for RUNNING (`docs/installation.md`).
 ⚠️ **`RegisterAutostart` stays the last action before `InstallFinalize`.** The task names the
 launcher, and a rollback onto a release without one would leave a task that starts nothing.
 ⚠️ **`AutostartBackOnRollback` and `DaemonBackOnRollback` stay ahead of `RemoveExistingProducts`.** A

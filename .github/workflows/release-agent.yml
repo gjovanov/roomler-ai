@@ -1755,8 +1755,8 @@ jobs:
       # which carries the Roomler service's Environment across a major upgrade.
       # msiexec takes it out of the MSI's Binary table and loads it alone, in a
       # temp folder, on every Windows device an update reaches, many with no
-      # VC++ redistributable. So the CRT is linked in: a DLL that cannot load
-      # (error 1723) is the one failure its Return="ignore" may not cover. A
+      # VC++ redistributable. So the CRT is linked in, or the carry fails there:
+      # a DLL that cannot load carries nothing (the upgrade still completes). A
       # target dir of its own keeps +crt-static off every other crate. The
       # per-Machine wxs names target\release\roomler_msi_ca.dll at harvest
       # time, and the payload signing below signs that copy: the one in
@@ -2199,8 +2199,8 @@ jobs:
       # reaches. So read it out of the MSI that ships and hold it to what a
       # fresh Windows has: API sets and System32 DLLs, and no redistributable,
       # refused by name because this runner HAS the VC++ redistributable. A
-      # DLL that cannot load fails the action with 1723, which Return="ignore"
-      # may not cover. When the payload was signed, the DLL in the MSI must
+      # DLL that cannot load carries nothing, though the upgrade still completes
+      # (Return="ignore"). When the payload was signed, the DLL in the MSI must
       # carry the payload's signer: AV scans it where msiexec extracts it.
       - name: "Assert the per-Machine MSI's custom-action DLL loads on a fresh Windows (#3375)"
         shell: pwsh
