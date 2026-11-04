@@ -1065,7 +1065,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:3987`](../agents/roomlerd/src/signaling.rs#L3987), [`:5467`](../agents/roomlerd/src/signaling.rs#L5467)), as the recording question does
+first the same way ([`signaling.rs:4077`](../agents/roomlerd/src/signaling.rs#L4077), [`:5558`](../agents/roomlerd/src/signaling.rs#L5558)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
@@ -1666,7 +1666,7 @@ session's grant backs it.
 |---|---|
 | the grant's field | `Grant::one_command` ([`ssh.rs:3036`](../agents/roomlerd/src/ssh.rs#L3036)), recorded by `record_grant` ([`:3112`](../agents/roomlerd/src/ssh.rs#L3112)), resolved into the session's policy ([`:840`](../agents/roomlerd/src/ssh.rs#L840)) |
 | the rules | one channel ([`ssh.rs:1721`](../agents/roomlerd/src/ssh.rs#L1721)), no forward ([`:1787`](../agents/roomlerd/src/ssh.rs#L1787)), one `exec` ([`:1882`](../agents/roomlerd/src/ssh.rs#L1882)), no shell ([`:1992`](../agents/roomlerd/src/ssh.rs#L1992)), no terminal ([`:2031`](../agents/roomlerd/src/ssh.rs#L2031)), no subsystem ([`:2134`](../agents/roomlerd/src/ssh.rs#L2134)) |
-| the device's word | `ssh-one-command` in the hello ([`caps.rs:4459`](../agents/roomlerd/src/encode/caps.rs#L4459)) |
+| the device's word | `ssh-one-command` in the hello ([`caps.rs:4649`](../agents/roomlerd/src/encode/caps.rs#L4649)) |
 | the SYSTEM service | the claim's word ([`ssh_service.rs:639`](../agents/roomlerd/src/ssh_service.rs#L639)), the published word ([`:648`](../agents/roomlerd/src/ssh_service.rs#L648)), and the claimed grant's field ([`:614`](../agents/roomlerd/src/ssh_service.rs#L614)) |
 | the server | routing a session's grant to the service ([`agent_ssh.rs:784`](../crates/modules/network/src/routes/agent_ssh.rs#L784)), the claim's backstop ([`:1392`](../crates/modules/network/src/routes/agent_ssh.rs#L1392)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2910`](../crates/remote_control/src/models.rs#L2910)) |
 
@@ -1716,10 +1716,10 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6757`](../agents/roomlerd/src/signaling.rs#L6757)) |
+| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6848`](../agents/roomlerd/src/signaling.rs#L6848)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6393`](../agents/roomlerd/src/signaling.rs#L6393), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6484`](../agents/roomlerd/src/signaling.rs#L6484), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ### The tool: `ssh_run` (FR-90 P3-8-2b-2)
 
