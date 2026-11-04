@@ -248,6 +248,14 @@ fn fallback_log_dir() -> Option<PathBuf> {
     Some(dirs.data_local_dir().join("logs"))
 }
 
+/// #3302 — where a process with no [`ServiceLogRole`] logs, whatever role this one
+/// has: the per-profile data dir. A SystemContext worker logs to `service-logs`, and
+/// the post-install watcher it spawns has no role, so the watcher's install record
+/// lands here, in SYSTEM's profile. `None` under `cfg(test)`, as [`resolve_log_dir`].
+pub fn profile_log_dir() -> Option<PathBuf> {
+    fallback_log_dir()
+}
+
 /// #3073 — open the log appender in `primary`, else in `fallback`. The notes
 /// say what failed, for [`init`] to log once the subscriber is up. Generic
 /// over the appender, so the choice is tested without touching a disk.
