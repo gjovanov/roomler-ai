@@ -94,7 +94,7 @@ socket in each wave. That accounts for the 6–8 hosts per roll that log two clo
 3. **One peer cannot move alone.** DERP is pod-local (`docs/multi-pod-scale-out.md:141-157`), so a
    pair exchanges frames only while both sockets are on one pod. A peer that moved first would send
    into a pod where its partner is not registered, and the frame is dropped as a miss
-   (`crates/modules/network/src/derp.rs:654-671`). The 08-29 design's "safe by construction" holds
+   (`crates/modules/network/src/derp.rs:725-742`). The 08-29 design's "safe by construction" holds
    on one pod only. Moving a pair needs both peers to move in one window, or dual-send while they do,
    with C-5's convergence closing sockets under it (`crates/modules/network/src/derp_cluster.rs:126-188`).
    This point is reasoned from the code, not measured.
