@@ -259,7 +259,7 @@ bar them and change the password on the device. For guessing, rotate the connect
 | The notices | `crates/modules/remote/src/extauth_notice.rs` |
 | Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `set_enabled` `:443`, `set_policy` `:496`, `audit` `:743`, `principals` `:778`, `set_principal` `:844` |
 | Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2403`, a device's `:2416`, an org's `:2422`. From another pod, `ctrl.rs`: `:122`, `:142`, `:156` |
-| The two collections | `crates/remote_control/src/models.rs:4668`, `:4743`; indexes `crates/modules/fleet/src/lib.rs:776`, `:789` |
+| The two collections | `crates/remote_control/src/models.rs:4439`, `:4514`; indexes `crates/modules/fleet/src/lib.rs:776`, `:789` |
 | The device's half | `agents/roomlerd/src/extauth.rs`, `agents/roomlerd/src/external_logins.rs` |
 | The page | `ui/src/views/remote/ConnectView.vue`, `ui/src/composables/useExternalLogin.ts` |
 | The audit page | `ui/src/components/admin/ExternalAuditSection.vue`, `ExternalPeopleCard.vue`, `ui/src/utils/externalAudit.ts` |

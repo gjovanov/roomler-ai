@@ -587,7 +587,7 @@ mechanism does not exist, so this section replaces it.
   its 10-person, 60-minute meetings (P5).
 - A tunnel's TURN leg cannot be steered from the server: `quic-derp-v1` is negotiated only
   when the client asked for it and sent its DERP identity
-  (`crates/modules/network/src/tunnel.rs:740`).
+  (`crates/modules/network/src/tunnel.rs:736`).
 
 Their bytes still count toward the allowance (P4c-0), so an org that relays heavily through
 them has its mesh throttled. The alternative to O10 is a second coturn listener per site with

@@ -34,21 +34,7 @@ use bson::oid::ObjectId;
 /// The order the cascade runs in: session holders (`remote`) release first,
 /// then lease holders (`network`), then the record owner (`fleet`); the
 /// collaboration modules and `saas` follow, in composition order.
-///
-/// FR-137 — `hive`, `vault` and `knowhow` (FR-90, parked) register no hooks
-/// and mount nothing. Their ids stay until the wire's `Owner::{Hive,Vault,
-/// Knowhow}` leave, because this list must equal `graph::MODULES`.
-pub const HOOK_ORDER: &[&str] = &[
-    "hive",
-    "vault",
-    "remote",
-    "network",
-    "fleet",
-    "conference",
-    "chat",
-    "saas",
-    "knowhow",
-];
+pub const HOOK_ORDER: &[&str] = &["remote", "network", "fleet", "conference", "chat", "saas"];
 
 /// What a lease holder freed when an agent was removed — the one piece of
 /// hook output a caller reports back (the admin delete route answers with
@@ -367,7 +353,6 @@ mod tests {
     #[test]
     fn session_holders_run_before_lease_holders_before_the_record_owner() {
         let pos = |id: &str| HOOK_ORDER.iter().position(|m| *m == id).unwrap();
-        assert!(pos("hive") < pos("network"));
         assert!(pos("remote") < pos("network"));
         assert!(pos("network") < pos("fleet"));
     }

@@ -36,10 +36,9 @@ use futures::{SinkExt, StreamExt, stream::SplitSink};
 use roomler_ai_remote_control::{
     models::{AgentStatus, OsKind, RelayMode, TunnelAuditEvent, TunnelAuditKind},
     signaling::{
-        ClientMsg, CloseReason, REJECT_REASON_NO_SESSION, REJECT_REASON_SESSION_MISMATCH,
-        RejectKind, ServerMsg,
+        ClientMsg, CloseReason, NET_GRANT_REFUSED, REJECT_REASON_NO_SESSION,
+        REJECT_REASON_SESSION_MISMATCH, RejectKind, ServerMsg,
     },
-    vault::NET_GRANT_REFUSED,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -223,7 +222,7 @@ pub async fn handle_tunnel_client_socket(
                 // The dedicated CLI is single-open, so `open_nonce` is
                 // normally None; the server echoes back whatever it sent.
                 // A grant here is refused, as everywhere since FR-137 parked
-                // FR-90 (S-A2).
+                // FR-90 (S-B3).
                 session = handle_tunnel_open(
                     &state,
                     &orig,
@@ -499,24 +498,20 @@ impl Originator {
     fn tunnel_client_id(&self) -> Option<ObjectId> {
         match self.principal {
             Principal::TunnelClient(id) => Some(id),
-            Principal::Agent(_) | Principal::Session { .. } => None,
+            Principal::Agent(_) => None,
         }
     }
     /// The originating agent id, or `None` for a dedicated-client origin.
-    /// (An originator is a connection, so never a session; its arm names
-    /// the device the session runs on.)
     fn origin_agent_id(&self) -> Option<ObjectId> {
         match self.principal {
-            Principal::Agent(id) | Principal::Session { agent_id: id, .. } => Some(id),
+            Principal::Agent(id) => Some(id),
             Principal::TunnelClient(_) => None,
         }
     }
     /// Stable id for log lines, regardless of principal kind.
     fn log_id(&self) -> ObjectId {
         match self.principal {
-            Principal::TunnelClient(id)
-            | Principal::Agent(id)
-            | Principal::Session { agent_id: id, .. } => id,
+            Principal::TunnelClient(id) | Principal::Agent(id) => id,
         }
     }
 }
@@ -530,7 +525,7 @@ async fn handle_tunnel_open(
     open_nonce: Option<String>,
     // R4 - the client's DERP identity from TunnelOpen (quic-derp-v1 only).
     derp_pubkey: Option<String>,
-    // FR-137 S-A2 - an agent session's grant (FR-90, parked), which an older
+    // FR-137 S-B3 - an agent session's grant (FR-90, parked), which an older
     // agent may still send. Refused, never verified.
     net_grant: Option<String>,
     client_supported: &[String],
@@ -694,10 +689,11 @@ async fn handle_tunnel_open(
         }
     }
 
-    // 3c. FR-137 S-A2 — an agent SESSION's grant (FR-90, parked) refuses the
-    // open whenever one is presented. Until P2 the wire still carries the
-    // field, and the open must never fall back to the device's own principal,
-    // which would hand the session whatever its device may reach.
+    // 3c. FR-137 S-B3 — an agent SESSION's grant (FR-90, parked) refuses the
+    // open whenever one is presented. The wire keeps the field, parse-only,
+    // while a 0.4.199 agent may still send one, and the open must never fall
+    // back to the device's own principal, which would hand the session
+    // whatever its device may reach.
     if net_grant.is_some() {
         let why = "an agent session's grant, and FR-90 is parked";
         warn!(origin = %orig.log_id(), %agent_id, why, "tunnel open refused");
@@ -826,9 +822,7 @@ async fn handle_tunnel_open(
         .insert(tunnel_session_id);
 
     // 5. Audit the open. RelayMode is "Direct" until ICE finishes —
-    // T2.7 updates this after candidate selection. `session_id` and
-    // `grant_id` are FR-90's, written `None` on every row until P2 drops them
-    // (FR-137 S-A4).
+    // T2.7 updates this after candidate selection.
     let _ = state
         .tunnel_audit
         .append(&TunnelAuditEvent {
@@ -854,8 +848,6 @@ async fn handle_tunnel_open(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: None,
-            session_id: None,
-            grant_id: None,
         })
         .await;
 
@@ -918,9 +910,6 @@ async fn handle_tunnel_open(
             ice_servers: quic_ice_servers,
             quic_auth_token,
             open_nonce,
-            // FR-137 S-A4 — a wire field until P2: no tunnel is opened under
-            // a grant, so none is echoed.
-            net_grant_id: None,
         },
     )
     .await;
@@ -1221,8 +1210,6 @@ async fn audit_tcp_accept(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: None,
-            session_id: None,
-            grant_id: None,
         })
         .await;
 }
@@ -1263,8 +1250,6 @@ async fn audit_tcp_reject(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: Some(format!("{kind:?}: {reason}")),
-            session_id: None,
-            grant_id: None,
         })
         .await;
 }
@@ -1295,8 +1280,6 @@ async fn audit_peer_close(state: &NetworkState, session: &TunnelSession, orig: &
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: None,
-            session_id: None,
-            grant_id: None,
         })
         .await;
 }
@@ -1561,8 +1544,6 @@ async fn audit_tcp_close(
             client_version: orig.client_version.clone(),
             client_os: orig.client_os,
             reason: Some(format!("{reason:?}")),
-            session_id: None,
-            grant_id: None,
         })
         .await;
 }
@@ -1687,7 +1668,7 @@ pub async fn relay_tunnel_client_msg_from_agent(
                 transport,
                 open_nonce,
                 derp_pubkey,
-                // FR-137 S-A2 — refused if present.
+                // FR-137 S-B3 — refused if present.
                 net_grant,
                 supported_transports,
             )
