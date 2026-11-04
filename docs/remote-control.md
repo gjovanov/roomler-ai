@@ -4504,7 +4504,7 @@ sequenceDiagram
 | what | where |
 |---|---|
 | The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:598` |
-| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:687` |
+| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:688` |
 | The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:637`, `within` `:674` |
 | Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:365` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
@@ -4519,7 +4519,7 @@ sequenceDiagram
 - As root, `sample` reads the hardened-runtime daemon: measured on a
   MacBook on 0.4.181, 43 threads with symbolized Rust frames in 1.6 s.
   On macOS the stacks are read **only as root**
-  (`may_read_own_stacks`, `watchdog.rs:654`). The FR-43 GUI worker runs
+  (`may_read_own_stacks`, `watchdog.rs:655`). The FR-43 GUI worker runs
   as the signed-in person, where a request to read the hardened binary
   would be refused, and a refused debugger-style request has no business
   on someone's desktop. Its record names the stall without the stacks.
