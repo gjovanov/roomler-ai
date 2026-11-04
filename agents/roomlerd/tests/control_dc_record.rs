@@ -267,12 +267,17 @@ fn a_reoffer_and_the_sessions_end_in_one_launch_stop_it() -> Result<()> {
 
 #[test]
 fn the_hosts_disconnect_stops_a_recording_the_grace_holds() -> Result<()> {
-    rt().block_on(held_while_live(AfterTheChannel::HostDisconnects))
+    rt().block_on(held_by_the_grace(Then::HostDisconnects))
 }
 
 #[test]
 fn a_recording_whose_channel_ended_waits_for_its_controller() -> Result<()> {
-    rt().block_on(held_while_live(AfterTheChannel::ControllerComesBack))
+    rt().block_on(held_by_the_grace(Then::ControllerComesBack))
+}
+
+#[test]
+fn the_hosts_disconnect_never_stops_another_recording() -> Result<()> {
+    rt().block_on(the_hosts_disconnect_never_stops_another_recording_cell())
 }
 
 /// The owner's two gates, as a local `ConfigSet` would set them.
@@ -2388,6 +2393,91 @@ async fn the_grace_never_stops_another_recording_cell() -> Result<()> {
     outcome
 }
 
+/// §10 — a host Disconnect stops ITS session's recording only. A detached
+/// recording ends by itself (the host's Stop), another controller starts
+/// one, and then the person at the device ends the first session, before
+/// the grace looks again: the other controller's recording goes on, and the
+/// first one's ending is reported once, on its own session (red when the
+/// Disconnect stops "whatever is recording": it stops the other controller's
+/// recording `host_stopped`).
+async fn the_hosts_disconnect_never_stops_another_recording_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    // A long pause between the grace's looks: the Disconnect lands inside it,
+    // while the grace still holds the first session's recording.
+    let poll = Duration::from_secs(15);
+    s.manager.set_grace_poll(poll);
+    let outcome = async {
+        let (device, _kill) = Device::new();
+        let on_device = || Opts {
+            device: Some(device.clone()),
+            ..Default::default()
+        };
+        let mut a = rig(on_device()).await?;
+        a.send(json!({"t": "rc:record.start", "id": "n1"})).await?;
+        let v = a.state(START).await?;
+        assert_eq!(v["state"], "recording", "{v}");
+        let name_a = v["name"].as_str().unwrap().to_string();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        a.drop_session().await?;
+        let dropped = tokio::time::Instant::now();
+        // The drop is seen (≤ 500 ms) and the grace's first look passes.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The host stops it, and another controller starts a recording.
+        let _ = s.manager.stop().await;
+        assert!(!s.manager.state().active, "the host's Stop did not stop it");
+        let mut c = rig(on_device()).await?;
+        c.send(json!({"t": "rc:record.start", "id": "n2"})).await?;
+        let v = c.state(START).await?;
+        assert_eq!(v["state"], "recording", "{v}");
+        let name_c = v["name"].as_str().unwrap().to_string();
+
+        // The person at the device ends the first session.
+        remote::host_ended(a.session_id);
+        assert!(
+            dropped.elapsed() < poll - Duration::from_secs(1),
+            "the grace looked again before the Disconnect: this cell proves nothing"
+        );
+        // The first session's ending is reported after whatever the
+        // Disconnect stops, so by then that has happened.
+        let a_kinds = reports_until(
+            &mut a,
+            RecordingActivityKind::Stopped,
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            s.manager
+                .active_remote()
+                .is_some_and(|r| r.session_id == c.session_id),
+            "the host's Disconnect stopped another controller's recording: {:?}",
+            s.manager.state().last.map(|l| l.reason)
+        );
+        assert_eq!(
+            a_kinds,
+            vec![
+                (RecordingActivityKind::Started, None),
+                (RecordingActivityKind::Stopped, Some("host_stopped".into())),
+            ]
+        );
+        c.send(json!({"t": "rc:record.stop", "id": "n2"})).await?;
+        let v = c.until_not_recording(STOP).await?;
+        assert_eq!(v["reason"], "requested", "{v}");
+        for n in [&name_a, &name_c] {
+            let file = s.out.join(n);
+            let _ = std::fs::remove_file(Sidecar::path_for(&file));
+            let _ = std::fs::remove_file(&file);
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    s.manager.set_grace_poll(GRACE_POLL);
+    outcome
+}
+
 /// P3b-3 — a re-offer on the SAME session id (its old peer replaced; the
 /// session goes on): the recording carries on under the new peer, and its
 /// banner keeps saying so (red when the pick-up takes "the old banner"
@@ -2781,27 +2871,25 @@ async fn ended_in_the_launch(end: InTheLaunch) -> Result<()> {
     Ok(())
 }
 
-/// What follows the end of a session's `record` channel, its session still
-/// live, in the two cells above.
+/// What follows, in the two cells above, once the re-attach grace holds a
+/// session's recording.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AfterTheChannel {
-    /// §10 — the host's Disconnect stops the recording then and there,
-    /// `host_stopped`, though the grace already holds it: the controller's
-    /// next session finds nothing to pick up, and the ending is reported once,
-    /// on the session it belonged to (red when the Disconnect reached only the
-    /// handler of the channel that had ended: the grace kept the recording for
-    /// the next session).
+enum Then {
+    /// §10 — a host Disconnect ends a recording the re-attach grace holds,
+    /// then and there, `host_stopped`: the controller's next session finds
+    /// nothing to pick up, and the ending is reported once, on the session it
+    /// belonged to (red when the grace kept the recording for the next
+    /// session).
     HostDisconnects,
     /// The control: with no Disconnect, the controller's next session picks
-    /// the same recording up, so the channel's end did put it into the grace,
-    /// and the other cell's `idle` is the Disconnect's doing.
+    /// the same recording up, so the grace did hold it, and the other cell's
+    /// `idle` is the Disconnect's doing.
     ControllerComesBack,
 }
 
-/// A recording whose session's `record` channel ends while the session goes
-/// on (the loop says nothing), then `then`, then the controller's next
-/// session asks for the status.
-async fn held_while_live(then: AfterTheChannel) -> Result<()> {
+/// A recording the re-attach grace holds, then `then`, then the controller's
+/// next session asks for the status.
+async fn held_by_the_grace(then: Then) -> Result<()> {
     let _serial = SERIAL.lock().await;
     let s = setup();
     idle(s).await;
@@ -2818,12 +2906,10 @@ async fn held_while_live(then: AfterTheChannel) -> Result<()> {
     a.send(json!({"t": "rc:record.start", "id": "g1"})).await?;
     let v = a.state(START).await?;
     let _ = a.dc.close().await;
-    // The channel's end reaches the device's handler (its `on_close`, or its
-    // watch within 500 ms), which puts the recording into the grace; the
-    // follower looks once a second, so by now it has handed it on, and the
-    // grace speaks for it.
+    // By now the re-attach grace holds the recording and speaks for it (the
+    // follower looks once a second).
     tokio::time::sleep(Duration::from_millis(1800)).await;
-    if then == AfterTheChannel::HostDisconnects {
+    if then == Then::HostDisconnects {
         // The person at the device sends the controller away.
         remote::host_ended(a.session_id);
         a.indicator.hide_session(a.session_id.to_hex());
@@ -2833,7 +2919,7 @@ async fn held_while_live(then: AfterTheChannel) -> Result<()> {
     b.send(json!({"t": "rc:record.status"})).await?;
     let picked = b.state(START).await?;
     let b_kinds: Vec<_> = b.reports().into_iter().map(|(k, _, _)| k).collect();
-    if then == AfterTheChannel::ControllerComesBack && picked["state"] == "recording" {
+    if then == Then::ControllerComesBack && picked["state"] == "recording" {
         b.send(json!({"t": "rc:record.stop", "id": "g1"})).await?;
         let _ = b.until_not_recording(STOP).await;
     }
@@ -2865,7 +2951,7 @@ async fn held_while_live(then: AfterTheChannel) -> Result<()> {
     }
     a.drop_session().await?;
     assert_eq!(v["state"], "recording", "{v}");
-    if then == AfterTheChannel::ControllerComesBack {
+    if then == Then::ControllerComesBack {
         assert_eq!(
             (picked["state"].as_str(), picked["id"].as_str()),
             (Some("recording"), Some("g1")),

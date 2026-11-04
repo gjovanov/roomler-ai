@@ -511,10 +511,10 @@ pub fn peer_replaced(session_id: ObjectId) {
 /// keep recording someone who just sent the controller away, and a
 /// controller whose device auto-grants would reconnect straight into it.
 ///
-/// ⚠️ That includes one the re-attach grace already holds while the session
-/// is still live (#3474). The handler of a channel that has ended does
-/// nothing, so the grace's recording for the session is stopped here, or the
-/// controller's next session would pick it up.
+/// ⚠️ That includes a recording the re-attach grace holds for the session
+/// (#3474): `stop_held` stops it here, then and there, and reports it once.
+/// Left to the grace, the controller's next session would pick it up. Another
+/// session's recording is never stopped by it.
 pub fn host_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
         h.over.store(true, Ordering::Release);
