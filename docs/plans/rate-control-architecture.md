@@ -60,7 +60,7 @@ from scratchpad to `scripts/`.
 
 ## FR-A — Encoder rate changes without an IDR (first)
 
-**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:413–465`, dispatch
+**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:403–465`, dispatch
 `encoder_smoke_cmd` :6387) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
@@ -229,7 +229,7 @@ before B2).
    (`vendored/webrtc/src/api/setting_engine/mod.rs:195–197`, evaluated per address in
    `webrtc-ice/src/util/mod.rs:129–132`) with the addresses **on our own adapters**, not a CIDR:
    `if_addrs::get_if_addrs()` filtered by `is_overlay_iface(name)` on Windows/Linux, plus LocalAPI
-   `status().overlay_ip/ip6` (`localapi/src/lib.rs:97–101`) for macOS `utunN`. An ISP CGNAT
+   `status().overlay_ip/ip6` (`localapi/src/lib.rs:93–101`) for macOS `utunN`. An ISP CGNAT
    address lives on the physical NIC and is never dropped — this retires the objection at
    `peer.rs:337–340`.
 2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:729–758`) — a 3-line
@@ -242,7 +242,7 @@ before B2).
 
 Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`peer.rs:1527–1527`)
 and in the FR-35 memory key (`peer.rs:4766` → `"{ip}|{class}"`, which fixes "a fast day carried
-onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:32–38`
+onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–38`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
 Update `docs/multi-org.md:340–341` (its "ICE never gathers on roomler-*" is true only on Linux) and

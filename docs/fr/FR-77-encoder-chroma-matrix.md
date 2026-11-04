@@ -23,7 +23,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - `AgentCaps` (`crates/remote_control/src/models.rs:40-186`) carries chroma as a
   transport name (`data-channel-vp9-444`, `:59` — used even when libvpx emits 4:2:0), a
   string `vp9_chroma` (`:165`) and a list `hevc_chroma` (`:177`). The session request
-  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:1014,679`).
+  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:978,679`).
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
   (`agents/roomlerd/src/peer.rs:5477-5484`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:770-787`),
@@ -34,9 +34,9 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   (fixed in #1468 by making the list the single source the type derives from).
 - The FFmpeg dispatch tables (`encoder.rs:113,107,133,148`) try
   `h264/hevc/av1 × nvenc/qsv/amf/videotoolbox` + `vp9_qsv` (profile 0 only, `:655-659`).
-  VAAPI was never wired (`agents/roomlerd/Cargo.toml:208-209` still promises it for
+  VAAPI was never wired (`agents/roomlerd/Cargo.toml:185-186` still promises it for
   "rc.74"); no `*_mf` name exists anywhere. macOS ships FFmpeg again since 2026-08-25
-  (`release-agent.yml:2406-2429`) — several docs still say it does not.
+  (`release-agent.yml:2403-2426`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
   (`ui/src/composables/useRemoteControl.ts:3027-3057`).

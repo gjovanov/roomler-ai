@@ -146,7 +146,7 @@ and never outliving the daemon (FR-97 P0e).
 | `exec` and SSH `daemon` mode | 🟡 SYSTEM on a SystemContext install, or once anchored (FR-94); the signed-in person on an attended one | ✅ root | ✅ root on the root half's row | `docs/fleet-rpc.md`, Who runs the command |
 | `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:887-891`); Windows: `docs/roomler-ssh.md` |
 | `named:<account>` | ⛔ | ✅ | ✅ | §8 |
-| SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1246-1250` |
+| SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1218-1222` |
 | A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:880` |
 
 ## 6. The desktop: companion, power, files, agent sessions
@@ -166,7 +166,7 @@ and never outliving the daemon (FR-97 P0e).
 |---|---|---|---|---|
 | A per-user install updates itself | ✅ | ✅ a root update helper (FR-96) | ✅ | `docs/installation.md` |
 | The artifact's own version checked against the manifest | ✅ MSI `ProductVersion` | ✅ the `.deb`'s `Version`, the tarball's top directory | ✅ the `.pkg`'s `PackageInfo` | `agents/roomlerd/src/artifact_version.rs:114` |
-| A private staging directory per download | ✅ | ✅ | ✅ measured: the root helper's temp directory is root's own | `agents/roomlerd/src/updater.rs:1157`, `:1181` |
+| A private staging directory per download | ✅ | ✅ | ✅ measured: the root helper's temp directory is root's own | `agents/roomlerd/src/updater.rs:973`, `:997` |
 | One verb registers the system service | ✅ | ✅ | ✅ | `service install --as-service` (alias `--system`, `agents/roomlerd/src/service.rs:421-428`) |
 | Uninstall | ✅ MSI, `install.ps1 -Uninstall` | ✅ `install.sh --uninstall` | ✅ the same | `docs/installation.md`, Uninstall |
 | An ephemeral device removes itself on a clean stop | ✅ | ✅ | ✅ | `docs/ephemeral-nodes.md` |
@@ -174,7 +174,7 @@ and never outliving the daemon (FR-97 P0e).
 | The daemon survives a log sink it cannot write | ✅ | ✅ | ✅ | #1538 |
 | An update's outcome is recorded | 🟡 written, never read | ❌ | ❌ | FR-67 |
 | The tunnel client updates itself (`roomler self-update`) | ✅ | ✅ from tunnel-v0.4.149: the tarball, or the `.deb` where dpkg owns the binary (field-verified on its release) | ✅ from tunnel-v0.4.149 (field-verified on its release) | every OS checks the release's `.asc` against the pinned key (`agents/roomler-cli/src/update.rs:227`); FR-97 P6b |
-| Processors the daemon runs on | 🟡 x64; ❌ ARM64 | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel | `agents/roomlerd/wix-perMachine/main.wxs:87`; `.github/workflows/release-agent.yml:2796`; FR-97 D6 |
+| Processors the daemon runs on | 🟡 x64; ❌ ARM64 | ✅ x86_64 and arm64 | 🟡 Apple silicon; ❌ Intel | `agents/roomlerd/wix-perMachine/main.wxs:87`; `.github/workflows/release-agent.yml:2793`; FR-97 D6 |
 | Hardware encoding on Linux arm64 | — | ✅ NVENC, field-verified on 0.4.189 ([FR-122](fr/FR-122-arm64-linux-hardware-cell.md)): on an NVIDIA GB10 the probe opens `h264_nvenc` and `hevc_nvenc` (4:2:0 and 4:4:4) and `av1_nvenc`, a session runs on them, and a recording writes H.264 + AAC. It needs NVIDIA driver 530.41 or newer from 0.4.188 (610 before, FR-122 P0c), and in a container the `video` driver capability. 🟡 VAAPI and Vulkan ship in the same build (FR-97 P7a, from 0.4.170) unproven on arm64; the lab's own arm64 host (an Asahi Mac) has no encoder Linux can drive | — | `.github/workflows/release-agent.yml` (`build-linux-arm64`); `vendor-ffmpeg-windows.yml` (`build-linux-arm64-minimal`) |
 | The standalone tunnel client and the wizard on Linux arm64 | — | ✅ from 0.4.149 (FR-97 P7b): the wizard with the agent release, the tunnel client from tunnel-v0.4.149 (its aarch64 `.deb` and tarball run on real arm64, 16 KiB pages included). Before it, x86_64 builds only, and `install.sh --role tunnel` handed an arm64 host the x86_64 CLI; the served script picks the aarch64 build since the 2026-10-21 promote (field-verified on real arm64, FR-97 §8) | — | `.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:298`; the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:194`) |
 

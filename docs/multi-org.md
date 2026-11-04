@@ -262,7 +262,7 @@ sequenceDiagram
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
 
-Only `store_unavailable` is retryable ([`signaling.rs:513`](../crates/remote_control/src/signaling.rs#L513)).
+Only `store_unavailable` is retryable ([`signaling.rs:491`](../crates/remote_control/src/signaling.rs#L491)).
 An unknown reason takes the conservative arm. The device does not retry on its own in
 either case: its signalling loop reconnects on its own ladder, and a retry at the
 refusal would race it.
@@ -277,7 +277,7 @@ refusal would race it.
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
   keeps the refusal in a process-global slot
-  ([`overlay.rs:1060-1070`](../agents/roomlerd/src/overlay.rs#L1060-L1070)). No overlay runtime
+  ([`overlay.rs:1019-1029`](../agents/roomlerd/src/overlay.rs#L1019-L1029)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
   ([`localclient.rs:2596-2618`](../agents/roomler-cli/src/localclient.rs#L2596-L2618)):
@@ -293,7 +293,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:284`](../crates/localapi/src/lib.rs#L284)), and then nothing is printed, never a
+  ([`lib.rs:280`](../crates/localapi/src/lib.rs#L280)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 
@@ -899,7 +899,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2259-2261`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2068-2070`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
