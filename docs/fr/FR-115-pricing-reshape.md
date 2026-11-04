@@ -734,8 +734,8 @@ sequenceDiagram
 
 | Guard | Where | What it prevents |
 |---|---|---|
-| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:660` | two pods warning one meeting; warning a meeting that ended |
-| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:679` | ending the **next** meeting in a room restarted between the sweep's read and its write |
+| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:674` | two pods warning one meeting; warning a meeting that ended |
+| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:693` | ending the **next** meeting in a room restarted between the sweep's read and its write |
 | The FR-102 collision is counted after the won end | `meeting_cap.rs:198` | a meeting counted twice when two pods reach it together |
 | `meetings.free_cap = false` | `crates/config/src/settings.rs` (`MeetingsSettings`) | the kill switch: no meeting is warned or ended |
 

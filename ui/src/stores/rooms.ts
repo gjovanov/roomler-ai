@@ -178,10 +178,29 @@ export const useRoomStore = defineStore('rooms', () => {
     return cid ? { connection_id: cid } : undefined
   }
 
+  // How long a join waits for the page's socket to be given its id: a moment
+  // after the page loads, longer on a weak network or a socket redialling.
+  const CALL_SOCKET_WAIT_MS = 10_000
+
+  /**
+   * The id of this page's socket, which the call session is scoped to,
+   * waiting for it up to `CALL_SOCKET_WAIT_MS`. A join sent without one opened
+   * a session no leave from the page could close, because the leave names its
+   * connection: the person stayed listed, and a call they were alone in never
+   * ended (#3416). A call cannot run without the socket, so past the bound
+   * this throws, and the join is refused with the reason.
+   */
+  async function callConnectionId(): Promise<string> {
+    const cid = await useWsStore().waitForConnectionId(CALL_SOCKET_WAIT_MS)
+    if (!cid) throw new Error('Not connected to the server. Check your connection and try again.')
+    return cid
+  }
+
   async function joinCall(tenantId: string, roomId: string) {
+    const connection_id = await callConnectionId()
     const data = await api.post<{ participant_id: string; joined: boolean; transports?: unknown }>(
       `/tenant/${tenantId}/room/${roomId}/call/join`,
-      callSessionBody(),
+      { connection_id },
     )
     return data
   }
@@ -335,6 +354,7 @@ export const useRoomStore = defineStore('rooms', () => {
     // Call operations
     updateRoomCallStatus,
     startCall,
+    callConnectionId,
     joinCall,
     leaveCall,
     endCall,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
 
 vi.mock('@/plugins/router', () => ({
@@ -23,6 +23,7 @@ vi.mock('@/api/client', () => ({
 }))
 
 import { useRoomStore, type Room } from '@/stores/rooms'
+import { useWsStore } from '@/stores/ws'
 import { api } from '@/api/client'
 
 const mockApi = vi.mocked(api)
@@ -248,6 +249,63 @@ describe('useRoomStore', () => {
 
       expect(result).toEqual(newRoom)
       expect(store.rooms).toContainEqual(newRoom)
+    })
+  })
+
+  // #3416 — a join sent before the page's socket had its id opened a call
+  // session no leave from the page could close: the leave names its
+  // connection. The join waits for the id, up to a bound, and is refused past
+  // it.
+  describe('joinCall waits for the socket id', () => {
+    const joinPath = '/tenant/t1/room/r1/call/join'
+
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('joins naming the id the socket already has', async () => {
+      useWsStore().connectionId = 'conn-1'
+
+      await useRoomStore().joinCall('t1', 'r1')
+
+      expect(mockApi.post).toHaveBeenCalledWith(joinPath, { connection_id: 'conn-1' })
+    })
+
+    it('holds the join until the socket has its id, then names it', async () => {
+      vi.useFakeTimers()
+      const joining = useRoomStore().joinCall('t1', 'r1')
+
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(mockApi.post, 'the join went out before the socket had its id').not.toHaveBeenCalled()
+
+      useWsStore().connectionId = 'conn-2'
+      await joining
+
+      expect(mockApi.post).toHaveBeenCalledTimes(1)
+      expect(mockApi.post).toHaveBeenCalledWith(joinPath, { connection_id: 'conn-2' })
+    })
+
+    it('is refused past the bound with a reason the person can read, and sends nothing', async () => {
+      vi.useFakeTimers()
+      const joining = useRoomStore().joinCall('t1', 'r1')
+      const refused = expect(joining).rejects.toThrow('Not connected to the server')
+
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      await refused
+      expect(mockApi.post).not.toHaveBeenCalled()
+    })
+
+    it('stops waiting once refused: an id that comes later sends no join', async () => {
+      vi.useFakeTimers()
+      const joining = useRoomStore().joinCall('t1', 'r1').catch(() => undefined)
+      await vi.advanceTimersByTimeAsync(10_000)
+      await joining
+
+      useWsStore().connectionId = 'conn-3'
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(mockApi.post).not.toHaveBeenCalled()
     })
   })
 })
