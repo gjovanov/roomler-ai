@@ -245,6 +245,11 @@ fn a_reoffer_while_the_recorder_launches_keeps_the_recording() -> Result<()> {
     rt().block_on(a_reoffer_while_the_recorder_launches_keeps_the_recording_cell())
 }
 
+#[test]
+fn a_reoffer_that_cannot_carry_the_recording_ends_it() -> Result<()> {
+    rt().block_on(a_reoffer_that_cannot_carry_the_recording_ends_it_cell())
+}
+
 /// The owner's two gates, as a local `ConfigSet` would set them.
 fn gates(enabled: bool, audio: bool) {
     let mut cfg = roomler_node_core::config::test_fixture();
@@ -2515,6 +2520,121 @@ async fn a_reoffer_while_the_recorder_launches_keeps_the_recording_cell() -> Res
             .all(|e| !e.recording))
         .await,
         "the banner outlived the recording"
+    );
+    Ok(())
+}
+
+/// #3468, from review — a re-offer whose new peer cannot carry the recording
+/// ends it. The hub forwards one offer per session (`admit_offer`), so only an
+/// older or hostile server sends a second one, and the peer the loop builds
+/// from it gets the default grant, without RECORD, and no record context:
+/// nothing on it can pick the recording up. Its old channel's end is then the
+/// session's end for the recording, as for any channel gone during the launch:
+/// the start stops it `session_ended`, and the controller's next session finds
+/// nothing (red when the old channel's end reads as a replacement: the
+/// recording waits in the grace, the host's Disconnect reaches only the old,
+/// ended handler, and the next session picks it up).
+async fn a_reoffer_that_cannot_carry_the_recording_ends_it_cell() -> Result<()> {
+    let _serial = SERIAL.lock().await;
+    let s = setup();
+    idle(s).await;
+    gates(true, false);
+    let before = mp4s(&s.out);
+    let (device, _kill) = Device::new();
+    let user = ObjectId::new();
+    let on_device = || Opts {
+        device: Some(device.clone()),
+        controller: Some(user),
+        ..Default::default()
+    };
+    let mut a = rig(on_device()).await?;
+    a.send(json!({"t": "rc:record.start", "id": "h1"})).await?;
+    // Spawned, not recording yet, as in the L3 cell.
+    let deadline = tokio::time::Instant::now() + START;
+    let launching = loop {
+        let st = s.manager.state();
+        if st.active || tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        if st.remote_controller.is_some() {
+            break true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    // The second offer's arm: the old peer replaced by one with no RECORD.
+    let in_the_launch = launching && {
+        a.reoffer().await;
+        !s.manager.state().active
+    };
+    let mut a_kinds = Vec::new();
+    let mut picked = Value::Null;
+    let mut b_kinds = Vec::new();
+    if in_the_launch {
+        a_kinds = reports_until(&mut a, RecordingActivityKind::Started, START).await;
+        // The old channel's end is seen (its watch looks every 500 ms), so
+        // the host's Disconnect reaches only an ended handler.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // The person at the device sends the controller away.
+        remote::host_ended(a.session_id);
+        a.indicator.hide_session(a.session_id.to_hex());
+        // The controller comes back on a new session.
+        let mut b = rig(on_device()).await?;
+        b.send(json!({"t": "rc:record.status"})).await?;
+        picked = b.state(START).await?;
+        b_kinds = b.reports().into_iter().map(|(k, _, _)| k).collect();
+        b.drop_session().await?;
+    }
+    let deadline = tokio::time::Instant::now() + STOP;
+    while s.manager.state().active && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let st = s.manager.state();
+    // `reports` drains: what the first look took is not seen again.
+    if !a_kinds
+        .iter()
+        .any(|(k, _)| *k == RecordingActivityKind::Stopped)
+    {
+        a_kinds.extend(
+            reports_until(
+                &mut a,
+                RecordingActivityKind::Stopped,
+                Duration::from_secs(5),
+            )
+            .await,
+        );
+    }
+    // Whatever happened, the next cell starts from an idle recorder and no
+    // stray file.
+    idle(s).await;
+    for f in mp4s(&s.out).into_iter().filter(|f| !before.contains(f)) {
+        let _ = std::fs::remove_file(Sidecar::path_for(&f));
+        let _ = std::fs::remove_file(&f);
+    }
+    a.drop_session().await?;
+    assert!(
+        launching,
+        "the recorder was never seen launching: this cell proves nothing"
+    );
+    assert!(
+        in_the_launch,
+        "the recorder started before the re-offer was in: this cell proves nothing"
+    );
+    assert_eq!(
+        picked["state"], "idle",
+        "a recording outlived a re-offer that could not carry it, and the host's Disconnect: {picked}"
+    );
+    assert!(b_kinds.is_empty(), "{b_kinds:?}");
+    assert!(!st.active, "the recording ran on");
+    assert_eq!(
+        st.last.as_ref().map(|l| l.reason.as_str()),
+        Some("session_ended")
+    );
+    assert_eq!(
+        a_kinds,
+        vec![
+            (RecordingActivityKind::Started, None),
+            (RecordingActivityKind::Stopped, Some("session_ended".into())),
+        ]
     );
     Ok(())
 }
