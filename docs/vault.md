@@ -595,7 +595,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | the device's switch | `vault_enabled` ([`config.rs:593`](../crates/agent-core/src/config.rs#L593)), off, never pushable: [`the_device_owned_refusals_are_not_pushable`](../crates/remote_control/src/models.rs#L9943) |
-| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1831`](../agents/roomlerd/src/signaling.rs#L1831) |
+| the key, and its half in the hello | [`vault.rs:35`](../agents/roomlerd/src/vault.rs#L35) `hello_key`, feature `vault` (it implies `hive`, and no release build carries it yet); the hello at [`signaling.rs:1862`](../agents/roomlerd/src/signaling.rs#L1862) |
 | the wire | `AgentHello::vault_key` ([`signaling.rs:603`](../crates/remote_control/src/signaling.rs#L603)) and [`vault_key_is_well_formed`](../crates/remote_control/src/signaling.rs#L120) |
 | what the fleet stores | [`socket.rs:103`](../crates/modules/fleet/src/socket.rs#L103), [`AgentDao::update_hello`](../crates/services/src/dao/agent.rs#L495), `Agent::vault_key` ([`models.rs:2355`](../crates/remote_control/src/models.rs#L2355)); no route answers it |
 
@@ -884,7 +884,7 @@ no answer, and the daemon stops waiting for it.
 >   allow from the same answer
 >   ([`supervisor.rs:4382`](../agents/roomlerd/src/hive/supervisor.rs#L4382)).
 >   It records whether the primary connection takes leases before it resumes
->   any run ([`signaling.rs:1887`](../agents/roomlerd/src/signaling.rs#L1887)).
+>   any run ([`signaling.rs:1918`](../agents/roomlerd/src/signaling.rs#L1918)).
 
 | Piece | Where |
 |---|---|
@@ -2223,7 +2223,7 @@ bash elsewhere.
 > - **A ticket is no lease**, and it is **recorded before it is given**, as
 >   a grant is (§21).
 > - **It is never logged by a daemon.** `rc:vault.ssh.granted` has an arm of
->   its own ([`signaling.rs:6804`](../agents/roomlerd/src/signaling.rs#L6804)),
+>   its own ([`signaling.rs:6899`](../agents/roomlerd/src/signaling.rs#L6899)),
 >   where the catch-all below would print the frame and the ticket with it.
 >   Since P3-8-2b-1 it answers the asker, on the primary's connection only, as
 >   a lease is; the ticket's `Debug` names it by its id alone.
@@ -2487,10 +2487,10 @@ sequenceDiagram
 
 | Piece | Where |
 |---|---|
-| the wire | `Request::Connect` and `ConnectStatus` ([`localapi/src/lib.rs:1606`](../crates/localapi/src/lib.rs#L1606)), `ConnectArgs` ([`:1617`](../crates/localapi/src/lib.rs#L1617)) and `EndpointState` ([`:1646`](../crates/localapi/src/lib.rs#L1646)); `Response::Connected` and `ConnectState` ([`:1974`](../crates/localapi/src/lib.rs#L1974)) |
-| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2353`](../crates/localapi/src/lib.rs#L2353)); the account, `ClientPeer::asker` ([`:2313`](../crates/localapi/src/lib.rs#L2313)); both read from one opening of the token, `token_facts` ([`:2599`](../crates/localapi/src/lib.rs#L2599)) |
-| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3598`](../crates/localapi/src/lib.rs#L3598)); each id kept before its answer is written ([`:3629`](../crates/localapi/src/lib.rs#L3629)), and let go at the connection's end ([`:3660`](../crates/localapi/src/lib.rs#L3660)) |
-| the daemon | `open` ([`person_connect.rs:33`](../agents/roomlerd/src/hive/person_connect.rs#L33)), `state` and `release` ([`:93`](../agents/roomlerd/src/hive/person_connect.rs#L93)); `DaemonState::connect` ([`localapi_state.rs:1890`](../agents/roomlerd/src/localapi_state.rs#L1890)) |
+| the wire | `Request::Connect` and `ConnectStatus` ([`localapi/src/lib.rs:1706`](../crates/localapi/src/lib.rs#L1706)), `ConnectArgs` ([`:1717`](../crates/localapi/src/lib.rs#L1717)) and `EndpointState` ([`:1746`](../crates/localapi/src/lib.rs#L1746)); `Response::Connected` and `ConnectState` ([`:2074`](../crates/localapi/src/lib.rs#L2074)) |
+| the gate | `peer_may_connect` ([`localapi/src/lib.rs:2453`](../crates/localapi/src/lib.rs#L2453)); the account, `ClientPeer::asker` ([`:2413`](../crates/localapi/src/lib.rs#L2413)); both read from one opening of the token, `token_facts` ([`:2699`](../crates/localapi/src/lib.rs#L2699)) |
+| the connection's endpoints | the dispatcher's arms ([`localapi/src/lib.rs:3698`](../crates/localapi/src/lib.rs#L3698)); each id kept before its answer is written ([`:3729`](../crates/localapi/src/lib.rs#L3729)), and let go at the connection's end ([`:3760`](../crates/localapi/src/lib.rs#L3760)) |
+| the daemon | `open` ([`person_connect.rs:33`](../agents/roomlerd/src/hive/person_connect.rs#L33)), `state` and `release` ([`:93`](../agents/roomlerd/src/hive/person_connect.rs#L93)); `DaemonState::connect` ([`localapi_state.rs:1894`](../agents/roomlerd/src/localapi_state.rs#L1894)) |
 | the command | `Command::Connect` ([`cli.rs:478`](../agents/roomler-cli/src/cli.rs#L478)); `run` ([`connectcmd.rs:30`](../agents/roomler-cli/src/connectcmd.rs#L30)) and `hold` ([`:71`](../agents/roomler-cli/src/connectcmd.rs#L71)) |
 
 ## 24. A session's egress allowlist: `rc:vault.egress` (P3b-1a)

@@ -136,7 +136,7 @@ Four rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:310`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:1008`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:1055`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:39`,
 `:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
-(`agents/roomlerd/src/signaling.rs:1464`, `:2137`)
+(`agents/roomlerd/src/signaling.rs:1480`, `:2154`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -493,7 +493,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1096`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6674`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6742`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -522,7 +522,7 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/apps/macos.rs` | FR-97 P2c: the window server's list (`quartz_windows`), the AX focus (`ax_window`, `MacWm::focus`), the launcher (`run_launcher`) and the Terminal script (`write_script`, `person_temp_dir`), `availability` (a window-server session or `no_session`). Its pure halves are in `mod.rs`: `QuartzWindow`, `quartz_listing`, `quartz_title`, `parse_quartz_window_id`, `terminal_script`, `terminal_script_name`, and the env floor (`APPS_ENV`, `apps_switched_off`, `permitted`) |
 | `agents/roomlerd/src/delegate.rs` · `signaling.rs` · `macos_supervisor.rs` | FR-97 P2c on a supervised Mac: `effective_apps` (the worker's words), the hello and heartbeat that carry them, and `WORKER_ENV_FORWARD`'s `APPS` |
-| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1612`, `:1618`), assigned by `with_config_lists` (`:777`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1657`, `:1664`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:789`) — why the child's struct must carry no `apps` |
+| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:4497`, `:4503`), assigned by `with_config_lists` (`:2944`) from `detect` (`:2388`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:4542`, `:4549`); `CACHED_CAPS` (`:39`) — why the hello is a snapshot; `cached_or_probed` (`:2956`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
 | `agents/roomlerd/src/app.rs` | `apps-probe` (`:4739`) — reads the device config through `read_if_present`, never `load` |

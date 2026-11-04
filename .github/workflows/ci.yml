@@ -1620,6 +1620,16 @@ jobs:
         run: |
           cargo clippy -p roomler-localapi --all-targets -- -D warnings
           cargo test -p roomler-localapi --lib
+      # #3375 — the per-Machine MSI's custom-action DLL: its `msi` module (the
+      # registry and MSI calls msiexec runs on every per-Machine upgrade) is
+      # `#[cfg(windows)]`, so no Linux lane compiles it. The tests hold the
+      # carry's encoding and merge rule, and read the per-Machine wxs for the
+      # entry points, the hidden properties and the order the carry needs.
+      - name: The MSI's custom-action DLL on Windows — clippy + unit tests (#3375)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo clippy -p roomler-msi-ca --all-targets -- -D warnings
+          cargo test -p roomler-msi-ca --lib
       # #3116 — the setup wizard's Windows half ran in NO lane: its unit tests
       # run on Linux and its `cargo check` on macOS, so every
       # `#[cfg(target_os = "windows")]` arm of the daemon pipeline (the MSI,

@@ -199,6 +199,7 @@ installing it, and is also bound to the release it claims to be: the Windows
 | Artifact | Workflow | Mechanism |
 |---|---|---|
 | `roomlerd.exe`, `roomler.exe` **inside** both MSIs | release-agent | sign-windows, *before* `cargo wix` harvests |
+| `roomler_msi_ca.dll` in the perMachine MSI's Binary table (#3375: msiexec extracts and loads it on every upgrade) | release-agent | sign-windows with the payload; the lane then reads it out of the built MSI and asserts the payload's signer and its imports (`.github/workflows/release-agent.yml:2205`) |
 | perUser + perMachine `.msi` | release-agent | sign-windows, before the size-budget/sha256 steps |
 | `roomler-desktop-<v>….exe` | release-agent | sign-windows |
 | `roomler-agent-<v>-aarch64-apple-darwin.pkg` | release-agent | inline codesign → productbuild → notarytool → staple → **verify** |
@@ -512,7 +513,10 @@ copyright grant to the company is a legal decision, not a packaging one.
 directives would propagate a *second* version resource into the Tauri EXEs
 that depend on these crates). `FILEVERSION` uses the same `MAJOR.MINOR.RC`
 remap as the MSI ProductVersion (`0.3.0-rc.238` → `0.3.238.0`), so file
-version and installer version always agree. The Tauri configs inherit the
+version and installer version always agree. `roomler_msi_ca.dll` (#3375) is a
+`cdylib` with no binary, so its `build.rs` uses `compile_for_everything`
+(`rustc-link-arg`), which reaches the crate's own artifacts only; nothing
+depends on it. The Tauri configs inherit the
 workspace version (the hardcoded `rc.30`/`rc.197` pins are gone).
 
 ## 11. Renewal / rotation

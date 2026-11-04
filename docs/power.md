@@ -111,7 +111,7 @@ sequenceDiagram
 heartbeat as an optional `power`
 ([`signaling.rs:676`](../crates/remote_control/src/signaling.rs#L676)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
-anything connects ([`app.rs:4726`](../agents/roomlerd/src/app.rs#L4726)) and
+anything connects ([`app.rs:4756`](../agents/roomlerd/src/app.rs#L4756)) and
 after every pass, with what it actually holds, not what it wanted
 ([`power.rs:319`](../agents/roomlerd/src/power.rs#L319)).
 
@@ -142,9 +142,9 @@ every live control connection its goodbye
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2099`](../agents/roomlerd/src/signaling.rs#L2099)). Then the run
+([`signaling.rs:2116`](../agents/roomlerd/src/signaling.rs#L2116)). Then the run
 loop holds every new dial until the wake
-([`signaling.rs:1091`](../agents/roomlerd/src/signaling.rs#L1091),
+([`signaling.rs:1107`](../agents/roomlerd/src/signaling.rs#L1107),
 [`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
 `hold_while_asleep`). A dial inside the window the OS gave the computer to go to
 sleep would say hello again and erase the reason.
@@ -176,7 +176,7 @@ sleep would say hello again and erase the reason.
 | surface | field | reads |
 |---|---|---|
 | `roomler status` | `power` ([`lib.rs:207`](../crates/localapi/src/lib.rs#L207)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2441`](../agents/roomler-cli/src/localclient.rs#L2441)) |
-| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3112`](../agents/roomler-cli/src/localclient.rs#L3112)) |
+| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3351`](../agents/roomler-cli/src/localclient.rs#L3351)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:640`](../crates/modules/fleet/src/agent.rs#L640)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |

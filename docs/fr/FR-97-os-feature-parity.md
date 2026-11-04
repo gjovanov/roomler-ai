@@ -257,7 +257,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | R1 | System audio in a session | ✅ WASAPI loopback | ❌ **the default microphone, always**: cpal lists only ALSA devices, so the `.monitor` pick never matched (measured, §8). Since P3c-1 a named device only, else no track and the reason (`audio_source.rs:261`) | ✅ since P2a: ScreenCaptureKit's mix of every app, in a process with a window-server session; on a supervised Mac the GUI worker, whose offer the root's row carries | Was: macOS had no capture backend; since P0c no `opus` either (`encode/caps.rs:2622`) ✔. *P2a:* `agents/roomlerd/src/audio/sck.rs`. Linux: nothing captures the session's monitor (P3c-2) | P0c, P2a, P3c |
-| R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ✅ since 0.4.153 (P2b): in the release set (`.github/workflows/release-agent.yml:2793`); on a supervised Mac the root half draws it (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
+| R2 | Native consent panel | ✅ | ✅ X11 · ⛔ Wayland → companion | ✅ since 0.4.153 (P2b): in the release set (`.github/workflows/release-agent.yml:2890`); on a supervised Mac the root half draws it (§8) | Was: built (`indicator/mac.rs`), not in the release set. The companion stays the fallback | P2b (D3) |
 | R3 | Remote Apps | ✅ | ✅ X11 · 🟡 Wayland: Xwayland windows (FR-56) | ✅ since P2c: the window server's list, focus through Accessibility, launch through LaunchServices and Terminal; on a supervised Mac the GUI worker serves it, and the root's row carries its words | Was: `Unavailable::Platform` (`apps/mod.rs:347`), no `apps/macos.rs`. *P2c:* `agents/roomlerd/src/apps/macos.rs` | P2c |
 | R4 | Live cursor shape | ✅ | ✅ X11 since P3a (XFixes), and the DRM arm's hardware cursor (FR-93 P3c, 0.4.134); a per-user Wayland compositor draws it into the frames | ❌ | `capture/cursor.rs:90`; an XFixes decoder already exists for recordings (`capture/pointer.rs:187-230`). *P8-2:* the inventory missed the DRM arm (`agents/roomlerd/src/capture/cursor.rs:128-152`) | P3a, P2d |
 | R5 | "Host is locked" consent hint | ✅ | 🟡 since P3b: advisory, from logind's `LockedHint`, and input passes (`lock_state.rs:347`), in a session; a request waiting for consent is not told (P2d-1 found it: the prompt's probe answers `None` here) | ✅ since P2d-1: advisory, from the session dictionary (`lock_state.rs:357`), in a session (`input: "unknown"`) and at a prompt | The pump's `LockState` is always `Unlocked` off Windows (`lock_state.rs:290-326`), on purpose: the hint never becomes its overlay. *P2d-1:* the prompt's probe asks a Mac's session (`lock_state.rs:301-320`) | P2d-1, P3b |
@@ -282,7 +282,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | D1 | Companion: tray, banner, consent, Apply now | ✅ | 🟡 | ✅ | One x86_64 `.deb` (`release-agent.yml:780-917`); Fedora, Arch and arm64 have none. *P8-2:* FR-93 P6d added an x86_64 `.rpm` (`.github/workflows/release-agent.yml:868-873`). *Corrected 2026-10-20:* FR-93 P6e builds the `.deb` and the `.rpm` for aarch64 too (`.github/workflows/release-agent.yml:960`), in every release since 0.4.138; only a host with neither dpkg nor rpm (Arch) has none (D17) | P3g (with FR-93 D5/D6, FR-95) |
-| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:2888`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:151`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
+| D2 | Companion pages on a system install | ✅ | 🟡 safety pages; Devices, the mesh and the live links since P2g/P2h | 🟡 Devices and the mesh (P2g), the Connection column and Overview's network fields (P2h) from the root half | Person socket (`crates/localapi/src/lib.rs:3009`). *Measured 2026-10-21:* a two-half Mac's Devices page listed the Mac alone, because the user half it asks has no overlay node (`no_node`). P2g: the user half asks the root half (`agents/roomlerd/src/person_socket.rs:151`); P2h: for `Status` and `Peers` too | #1911; FR-43 P3; P2g, P2h |
 | D3 | Keep the host awake during a session | ✅ `PowerCreateRequest` | ✅ since P3b: a logind block inhibitor (`power.rs:758`) | ✅ IOPMAssertion | Was a stub whose reason, "zbus is in no shipped Linux feature set", had gone stale: `portal-capture` ships zbus in `full` | P3b |
 | D4 | Received files land as the signed-in user (system install) | ✅ | 🟡 built (P3d) | ✅ | Was: `/tmp`, owned `root:root`, measured on 0.4.143 (§8). P3d: the person at seat0's Downloads, every step as them (`agents/roomlerd/src/files.rs:223-294`) | P3d |
 | D5 | The setup wizard installs the daemon | ✅ | ❌ | ❌ | Tunnel client only (`agents/roomler-setup/src/commands.rs:85-109`) ✔, yet the enroll dialog offered it for agents. P0c-2 offers it for agents on Windows only (`ui/src/utils/enrollCommands.ts:202`) | P0c, D5 |
@@ -309,8 +309,8 @@ and the consent chain's fallbacks.
 | O7 | A supervisor records a worker that dies before its own hook | ✅ | ⛔ journald | 🟡 built (P6e-2) | Was: `macos_supervisor.rs` never called `crash_recorder`. *P6e-2:* a worker that a signal killed, or that exited with a code the agent did not choose, leaves a `SupervisorDetected` record in the root daemon's own crashes dir, which its own uploader drains (`agents/roomlerd/src/macos_supervisor.rs:271-295`, `:1092-1099`) | P6e |
 | O8 | The daemon survives a failed stdout write | ✅ | ✅ | ❌ | #1538 | P6e |
 | O9 | A private per-download staging dir | 🟡 shared `%TEMP%\roomlerd-update` | ✅ mkdtemp | 🟡 shared | `updater.rs:997-1006` | P6f |
-| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3457`, `session_end.rs:220`) | P4d |
-| A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2508-2514`); the CLI and the wizard are universal | D6 |
+| O10 | An ephemeral device removes itself on a clean stop | ✅ since P4d: the SCM service, and a per-user install on `service stop`, sign-out and shutdown | ✅ | ✅ | Was: a Scheduled-Task install had no stop signal. Now its own event and a session-end window (`app.rs:3482`, `session_end.rs:220`) | P4d |
+| A1 | Daemon + companion on Intel Macs | — | — | ❌ | arm64 only (`release-agent.yml:2605-2611`); the CLI and the wizard are universal | D6 |
 | A2 | Daemon on Windows ARM64 | ❌ | — | — | x64 MSI only (`wix-perMachine/main.wxs:86-87`); behaviour under emulation unverified | D6 |
 | A3 | Hardware encode on Linux arm64 | — | ❌ | — | No `ffmpeg-encoder` in the arm64 build step before P7a; recordings write Opus, not AAC. *P7a (#2881):* the arm64 build carries the vendored FFmpeg (nvenc, vaapi, vulkan, AAC); a cell's proof is FR-122 | P7a |
 | A4 | Tunnel CLI and wizard on Linux arm64 | — | ❌ | — | x86_64 only (`release-tunnel.yml:127-131`, `release-setup.yml:189-194`). *P7b:* the aarch64 jobs (`.github/workflows/release-tunnel.yml:215`, `.github/workflows/release-setup.yml:298`) and the proxy's `linux-aarch64` (`crates/modules/fleet/src/tunnel_release.rs:194`), from 0.4.149 | P7b |
@@ -357,7 +357,7 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
 | code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:85-86`, `caps.rs:4640`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-86`, `agents/roomlerd/src/encode/caps.rs:4671`, `crates/tunnel-core/src/overlay/tun.rs:4034-4035`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3887`, `:3983`, `:4390`, `agents/roomlerd/src/app.rs:5267` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3887`, `:3983`, `:4390`, `agents/roomlerd/src/app.rs:5296` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -669,7 +669,7 @@ test of the SIGKILL property itself.
     only to an object conforming to `SCStreamOutput`.
 - **D2, video through SCK as well.** It would bring dirty rects (R13), keep the banner out of the stream (R14), and
   cursor metadata (R4), but it replaces a backend that works. Decide on a measured A/B of latency and CPU.
-- **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2776-2790`: a dispatch
+- **P2b, the native consent panel.** Follow the procedure written at `release-agent.yml:2873-2887`: a dispatch
   build on a real Mac where the daemon starts and a prompt appears and answers, then add `viewer-indicator-macos` to
   the release set. It moves tokio off the main thread on every Mac, and a Mac that fails to start cannot pull its own
   fix, so it goes to one Mac, then the field Macs, then a release.
@@ -792,7 +792,7 @@ test of the SIGKILL property itself.
   lists a device with no node by itself (`overlay: "no_node"`, `crates/api/src/routes/agent_self.rs`). The fix keeps
   the server and the companion as they are:
   - the root half serves the console user a person socket (FR-27 P11's mechanism) at
-    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4240`). The directory is root's and writable by
+    `/var/run/roomler-person/<uid>.sock` (`crates/localapi/src/lib.rs:4340`). The directory is root's and writable by
     nobody else (`root_only_dir`, `:4321`), so root binds and then hands the socket over (`bind_root_owned`,
     `:4334`). That is safe there and not in a directory the person owns. The per-connection uid check is unchanged;
   - `person_may` (`:3057`) admits `Devices` and `Mesh`, read-only. That widens a Linux system install's person
@@ -810,13 +810,13 @@ test of the SIGKILL property itself.
 
   Built:
   - **One async hook at the dispatch of each request**, `LocalApiState::status_view` and `peers_view`
-    (`crates/localapi/src/lib.rs:2746`, `:2751`, dispatched at `:3369`). They default to the sync reads, so the
+    (`crates/localapi/src/lib.rs:2846`, `:2851`, dispatched at `:3469`). They default to the sync reads, so the
     tests' fakes are untouched.
-  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2063`, `:2076`), with P2g's
+  - **The daemon overrides both on a Mac** (`agents/roomlerd/src/localapi_state.rs:2067`, `:2080`), with P2g's
     rule turned to the live view: no overlay address of its own and not root (`person_socket.rs:200`). Then
     `Peers` is the root half's, and `Status` is its own with the root half's overlay addresses, exit status and
     MagicDNS (`with_machine_network`, `:213`).
-  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3210`). That drops
+  - **`person_may` admits `Peers`**, served through `person_view` (`crates/localapi/src/lib.rs:3310`). That drops
     the endpoints of either end and of a relay, the carrier snapshot, the path decision and the probes, which
     name other devices' public and LAN addresses.
   - **A root half slow to answer** (1.5 s) leaves the half's own answer for that poll.

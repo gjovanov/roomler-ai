@@ -172,7 +172,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3660`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3678`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10007`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
@@ -1508,7 +1508,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:843`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6326`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6420`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1521,11 +1521,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6587`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6681`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6616`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6710`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
