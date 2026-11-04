@@ -4624,8 +4624,79 @@ installer PID (Win `OpenProcess` + `WaitForSingleObject`; Unix
 settle, runs the new binary's `--version`, writes a typed JSON
 outcome to `<log_dir>/last-install.json` with status
 `InProgress` / `SucceededVerified` / `SucceededUnverified` /
-`InstallerFailed` / `Timeout`. Operators + future agent startups
-read the file to surface what actually happened to the upgrade.
+`InstallerFailed` / `Timeout` / `WatcherStopped`. Operators + future
+agent startups read the file to surface what actually happened to the
+upgrade.
+
+**What the record says** (#3302):
+
+| `status` | Meaning | `installer_exit_code` |
+|---|---|---|
+| `InProgress` | The watcher wrote its opening line and no verdict yet | none |
+| `SucceededVerified` | The new binary answers the expected version: by the watcher's probe, or, when the watcher left no verdict, by the next daemon being that version | 0 or 3010, or none when nobody read it |
+| `SucceededUnverified` | The installer went through and the probe did not confirm the version. The note says what it saw | 0 or 3010 |
+| `InstallerFailed` | The installer exited with anything else, or it was gone before its exit could be read and the expected version is not on disk | the code, or none |
+| `Timeout` | The installer did not exit within the budget, on Windows after a kill and a retry | none |
+| `WatcherStopped` | Nothing wrote a verdict in the watcher's whole life, 25 min, and this daemon is not the expected version | none |
+
+⚠️ **A process gone before the wait has no exit code.** A refused MSI is
+over in under a second and the watcher starts after it, so `OpenProcess`
+finds no such pid. That used to read as exit 0: released 0.4.197 wrote
+`installer_exit_code: 0` and `SucceededUnverified` for an MSI whose own
+log says `status 1603`. `WaitOutcome::AlreadyGone` leaves the code unset
+and the version on disk decides. Unix keeps its stand-in 0: `wait_pid_unix`
+is never the installer's parent, so it reads no exit at all, and the probe
+is its source of truth.
+
+⚠️ **3010 is a success with a reboot asked for** (#3340). `msiexec` answers it
+when it replaced a file in use, and 1641 is the same family, so
+`installer_went_through` sends both on to the probe and the note says a reboot
+was asked for. A self-update measured at 3010 was online on the new version
+15 s later, with a record that called it failed.
+
+⚠️ **The next daemon settles what the watcher never wrote.** A watcher can
+be stopped before its verdict, and a release cannot reach the watcher of
+the release before it, so the watcher alone could never fix the first
+jump. At the clean-run threshold the daemon reads the record, and
+`post_install::settle_unreported` turns an `InProgress` into
+`SucceededVerified` when this daemon is the expected version, or, once the
+watcher's whole life has passed, into `WatcherStopped`. Younger than that
+it looks once more when the time is up.
+
+⚠️ **The record is read in two places.** A SystemContext worker logs to
+`service-logs`, and the watcher it spawns has no service role, so the
+watcher writes `last-install.json` into SYSTEM's profile. Reading only its
+own log dir, the settle found nothing there: on a per-machine guest, a real
+self-update from 0.4.220 to 0.4.221 still read `InProgress` after the
+clean-run threshold. `post_install::outcome_paths` lists the daemon's own
+log dir and the profile's. The most recently written record is the one read
+and settled, in the file it came from. The watcher runs the outgoing
+release's code, so the reader is the side a release can fix.
+
+**What stops a watcher** (#3302). Measured beside a real per-user update,
+released 0.4.196 to 0.4.197, with four stand-ins running the same
+`post-install-watch`:
+
+| Who | Its console | Its VC runtime | How it ended |
+|---|---|---|---|
+| the real watcher | the daemon's | the install folder's | `0xC000013A` |
+| stand-in A | its own | the install folder's | `0xC000013A` |
+| stand-in B | the daemon's | the install folder's | `0xC000013A` |
+| stand-in C | its own | its own copy | still alive |
+| stand-in D | the daemon's | its own copy | `0xC000013A` |
+
+All four ended within 6 ms, 3.5 s after the MSI began, at Restart Manager's
+event 10002. `0xC000013A` is `STATUS_CONTROL_C_EXIT`, a console control event.
+So Restart Manager picks its targets by the files they hold and reaches them
+through their console, and either half is enough on its own: holding the
+runtime makes you a target, and sharing a console with a target gets you the
+same event.
+
+⚠️ **A staged copy does not keep a watcher off that list.** A copy in `%TEMP%`
+still loads `VCRUNTIME140.dll` from the install folder. What saves one is having
+no console at all: with the launcher's daemon (`roomlerdw.exe`) the record reached
+`SucceededVerified`, with no event 10002. `CREATE_NO_WINDOW` would not do it,
+because that hands the watcher a console of its own, which is stand-in A.
 
 **Each attempt keeps its own MSI log (#2107).** The verbose `/l*v` log
 exists to name the action a wedged run stopped in, and the watcher's
@@ -4637,7 +4708,7 @@ wedged.
 |---|---|---|
 | `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:2017`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
 | `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
-| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:543`) | until the next wedge moves it to `msi-wedged.prev.log` |
+| `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:628`) | until the next wedge moves it to `msi-wedged.prev.log` |
 
 The record's `note` in `last-install.json` names the kept copy.
 
