@@ -70,9 +70,9 @@ pub fn classify(ending: bool, flags: u32) -> Option<SessionEnd> {
 }
 
 /// How long the window holds `WM_ENDSESSION` for the clean stop. The slowest
-/// steps are each capped: an ephemeral device's unenroll at 3 s, and the hive
-/// wind-down at 3 s where sessions run. Usually the whole stop takes well under
-/// a second. Windows does not wait on a program at sign-out for long, and the
+/// step is capped: an ephemeral device's unenroll at 3 s. Usually the whole
+/// stop takes well under a second. Windows does not wait on a program at
+/// sign-out for long, and the
 /// server's reaper collects an ephemeral device whose unenroll was cut short.
 pub const SESSION_END_BUDGET: Duration = Duration::from_secs(5);
 

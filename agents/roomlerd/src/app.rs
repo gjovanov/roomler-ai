@@ -137,16 +137,6 @@ enum Command {
         /// something privileged enough to bring up a TUN.
         #[arg(long)]
         overlay: bool,
-        /// FR-90 P2h-1 — enroll as an archive replica of the organization, as
-        /// the archive image does: it holds copies of the org's sessions and
-        /// offers itself as an archive (`hive_replica`, `hive_archive`), runs
-        /// no session, takes no command or SSH session, is no tunnel exit,
-        /// and never updates itself. Written with the enrolled config, so the
-        /// first start is already one. Needs a fresh config, and a standard
-        /// (never an ephemeral) token; an `ADMINISTRATOR` still designates
-        /// the device before it holds anything.
-        #[arg(long)]
-        archive_replica: bool,
         /// FR-102 — how this daemon was installed, for the server's install
         /// trace: one of `wizard`, `script-sh`, `script-ps1`, `msi`, `deb`,
         /// `pkg`, `manual`, `container`, `other`. Falls back to the
@@ -1445,103 +1435,6 @@ async fn daemon_main() -> Result<()> {
         return Ok(());
     }
 
-    // FR-90 P1a — `roomlerd hive-mcp <socket>`: a Hive session's toolbelt
-    // relay, started by Claude Code as the session's account. Like the
-    // embedded CLI it runs none of the setup below, and it EXITS rather than
-    // returns: the runtime's shutdown would wait on a stdin read the harness
-    // may hold open.
-    #[cfg(hive_host)]
-    if let Some(socket) = roomlerd::hive::relay_args() {
-        let code = match roomlerd::hive::relay(&socket).await {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("roomlerd hive-mcp: {e:#}");
-                1
-            }
-        };
-        std::process::exit(code);
-    }
-
-    // FR-90 P8-2a-1 — `roomlerd hive-worker`: a session's or the device's worker,
-    // which the daemon starts as its own supervised child with its channel (fd 3;
-    // P8-2b-1 on Windows, an inherited pipe). It runs none of the setup below.
-    #[cfg(hive_host)]
-    if roomlerd::hive::worker_args() {
-        std::process::exit(roomlerd::hive::worker_main().await);
-    }
-
-    // FR-90 P2e-7 — `roomlerd hive-resume-note <file>`: a Hive session's
-    // `SessionStart` hook, run by Claude Code as the session's account. It
-    // prints the resume note the daemon left for a session moved here, if
-    // there is one. None of the setup below is its.
-    #[cfg(hive_host)]
-    if let Some(file) = roomlerd::hive::note_args() {
-        std::process::exit(roomlerd::hive::note_main(&file));
-    }
-
-    // FR-90 P2b-3a — `roomlerd hive-checkpoint <request>`: a session's
-    // checkpoint, which the daemon runs AS THE SESSION'S ACCOUNT at a turn's
-    // end; it writes the checkpoint to stdout. None of the setup below is its.
-    #[cfg(hive_host)]
-    if let Some(request) = roomlerd::hive::checkpoint_args() {
-        std::process::exit(roomlerd::hive::checkpoint_main(&request));
-    }
-
-    // FR-90 P2b-4a — `roomlerd hive-materialize`: its reverse, a checkpoint
-    // written back into a session's config directory AS THE ACCOUNT, from the
-    // frames the daemon streams on its stdin.
-    #[cfg(hive_host)]
-    if roomlerd::hive::materialize_args() {
-        std::process::exit(roomlerd::hive::materialize_main());
-    }
-
-    // FR-90 P2f-2a — `roomlerd hive-pack`: git's have and want for a
-    // session's workspace AS THE ACCOUNT — which commits its folder's
-    // repository holds, or a pack thin against them. P2f-2b — the request
-    // on stdin, the answer to stdout.
-    #[cfg(hive_host)]
-    if roomlerd::hive::pack_args() {
-        std::process::exit(roomlerd::hive::pack_main());
-    }
-
-    // FR-90 P2f-4a — `roomlerd hive-import`: an ended terminal session's own
-    // history, put in place as the managed session it is made AS THE
-    // TERMINAL'S ACCOUNT. The request on stdin, one line to stdout.
-    #[cfg(hive_host)]
-    if roomlerd::hive::import_args() {
-        std::process::exit(roomlerd::hive::import_main());
-    }
-
-    // FR-90 P2g-1 — `roomlerd hive-purge`: what a purged session's account
-    // holds of it (its state directory, its checkpoints' refs and index),
-    // deleted AS THE ACCOUNT. The request on stdin, one line to stdout.
-    #[cfg(hive_host)]
-    if roomlerd::hive::purge_args() {
-        std::process::exit(roomlerd::hive::purge_main());
-    }
-
-    // FR-90 P4-3b-1 — `roomlerd knowhow-scan`: one root of a knowhow scan,
-    // read AS THE ACCOUNT THAT OWNS IT, for metadata alone. The request on
-    // stdin, one line to stdout.
-    #[cfg(all(hive_host, unix))]
-    if roomlerd::hive::knowhow::scan_args() {
-        std::process::exit(roomlerd::hive::knowhow::scan_main());
-    }
-
-    // FR-90 P1i — `roomlerd hive-prep …`: a Windows session's preparation,
-    // which the daemon runs AS THE CONSOLE USER before the harness starts, as
-    // the Unix wrapper runs as the account. None of the setup below is its.
-    #[cfg(all(windows, feature = "hive"))]
-    if let Some(prep) = roomlerd::hive_win::PrepArgs::from_env() {
-        std::process::exit(match prep.and_then(|a| roomlerd::hive_win::prep(&a)) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("roomlerd hive-prep: {e}");
-                1
-            }
-        });
-    }
-
     // #1705 — the desktop companion's service probes (every 10 s) answer one
     // question about the service manager; none of the daemon setup below is
     // theirs, and its startup lines used to flood the per-user log.
@@ -1758,7 +1651,6 @@ async fn daemon_main() -> Result<()> {
             replace,
             ephemeral,
             overlay,
-            archive_replica,
             install_method,
             install_scope,
         } => {
@@ -1777,7 +1669,6 @@ async fn daemon_main() -> Result<()> {
                     replace,
                     ephemeral,
                     overlay,
-                    archive_replica,
                     install_method: install_method.as_deref(),
                     install_scope: install_scope.as_deref(),
                 },
@@ -2709,8 +2600,6 @@ struct EnrollOptions<'a> {
     /// server's response (not this flag) decides what the CONFIG records.
     ephemeral: bool,
     overlay: bool,
-    /// FR-90 P2h-1 — the archive replica's posture ([`roomlerd::archive_replica`]).
-    archive_replica: bool,
     /// FR-102 P3 — the install trace, flag-first; `None` falls back to the
     /// env, then to `manual` / `unknown` (`enrollment::resolve_install`).
     install_method: Option<&'a str>,
@@ -2727,7 +2616,6 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         replace,
         ephemeral,
         overlay,
-        archive_replica,
         install_method,
         install_scope,
     } = opts;
@@ -2760,11 +2648,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
 
     // FR-129 A4 — `--pair` waits, minutes if need be, for a person in a
     // browser, so the pairing runs HERE: after the refusals above (the
-    // install trace, the target path) and the archive replica's, which reads
-    // the config — so a refusal costs nobody an approval — and BEFORE
-    // everything below, which then runs exactly as it runs for a pasted
-    // token: the same read of the existing config, the same machine id, the
-    // same `apply_enrollment` merge, the same save. The read belongs AFTER
+    // install trace, the target path), so a refusal costs nobody an
+    // approval, and BEFORE everything below, which then runs exactly as it
+    // runs for a pasted token: the same read of the existing config, the
+    // same machine id, the same `apply_enrollment` merge, the same save. The
+    // read belongs AFTER
     // the wait: a daemon running on this machine saves its own config in
     // the meantime (token renewal, remote configuration, the companion's
     // settings), and a copy read before the wait would be merged and saved
@@ -2774,12 +2662,6 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         TokenSource::Given(t) => t,
         TokenSource::Pair { expect_org } => {
             // `--ephemeral` cannot reach here: clap refuses it beside `--pair`.
-            if archive_replica {
-                roomlerd::archive_replica::preflight(
-                    config::read_if_present(&target_path).is_some(),
-                    ephemeral,
-                )?;
-            }
             let approved = pairing_terminal::pair_from_terminal(
                 pairing_terminal::PairParams {
                     server,
@@ -2827,11 +2709,6 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
              for free) or remove the existing enrollment first.",
             target_path.display()
         );
-    }
-    // FR-90 P2h-1 — before the single-use token is spent, so a refusal
-    // leaves no device row behind.
-    if archive_replica {
-        roomlerd::archive_replica::preflight(existing.is_some(), ephemeral)?;
     }
     let machine_id = match &existing {
         Some(cfg) => {
@@ -2920,11 +2797,6 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // no privilege. Anything else is the explicit `org overlay` verb.
     if overlay {
         roomlerd::org_join::apply_overlay_flag(&mut cfg, &outcome);
-    }
-    // FR-90 P2h-1 — the archive replica's posture, before the first save. The
-    // preflight made this a fresh primary enrollment.
-    if archive_replica {
-        roomlerd::archive_replica::apply(&mut cfg);
     }
     // FR-99 decision 3 — a fresh Windows service install (`--machine-global`)
     // starts at `lock_on_end = auto`; a refresh keeps what the device had.
@@ -3885,24 +3757,6 @@ async fn run_cmd(
             "a GUI worker with no enrollment: sessions come from the root daemon alone (FR-43 P3a)"
         );
     }
-    // FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
-    // joined the mesh joins it at its first start in a newer image, before
-    // anything reads the overlay keys (the WG key is minted below from them).
-    if roomlerd::archive_replica::reconcile_at_start(
-        &mut cfg,
-        std::env::var(roomlerd::archive_replica::IMAGE_ENV).is_ok_and(|v| v == "1"),
-    ) {
-        match startup_writes.save(&cfg) {
-            Ok(()) => tracing::info!(
-                "archive replica: joined the mesh, in the userspace stack (FR-90 P2k-4)"
-            ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "archive replica: on the mesh for this run; persisting it failed, so the \
-                 next start in the image joins it again"
-            ),
-        }
-    }
 
     // FR-84 D3 — who will relaunch this process if it exits, decided once,
     // from evidence the supervisor left (argv, environment, cgroup) — never
@@ -4687,9 +4541,6 @@ async fn run_cmd(
     // flows verbs) and the signaling loop (publish the live egress + demux).
     let tunnel_hub =
         roomlerd::tunnel::client_mgr::TunnelClientHub::new(env!("CARGO_PKG_VERSION").to_string());
-    // FR-90 P3-7-3c — the primary enrollment's hub is where an agent
-    // session's own egress opens its flows (`net_socks`, `net_forward`).
-    tunnel_hub.set_primary();
     // P3b-3: shared RTT cache — filled by the prober task (below), read by
     // `peers()`. Clone the pinger for the prober; the original moves into
     // `DaemonState` for the `ping` verb.
@@ -4715,26 +4566,6 @@ async fn run_cmd(
     // FR-100 P1c — and every other live key it holds (`peer_auth`), from the
     // same config: a fresh `new` judges offers under `audit` until told.
     remote_cfg.adopt_local(&cfg);
-    // FR-90 — the agent-session supervisor, from this start's `hive_*` keys
-    // (restart-required). Built with every gate closed too, so a start is
-    // answered with the device's actual refusal rather than silence.
-    #[cfg(hive_host)]
-    {
-        roomlerd::hive::init(&cfg);
-        // FR-90 P1d-2 — every way the daemon stops signals this first (an
-        // update, a requested restart, a rollback, an OS stop), before its
-        // connections close: from that moment, what its sessions do is going
-        // down with it, and what the device hosts is frozen for the next one.
-        let mut stopping = shutdown_rx.clone();
-        tokio::spawn(async move {
-            while stopping.changed().await.is_ok() {
-                if *stopping.borrow() {
-                    roomlerd::hive::begin_shutdown();
-                    break;
-                }
-            }
-        });
-    }
     // P6: the declared-route reconciler — converges `[[tunnel_routes]]`
     // from the loaded config into live hub flows, and backs the LocalAPI
     // Route* verbs (persisting through the write lock).
@@ -4755,21 +4586,6 @@ async fn run_cmd(
     } else {
         primary_ctx
     };
-    // FR-90 P4-3b-1 — the primary's knowhow scanner, reading its roots from
-    // this config file under the LocalAPI's own write lock. A secondary's
-    // context has none (decision 43).
-    #[cfg(all(hive_host, unix))]
-    let primary_ctx = primary_ctx.with_knowhow(roomlerd::hive::knowhow::Scanner::subprocess(
-        config_path.clone(),
-        cfg_write_lock.clone(),
-    ));
-    // FR-90 P4-5-1b — and its prober, reading `knowhow_probe_reach` from the
-    // same file under the same lock at each probe. A secondary has none.
-    #[cfg(hive_host)]
-    let primary_ctx = primary_ctx.with_prober(roomlerd::hive::knowhow_probe::Prober::new(
-        config_path.clone(),
-        cfg_write_lock.clone(),
-    ));
     let mut org_spawns: Vec<OrgSpawn> = Vec::new();
     // Multi-org — every secondary org.s live overlay view, so `peers` can
     // report all orgs (the receivers used to be dropped on the floor).
@@ -5597,11 +5413,6 @@ async fn run_cmd(
     let mut os_initiated_stop = false;
     tokio::select! {
         res = sig_task => {
-            // FR-90 P1d-2 — first, on every way out: a harness that ends from
-            // here on went down with the daemon, and its session is resumed
-            // by the next one instead of being ended.
-            #[cfg(hive_host)]
-            roomlerd::hive::begin_shutdown();
             // FR-84 D3 — an accepted restart leaves through the graceful door
             // whatever the signalling loop did on its way out (an error, even
             // a panic): the shutdown is our own, and a crash counted here
@@ -5637,8 +5448,6 @@ async fn run_cmd(
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            #[cfg(hive_host)]
-            roomlerd::hive::begin_shutdown();
             tracing::info!("shutdown requested");
             graceful_shutdown = true;
             os_initiated_stop = true;
@@ -5650,10 +5459,6 @@ async fn run_cmd(
         // for what this cost before it existed (#1040 on Unix; #1683 on the
         // Windows SCM service, where the stop arrived only as a hard kill).
         _ = terminate_signal(stop_event, config_path) => {
-            // Under systemd the same stop reaches every harness a moment
-            // after this (`KillMode=control-group`).
-            #[cfg(hive_host)]
-            roomlerd::hive::begin_shutdown();
             tracing::info!("OS/service-manager stop received; shutting down gracefully");
             graceful_shutdown = true;
             os_initiated_stop = true;
@@ -5694,14 +5499,6 @@ async fn run_cmd(
     // `_virtual_desktop` and by `exit_for_requested_restart`.
     #[cfg(target_os = "linux")]
     virtual_desktop::teardown();
-    // FR-90 P1h — the same for the agent sessions this daemon launched: each
-    // harness leads its own process group, which a service manager reaches
-    // only when it kills a whole cgroup (systemd's `KillMode=control-group`).
-    // launchd does not, and nothing does for an unsupervised daemon, so the
-    // daemon takes them down itself — after `begin_shutdown`, so each session
-    // is kept for the next daemon to resume. Bounded.
-    #[cfg(hive_host)]
-    roomlerd::hive::wind_down().await;
     tracing::info!(
         elapsed_ms = teardown.elapsed().as_millis() as u64,
         "shutdown: tasks stopped"

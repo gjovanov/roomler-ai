@@ -4456,13 +4456,6 @@ fn rpc_caps() -> Vec<String> {
         // hold the caller for it. A property of the BUILD, like `ssh`: the
         // ack is sent even when the device refuses — that is the point.
         caps.push(RpcCap::SshGrantAck);
-        // FR-90 P3-8-2a. This build's SSH server holds an agent session's
-        // grant (`one_command`) to ONE `exec` and nothing else. Distinct from
-        // `ssh`, its prefix, because every build before it would read past
-        // the field and serve that session's key a shell: the server sends a
-        // session's grant only to a device that says this. A property of the
-        // BUILD; the SYSTEM service says it for itself, when it publishes.
-        caps.push(RpcCap::SshOneCommand);
     }
     // FR-52 P4 — this build can ADMIT an external session: bind it to a
     // verified login, check its offer's MAC, seal its answer. The server opens
@@ -4493,136 +4486,6 @@ fn rpc_caps() -> Vec<String> {
     // refuse (`overlay_key_rotation=false`), and says so in its report.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     caps.push(RpcCap::KeyRotate);
-    // FR-90 — a build that runs agent sessions answers `rc:hive.start` and
-    // reports with `rc:hive.state`. A property of the BUILD, like `ssh`: the
-    // device still refuses unless its owner switched `hive_enabled` on, and
-    // says so in the ack. Every `hive_host` build: Linux, macOS, Windows.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::Hive);
-    // FR-90 P0d-2 — and serves a session's transcript to a browser over a
-    // viewer peer: answers `rc:hive.view.grant` before the browser dials.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveView);
-    // FR-90 P1e — and understands a session's core memory (`rc:hive.memory`).
-    // A property of the BUILD: whether a session ever sees it is the device's
-    // own `hive_core_memory`, default off.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveMemory);
-    // FR-90 P1j — and mirrors terminal sessions its people adopted. NOT a
-    // property of the build alone: advertised only while the device's owner
-    // allows it (`hive_adopt`), and the server honours an offer only from a
-    // connection that advertises it.
-    #[cfg(hive_host)]
-    if crate::hive::adopt_enabled() {
-        caps.push(RpcCap::HiveAdopt);
-    }
-    // FR-90 P2c-3 — and holds copies of its owner's sessions run elsewhere:
-    // answers `rc:hive.replica.join`. Not a property of the build alone:
-    // only while the owner's `hive_replica` is on and the store is open, and
-    // on the primary enrollment's connection only (the hello strips both
-    // words from any other). `hive-archive` only ever with it.
-    #[cfg(hive_host)]
-    if crate::hive::replica_enabled() {
-        caps.push(RpcCap::HiveReplica);
-    }
-    #[cfg(hive_host)]
-    if crate::hive::archive_enabled() {
-        caps.push(RpcCap::HiveArchive);
-    }
-    // FR-90 P2i-1 — and answers a search over those copies, as an archive
-    // replica: `hive-search`, only with `hive-archive` and `hive-replica`,
-    // which the device's own gate asks again at each grant.
-    #[cfg(hive_host)]
-    if crate::hive::archive_enabled() && crate::hive::replica_enabled() {
-        caps.push(RpcCap::HiveSearch);
-    }
-    // FR-90 P2d-3b — and carries the replica stream: serves a member's grant
-    // as a source and follows a dial as a member. While its store is open,
-    // whatever its owner says of holding copies: a primary serves its own
-    // sessions' members. Stripped from any connection but the primary
-    // enrollment's (the hello), like every Hive word.
-    #[cfg(hive_host)]
-    if crate::hive::stream_enabled() {
-        caps.push(RpcCap::HiveStream);
-    }
-    // FR-90 P2e-2 — and holds a leased session to the server's word on each
-    // connection (`rc:hive.lease`): after a restart or a reconnect it runs
-    // one only once the server has said so there. A property of the BUILD,
-    // like `hive`, and kept on a secondary org's connection like it: that
-    // org's Hive frames are refused there either way.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveLease);
-    // FR-90 P2e-5c — and takes part in a promotion at either end: as the
-    // primary it drains (`rc:hive.drain`), as the member it prepares
-    // (`rc:hive.prepare`) and takes the session over from its copy at the
-    // move (`rc:hive.move`), and its joins take where each superseded fence
-    // ended (P2e-5b). A property of the BUILD, like `hive-lease`: the device
-    // still refuses a drain or a prepare its own gates do not pass, in its
-    // own words, and a secondary org's connection refuses both.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePromote);
-    // FR-90 P2f-1a — and takes part in a teleport, a move to a device that
-    // holds no copy yet: as the target, a teleport's prepare passes every
-    // start gate but the copy and admits that one session's join, whatever
-    // `hive_replica` says; as the primary, a join in the primary's role
-    // checkpoints at once when no turn runs and says where its copy ends. A
-    // property of the BUILD, like `hive-promote`, and kept on a secondary
-    // org's connection like it: no placement chooses a teleport's target, and
-    // that org's prepare and join are refused there either way.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveTeleport);
-    // FR-90 P2f-3a — and starts a fork of a session it holds a copy of: a
-    // start carrying `fork_of` takes the parent's last checkpoint under the
-    // fork's ids and launches `--resume <parent> --fork-session --session-id
-    // <fork>`. A property of the BUILD; a build before it would start the
-    // fork empty.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveFork);
-    // FR-90 P2f-4a — and makes a terminal session it adopted, whose terminal
-    // ended here, a managed one: a start carrying `from_terminal` puts the
-    // terminal's own history in place as the account it ran as, by this
-    // device's record of whose terminal it was, and resumes it. A property of
-    // the BUILD, Unix only: Windows adopts since FR-97 P4c, but putting a
-    // terminal's history in place runs as the account through Unix tools. The
-    // device's start gates still decide, `hive_enabled` first.
-    #[cfg(all(hive_host, unix))]
-    caps.push(RpcCap::HiveManage);
-    // FR-90 P2g-1 — and purges a session on `rc:hive.purge`, answering per
-    // part: its own copy, then as the session's account its state directory
-    // and its checkpoints' refs. A property of the BUILD, on every platform
-    // that runs sessions.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurge);
-    // FR-90 P2g-4a — and purges every session it holds on
-    // `rc:hive.purge_all`, which its enrollment's removal sends. A property
-    // of the BUILD, as `hive-purge` is.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurgeAll);
-    // #2294 — and finishes that purge before it exits on the removal's
-    // goodbye (`hive::finish_removal_purge`), so the server's kick may tell
-    // it. A property of the BUILD, as `hive-purge-all` is.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurgeDrain);
-    // FR-90 P4-3b-1 — and scans the roots its owner lists on
-    // `rc:knowhow.scan`, each as the account that owns it. A property of the
-    // BUILD, as `hive-purge` is: an empty `knowhow_scan_roots` is an answer
-    // (`no_roots`), never a reason to stay silent. Linux and macOS; Windows
-    // advertises it from P4-3b-4.
-    #[cfg(all(hive_host, unix))]
-    caps.push(RpcCap::KnowhowScan);
-    // FR-90 P4-4-1b — and its sessions can ask the organization's map, so
-    // its server tells it at each hello whether the map is there for them
-    // (`rc:knowhow.served`, decision 49). A property of the BUILD: every OS
-    // that runs sessions, the toolbelt's tools apart from the scanner.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::KnowhowTools);
-    // FR-90 P4-5-1b — and probes, on `rc:knowhow.probe`, what the map says
-    // within what its owner lists in `knowhow_probe_reach`. A property of the
-    // BUILD, as `knowhow-scan` is: an empty list is an answer
-    // (`not_allowed`), never a reason to stay silent. Every OS that runs
-    // sessions.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::KnowhowProbe);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.
@@ -5012,14 +4875,6 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::SshGrantAck.wire()),
             cfg!(feature = "ssh-server"),
             "ssh-grant-ack must be advertised exactly when the SSH server is built"
-        );
-        // FR-90 P3-8-2a — and so does one command: the server sends an agent
-        // session's grant only where this is said, and the SSH server is what
-        // holds it there.
-        assert_eq!(
-            advertised.iter().any(|v| v == RpcCap::SshOneCommand.wire()),
-            cfg!(feature = "ssh-server"),
-            "ssh-one-command must be advertised exactly when the SSH server is built"
         );
         // FR-97 P5a — `console-user` on every Unix build and never on
         // Windows, whose `console_user` is its SYSTEM service's: a Windows

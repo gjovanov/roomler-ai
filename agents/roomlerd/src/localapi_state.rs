@@ -314,8 +314,7 @@ impl RestartHandle {
         let _ = self.inner.shutdown.send(true);
     }
 
-    /// The daemon's shutdown signal, for work that must end with the daemon:
-    /// an update hold (FR-90 P1h-2) stops waiting when the daemon stops.
+    /// The daemon's shutdown signal, for work that must end with the daemon.
     pub fn shutdown_rx(&self) -> watch::Receiver<bool> {
         self.inner.shutdown.subscribe()
     }
@@ -1864,58 +1863,6 @@ impl LocalApiState for DaemonState {
         }
     }
 
-    /// FR-90 P1h-2 — the root update helper (macOS) holds this daemon before
-    /// `installer(8)` restarts it: the same wait the in-process updater runs
-    /// (P1d-1), ended early only by the daemon stopping.
-    async fn hive_update_hold(&self) -> Response {
-        // Without a restart handle (tests, a daemon built without one) the
-        // sender lives here, for as long as the wait does.
-        let (_keep, idle) = watch::channel(false);
-        let shutdown = self
-            .restart
-            .as_ref()
-            .map(RestartHandle::shutdown_rx)
-            .unwrap_or(idle);
-        crate::updater::hold_for_install(shutdown).await
-    }
-
-    fn hive_update_release(&self) {
-        crate::updater::release_install_hold();
-    }
-
-    /// FR-90 P3-9-2b — `roomler connect`: a person's endpoint, served to the
-    /// account the LocalAPI listener read, its leases asked for the device's
-    /// owner and renewed while the asking connection stays open.
-    #[cfg(all(hive_host, feature = "vault"))]
-    async fn connect(
-        &self,
-        asker: &tunnel_core::localapi::Asker,
-        args: &tunnel_core::localapi::ConnectArgs,
-    ) -> Response {
-        if let Some(refused) = self.root_half_only("`roomler connect`") {
-            return refused;
-        }
-        match crate::hive::person_connect::open(asker, args).await {
-            Ok((id, endpoint)) => Response::Connected { id, endpoint },
-            Err(message) => Response::Error { message },
-        }
-    }
-
-    #[cfg(all(hive_host, feature = "vault"))]
-    fn connect_status(&self, id: u64) -> Response {
-        match crate::hive::person_connect::state(id) {
-            Some(state) => Response::ConnectState(state),
-            None => Response::Error {
-                message: format!("no endpoint {id} is held"),
-            },
-        }
-    }
-
-    #[cfg(all(hive_host, feature = "vault"))]
-    fn connect_release(&self, id: u64) {
-        crate::hive::person_connect::release(id);
-    }
-
     /// Fleet RPC — relay an exec to another device over this daemon's own
     /// agent WS and wait for the answer.
     ///
@@ -2030,7 +1977,8 @@ impl LocalApiState for DaemonState {
                 target: node.to_string(),
                 public_key: public_key.to_string(),
                 session_secs,
-                // A person's request: no agent session's ticket (FR-90 P3-8).
+                // Never a ticket: the field stays parse-only (FR-137 S-B3),
+                // and the server refuses a request that carries one.
                 ssh_ticket: None,
             })
             .await

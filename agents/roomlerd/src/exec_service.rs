@@ -1258,8 +1258,7 @@ mod win {
     const INHERIT_ONLY_ACE: u8 = 0x08;
 
     /// A security descriptor from SDDL, and the `SECURITY_ATTRIBUTES` that
-    /// hand it to a directory or a pipe instance. Freed on drop. (FR-90's
-    /// `hive_win::Sddl` is the same thing, compiled only with `hive`.)
+    /// hand it to a directory or a pipe instance. Freed on drop.
     struct Sddl {
         sa: SECURITY_ATTRIBUTES,
         psd: PSECURITY_DESCRIPTOR,
