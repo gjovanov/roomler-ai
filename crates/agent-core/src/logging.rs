@@ -724,8 +724,9 @@ pub fn resolve_log_dir() -> Option<PathBuf> {
     // file layer writing into the live daemon log, a panic hook that turns
     // a failing test into a crash of this device (the daemon uploads it),
     // and a prune of the real dir. `None` takes init's stdout-only branch.
+    // #3438: except in a child a test started with a directory of its own.
     if cfg!(test) {
-        return None;
+        return std::env::var_os("ROOMLER_TEST_LOG_DIR").map(PathBuf::from);
     }
     #[cfg(target_os = "windows")]
     if SERVICE_ROLE.get().is_some() {
@@ -1346,6 +1347,124 @@ mod tests {
                 rolling_file(dir.path(), &before).exists()
                     || rolling_file(dir.path(), &after).exists()
             );
+        }
+
+        /// #3438 — what `resolve_log_dir` reads in a test's child.
+        const CHILD_LOG_DIR: &str = "ROOMLER_TEST_LOG_DIR";
+
+        /// `child`, in a console with no window, the way the supervisor starts the
+        /// SystemContext worker (`CREATE_NO_WINDOW`, `supervisor.rs:331`). The
+        /// supervisor passes no standard handles, so the worker's are that console's.
+        /// `Command` always passes some, so the child takes its console (`CONOUT$`)
+        /// as its stdout and stderr itself.
+        fn child_in_a_console_with_no_window(name: &str, dir: &Path) -> std::process::ExitStatus {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::stderr_capture::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir)
+                .env(CHILD_LOG_DIR, dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        /// This process's console text, up to the cursor's row.
+        fn console_text() -> String {
+            use windows_sys::Win32::System::Console::{
+                CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo, GetStdHandle,
+                ReadConsoleOutputCharacterW, STD_OUTPUT_HANDLE,
+            };
+            // SAFETY: `info`, `text` and `read` are valid for the sizes passed.
+            unsafe {
+                let out = GetStdHandle(STD_OUTPUT_HANDLE);
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+                if GetConsoleScreenBufferInfo(out, &mut info) == 0 {
+                    return format!("(no screen buffer: {})", std::io::Error::last_os_error());
+                }
+                let rows = info.dwCursorPosition.Y.max(0) as u32 + 1;
+                let cells = info.dwSize.X.max(0) as u32 * rows;
+                let mut text = vec![0u16; cells as usize];
+                let mut read = 0u32;
+                let origin = COORD { X: 0, Y: 0 };
+                ReadConsoleOutputCharacterW(out, text.as_mut_ptr(), cells, origin, &mut read);
+                String::from_utf16_lossy(&text[..text.len().min(read as usize)])
+            }
+        }
+
+        /// A SystemContext worker's logging, in a console that has no window. It
+        /// leaves the parent whether the console has a window and the console's text.
+        /// Nothing after `init` may panic: the hook would record a crash.
+        #[test]
+        fn child_logs_in_a_console_with_no_window() {
+            use std::os::windows::io::IntoRawHandle;
+            use windows_sys::Win32::System::Console::{
+                GetConsoleWindow, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+            };
+            let Some(dir) = child_dir() else { return };
+            let report = dir.join("console.txt");
+            let console = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("CONOUT$")
+            };
+            let (Ok(out), Ok(err)) = (console(), console()) else {
+                let _ = std::fs::write(&report, "(no console)");
+                return;
+            };
+            // SAFETY: two valid handles, owned by the standard-handle table from here on.
+            unsafe {
+                SetStdHandle(STD_OUTPUT_HANDLE, out.into_raw_handle());
+                SetStdHandle(STD_ERROR_HANDLE, err.into_raw_handle());
+            }
+            super::super::set_service_logging(super::super::ServiceLogRole::Worker);
+            super::super::init();
+            tracing::warn!("a-line-for-the-log");
+            super::super::say_on_stderr("the-last-words");
+            super::super::say_on_stdout("a-line-on-the-console");
+            // SAFETY: takes no arguments.
+            let window = if unsafe { GetConsoleWindow() }.is_null() {
+                "none"
+            } else {
+                "some"
+            };
+            let _ = std::fs::write(&report, format!("window={window}\n{}", console_text()));
+        }
+
+        /// #3438 — the SystemContext worker's console has no window and nobody reads
+        /// it, yet every log line went there first and waited for its `conhost`: on a
+        /// starved host a 10 s bound's warning was stamped 40-46 s late. No line goes
+        /// to such a console, and what only stderr carries goes to the rolling log.
+        #[test]
+        fn a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child_in_a_console_with_no_window(
+                "child_logs_in_a_console_with_no_window",
+                dir.path(),
+            );
+            assert!(status.success(), "{status:?}");
+            let console = std::fs::read_to_string(dir.path().join("console.txt")).unwrap();
+            // The premise, and a control that the console is read at all.
+            assert!(console.starts_with("window=none\n"), "{console}");
+            assert!(console.contains("a-line-on-the-console"), "{console}");
+            assert!(
+                !console.contains("a-line-for-the-log"),
+                "a log line reached the console: {console}"
+            );
+            assert!(
+                !console.contains("the-last-words"),
+                "stderr reached the console: {console}"
+            );
+            let log = today(dir.path());
+            assert!(log.contains("the-last-words"), "{log}");
         }
     }
 }
