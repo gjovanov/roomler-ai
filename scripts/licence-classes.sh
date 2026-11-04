@@ -47,6 +47,7 @@ CLIENT_PATHS=(
   agents/roomler-desktop
   agents/roomler-cli-shim
   agents/roomlerdw
+  agents/roomler-msi-ca
   agents/roomler-setup
   agents/roomler-cli
   crates/agent-core
@@ -100,6 +101,7 @@ CLIENT_CRATES=(
   roomler-desktop
   roomler-cli-shim
   roomlerdw
+  roomler-msi-ca
   roomler-setup
   roomler-cli
   roomler-node-core
@@ -117,6 +119,7 @@ CLIENT_CRATES=(
 SHIPPED_AGENT_CRATES=(
   roomlerd
   roomlerdw
+  roomler-msi-ca
   roomler-cli
   roomler-cli-shim
   roomler-desktop

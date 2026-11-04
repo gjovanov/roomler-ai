@@ -799,13 +799,13 @@ enum Command {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Write a single name=value entry into the `Roomler`
-    /// SCM `Environment` REG_MULTI_SZ block. Omit `--value` to REMOVE
-    /// the entry. Operators may use this directly, or the higher-level
-    /// `enable-system-context` / `disable-system-context` wrappers.
-    /// The rc.30 Done-page snippet in the installer wizard references
-    /// this subcommand by name, so the surface is load-bearing for
-    /// any rc.28+ wizard EXE in the field. Requires admin (HKLM write).
+    /// Write a single name=value entry into the `Roomler` SCM `Environment` REG_MULTI_SZ
+    /// block. Omit `--value` to REMOVE the entry. Operators may use this directly, or the
+    /// higher-level `enable-system-context` / `disable-system-context` wrappers. The rc.30
+    /// Done-page snippet in the installer wizard references this subcommand by name, so the
+    /// surface is load-bearing for any rc.28+ wizard EXE in the field. Requires admin (HKLM
+    /// write). An entry stays through updates (from 0.4.200 on, #3375) and repairs, and an
+    /// uninstall removes it; an update decides the SystemContext switch itself.
     ///
     /// Typical use:
     ///   roomlerd set-service-env-var --name ROOMLERD_VP9_FPS --value 60
@@ -6174,6 +6174,28 @@ fn keep_system_context_cmd(_no_restart: bool) -> Result<()> {
     bail!("`keep-system-context` is Windows-only.")
 }
 
+/// #3375 — how long an entry `set-service-env-var` wrote lasts, as the verb
+/// tells it. The per-Machine MSI carries the service's `Environment` across
+/// an update from 0.4.200 on, a repair reconfigures the service in place
+/// (#3115), and an uninstall deletes the service, the block with it. The
+/// SystemContext switch, in either spelling the daemon reads, is not carried:
+/// an update decides it from the last enable or disable, which the installer
+/// records (`agents/roomler-msi-ca/src/carry.rs`, `INSTALLER_OWNED`). Off
+/// Windows only the unit tests call it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn service_env_var_lifetime(name: &str) -> &'static str {
+    let switch = tunnel_core::env::PREFIXES
+        .iter()
+        .any(|p| format!("{p}ENABLE_SYSTEM_SWAP").eq_ignore_ascii_case(name));
+    if switch {
+        "An update does not keep this entry as written: it decides SystemContext from the last \
+         `roomlerd enable-system-context` or `disable-system-context`, so use those to keep it."
+    } else {
+        "It stays through updates (from 0.4.200 on) and repairs. Uninstalling Roomler removes it \
+         with the service."
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
     use roomlerd::win_service::environment;
@@ -6182,14 +6204,15 @@ fn set_service_env_var_cmd(name: &str, value: Option<&str>) -> Result<()> {
             environment::set_service_env_var(name, v)
                 .with_context(|| format!("set-service-env-var: {name}={v}"))?;
             println!(
-                "{name}={v} written to SCM service env block. Run `roomlerd restart-service` to apply."
+                "{name}={v} written to the Roomler service's Environment. Run `roomlerd restart-service` to apply."
             );
+            println!("{}", service_env_var_lifetime(name));
         }
         None => {
             environment::unset_service_env_var(name)
                 .with_context(|| format!("unset-service-env-var: {name}"))?;
             println!(
-                "{name} removed from SCM service env block. Run `roomlerd restart-service` to apply."
+                "{name} removed from the Roomler service's Environment. Run `roomlerd restart-service` to apply."
             );
         }
     }
@@ -7855,6 +7878,28 @@ mod tests {
             }
             other => panic!("expected SetServiceEnvVar, got {other:?}"),
         }
+    }
+
+    /// #3375 — the verb says what an update does with the entry it wrote: an
+    /// operator's entry is carried, the SystemContext switch (either spelling
+    /// the daemon reads, any case) is the installer's to decide.
+    #[test]
+    fn set_service_env_var_says_what_an_update_keeps() {
+        for kept in ["ROOMLERD_SFTP_AS_USER", "ROOMLERD_UPDATE_URL", "RUST_LOG"] {
+            let said = service_env_var_lifetime(kept);
+            assert!(said.contains("stays through updates"), "{kept}: {said}");
+            assert!(said.contains("removes it"), "{kept}: {said}");
+        }
+        for switch in [
+            "ROOMLERD_ENABLE_SYSTEM_SWAP",
+            "ROOMLER_NODE_ENABLE_SYSTEM_SWAP",
+            "roomlerd_enable_system_swap",
+        ] {
+            let said = service_env_var_lifetime(switch);
+            assert!(said.contains("enable-system-context"), "{switch}: {said}");
+        }
+        // A name that only contains the switch's is an ordinary entry.
+        assert!(service_env_var_lifetime("X_ROOMLERD_ENABLE_SYSTEM_SWAP").contains("stays"));
     }
 
     /// FR-16 L1 — release-agent.yml runs `encoder-smoke --encoder hardware` on
