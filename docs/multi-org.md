@@ -280,7 +280,7 @@ refusal would race it.
   ([`overlay.rs:1060-1070`](../agents/roomlerd/src/overlay.rs#L1060-L1070)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2596-2618`](../agents/roomler-cli/src/localclient.rs#L2596-L2618)):
+  ([`localclient.rs:2606-2628`](../agents/roomler-cli/src/localclient.rs#L2606-L2628)):
 
   ```
     overlay ip  —
