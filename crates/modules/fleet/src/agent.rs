@@ -772,6 +772,11 @@ pub struct KeyRotationView {
     pub request_id: String,
     pub requested_at: String,
     pub requested_by: String,
+    /// FR-40 P2 — set when the SERVER placed the order (`key_retired`: the
+    /// device presented a retired key at its join); `requested_by` is then
+    /// the zero id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
     /// P1c — the key the device held when the order was placed; the grid's
@@ -864,6 +869,7 @@ fn key_rotation_view(
         request_id: req.request_id,
         requested_at: fmt_dt(req.requested_at),
         requested_by: req.requested_by.to_hex(),
+        trigger: req.trigger,
         delivered_at: req.delivered_at.map(fmt_dt),
         public_key_before: req.public_key_before,
         report: report.map(|r| KeyRotationReportView {
@@ -1898,6 +1904,7 @@ mod key_rotation_state_tests {
             request_id: "r1".into(),
             requested_by: ObjectId::new(),
             requested_at: at,
+            trigger: None,
             delivered_at: delivered.then_some(at),
             public_key_before: before.map(str::to_string),
         }

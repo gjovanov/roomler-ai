@@ -144,10 +144,10 @@ and never outliving the daemon (FR-97 P0e).
 | Feature | Windows | Linux | macOS | Why, and where |
 |---|---|---|---|---|
 | `exec` and SSH `daemon` mode | 🟡 SYSTEM on a SystemContext install, or once anchored (FR-94); the signed-in person on an attended one | ✅ root | ✅ root on the root half's row | `docs/fleet-rpc.md`, Who runs the command |
-| `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:881-885`); Windows: `docs/roomler-ssh.md` |
+| `console_user`: the person at the screen | 🟡 where SYSTEM serves the session: SystemContext, or the device's service (FR-105); an attended install refuses it, saying why | ✅ logind's seat0 | ✅ the owner of `/dev/console` | refused while nobody is there (`agents/roomlerd/src/exec.rs:887-891`); Windows: `docs/roomler-ssh.md` |
 | `named:<account>` | ⛔ | ✅ | ✅ | §8 |
 | SFTP and `scp` as the signed-in person | 🟡 where OpenSSH's `sftp-server` is installed | ✅ | ✅ | `agents/roomlerd/src/ssh.rs:1254-1258` |
-| A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:874` |
+| A session starts in the person's home | ✅ | ✅ | ✅ | `agents/roomlerd/src/exec.rs:880` |
 
 ## 6. The desktop: companion, power, files, agent sessions
 
@@ -193,7 +193,7 @@ Release feature sets per OS, which decide what ships: Linux x86_64
 | Privacy mode | macOS | Since macOS 15 no public API keeps a window out of capture: ScreenCaptureKit ignores `NSWindow.sharingType = .none` (`docs/privacy-mode.md`, Platforms) |
 | A closed lid keeps sleeping | macOS | Clamshell sleep ignores idle-sleep assertions on a laptop with no external display (`agents/roomlerd/src/power.rs:30-34`) |
 | Exit node, serving IPv6 | Windows | WinNAT has no IPv6 API, so a client's v6 through a Windows exit is dropped, never leaked (`crates/tunnel-core/src/overlay/nat.rs:451-456`). Serving it would take a userspace egress (FR-97 D1) |
-| `named:<account>` for SSH and `exec` | Windows | Windows has no way to become an arbitrary local account without its credentials (`agents/roomlerd/src/exec.rs:751-752`) |
+| `named:<account>` for SSH and `exec` | Windows | Windows has no way to become an arbitrary local account without its credentials (`agents/roomlerd/src/exec.rs:757-758`) |
 | A worker's crash recorded by its supervisor | Linux | The daemon is systemd's own service: there is no supervising process of ours, and journald records how it died |
 | SystemContext | Linux, macOS | A Windows service can attach a SYSTEM worker to the interactive desktop. macOS has no such API (`agents/roomlerd/src/macos_supervisor.rs:5-10`); a Linux system install reads the scanout instead (DRM) |
 | WFP and the Defender rule; Wintun's stable GUID and the stray-adapter sweep | Linux, macOS | Windows-only machinery for Windows-only failures: a GPO-locked firewall, adapters that outlive their process (`docs/overlay-wfp.md`) |
