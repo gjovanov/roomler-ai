@@ -4,7 +4,6 @@ import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { looksSignedIn } from '@/api/session'
 import { useCapabilitiesStore } from '@/stores/capabilities'
-import { useHiveStore } from '@/stores/hive'
 import { PAIR_PATH, takePendingPair } from '@/utils/pairing'
 import type { ModuleId } from '@/modules/registry'
 
@@ -292,31 +291,6 @@ const routes: RouteRecordRaw[] = [
             meta: { module: 'fleet' },
           },
           {
-            // FR-90 — your agent sessions. A session's own page is its
-            // chat room (`room/:roomId`), where the transcript is read.
-            path: 'sessions',
-            name: 'hive-sessions',
-            component: () => import('@/views/hive/HiveSessionsView.vue'),
-            meta: { module: 'hive' },
-          },
-          {
-            // FR-90 P1e — the facts people keep for the org's agent
-            // sessions (core memory).
-            path: 'memory',
-            name: 'hive-memory',
-            component: () => import('@/views/hive/HiveMemoryView.vue'),
-            meta: { module: 'hive' },
-          },
-          {
-            // FR-90 P2h-2 — where the org's agent sessions are copied, and
-            // its archive replicas. The page says so itself where the
-            // server copies none (`hive.replicaset` off).
-            path: 'copies',
-            name: 'hive-copies',
-            component: () => import('@/views/hive/HiveCopiesView.vue'),
-            meta: { module: 'hive' },
-          },
-          {
             // S4 pivot — the overlay/tunnel network group, promoted out
             // of Admin (Tailscale-style IA). Sections stay child routes
             // (bookmarkable, back/forward-friendly), same pattern as
@@ -478,13 +452,6 @@ router.beforeEach(async (to) => {
   const caps = useCapabilitiesStore()
   await caps.ready()
   if (caps.has(wanted)) {
-    // FR-90 P1g — agent sessions may serve some organizations and not
-    // others: a deep link into one they do not serve goes to its dashboard.
-    const tid = to.params.tenantId
-    if (wanted === 'hive' && typeof tid === 'string' && tid !== '' && !(await useHiveStore().checkServed(tid))) {
-      console.warn(`[modules] agent sessions do not serve organization ${tid}`)
-      return { name: 'tenant-dashboard', params: { tenantId: tid } }
-    }
     return true
   }
   console.warn(

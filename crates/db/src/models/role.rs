@@ -99,30 +99,27 @@ pub mod permissions {
     /// whoever is at it and ends with the session, but a recording is a copy
     /// that outlives both. An org grants it on purpose or not at all.
     pub const RECORD_REMOTE_SCREEN: u64 = 1 << 31;
-    /// FR-90 — start and drive Hive agent sessions on a device
-    /// (`docs/roomler-hive-design.md` §3.4). The first bit above 31: the UI
-    /// mirror's mask arithmetic is exact to bit 52 since #888.
+    /// ⚠️ RESERVED — never reuse, never delete (FR-137, decision D1). Bits
+    /// 32-34 were FR-90's `HIVE_RUN`, `KNOWHOW_VIEW` and `KNOWHOW_EDIT`. FR-90
+    /// is parked off master, but the bits stay set in stored role masks for
+    /// good: the managed-role reconcile only ADDS (`stored | definition`), so
+    /// every org that booted with FR-90's presets holds bit 33 on its member,
+    /// moderator and admin rows, bit 34 on its admin rows, and all three on
+    /// its owner rows. A new permission on one of these bits would be granted
+    /// at once to every such member, and so would one on a bit whose name was
+    /// deleted, because both bit tests below read [`NAMED`].
     ///
-    /// ⚠️ In NO managed row below the ADMINISTRATOR bypass, like
-    /// [`EXEC_DEVICE`], [`SSH_DEVICE`] and [`RECORD_REMOTE_SCREEN`]: an agent
-    /// session is remote code execution on a device. It runs as the account
-    /// the DEVICE maps the starter to — never SYSTEM/root — but "an AI
-    /// typing commands as you on that box" is still a power an org grants on
-    /// purpose or not at all.
+    /// So they keep their consts, their names (`names()` and the escalation
+    /// guard's 403 stay readable) and their place in [`ALL`]; no managed row
+    /// seeds them; the UI catalog lists none of them; and nothing grants or
+    /// checks them. [`RESERVED`] holds all three.
     pub const HIVE_RUN: u64 = 1 << 32;
-    /// FR-90 P4 — read the organization's map, knowhow: its machines,
-    /// repositories, databases, clusters and services, and how each is
-    /// reached (decision 37: from `member` up, not `guest`). A session reads
-    /// what its starter may.
-    ///
-    /// Safe in every managed row from `member` up because the map grants
-    /// nothing: the vault, the network and the device still decide every
-    /// reach. What it shows is where things are, never a way in.
+    /// ⚠️ RESERVED — see [`HIVE_RUN`].
     pub const KNOWHOW_VIEW: u64 = 1 << 33;
-    /// FR-90 P4 — change the map: add, change and archive what it holds,
-    /// every change recorded with who made it (decision 36: `admin`). It
-    /// implies reading it.
+    /// ⚠️ RESERVED — see [`HIVE_RUN`].
     pub const KNOWHOW_EDIT: u64 = 1 << 34;
+    /// FR-137 — the retired bits, for the test that keeps them retired.
+    pub const RESERVED: u64 = HIVE_RUN | KNOWHOW_VIEW | KNOWHOW_EDIT;
     // ⚠️ Bit 52 is the ceiling, and the reason is the JSON number rather than
     // anything here: a mask crosses the wire as a JSON integer, which is exact
     // only below 2^53. The UI mirror (`ui/src/utils/permissions.ts`) does its
@@ -150,10 +147,7 @@ pub mod permissions {
         | ADD_REACTIONS
         | CONNECT_VOICE
         | SPEAK
-        | STREAM_VIDEO
-        // FR-90 P4 — the map, read (decision 37). In this composite, so
-        // `moderator` and `admin` hold it too; `guest` has its own mask.
-        | KNOWHOW_VIEW;
+        | STREAM_VIDEO;
 
     /// Admin permissions (all except ADMINISTRATOR)
     pub const DEFAULT_ADMIN: u64 = DEFAULT_MEMBER
@@ -180,14 +174,12 @@ pub mod permissions {
         // SYSTEM/root with nobody watching. Both stay explicit grants.
         | VIEW_EXEC_AUDIT
         // Same split for SSH: see the audit without gaining the session.
-        | VIEW_SSH_AUDIT
-        // FR-90 P4 — the map, changed (decision 36). It grants nothing, so
-        // changing it is an administrator's job, not an owner's grant.
-        | KNOWHOW_EDIT;
+        | VIEW_SSH_AUDIT;
 
     /// Owner permissions (everything). Bump the mask whenever a new bit is
     /// added above so `ALL` literally contains every defined permission (owner
     /// also passes via the `ADMINISTRATOR` bypass in `has`, but keep this exact).
+    /// The [`RESERVED`] bits stay inside it: owner rows already hold them.
     pub const ALL: u64 = (1 << 35) - 1;
 
     /// Every named bit, with its wire name. Lives here rather than in the test
@@ -228,6 +220,7 @@ pub mod permissions {
         ("SSH_DEVICE", SSH_DEVICE),
         ("VIEW_SSH_AUDIT", VIEW_SSH_AUDIT),
         ("RECORD_REMOTE_SCREEN", RECORD_REMOTE_SCREEN),
+        // ⚠️ RESERVED (FR-137): kept so stored masks still name them.
         ("HIVE_RUN", HIVE_RUN),
         ("KNOWHOW_VIEW", KNOWHOW_VIEW),
         ("KNOWHOW_EDIT", KNOWHOW_EDIT),
@@ -466,14 +459,46 @@ mod tests {
                 "managed role `{}` seeds RECORD_REMOTE_SCREEN without the ADMINISTRATOR bypass",
                 r.name
             );
-            // FR-90 — an agent session is remote code execution on a device.
+        }
+    }
+
+    /// FR-137 (decision D1) — bits 32-34 are FR-90's, retired but still set
+    /// in stored masks, because the reconcile only adds. They stay named
+    /// exactly as stored masks knew them, inside `ALL`, and seeded by no
+    /// managed row below the owner's bypass. A rename, a deletion or a reuse
+    /// fails here: each would let a new permission land on bits that members
+    /// across the deployment already hold.
+    #[test]
+    fn the_reserved_bits_stay_named_and_seeded_by_no_row_below_the_owner() {
+        assert_eq!(RESERVED, (1 << 32) | (1 << 33) | (1 << 34));
+        let named: Vec<(&str, u64)> = NAMED
+            .iter()
+            .filter(|(_, bit)| RESERVED & bit != 0)
+            .copied()
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("HIVE_RUN", 1 << 32),
+                ("KNOWHOW_VIEW", 1 << 33),
+                ("KNOWHOW_EDIT", 1 << 34),
+            ],
+            "a reserved bit was renamed, deleted or given to something new"
+        );
+        assert_eq!(ALL & RESERVED, RESERVED, "owner rows already hold them");
+        for r in MANAGED_ROLES {
+            if r.permissions & ADMINISTRATOR != 0 {
+                continue;
+            }
             assert_eq!(
-                r.permissions & HIVE_RUN,
+                r.permissions & RESERVED,
                 0,
-                "managed role `{}` seeds HIVE_RUN without the ADMINISTRATOR bypass",
+                "managed role `{}` seeds a reserved bit",
                 r.name
             );
         }
+        assert_eq!(DEFAULT_MEMBER & RESERVED, 0);
+        assert_eq!(DEFAULT_ADMIN & RESERVED, 0);
     }
 
     #[test]
@@ -581,27 +606,6 @@ mod tests {
             0,
             "RECORD_REMOTE_SCREEN must stay an explicit grant"
         );
-        assert_eq!(
-            DEFAULT_ADMIN & HIVE_RUN,
-            0,
-            "HIVE_RUN must stay an explicit grant"
-        );
-    }
-
-    #[test]
-    fn the_map_is_read_from_member_up_and_changed_by_admins() {
-        // FR-90 P4 — decisions 37 and 36, as the managed rows carry them. The
-        // reconcile hands each row's bits to every existing org at the next
-        // boot, so these are the rows that decide who reads the map.
-        let mask = |name: &str| ManagedRole::by_name(name).unwrap().permissions;
-        for name in ["member", "moderator", "admin"] {
-            assert_ne!(mask(name) & KNOWHOW_VIEW, 0, "`{name}` cannot read the map");
-        }
-        assert_eq!(mask("guest") & KNOWHOW_VIEW, 0, "a guest reads no map");
-        assert_ne!(mask("admin") & KNOWHOW_EDIT, 0, "admins change the map");
-        for name in ["member", "moderator", "guest"] {
-            assert_eq!(mask(name) & KNOWHOW_EDIT, 0, "`{name}` changes the map");
-        }
     }
 
     #[test]

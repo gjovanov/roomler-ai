@@ -141,7 +141,8 @@ pub async fn handle_agent_ssh_request(
     target: String,
     public_key: String,
     session_secs: u64,
-    // FR-90 P3-8-1b — an agent session's ticket, when a session asks.
+    // FR-137 S-A2 — an agent session's ticket, which an older agent may still
+    // send. Refused, never verified: FR-90 is parked.
     ssh_ticket: Option<String>,
     reply_tx: roomler_ai_remote_control::session::ClientTx,
 ) {
@@ -185,35 +186,21 @@ pub async fn handle_agent_ssh_request(
             }
         };
 
-    // FR-90 P3-8-1b — an agent session's request is the session's. Its ticket
-    // is bound here, where the origin device and the resolved target are both
-    // known, and the outcome rides the caller into `dispatch`, which audits it
-    // whatever it is: a ticket that does not hold is refused there, never
-    // answered as the device owner's request instead.
-    use crate::routes::agent_ssh::{CallerSession, bind_ssh_ticket};
-    let session = match ssh_ticket.as_deref() {
-        None => CallerSession::None,
-        Some(token) => match bind_ssh_ticket(
-            &state.core.auth,
-            tenant_id,
-            Some(origin_agent_id),
-            agent.id.unwrap_or_default(),
-            token,
-        ) {
-            Ok(s) => CallerSession::Bound(s),
-            Err(why) => CallerSession::Refused(why),
-        },
+    // FR-137 S-A2 — a request carrying an agent session's ticket rides the
+    // caller into `dispatch`, which refuses and audits it. Until P2 the wire
+    // still carries the field, and ignoring it would answer a session's
+    // request as the device owner's own.
+    use crate::routes::agent_ssh::CallerSession;
+    let session = if ssh_ticket.is_some() {
+        CallerSession::Refused("an agent session's ticket, and FR-90 is parked")
+    } else {
+        CallerSession::None
     };
-    // The person accountable: a session's owner, who need not own the device
-    // it runs on; else the origin device's owner.
-    let accountable = match &session {
-        CallerSession::Bound(s) => s.owner_user_id,
-        CallerSession::None | CallerSession::Refused(_) => origin.owner_user_id,
-    };
+    // The person accountable: the origin device's owner.
+    let accountable = origin.owner_user_id;
 
     // "<person> (via <device>)" — the target's log and consent prompt name
-    // both the human accountable and the box the request came from; for a
-    // session, the session too.
+    // both the human accountable and the box the request came from.
     let who = state
         .users
         .base
@@ -221,15 +208,7 @@ pub async fn handle_agent_ssh_request(
         .await
         .map(|u| u.display_name)
         .unwrap_or_else(|_| accountable.to_hex());
-    let display = match &session {
-        CallerSession::Bound(s) => {
-            format!(
-                "agent session {} of {who} (via {})",
-                s.session_id, origin.name
-            )
-        }
-        CallerSession::None | CallerSession::Refused(_) => format!("{who} (via {})", origin.name),
-    };
+    let display = format!("{who} (via {})", origin.name);
     let caller = crate::routes::agent_ssh::Caller {
         user_id: accountable,
         display,
@@ -263,7 +242,6 @@ pub async fn handle_agent_ssh_request(
         host_pubkey,
         expires_at_ms,
         error,
-        ssh_ticket_id,
     } = res;
     let msg = ServerMsg::SshResponse {
         request_id: request_id.clone(),
@@ -273,7 +251,8 @@ pub async fn handle_agent_ssh_request(
         host_pubkey,
         expires_at_ms,
         error,
-        ssh_ticket_id,
+        // FR-137 S-A4 — a wire field until P2: no request is held to a ticket.
+        ssh_ticket_id: None,
     };
     if reply_tx.try_send(msg).is_err() {
         warn!(%origin_agent_id, %request_id, "rc:ssh.response undeliverable — origin WS gone");

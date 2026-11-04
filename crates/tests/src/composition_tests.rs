@@ -71,17 +71,10 @@ fn baseline_path() -> PathBuf {
 }
 
 async fn snapshot() -> Snapshot {
-    // Every compiled module MOUNTED, including FR-90's `hive`, `vault` and
-    // `knowhow`, whose switches default off: a default-off module's routes
-    // and indexes are still a claim this build makes, and a change to them
-    // must be a reviewed line in the baseline rather than invisible until
-    // someone turns it on.
-    let app = TestApp::spawn_with_settings(|s| {
-        s.modules.hive = true;
-        s.modules.vault = true;
-        s.modules.knowhow = true;
-    })
-    .await;
+    // Every compiled module MOUNTED, as the test settings have it: a module
+    // switched off would hide its routes and indexes from the baseline, and
+    // a change to them must be a reviewed line in it.
+    let app = TestApp::spawn_with_settings(|_| {}).await;
     // A second router from the same state: the one `TestApp` serves is owned
     // by its listener task, and `build_router` is pure composition.
     let router = build_router(app.state.clone());

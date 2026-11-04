@@ -72,7 +72,15 @@ flowchart LR
 no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
 ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
 the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
-count, and AC1 bounds it at 0.5 %.
+count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
+bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
+
+⚠️ **Display match can change the display under a recording** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467),
+open). On an X11 host nobody has touched for five minutes, a viewer that connects makes display match
+([`display-match.md`](display-match.md)) switch the display to the viewer's size, and a running recording does not
+refuse it. A local recording keeps its frame size, but everything outside the matched area freezes until the
+session lets the display go. A remote recording started in that session is recorded at the matched size.
+`display_match = never` in the device's config avoids it until #3467 lands.
 
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
