@@ -477,7 +477,7 @@ The operator chose on 2026-11-02 (#971): a secondary org's session is delegated 
 |---|---|---|
 | The worker serves a delegated session only from inside its own connection, in the `next_delegated` arm | `agents/roomlerd/src/signaling.rs:2975` | Delete the per-user row and the worker exits 7 at every spawn, so the daemon's row loses remote desktop with it |
 | `run` refuses to start with no config | `agents/roomlerd/src/app.rs:3806-3811` | A root-only Mac gets no worker, so one token gives a row that can't stream. That is AC1's RED |
-| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3626-3628`, `agents/roomlerd/src/app.rs:5235`, `:5422` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes. P3b gives a secondary's loop the host under the switch |
+| Delegation is primary-org only, on purpose | `agents/roomlerd/src/signaling.rs:3628-3630`, `agents/roomlerd/src/app.rs:5235`, `:5422` | Not run. A secondary org's rows stream today through the per-user half, which P3 removes. P3b gives a secondary's loop the host under the switch |
 
 After P3 a Mac has one row in each org, and the worker talks to the server through the daemon alone:
 
@@ -563,7 +563,7 @@ Declared `[[tunnel_routes]]` in a person's file are named by the migration, not 
 
 ### P3b — a secondary org's session is delegated
 
-Built behind the switch, and proven in unit tests only. Under the switch, `run_cmd` gives every org loop the host (`agents/roomlerd/src/app.rs:4865`, `:5235`, and `:5422` for a join, through `Delegation::for_secondary`, `agents/roomlerd/src/delegate.rs:456`). The gates that read `ctx.is_primary` now read whether the loop holds the host: the delegation (`agents/roomlerd/src/signaling.rs:3626-3628`), the session params (`:3998`), the audio offer (`:3806`), and the caps on the hello and the heartbeat (`:1779-1797`, `:2518-2532`). Off one row only the primary's loop holds the host, so with the switch off nothing changes.
+Built behind the switch, and proven in unit tests only. Under the switch, `run_cmd` gives every org loop the host (`agents/roomlerd/src/app.rs:4865`, `:5235`, and `:5422` for a join, through `Delegation::for_secondary`, `agents/roomlerd/src/delegate.rs:456`). The gates that read `ctx.is_primary` now read whether the loop holds the host: the delegation (`agents/roomlerd/src/signaling.rs:3628-3630`), the session params (`:4000`), the audio offer (`:3808`), and the caps on the hello and the heartbeat (`:1779-1797`, `:2520-2534`). Off one row only the primary's loop holds the host, so with the switch off nothing changes.
 
 | Who holds the host | Switch off, the default | Switch on |
 |---|---|---|
