@@ -284,6 +284,43 @@ async fn the_devices_worker_starts_into_a_job_at_its_own_bound() {
     worker.kill().await;
 }
 
+/// #3441, on Windows — what a worker started ends at the worker's end. Its job
+/// holds every process the worker starts, and the supervisor ends the job at
+/// each end of a worker's life (`InJob::kill`, which `supervise` calls however
+/// that life ended), the worker's own death included. Here `cmd.exe` plays the
+/// worker, its `ping` the process it started, and the worker dies first and
+/// alone, as a crash would.
+#[tokio::test]
+async fn what_a_worker_started_ends_at_its_end_though_the_worker_died_first() {
+    use crate::exec::session_lifetime::{GONE_WITHIN, Watched};
+
+    let (_server, pipe) = channel().unwrap();
+    let args = ["/d", "/c", "ping -n 300 127.0.0.1"].map(String::from);
+    let mut worker = spawn(&crate::hive_win::system_cmd(), None, &args, pipe).unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    let child = loop {
+        if let Some(child) = crate::hive::procs::child_of(worker.pid) {
+            break Watched::open(child);
+        }
+        assert!(
+            std::time::Instant::now() < until,
+            "the worker started nothing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // SAFETY: the worker's live process handle, held in `worker`.
+    unsafe { TerminateProcess(worker.process.as_raw_handle() as HANDLE, 7) };
+    assert!(
+        !child.gone_within(Duration::from_millis(500)),
+        "its ping ended with the worker alone: the job is what this is about"
+    );
+    worker.kill().await;
+    assert!(
+        child.gone_within(GONE_WITHIN),
+        "the worker's ping outlived the worker's end"
+    );
+}
+
 /// The real `roomlerd hive-worker`, started as the daemon starts it: it
 /// finds its pipe, answers `hello` with its own pid at this build's version,
 /// each beat, and ends at `bye`. Needs the binary, which a lib test does not

@@ -419,6 +419,12 @@ mod imp {
     }
 }
 
+/// A child of `pid`: [`imp::child_of`], for a test elsewhere in Hive (#3437).
+#[cfg(all(test, windows))]
+pub(crate) fn child_of(pid: u32) -> Option<u32> {
+    imp::child_of(pid)
+}
+
 #[cfg(all(test, windows))]
 mod win_tests {
     use super::*;

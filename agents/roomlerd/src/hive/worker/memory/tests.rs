@@ -293,6 +293,89 @@ async fn the_devices_worker_has_its_own_bound_and_what_the_daemon_spawns_stays_o
     assert!(!dir.exists(), "its cgroup gone with it: {}", dir.display());
 }
 
+/// A worker with a process of its own: a `sleep` put in the background, then
+/// itself a `sleep`, so its cgroup holds two processes whatever `/bin/sh` is.
+const WITH_A_CHILD: &str = "sleep 300 & exec sleep 30";
+
+/// The pids `dir`'s `cgroup.procs` lists.
+fn procs_in(dir: &Path) -> Vec<i32> {
+    std::fs::read_to_string(dir.join("cgroup.procs"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|p| p.parse().ok())
+        .collect()
+}
+
+/// A worker's cgroup that a red run leaves, ended at the test's end whatever
+/// it found: what is listed in it killed, then the cgroup removed.
+struct LeftOver(PathBuf);
+
+impl Drop for LeftOver {
+    fn drop(&mut self) {
+        for _ in 0..500 {
+            for pid in procs_in(&self.0) {
+                // SAFETY: a signal to a process in this test's own cgroup.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            if !self.0.exists() || std::fs::remove_dir(&self.0).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// #3441 — a worker that started a process of its own: after its kill nothing
+/// of it is left, and its cgroup is gone. The kill reached the worker's own pid
+/// alone: the child lived on, adopted, inside the cgroup, which could not be
+/// removed while it did (`EBUSY`), and both removals dropped the error.
+///
+/// Run inside a delegated cgroup, which CI has not: see the tests above.
+#[tokio::test]
+#[ignore = "needs a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)"]
+async fn a_workers_kill_ends_what_it_started_and_removes_its_cgroup() {
+    let _turn = REAL_CGROUP.lock().await;
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let base = unit_dir(v2_path(&own).expect("a cgroup v2 hierarchy"));
+    ready_for_test(&base).await.expect(
+        "a delegated cgroup with the memory controller (systemd-run --user --scope -p Delegate=yes)",
+    );
+    let program = super::super::Program {
+        exe: "/bin/sh".into(),
+        arg0: None,
+        args: vec!["-c".into(), WITH_A_CHILD.into()],
+    };
+    let (_ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let (_ours_d, theirs_d) = std::os::unix::net::UnixStream::pair().unwrap();
+    let theirs = super::super::Theirs {
+        ch: theirs,
+        descriptors: theirs_d,
+    };
+    let mut running = super::super::Spawn::spawn(&program, theirs).unwrap();
+    let pid = running.pid().unwrap();
+    let theirs = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let path = v2_path(&theirs).unwrap().to_string();
+    let dir = Path::new(CGROUP_ROOT).join(path.trim_start_matches('/'));
+    assert!(
+        path.rsplit('/')
+            .next()
+            .is_some_and(|leaf| leaf.starts_with(WORKER_PREFIX)),
+        "the worker in a cgroup of its own: {path}"
+    );
+    let _left = LeftOver(dir.clone());
+    wait_for(|| procs_in(&dir).len() == 2, "the worker and its child in it");
+    let before = procs_in(&dir);
+    running.kill().await;
+    for p in &before {
+        assert!(
+            matches!(state_of(*p), None | Some('Z')),
+            "{p} outlived the worker's kill (the worker was {pid}): {:?}",
+            state_of(*p)
+        );
+    }
+    assert!(!dir.exists(), "its cgroup gone with it: {}", dir.display());
+}
+
 // ─── What passes (#3349) ────────────────────────────────────────────────────
 
 /// A stand-in for a unit's cgroup, in a directory: `listed` is its

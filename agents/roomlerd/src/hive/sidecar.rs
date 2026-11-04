@@ -68,6 +68,7 @@ use super::supervisor::Supervisor;
 
 #[cfg(worker_calls)]
 pub(crate) mod handed;
+mod helper;
 
 /// Where model calls go when nothing else is configured.
 pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
@@ -284,40 +285,21 @@ impl Supervisor {
 }
 
 /// Run the device's key helper and return the first line it prints. Never
-/// logged — not the output, not the error's stdout.
-///
-/// P1i-2 — on Windows through `cmd.exe /d /s /c "<helper>"`, by its full path:
-/// `/s` makes cmd strip the outer quotes and run the helper as written, as
-/// `/bin/sh -c` does, and the line is passed raw, so no quoting of Rust's own
-/// can change it. `/d`: no AutoRun from the registry runs first.
+/// logged — not the output, not the error's stdout. How it runs:
+/// [`helper::start`].
 pub(crate) async fn run_key_helper(helper: &str) -> Result<String, String> {
-    #[cfg(unix)]
-    let mut cmd = {
-        let mut cmd = tokio::process::Command::new("/bin/sh");
-        cmd.arg("-c").arg(helper);
-        cmd
-    };
-    #[cfg(windows)]
-    let mut cmd = {
-        let mut cmd = tokio::process::Command::new(crate::hive_win::system_cmd());
-        cmd.raw_arg(format!("/d /s /c \"{helper}\""))
-            // CREATE_NO_WINDOW: no console flashes on the user's desktop.
-            .creation_flags(0x0800_0000);
-        cmd
-    };
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(HELPER_TIMEOUT, cmd.output())
+    let could_not_run = |e: std::io::Error| format!("hive_api_key_helper could not run: {e}");
+    let out = helper::start(helper)
+        .map_err(could_not_run)?
+        .output_within(HELPER_TIMEOUT)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             format!(
                 "hive_api_key_helper did not finish within {} s",
                 HELPER_TIMEOUT.as_secs()
             )
         })?
-        .map_err(|e| format!("hive_api_key_helper could not run: {e}"))?;
+        .map_err(could_not_run)?;
     if !out.status.success() {
         return Err(format!("hive_api_key_helper failed ({})", out.status));
     }
