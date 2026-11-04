@@ -292,7 +292,7 @@ The whole run cost $0.24 in model calls.
 | the snapshot at a start, and its re-send | [`routes.rs:601`](../crates/modules/hive/src/routes.rs#L601), [`agent_socket.rs:1157`](../crates/modules/hive/src/agent_socket.rs#L1157) |
 | the frame | `ServerMsg::HiveMemory` in [`signaling.rs:4797`](../crates/remote_control/src/signaling.rs#L4797); `MAX_CORE_MEMORY_BYTES` in [`hive.rs:63`](../crates/remote_control/src/hive.rs#L63); `RpcCap::HiveMemory` (`hive-memory`), matched by equality |
 | the device | [`supervisor.rs`](../agents/roomlerd/src/hive/supervisor.rs): `receive_memory` `:811`, the launch `:1909`, `write_memory` `:2448`, `memory_note` `:2523`; the copy in `WRAPPER` `:98` and, on Windows, [`hive_win.rs:845`](../agents/roomlerd/src/hive_win.rs#L845) `prep` |
-| the device's key | `hive_core_memory` in [`config.rs:533`](../crates/agent-core/src/config.rs#L533) |
+| the device's key | `hive_core_memory` in [`config.rs:547`](../crates/agent-core/src/config.rs#L547) |
 | the page | [`ui/src/views/hive/HiveMemoryView.vue`](../ui/src/views/hive/HiveMemoryView.vue); the calls in [`stores/hive.ts`](../ui/src/stores/hive.ts) |
 
 ## Not built
