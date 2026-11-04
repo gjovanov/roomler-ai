@@ -33,7 +33,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2183`,
+   deny. — `agents/roomlerd/src/signaling.rs:2201`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
@@ -67,7 +67,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:5545`, `ssh.rs:2165` vs `git grep write_pending`
+   — `signaling.rs:5518`, `ssh.rs:2176` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
@@ -166,7 +166,7 @@ dependency tree; and the macOS daemon **already ships as an `.app` with
 `LSUIElement=true`** (`release-agent.yml:2636`), the bundle identity AppKit
 windows require.
 
-⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:744`
+⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:764`
 is `#[tokio::main]`, so the main thread is parked in `block_on` for the daemon's
 whole life — the main dispatch queue never drains and AppKit can never deliver a
 click to an Approve button. The macOS arm has to build the runtime explicitly, run
@@ -315,7 +315,7 @@ in place of `Permission denied (os error 13)` for everything else.
 | 0 | FR + issue + ledger | n/a | **done** — the FR-24 collision was already repaired on master by #850 |
 | 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomlerd consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — timeout≠deny and `prompt_then_email` field-verified on 0.4.16, `.pending` for exec+ssh on 0.4.18, **the local floor on 2026-09-25** (AC4, WSL node, 0.4.102); `prompt_owner` still needs an owner-account run |
 | 2 | Desktop companion — one tray with an icon, daemon-path resolution, update-output surfacing, version honesty, `ensure_running()` | each item independent; no wire change | **implemented** (version honesty deferred to a follow-up) — field pending |
-| 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac. *FR-97 P2b (2026-10-21) ran that procedure on a tart Mac (both halves, a viewer from outside): the native panel came up, Approve connected and Deny declined, so the feature is in the macOS release set (`.github/workflows/release-agent.yml:2880`); the field Mac and a release follow* |
+| 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac. *FR-97 P2b (2026-10-21) ran that procedure on a tart Mac (both halves, a viewer from outside): the native panel came up, Approve connected and Deny declined, so the feature is in the macOS release set (`.github/workflows/release-agent.yml:2877`); the field Mac and a release follow* |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | **implemented** — field pending |
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |

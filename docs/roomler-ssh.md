@@ -1057,7 +1057,7 @@ global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
 
 ⚠️ **Armed before it is shown (#3442).** The device registers the question with
-the broker first (`ask_here`, [`ssh.rs:2488`](../agents/roomlerd/src/ssh.rs#L2488)), then puts it up: the native panel, the
+the broker first (`ask_here`, [`ssh.rs:2382`](../agents/roomlerd/src/ssh.rs#L2382)), then puts it up: the native panel, the
 `.pending` marker the companion and `roomlerd consent --list` read, a companion
 it may have to start (up to 3 s), a notification. An answer counts from the
 moment anything shows the question. Until #3442 the question was armed last,
@@ -1065,11 +1065,11 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4093`](../agents/roomlerd/src/signaling.rs#L4093), [`:5609`](../agents/roomlerd/src/signaling.rs#L5609)), as the recording question does
+first the same way ([`signaling.rs:4002`](../agents/roomlerd/src/signaling.rs#L4002), [`:5518`](../agents/roomlerd/src/signaling.rs#L5518)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
-[`ssh.rs:2354`](../agents/roomlerd/src/ssh.rs#L2354)).** Channels of one session can ask at once: a command waits in a
+[`ssh.rs:2248`](../agents/roomlerd/src/ssh.rs#L2248)).** Channels of one session can ask at once: a command waits in a
 task of its own, so a second channel can ask while the first waits. A channel
 that asks what a question already standing for its grant asks (the same
 activity: "run a command", "open an interactive shell", "transfer files over
@@ -1078,7 +1078,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2372`](../agents/roomlerd/src/ssh.rs#L2372)), and the answer's line carries the grant ([`:2566`](../agents/roomlerd/src/ssh.rs#L2566)), so a
+question's id ([`ssh.rs:2266`](../agents/roomlerd/src/ssh.rs#L2266)), and the answer's line carries the grant ([`:2460`](../agents/roomlerd/src/ssh.rs#L2460)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same
@@ -1110,7 +1110,7 @@ what was asked (#3465).
 
 The SYSTEM service (FR-105) coalesces before it relays, and the relayed
 question carries its own id, which the worker checks is an object id
-([`ssh_service.rs:948`](../agents/roomlerd/src/ssh_service.rs#L948)). ⚠️ **The fix needs the service, not only the worker.** A
+([`ssh_service.rs:928`](../agents/roomlerd/src/ssh_service.rs#L928)). ⚠️ **The fix needs the service, not only the worker.** A
 service from before #3442 relays the grant's id for every question and does not
 coalesce, so a worker behind it still has the second question withdraw the
 first, until the service is updated too.

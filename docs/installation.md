@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3710`, `crates/agent-core/src/config.rs:4414`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3735`, `crates/agent-core/src/config.rs:4414`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -935,7 +935,7 @@ Windows compares environment names, and is added where there is none. The
 exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
 both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 `carry.rs:37`). The installer decides the switch: the updater passes
-`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:2176`),
+`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:1991`),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
@@ -965,7 +965,7 @@ its entry point). What the DLL's build buys is the carry itself: it links its
 CRT (`+crt-static`) and imports only what Windows ships, so it loads on a
 machine with no VC++ runtime. The release lane reads it out of the built MSI,
 checks its imports with a negative control, and checks that it carries the
-payload's signature (`.github/workflows/release-agent.yml:2205`). `ROOMLER_TEST_CA_FAIL=capture` or
+payload's signature (`.github/workflows/release-agent.yml:2202`). `ROOMLER_TEST_CA_FAIL=capture` or
 `=restore` (`main.wxs:561`) fails one of the two on purpose; installer-smoke uses
 it to show an upgrade completing through either failure
 (`.github/workflows/installer-smoke.yml:870`). Its only effect is that nothing is
@@ -1922,7 +1922,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3341`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3366`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -2169,7 +2169,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2102`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2127`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

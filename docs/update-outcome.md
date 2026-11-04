@@ -15,7 +15,7 @@ Claims about behaviour were checked against the code at `5f126955b` plus
 
 Every self-update ends in a verdict. The updater spawns a **post-install
 watcher** beside the installer (`updater::spawn_installer_with_watch`,
-`agents/roomlerd/src/updater.rs:1920` → `spawn_watcher`, `:2892`), the watcher
+`agents/roomlerd/src/updater.rs:1735` → `spawn_watcher`, `:2707`), the watcher
 waits the installer out where there is anything to wait for, runs the new
 binary's `--version`, and writes a typed record to `<log_dir>/last-install.json`
 (`post_install::watch`, `agents/roomlerd/src/post_install.rs:297`).
@@ -33,7 +33,7 @@ reading was wrong about which mattered:
 | | What | Fixed |
 |---|---|---|
 | 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:288`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
-| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2834`) |
+| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2649`) |
 
 ## 2. The record
 
@@ -51,7 +51,7 @@ reading was wrong about which mattered:
 | `note` | the watcher's own sentence: the probe's answer, the exit code, on Windows the service settle's verdict (`service Roomler: running (0 starts; seen Running)`) |
 
 `<log_dir>` is `logging::resolve_log_dir`'s
-(`crates/agent-core/src/logging.rs:764`): the process's per-user data dir plus
+(`crates/agent-core/src/logging.rs:762`): the process's per-user data dir plus
 `logs`, except a Windows process with a service role, which logs under
 `%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
 worker and `netd` (`ServiceLogRole`). The watcher never has one, so the record
@@ -118,7 +118,7 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:549`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:545`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
 a record older than that (`never_reported`, `:557`).
@@ -226,7 +226,7 @@ $ roomler status
   altogether** — the same inherited pipe kept the exec's reader from EOF and
   made the outgoing worker overrun its stop budget — so `spawn_watcher` gives
   it `/dev/null` for all three on every platform (`without_caller_stdio`,
-  `agents/roomlerd/src/updater.rs:2862`, called at `:2963`). From the first
+  `agents/roomlerd/src/updater.rs:2677`, called at `:2778`). From the first
   update a 0.4.176+ daemon spawns, the journal shows the daemon's own
   `post-install watcher spawned` line and nothing from the watcher; the
   verdict reaches the record file and P3's two readers, and nothing else.
@@ -256,7 +256,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:7616`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:6630`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries
