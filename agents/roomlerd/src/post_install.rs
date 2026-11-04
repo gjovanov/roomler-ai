@@ -84,6 +84,9 @@
 //!    `service::windows::start_soon_triggers`), within 5 s (systemd,
 //!    `Restart=always`), or through the `.pkg`'s postinstall (launchd skips a
 //!    clean exit); the new binary reads `last-install.json` at startup.
+//! 8. A watcher can be stopped before step 7, and a release cannot reach the
+//!    watcher of the release before it. So the next daemon, once healthy, settles
+//!    a record still at `InProgress` ([`settle_unreported`], #3302).
 //!
 //! ## What this is NOT
 //!
@@ -95,7 +98,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 #[cfg(all(unix, not(target_os = "windows")))]
 use std::time::Instant;
@@ -110,6 +113,11 @@ pub const INSTALLER_BUDGET: Duration = Duration::from_secs(600);
 /// `--version`. Lets the FS settle (cargo-wix MSI sometimes
 /// fsyncs after process exit).
 pub const POST_INSTALL_SETTLE: Duration = Duration::from_secs(2);
+
+/// #3302 — how long a record can sit at `InProgress` with a watcher still at work
+/// on it: [`INSTALLER_BUDGET`], twice on a Windows wedge retry, and the service
+/// settle. Past this nothing is going to write a verdict.
+pub const WATCHER_LIFETIME: Duration = Duration::from_secs(25 * 60);
 
 /// Persistent record of the most recent install attempt. Written
 /// to `<log_dir>/last-install.json`. The new agent reads this at
@@ -134,21 +142,28 @@ pub enum InstallStatus {
     /// at watch-start so a watcher that itself crashes leaves a
     /// trail of "we got this far."
     InProgress,
-    /// Installer exited 0 AND the new binary's `--version` output
-    /// contained the expected version triple.
+    /// The new binary answers the expected version. The installer went through
+    /// ([`installer_went_through`]), or nobody read how it ended (#3302: gone before
+    /// the watcher looked, or the watcher stopped first and the next daemon IS that
+    /// version).
     SucceededVerified,
-    /// Installer exited 0 but the version check failed (binary
-    /// missing, wrong version, or `--version` didn't run). The
+    /// Installer went through ([`installer_went_through`]) but the version check
+    /// failed (binary missing, wrong version, or `--version` didn't run). The
     /// install probably worked; surface this so an operator can
     /// investigate without us assuming the worst.
     SucceededUnverified,
-    /// Installer exited with a non-zero code. The agent's old
-    /// binary is still in place and the supervisor will keep
+    /// Installer exited with a code that is no success, or it was gone before its
+    /// exit could be read and the expected version is not on disk (#3302). The
+    /// agent's old binary is still in place and the supervisor will keep
     /// running it on next logon.
     InstallerFailed,
     /// Installer didn't exit within `INSTALLER_BUDGET`. We give up
     /// rather than block the watcher process forever.
     Timeout,
+    /// #3302 — nothing wrote a verdict in [`WATCHER_LIFETIME`], and the daemon that
+    /// found the record is not the version it was for. Written by that daemon, never
+    /// by a watcher.
+    WatcherStopped,
 }
 
 /// Resolve the path of the persistent install-outcome JSON file.
@@ -166,12 +181,74 @@ pub fn outcome_path() -> Option<PathBuf> {
 /// recoverable.
 pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
     let path = outcome_path().context("no log dir resolvable")?;
+    write_outcome_at(&path, outcome)?;
+    Ok(path)
+}
+
+/// [`write_outcome`] into a given file: the settle writes a record back where it
+/// found it.
+fn write_outcome_at(path: &Path, outcome: &InstallOutcome) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let json = serde_json::to_string_pretty(outcome).context("serialising install outcome")?;
-    std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+    std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))
+}
+
+/// #3302 — every file a record may be in, this process's own log dir first.
+///
+/// ⚠️ A SystemContext worker logs to `service-logs`, and the watcher it spawns has no
+/// service role, so the watcher writes its record into SYSTEM's profile. Reading only
+/// its own dir, the worker's settle never found a record: read on a per-machine
+/// guest, the record stayed `InProgress` past the clean-run threshold. The watcher is
+/// always the outgoing release's code, so the reader is the side that can be fixed.
+fn outcome_paths() -> Vec<PathBuf> {
+    record_paths_in(crate::logging::log_dir(), crate::logging::profile_log_dir())
+}
+
+/// [`outcome_paths`] from its two directories: each once, own first.
+fn record_paths_in(own: Option<PathBuf>, profile: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for dir in [own, profile].into_iter().flatten() {
+        let path = dir.join("last-install.json");
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The record file most recently written among `paths`, if any exists.
+fn newest_record_path(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut newest: Option<(&PathBuf, std::time::SystemTime)> = None;
+    for path in paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        let written = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.is_none_or(|(_, seen)| written > seen) {
+            newest = Some((path, written));
+        }
+    }
+    newest.map(|(path, _)| path.clone())
+}
+
+/// The record in one file.
+fn read_outcome_at(path: &Path) -> Result<InstallOutcome> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// The record most recently written among `paths`, with its file. The newest file
+/// speaks even when it doesn't parse, so an unreadable record is never hidden by an
+/// older one that reads.
+fn read_newest_outcome(paths: &[PathBuf]) -> Result<Option<(PathBuf, InstallOutcome)>> {
+    let Some(path) = newest_record_path(paths) else {
+        return Ok(None);
+    };
+    let outcome = read_outcome_at(&path)?;
+    Ok(Some((path, outcome)))
 }
 
 /// Read the most recent install outcome, if any. Returns `None`
@@ -179,17 +256,7 @@ pub fn write_outcome(outcome: &InstallOutcome) -> Result<PathBuf> {
 /// install where the operator manually deleted it). Errors are
 /// surfaced — a corrupt file is operator-actionable.
 pub fn read_outcome() -> Result<Option<InstallOutcome>> {
-    let Some(path) = outcome_path() else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    Ok(Some(parsed))
+    Ok(read_newest_outcome(&outcome_paths())?.map(|(_, outcome)| outcome))
 }
 
 /// Run the watcher loop. Blocks until the installer exits or the
@@ -266,18 +333,29 @@ pub fn watch(
     match exit {
         WaitOutcome::Exited(code) => {
             outcome.installer_exit_code = Some(code);
-            if code != 0 {
-                outcome.status = InstallStatus::InstallerFailed;
-                outcome.note = format!("installer exited with {code}");
-                tracing::error!(exit = code, "installer failed");
-            } else {
+            if installer_went_through(code) {
                 verify_new_binary(
                     &mut outcome,
                     &expected_version,
                     origin_exe.as_deref(),
                     already_exited,
                 );
+                note_reboot_asked(&mut outcome, code);
+            } else {
+                outcome.status = InstallStatus::InstallerFailed;
+                outcome.note = format!("installer exited with {code}");
+                tracing::error!(exit = code, "installer failed");
             }
+        }
+        WaitOutcome::AlreadyGone => {
+            verify_new_binary(
+                &mut outcome,
+                &expected_version,
+                origin_exe.as_deref(),
+                already_exited,
+            );
+            verdict_with_no_exit_code(&mut outcome);
+            tracing::warn!(status = ?outcome.status, "installer was gone before its exit could be read");
         }
         WaitOutcome::Timeout => {
             // Windows: this is the field-reproduced msiexec wedge
@@ -468,6 +546,20 @@ fn recover_wedged_install(
     run_recovery_cmd("taskkill", &["/F", "/IM", "msiexec.exe"]);
     std::thread::sleep(Duration::from_secs(5));
 
+    // #2107 — the one log that names the action this attempt stopped in.
+    let kept_note = crate::logging::log_dir()
+        .and_then(|dir| {
+            let log = PathBuf::from(format!("{}.log", installer_path.display()));
+            keep_wedged_log(&log, &dir)
+        })
+        .map_or_else(String::new, |kept| {
+            tracing::warn!(path = %kept.display(), "kept the wedged attempt's MSI log");
+            format!(
+                "; the wedged attempt's MSI log is kept at {}",
+                kept.display()
+            )
+        });
+
     // Spawn the retry against the ORIGIN install's flavour — a
     // staged-copy watcher's own path would classify PerUser and take
     // the non-elevated msiexec path, which a perMachine MSI rejects
@@ -477,7 +569,7 @@ fn recover_wedged_install(
             Ok(pid) => pid,
             Err(e) => {
                 outcome.status = InstallStatus::Timeout;
-                outcome.note = format!("installer wedged; retry spawn failed: {e:#}");
+                outcome.note = format!("installer wedged; retry spawn failed: {e:#}{kept_note}");
                 tracing::error!(error = %e, "retry spawn after wedge failed");
                 return;
             }
@@ -485,13 +577,14 @@ fn recover_wedged_install(
     outcome.installer_pid = retry_pid;
     let _ = write_outcome(outcome);
     match wait_for_pid(retry_pid, INSTALLER_BUDGET) {
-        WaitOutcome::Exited(0) => {
-            outcome.installer_exit_code = Some(0);
+        WaitOutcome::Exited(code) if installer_went_through(code) => {
+            outcome.installer_exit_code = Some(code);
             // `false`: this is the wedge-recovery retry, where we genuinely
             // waited on msiexec. That is exactly the case POST_INSTALL_SETTLE
             // was written for — cargo-wix can fsync after process exit — so the
             // pause is kept here.
             verify_new_binary(outcome, expected_version, origin, false);
+            note_reboot_asked(outcome, code);
             outcome.note = format!(
                 "recovered by kill+retry after initial {}s wedge; {}",
                 INSTALLER_BUDGET.as_secs(),
@@ -504,6 +597,12 @@ fn recover_wedged_install(
             outcome.status = InstallStatus::InstallerFailed;
             outcome.note = format!("retry after wedge exited with {code}");
             tracing::error!(exit = code, "retry after wedge failed");
+        }
+        WaitOutcome::AlreadyGone => {
+            verify_new_binary(outcome, expected_version, origin, false);
+            verdict_with_no_exit_code(outcome);
+            outcome.note = format!("retry after wedge: {}", outcome.note);
+            tracing::warn!(status = ?outcome.status, "retry was gone before its exit could be read");
         }
         WaitOutcome::Timeout => {
             run_recovery_cmd("taskkill", &["/F", "/T", "/PID", &retry_pid.to_string()]);
@@ -520,6 +619,21 @@ fn recover_wedged_install(
             tracing::error!(error = %e, "retry installer wait failed");
         }
     }
+    outcome.note.push_str(&kept_note);
+}
+
+/// #2107 — a wedged attempt's log, copied out of the staging dir: the startup sweep
+/// removes that dir an hour later. Two slots, so a host that wedges on every update
+/// keeps the last two and nothing piles up. Best effort, and returns where it landed.
+#[cfg(any(target_os = "windows", test))]
+fn keep_wedged_log(log: &std::path::Path, dir: &std::path::Path) -> Option<PathBuf> {
+    if !log.is_file() {
+        return None;
+    }
+    let kept = dir.join("msi-wedged.log");
+    let _ = std::fs::rename(&kept, dir.join("msi-wedged.prev.log"));
+    std::fs::copy(log, &kept).ok()?;
+    Some(kept)
 }
 
 /// Spawn a recovery shell-out, log its exit code, never fail the
@@ -1053,9 +1167,137 @@ pub fn beside_daemon_after_install(version_answer: Option<&str>, latest: &str) -
     }
 }
 
+/// #3340 — whether an installer's exit code means the install went through.
+/// `msiexec` says 3010 (`ERROR_SUCCESS_REBOOT_REQUIRED`) when it replaced a file in
+/// use, and 1641 (`ERROR_SUCCESS_REBOOT_INITIATED`) belongs to the same family. The
+/// version on disk still decides the verdict.
+fn installer_went_through(code: i32) -> bool {
+    matches!(code, 0 | 3010 | 1641)
+}
+
+/// #3340 — say so when the installer went through and asked for a reboot.
+fn note_reboot_asked(outcome: &mut InstallOutcome, code: i32) {
+    if code != 0 {
+        outcome.note = format!(
+            "{}; installer exit {code}: a reboot was asked for",
+            outcome.note
+        );
+    }
+}
+
+/// #3302 — the verdict when the installer was gone before anyone could read how it
+/// ended, after [`verify_new_binary`] has looked at the disk. A refused MSI is over
+/// in under a second and the watcher starts after it, so the expected version not
+/// being there is a failed install, not a success nobody could confirm.
+fn verdict_with_no_exit_code(outcome: &mut InstallOutcome) {
+    outcome.installer_exit_code = None;
+    if outcome.status == InstallStatus::SucceededVerified {
+        outcome.note = format!(
+            "{}; the installer was gone before its exit could be read",
+            outcome.note
+        );
+    } else {
+        outcome.status = InstallStatus::InstallerFailed;
+        outcome.note = format!(
+            "the installer was gone before its exit could be read, and {}",
+            outcome.note
+        );
+    }
+}
+
+/// What [`settle_unreported`] did with a record.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Settle {
+    /// It has a verdict already.
+    HasVerdict,
+    /// It now has one: write it back.
+    Settled,
+    /// A watcher could still be at work on it, for this long.
+    TooSoon(Duration),
+}
+
+/// #3302 — give a record still at `InProgress` the verdict its watcher never wrote.
+/// Called by a daemon that has reached the clean-run threshold, so no installer is
+/// about to replace it and a live watcher has had its chance. A watcher that does
+/// come back later overwrites this with what it knows.
+///
+/// The daemon being the expected version settles it at any age. Anything else waits
+/// out [`WATCHER_LIFETIME`], and then says plainly that nobody will ever say more.
+pub(crate) fn settle_unreported(
+    outcome: &mut InstallOutcome,
+    running_version: &str,
+    now_unix: u64,
+) -> Settle {
+    if outcome.status != InstallStatus::InProgress {
+        return Settle::HasVerdict;
+    }
+    if version_matches(running_version, &outcome.expected_version) {
+        outcome.status = InstallStatus::SucceededVerified;
+        outcome.new_binary_version = Some(format!("roomlerd {running_version}"));
+        outcome.note = format!(
+            "the watcher left no verdict; this daemon is {running_version}, and has stayed up on it"
+        );
+    } else {
+        let age = now_unix.saturating_sub(outcome.started_unix);
+        let life = WATCHER_LIFETIME.as_secs();
+        if age < life {
+            return Settle::TooSoon(Duration::from_secs(life - age));
+        }
+        outcome.status = InstallStatus::WatcherStopped;
+        outcome.note = format!(
+            "no verdict after {} min: the watcher was stopped first. This daemon is \
+             {running_version}, and the install was for {}",
+            age / 60,
+            outcome.expected_version
+        );
+    }
+    outcome.finished_unix = Some(now_unix);
+    Settle::Settled
+}
+
+/// #3302 — [`settle_unreported`] on the record on disk. Returns how long to wait
+/// before looking again, when a watcher could still be at work on it.
+pub fn settle_record(running_version: &str) -> Option<Duration> {
+    settle_record_in(&outcome_paths(), running_version, unix_now())
+}
+
+/// [`settle_record`] over given files, at a given time.
+fn settle_record_in(paths: &[PathBuf], running_version: &str, now_unix: u64) -> Option<Duration> {
+    let (path, mut outcome) = match read_newest_outcome(paths) {
+        Ok(Some(found)) => found,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not read the install record");
+            return None;
+        }
+    };
+    match settle_unreported(&mut outcome, running_version, now_unix) {
+        Settle::HasVerdict => None,
+        Settle::TooSoon(wait) => Some(wait),
+        Settle::Settled => {
+            match write_outcome_at(&path, &outcome) {
+                Ok(_) => tracing::warn!(
+                    status = ?outcome.status,
+                    expected = %outcome.expected_version,
+                    "the install's watcher left no verdict; settled its record"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "could not settle the install record")
+                }
+            }
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 enum WaitOutcome {
     Exited(i32),
+    /// #3302 — gone before this watcher looked, so nobody read how it ended. Windows
+    /// only: `wait_pid_unix` is never the installer's parent, reads no exit at all,
+    /// and keeps its stand-in 0.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    AlreadyGone,
     Timeout,
     // Constructed only in `wait_pid_windows` and the
     // non-windows-non-unix fallback; the unix wait path
@@ -1105,7 +1347,7 @@ fn wait_pid_windows(pid: u32, budget: Duration) -> WaitOutcome {
     if h.is_null() {
         let err = unsafe { GetLastError() };
         if err == ERROR_INVALID_PARAMETER {
-            return WaitOutcome::Exited(0);
+            return WaitOutcome::AlreadyGone;
         }
         return WaitOutcome::Error(anyhow::anyhow!("OpenProcess({pid}) failed (err {err})"));
     }
@@ -1330,6 +1572,277 @@ pub fn log_at_startup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3302 — a process gone before the wait began has no exit code anyone read.
+    /// A 0 here made a refused MSI read as a success: the record said exit 0 and the
+    /// MSI's own log said 1603.
+    ///
+    /// A pid no process can hold, not a child that has exited: anything else on the
+    /// host with a handle to that child (a CI runner did) keeps its process object
+    /// there to ask, and the wait then reads its true code, the next test's case.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_process_gone_before_the_wait_has_no_exit_code() {
+        let out = wait_for_pid(0x7FFF_FFFC, Duration::from_secs(1));
+        assert!(matches!(out, WaitOutcome::AlreadyGone), "{out:?}");
+    }
+
+    /// The other side of it: a process the wait did catch reports what it said.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_process_the_wait_caught_reports_its_exit_code() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit 1603"])
+            .spawn()
+            .expect("spawn cmd");
+        // `child` keeps its handle open, so the process object is there to ask.
+        let out = wait_for_pid(child.id(), Duration::from_secs(20));
+        child.wait().expect("wait");
+        assert!(matches!(out, WaitOutcome::Exited(1603)), "{out:?}");
+    }
+
+    fn unreported(expected: &str, started_unix: u64) -> InstallOutcome {
+        InstallOutcome {
+            installer_pid: 42,
+            installer_path: "x.msi".into(),
+            expected_version: expected.into(),
+            started_unix,
+            finished_unix: None,
+            installer_exit_code: None,
+            new_binary_path: None,
+            new_binary_version: None,
+            status: InstallStatus::InProgress,
+            note: String::new(),
+        }
+    }
+
+    /// #3302, the field record: a refused MSI, the old version still on disk. It
+    /// read `SucceededUnverified` with an exit 0 nobody had read.
+    #[test]
+    fn an_installer_gone_with_the_old_version_on_disk_failed() {
+        let mut o = unreported("agent-v0.4.196", 1000);
+        o.status = InstallStatus::SucceededUnverified;
+        o.note = "new binary reports roomlerd 0.4.197 but expected agent-v0.4.196".into();
+        verdict_with_no_exit_code(&mut o);
+        assert_eq!(o.status, InstallStatus::InstallerFailed);
+        assert_eq!(o.installer_exit_code, None);
+        assert!(o.note.contains("gone before its exit could be read"));
+        assert!(o.note.contains("reports roomlerd 0.4.197"), "{}", o.note);
+    }
+
+    #[test]
+    fn an_installer_gone_with_the_new_version_on_disk_succeeded() {
+        let mut o = unreported("agent-v0.4.197", 1000);
+        o.status = InstallStatus::SucceededVerified;
+        o.note = "new binary reports roomlerd 0.4.197".into();
+        verdict_with_no_exit_code(&mut o);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert_eq!(o.installer_exit_code, None);
+        assert!(o.note.contains("gone before its exit could be read"));
+    }
+
+    /// #3340 — 3010 is a success that wants a reboot, measured on a self-update whose
+    /// row was online on the new version 15 s later, and on the record as a failure.
+    #[test]
+    fn a_reboot_asked_for_is_no_failed_install() {
+        for code in [0, 3010, 1641] {
+            assert!(installer_went_through(code), "{code}");
+        }
+        for code in [1, -1, 1602, 1603, 1618, 1625] {
+            assert!(!installer_went_through(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn the_note_says_a_reboot_was_asked_for_and_only_then() {
+        let mut o = unreported("agent-v0.4.197", 1000);
+        o.note = "new binary reports roomlerd 0.4.197".into();
+        note_reboot_asked(&mut o, 0);
+        assert_eq!(o.note, "new binary reports roomlerd 0.4.197");
+        note_reboot_asked(&mut o, 3010);
+        assert!(o.note.contains("3010"), "{}", o.note);
+        assert!(o.note.contains("reboot"), "{}", o.note);
+    }
+
+    #[test]
+    fn a_daemon_on_the_expected_version_settles_the_record_at_any_age() {
+        let mut o = unreported("agent-v0.4.197", 1000);
+        assert_eq!(settle_unreported(&mut o, "0.4.197", 1010), Settle::Settled);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert_eq!(o.finished_unix, Some(1010));
+        assert_eq!(o.new_binary_version.as_deref(), Some("roomlerd 0.4.197"));
+        assert_eq!(o.installer_exit_code, None, "nobody read it");
+        assert!(o.note.contains("no verdict"), "{}", o.note);
+    }
+
+    #[test]
+    fn another_version_waits_out_the_watchers_life_before_it_says_so() {
+        let life = WATCHER_LIFETIME.as_secs();
+        let mut o = unreported("agent-v0.4.198", 1000);
+        assert_eq!(
+            settle_unreported(&mut o, "0.4.197", 1000 + life - 60),
+            Settle::TooSoon(Duration::from_secs(60))
+        );
+        assert_eq!(o.status, InstallStatus::InProgress);
+        assert_eq!(o.finished_unix, None);
+
+        assert_eq!(
+            settle_unreported(&mut o, "0.4.197", 1000 + life),
+            Settle::Settled
+        );
+        assert_eq!(o.status, InstallStatus::WatcherStopped);
+        assert_eq!(o.finished_unix, Some(1000 + life));
+        assert!(o.note.contains("0.4.197"), "{}", o.note);
+        assert!(o.note.contains("agent-v0.4.198"), "{}", o.note);
+    }
+
+    /// A clock stepped back must not settle a live watcher's record, and must not panic.
+    #[test]
+    fn a_start_in_the_future_reads_as_just_started() {
+        let mut o = unreported("agent-v0.4.198", 5000);
+        assert_eq!(
+            settle_unreported(&mut o, "0.4.197", 1000),
+            Settle::TooSoon(WATCHER_LIFETIME)
+        );
+        assert_eq!(o.status, InstallStatus::InProgress);
+    }
+
+    /// A verdict is the watcher's to give: nothing here rewrites one, whatever the
+    /// version and however old.
+    #[test]
+    fn a_record_with_a_verdict_is_left_alone() {
+        for status in [
+            InstallStatus::SucceededVerified,
+            InstallStatus::SucceededUnverified,
+            InstallStatus::InstallerFailed,
+            InstallStatus::Timeout,
+            InstallStatus::WatcherStopped,
+        ] {
+            let mut o = unreported("agent-v0.4.198", 0);
+            o.status = status.clone();
+            o.note = "the watcher's word".into();
+            assert_eq!(
+                settle_unreported(&mut o, "0.4.197", 99_999),
+                Settle::HasVerdict
+            );
+            assert_eq!(o.status, status);
+            assert_eq!(o.note, "the watcher's word");
+            assert_eq!(o.finished_unix, None);
+        }
+    }
+
+    /// Give a file a last-write time, so which record is newer doesn't hang on the
+    /// clock's resolution.
+    fn written_at(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// #3302, the per-machine field read: a SystemContext worker logs to
+    /// `service-logs`, its watcher into SYSTEM's profile, and the settle looked in
+    /// its own dir only.
+    #[test]
+    fn a_record_is_looked_for_in_the_profile_too_and_each_dir_once() {
+        let own = PathBuf::from(r"C:\ProgramData\roomler\roomler\service-logs");
+        let profile = PathBuf::from(
+            r"C:\Windows\System32\config\systemprofile\AppData\Local\roomler\roomler\data\logs",
+        );
+        let record = |d: &PathBuf| d.join("last-install.json");
+        assert_eq!(
+            record_paths_in(Some(own.clone()), Some(profile.clone())),
+            vec![record(&own), record(&profile)]
+        );
+        assert_eq!(
+            record_paths_in(Some(profile.clone()), Some(profile.clone())),
+            vec![record(&profile)]
+        );
+        assert_eq!(
+            record_paths_in(None, Some(profile.clone())),
+            vec![record(&profile)]
+        );
+        assert!(record_paths_in(None, None).is_empty());
+    }
+
+    #[test]
+    fn the_settle_finds_the_watchers_record_in_the_other_dir_and_leaves_it_there() {
+        let own = tempfile::tempdir().unwrap();
+        let profile = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(
+            Some(own.path().to_path_buf()),
+            Some(profile.path().to_path_buf()),
+        );
+        write_outcome_at(&paths[1], &unreported("agent-v0.4.221", 1000)).unwrap();
+
+        assert_eq!(settle_record_in(&paths, "0.4.221", 1400), None);
+
+        assert!(!paths[0].exists(), "nothing new in the worker's own dir");
+        let (path, o) = read_newest_outcome(&paths).unwrap().unwrap();
+        assert_eq!(path, paths[1]);
+        assert_eq!(o.status, InstallStatus::SucceededVerified);
+        assert_eq!(o.finished_unix, Some(1400));
+    }
+
+    #[test]
+    fn the_most_recently_written_record_is_the_one_read() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(Some(a.path().to_path_buf()), Some(b.path().to_path_buf()));
+        write_outcome_at(&paths[0], &unreported("agent-v0.4.220", 1000)).unwrap();
+        write_outcome_at(&paths[1], &unreported("agent-v0.4.221", 2000)).unwrap();
+        written_at(&paths[0], 5_000);
+        written_at(&paths[1], 6_000);
+        let (path, o) = read_newest_outcome(&paths).unwrap().unwrap();
+        assert_eq!(
+            (path, o.expected_version.as_str()),
+            (paths[1].clone(), "agent-v0.4.221")
+        );
+
+        written_at(&paths[0], 7_000);
+        let (path, o) = read_newest_outcome(&paths).unwrap().unwrap();
+        assert_eq!(
+            (path, o.expected_version.as_str()),
+            (paths[0].clone(), "agent-v0.4.220")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_newest_record_is_not_hidden_by_an_older_one() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(Some(a.path().to_path_buf()), Some(b.path().to_path_buf()));
+        write_outcome_at(&paths[0], &unreported("agent-v0.4.220", 1000)).unwrap();
+        std::fs::write(&paths[1], "{ \"status\": \"InProg").unwrap();
+        written_at(&paths[0], 5_000);
+        written_at(&paths[1], 6_000);
+        assert!(read_newest_outcome(&paths).is_err());
+        assert_eq!(settle_record_in(&paths, "0.4.220", 9_000), None);
+        assert_eq!(
+            std::fs::read_to_string(&paths[1]).unwrap(),
+            "{ \"status\": \"InProg",
+            "the settle writes nothing over a record it could not read"
+        );
+    }
+
+    #[test]
+    fn no_record_anywhere_is_nothing_to_settle() {
+        let a = tempfile::tempdir().unwrap();
+        let paths = record_paths_in(Some(a.path().to_path_buf()), None);
+        assert!(read_newest_outcome(&paths).unwrap().is_none());
+        assert_eq!(settle_record_in(&paths, "0.4.221", 1000), None);
+        assert!(!paths[0].exists());
+    }
+
+    /// What the record holds its life by: the watcher's real budgets must fit in it.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_watchers_life_covers_its_budgets() {
+        let budgets = INSTALLER_BUDGET * 2 + SERVICE_SETTLE_BUDGET + POST_INSTALL_SETTLE;
+        assert!(budgets < WATCHER_LIFETIME, "{budgets:?}");
+    }
 
     // P4b: pure path derivation behind the folder-rename fallback.
     // LOCALAPPDATA / ProgramFiles are always set on a real Windows
@@ -1616,6 +2129,32 @@ mod tests {
         }
     }
 
+    /// #2107 — the copy is what outlives the staging sweep, and the slot before it
+    /// is what a second wedge on the next update does not cost.
+    #[test]
+    fn a_wedged_log_is_kept_and_the_one_before_it_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("x.msi.log");
+        let dir = tmp.path().join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(keep_wedged_log(&log, &dir), None, "no log, nothing kept");
+
+        std::fs::write(&log, "first wedge").unwrap();
+        let kept = keep_wedged_log(&log, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "first wedge");
+
+        std::fs::write(&log, "second wedge").unwrap();
+        assert_eq!(keep_wedged_log(&log, &dir).unwrap(), kept);
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "second wedge");
+        let prev = dir.join("msi-wedged.prev.log");
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "first wedge");
+
+        std::fs::write(&log, "third wedge").unwrap();
+        keep_wedged_log(&log, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), "second wedge");
+    }
+
     #[test]
     fn version_matches_when_output_contains_triple() {
         assert!(version_matches("roomlerd 0.1.50", "agent-v0.1.50"));
@@ -1725,6 +2264,7 @@ mod tests {
                 "\"SucceededUnverified\"",
             ),
             (InstallStatus::InstallerFailed, "\"InstallerFailed\""),
+            (InstallStatus::WatcherStopped, "\"WatcherStopped\""),
             (InstallStatus::Timeout, "\"Timeout\""),
         ];
         for (status, expected) in cases {

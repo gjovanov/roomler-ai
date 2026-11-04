@@ -500,7 +500,7 @@ const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 /// the LAST outage left the ladder. The bar is the session's life, not the
 /// handshake: a server that accepts and drops at once must still climb the
 /// ladder, or a fleet would reconnect to it every second.
-const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
 
 /// #2221 — the reconnect ladder after a transient drop. `started_outage`: the
 /// attempt that just ended had sent its hello (see [`OrgCtx::note_ws_down`]);
@@ -526,6 +526,11 @@ pub struct OrgCtx {
     /// exit-route purges, and the `process::exit` escalations — a secondary
     /// org's terminal conditions stop ITS loop, never the daemon.
     pub is_primary: bool,
+    /// FR-43 P3a — this process is a GUI worker with no enrollment, on the
+    /// stand-in control plane ([`crate::unenrolled`]). A session reaches it
+    /// through the root's delegation channel and nothing else, so every text
+    /// frame off its own socket is dropped, whoever answers on that port.
+    pub unenrolled: bool,
     /// Watchdog pump name, registered by `run_cmd` before spawn:
     /// `signaling` for the primary (kept verbatim for log/tooling
     /// continuity) and `signaling:<label>` for secondaries — per-org pumps
@@ -554,6 +559,9 @@ pub struct OrgCtx {
     /// FR-103 — rung once the server has ACCEPTED the token on a connect:
     /// the renewal task looks after every connect.
     renewal_connected: Arc<tokio::sync::Notify>,
+    /// FR-28 — the flat redial on a load balancer's 502, for this org's loop.
+    /// As the config says unless a test passes its own ([`Self::with_flat_redial`]).
+    pub flat_redial: crate::ws_connect::FlatRedial,
     /// FR-90 P4-3b-1 — the device's knowhow scanner, on the primary's context
     /// alone (decision 43): `None` on a secondary's, and on a daemon with no
     /// config file to read its roots from.
@@ -571,12 +579,14 @@ impl OrgCtx {
         Self {
             label: crate::config::PRIMARY_ORG_LABEL.to_string(),
             is_primary: true,
+            unenrolled: false,
             pump: "signaling",
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
+            flat_redial: crate::ws_connect::FlatRedial::from_config(),
             #[cfg(all(hive_host, unix))]
             knowhow: None,
             #[cfg(hive_host)]
@@ -588,6 +598,7 @@ impl OrgCtx {
         Self {
             label: label.to_string(),
             is_primary: false,
+            unenrolled: false,
             // Interned (see the `pump` field doc): the watchdog registry
             // wants `&'static str`; one bounded leak per org per process.
             pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
@@ -596,6 +607,7 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
+            flat_redial: crate::ws_connect::FlatRedial::from_config(),
             // Decision 43: a secondary enrollment never scans, nor probes.
             #[cfg(all(hive_host, unix))]
             knowhow: None,
@@ -604,10 +616,23 @@ impl OrgCtx {
         }
     }
 
+    /// FR-43 P3a — this loop runs on the stand-in control plane
+    /// ([`Self::unenrolled`], the field).
+    pub fn unenrolled(mut self) -> Self {
+        self.unenrolled = true;
+        self
+    }
+
     /// FR-103 — replace the renewal knobs (`run_cmd` passes the
     /// environment's; a test passes its own).
     pub fn with_renewal(mut self, renewal: crate::token_renewal::Settings) -> Self {
         self.renewal = renewal;
+        self
+    }
+
+    /// FR-28 — replace the flat redial the config picked (a test passes its own).
+    pub fn with_flat_redial(mut self, flat_redial: crate::ws_connect::FlatRedial) -> Self {
+        self.flat_redial = flat_redial;
         self
     }
 
@@ -625,6 +650,14 @@ impl OrgCtx {
     pub fn with_prober(mut self, prober: Arc<crate::hive::knowhow_probe::Prober>) -> Self {
         self.prober = Some(prober);
         self
+    }
+
+    /// No outage is stamped: the last attempt sent its hello, or no attempt has
+    /// failed yet. What [`Self::note_ws_down`]'s stamp would answer.
+    fn ws_is_up(&self) -> bool {
+        self.down_since_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
     }
 
     /// Stamp the start of an outage. `true` when this failure STARTED one: the
@@ -1009,6 +1042,9 @@ pub async fn run(
     // LocalAPI shares the SAME instance and its live `pending` set. Lives across
     // reconnects, so a sentinel dropped while the WS was down is still honoured.
     let mut backoff = Duration::from_secs(1);
+    // FR-28 — off unless the device's config turned it on; off, this loop's
+    // ladder is exactly the one above (`ws_connect::FlatRedial`).
+    let mut flat_redial = ctx.flat_redial.clone();
     // netstate PR-2b — a MAJOR network change during a reconnect backoff
     // cuts the wait and resets the ladder: the transition that killed this
     // WS has ended (or moved again), and an exponential grown to 60 s while
@@ -1104,6 +1140,11 @@ pub async fn run(
         .await;
         if !matches!(attempt, Err(ConnectError::AuthRejected)) {
             recovered_last = false;
+        }
+        // FR-28 — only a connection that lived earns the next outage its flat
+        // redials: #2221's bar, on every way a connection can end.
+        if ctx.ws_is_up() {
+            flat_redial.connection_ended(attempt_started.elapsed());
         }
         match attempt {
             Ok(()) => {
@@ -1364,9 +1405,24 @@ pub async fn run(
                 // every failure mode, blocking root-cause analysis.
                 let cause = error_chain(e.as_ref());
                 warn!(error = %e, %cause, "signaling connect failed; backing off");
+                // FR-28 — the load balancer answered 502: this tenant's pod is
+                // rolling. A flat wait, and the ladder stays where it is.
+                let flat_wait = flat_redial.step(
+                    e.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+                        .is_some_and(crate::ws_connect::is_lb_502),
+                );
+                if let Some(wait) = flat_wait {
+                    info!(
+                        wait_ms = wait.as_millis() as u64,
+                        left = flat_redial.left(),
+                        "signaling: the load balancer has no pod for this org yet; redialling flat (FR-28)"
+                    );
+                }
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    _ = tokio::time::sleep(flat_wait.unwrap_or(backoff)) => {
+                        if flat_wait.is_none() {
+                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                        }
                     },
                     // netstate PR-2b — the network moved: retry NOW with a
                     // reset ladder instead of waiting out a backoff sized
@@ -1374,6 +1430,7 @@ pub async fn run(
                     _ = next_major_netchange(&mut ladder_net_rx) => {
                         info!("network changed during reconnect backoff — retrying immediately");
                         backoff = Duration::from_secs(1);
+                        flat_redial.restart();
                         // New network = new throttle regime: the slowness
                         // treadmill re-earns its verdict from scratch.
                         slowness_cycles = 0;
@@ -2945,6 +3002,14 @@ async fn connect_once(
                     let _stage = watchdog::enter(ctx.pump, "ws.text");
                     last_rx = std::time::Instant::now();
                     watchdog::tick(ctx.pump);
+                    // FR-43 P3a — the stand-in sends none, so a text frame here
+                    // is something else on its port. This process holds the
+                    // person's capture grants, and it takes a session from the
+                    // root's delegation channel alone.
+                    if ctx.unenrolled {
+                        warn!("a text frame on the stand-in control plane's socket; dropped");
+                        continue;
+                    }
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
                             // #2551 — which message this arm is handling: the
@@ -5196,7 +5261,7 @@ async fn handle_server_msg(
                     if !applied.needs_restart.is_empty() {
                         warn!(
                             keys = ?applied.needs_restart,
-                            "rc:agent.config — saved, but these need a daemon restart \
+                            "rc:agent.config — these need a daemon restart \
                              to take effect"
                         );
                     }
@@ -5436,6 +5501,9 @@ async fn handle_server_msg(
                 run_as,
                 // Where it always started, or its `cwd` (FR-97 P5b is SSH's).
                 start_in_home: false,
+                // A command here may stop this daemon, and must outlive it
+                // (`roomler exec … self-update`, #2718).
+                session_owned: false,
             };
             let ind = indicator.clone();
             tokio::spawn(async move {

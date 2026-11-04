@@ -36,6 +36,7 @@ const WHOLE_FOLDERS: &[&str] = &[
 /// with a spawn on this path; the others are here so that one added to them
 /// fails too.
 const DAEMON_FILES: &[&str] = &[
+    "agents/roomlerd/src/code_signature.rs",
     "agents/roomlerd/src/updater.rs",
     "agents/roomlerd/src/service.rs",
     "agents/roomlerd/src/jwt_introspect.rs",

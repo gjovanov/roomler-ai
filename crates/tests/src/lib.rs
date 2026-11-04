@@ -50,6 +50,10 @@ mod agent_e2e_tests;
 mod agent_exec_tests;
 #[cfg(test)]
 mod agent_presence_tests;
+/// FR-28 — the control socket's redial on the load balancer's 502, through the
+/// real signaling loop and a scripted front.
+#[cfg(test)]
+mod agent_redial_tests;
 /// #2267 — a removal (or an archive) tells a connected device at once with
 /// `rc:goodbye AgentDeleted`, instead of leaving it its socket.
 #[cfg(test)]
@@ -310,6 +314,11 @@ mod relay_region_tests;
 mod remote_control_tests;
 #[cfg(test)]
 mod remote_recording_tests;
+/// FR-40 P2 — a key a device rotated away from cannot be used to rejoin:
+/// refused `key_retired` at join and DERP under the org's `enforce`, the
+/// device with the verb ordered to rotate (once), `warn` and `off` admit.
+#[cfg(test)]
+mod retired_key_tests;
 #[cfg(test)]
 mod role_reconcile_tests;
 #[cfg(test)]
@@ -367,6 +376,10 @@ mod tenant_archive_tests;
 /// earlier token (agents and tunnel clients alike).
 #[cfg(test)]
 mod token_renewal_tests;
+/// #1821, #1829 — what a removal leaves behind answers nothing: External
+/// access on a removed device, and an overlay join on the socket it still holds.
+#[cfg(test)]
+mod tombstone_tests;
 /// FR-111 P4a — the org's on-screen control presets: any member reads them,
 /// `MANAGE_TENANT` writes them, a foreign id is a 404, a bad body is refused
 /// with a code, and an org keeps at most fifty.

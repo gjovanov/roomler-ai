@@ -157,6 +157,10 @@ Two consequences worth knowing:
 
 - **Removal is final.** A removed machine that re-enrolls comes back as a *new*
   node with a fresh address and a fresh name; the tombstone is never revived.
+  Until it does, it takes no lease at all: a join is refused while the row behind
+  the socket is a tombstone (#1829), or its org is archived (#3042), and it is the
+  kick or the revocation poll that tells it why. A relay request naming a released
+  peer gets no grant.
 - **Evict is "force a new lease", not "ban".** It doesn't touch the backing
   agent / tunnel client, so a still-enrolled device rejoins on its next connect
   with a *different* address. To remove a device for good, delete it. There is
@@ -257,7 +261,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:348`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:356`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -692,9 +696,9 @@ flowchart LR
 
 | Lever | Where | What it does |
 |---|---|---|
-| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:472` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
-| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:374`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
-| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:440`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:477` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:71`), called once per connect (`:379`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:440`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:445`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
 
 ⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
 still return success, so the daemon reads the size back with
@@ -727,11 +731,11 @@ buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:165`). It carries
 | no TCP socket under the WebSocket | WARN | *"… left at the OS default — unrecognised TLS wrapper"* |
 
 The verdict per OS and the line's fields are pinned by unit tests
-(`agents/roomlerd/src/derp.rs:675`, `:841`). Two more use a real loopback
+(`agents/roomlerd/src/derp.rs:942`, `:1108`). Two more use a real loopback
 socket. In one, the cap reaches the socket under the WebSocket and reads back
-as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:753`).
+as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:1020`).
 In the other, a socket filled until the kernel takes no more keeps the size its
-cap read back (`agents/roomlerd/src/derp.rs:781`). CI runs them on Linux and
+cap read back (`agents/roomlerd/src/derp.rs:1048`). CI runs them on Linux and
 Windows.
 
 ⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
@@ -816,6 +820,17 @@ long-lived sockets on the wrong pod after a roll.
 under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), the image pull
 (3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:49`), which is
 why per-roll medians land on 7.5, 15 and 25 s.
+
+**Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
+
+| Lever | What it changes | Switch |
+|---|---|---|
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:60`), up to 30 times an outage. Every other failure keeps the ladder | `ws_flat_redial`, default OFF |
+| Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)) | The deploy repo's DaemonSet file |
+
+⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a
+502 is flat, an accepted socket that does not last refills nothing, and the allowance bounds a 502 that never ends,
+such as a corporate proxy's.
 
 ---
 

@@ -13,7 +13,8 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{AccessPolicy, AgentStatus, InstallInfo, OsKind};
-use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::dao::base::{DaoError, PaginationParams};
+use roomler_ai_services::dao::tenant::TenantDao;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,28 @@ impl EnrollmentTokenRequest {
     }
 }
 
+/// What an archived org answers at every door an enrollment comes through.
+pub const ARCHIVED_ORG_REFUSES_ENROLLMENT: &str =
+    "This organization is archived and accepts no device enrollments";
+
+/// An archived org accepts no devices — including back into an existing row,
+/// which is what makes archiving a throwaway org actually final
+/// (`routes::tenant::archive`). #3042: one check, for a daemon and a tunnel client
+/// alike, at the routes that enroll and the routes that mint a token for them.
+///
+/// A tenant that is gone answers as it always has: enrollment is what would
+/// surface that, and it has its own answer. A failed read refuses: an org that
+/// cannot be shown to be open enrolls nothing, and the token stays unspent.
+pub async fn org_accepts_enrollment(tenants: &TenantDao, tid: ObjectId) -> Result<(), ApiError> {
+    match tenants.base.find_by_id(tid).await {
+        Ok(t) if t.is_archived => Err(ApiError::Forbidden(
+            ARCHIVED_ORG_REFUSES_ENROLLMENT.to_string(),
+        )),
+        Ok(_) | Err(DaoError::NotFound) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// POST /api/tenant/{tenant_id}/agent/enroll-token — admin issues an enrollment
 /// token that a new agent binary exchanges (once, within 10 min) for a
 /// long-lived agent token.
@@ -107,6 +130,7 @@ pub async fn issue_enrollment_token(
         "MANAGE_AGENTS",
     )
     .await?;
+    org_accepts_enrollment(&state.tenants, tid).await?;
 
     let anchor = EnrollmentTokenRequest::from_body(&headers, &body)?.anchor;
     let (token, jti) =
@@ -191,22 +215,9 @@ pub async fn enroll_agent(
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
-    // An archived org accepts no devices — including back into an existing
-    // row, which is what makes archiving a throwaway org actually final
-    // (`routes::tenant::archive`). Checked before the single-use claim so a
-    // refused enrollment does not also burn the token.
-    if state
-        .tenants
-        .base
-        .find_by_id(tid)
-        .await
-        .map(|t| t.is_archived)
-        .unwrap_or(false)
-    {
-        return Err(ApiError::Forbidden(
-            "This organization is archived and accepts no device enrollments".to_string(),
-        ));
-    }
+    // Checked before the single-use claim so a refused enrollment does not also
+    // burn the token.
+    org_accepts_enrollment(&state.tenants, tid).await?;
 
     if is_ephemeral {
         return enroll_agent_ephemeral(&state, tid, admin_uid, &claims.jti, body).await;
@@ -761,6 +772,11 @@ pub struct KeyRotationView {
     pub request_id: String,
     pub requested_at: String,
     pub requested_by: String,
+    /// FR-40 P2 — set when the SERVER placed the order (`key_retired`: the
+    /// device presented a retired key at its join); `requested_by` is then
+    /// the zero id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivered_at: Option<String>,
     /// P1c — the key the device held when the order was placed; the grid's
@@ -853,6 +869,7 @@ fn key_rotation_view(
         request_id: req.request_id,
         requested_at: fmt_dt(req.requested_at),
         requested_by: req.requested_by.to_hex(),
+        trigger: req.trigger,
         delivered_at: req.delivered_at.map(fmt_dt),
         public_key_before: req.public_key_before,
         report: report.map(|r| KeyRotationReportView {
@@ -1887,6 +1904,7 @@ mod key_rotation_state_tests {
             request_id: "r1".into(),
             requested_by: ObjectId::new(),
             requested_at: at,
+            trigger: None,
             delivered_at: delivered.then_some(at),
             public_key_before: before.map(str::to_string),
         }

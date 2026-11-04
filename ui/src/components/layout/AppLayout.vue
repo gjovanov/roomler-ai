@@ -696,8 +696,8 @@
             />
             <v-text-field
               v-model="orgSlug"
-              label="Slug"
-              hint="URL-friendly identifier, globally unique"
+              label="Short name"
+              hint="Lowercase letters, digits and dashes, used in links. Unique on this server."
               :rules="[rules.required, rules.slug]"
               @update:model-value="orgSlugTouched = true"
             />
@@ -1200,7 +1200,7 @@ async function handleCreateOrg() {
     // tenants.slug is globally unique, and a taken slug is the only 409 here.
     showCreateOrgError(
       e instanceof ApiError && e.status === 409
-        ? 'That slug is already taken — pick another'
+        ? 'That short name is already taken — pick another'
         : msg,
     )
   } finally {

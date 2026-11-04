@@ -174,10 +174,10 @@ fn far_turn_verdict(target: Option<bool>, browser: Option<bool>) -> Option<bool>
 }
 
 /// Network's side of the tenant cascade (P7b, from the host's archive
-/// route): release every overlay node — which pools its address and tells
-/// the peers — then quarantine the tenant's block, never re-issue it (a
-/// device that never saw the archive still thinks it owns an address in that
-/// range).
+/// route): revoke every tunnel client, release every overlay node — which pools
+/// its address and tells the peers — then quarantine the tenant's block, never
+/// re-issue it (a device that never saw the archive still thinks it owns an
+/// address in that range).
 pub struct NetworkTenantHooks {
     pub state: NetworkState,
 }
@@ -190,6 +190,34 @@ impl TenantLifecycle for NetworkTenantHooks {
         reason: &str,
     ) -> anyhow::Result<TenantArchived> {
         let state = &self.state;
+
+        // #3042 — every enrollment is revoked, a tunnel client's too: its long-lived
+        // token stays valid for its year, so the row is what withdraws it, and its
+        // socket ends at the next revocation poll. Before the nodes, so nothing can
+        // lease again behind the release. A failed read or write logs and goes on,
+        // like every other step of this cascade: the org is already archived.
+        let mut devices_revoked = 0u64;
+        match state
+            .tunnel_clients
+            .list_all_active_for_tenant(tenant_id)
+            .await
+        {
+            Ok(clients) => {
+                for id in clients.iter().filter_map(|c| c.id) {
+                    match state.tunnel_clients.soft_delete(tenant_id, id).await {
+                        Ok(true) => devices_revoked += 1,
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(%tenant_id, client = %id, %e, "archive: could not revoke a tunnel client");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%tenant_id, %e, "archive: could not list the tunnel clients");
+            }
+        }
+
         let network = state
             .overlay_networks
             .find_for_tenant(tenant_id)
@@ -234,7 +262,7 @@ impl TenantLifecycle for NetworkTenantHooks {
         }
 
         Ok(TenantArchived {
-            devices_revoked: 0,
+            devices_revoked,
             nodes_released,
             block_quarantined,
         })

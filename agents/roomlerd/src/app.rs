@@ -231,6 +231,12 @@ enum Command {
         /// readable via `ps`, while the pipe is only the parent's.
         #[arg(long, hide = true)]
         supervised: bool,
+        /// FR-43 P3a (macOS) — this worker holds no enrollment: the root daemon
+        /// that spawned it does (`macos_one_row`). It dials no server and takes
+        /// its sessions from the delegation channel alone, and any enrollment
+        /// in the person's config is ignored and left in the file.
+        #[arg(long, hide = true, requires = "supervised")]
+        unenrolled: bool,
         /// FR-84 D3 (Windows) — which spawner started this worker: `scm` (the
         /// SCM service host's supervisor, `win_service::worker_args`) or
         /// `task` (the per-user Scheduled Task's action, `service.rs`). It is
@@ -265,6 +271,13 @@ enum Command {
         /// the same reason as `--stop-event`.
         #[arg(long, hide = true)]
         gpu_pin_event: Option<String>,
+        /// #3289 (Windows) — the SCM service host's word for how the last
+        /// worker ended, when it saw that end and it was not the worker failing
+        /// (`supervisor::worker_end_is_no_crash`). This start then does not
+        /// count the last run as a crash. Passed only by the host; hidden for
+        /// the same reason as `--stop-event`.
+        #[arg(long, hide = true)]
+        prior_end: Option<String>,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -1709,6 +1722,7 @@ async fn daemon_main() -> Result<()> {
         // A bare `roomlerd` is never a supervised worker: the supervisor always
         // spawns `run --supervised` explicitly.
         supervised: false,
+        unenrolled: false,
         // Likewise the Windows spawners always say which one they are.
         supervisor: None,
         // #1683 — only the SCM service host passes a stop-event name.
@@ -1717,6 +1731,8 @@ async fn daemon_main() -> Result<()> {
         sas_event: None,
         // FR-119 P2b-16 — and a GPU-pin relay.
         gpu_pin_event: None,
+        // #3289 — and what it saw of the last worker's end.
+        prior_end: None,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1807,10 +1823,12 @@ async fn daemon_main() -> Result<()> {
         Command::Run {
             encoder,
             supervised,
+            unenrolled,
             supervisor,
             stop_event,
             sas_event,
             gpu_pin_event,
+            prior_end,
         } => {
             // FR-97 P4a — the host's relay, for the real Ctrl+Alt+Del.
             #[cfg(target_os = "windows")]
@@ -1830,8 +1848,10 @@ async fn daemon_main() -> Result<()> {
                 &config_path,
                 encoder.as_deref(),
                 supervised,
+                unenrolled,
                 supervisor.as_deref(),
                 stop_event.as_deref(),
+                prior_end.as_deref(),
             )
             .await
             .map(|restart| {
@@ -2574,6 +2594,27 @@ fn rollback_attention_msg(
          and reinstall manually.",
     );
     msg
+}
+
+/// #3289 — what a crash loop says where the installer cannot go back
+/// ([`updater::ROLLBACK_CAN_DOWNGRADE`]). Nothing was attempted, so nothing failed,
+/// and running the older installer over this version is the one thing it refuses.
+/// The way back it gives is measured: an uninstall keeps the config and the
+/// enrollment, and with updates left on the older version took this one back in 25 s.
+fn crash_loop_no_rollback_msg(current: &str, target: &str, crash_count: u32) -> String {
+    format!(
+        "Roomler agent: crash loop detected.\n\n\
+         Version {current} has crashed {crash_count} times within {win_min} min. \
+         Last known good version: {target}.\n\n\
+         This device did not roll back: the Windows installer refuses to install an \
+         older version over a newer one. It stays on {current} and updates itself as \
+         usual when a newer release is published.\n\n\
+         To go back sooner: set auto_update = false in this device's config.toml, \
+         uninstall Roomler, then install {target} from\n\
+         https://github.com/gjovanov/roomler-ai/releases\n\
+         With updates left on, it takes {current} again at its first check.",
+        win_min = config::CRASH_WINDOW_SECS / 60,
+    )
 }
 
 fn unix_now() -> u64 {
@@ -3747,15 +3788,22 @@ async fn run_cmd(
     config_path: &PathBuf,
     cli_encoder: Option<&str>,
     supervised: bool,
+    // FR-43 P3a — a GUI worker with no enrollment (`run --supervised
+    // --unenrolled`). Its own branches below are few on purpose: most of what
+    // it does not do follows from the view of the config it runs on.
+    unenrolled: bool,
     supervisor_flag: Option<&str>,
     // #1683 (Windows) — the SCM host's stop event, waited on by
     // `terminate_signal`. `None` on every non-service run and every other
     // platform.
     stop_event: Option<&str>,
+    // #3289 (Windows) — the SCM host's word for the last worker's end, when it
+    // saw that end and it was not the worker failing. `None` everywhere else.
+    prior_end: Option<&str>,
 ) -> Result<Option<i32>> {
     // FR-84 D3 — this process's own clock, for the restart verb's uptime rule.
     let process_started = std::time::Instant::now();
-    if !config_path.exists() {
+    if !config_path.exists() && !unenrolled {
         bail!(
             "no config found at {}. Run `roomlerd enroll` first.",
             config_path.display()
@@ -3807,6 +3855,14 @@ async fn run_cmd(
     // with the session (`PartOf=`), and a user manager that outlives a logout
     // never reaches `default.target` twice. Per-user only, on its own thread.
     roomlerd::service::repair_session_wants_at_start();
+    // FR-43 P3a — a person with no enrollment on a one-row Mac has no file yet,
+    // and `caps`, `record` and `config set` all load it. After the lock, so one
+    // process writes it.
+    if unenrolled && !config_path.exists() {
+        let name = roomlerd::machine::hostname().unwrap_or_default();
+        let blank = config::AgentConfig::for_person_with_no_enrollment(&name)?;
+        config::save(config_path, &blank).context("writing the person's config")?;
+    }
     let mut cfg = config::load(config_path).context("loading config")?;
     // #3116 — every save below, up to the LocalAPI coming up, writes THIS
     // copy, so each goes through `startup_writes`: it refuses to write over a
@@ -3814,6 +3870,21 @@ async fn run_cmd(
     // enrollment, a second after the MSI restarted the service). The runtime
     // writers after it reload under the write lock instead.
     let mut startup_writes = config::StartupWrites::after_load(config_path);
+    // FR-43 P3a — from here this process runs on a view of the person's file,
+    // pointed at its own stand-in control plane. The file stays as it is: its
+    // startup saves are off, and the writers after them reload it first.
+    if unenrolled {
+        let stand_in = roomlerd::unenrolled::StandIn::start().await?;
+        cfg = cfg.for_unenrolled_worker(
+            &stand_in.server_url(),
+            &stand_in.ws_url(),
+            stand_in.secret(),
+        );
+        startup_writes = config::StartupWrites::read_only(config_path);
+        tracing::info!(
+            "a GUI worker with no enrollment: sessions come from the root daemon alone (FR-43 P3a)"
+        );
+    }
     // FR-90 P2k-4 (F4) — an archive replica enrolled before its posture
     // joined the mesh joins it at its first start in a newer image, before
     // anything reads the overlay keys (the WG key is minted below from them).
@@ -4049,7 +4120,10 @@ async fn run_cmd(
     // routing was active when it died — then had overlay disabled — is still
     // healed (else a persisted Windows Wintun `/1` blackholes egress to a dead
     // NIC until reboot). No-op on non-`overlay-l3` builds.
-    roomlerd::purge_exit_routes();
+    // #3291 — the start waits for the exit-DNS purge for a bounded time only:
+    // a starved host held its `powershell` for as long as the load lasted, and
+    // the device stayed offline meanwhile. The purge still runs to its end.
+    roomlerd::purge_exit_routes_at_start();
 
     let encoder_preference = resolve_encoder_preference(cli_encoder, cfg.encoder_preference);
     // FR-84 D4 — publish the RESOLVED preference, so the LocalAPI reports
@@ -4134,48 +4208,52 @@ async fn run_cmd(
     // but logs an actionable hint up front so the operator doesn't
     // chase the wrong rabbit hole when the WS reconnect ladder kicks
     // in. 15 s overall budget, 5 s per probe in parallel.
-    let preflight_report = preflight::run_checks(&cfg.server_url).await;
-    preflight_report.log();
+    // FR-43 P3a — not a worker with no enrollment: it has no server to check.
+    if !unenrolled {
+        let preflight_report = preflight::run_checks(&cfg.server_url).await;
+        preflight_report.log();
+    }
 
     // Crash-loop bookkeeping: if the previous run was marked
     // `last_run_unhealthy=true` (started, never reached the clean
-    // threshold, never exited gracefully) → count it as a crash. Then
-    // mark THIS run as tentatively unhealthy; either the 5-min healthy
+    // threshold, never exited gracefully) and neither the OS nor its
+    // service host ended it (#3289) → count it as a crash. Then mark
+    // THIS run as tentatively unhealthy; either the 5-min healthy
     // task or the Ctrl-C handler will flip the flag back to false.
     // Save before checking for rollback so the worst-case state is
     // durable on disk if we then crash again.
     let now_unix = unix_now();
     let current_pkg = env!("CARGO_PKG_VERSION");
-    if cfg.last_run_unhealthy {
-        config::record_crash_at(&mut cfg, now_unix);
-        tracing::warn!(
+    let boot_now = roomlerd::boot_id::current();
+    match config::previous_run(&cfg, boot_now.as_deref(), prior_end.is_some()) {
+        config::PreviousRun::Clean => {}
+        config::PreviousRun::Crashed => {
+            config::record_crash_at(&mut cfg, now_unix);
+            tracing::warn!(
+                crash_count = cfg.crash_count,
+                "previous run did not reach clean-run threshold — counting as crash"
+            );
+        }
+        ended => tracing::info!(
+            ?ended,
+            prior_end,
             crash_count = cfg.crash_count,
-            "previous run did not reach clean-run threshold — counting as crash"
-        );
+            "previous run did not reach clean-run threshold, but it did not crash — not counting it"
+        ),
     }
     config::mark_run_starting(&mut cfg);
+    cfg.last_run_boot = boot_now;
     if let Err(e) = startup_writes.save(&cfg) {
         tracing::warn!(error = %format!("{e:#}"), "could not persist crash-tracking state");
     }
 
     // If the crash counter has tripped the rollback threshold AND we
     // have a known-good fallback to roll back TO that isn't this same
-    // version, raise an attention sentinel. v1 does NOT auto-execute
-    // the rollback install — that requires fetching a specific tag's
-    // installer and ships in 0.1.52 alongside the SHA256 / HMAC
-    // manifest work. The operator can downgrade manually via
-    // `roomlerd self-update --pin <version>` (also 0.1.52) or
-    // by reinstalling the previous MSI by hand.
+    // version: go back to it where the installer can, and raise the
+    // attention sentinel where it cannot or when the attempt fails.
     if config::should_rollback(&cfg, current_pkg, now_unix)
         && let Some(target) = cfg.last_known_good_version.clone()
     {
-        let target_tag = format!("agent-v{target}");
-        tracing::error!(
-            current = %current_pkg,
-            target = %target_tag,
-            crash_count = cfg.crash_count,
-            "crash loop detected; attempting automatic rollback"
-        );
         // Mark attempted FIRST so a crash during the rollback
         // itself doesn't loop us back into another rollback. If the
         // rollback fetch / install fails, the operator still gets
@@ -4183,65 +4261,96 @@ async fn run_cmd(
         config::mark_rollback_attempted(&mut cfg);
         let _ = startup_writes.save(&cfg);
 
-        let outcome = updater::pin_version(&target_tag).await;
-        match outcome {
-            updater::CheckOutcome::UpdateReady {
-                latest,
-                installer_path,
-                ..
-            } => {
-                tracing::warn!(
-                    target = %latest,
-                    path = %installer_path.display(),
-                    "rollback installer downloaded — spawning + exiting"
-                );
-                if let Err(e) = updater::spawn_installer_with_watch(&installer_path, Some(&latest))
-                {
-                    tracing::error!(error = %e, "rollback installer spawn failed");
-                    let _ = notify::raise_attention_with_reason_for_version(
-                        notify::REASON_ROLLBACK,
+        if updater::ROLLBACK_CAN_DOWNGRADE {
+            let target_tag = format!("agent-v{target}");
+            tracing::error!(
+                current = %current_pkg,
+                target = %target_tag,
+                crash_count = cfg.crash_count,
+                "crash loop detected; attempting automatic rollback"
+            );
+            let outcome = updater::pin_version(&target_tag).await;
+            match outcome {
+                updater::CheckOutcome::UpdateReady {
+                    latest,
+                    installer_path,
+                    ..
+                } => {
+                    tracing::warn!(
+                        target = %latest,
+                        path = %installer_path.display(),
+                        "rollback installer downloaded — spawning + exiting"
+                    );
+                    if let Err(e) =
+                        updater::spawn_installer_with_watch(&installer_path, Some(&latest))
+                    {
+                        tracing::error!(error = %e, "rollback installer spawn failed");
+                        // FR-53: the build being accused, so a later healthy
+                        // connect from a different one can clear this.
+                        let _ = notify::raise_rollback_attention(
+                            &rollback_attention_msg(
+                                current_pkg,
+                                &target,
+                                cfg.crash_count,
+                                Some(&format!("automatic install failed: {e}")),
+                            ),
+                            current_pkg,
+                        );
+                    } else {
+                        // Installer is running, agent is about to exit.
+                        // The post-install watcher (spawned by
+                        // spawn_installer_with_watch) will record the
+                        // verdict in last-install.json; the new binary
+                        // can surface it on next start. #3289 — this exit is
+                        // our own, so the next start must not count it.
+                        config::mark_clean_shutdown(&mut cfg);
+                        let _ = startup_writes.save(&cfg);
+                        return Ok(None);
+                    }
+                }
+                updater::CheckOutcome::Skipped(reason)
+                | updater::CheckOutcome::Unreachable(reason) => {
+                    tracing::error!(%reason, "rollback fetch skipped — operator action required");
+                    let _ = notify::raise_rollback_attention(
                         &rollback_attention_msg(
                             current_pkg,
                             &target,
                             cfg.crash_count,
-                            Some(&format!("automatic install failed: {e}")),
+                            Some(&reason),
                         ),
-                        // FR-53: the build being accused, so a later
-                        // healthy connect from a different one can clear this.
-                        Some(current_pkg),
+                        current_pkg,
                     );
-                } else {
-                    // Installer is running, agent is about to exit.
-                    // The post-install watcher (spawned by
-                    // spawn_installer_with_watch) will record the
-                    // verdict in last-install.json; the new binary
-                    // can surface it on next start.
-                    return Ok(None);
+                }
+                updater::CheckOutcome::UpToDate { .. } => {
+                    tracing::warn!(
+                        "rollback target reports as up-to-date — odd state, raising sentinel"
+                    );
+                    let _ = notify::raise_rollback_attention(
+                        &rollback_attention_msg(
+                            current_pkg,
+                            &target,
+                            cfg.crash_count,
+                            Some(
+                                "target version reports as up-to-date — manual investigation needed",
+                            ),
+                        ),
+                        current_pkg,
+                    );
                 }
             }
-            updater::CheckOutcome::Skipped(reason) | updater::CheckOutcome::Unreachable(reason) => {
-                tracing::error!(%reason, "rollback fetch skipped — operator action required");
-                let _ = notify::raise_attention_with_reason_for_version(
-                    notify::REASON_ROLLBACK,
-                    &rollback_attention_msg(current_pkg, &target, cfg.crash_count, Some(&reason)),
-                    Some(current_pkg),
-                );
-            }
-            updater::CheckOutcome::UpToDate { .. } => {
-                tracing::warn!(
-                    "rollback target reports as up-to-date — odd state, raising sentinel"
-                );
-                let _ = notify::raise_attention_with_reason_for_version(
-                    notify::REASON_ROLLBACK,
-                    &rollback_attention_msg(
-                        current_pkg,
-                        &target,
-                        cfg.crash_count,
-                        Some("target version reports as up-to-date — manual investigation needed"),
-                    ),
-                    Some(current_pkg),
-                );
-            }
+        } else {
+            // #3289 — no download and no exit: the installer would refuse, and this
+            // process is still the device's remote access for as long as it stays up.
+            tracing::error!(
+                current = %current_pkg,
+                last_known_good = %target,
+                crash_count = cfg.crash_count,
+                "crash loop detected; the installer here refuses a downgrade, so no rollback runs"
+            );
+            let _ = notify::raise_rollback_attention(
+                &crash_loop_no_rollback_msg(current_pkg, &target, cfg.crash_count),
+                current_pkg,
+            );
         }
     }
 
@@ -4410,6 +4519,7 @@ async fn run_cmd(
     let _ = watchdog::install(wd.clone());
     watchdog::spawn_thread_watchdog(wd.clone());
     tokio::spawn(roomlerd::resource_watch::run(shutdown_rx.clone()));
+    tokio::spawn(roomlerd::runtime_canary::run(shutdown_rx.clone()));
     let wd_task = tokio::spawn({
         let wd = wd.clone();
         let rx = shutdown_rx.clone();
@@ -4450,6 +4560,11 @@ async fn run_cmd(
         let token = primary_token.clone();
         let mut shutdown = shutdown_rx.clone();
         async move {
+            // FR-43 P3a — a worker with no enrollment has no token to upload
+            // on. Its supervisor records a crash the panic hook could not.
+            if unenrolled {
+                return;
+            }
             // Initial drain (formerly the only call site).
             crash_uploader::drain_and_upload(&cfg, &token).await;
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -4482,7 +4597,20 @@ async fn run_cmd(
     // `ROOMLERD_LOGS_UPLOAD_DISABLED=1` per the rc.58 plan.
     let logs_upload_disabled =
         roomlerd::logs_upload::parse_disable_flag(node_env("LOGS_UPLOAD_DISABLED").as_deref());
-    if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
+    // FR-43 P3a — a worker with no enrollment has no token to upload on, so its
+    // lines go to the root daemon over the delegation channel, and the daemon
+    // uploads them on its row (`delegate_worker`). Its kill switch is this one.
+    let worker_log_lines = if unenrolled && !logs_upload_disabled {
+        logging::take_log_upload_receiver()
+    } else {
+        None
+    };
+    if unenrolled {
+        tracing::info!(
+            forwarded = worker_log_lines.is_some(),
+            "logs upload: through the root daemon, since this worker holds no enrollment"
+        );
+    } else if !logs_upload_disabled && let Some(rx) = logging::take_log_upload_receiver() {
         let host_hash = roomlerd::logs_upload::hash_hostname(
             &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
         );
@@ -4585,7 +4713,9 @@ async fn run_cmd(
         cfg_write_lock.clone(),
         cfg.exec_enabled,
         cfg.remote_config_enabled,
-    );
+    )
+    // FR-132 P1c — what this process runs, for the `needs_restart` it reports.
+    .running_on(&cfg);
     // FR-100 P1c — and every other live key it holds (`peer_auth`), from the
     // same config: a fresh `new` judges offers under `audit` until told.
     remote_cfg.adopt_local(&cfg);
@@ -4624,6 +4754,11 @@ async fn run_cmd(
     // terminal-error slot / OrgCtx) are minted here so the registry rows and
     // the spawned supervisors share the SAME instances.
     let primary_ctx = signaling::OrgCtx::primary(primary_token.clone()).with_renewal(token_renewal);
+    let primary_ctx = if unenrolled {
+        primary_ctx.unenrolled()
+    } else {
+        primary_ctx
+    };
     // FR-90 P4-3b-1 — the primary's knowhow scanner, reading its roots from
     // this config file under the LocalAPI's own write lock. A secondary's
     // context has none (decision 43).
@@ -4723,6 +4858,33 @@ async fn run_cmd(
     // the daemon tells it the overlay's blocks (`rc_overlay` off needs them).
     #[cfg(target_os = "macos")]
     delegate_host.set_overlay_footprint(tunnel_core::overlay_footprint::v4_nets);
+    // FR-43 P3a — a one-row Mac's worker holds no enrollment, so its log lines
+    // arrive over the delegation channel and go up on this row, each marked as
+    // the worker's. Root only: no other process supervises a worker.
+    #[cfg(target_os = "macos")]
+    if !unenrolled
+        && !logs_upload_disabled
+        && cfg.macos_one_row
+        && cfg.macos_supervise_gui_worker
+        // SAFETY: geteuid never fails.
+        && unsafe { libc::geteuid() } == 0
+    {
+        let (sink, lines) = tokio::sync::mpsc::channel(roomlerd::logs_upload::CHANNEL_CAPACITY);
+        delegate_host.set_worker_log_sink(sink);
+        let upload_cfg = roomlerd::logs_upload::UploadConfig {
+            server_url: cfg.server_url.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            agent_id: cfg.agent_id.clone(),
+            agent_jwt: primary_token.clone(),
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_id_hash: roomlerd::logs_upload::hash_hostname(
+                &roomlerd::machine::hostname().unwrap_or_else(|_| "unknown".to_string()),
+            ),
+            source: roomlerd::logs_upload::LogSource::Agent,
+        };
+        tokio::spawn(roomlerd::logs_upload::run_uploader(lines, upload_cfg));
+        tracing::info!("logs upload: the GUI worker's lines go up on this row (FR-43 P3a)");
+    }
 
     // FR-55 — keep the device reachable instead of letting it quietly sleep.
     // Default `never`, so on a device that has not opted in this task holds
@@ -4841,7 +5003,10 @@ async fn run_cmd(
     // companion's device list and mesh.
     .with_org_http(org_http.clone())
     // FR-51 P4 — surface the enrollment's nature in `roomler status`.
-    .with_ephemeral(cfg.ephemeral);
+    .with_ephemeral(cfg.ephemeral)
+    // FR-43 P3a — a worker with no enrollment sends what needs a server to the
+    // root half.
+    .with_no_enrollment(unenrolled);
     // FR-85 — the local recording verbs: this daemon launches `roomlerd
     // record` (its own image, resolved now, before any package upgrade can
     // leave `/proc/self/exe` pointing at a deleted inode).
@@ -4957,6 +5122,7 @@ async fn run_cmd(
     // revokes the worker. An abort would skip exactly that.
     let _macos_supervisor_task = tokio::spawn(roomlerd::macos_supervisor::run(
         cfg.macos_supervise_gui_worker,
+        cfg.macos_one_row,
         delegate_host.clone(),
         shutdown_rx.clone(),
     ));
@@ -4969,6 +5135,8 @@ async fn run_cmd(
     // Same: exits on the shutdown watch, so no abort.
     let _delegate_worker_task = tokio::spawn(roomlerd::delegate_worker::run(
         supervised,
+        unenrolled,
+        worker_log_lines,
         worker_channels,
         shutdown_rx.clone(),
         // #2987 — a worker whose daemon is gone stops through this door.
@@ -5368,6 +5536,17 @@ async fn run_cmd(
                         }
                         Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
                     }
+                    drop(_write_guard);
+                    // #3302 — a watcher stopped before its verdict leaves the record
+                    // at InProgress for good. Healthy this long, this daemon can say.
+                    if let Some(wait) = post_install::settle_record(&pkg) {
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {
+                                let _ = post_install::settle_record(&pkg);
+                            }
+                            _ = shutdown.changed() => {}
+                        }
+                    }
                 }
                 _ = shutdown.changed() => {}
             }
@@ -5560,14 +5739,16 @@ async fn run_cmd(
             // (rollbacks included); the policy itself is one pure table
             // (`updater::should_self_unenroll`). Platform-neutral on purpose.
             let update_in_flight = updater::update_in_flight();
-            if updater::should_self_unenroll(current.ephemeral, os_initiated_stop, update_in_flight)
-            {
+            // FR-43 P3a — `current` is the person's file, and a worker with no
+            // enrollment is not the row in it, whatever kind that row is.
+            let ephemeral = current.ephemeral && !unenrolled;
+            if updater::should_self_unenroll(ephemeral, os_initiated_stop, update_in_flight) {
                 match enrollment::self_unenroll(&current.server_url, &current.agent_token).await {
                     Ok(()) => tracing::info!("ephemeral device unenrolled itself on shutdown"),
                     Err(e) => tracing::warn!(error = %e,
                         "ephemeral self-unenroll failed; the server-side reaper will collect this device"),
                 }
-            } else if current.ephemeral && os_initiated_stop {
+            } else if ephemeral && os_initiated_stop {
                 // The one way the gate says no to an ephemeral OS stop. Named,
                 // so "why is this row still here?" has an answer in the log.
                 tracing::info!(
@@ -7459,6 +7640,45 @@ mod tests {
         match cli.command {
             Some(Command::KeepSystemContext { no_restart }) => assert!(!no_restart),
             other => panic!("expected KeepSystemContext, got {other:?}"),
+        }
+    }
+
+    /// #3289 — nothing was attempted, so it does not say an attempt failed, and it
+    /// does not send a person to the one thing the installer refuses.
+    #[test]
+    fn a_crash_loop_with_no_rollback_says_what_is_true() {
+        let msg = crash_loop_no_rollback_msg("0.4.220", "0.4.197", 3);
+        assert!(msg.contains("0.4.220 has crashed 3 times within 10 min"));
+        assert!(msg.contains("Last known good version: 0.4.197"));
+        assert!(msg.contains("did not roll back"));
+        assert!(msg.contains("auto_update = false"));
+        assert!(msg.contains("uninstall Roomler, then install 0.4.197"));
+        assert!(!msg.contains("auto-rollback failed"));
+        assert!(!msg.contains("reinstall manually"));
+    }
+
+    /// #3289 — a worker the host hands a flag this build does not parse exits at
+    /// once, on every spawn, so the host's spelling is read back here.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_a_worker_as_the_service_host_spawns_it() {
+        use roomlerd::win_service::supervisor::{ENDED_BY_HOST, prior_end_args};
+        for word in [Some(ENDED_BY_HOST), None] {
+            let mut argv = vec!["roomlerd".to_string()];
+            argv.extend(win_service::worker_args());
+            argv.extend(prior_end_args(word));
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    supervisor,
+                    prior_end,
+                    ..
+                }) => {
+                    assert_eq!(supervisor.as_deref(), Some("scm"));
+                    assert_eq!(prior_end.as_deref(), word);
+                }
+                other => panic!("expected run, got {other:?}"),
+            }
         }
     }
 

@@ -463,30 +463,48 @@ pub fn stdin_link<R: std::io::BufRead>(
     }
 }
 
+/// FR-43 P3a — what `spawn_worker` starts a worker with, after the executable.
+/// With `one_row` the worker holds no enrollment (`macos_one_row`).
+pub fn worker_args(one_row: bool) -> &'static [&'static str] {
+    if one_row {
+        &["run", "--supervised", "--unenrolled"]
+    } else {
+        &["run", "--supervised"]
+    }
+}
+
 /// #2987 — a supervised worker's command line, as `ps` prints it: the argv
 /// `spawn_worker` builds (`/usr/bin/env` execs into the agent, so it is not
 /// part of it).
-pub fn worker_command(exe: &str) -> String {
-    format!("{exe} run --supervised")
+pub fn worker_command(exe: &str, one_row: bool) -> String {
+    format!("{exe} {}", worker_args(one_row).join(" "))
+}
+
+/// FR-43 P3a — every command line a supervised worker can run under. A daemon
+/// looks for both whatever its own switch says: the worker left behind may be
+/// from before the switch last moved.
+pub fn worker_commands(exe: &str) -> [String; 2] {
+    [worker_command(exe, false), worker_command(exe, true)]
 }
 
 /// #2987 — the workers a previous daemon left behind, out of
-/// `ps -axww -o pid= -o uid= -o command=`: every process that runs exactly
-/// `command` as a person (uid ≠ 0), other than `own_pid`. Returns
+/// `ps -axww -o pid= -o uid= -o command=`: every process that runs exactly one
+/// of `commands` as a person (uid ≠ 0), other than `own_pid`. Returns
 /// `(pid, uid)` pairs.
 ///
 /// Exact match only, because each match gets a SIGTERM from root.
-/// `--supervised` appears on no command line except the one `spawn_worker`
+/// `--supervised` appears on no command line except the ones `spawn_worker`
 /// builds, so a hand-run `roomlerd run`, launchd's own worker (`… run`) and
 /// the daemon (`… --config … run`) never match.
-pub fn stale_workers(ps: &str, command: &str, own_pid: u32) -> Vec<(u32, u32)> {
+pub fn stale_workers(ps: &str, commands: &[String], own_pid: u32) -> Vec<(u32, u32)> {
     ps.lines()
         .filter_map(|line| {
             let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
             let (uid, cmd) = rest.trim_start().split_once(char::is_whitespace)?;
             let pid: u32 = pid.parse().ok()?;
             let uid: u32 = uid.parse().ok()?;
-            (cmd.trim() == command && uid != 0 && pid != own_pid).then_some((pid, uid))
+            let cmd = cmd.trim();
+            (commands.iter().any(|c| c == cmd) && uid != 0 && pid != own_pid).then_some((pid, uid))
         })
         .collect()
 }
@@ -497,7 +515,10 @@ pub fn stale_workers(ps: &str, command: &str, own_pid: u32) -> Vec<(u32, u32)> {
 /// launchd's "don't relaunch me"). A missing per-user enrollment ends in an
 /// error, which is code 1. Before #2987 the give-up named only the second, so
 /// the first was misreported as an enrollment problem.
-pub fn gave_up_reason(last: Option<WorkerEnd>) -> &'static str {
+///
+/// FR-43 P3a — a worker with no enrollment needs no per-user config, so under
+/// `one_row` that second reading would send a person after the wrong thing.
+pub fn gave_up_reason(last: Option<WorkerEnd>, one_row: bool) -> &'static str {
     match last {
         Some(WorkerEnd::Code(0)) => {
             "each worker exited 0 at once: another roomlerd holds this person's \
@@ -505,6 +526,11 @@ pub fn gave_up_reason(last: Option<WorkerEnd>) -> &'static str {
              (a hand-run `roomlerd run`, say). Find it with: pgrep -lU <uid> roomlerd. \
              Once it is gone, restart this daemon: \
              launchctl kickstart -k system/com.roomler.daemon"
+        }
+        _ if one_row => {
+            "this worker holds no enrollment, so the cause is not a per-user config: read how \
+             it ended in its own log, under the console user's \
+             Library/Application Support/live.roomler.roomler/logs"
         }
         _ => {
             "almost always this Mac has no per-user enrollment: the worker runs AS the \
@@ -609,7 +635,15 @@ mod imp {
     /// resolves the user's own config — the same enrollment the LaunchAgent
     /// would have used. P1 changes who launches the worker, nothing about its
     /// identity.
-    fn spawn_worker(uid: u32, exe: &std::path::Path, secret: &str) -> std::io::Result<Child> {
+    ///
+    /// FR-43 P3a — with `one_row` the worker holds no enrollment. The person's
+    /// config still resolves the same way: its session knobs are theirs.
+    fn spawn_worker(
+        uid: u32,
+        exe: &std::path::Path,
+        secret: &str,
+        one_row: bool,
+    ) -> std::io::Result<Child> {
         let mut cmd = Command::new("launchctl");
         cmd.arg("asuser")
             .arg(uid.to_string())
@@ -642,9 +676,8 @@ mod imp {
         tunnel_core::child::inherit_only_stdio(&mut cmd);
         let mut child = cmd
             .arg(exe)
-            .arg("run")
-            // FR-43 P2a — tell the worker it is ours, and that its
-            // delegation-channel secret is waiting on stdin.
+            // FR-43 P2a — `--supervised` tells the worker it is ours, and that
+            // its delegation-channel secret is waiting on stdin.
             //
             // ⚠️ This REPLACES the `ROOMLER_MACOS_SUPERVISED` environment
             // marker P1 shipped, which never arrived at a single worker:
@@ -654,7 +687,7 @@ mod imp {
             // variables. Nothing had noticed because nothing read the marker
             // yet, which is precisely what made it worth checking before
             // building on it.
-            .arg("--supervised")
+            .args(worker_args(one_row))
             // The secret goes on the pipe, never in argv: `ps` is world
             // readable and the pipe is only ours.
             .stdin(Stdio::piped())
@@ -848,8 +881,8 @@ mod imp {
         };
         // #3080 — `ps` blocks, so it runs on the blocking pool, never on a
         // runtime worker.
-        let command = worker_command(exe);
-        let stale = tokio::task::spawn_blocking(move || find_processes(&command))
+        let commands = worker_commands(exe);
+        let stale = tokio::task::spawn_blocking(move || find_processes(&commands))
             .await
             .unwrap_or_default();
         for &(pid, uid) in &stale {
@@ -883,12 +916,12 @@ mod imp {
 
     /// `ps` once, read through [`stale_workers`]. If `ps` fails, nothing is
     /// found, which leaves things as they were before #2987.
-    fn find_processes(command: &str) -> Vec<(u32, u32)> {
+    fn find_processes(commands: &[String]) -> Vec<(u32, u32)> {
         // One `-o` per column: BSD `ps` lets only the LAST keyword of an `-o`
         // carry `=`, and `pid=,uid=` would make `,uid=` pid's header.
         let mut ps = Command::new("/bin/ps");
         ps.args(["-axww", "-o", "pid=", "-o", "uid=", "-o", "command="]);
-        find_processes_via(&mut ps, command)
+        find_processes_via(&mut ps, commands)
     }
 
     /// The read half of [`find_processes`], with the `ps` to run given, so a
@@ -900,11 +933,11 @@ mod imp {
     /// `route -n monitor` did, `Command::output()` waited on a runtime worker
     /// for an EOF that never came, and the supervisor never reached its loop.
     /// The Mac had no GUI worker, so no capture or input, until a restart.
-    fn find_processes_via(ps: &mut Command, command: &str) -> Vec<(u32, u32)> {
+    fn find_processes_via(ps: &mut Command, commands: &[String]) -> Vec<(u32, u32)> {
         match tunnel_core::child::output_bounded(ps, PS_DEADLINE) {
             Ok(out) if out.status.success() => stale_workers(
                 &String::from_utf8_lossy(&out.stdout),
-                command,
+                commands,
                 std::process::id(),
             ),
             Ok(out) => {
@@ -969,6 +1002,8 @@ mod imp {
     /// than the one it exists to fix.
     pub async fn run(
         enabled: bool,
+        // FR-43 P3a — `macos_one_row`: its workers hold no enrollment.
+        one_row: bool,
         delegate: crate::delegate::DelegateHost,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
@@ -980,6 +1015,12 @@ mod imp {
                 is_root,
                 "macOS GUI-worker supervisor idle (switch off, or not root)"
             );
+            if one_row && is_root {
+                tracing::warn!(
+                    "macos_one_row is on and macos_supervise_gui_worker is off, so nothing runs \
+                     a worker for this row: it has no screen until both are on (FR-43 P3a)"
+                );
+            }
             return;
         }
         let exe = match std::env::current_exe() {
@@ -994,6 +1035,7 @@ mod imp {
         };
         tracing::info!(
             exe = %exe.display(),
+            one_row,
             "macOS GUI-worker supervisor ON (FR-43 P1) — stands down whenever the LaunchAgent is loaded"
         );
         let mut worker: Option<(u32, Child, Instant)> = None;
@@ -1093,7 +1135,7 @@ mod imp {
                         last_end = ?last_end,
                         "macOS supervisor: the GUI worker died on arrival too many times — \
                          NOT retrying: {}",
-                        gave_up_reason(last_end)
+                        gave_up_reason(last_end, one_row)
                     );
                 } else {
                     tracing::info!(?action, console_uid = ?uid_now, "macOS supervisor state");
@@ -1176,7 +1218,7 @@ mod imp {
                         // and tying the two together means neither can be
                         // set up without the other.
                         let secret = delegate.open_for(uid);
-                        match spawn_worker(uid, &exe, &secret) {
+                        match spawn_worker(uid, &exe, &secret, one_row) {
                             Ok(child) => {
                                 tracing::info!(uid, "macOS supervisor: spawned GUI worker");
                                 worker = Some((uid, child, Instant::now()));
@@ -1240,7 +1282,7 @@ mod imp {
             assert!(status.success());
             let mut found = Vec::new();
             for _ in 0..50 {
-                found = find_processes(&command);
+                found = find_processes(std::slice::from_ref(&command));
                 if !found.is_empty() {
                     break;
                 }
@@ -1251,7 +1293,7 @@ mod imp {
             assert_eq!(found[0].1, unsafe { libc::getuid() });
             stop_processes(&[found[0].0]).await;
             assert!(
-                find_processes(&command).is_empty(),
+                find_processes(std::slice::from_ref(&command)).is_empty(),
                 "still running after stop_processes"
             );
         }
@@ -1301,11 +1343,14 @@ mod imp {
         #[test]
         fn the_reap_answers_once_ps_exits_though_its_pipe_is_held() {
             let pid_file = pid_file("ps");
-            let command = worker_command("/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd");
+            let command = worker_command(
+                "/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd",
+                false,
+            );
             let started = Instant::now();
             let found = find_processes_via(
                 &mut pinned_ps(&pid_file, &format!("  4242   501 {command}")),
-                &command,
+                std::slice::from_ref(&command),
             );
             let took = started.elapsed();
             end_holder(&pid_file);
@@ -1928,16 +1973,48 @@ mod tests {
     /// build, not a root process.
     #[test]
     fn only_a_supervised_worker_of_this_install_is_stale() {
-        let command = worker_command(EXE);
-        assert_eq!(command, format!("{EXE} run --supervised"));
+        let commands = worker_commands(EXE);
+        assert_eq!(commands[0], format!("{EXE} run --supervised"));
         assert_eq!(
-            stale_workers(PS, &command, 412),
+            stale_workers(PS, &commands, 412),
             vec![(68123, 501), (70005, 502)]
         );
         // Never this process.
-        assert_eq!(stale_workers(PS, &command, 70005), vec![(68123, 501)]);
-        assert!(stale_workers("", &command, 412).is_empty());
-        assert!(stale_workers("  PID   UID COMMAND\nnot a row\n", &command, 412).is_empty());
+        assert_eq!(stale_workers(PS, &commands, 70005), vec![(68123, 501)]);
+        assert!(stale_workers("", &commands, 412).is_empty());
+        assert!(stale_workers("  PID   UID COMMAND\nnot a row\n", &commands, 412).is_empty());
+    }
+
+    /// FR-43 P3a — a worker with no enrollment holds the same single-instance
+    /// lock, so the reap finds it, whatever the switch reads now: the switch may
+    /// have moved since that worker started.
+    #[test]
+    fn the_reap_finds_a_worker_of_either_kind() {
+        assert_eq!(
+            worker_commands(EXE)[1],
+            format!("{EXE} run --supervised --unenrolled")
+        );
+        let ps = format!(
+            "  601   501 {EXE} run --supervised\n  \
+             602   501 {EXE} run --supervised --unenrolled\n  \
+             603   501 {EXE} run --unenrolled\n"
+        );
+        assert_eq!(
+            stale_workers(&ps, &worker_commands(EXE), 1),
+            vec![(601, 501), (602, 501)]
+        );
+    }
+
+    /// FR-43 P3a — the spawn and the reap read the same arguments, and the switch
+    /// decides them.
+    #[test]
+    fn the_switch_decides_how_a_worker_starts() {
+        assert_eq!(worker_args(false), ["run", "--supervised"]);
+        assert_eq!(worker_args(true), ["run", "--supervised", "--unenrolled"]);
+        assert_eq!(
+            worker_command(EXE, true),
+            format!("{EXE} {}", worker_args(true).join(" "))
+        );
     }
 
     #[test]
@@ -1945,7 +2022,7 @@ mod tests {
         let exe = "/Applications/Roomler Beta.app/Contents/MacOS/roomlerd";
         let ps = format!("  555   501 {exe} run --supervised\n  556   501 {exe} run\n");
         assert_eq!(
-            stale_workers(&ps, &worker_command(exe), 1),
+            stale_workers(&ps, &worker_commands(exe), 1),
             vec![(555, 501)]
         );
     }
@@ -1954,14 +2031,31 @@ mod tests {
     /// worker had exited 0 on a held lock. The exit code tells them apart.
     #[test]
     fn the_give_up_names_the_lock_when_workers_exit_cleanly() {
-        let lock = gave_up_reason(Some(WorkerEnd::Code(0)));
+        let lock = gave_up_reason(Some(WorkerEnd::Code(0)), false);
         assert!(lock.contains("single-instance lock"), "{lock}");
         assert!(!lock.contains("enrollment"), "{lock}");
         for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
             assert!(
-                gave_up_reason(end).contains("per-user enrollment"),
+                gave_up_reason(end, false).contains("per-user enrollment"),
                 "{end:?}"
             );
         }
+    }
+
+    /// FR-43 P3a — a worker with no enrollment cannot be missing one, so the
+    /// give-up does not send a person after a per-user config. A held lock reads
+    /// the same under either.
+    #[test]
+    fn the_give_up_does_not_blame_an_enrollment_a_worker_never_needed() {
+        for end in [Some(WorkerEnd::Code(1)), Some(WorkerEnd::Signal(9)), None] {
+            assert!(
+                !gave_up_reason(end, true).contains("per-user enrollment"),
+                "{end:?}"
+            );
+        }
+        assert_eq!(
+            gave_up_reason(Some(WorkerEnd::Code(0)), true),
+            gave_up_reason(Some(WorkerEnd::Code(0)), false)
+        );
     }
 }

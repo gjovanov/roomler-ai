@@ -499,7 +499,7 @@ not what the trace records. The token is minted at delivery by the admin route's
 `pairing::deliver` mints with `issue_enrollment_token_with` and writes
 `enroll_tokens.record_issued(jti, tenant_id, approver, now)`
 (`crates/modules/fleet/src/pairing.rs:992-1011`), the same call `POST …/agent/enroll-token`
-makes (`agent.rs:115-126`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
+makes (`agent.rs:139-150`) — so the ledger row is `{_id: jti, tenant_id, issued_by: <the
 approver>, issued_at, kind: standard}`, one per half, and "tokens issued → redeemed" counts a
 paired token like any other. The tunnel kind writes no ledger row, as the tunnel route never
 has. The enroll is the ordinary one, so `agents.install` says who installed: `method: wizard`
@@ -548,7 +548,7 @@ sequenceDiagram
   · `enroll` · `companion` · `anchor` (the two best-effort steps, recorded only where they
   apply) · `done`; `outcome` is `ok` · `failed` · `cancelled`; `error_code` is a **code from a
   fixed vocabulary** (`advanced_options`, `unsupported_platform`, `preflight`, `resolve`,
-  `download`, `sha256_mismatch`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
+  `download`, `sha256_mismatch`, `signature_refused`, `msi_spawn`, `msi_wait`, `msi_user_cancel`,
   `msi_another_install`, `msi_fatal`, `msi_other`, `extract`, `integrate`, `enroll_rejected`,
   `enroll_network`, `config_write`, `companion`, `anchor`, `other`) — never the error text, a
   path, a hostname or a user name; `os` is the family; `wizard_version` the crate's version.
@@ -2028,7 +2028,7 @@ addresses.
 ⚠️ **An overlay pair needs the device to allow it.** #1882's `access_policy.rc_overlay` is off unless
 the device opts in, and with it off the agent drops every overlay candidate. With it on, an agent
 whose overlay interface is named `roomler*` still never gathers on it: the interface-name rule
-(`is_overlay_iface`, [`peer.rs:13318`](../agents/roomlerd/src/peer.rs)) applies whatever
+(`is_overlay_iface`, [`peer.rs:13396`](../agents/roomlerd/src/peer.rs)) applies whatever
 `rc_overlay` says. So an overlay carrier comes from `rc_overlay` on AND either a macOS agent, whose
 `utunN` the name rule cannot see, or a controller whose route to the agent runs through the mesh.
 Measured on 2026-10-19 (FR-102 §8): a controller on the vmtest org's mesh viewing a Linux agent
