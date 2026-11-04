@@ -164,22 +164,50 @@ enum Detach {
     Evicted(Detached),
     /// That session's recording was already there.
     Already,
+    /// #3451 — that session's recorder is still launching: nothing is
+    /// detached, and the start decides once the recorder runs.
+    Launching,
 }
 
 /// The one detached recording, and every way it changes hands. Each change
 /// is one call under one lock, so two parties can never both win it.
 #[derive(Default)]
-struct Slot(Option<Detached>);
+struct Slot {
+    held: Option<Detached>,
+    /// #3451 — the sessions whose recorder is launching, one entry per start
+    /// (a second start that finds the recorder busy adds and takes back its
+    /// own). A recording of theirs is not detached meanwhile: once the
+    /// recorder runs, the start looks at its session and either stops the
+    /// recording or leaves its follower to hand it on, as for any drop.
+    /// Detached during the launch, it could be picked up before the start had
+    /// looked, and the start's own decision then came too late.
+    launching: Vec<ObjectId>,
+}
 
 impl Slot {
     /// Put `d` into the grace.
     fn detach(&mut self, d: Detached) -> Detach {
-        match &self.0 {
+        if self.launching.contains(&d.session_id) {
+            return Detach::Launching;
+        }
+        match &self.held {
             Some(cur) if cur.session_id == d.session_id => Detach::Already,
-            _ => match self.0.replace(d) {
+            _ => match self.held.replace(d) {
                 Some(old) => Detach::Evicted(old),
                 None => Detach::Done,
             },
+        }
+    }
+
+    /// #3451 — `session`'s recorder is launching.
+    fn launching(&mut self, session: ObjectId) {
+        self.launching.push(session);
+    }
+
+    /// #3451 — that launch is over: one entry comes off.
+    fn launched(&mut self, session: ObjectId) {
+        if let Some(i) = self.launching.iter().position(|s| *s == session) {
+            self.launching.swap_remove(i);
         }
     }
 
@@ -187,11 +215,11 @@ impl Slot {
     /// recording the grace is already stopping.
     fn pick_up(&mut self, user: ObjectId) -> Option<Detached> {
         if self
-            .0
+            .held
             .as_ref()
             .is_some_and(|d| d.controller_user_id == user && !d.stopping)
         {
-            self.0.take()
+            self.held.take()
         } else {
             None
         }
@@ -200,7 +228,7 @@ impl Slot {
     /// The grace claims `session`'s recording for a stop. `false` = it is not
     /// there to claim (picked up, or claimed already).
     fn claim_stop(&mut self, session: ObjectId) -> bool {
-        match self.0.as_mut() {
+        match self.held.as_mut() {
             Some(d) if d.session_id == session && !d.stopping => {
                 d.stopping = true;
                 true
@@ -212,7 +240,7 @@ impl Slot {
     /// Take `session`'s recording out: the grace is done with it.
     fn take(&mut self, session: ObjectId) -> Option<Detached> {
         if self.holds(session) {
-            self.0.take()
+            self.held.take()
         } else {
             None
         }
@@ -221,22 +249,43 @@ impl Slot {
     /// `session`'s recording, while it waits (not being stopped): whether it
     /// runs unattended.
     fn waiting(&self, session: ObjectId) -> Option<bool> {
-        self.0
+        self.held
             .as_ref()
             .filter(|d| d.session_id == session && !d.stopping)
             .map(|d| d.unattended)
     }
 
     fn holds(&self, session: ObjectId) -> bool {
-        self.0.as_ref().is_some_and(|d| d.session_id == session)
+        self.held.as_ref().is_some_and(|d| d.session_id == session)
     }
 }
 
-static DETACHED: StdMutex<Slot> = StdMutex::new(Slot(None));
+static DETACHED: StdMutex<Slot> = StdMutex::new(Slot {
+    held: None,
+    launching: Vec::new(),
+});
 
 /// Run `f` on the slot, under its lock.
 fn slot<T>(f: impl FnOnce(&mut Slot) -> T) -> Option<T> {
     DETACHED.lock().ok().map(|mut s| f(&mut s))
+}
+
+/// #3451 — a start's mark in the slot while its recorder launches
+/// ([`Slot::launching`]). It comes off when the start has looked at its
+/// session, when the launch failed, or when the start went away.
+struct Launch(ObjectId);
+
+impl Launch {
+    fn begin(session: ObjectId) -> Self {
+        slot(|s| s.launching(session));
+        Self(session)
+    }
+}
+
+impl Drop for Launch {
+    fn drop(&mut self) {
+        slot(|s| s.launched(self.0));
+    }
 }
 
 /// P3b-3 — the handler whose session holds the remote recording in progress.
@@ -376,20 +425,18 @@ async fn grace_watch(session_id: ObjectId) {
 /// closes a peer within a budget, and a close that overruns it is dropped
 /// before it ever reaches the channel, which then stays `Open` for good.
 /// The loop knows every end (the server's terminate, the control connection
-/// lost, the host's Disconnect) and says so here. An entry goes when its
-/// session ends.
+/// lost, the host's Disconnect) and says so here, and it says when a re-offer
+/// replaces the session's peer (#3451).
+///
+/// ⚠️ An entry stays while its handler lives, after its channel's end too
+/// (#3451). A start still launching there must hear its session's end, or its
+/// peer's replacement, and its channel may have gone first.
 static HANDLERS: StdMutex<Vec<(ObjectId, std::sync::Weak<Handler>)>> = StdMutex::new(Vec::new());
 
 fn register(session_id: ObjectId, h: &Arc<Handler>) {
     if let Ok(mut all) = HANDLERS.lock() {
         all.retain(|(_, w)| w.strong_count() > 0);
         all.push((session_id, Arc::downgrade(h)));
-    }
-}
-
-fn unregister(h: &Handler) {
-    if let Ok(mut all) = HANDLERS.lock() {
-        all.retain(|(_, w)| w.strong_count() > 0 && !std::ptr::eq(w.as_ptr(), h));
     }
 }
 
@@ -411,7 +458,28 @@ fn handlers_of(session_id: ObjectId) -> Vec<Arc<Handler>> {
 /// or not its channel ever closes.
 pub fn session_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
+        h.over.store(true, Ordering::Release);
         h.end_session();
+    }
+}
+
+/// #3451 — the signalling loop is replacing `session_id`'s peer with one that
+/// carries the recording (a re-offer whose grant holds RECORD and whose record
+/// context is set). Said BEFORE the old peer closes: that peer's `record`
+/// channel ending is then not the session's end. The session goes on under
+/// the new peer, and a recorder launching for it carries on, for the new
+/// peer's channel to pick up.
+///
+/// ⚠️ Never for a peer without the recording (#3468, from review). The hub
+/// forwards one offer per session, and a peer built from a second one gets
+/// the default grant and no record context: nothing on it picks the recording
+/// up, so the old channel's end IS the recording's end. Said for it, a
+/// recording launching there waited in the grace past the host's Disconnect.
+/// The loop's check is `signaling::reoffer_carries_record`, always `false`
+/// today.
+pub fn peer_replaced(session_id: ObjectId) {
+    for h in handlers_of(session_id) {
+        h.replaced.store(true, Ordering::Release);
     }
 }
 
@@ -422,6 +490,7 @@ pub fn session_ended(session_id: ObjectId) {
 /// controller whose device auto-grants would reconnect straight into it.
 pub fn host_ended(session_id: ObjectId) {
     for h in handlers_of(session_id) {
+        h.over.store(true, Ordering::Release);
         h.host_ended();
     }
 }
@@ -794,6 +863,12 @@ struct Handler {
     /// once: from the signalling loop, `on_close`, or the channel watch that
     /// sees an end `on_close` never reports).
     gone: AtomicBool,
+    /// #3451 — the signalling loop ended this session ([`session_ended`],
+    /// [`host_ended`]), whichever end of it this handler saw first.
+    over: AtomicBool,
+    /// #3451 — the signalling loop replaced this session's peer
+    /// ([`peer_replaced`]): this channel's end is not the session's.
+    replaced: AtomicBool,
     /// P3b-2 — the transfer in progress (`id`, its cancel flag): one at a
     /// time per session.
     transfer: StdMutex<Option<(String, Arc<AtomicBool>)>>,
@@ -813,6 +888,8 @@ pub fn attach(dc: Arc<RTCDataChannel>, ctx: SessionCtx) {
         unattended: AtomicBool::new(false),
         ending: AtomicBool::new(false),
         gone: AtomicBool::new(false),
+        over: AtomicBool::new(false),
+        replaced: AtomicBool::new(false),
         transfer: StdMutex::new(None),
     });
     // The session's end, three ways: the signalling loop says so
@@ -1244,6 +1321,9 @@ impl Handler {
             controller_user_id: self.ctx.controller_user_id,
             controller_name: self.ctx.controller_name.clone(),
         };
+        // #3451 — from here until the look below, nothing detaches this
+        // session's recording.
+        let launch = Launch::begin(sid);
         match m.start_remote(initiator, audio, identity).await {
             Ok(state) => {
                 let name = file_name(state.path.as_deref());
@@ -1252,35 +1332,39 @@ impl Handler {
                 let speaker = claim_speaker(name.as_deref().unwrap_or_default());
                 info!(session = %sid, ?name, audio, "remote recording started");
                 // ⚠️ The session may have ended while the recorder launched
-                // (#3433). Its end found nothing recording yet, or detached
-                // what had just begun into the re-attach grace, where the
-                // controller's next session picked up a recording made for a
-                // session that was over. It stops now, `session_ended`, and
-                // this session's follower reports it like any stop it asked
-                // for. `ending` is set first, then whatever was detached is
-                // taken back under the slot's lock, the one a detach reads
-                // `ending` under: a detach either comes before and is undone
-                // here, or sees `ending` and leaves it. So the grace never
-                // holds it, and nobody picks it up.
-                if self.gone.load(Ordering::Acquire) || channel_gone(&self.dc) {
-                    self.ending.store(true, Ordering::Release);
-                    slot(|s| s.take(sid));
-                    info!(session = %sid, "the session ended while its recorder launched — stopping it");
-                    tokio::spawn(async move {
-                        if let Some(m) = manager() {
-                            m.stop_with(Some("session_ended")).await;
-                        }
-                    });
-                }
+                // (#3433). Detached then, the recording waited in the grace,
+                // and the controller's next session picked up a recording made
+                // for a session that was over. Nothing detached it meanwhile
+                // (the launch's mark, #3451), so it is this start's to decide:
+                // on the session's end it stops now, `session_ended`, and this
+                // session's follower reports it like any stop it asked for.
+                //
+                // ⚠️ The SESSION's end, not its channel's (#3451): the loop's
+                // word, or the channel gone with no replacement behind it. Only
+                // a re-offer whose new peer carries the recording replaces the
+                // channel (`peer_replaced`): the recording then carries on under
+                // the new one, its follower handing it on as for any drop. The
+                // hub forwards one offer per session, and a peer built from a
+                // second one carries no RECORD, so today every channel end here
+                // is the session's end (#3468, from review).
+                //
+                // `ending` is set before the mark comes off, and a detach reads
+                // both under the slot's lock: it came before and was refused,
+                // or it sees `ending` and leaves the recording to this stop.
+                // An ending something else asked for first (the controller's
+                // Stop, the host's Disconnect) stands.
+                let over = self.over.load(Ordering::Acquire)
+                    || (channel_gone(&self.dc) && !self.replaced.load(Ordering::Acquire));
+                let stop = over && !self.ending.swap(true, Ordering::AcqRel);
+                // Also before the mark comes off (#3468, from review): what a
+                // detach builds the grace's record from, and the start's report.
+                // A detach right after the mark read an empty id and a stale
+                // `unattended: false`, and the grace then never stopped an
+                // unattended recording when someone signed in.
                 if let Ok(mut c) = self.current.lock() {
                     *c = Some(id.to_string());
                 }
                 self.unattended.store(unattended, Ordering::Release);
-                let mut s = StateMsg::new(id, "recording");
-                s.name = name.clone();
-                s.audio = state.system_audio;
-                s.unattended = unattended;
-                send(&self.dc, &s).await;
                 self.report(
                     RecordingActivityKind::Started,
                     name.clone(),
@@ -1289,6 +1373,20 @@ impl Handler {
                     None,
                 );
                 hold(&self);
+                drop(launch);
+                if stop {
+                    info!(session = %sid, "the session ended while its recorder launched — stopping it");
+                    tokio::spawn(async move {
+                        if let Some(m) = manager() {
+                            m.stop_with(Some("session_ended")).await;
+                        }
+                    });
+                }
+                let mut s = StateMsg::new(id, "recording");
+                s.name = name.clone();
+                s.audio = state.system_audio;
+                s.unattended = unattended;
+                send(&self.dc, &s).await;
                 tokio::spawn(
                     self.clone()
                         .follow(id.to_string(), unattended, name, speaker),
@@ -1296,6 +1394,7 @@ impl Handler {
                 None
             }
             Err(e) => {
+                drop(launch);
                 self.ctx.indicator.end_recording(sid);
                 Some(match e {
                     StartError::Busy => ("busy", None),
@@ -1777,7 +1876,6 @@ impl Handler {
         if self.gone.swap(true, Ordering::AcqRel) {
             return;
         }
-        unregister(self);
         // ⚠️ Read only after `gone` is set (#3433). `ask_host` registers its
         // question under this lock, and only while `gone` is clear: either it
         // sees this end and asks nobody, or this sees its question, armed,
@@ -1855,7 +1953,9 @@ impl Handler {
             // Another session's recording, over, whose grace had not looked
             // since: finished here, or its banner stays up for good.
             Some(Detach::Evicted(old)) => finish_detached(m, old),
-            Some(Detach::Already) | None => return,
+            // In the grace already; or its recorder still launching, where
+            // the start decides (#3451).
+            Some(Detach::Already | Detach::Launching) | None => return,
         }
         info!(
             session = %sid,
@@ -2096,6 +2196,34 @@ mod tests {
             _ => panic!("the other session's recording was not handed back"),
         }
         assert!(s.holds(b) && !s.holds(a));
+    }
+
+    /// #3451 — nothing detaches a recording whose recorder is still
+    /// launching: its start decides once the recorder runs. So nothing can
+    /// pick it up first and leave that decision too late. Another session's
+    /// detach is not held up, and a second start's mark (one that found the
+    /// recorder busy) comes off without taking the launching start's.
+    #[test]
+    fn a_launching_recording_is_never_detached() {
+        let (a, b, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let mut s = Slot::default();
+        s.launching(a);
+        assert!(matches!(s.detach(detached(a, user)), Detach::Launching));
+        assert!(s.pick_up(user).is_none(), "picked up while it launched");
+        assert!(matches!(s.detach(detached(b, user)), Detach::Done));
+
+        s.launching(a);
+        s.launched(a);
+        assert!(
+            matches!(s.detach(detached(a, user)), Detach::Launching),
+            "a busy start's mark took the launching start's with it"
+        );
+        s.launched(a);
+        match s.detach(detached(a, user)) {
+            Detach::Evicted(old) => assert_eq!(old.session_id, b),
+            _ => panic!("once launched, the recording is detached as any other"),
+        }
+        assert!(s.holds(a));
     }
 
     /// P3b-3 — a recording's ending has one speaker. A pick-up's claim for

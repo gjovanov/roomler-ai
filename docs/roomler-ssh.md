@@ -1065,7 +1065,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4077`](../agents/roomlerd/src/signaling.rs#L4077), [`:5558`](../agents/roomlerd/src/signaling.rs#L5558)), as the recording question does
+first the same way ([`signaling.rs:4093`](../agents/roomlerd/src/signaling.rs#L4093), [`:5609`](../agents/roomlerd/src/signaling.rs#L5609)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
@@ -1726,10 +1726,10 @@ for one `exec` because that is all it needs; the target refuses anything more
 
 | Piece | Where |
 |---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6848`](../agents/roomlerd/src/signaling.rs#L6848)) |
+| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6899`](../agents/roomlerd/src/signaling.rs#L6899)) |
 | the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
 | the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6484`](../agents/roomlerd/src/signaling.rs#L6484), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
+| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6535`](../agents/roomlerd/src/signaling.rs#L6535), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
 
 ### The tool: `ssh_run` (FR-90 P3-8-2b-2)
 
