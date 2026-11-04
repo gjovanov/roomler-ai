@@ -797,6 +797,10 @@
       "methods": "PUT"
     },
     {
+      "path": "/api/tenant/{tenant_id}/overlay-retired-keys",
+      "methods": "GET,HEAD,PUT"
+    },
+    {
       "path": "/api/tenant/{tenant_id}/peer-relay",
       "methods": "GET,HEAD,PUT"
     },
@@ -2392,6 +2396,18 @@
             "key": {
               "tenant_id": 1,
               "node_ref.id": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "wg_public_key": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "retired_keys.public_key": 1
             }
           }
         ]
@@ -4853,6 +4869,18 @@
             "key": {
               "tenant_id": 1,
               "node_ref.id": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "wg_public_key": 1
+            }
+          },
+          {
+            "key": {
+              "network_id": 1,
+              "retired_keys.public_key": 1
             }
           }
         ]

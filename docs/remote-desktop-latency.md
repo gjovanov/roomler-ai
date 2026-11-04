@@ -82,7 +82,7 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
    session and the pump awaits the packets (`thread.rs:387` `encode`, called at
-   `peer.rs:9547`). `block_in_place` remains the inline path, `media_thread = false`.
+   `peer.rs:9613`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -104,7 +104,7 @@ a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
 masked at 1.0 (`governor.rs:1602`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
 reads `governor.paced_fps()` each loop (`governor.rs:1614`; consumed at
-`peer.rs:8096`, logged at `:9918`). FR-112 gave a software encoder a pace of its
+`peer.rs:8155`, logged at `:9984`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
@@ -156,7 +156,7 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:213` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:4875` `statsAgeLabel`, rendered at `:289`).
+  (`RemoteControl.vue:4876` `statsAgeLabel`, rendered at `:289`).
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,

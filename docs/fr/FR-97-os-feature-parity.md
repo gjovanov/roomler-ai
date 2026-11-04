@@ -265,7 +265,7 @@ declared routes; the in-daemon overlay ACL; key rotation; ephemeral nodes; the s
 | R7 | Match remote display | ✅ | ✅ X11 since P3e-2: a person's own display with one active output, a per-user install, and the virtual desktop (FR-108 P2); ❌ Wayland, a system install | ✅ since P2d-2b: the main display, with one active display, at its scale and refresh rate; the mode reverts by itself if the process dies | `display_match.rs:911`. *P3e-2:* `agents/roomlerd/src/display_match.rs:333` `x11_offered`; the viewer's toggle followed the OS until P3e-2. *P2d-2b:* `agents/roomlerd/src/display_match.rs:351` `mac_offered` | P2d, P3e |
 | R8 | Clipboard: host → viewer image sync | ✅ | ✅ X11 since P3e-3a, behind the XFixes change gate; ❌ Wayland and a system install | ✅ since P2e-1, behind the pasteboard's change count | Forced off (`clipboard.rs:818-822` before P3e-3a) ✔ while advertised (`caps.rs:4132-4140`). *P3e-3a:* `agents/roomlerd/src/clipboard.rs:643` `x11_gate`. *P2e-1:* `agents/roomlerd/src/clipboard.rs:756` `mac_gate` | P0c, P2e, P3e |
 | R9 | Clipboard: RTF lane | ✅ | ❌ | ❌ | `clipboard.rs:1044` | P2e, P3e |
-| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10577-10580`) | FR-93 P7 |
+| R10 | Clipboard on a system (root) install | ✅ | ❌ | ✅ | No `DISPLAY`, advertised anyway (`peer.rs:10643-10646`) | FR-93 P7 |
 | R11 | Typing text on a non-US layout (uinput) | ✅ | ✅ since P3f: the host's own XKB keymap; the US table where libxkbcommon is missing | ✅ | `keylayout.rs:40-46`, `uinput_backend.rs:630-636`. *P3f:* `agents/roomlerd/src/input/keylayout/xkb.rs:82`, the KeyText arm at `agents/roomlerd/src/input/uinput_backend.rs:641` | P3f |
 | R12 | Recording with audio | ✅ system + mic | ✅ | ✅ the computer's sound since P2a (the recorder child opens the session's own capture) and the microphone since P2f (cpal, once AVFoundation says the person has not turned it off) | Was: no SCK audio, and cpal was not a macOS dependency | P2a, P2f |
 | R13 | Dirty-rect capture (idle CPU) | ✅ WGC | ✅ X11 · ❌ Wayland | ❌ | `Damage::Unknown` (`scrap_backend.rs:248`) | D2 |
@@ -293,7 +293,7 @@ and the consent chain's fallbacks.
 | # | Feature | Windows | Linux | macOS | Where it stops | Phase / owner |
 |---|---|---|---|---|---|---|
 | X1 | `exec` and SSH `daemon` mode run as the machine | 🟡 the console worker: the signed-in user on attended installs (#2021) | ✅ root | 🟡 root on the `-daemon` row, the user on the other | Two identities, one per row | FR-94; FR-43 P3 |
-| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:807`), for SSH and exec's `run_as` | P5a |
+| X2 | `console_user` account mode | 🟡 SystemContext, or the SYSTEM service (FR-105) | 🟡 built (P5a) | 🟡 built (P5a) | Was: "a Windows concept". P5a drops to the person at seat0 or owning the console (`exec.rs:813`), for SSH and exec's `run_as` | P5a |
 | X3 | SFTP / scp as the signed-in user | 🟡 built (P4b), where `sftp-server.exe` is installed | ✅ | ✅ | Was refused: `tokio::process` cannot take a token. P4b takes `exec`'s console-user spawn (`ssh.rs:1395`) | P4b |
 
 ### 2.6 Install, update, ops, architectures
@@ -352,12 +352,12 @@ devices A1 and A2 would serve. P0d adds the native machine architecture to the h
 | `docs/roomler-ssh.md:311-325` | Windows `daemon` → SYSTEM | the console worker (#2021, FR-94). ✅ FR-94 and FR-105's docs already say so |
 | `docs/installation.md:21-22`, `ui/docs/content/start/install/macos.md:51-55` | install the macOS daemon with the wizard | the wizard's daemon roles are Windows-only. ✅ Both say so since P0c-4, as do both homepages |
 | `docs/installation.md:43-44`, `ui/docs/content/troubleshooting/install-problems.md:37-40` | downloads come from roomler.ai | true for the MSI proxy, the CLI and the wizard; `install.sh`'s `.deb`/tarball/`.pkg` and every self-update fetch from GitHub (`updater.rs:1287,1360`). ✅ **P8:** both name the hosts, measured 2026-10-18: the manifest's asset URLs are `github.com`, redirected to `release-assets.githubusercontent.com`; `install.ps1`'s companion is one too, and its VC++ runtime comes from `aka.ms` |
-| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3641` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
+| `ui/docs/content/remote-desktop/files-and-clipboard.md:14,63`; the tooltip at `RemoteControl.vue:3642` | the clipboard is text; images sync automatically | images and HTML on all three; host → viewer images from Windows only; nothing on a root Linux daemon. ✅ Both say so since P0c-2 |
 | `ui/docs/content/remote-desktop/per-os-permissions.md:76-103`, `unattended-access.md:58-59` | Wayland input supported; a root service has nothing to capture | input is `xwayland_only` by default (`input/reach.rs:187-230`); DRM captures from root (opt-in). ⏳ **P8-2.** This row moved under it: since FR-95 (verified on 0.4.141) a system install switches DRM and uinput on by itself for the person's Wayland session, FR-113 (merged, not yet released) does the same for X11, and the wlroots portal never produced frames in the lab. ✅ **P8-2** (#2548), once FR-113 shipped (0.4.144, closed on 0.4.145): `unattended-access.md`'s Linux tab, and the same claim in `ui/docs/content/start/install/linux.md`'s tip and in `scripts/install.sh`'s `--system` help and its enable line. ⏳ `per-os-permissions.md` and `troubleshooting/black-screen.md` ride #2533 |
 | `ui/docs/content/start/install/windows.md:95` | machine-global config at `%PROGRAMDATA%\roomler\config.toml` | `%PROGRAMDATA%\roomler\roomler\config.toml` (`appdirs.rs:41-44`). ✅ **P8** |
 | `packaging/linux/README.Debian` | capture is X11-only; Wayland fails | FR-36, FR-45, FR-93. ✅ FR-93 added the Wayland section; **P8** rewrote the system unit's half, which still read "only once both keys are set", for FR-95 and FR-113 (the package ships master's code) |
 | code comments: `power.rs`'s Linux stub (rewritten in P3b), `lock_overlay.rs:32-34`, `code_signature.rs:36-43`, `post_install.rs:85-86`, `caps.rs:4450`, `tun.rs:3249-3254` | — | stale, each named in its row above or in the sweeps. ✅ **P8-2** (#2548): `agents/roomlerd/src/lock_overlay.rs:32-34`, `agents/roomlerd/src/code_signature.rs:38-43`, `agents/roomlerd/src/post_install.rs:81-86`, `agents/roomlerd/src/encode/caps.rs:4488`, `crates/tunnel-core/src/overlay/tun.rs:4034-4035`, and one found writing the page, "v6 exit egress is Linux-only" since P1b (`crates/tunnel-core/src/overlay/nat.rs:453-454`). `power.rs` was P3b's |
-| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3887`, `:3983`, `:4390`, `agents/roomlerd/src/app.rs:5425` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
+| W7c's leftovers, found by P1d: `overlay_multi_org`'s help (`crates/agent-core/src/config_surface.rs:227`), `crates/tunnel-core/src/overlay/mod.rs:92`, `crates/tunnel-core/src/overlay/tun.rs:3887`, `:3983`, `:4390`, `agents/roomlerd/src/app.rs:5428` | the shared OS TUN, as if it were live | W7c deleted it; every org has an adapter of its own (N10). P1d fixed the ones on its own lines. ✅ #2493 rewrote `crates/agent-core/src/config.rs`'s two (`for_org`'s doc comment and its test), plus one P1d missed, `apply_overlay_flag`'s doc comment (`agents/roomlerd/src/org_join.rs:628-633`). ✅ **P8-2** (#2548) the rest, two more in `main.rs`'s org teardown, and `overlay_multi_org`'s own doc comment in `crates/agent-core/src/config.rs`, which #2493 had made wrong: a netstack secondary keeps its own stack |
 | `ui/docs/content/reference/ports-and-firewall.md`, "Allow-listing by hostname" | installers and updates come from the server's own origin, so an allow-list needs only `roomler.ai` | the same split as the `installation.md` row above. ✅ **P8-2** (#2548), found writing the user page: it names GitHub's two hosts and `aka.ms` too |
 | `docs/README.md`'s `multi-org.md` row | the doc covers the mux NAT | history since W7c (the `multi-org.md` row above). ✅ **P8-2** (#2548) |
 
@@ -1007,12 +1007,12 @@ test of the SIGKILL property itself.
   - The viewer sends `{t: "sas"}` only to an agent that advertises it; the injector checks again before it asks.
   - `sas.dll` is loaded at send time from System32 only, never imported. `docs/remote-control.md` §5.1e.
 - **P4b, SFTP as `console_user`** (built). `sftp-server` runs through the `CreateProcessAsUserW` + three-pipe path
-  the exec code already uses (`exec::run_console_user_program`, `exec.rs:937`), instead of `tokio::process`
+  the exec code already uses (`exec::run_console_user_program`, `exec.rs:943`), instead of `tokio::process`
   (`ssh.rs:1395`).
   - The command line is the quoted path alone: no shell stands in front, and nothing a client sends becomes an
     argument.
   - The bytes are raw. The streamed shell path redacts, and redaction inside a binary SFTP stream is corruption.
-  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3544`). A service starts
+  - It starts in the person's profile, read from the token the child runs under (`exec.rs:3615`). A service starts
     in System32, where a bare `put` cannot land.
   - The client gets the exit status, then EOF, then close (`scp`'s verdict), and its abort sits with the exec
     channels', so a closed channel or a dropped session kills the tree.
@@ -1054,11 +1054,11 @@ test of the SIGKILL property itself.
 
 `console_user` on Linux and macOS: resolve the active seat's user (Linux: logind's seat0 active session) or the
 console user (macOS: `SCDynamicStoreCopyConsoleUser`) and route into the existing `unix_priv::drop_to`
-(`exec.rs:965-981`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
+(`exec.rs:971-987`). Refuse when nobody is at the screen. It is a privilege drop, never a gain. It waits for FR-94's
 model on Windows, so the three agree on what the mode means.
 
 **P5a (built).** One rule for SSH's `account_mode` and Fleet RPC's `run_as`, through `apply_run_as`
-(`exec.rs:807`), so exec, the pty and `sftp` all take it:
+(`exec.rs:813`), so exec, the pty and `sftp` all take it:
 
 - **Who is at the screen.** Linux: the user of logind's `ActiveSession` on `seat0`, when that session's class is
   `user` (`companion::seat0_user`, `companion.rs:1090`). It is not `graphical_session`, which takes the first
@@ -1068,7 +1068,7 @@ model on Windows, so the three agree on what the mode means.
   which names the same person `SCDynamicStoreCopyConsoleUser` does and keeps the companion's launch, the
   postinstall and this rule on one reading. Nobody, when: no logind or seat0, an empty seat, a greeter, the login
   window, or a system account (`_mbsetupuser` during Setup Assistant).
-- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1404`). A root daemon drops to the person;
+- **A drop, never a gain** (`unix_priv::drop_to_console`, `exec.rs:1410`). A root daemon drops to the person;
   uid 0 is refused, as for `named`. A per-user daemon whose own account is at the screen runs the command as
   itself, which changes no identity; it could not drop anyway, since `setgroups` needs root even to keep its own
   groups. A per-user daemon whose owner is not at the screen is refused.

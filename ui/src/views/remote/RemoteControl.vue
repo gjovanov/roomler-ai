@@ -1118,13 +1118,13 @@
           This agent is currently offline. The session will fail until the agent
           reconnects.
         </p>
-        <!-- Not offered right after the person at the device ended the session:
-             their Disconnect is an explicit "stop", and the next step offered is
-             Reconnect, which asks them again. Break-glass stays available from a
-             fresh page, with its reason, audit and owner notice (operator,
-             2026-10-10). -->
+        <!-- Not offered right after the person at the device ended the session
+             (their Disconnect is an explicit "stop"; Reconnect asks them again),
+             nor ever to an outsider, who has no break-glass (#3258): see
+             `offersBreakGlass`. A member keeps it on a fresh page, with its
+             reason, audit and owner notice (operator, 2026-10-10). -->
         <v-btn
-          v-if="rc.endedBy.value !== 'host'"
+          v-if="offersBreakGlass({ external: isExternal, endedBy: rc.endedBy.value })"
           variant="text"
           size="small"
           color="warning"
@@ -2618,6 +2618,7 @@ import {
   uploadOutcomeMessage,
   thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
+import { offersBreakGlass } from '@/composables/breakGlass'
 import {
   PICKER_CHROMAS,
   PICKER_CODECS,
