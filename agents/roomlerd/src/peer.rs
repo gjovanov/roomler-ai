@@ -11082,17 +11082,9 @@ fn attach_control_handler(
                         let answer = tokio::task::spawn_blocking(move || {
                             if !enable {
                                 // P3: only the owning session's toggle-off
-                                // restores; a non-owner disabling its OWN match
-                                // preference must not revert the mode another
-                                // session applied.
-                                if crate::display_match::restore_for(session_id) {
-                                    tracing::info!("display-match: restored original mode");
-                                } else {
-                                    tracing::debug!(
-                                        "display-match: disable from non-owner session — no-op"
-                                    );
-                                }
-                                return crate::display_match::Answer::Off;
+                                // restores, and a request this session left
+                                // waiting is dropped with it.
+                                return crate::display_match::turn_off(session_id);
                             }
                             crate::display_match::request_for(session_id, w, h)
                         })
