@@ -472,196 +472,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ssh_activity_log: bool,
 
-    // ─── FR-90: Hive agent sessions ─────────────────────────────────────
-    // The device's own gates, every one of them default-deny, and none of them
-    // settable by the server: which local account runs a session and where it
-    // may run are the DEVICE's answer, so a compromised server can neither
-    // pick SYSTEM/root nor point a session at `/etc` (design §4.2, §13).
-    /// May this device RUN agent sessions (`rc:hive.start`)? Default
-    /// **`false`** — gate 4, the refusal that survives a compromised server,
-    /// like [`Self::exec_enabled`] and [`Self::ssh_enabled`]. A session is a
-    /// model running commands on this machine as one of its accounts.
-    #[serde(default)]
-    pub hive_enabled: bool,
-
-    /// Which local account a Roomler user's sessions run as:
-    /// `{ "<user id, or the user's proven email>" = "<account>" }`.
-    ///
-    /// **Unmapped means refused** (`no_account`) — never a fallback to the
-    /// daemon's own identity, and never an account the server names (the
-    /// start frame carries none). A mapping to a uid-0 account is refused at
-    /// launch too, by the same privilege path exec and SSH use.
-    #[serde(default)]
-    pub hive_accounts: BTreeMap<String, String>,
-
-    /// The folders sessions may run in, checked on the resolved path, so
-    /// `..` and a symlink out of a root do not count. **Empty means nowhere**,
-    /// never anywhere — the overlay ACL's `Some([])` lesson, applied before
-    /// anyone ships the other reading.
-    #[serde(default)]
-    pub hive_roots: Vec<String>,
-
-    /// The most sessions this device runs at once (`at_capacity` past it).
-    /// `None` = 4.
-    #[serde(default)]
-    pub hive_max_sessions: Option<u32>,
-
-    /// The harness binary (Claude Code), absolute. `None` = the first of
-    /// `~/.local/bin/claude`, `/usr/local/bin/claude`, `/usr/bin/claude` that
-    /// exists, the first one resolved in the mapped account's home.
-    #[serde(default)]
-    pub hive_harness: Option<String>,
-
-    /// FR-90 P0e — the command the DAEMON runs (as SYSTEM/root) to print the
-    /// model provider's API key. The key stays in the daemon: a session's
-    /// Claude Code gets a per-session token for the loopback model sidecar,
-    /// which checks it (this session, still running here at its fence, and a
-    /// device not offline past `offline_grace`) and swaps the key in on the
-    /// way out. Unset = no model credential, and a session's model calls fail
-    /// (a per-session config directory holds no login of its own).
-    #[serde(default)]
-    pub hive_api_key_helper: Option<String>,
-    /// FR-90 P0g — the provider workspace the model calls are made in, for
-    /// a key that is not scoped to one: the API then requires an
-    /// `anthropic-workspace-id` header on every call. The sidecar adds it
-    /// with the key; a session never sets it (field, 2026-10-07: such a key
-    /// answered every call `400 This API key is not scoped to a workspace`).
-    /// Unset = no header — right for a workspace-scoped key.
-    #[serde(default)]
-    pub hive_api_workspace_id: Option<String>,
-    /// FR-90 P1d-1 (AC7) — how long an update waits for running agent turns
-    /// before it restarts the daemon, which cuts every session's turn, in
-    /// seconds. A turn is a person's work in progress, so the wait holds a
-    /// server-pushed update too; it is bounded, so a busy session cannot hold
-    /// the device's updates back. `None` = 1800 (30 min); `0` = never wait.
-    #[serde(default)]
-    pub hive_update_wait_secs: Option<u32>,
-    /// FR-90 P1e — show the org's core memory to the sessions on this device:
-    /// the snapshot the server sends with a start, written into the session's
-    /// own config dir as `CLAUDE.md` and the auto-memory `MEMORY.md`. Default
-    /// OFF, and never pushable: Claude Code reads `CLAUDE.md` as the user's
-    /// own OVERRIDING instructions, so this is the one place server-authored
-    /// text reaches a session's model, and whether it may is the device
-    /// owner's call alone.
-    #[serde(default)]
-    pub hive_core_memory: bool,
-    /// FR-90 P1j — let the people who use this device adopt the Claude Code
-    /// sessions they run in a terminal (`roomler hive adopt`): mirrored into
-    /// this device's store and listed for their owner alone, read-only.
-    /// Default OFF, and never pushable: a terminal session passed none of
-    /// Hive's start gates, so whether this machine reports on its terminals
-    /// at all is the device owner's call alone. Each person still opts in
-    /// themselves, and their account must map in `hive_accounts`.
-    #[serde(default)]
-    pub hive_adopt: bool,
-    /// FR-90 decision 15 — on a Mac, run sessions as an account whose `sudo`
-    /// needs no password. Default OFF: such a start is refused, because
-    /// macOS's `sudo` reads the account's groups from the directory, so the
-    /// session would have root whatever groups it drops. Never pushable:
-    /// whether an agent on this machine may be root is the device owner's
-    /// call alone. Linux needs no such key: a session there cannot `sudo`.
-    #[serde(default)]
-    pub hive_allow_passwordless_sudo: bool,
-    /// FR-90 P2c — hold copies of the sessions this device's owner runs on
-    /// their other devices: a replica, which a promotion can move a session
-    /// to once its device is gone. Default OFF, and never pushable: a replica
-    /// is a plaintext copy of everything the agent saw, so whether this
-    /// device holds one is its owner's call alone. Off, it advertises no
-    /// `hive-replica` and refuses a join on its own word.
-    #[serde(default)]
-    pub hive_replica: bool,
-    /// FR-90 P2c — offer this device as an archive replica of the org: once
-    /// an `ADMINISTRATOR` designates it, it holds every session the org's
-    /// rules allow, for their retention. Counts only with `hive_replica` on.
-    /// Default OFF, never pushable: offering is the device owner's, as
-    /// designating is the org's.
-    #[serde(default)]
-    pub hive_archive: bool,
-    /// FR-90 P2c — the most this device keeps of the sessions it holds as a
-    /// replica, in MiB; `None` = no bound but the disk's. Never pushable: the
-    /// device owner's disk.
-    #[serde(default)]
-    pub hive_store_quota_mib: Option<u32>,
-    /// FR-90 P3-3 — let the org's vault lease values to the agent sessions on
-    /// this device. On, the daemon makes a vault key at start (in memory
-    /// only, a new one each start) and publishes its public half in the
-    /// primary enrollment's hello; off, it makes none, publishes none, and
-    /// the vault leases it nothing. Default OFF, and never pushable: whether
-    /// org secrets are ever decrypted on this machine is the device owner's
-    /// call alone, as whether sessions run here at all is `hive_enabled`'s.
-    #[serde(default)]
-    pub vault_enabled: bool,
-    /// FR-90 P3-4d-2 — report to the organization what this device does with
-    /// the values its vault leases it: each command a session ran with them
-    /// (the program and how it ended) and each file it wrote (the name),
-    /// never a value. Off by default because it is the DEVICE that decides
-    /// what it says about itself, as `ssh_activity_log` is; the org's record
-    /// of what it released lives in `vault_audit` and does not depend on this
-    /// key. Never pushable.
-    #[serde(default)]
-    pub vault_activity_log: bool,
-    /// FR-90 P3-7-3c — offer the agent sessions on this device their own
-    /// egress: `net_socks` and `net_forward`, a loopback listener per call,
-    /// served to the session's account alone, its flows leaving from another
-    /// device of the organization as its vault and tunnel policies decide.
-    /// Only beside `vault_enabled`. Default OFF, and never pushable: whether
-    /// a session here reaches a network beyond this device is the owner's call.
-    #[serde(default)]
-    pub hive_net: bool,
-    /// FR-90 P3-8-2b-2 — offer the agent sessions on this device `ssh_run`:
-    /// one command on another device of the organization over Roomler SSH,
-    /// as the account that device's SSH policy maps (which may be SYSTEM or
-    /// root there), its key minted by this daemon for the one call. Only
-    /// beside `vault_enabled`: the vault decides each call, and a person
-    /// approves it. Default OFF, and never pushable: whether a session here
-    /// reaches into another device is the owner's call.
-    #[serde(default)]
-    pub hive_ssh: bool,
-    /// FR-90 P3b-1b-2 — run every agent session on this device in Claude
-    /// Code's sandbox, its commands' connections sent through the session's
-    /// egress proxy, each host decided by the organization's vault
-    /// (`net:egress`; decisions 27 and 28). Only beside `vault_enabled`. On
-    /// Windows, where no sandbox runs, every session gets the proxy named in
-    /// its environment, advisory (P3b-5-1, decision 30). Default OFF, and
-    /// never pushable: whether a session here reaches the network only as
-    /// the vault decides is the owner's call.
-    #[serde(default)]
-    pub hive_egress: bool,
-    /// FR-90 P8-2a-1 — run a worker beside each agent session on this device
-    /// (`roomlerd hive-worker`, the same binary as the daemon's supervised
-    /// child) and, P8-2d-1, one for the device itself, so a fault in what one
-    /// serves costs that worker and never the daemon. Default OFF, and never
-    /// pushable: how this device's own processes are arranged is the owner's
-    /// call. Read as the daemon starts: a change waits for its next start.
-    #[serde(default)]
-    pub hive_worker: bool,
-    /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):
-    /// absolute paths, a folder walked for its git checkouts, each read as
-    /// the account that owns it and never as the daemon, for metadata alone.
-    /// **Empty means nothing is read** (the scan answers `no_roots`), never
-    /// everything. Read from this file again at each scan, so an edit takes
-    /// the next one, and never pushable: what a device reads is its owner's
-    /// call, not the server's.
-    #[serde(default)]
-    pub knowhow_scan_roots: Vec<String>,
-    /// FR-90 P4-3b-3 — whether this device's knowhow scans report the TCP
-    /// ports it listens on (decision 47): each port, its bound address and
-    /// the process holding it, read by the daemon from the system's own
-    /// table. Default **off**: a listener is under no root, and its process
-    /// names software a person runs. Read from this file again at each scan,
-    /// and never pushable.
-    #[serde(default)]
-    pub knowhow_scan_listeners: bool,
-    /// FR-90 P4-5-1b — where this device's knowhow probes may go (decision
-    /// 53), in [`crate::probe_reach`]'s syntax (`100.64.0.0/10:22`,
-    /// `db.example.com:5432`, `*.example.com:443`). **Empty means nowhere**:
-    /// every probe is answered `not_allowed`, since a probe leaves from
-    /// inside this device's own network. Link-local and the cloud metadata
-    /// addresses are never reached, whatever it lists. Read from this file
-    /// again at each probe, and never pushable: where a device connects to on
-    /// the map's word is its owner's call, not the server's.
-    #[serde(default)]
-    pub knowhow_probe_reach: Vec<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -2324,18 +2134,6 @@ impl AgentConfig {
         c.exec_enabled = false;
         c.remote_config_enabled = false;
         c.external_access_enabled = false;
-        c.hive_enabled = false;
-        c.hive_adopt = false;
-        c.hive_replica = false;
-        c.hive_archive = false;
-        c.hive_net = false;
-        c.hive_ssh = false;
-        c.hive_egress = false;
-        c.hive_worker = false;
-        c.vault_enabled = false;
-        c.knowhow_scan_roots = Vec::new();
-        c.knowhow_scan_listeners = false;
-        c.knowhow_probe_reach = Vec::new();
         c.auto_update = Some(false);
         c.crash_count = 0;
         c.last_crash_unix = 0;
@@ -3048,29 +2846,6 @@ pub fn test_fixture() -> AgentConfig {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
-        hive_enabled: false,
-        hive_accounts: BTreeMap::new(),
-        hive_roots: Vec::new(),
-        hive_max_sessions: None,
-        hive_harness: None,
-        hive_api_key_helper: None,
-        hive_api_workspace_id: None,
-        hive_update_wait_secs: None,
-        hive_core_memory: false,
-        hive_adopt: false,
-        hive_allow_passwordless_sudo: false,
-        hive_replica: false,
-        hive_archive: false,
-        hive_store_quota_mib: None,
-        vault_enabled: false,
-        vault_activity_log: false,
-        hive_net: false,
-        hive_ssh: false,
-        hive_egress: false,
-        hive_worker: false,
-        knowhow_scan_roots: Vec::new(),
-        knowhow_scan_listeners: false,
-        knowhow_probe_reach: Vec::new(),
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,
@@ -4559,6 +4334,45 @@ fn serialise_for(
 /// process and file: after a rollback, or a key set ahead of the update that
 /// knows it, "my setting did nothing" has its answer in the log. Key paths
 /// only; the file holds secrets.
+/// FR-137 S-B7 (decision D11) — FR-90's 23 config keys, retired with Hive.
+/// Every recent agent wrote them, Hive host or not (`false` and `[]` included),
+/// so nearly every `config.toml` in the fleet carries them. They stay through
+/// every save (the unknown-key merge, S-B6: never add `deny_unknown_fields`),
+/// and a build from a revert reads them again. What they are not is news: the
+/// once-per-start WARN below leaves them out, or every host would log the same
+/// twenty-odd keys at every start.
+pub(crate) const RETIRED_KEYS: [&str; 23] = [
+    "hive_enabled",
+    "hive_accounts",
+    "hive_roots",
+    "hive_max_sessions",
+    "hive_harness",
+    "hive_api_key_helper",
+    "hive_api_workspace_id",
+    "hive_update_wait_secs",
+    "hive_core_memory",
+    "hive_adopt",
+    "hive_allow_passwordless_sudo",
+    "hive_replica",
+    "hive_archive",
+    "hive_store_quota_mib",
+    "vault_enabled",
+    "vault_activity_log",
+    "hive_net",
+    "hive_ssh",
+    "hive_egress",
+    "hive_worker",
+    "knowhow_scan_roots",
+    "knowhow_scan_listeners",
+    "knowhow_probe_reach",
+];
+
+/// Is this dotted path one of [`RETIRED_KEYS`], or inside one (the
+/// `hive_accounts` table)?
+fn is_retired_key(dotted: &str) -> bool {
+    RETIRED_KEYS.contains(&dotted.split('.').next().unwrap_or(dotted))
+}
+
 fn note_unknown_keys(path: &PathBuf) {
     static NOTED: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
     let Ok(raw) = std::fs::read_to_string(path) else {
@@ -4567,14 +4381,15 @@ fn note_unknown_keys(path: &PathBuf) {
     let Some(unknown) = unknown_keys(&raw) else {
         return;
     };
-    if unknown.is_empty() {
-        return;
-    }
     let keys = unknown
         .iter()
         .map(|s| dotted(s))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .filter(|k| !is_retired_key(k))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return;
+    }
+    let keys = keys.join(", ");
     {
         let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
         if noted.iter().any(|(p, k)| p == path && *k == keys) {
@@ -5029,6 +4844,58 @@ machine_name = "devbox"
         assert_eq!(try_load(&path).unwrap().machine_name, "renamed");
     }
 
+    /// FR-137 S-B6 / S-B7 — FR-90's 23 real keys, as a 0.4.199 save wrote
+    /// them (`hive_accounts` a whole table), survive two saves of a build that
+    /// no longer knows them, so a build from a revert finds every one of them
+    /// again, `hive_enabled = true` included. And they are no news: the
+    /// once-per-start WARN leaves them out, and only them.
+    #[test]
+    fn fr90s_retired_keys_survive_two_saves_and_are_not_warned_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let hive = "hive_enabled = true\nhive_roots = [\"/srv/work\"]\nhive_max_sessions = 2\n\
+            hive_harness = \"claude\"\nhive_api_key_helper = \"/usr/local/bin/key\"\n\
+            hive_api_workspace_id = \"ws1\"\nhive_update_wait_secs = 600\n\
+            hive_core_memory = false\nhive_adopt = true\nhive_allow_passwordless_sudo = false\n\
+            hive_replica = false\nhive_archive = false\nhive_store_quota_mib = 512\n\
+            vault_enabled = false\nvault_activity_log = false\nhive_net = false\n\
+            hive_ssh = false\nhive_egress = true\nhive_worker = false\n\
+            knowhow_scan_roots = []\nknowhow_scan_listeners = false\nknowhow_probe_reach = []\n";
+        let raw = format!(
+            "{hive}{}\n[hive_accounts]\nalice = \"alice\"\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let mut want: Vec<String> = RETIRED_KEYS.iter().map(|k| k.to_string()).collect();
+        want.sort();
+        assert_eq!(unknown_names(&path), want, "all 23, and nothing else");
+
+        let mut cfg = load(&path).expect("a 0.4.199 file still loads");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        save(&path, &back).unwrap();
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+        let table = saved_table(&path);
+        assert_eq!(table["hive_enabled"].as_bool(), Some(true));
+        assert_eq!(table["hive_egress"].as_bool(), Some(true));
+        assert_eq!(table["hive_store_quota_mib"].as_integer(), Some(512));
+        assert_eq!(table["hive_accounts"]["alice"].as_str(), Some("alice"));
+        assert_eq!(table["hive_roots"][0].as_str(), Some("/srv/work"));
+
+        for k in RETIRED_KEYS {
+            assert!(is_retired_key(k), "{k}");
+        }
+        assert!(is_retired_key("hive_accounts.alice"), "inside the table");
+        assert!(!is_retired_key("a_key_from_a_newer_build"));
+        assert!(!is_retired_key("hive"), "a prefix is not a key");
+        assert!(
+            !is_retired_key("forward_acl.hive_enabled"),
+            "nor a key elsewhere"
+        );
+    }
+
     /// #2078 — only keys this build IGNORES are carried over. One it knows and
     /// the save cleared stays cleared, though the file being replaced had it.
     #[test]
@@ -5226,8 +5093,8 @@ machine_name = "devbox"
     /// for every thread: a parallel test with no subscriber of its own makes
     /// it `never`, and the capture misses that line for good, though this
     /// thread emitted it. Measured in CI on two of the save tests. With two,
-    /// every registered dispatcher is asked, as `pairing_terminal`'s and the
-    /// hive tests' captures hold. The scope ends first, then the second.
+    /// every registered dispatcher is asked, as `pairing_terminal`'s captures
+    /// hold. The scope ends first, then the second.
     struct CaptureGuard {
         _scoped: tracing::dispatcher::DefaultGuard,
         _second: tracing::Dispatch,
@@ -7095,8 +6962,6 @@ tenant_id = "tid2"
         file.exec_enabled = true;
         file.remote_config_enabled = true;
         file.external_access_enabled = true;
-        file.hive_enabled = true;
-        file.vault_enabled = true;
         file.auto_update = Some(true);
         file.crash_count = 3;
         file.rollback_attempted = true;
@@ -7125,8 +6990,6 @@ tenant_id = "tid2"
         assert!(!view.exec_enabled);
         assert!(!view.remote_config_enabled);
         assert!(!view.external_access_enabled);
-        assert!(!view.hive_enabled);
-        assert!(!view.vault_enabled);
         assert_eq!(view.auto_update, Some(false));
         assert_eq!(view.crash_count, 0);
         assert!(!view.rollback_attempted);

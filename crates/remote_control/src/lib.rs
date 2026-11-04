@@ -18,7 +18,6 @@
 //! - [`turn_url`]    — port-correct TURN URL parsing + transport-variant expansion
 //! - [`audit`]       — write-side of the remote_audit collection
 //! - [`models`]      — Mongo-backed entities (Agent, RemoteSession, RemoteAuditEvent)
-//! - [`hive`]        — FR-90 Hive vocabulary: session refusals, run states, limits
 //! - [`error`]       — unified error type
 //!
 //! This crate intentionally does NOT depend on the mediasoup crate. The SFU
@@ -39,10 +38,6 @@ pub mod consent;
 pub mod derp_frame;
 pub mod derp_ticket;
 pub mod error;
-pub mod hive;
-/// FR-90 P4-3 — knowhow's scan vocabulary: a scan's findings, their bounds,
-/// and the credential shapes both ends refuse.
-pub mod knowhow;
 pub mod models;
 pub mod permissions;
 pub mod serde_helpers;
@@ -58,9 +53,6 @@ pub mod turn_creds;
 /// collector and by a PoP's `derp-relay` alike.
 pub mod turn_stats;
 pub mod turn_url;
-/// FR-90 P3-3b — the vault's lease vocabulary: refusal words and bounds both
-/// ends read.
-pub mod vault;
 pub mod worker_pick;
 
 pub use error::{Error, Result};
