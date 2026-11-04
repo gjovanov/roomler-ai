@@ -1460,10 +1460,16 @@ companion show the root half's row, and a verb that needs the server (`forward`,
 `exec`, `ssh`, a rename) says to run it with `sudo`. The worker's log lines go up on
 the root half's row, each marked `process: gui-worker`.
 
+A secondary org's session goes to the worker too (FR-43 P3b). Its prompt names the org
+that asks, each reply goes back on that org's connection, and no org reaches a session
+another org opened. A person's own `auto_grant_session = false` and their `rc_*` keys
+still bind every session on that Mac: the worker hands them to the daemon, which takes
+the stricter of the person's and its own.
+
 The switch is off by default and stays off until the
 [field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't yet give
-one row alone: secondary orgs, the migration of a two-row Mac and the one-token install
-are P3b, P3c and P3d.
+one row alone: the migration of a two-row Mac and the one-token install are P3c and
+P3d.
 
 ```bash
 # Screen sharing only (one token, one device row):
