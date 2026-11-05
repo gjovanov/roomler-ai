@@ -211,15 +211,13 @@ crates/
   tunnel-core/        → tunnels + the overlay data plane, shared by the CLI and the agent
   derp-relay/         → the standalone regional DERP relay
   tcp-turn-conn/      → TURNS-over-TLS-over-TCP for UDP-blocked networks
-  hive-node/          → FR-90 Hive on the device
   roomler-setup-core/ → shared install-wizard machinery
   vendored/           → patched forks (scrap, webrtc*, rtp, wintun-bindings)
   core/               → roomler-core (AGPL, server only): Module trait, hooks, jobs, the module
                         DAG, composition, Core (/ws registry, Redis fan-out, storage, rate limits)
   modules/<name>/     → roomler-ai-mod-<name>: chat · conference (the only mediasoup crate) ·
                         fleet (devices, agent Hub, releases, consent, remote config, fleet RPC) ·
-                        remote + network (both on fleet) · hive · vault · knowhow (FR-90,
-                        default OFF) · saas (an add-on)
+                        remote + network (both on fleet) · saas (an add-on)
   api/                → Axum HTTP/WS server; compose.rs is the host composition
   tests/              → integration tests (real servers; drive the agent in-process)
 agents/

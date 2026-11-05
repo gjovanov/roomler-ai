@@ -1549,240 +1549,30 @@ SYSTEM, the signed-in user on an attended install).
 until their mask is rewritten — the same friction `SSH_DEVICE` has. Owner is
 unaffected (it passes via the `ADMINISTRATOR` bypass).
 
-### An agent session's request (FR-90 P3-8-1b)
+### What parked agent sessions left behind (FR-137)
 
-A Hive agent session runs one command on another device of its organization
-(`ssh_run`, the FR-90 spec's §3e "P3-8, `ssh_run`, as designed"). It asks
-from its own device, on the device-originated leg, which today runs under
-the origin device's **owner**. A session that used it as it is would borrow
-its owner's SSH rights. So the session's request carries a decision of its
-own: the vault's **ticket** (`ssh_ticket`, [`vault.md`](vault.md) §22), and
-the network module holds the request to it. It is a ticket, not a grant,
-because `rc:ssh.grant` is already the target's grant, and the request
-carries both.
+Parked FR-90 let an agent session run one command on another device: it asked
+with a ticket its vault signed (`ssh_ticket` on `rc:ssh.request`), toward a
+target that advertised `ssh-one-command`. That code is off master. Three things
+stay, each for a reason that outlives it:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant D as the session's device
-    participant S as server (network module)
-    participant T as target device
-    D->>S: rc:ssh.request { …, ssh_ticket }
-    S->>S: bind the ticket: this org, this device, this target (else ticket_refused)
-    S->>S: its account still the target's? the target says ssh-one-command?
-    S->>S: gate 1 · gate 2 is the vault's · gate 3: no policy admits a session yet
-    S-->>D: rc:ssh.response { error, ssh_ticket_id }
-    Note over T: nothing reaches the target until a policy admits sessions
-```
+| What stays | Why | Where | It may go when |
+|---|---|---|---|
+| `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:841` | no agent at 0.4.199 or older is left (FR-137 D8) |
+| a request that carries one is refused `TicketRefused` and audited, never served as the owner's | the same | bound to a refused caller at `crates/modules/network/src/agent_arms.rs:193`, refused at `crates/modules/network/src/routes/agent_ssh.rs:338`, and recorded by `dispatch` like any refusal | with the field |
+| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5064-5074` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
 
-| Check, in order | Refused as | The answer echoes the ticket |
-|---|---|---|
-| the ticket binds: this server's, unexpired, for THIS organization, from THIS connection's device, toward the request's target as resolved (by id) | `ticket_refused` | no: nothing it claims was verified |
-| the public key | `bad_public_key` | yes |
-| the account the ticket was decided for is still the one the target's policy maps | `ticket_refused` | yes |
-| the target advertises `ssh-one-command` (it can hold a grant to one command) | `target_too_old` | yes |
-| gate 1, the org's switch | `org_disabled` | yes |
-| gate 2 | (the vault decided `ssh:run` in its place: the owner's `SSH_DEVICE` is not read) | — |
-| gate 3: the device's `mode`, then which policies admit a session | `device_disabled`, then `session_not_allowed` until decision 22 | yes |
+A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
+`claim_service_grant` reads no query, so the word is ignored
+(`crates/modules/network/src/routes/agent_ssh.rs:1200`). The verb
+`ssh-one-command` is reserved with the rest of FR-90's verbs.
 
-What a session's request is held to once a policy admits it (decision 22,
-P3-8-1b-2), already in place:
-
-- **The rate limit counts the session**, not its owner: one session cannot
-  spend its owner's budget, nor the owner the session's.
-- **`session_secs` ends with the ticket at the latest**: the target closes the
-  session there, whatever the session asked for. What is left of a ticket is
-  never 0, which `clamp_session_secs` would read as the ceiling.
-- **The grant says `one_command`**, and so does FR-105's pending row and the
-  SYSTEM service's claim: the target serves the key one `exec` (P3-8-2a).
-
-⚠️ **Never served as the owner's request.** A ticket that does not hold
-refuses the request. It does not fall back to the owner's path, which the
-device-originated leg would otherwise take: a session's daemon that sent a
-forged or stale ticket gets a refusal, not its owner's rights.
-
-⚠️ **The audit names the session.** `ssh_audit` rows of a session's request
-are `source: session`. Once the ticket holds, they carry `session_id` and
-`ssh_ticket_id` (`ticket:<id>` in `vault_audit`), and `user_id` is the
-person the session acts for, who need not own the device it runs on. The
-`caller` names the session too. A refused ticket's row is `session` with no
-session id, since nothing it claimed was verified.
-
-⚠️ **The echo is the client's guard.** A server before P3-8-1b ignores
-`ssh_ticket`, an unknown field, and would answer the request as the owner's.
-So `rc:ssh.response` echoes `ssh_ticket_id` whenever the ticket held, and
-the session's daemon never dials on an answer that does not echo the ticket
-it presented (P3-8-2b).
-
-| Piece | Where |
-|---|---|
-| the wire | `ssh_ticket` on `rc:ssh.request` ([`signaling.rs:841`](../crates/remote_control/src/signaling.rs#L841)), `one_command` on `rc:ssh.grant` ([`:3930`](../crates/remote_control/src/signaling.rs#L3930)), `ssh_ticket_id` on `rc:ssh.response` ([`:3971`](../crates/remote_control/src/signaling.rs#L3971)); `RpcCap::SshOneCommand` ([`models.rs:1141`](../crates/remote_control/src/models.rs#L1141)) and the three refusals ([`models.rs:5064`](../crates/remote_control/src/models.rs#L5064)) |
-| the binding | `bind_ssh_ticket` ([`agent_ssh.rs:220`](../crates/modules/network/src/routes/agent_ssh.rs#L220)), called where the request arrives ([`agent_arms.rs:193`](../crates/modules/network/src/agent_arms.rs#L193)); the outcome is a `CallerSession` ([`agent_ssh.rs:180`](../crates/modules/network/src/routes/agent_ssh.rs#L180)), and a refused one is answered at [`:333`](../crates/modules/network/src/routes/agent_ssh.rs#L333) |
-| the checks | the account and one-command checks ([`agent_ssh.rs:496`](../crates/modules/network/src/routes/agent_ssh.rs#L496)); gate 3's refusal of a session ([`:324`](../crates/modules/network/src/routes/agent_ssh.rs#L324)); what is left of a ticket ([`:954`](../crates/modules/network/src/routes/agent_ssh.rs#L954)) |
-| the audit | the `session` source and the session's ids ([`agent_ssh.rs:858`](../crates/modules/network/src/routes/agent_ssh.rs#L858)) |
-| what comes next | P3-8-1b-2: gate 3 for a session, as decision 22 says. The target holding `one_command` (P3-8-2a), the device's client (P3-8-2b-1) and the tool `ssh_run` (P3-8-2b-2) are the next three sections |
-
-### A session's grant on the target: one command (FR-90 P3-8-2a)
-
-The grant a session's request earns says `one_command`, and the **target**
-holds the session it opens to exactly that: one `exec`, on one channel. It is
-the target's rule, not the client's. The session's daemon holds the key, and
-a key may ask for anything a key may ask for, so only the device being reached
-can keep the session to what its ticket was decided for.
-
-| The session asks for | What it gets |
-|---|---|
-| a session channel | the first one. A second is refused (`administratively prohibited`): it could carry a second command |
-| `exec` | the first one runs. Any later one is refused with the reason on stderr. The attempt is spent when it is asked, so a refused or failed `exec` is not followed by another |
-| a terminal (`pty-req`) | refused before it is recorded. The command runs without one |
-| a shell | refused, with the reason on stderr |
-| a subsystem, `sftp` included | refused, with the reason on stderr |
-| a forward (`direct-tcpip`) | refused, even to a destination this device's `forward_acl` admits, and reported as a denied forward |
-| `-R`, agent or X11 forwarding | what every session gets: nothing (none is implemented) |
-
-```mermaid
-flowchart LR
-    S["server: a session's grant<br/>one_command"] --> R{"the device's SYSTEM service<br/>published one_command?"}
-    R -- "yes, and it serves this account" --> V["the service claims it<br/>(claim says one_command=true)"]
-    R -- "no" --> W["the worker records it<br/>(its own ssh-one-command)"]
-    V --> H["the SSH server: one exec,<br/>on one channel"]
-    W --> H
-```
-
-**Who says the device can hold it.** The worker's hello advertises
-`ssh-one-command`, and P3-8-1b sends a session's grant to no connection that
-does not. That word speaks for the worker's own server. On an anchored Windows
-device, a grant may instead go to the SYSTEM service (FR-105), whose build can
-be older than the worker's. So the service says it for itself:
-- its endpoint publish carries `one_command: true`, and a session's grant is
-  routed to the service only when the published record says so. Otherwise the
-  worker serves it, as it serves any grant outside the service's reach;
-- its claim carries `one_command=true`, and a session's grant is handed to no
-  claim that does not say so: the same 404 as every other refusal, audited
-  `claim_refused`. Routing already keeps such a grant from a service that
-  never said the word, so this is the backstop for one whose build changed
-  since it published.
-
-⚠️ **The attempt counts, not the success.** A session that sent an `exec`
-the device refused, or whose command failed to start, has used its one
-command. Retrying would let a session probe the device's rules one refusal at
-a time.
-
-⚠️ **The key-list path is never one-command.** A key in the device's own
-`ssh_authorized_keys` is the owner's break-glass access, and no agent
-session's grant backs it.
-
-| Piece | Where |
-|---|---|
-| the grant's field | `Grant::one_command` ([`ssh.rs:3036`](../agents/roomlerd/src/ssh.rs#L3036)), recorded by `record_grant` ([`:3000`](../agents/roomlerd/src/ssh.rs#L3000)), resolved into the session's policy ([`:836`](../agents/roomlerd/src/ssh.rs#L836)) |
-| the rules | one channel ([`ssh.rs:1721`](../agents/roomlerd/src/ssh.rs#L1721)), no forward ([`:1787`](../agents/roomlerd/src/ssh.rs#L1787)), one `exec` ([`:1882`](../agents/roomlerd/src/ssh.rs#L1882)), no shell ([`:1992`](../agents/roomlerd/src/ssh.rs#L1992)), no terminal ([`:2031`](../agents/roomlerd/src/ssh.rs#L2031)), no subsystem ([`:2134`](../agents/roomlerd/src/ssh.rs#L2134)) |
-| the device's word | `ssh-one-command` in the hello ([`caps.rs:4649`](../agents/roomlerd/src/encode/caps.rs#L4649)) |
-| the SYSTEM service | the claim's word ([`ssh_service.rs:639`](../agents/roomlerd/src/ssh_service.rs#L639)), the published word ([`:648`](../agents/roomlerd/src/ssh_service.rs#L648)), and the claimed grant's field ([`:614`](../agents/roomlerd/src/ssh_service.rs#L614)) |
-| the server | routing a session's grant to the service ([`agent_ssh.rs:775`](../crates/modules/network/src/routes/agent_ssh.rs#L775)), the claim's backstop ([`:1378`](../crates/modules/network/src/routes/agent_ssh.rs#L1378)) in the pending rows' claim ([`ssh_pending.rs:63`](../crates/services/src/dao/ssh_pending.rs#L63)), the published record ([`models.rs:2910`](../crates/remote_control/src/models.rs#L2910)) |
-
-### The session's own device: the client (FR-90 P3-8-2b)
-
-The SSH client is the session's own daemon, never the session. The session
-never holds a key, and no key reaches its transcript: this daemon mints one for
-each call, presents its public half once, and drops it when the call ends.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant D as the session's daemon
-    participant V as vault
-    participant N as network module
-    participant T as target
-    D->>V: rc:vault.ssh {session, fence, target, ttl}
-    V-->>D: rc:vault.ssh.granted {ticket_id, ticket, os, account}
-    D->>D: mint an ed25519 key for this call
-    D->>N: rc:ssh.request {target, public key, session_secs, ssh_ticket}
-    N-->>D: rc:ssh.response {address, port, host_pubkey, ssh_ticket_id}
-    D->>D: the echo is this ticket's, and a host key is named? (else nothing dials)
-    D->>T: dial the overlay address, pin the host key, one exec
-    T-->>D: exit status, stdout, stderr
-```
-
-| Step | What the client does |
-|---|---|
-| the ticket | asks the vault (`rc:vault.ssh`), the primary's connection only, as a lease is. An answer that is not whole is refused; `Debug` never shows the ticket |
-| the key | ed25519, minted for the call; its private half lives in this process's memory alone |
-| the request | `rc:ssh.request` with the ticket and the key's public half. `session_secs` is the command's time plus the target's 30 s prompt; the network module clamps it to what is left of the ticket |
-| the answer | refused unless it echoes the ticket it presented and names a host key that parses. A refusal is the server's words |
-| the dial | the target's overlay address: through the userspace stack on a netstack node, through the OS's routes on a node with a TUN |
-| the session | the target's host key pinned to the answer's; one `exec`; the exit status and both streams, each to 64 KiB (`truncated` when cut), all within the call's time |
-
-⚠️ **The echo is the client's guard.** A server before P3-8-1b ignores
-`ssh_ticket`, an unknown field, and would answer the request as the device
-owner's. Such an answer echoes nothing, and the client dials nothing on it.
-
-⚠️ **Another host key is refused before the key is offered.** The client
-checks the target's key during the handshake, before it authenticates, so a
-device that answers in the target's place learns no key and spends no grant.
-
-⚠️ **One command is the target's rule, not this client's.** The client asks
-for one `exec` because that is all it needs; the target refuses anything more
-(P3-8-2a), whatever a daemon holding the key might ask.
-
-| Piece | Where |
-|---|---|
-| the ask | `Client::ssh` ([`vault.rs:927`](../agents/roomlerd/src/vault.rs#L927)), answered at [`:1079`](../agents/roomlerd/src/vault.rs#L1079) from the primary's connection ([`signaling.rs:6935`](../agents/roomlerd/src/signaling.rs#L6935)) |
-| the client | the key ([`ssh_client.rs:138`](../agents/roomlerd/src/ssh_client.rs#L138)), the request ([`:187`](../agents/roomlerd/src/ssh_client.rs#L187)), the answer's checks ([`:156`](../agents/roomlerd/src/ssh_client.rs#L156)), the one `exec` ([`:286`](../agents/roomlerd/src/ssh_client.rs#L286)), one call whole ([`:371`](../agents/roomlerd/src/ssh_client.rs#L371)) |
-| the dial | the netstack's ([`overlay.rs:972`](../agents/roomlerd/src/overlay.rs#L972)), the OS's ([`ssh_client.rs:240`](../agents/roomlerd/src/ssh_client.rs#L240)) |
-| the echo, carried | `rc:ssh.response` into the client's answer ([`signaling.rs:6535`](../agents/roomlerd/src/signaling.rs#L6535), [`ssh_origin.rs:37`](../agents/roomlerd/src/ssh_origin.rs#L37)) |
-
-### The tool: `ssh_run` (FR-90 P3-8-2b-2)
-
-A session asks for its one command with `ssh_run`, on its toolbelt. The tool is
-offered only where three things hold: the device's owner turned on `hive_ssh`,
-the vault is offered here (`vault_enabled`), and the build carries the `vault`
-and `ssh-server` features. Anywhere else `ssh_run` is an unknown tool.
-
-```mermaid
-flowchart LR
-    S["the session calls<br/>ssh_run {device, command, timeout_s}"] --> A{"a person approves<br/>(the settings ask)"}
-    A -- no --> X["denied: nothing is asked"]
-    A -- yes --> P{"one line, at most 8 KiB?<br/>timeout 1 to 300 s?"}
-    P -- no --> Y["refused in words:<br/>the vault is asked nothing"]
-    P -- yes --> V["rc:vault.ssh, its ticket for<br/>30 s + 30 s + the timeout"]
-    V -- refused --> Z["the vault's word"]
-    V -- a ticket --> C["the client, above:<br/>key, request, echo, host key, one exec"]
-    C --> R["os, account, ticket_id,<br/>exit_code, stdout, stderr, truncated"]
-```
-
-| Piece | What it does |
-|---|---|
-| the offer | `hive_ssh`: device-owned, default off, and never pushable (`DesiredConfig` cannot carry it). Only beside `vault_enabled` |
-| the call | `device`, a device's id; `command`, one line of at most 8 KiB for that device's shell (PowerShell on Windows, bash elsewhere); `timeout_s`, 1 to 300 seconds, 60 if not given. A call that breaks one of these is refused before the vault is asked |
-| the approval | the session's settings ASK for `mcp__roomler__ssh_run` on every call, as they do for the vault's uses, so a repository's own allow rule cannot skip the person |
-| the ticket | asked for the session at its fence, toward `device`, to last the server's answer (30 s), the target's prompt (30 s) and the command. The network module ends the SSH session with what is left of the ticket, so a shorter one would cut the command off |
-| the run | this daemon's own client (above), on the primary connection the vault answered on |
-| the answer | the target's `os`, the `account` it ran as, the ticket's id (the join key to `ssh_audit`), the exit code, and both streams with `truncated`. Never the ticket itself |
-
-⚠️ **The approval names the device and the command, not the account.** The
-person answers before the vault is asked: an approval may wait 25 minutes, and
-a ticket ends within 900 s. The account the target maps comes back in the
-answer. What an account may run is the organization's guardrail to decide
-beforehand: a Cedar `forbid` when `context.account == "daemon"` keeps a
-session off SYSTEM and root ([`vault.md`](vault.md) §7). Whether the vault
-seeds that guardrail is part of decision 22.
-
-⚠️ **Until decision 22, every call is refused at gate 3.** No `SshPolicy`
-admits a session yet, so the network module answers `session_not_allowed`
-(P3-8-1b-1), whatever ticket the vault gave. The tool, the ticket and the
-target's one command are all in place for that decision; until it lands,
-nothing reaches a target.
-
-⚠️ **The daemon never logs the command.** Its log line names the session, the
-target, the ticket and the account, for the reason a terminal's content is
-never recorded: what a session typed is its own.
-
-| Piece | Where |
-|---|---|
-| the owner's key | `hive_ssh` ([`config.rs:619`](../crates/agent-core/src/config.rs#L619)), never pushable ([`models.rs:9399`](../crates/remote_control/src/models.rs#L9399)), read into `HiveConfig.ssh` ([`gates.rs:58`](../agents/roomlerd/src/hive/gates.rs#L58)) |
-| the offer | `Supervisor::ssh_runner` ([`supervisor.rs:1602`](../agents/roomlerd/src/hive/supervisor.rs#L1602)), made at start ([`:878`](../agents/roomlerd/src/hive/supervisor.rs#L878)); `Run.ssh` ([`toolbelt.rs:510`](../agents/roomlerd/src/hive/toolbelt.rs#L510)); the settings' ask ([`supervisor.rs:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055), `SSH_TOOLS` at [`toolbelt.rs:631`](../agents/roomlerd/src/hive/toolbelt.rs#L631)) |
-| the tool | its definition ([`toolbelt.rs:1378`](../agents/roomlerd/src/hive/toolbelt.rs#L1378)); the call ([`ssh_tools.rs:153`](../agents/roomlerd/src/hive/ssh_tools.rs#L153)), its checks ([`:113`](../agents/roomlerd/src/hive/ssh_tools.rs#L113)), the ticket's life ([`:146`](../agents/roomlerd/src/hive/ssh_tools.rs#L146)), the daemon's runner ([`:63`](../agents/roomlerd/src/hive/ssh_tools.rs#L63)) |
-| the ask | `VaultTools::ssh` ([`toolbelt.rs:481`](../agents/roomlerd/src/hive/toolbelt.rs#L481)), on the primary's queue ([`vault.rs:668`](../agents/roomlerd/src/vault.rs#L668)) |
+`a_ticketed_ssh_request_is_refused_and_audited`
+(`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
+(`:118`) and `ssh_audit_rows_written_before_p2_still_load`
+(`crates/remote_control/src/models.rs:8646`) lock it. The other surfaces FR-90
+left reserved are listed in
+[retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
 ## 5. Roadmap
 

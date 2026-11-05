@@ -539,7 +539,7 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 |---|---|---|
 | No config file (`app.rs:3703`) | bails, the supervisor gives up | writes one with blank identity fields, because `caps`, `record` and `config set` load the file |
 | No secret on stdin (`agents/roomlerd/src/delegate_worker.rs:210`) | warns and keeps serving its own row | exits: with no channel it can serve nothing, and the supervisor's bound applies |
-| Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay, hive, vault | from the file | blank or off in the view: the root holds all of them |
+| Identity, `[[orgs]]`, `[[tunnel_routes]]`, overlay, SSH, exec, relay | from the file | blank or off in the view: the root holds all of them |
 | Preflight to the server (`app.rs:4092`) | runs | skipped |
 | Crash bookkeeping and rollback (`app.rs:4096-4234`) | runs | skipped. A worker cannot install a package. The supervisor records its crashes on the root's enrollment (`macos_supervisor.rs:1093`) |
 | Updater (`app.rs:4244`, `:5428`) | runs | off: the view sets `auto_update = false`, and the root and its update helper own updates |

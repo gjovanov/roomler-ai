@@ -125,7 +125,7 @@ P4c extends it to TURN, behind two switches that ship **off** and have been on i
 since 2026-10-23. With `count_turn` (P4c-0),
 `turn_bytes` count toward the allowance beside `derp_bytes`. With `turn` (P4c-1), the org's
 overlay pairs leave TURN for that same DERP floor, and so meet the same throttle. Remote
-desktop, meetings, hive and tunnels keep TURN: a browser's WebRTC has no DERP path, and a
+desktop, meetings and tunnels keep TURN: a browser's WebRTC has no DERP path, and a
 tunnel's TURN leg cannot be steered from the server. The plan's session and meeting caps bound
 them instead, and their bytes still count (FR-115 *P4c, as proposed*).
 

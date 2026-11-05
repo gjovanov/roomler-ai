@@ -848,245 +848,33 @@ Locked by lib tests, each shown red with a one-line negative control:
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
-   as *subject* (user / tunnel client / agent / an agent session, below) ×
+   as *subject* (user / tunnel client / agent) ×
    *target* (agent) × *destination* (`host:port`, protocol). Managed in the
    admin UI; every decision lands in `tunnel_audit` (90 d).
 2. **Agent-local `forward_acl`** (config.toml): the exit machine's own last word —
    it survives a compromised server. Empty-but-enabled means "trust the server".
 
-### An agent session's grant (FR-90 P3-7-2a)
+### A retired agent-session grant is refused (FR-137)
 
-A Hive agent session ([hive.md](hive.md)) reaches a private subnet, or the
-internet from a chosen place, through these same tunnels, but never as its
-device. It asks the vault, which decides by policy and answers with a
-**grant** ([vault.md](vault.md) §21): a token signed under its own `net_grant`
-audience. The grant names the session, its owner, the device it runs on (the
-origin), the exit, a forward's one destination, and an end at most 900 s away.
-The device presents it on `rc:tunnel.open`, over its own agent WS. The server
-binds it to that tunnel, and every flow the tunnel carries is then the
-**session's**, never the device's. No device presents one before P3-7-3.
+Parked FR-90 let an agent session open a tunnel under a grant its vault signed,
+presented as `net_grant` on `rc:tunnel.open`. That code is off master, but a
+0.4.199 device still sends the field, and `ClientMsg` ignores a field it does not
+know. Dropped from the wire, such an open would parse as the device's own and
+reach whatever the device may reach. So:
 
-```mermaid
-sequenceDiagram
-    participant D as roomlerd (the session's device)
-    participant S as network module
-    participant E as exit
-    D->>S: rc:tunnel.open {agent_id: exit, open_nonce, net_grant}
-    S->>S: verify_net_grant: signature, audience, kind, destination, life
-    S->>S: an agent's own WS? its organization? origin = this device? exit = agent_id?
-    alt the grant holds
-        S-->>D: rc:tunnel.opened {session_id, open_nonce, net_grant_id}
-        D->>S: rc:tunnel.tcp.request {session_id, flow_id, dst}
-        S->>S: the grant first: TCP, before its end, a forward's one destination
-        S->>S: then tunnel_policies, for Principal::Session
-        S-->>D: rc:tunnel.tcp.reject {kind: acl_denied}, until a policy names sessions
-        S-->>E: rc:tunnel.tcp.forward, once one does (decision 20, P3-7-2b)
-    else it does not
-        S-->>D: rc:error {code: net_grant_refused, message, open_nonce}
-    end
-```
+- `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
+  (`crates/remote_control/src/signaling.rs:1319`), and no build sends it;
+- the server refuses any open that carries one, at step 3c
+  (`crates/modules/network/src/tunnel.rs:697`), before a tunnel session exists
+  (step 4, `:780`), with `rc:error {code: net_grant_refused}`
+  (`NET_GRANT_REFUSED`, `signaling.rs:101`). An old device reads that code as the
+  end of its grant, never as a reason to retry.
 
-| At the open, in order | Refused `net_grant_refused`, with the message |
-|---|---|
-| it came on an agent's own WS, not a tunnel client's | `a session's grant rides only its own device's connection` |
-| it verifies as a grant: this server's signature, the `net_grant` audience, a kind this build names, a forward's host canonical, every id it names an id, a life of at most 900 s, and before its end, with no leeway | `not a grant this server signed, or it has ended` |
-| its organization is this connection's | `a grant for another organization` |
-| its origin is this connection's device | `a grant for another device` |
-| its exit is the open's `agent_id` | `a grant for another exit` |
-
-| At each flow, before any policy is read | Rejected `acl_denied`, with the reason |
-|---|---|
-| TCP: a session's listener serves CONNECT only | `a session's grant carries TCP only` |
-| before the grant's end | `the session's grant has ended` |
-| a forward: toward the grant's one destination, its host compared in `canonical_net_host`'s one spelling | `outside the session's grant` |
-
-- ⚠️ **A grant that does not hold refuses the open.** It never falls back to
-  the device's own principal, which would hand the session whatever its device
-  may reach.
-- ⚠️ **A session matches no subject yet.** `subject_matches` answers `false`
-  for `Principal::Session` before it reads a subject: `AllUsers`, the owner's
-  `UserId` and the device's `AgentId` included. Which subjects match a session
-  is the operator's decision 20 (FR-90 §6), built in P3-7-2b. Until then a
-  session's flow passes its grant and every policy refuses it, so no policy
-  written before P3-7 opens anything to a session.
-- ⚠️ **The grant's end refuses new flows; it does not cut open ones.** A flow
-  admitted before the end runs until either side closes it. Ending it with
-  the grant is the device's job: its listener goes at the grant's end and its
-  flows with it, both halves (#2129, P3-7-3). The grant's life is at most
-  900 s.
-- ⚠️ **An older server ignores the grant** (an unknown field) and opens the
-  tunnel as the device's own. `net_grant_id` on `rc:tunnel.opened` is the
-  device's proof that its grant was bound: a device that presented one carries
-  no session flow over a tunnel opened without it (P3-7-3).
-- **The audit names the session.** Every `tunnel_audit` row of such a tunnel
-  carries `session_id` and `grant_id`; its `user_id` is the session's owner,
-  and `origin_agent_id` stays the device.
-
-| Piece | Where |
-|---|---|
-| the wire | `net_grant` on `rc:tunnel.open` ([`signaling.rs:2216`](../crates/remote_control/src/signaling.rs#L2216)), `net_grant_id` on `rc:tunnel.opened` ([`:4030`](../crates/remote_control/src/signaling.rs#L4030)) |
-| the binding | `bind_net_grant` ([`tunnel.rs:542`](../crates/modules/network/src/tunnel.rs#L542)), at step 3c of the open ([`:816`](../crates/modules/network/src/tunnel.rs#L816)) |
-| each flow | `SessionGrant::admits` ([`tunnel.rs:517`](../crates/modules/network/src/tunnel.rs#L517)), first in `handle_forward_request` ([`:1173`](../crates/modules/network/src/tunnel.rs#L1173)) |
-| the principal | `Principal::Session` ([`policy.rs:48`](../crates/tunnel-core/src/policy.rs#L48)), `subject_matches` ([`:124`](../crates/tunnel-core/src/policy.rs#L124)) |
-| the audit | `TunnelAuditEvent.session_id` and `grant_id` ([`models.rs:4922`](../crates/remote_control/src/models.rs#L4922)) |
-| tests | `tunnel::tests` in the network module (3), `policy::tests::a_session_matches_no_subject_yet`, `signaling::tests::tunnel_open_carries_a_grant_and_opened_echoes_its_id`, and end to end [`tunnel_grant_tests.rs`](../crates/tests/src/tunnel_grant_tests.rs) (3) |
-
-#### The device's half: asking, and opening under the grant (P3-7-3a)
-
-The session's device asks the vault (`rc:vault.net`) and opens its tunnel
-under the answer. The tools `net_socks` and `net_forward` call it (P3-7-3c,
-below), and the listeners they serve are P3-7-3b's.
-
-```mermaid
-sequenceDiagram
-    participant T as the session's tool (P3-7-3c)
-    participant V as the daemon's vault client
-    participant H as the daemon's tunnel client hub
-    participant S as server
-    T->>V: net(session, fence, exit, dst?)
-    V->>S: rc:vault.net
-    S-->>V: rc:vault.net.granted {grant_id, grant, expires_at_ms, host?, port?}
-    V->>V: does it grant what was asked? else NotAsked
-    V-->>T: NetGrant, its end on this clock, never past 900 s
-    T->>H: a flow under the grant
-    H->>S: rc:tunnel.open {net_grant}, at every open of the flow
-    S-->>H: rc:tunnel.opened {net_grant_id}
-    H->>H: is the echo the grant's id? else NotBound, and the exit is told
-```
-
-| On the device | Ends with | Why |
-|---|---|---|
-| the vault's answer grants another destination, another port, a destination for SOCKS, or no token | `LeaseError::NotAsked` | a grant is used for exactly what the session asked, or not at all |
-| the server refuses the open (`net_grant_refused`) | `GrantError::Refused`, in the server's words | the grant does not hold, and another open would present the same grant |
-| `rc:tunnel.opened` does not echo the grant's id | `GrantError::NotBound` | a server from before P3-7-2a ignored the grant and opened the tunnel as the device's own |
-
-- ⚠️ **Both `GrantError`s end the flow for good** (`permanent_session_error`,
-  by the error's type). A daemon flow otherwise retries forever, and this one
-  would present the same grant to the same server. The session asks again.
-- ⚠️ **The echo is checked after the terminate guard is armed**, so a tunnel
-  that ends `NotBound` still tells the exit to drop its peer (#1754).
-- ⚠️ **The token is never logged.** `SessionGrantRef` and `NetGrant` print the
-  grant's id alone, and `rc:vault.net.granted` has an arm of its own in the
-  daemon's signalling: the catch-all logs every frame it is handed.
-
-| Piece | Where |
-|---|---|
-| asking | `vault::net` ([`vault.rs:884`](../agents/roomlerd/src/vault.rs#L884)) and its answer `on_net_granted` ([`:1049`](../agents/roomlerd/src/vault.rs#L1049)), held to what was asked by `net_granted` ([`:389`](../agents/roomlerd/src/vault.rs#L389)); the answer's own arm in the daemon's signalling ([`signaling.rs:6870`](../agents/roomlerd/src/signaling.rs#L6870)) |
-| presenting | `SessionParams.net_grant` ([`driver.rs:413`](../crates/tunnel-core/src/driver.rs#L413)), sent at the open ([`:1024`](../crates/tunnel-core/src/driver.rs#L1024)); a refusal typed ([`:1076`](../crates/tunnel-core/src/driver.rs#L1076)); the echo checked after the guard ([`:1102`](../crates/tunnel-core/src/driver.rs#L1102)); `SessionGrantRef` and `GrantError` ([`:2315`](../crates/tunnel-core/src/driver.rs#L2315), [`:2332`](../crates/tunnel-core/src/driver.rs#L2332)) |
-| the flow | `FlowLive.net_grant` ([`client_mgr.rs:201`](../agents/roomlerd/src/tunnel/client_mgr.rs#L201)), permanent by its type in `permanent_session_error` ([`:1638`](../agents/roomlerd/src/tunnel/client_mgr.rs#L1638)) |
-| the code | `NET_GRANT_REFUSED` ([`vault.rs:575`](../crates/remote_control/src/vault.rs#L575)), shared by the server and the device |
-| tests | `driver::tests` (4), `tunnel::client_mgr::tests::a_refused_or_unbound_grant_ends_the_flow`, `vault::tests::client` (2): 7, and 13 negative controls |
-
-#### The device's listeners (P3-7-3b)
-
-A session's flow serves on loopback, to the session's account alone.
-P3-7-3c's tools create them (below).
-
-```mermaid
-flowchart LR
-    APP["a process of the session's account"] -->|"127.0.0.1, a port the system picked"| L["the flow's listener"]
-    OTHER["another account's process"] -.->|"refused: closed, never held"| L
-    L --> SOCKS{"SOCKS5?"}
-    SOCKS -->|"RFC 1929: the listener's credential, CONNECT alone"| T["the tunnel, under the grant"]
-    SOCKS -->|"a forward: its one destination"| T
-    T -->|"the grant's end"| END["listener closed; every connection ended, both halves"]
-```
-
-| What | How |
-|---|---|
-| the port | `127.0.0.1`, one the system picks, bound before the flow is handed back, so the address a tool answers with already serves |
-| the account | every connection is first asked of an admit hook on the flow's listener (`FlowListener::bind_admitting`), before it is held or carried. The hook makes the check `vault_connect`'s endpoints make (`connection_is`): the connection table and the process's token on Windows, `/proc/net/tcp` on Linux, the descriptors each process holds on macOS. Where the system cannot say, nothing is served |
-| SOCKS5 | RFC 1929 alone, with the listener's own credential (the session's id, and a capability made for the listener), compared in constant time; CONNECT alone (`Target::SessionSocks5`). Every other listener keeps its no-auth |
-| its end | the grant's: the flow is killed, its listener closes, what it held is released, and every live connection ends with the carrier, both halves (#2129) |
-
-- ⚠️ **The account is checked before the hold.** A connection from another
-  account is never queued for a carrier, so it cannot wait out a reconnect and
-  be carried later.
-- ⚠️ **RFC 1929 is the second lock, not the first.** Two sessions can run as
-  one account, and the account check cannot tell them apart; the capability
-  keeps one session off the other's SOCKS listener. It guards against a
-  mistake between them, not against each other: an account's processes can
-  read what its sessions keep, the transcript that carries the capability
-  included (P3-7-3c, below).
-
-| Piece | Where |
-|---|---|
-| the hook | `Admit` ([`flow_listener.rs:122`](../crates/tunnel-core/src/flow_listener.rs#L122)), `FlowListener::bind_admitting` ([`:133`](../crates/tunnel-core/src/flow_listener.rs#L133)), asked before the hold ([`:304`](../crates/tunnel-core/src/flow_listener.rs#L304)) |
-| the account | `connection_is` ([`vault_connect.rs:2485`](../agents/roomlerd/src/hive/vault_connect.rs#L2485)), the session listener's hook `session_admit` ([`:2548`](../agents/roomlerd/src/hive/vault_connect.rs#L2548)) |
-| RFC 1929 | `Socks5Credential` ([`socks5.rs:95`](../crates/tunnel-core/src/socks5.rs#L95)), `accept_connect_authenticated` ([`:122`](../crates/tunnel-core/src/socks5.rs#L122)); `Target::SessionSocks5` ([`driver.rs:376`](../crates/tunnel-core/src/driver.rs#L376)), served in the carrier ([`:676`](../crates/tunnel-core/src/driver.rs#L676)) |
-| the flow | `create_session_flow` ([`client_mgr.rs:462`](../agents/roomlerd/src/tunnel/client_mgr.rs#L462)), ended at the grant's end ([`:495`](../agents/roomlerd/src/tunnel/client_mgr.rs#L495)) |
-| tests | `socks5::tests` (2), `flow_listener::tests` (1), `driver::tests::a_session_carrier_forwards_its_credentials_connections_alone`, `tunnel::client_mgr::tests::a_session_flow_serves_whom_it_admits_and_ends_with_its_grant`, `hive::vault_connect::tests::a_session_listener_admits_its_account_alone`: 6, and 11 negative controls |
-
-#### The tools: `net_socks` and `net_forward` (P3-7-3c)
-
-A session asks for its own egress on its toolbelt, the `roomler` MCP server
-([hive.md](hive.md) §4). Each call is a grant of its own, served on a
-listener of its own.
-
-```mermaid
-sequenceDiagram
-    participant C as Claude Code (the session)
-    participant P as a driver
-    participant B as the toolbelt
-    participant V as the vault
-    participant H as the tunnel client hub
-    C->>P: may it call net_socks {exit, ttl_s}?
-    P-->>C: yes
-    C->>B: tools/call net_socks {exit, ttl_s}
-    B->>B: under the run's 8 listeners? can this system say who connects?
-    B->>V: rc:vault.net {session, fence, exit, ttl}
-    V-->>B: the grant, or why not
-    B->>H: create_session_flow: SOCKS5 with the session's id and a new capability, under the grant, until its end, for the session's account
-    H-->>B: the flow, at 127.0.0.1:port
-    B-->>C: {proxy: socks5h://session:capability@127.0.0.1:port, expires_in_secs}
-    Note over B,H: at the grant's end, or the run's end here, the listener ends, and every connection
-```
-
-| Tool | Asks | Answers |
-|---|---|---|
-| `net_socks` | `exit`, the id of the device of the organization the flows leave from; `ttl_s`, 300 unless named, which the vault holds to 30–900 | `proxy`, `socks5h://<session id>:<capability>@127.0.0.1:<port>`, for `curl -x` or `ALL_PROXY`; `host`, `port`, `expires_in_secs` |
-| `net_forward` | `exit`, `host`, `port`, `ttl_s` | `address`, `127.0.0.1:<port>`; `host`, `port`; `destination`, in the vault's one spelling; `expires_in_secs` |
-
-Four parties each say yes, and each for itself:
-
-| Gate | Whose | How |
-|---|---|---|
-| `hive_net`, default off, never pushable, and only beside `vault_enabled` | the device's owner | the toolbelt offers the tools only then; elsewhere they are unknown tools |
-| the call | a driver of the session | the session's settings `ask` for both, beside the vault's uses: Claude Code asks before every call, whatever a repository's own settings allow |
-| the grant | the organization's vault policies, `net:socks` and `net:forward` | `rc:vault.net` ([vault.md](vault.md) §21) |
-| each flow | the organization's tunnel policies | the network module, at the flow ([above](#an-agent-sessions-grant-fr-90-p3-7-2a)) |
-
-- ⚠️ **Until decision 20 a session's flow reaches nothing.** The tools are
-  offered, the vault grants, the listener serves and the tunnel opens under
-  the grant; then every flow is rejected `acl_denied`, because no tunnel
-  policy matches a session yet (P3-7-2b).
-- ⚠️ **The capability lands in the transcript.** The proxy URL carries it,
-  and the model reads the URL. It is the session's own: only the session's
-  account is admitted to the listener, and it ends with the listener. Nothing
-  on the device keeps two sessions of one account apart, so between them it
-  stops a mistake, not a session that reads the other's transcript. The
-  grant's token stays in the daemon; no answer carries it.
-- ⚠️ **The run's end ends them.** A run that ends here, at its end or at a
-  move, kills every flow its tools opened, listener and connections, whatever
-  is left of their grants (`drop_run`).
-- **A run holds at most 8 listeners** (`MAX_FLOWS`), counting the calls
-  still asking for one: each holds its place from before the vault is asked.
-  One more is refused before the vault is asked, and a listener that ended,
-  or a call that ended without one (refused, or cancelled by the harness),
-  gives its place back. A listener made after its run ended here is ended at
-  once.
-- **The primary enrollment's hub serves them**, as the primary connection
-  carries the vault's leases (`TunnelClientHub::set_primary`). They are the
-  hub's flows like any other: the LocalAPI's `Flows` lists them, without
-  their credential, and `KillFlow` ends one.
-
-| Piece | Where |
-|---|---|
-| the tools | `net_tools` ([`toolbelt.rs:1331`](../agents/roomlerd/src/hive/toolbelt.rs#L1331)), offered in `tools/list` ([`:1885`](../agents/roomlerd/src/hive/toolbelt.rs#L1885)) and answered in `ask_vault` ([`:1730`](../agents/roomlerd/src/hive/toolbelt.rs#L1730)); their names in the settings, `NET_TOOLS` ([`:625`](../agents/roomlerd/src/hive/toolbelt.rs#L625)) |
-| a call | `net_tools::call` ([`net_tools.rs:192`](../agents/roomlerd/src/hive/net_tools.rs#L192)), its arguments `parse` ([`:144`](../agents/roomlerd/src/hive/net_tools.rs#L144)), the run's end `drop_run` ([`:336`](../agents/roomlerd/src/hive/net_tools.rs#L336)), called as the run's leases go ([`supervisor.rs:4048`](../agents/roomlerd/src/hive/supervisor.rs#L4048)) |
-| the owner's gate | `hive_net` ([`config.rs:610`](../crates/agent-core/src/config.rs#L610)), `HiveConfig.net` ([`gates.rs:55`](../agents/roomlerd/src/hive/gates.rs#L55)), `Supervisor::net_hub` ([`supervisor.rs:1565`](../agents/roomlerd/src/hive/supervisor.rs#L1565)); the settings' `ask`, `vault_use_tools` ([`:5055`](../agents/roomlerd/src/hive/supervisor.rs#L5055)) |
-| the hub | `TunnelClientHub::set_primary` ([`client_mgr.rs:289`](../agents/roomlerd/src/tunnel/client_mgr.rs#L289)), called as the daemon builds it ([`app.rs:4735`](../agents/roomlerd/src/app.rs#L4735)) |
-| tests | `hive::toolbelt::tests` (6), `hive::net_tools::tests` (6: the call's arguments, its capability, the place it holds, a listener made after its run ended), `hive::supervisor::tests` (2: the settings' `ask`, `net_hub`), `hive::gates::tests::hive_net_is_the_owners_word`, `config_surface::tests::hive_net_defaults_off_and_clears_off`: 16, and 17 negative controls |
+`a_tunnel_open_with_a_net_grant_is_refused`
+(`crates/tests/src/parked_wire_tests.rs:89`) locks it. The field may go once no
+agent at 0.4.199 or older is left (FR-137 D8). The other surfaces FR-90 left
+reserved are listed in
+[retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
 ## LocalAPI
 
@@ -1109,7 +897,6 @@ to a running `roomlerd` without any token:
 | `ConfigGet` · `ConfigSet` | The config surface, grouped (FR-84 D2) |
 | `RestartDaemon` | "Apply now" — restart only under a proven supervisor (FR-84 D3) |
 | `EncoderCaps` · `Devices` · `Mesh` | What the companion's Overview and Devices pages show (FR-84 D4, D5) |
-| `Connect` · `ConnectStatus` | `roomler connect`'s endpoint and where it stands, held for the connection that opened it. Only root or SYSTEM, an elevated administrator, or the daemon's own account may ask, and never on the person socket (FR-90 P3-9-2b, [vault.md](vault.md) §23) |
 
 ⚠️ **On Windows the pipe keeps a pool of listening instances** (`localapi_pipe_pool`,
 default 4; `1` is the pre-FR-84 single instance). With one instance, a client that
@@ -1136,7 +923,6 @@ cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) 
 | `restart` | Restart the daemon through its supervisor — refused when it has none it can prove (FR-84) |
 | `kill <flow-id>` · `rename <name>` · `logs` · `config ls/set/clear` | Node management |
 | `exec` | Run a command on a fleet device — four default-deny gates, full audit ([fleet-rpc.md](fleet-rpc.md)) |
-| `connect <handle>` | A vault secret's upstream through a local endpoint the daemon serves, signed in as the secret's user, held in the foreground (FR-90 P3-9-2b, [vault.md](vault.md) §23) |
 | `diag host` / `diag pair` | Diagnostic evidence bundles (CLI-side, so new probes don't need a fleet rollout) |
 | `self-update` | Tunnel-only hosts update in place; on daemon hosts the MSI/.deb owns the binaries and the shim refuses |
 

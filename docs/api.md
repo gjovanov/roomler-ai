@@ -324,14 +324,12 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET/POST | `…/room/{rid}/recording` | List / create recordings |
 | DELETE | `…/recording/{rec_id}` | Delete recording |
 
-A room or message response may carry `binding {module, ref}` — another module owns what it
-means (FR-90: an agent session's room, and the turn stubs in it). Chat stores it and never
-interprets it. A message also carries `author_type` (`user` · `bot` · `webhook` · `system`).
-An agent's message is authored by its **session**: `author_id` is the session's id and
-`author_name` is `Claude · <device>`, the device named as the device list names it (its display
-name, else its machine's name; FR-116 AC4). The edit and delete routes match the author, so they
-refuse every person, the session's owner included — a stub reads as the agent's, and only the
-agent's session can change it.
+A room or message response may carry `binding {module, ref}`: another module owns what it
+means. Chat stores it and never interprets it, and no module sets it now. The rooms and turn
+stubs that parked FR-90 wrote still carry it (FR-137), and such a room opens as a plain Secret
+room. A message also carries `author_type` (`user` · `bot` · `webhook` · `system`). A non-user
+author keeps its own name in `author_name`, and the edit and delete routes match the author, so
+they refuse every person on such a message.
 
 ### Files, tasks, export
 
@@ -411,145 +409,6 @@ before it leaves the host.
 | GET | `…/overlay-block` | The tenant's overlay address block |
 | POST | `…/overlay-block/renumber` | Migrate onto a disjoint block (**dry-run by default**; cycles agent connections) |
 | POST | `…/overlay-block/reconcile-hosts` | FR-47 P3: return leaked host ordinals to the tenant's recycle pool, each through `release_host`. Platform operator only (anyone else gets 404); **dry-run by default** ([overlay-communication.md](overlay-communication.md), *Pre-release gaps*) |
-
-### Agent sessions (FR-90, module `hive` — mounted only with `[modules] hive = true` or a `hive.tenants` list)
-
-FR-90 P1g — and only for the organizations in `hive.tenants` (`ROOMLER__HIVE__TENANTS`,
-comma-separated ids; empty or `*` is every organization). A member of any other organization gets
-**404** on every route below (`agent sessions are not available to this organization`), the viewer
-answers `not_found`, and its devices are told to stop what they still run for it when they connect.
-Membership is checked first, so someone outside an organization learns nothing about whether it is
-served. A list mounts the module by itself, with no `[modules] hive` (P1g-2): the form a hosted
-server uses, because no older image reads a list as the switch — promoting one leaves the module
-off instead of open to every organization.
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `…/hive` | P1g — whether agent sessions serve this organization: `{enabled: true}`, or **404** where they do not. The SPA asks before it shows any of the module's pages |
-| POST | `…/hive/session` | `{device_id, folder, title?, role?}` — start an agent session on a device; `role` (FR-90 P3-2b) is a vault role the vault must allow the starter on that device first ([vault.md](vault.md) §8). Always **200** for a well-formed request: `outcome` is `accepted` (the device is launching it), `refused` (`reason` names the gate — the server's `org_archived` · `no_permission` · `device_offline` · `device_unsupported` · `rate_limited` · `role_refused` · `vault_unavailable` · `role_undecided`, or the device's `hive_disabled` · `no_account` · `no_console_user` · `folder_not_allowed` · `harness_missing` · `launch_failed` · `at_capacity`) or `pending` (no answer within 10 s; the session updates when it comes). Needs `HIVE_RUN`; every attempt is in `hive_audit`, and with `hive.replicaset` on so is the session's placement (`action: place`, `placed` or `short`) |
-| GET | `…/hive/session` | The caller's own sessions, newest first (paginated) |
-| GET | `…/hive/session/{sid}` | One session, for anyone who may read it: its owner and the members of its room (P1c). Anyone else's read is a **404**, the answer a bogus id gets. `drivers` lists who besides the owner drives it. `origin` is `started` or, for a terminal session its owner adopted (P1j), `adopted`. `replicaset` (P2c-2b) is where its copies go, chosen when it started with `hive.replicaset` on, or when its primary first connected with it on (P2c-4b): `{policy_revision, min, max, restricted_tags, members[{device_id, role, state, refusal?, answered_at?, tip?}], short?, placed_at}`, `role` being `primary`, `archive`, `owner` or (P2f-1, a teleport's target) `teleport`, and `short` (`restricted` · `no_device`) present when it holds fewer than `min`. Each member's `state` (P2c-3a) is `pending`, `joined`, `refused` (`refusal` says which of the device's gates) or, once placement no longer chooses it (P2c-4a), `leaving`. The primary is `joined` from its placement, and `pending` while it is owed its join (P2c-4b: its session gained its first member after a start that said it had none), then `joined` or `refused` by its own answer. `tip` is where its copy ends as it last said: `{fence, seq, hash, checkpoint_seq?, checkpoint_hash?, at}`, and `holds` (P2j-1) is how much of the session's chain that copy holds, as a `seq`, counted by the rule a promotion is decided by: a tail past where its fence ended counts for nothing, so the freshest copy holds the most; absent without a `tip`. Absent for a session placed nowhere |
-| POST | `…/hive/session/{sid}/stop` | Stop it — the owner only: `stopping` (the device was told), `queued` (it is not connected; told when it connects) or `ended`. Needs no permission — ending your own session is never what a role change blocks |
-| POST | `…/hive/session/{sid}/promote` | FR-90 P2e-3 — `{device_id, folder?}` — the owner, holding `HIVE_RUN`, moves the session to a member of its replicaset that took its copy. Always **200** for a well-formed request: `outcome` is `promoting` (the member is ready; the primary drains), `refused` (`reason` names the gate: the server's `org_archived` · `no_permission` · `session_not_running` · `promotion_in_progress` · `moved_too_often` · `not_a_member` · `not_freshest` · `already_primary` · `device_offline` · `device_unsupported` · `primary_offline` · `primary_unsupported` · `rate_limited` · `role_refused` · `vault_unavailable` · `role_undecided` (P3-2b: a session with a vault role moves with it only as the vault allows it on the target), or the member's own start refusals) or `pending` (no answer within 10 s). The session's `promotion` (`{id, to, to_name, folder, from, from_fence, by, state, started_at, deadline, teleport?}`, `state` being `preparing` · `joining` · `draining` · `syncing` · `moving`) and its room say how it goes on. **404** with `hive.replicaset` off; every attempt is in `hive_audit` (`action: promote`) |
-| POST | `…/hive/session/{sid}/teleport` | FR-90 P2f-1 — `{device_id, folder?}` — the same, to a device that holds no copy of the session: it prepares without one, takes a copy in a `joining` step while the session still runs, then the drain, the sync and the move are a promotion's. `outcome` is `teleporting`, `refused` or `pending`. The refusals are the promotion's, with `already_a_member` (the device holds a copy: promote to it) in place of `not_a_member`; the primary must be online (`primary_offline`: a teleport copies from it), and both ends must advertise `hive-teleport`. Audited as `action: teleport` |
-| POST | `…/hive/session/{sid}/fork` | FR-90 P2f-3 — `{device_id, folder, title?}` — the owner, holding `HIVE_RUN`, makes a new session from this one's conversation, on a device that holds a copy of it (its primary, or a member that took its copy) or, from P2f-3c, on one that takes a copy first. The fork is a record of its own, its owner's, with its own room and replicaset under the session's restricted tags, naming the session in `parent_session_id`. The answer is a start's (`accepted` · `refused` · `pending`), or `joining` while a device with no copy takes one. The server's refusals: `org_archived` · `no_permission` · `not_forkable` (an adopted session) · `not_replicated` · `no_conversation` · `in_progress` · `no_copy` · `same_folder` · `restricted` · `copy_behind` · `device_offline` · `device_unsupported` · `primary_offline` · `primary_unsupported` · `rate_limited` · `role_refused` · `vault_unavailable` · `role_undecided` (P3-2b: the parent's vault role, decided again for the fork's device). **404** with `hive.replicaset` off, and for anyone but the owner. Audited as `action: fork`, naming the session it forks |
-| POST | `…/hive/session/{sid}/manage` | FR-90 P2f-4 — `{folder?}` — the owner, holding `HIVE_RUN`, makes their ended adopted session (P1j) a managed one: the SAME record, at its fence, on the device that adopted it, which resumes the terminal's own history (P2f-4a). `folder` defaults to the terminal's. The answer is a start's: `accepted`, `refused` (the server's `org_archived` · `no_permission` · `in_progress` · `not_adopted` · `not_ended` · `stopped` (its mirroring was stopped from Roomler) · `ended_otherwise` · `device_offline` · `device_unsupported` · `rate_limited`, or the device's own start refusals) or `pending`. A start the device refuses, or that never reaches it, leaves the adopted session it was, the word kept as `from_terminal.refused`. The session's `from_terminal` (`{at, refused?}`) says it began in a terminal. **404** with `hive.replicaset` off, and for anyone but the owner. Audited as `action: manage` |
-| DELETE | `…/hive/session/{sid}` | FR-90 P2g-2 — the owner, holding `HIVE_RUN`, purges the session from every device that held it (where it runs, its replicaset's members, where it ran before). The record becomes the purge's tombstone at once, read by nobody, the owner included; its room, core memory snapshot and approvals are deleted. Each device is sent `rc:hive.purge` while it is connected, and first at its next connection, until it answers. Always **200** for a well-formed request: `outcome` is `purging`, `purged` (every device answered, or none could be asked) or `refused` (`reason`: `no_permission` · `in_progress`, a promotion in flight); `purge` is `{id, session_id, reason, at, done_at?, devices[{device_id, state, store?, account?, detail?, answered_at?, closed?}]}`, `state` being `pending` · `done` · `closed` (`closed`: `device_removed` · `holds_nothing`), `detail` `device_unsupported` for a device whose agent does not purge yet; `forks` counts the sessions forked from it, which keep its conversation up to their fork. Asking again answers with the same purge. **404** with `hive.replicaset` off, and for anyone but the owner. Audited as `action: purge` (`issued`, `refused`, `complete`) |
-| GET | `…/hive/session/{sid}/purge` | FR-90 P2g-2 — the owner's read of the purge of their session: the `purge` above, while it is pending and for 90 days after it completed. Its `reason` is `owner`, or (P2g-3a) `retention` for one the server's sweep issued once the session had been over for longer than the organization's `retention_days`. **404** for anyone else, for a session never purged, and with `hive.replicaset` off |
-| GET | `…/hive/session/{sid}/participant` | FR-90 P1c — who takes part: `items[{user_id, display_name, role}]`, `role` `owner` · `driver` · `reader`, and `may_manage` (the owner alone). For anyone who may read the session |
-| PUT | `…/hive/session/{sid}/participant/{user_id}` | `{role: "driver" \| "reader"}` — the owner names an org member: into the session's room, prompting it or not. A driver needs `HIVE_RUN` (**403** otherwise, audited `no_permission`), at most 16 besides the owner (**409**). The person's open views end `role_changed`, and the room is told. The owner's own id is a **400**. An adopted session (P1j) takes readers only: a driver is a **409**, because the terminal holds the harness |
-| DELETE | `…/hive/session/{sid}/participant/{user_id}` | The owner takes someone out: out of the room, driving nothing, their views ended (`removed`). Idempotent |
-| GET | `…/hive/brain?device_id=` | FR-90 P1e — core memory the caller may read: the org's facts, their own, and with `device_id` that device's (a live device of this org; 404 otherwise). `{brain_rev, facts[{id, scope, owner_id?, text, kind, version, created_by, created_at, updated_by, updated_at}], budgets[{scope, owner_id?, used, budget}]}` |
-| POST | `…/hive/brain` | `{scope: "org" \| "user" \| "device", owner_id?, text, kind?}` — keep a fact: one line, at most 500 characters, `kind` one of `preference` · `convention` (the default) · `path` · `gotcha` · `decision` · `warning`. Org needs `ADMINISTRATOR`; user is the caller's own (`owner_id` defaults to them), with `HIVE_RUN`; device names a live device of this org, with `MANAGE_AGENTS` (**403** otherwise). A fact that does not fit its scope's budget (org 3,000, user 1,500, device 800 characters) is **409** `{error: "over_budget", message, scope, used, budget, needed}`; nothing is evicted |
-| PUT | `…/hive/brain/{fact_id}` | `{text, kind?, version}` — change a fact at the version read: **409** `conflict` when it changed or was archived since, **409** `over_budget` when it grows past the budget. Someone else's user fact is a **404** |
-| DELETE | `…/hive/brain/{fact_id}` | Archive a fact: out of every future snapshot and out of its budget, kept as a record. `{archived}` — `false` when it was not active |
-| GET | `…/hive/policy` | FR-90 P2c-2a — where the organization's sessions are copied, for any member: `{replicaset: {min, max, archive, prefer[], restricted_tags[]}, retention_days, archive_devices[], revision, is_default, updated_by?, updated_at?}`. Until an administrator writes one, decision 2's defaults (`is_default: true`, `revision: 0`). **404** while the server's `hive.replicaset` is off |
-| PUT | `…/hive/policy` | `{replicaset, retention_days, archive_devices[], revision}` — an `ADMINISTRATOR` sets it from the `revision` they read (**403** otherwise): `min` 1–8, `max` `min`–8, `prefer` only `owner_devices`, `restricted_tags` normalized as device tags are, `retention_days` 0–3650 (0 keeps sessions for ever), at most 16 archive devices, each a live device of this organization and not ephemeral (**400** otherwise). A write from a revision no longer stored is **409**. Every attempt is audited (`hive_audit`, `action: policy`), and a stored one places the organization's live sessions again (P2c-4a). **404** while `hive.replicaset` is off |
-
-Metadata only, in both directions: no route here takes or returns a prompt, a tool call or an
-output — see [the design](roomler-hive-design.md) §3.3. Core memory is the one exception by design:
-curated facts, never a session's content. Every write is audited (`hive_audit`, `action: brain`),
-and every write bumps the org's `brain_rev`. A session pins it when it starts and gets a frozen
-snapshot of it (`rc:hive.memory`, sent just before `rc:hive.start` to a device that advertises
-`hive-memory`).
-
-**Reading a session (P0d-2) is not a route.** A member of the session's room sends
-`hive:view.open {session_id}` on the user WebSocket ([real-time.md](real-time.md)). The server
-checks org and room membership (anyone else gets `not_found`), the device (online, advertising
-`hive-view`) and a rate (20 opens per minute per user and session). It then mints a grant, and
-answers `hive:view.ready` with ICE servers only once the device has confirmed it. Refusals name
-who said no: the server's `not_found` · `device_offline` · `device_unsupported` ·
-`too_many_views` · `rate_limited` · `no_answer`, or the device's `hive_disabled` · `no_session` ·
-`at_capacity`. The transcript itself flows browser ⇄ device over the peer and never through the
-server. The starter of a live session may prompt it; everyone else reads. Every open is in
-`hive_audit` (`action: view`).
-
-**Searching (P2i-2) is not a route either.** A member sends `hive:search.open {tenant_id}` on the
-user WebSocket. The server checks the organization (copies on, served, the asker a member; anyone
-else gets `not_found`), then the policy's designated archive replicas online here that advertise
-`hive-search` (none: `no_archive_replica`), one connection's grants and a rate (20 opens per minute
-per user and organization). It names the sessions the asker may read whose copy the archive
-replica holds, at most 500, the most recently active first (none: `no_session`), and answers
-`hive:search.ready` with ICE servers and how many sessions it named once the device has confirmed
-the grant. The rest of the handshake is a view's, by its grant. The query and every hit flow
-browser ⇄ device over the peer and never through the server. Every open is in `hive_audit`
-(`action: search`, with the count, never a query). `GET …/hive` answers `search`: whether the
-organization can be searched, for the SPA's box.
-
-**Adopted sessions (P1j) are not started by a route either.** A person adopts the Claude Code
-sessions they run in a terminal (`roomler hive adopt`, on a device whose owner allows it:
-`hive_adopt`, advertised as `hive-adopt`). The device offers each one with `rc:hive.adopt
-{adopt_id, harness_session, keys, account, folder}`. The answer is `rc:hive.adopt_ack {adopt_id,
-session_id, fence}`, or `{adopt_id, refused}`: `hive_not_enabled` · `rate_limited` · `no_account`
-· `ambiguous_account` · `not_a_member` · `at_capacity`. The keys are the device's `hive_accounts` keys
-for that account. The server adopts only when they name exactly one person, a member of the org:
-an account two people share is refused, never attributed by guess. The record reads like any
-session's, with `origin: "adopted"`. It is its owner's alone, readers by name, no drivers. It is
-named after its folder, because a terminal's first prompt is content. An offer for a terminal
-session already held is answered with the same record. Every adoption is in `hive_audit`
-(`action: adopt`).
-
-### Vault (FR-90 P3-1, module `vault` — mounted only with `[modules] vault = true` or a `vault.tenants` list)
-
-The org gate reads like Hive's: `vault.tenants` (`ROOMLER__VAULT__TENANTS`) names the organizations
-served, a list mounts the module by itself, and a member of any other organization gets **404**
-(`the vault is not available to this organization`) after the membership check. Every route is
-for the organization's `ADMINISTRATOR`s (**403** otherwise), and **no route answers a value**.
-The vault lends to a served organization's PEOPLE (`roomler connect`, P3-9-1) only where
-`vault.people` (`ROOMLER__VAULT__PEOPLE`) lists it, opt-in and empty by default.
-Every `secret:*` and `vault:verify` decision is recorded in `vault_audit`, allow and deny; an allow
-is written before it is acted on. Full treatment: [vault.md](vault.md).
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `…/vault` | `{enabled, kek: {state: ready · missing · invalid, recipient? \| reason?}, secrets, versions, other_kek}` — `other_kek` counts the versions wrapped to another KEK than the one loaded |
-| GET | `…/vault/secret` | The live secrets, by path (`?prefix=` a folder). Metadata only, each with its `rrn` (`rrn:{org slug}:secret:{path}`) and the fields that hold a value |
-| POST | `…/vault/secret` | `{path, kind: static · structured, description?, audiences?, exec_allow?, tags?, rotation_days?, disabled?, owner_id?}` — **201**; **409** when a live secret holds the path; **422** for an unknown field, `value` included |
-| GET | `…/vault/secret/{id}` | One secret and `versions[]` — `{field, n, current, kek, created_by, created_at, expires_at}`, never the sealed bytes |
-| PATCH | `…/vault/secret/{id}` | Its rules; `path` and `kind` never change (**422**). `rotation_days: 0` clears it |
-| DELETE | `…/vault/secret/{id}` | Tombstone it and destroy every version: `{deleted: true, versions_destroyed}` |
-| PUT | `…/vault/secret/{id}/value` | `{field?, value, expires_at?}` — the field's next version, sealed: `{field, n, created_at, expires_at}`. **503** without a usable KEK |
-| POST | `…/vault/verify` | Open every version (up to 10,000): `{versions, ok, failed, failures[{secret_id, field, n, reason: other_kek · dek_unreadable · tampered}], truncated}`. **503** without a usable KEK |
-| GET | `…/vault/audit` | The decisions, newest first (`?before=` RFC 3339, `?limit=` 1–200) |
-| GET | `…/vault/activity` | P3-4d — what devices **report** doing with their leases, newest first (`?session_id=`, `?lease_id=`, `?before=` RFC 3339, `?limit=` 1–200): `{id, at, device_id, session_id, fence, kind: exec · render, lease_ids, target, exit_code, timed_out}`. Claims, never decisions; an empty answer is not evidence of disuse |
-| GET | `…/vault/approval/{approval_id}` | P3-4e — an approval card as its session's readers see it: `{id, session_id, device_id, secret_id, rrn, field, mode, audience, ttl_s, status, requested_at, expires_at, answered_by, answered_at, lease_id, used_at, may_answer, may_approve}` (`may_approve`: the caller drives it now and the policy would take their yes); one past its deadline answers `expired`, one whose session moved or ended `withdrawn`. 404 for a caller who does not read the session, as for an id that names nothing |
-| POST | `…/vault/approval/{approval_id}` | P3-4e — a driver's answer, `{answer: "approve" \| "deny"}`; a yes is decided by Cedar with the caller as the approver first. 403 for a caller who does not drive the session now, or whose yes the policy does not accept; 409 once it is answered, used, expired or withdrawn ([vault.md](vault.md) §18) |
-| GET | `…/vault/schema` | P3-2a — `{schema, actions, modes, oses, secret_prefix}`: what a policy is written against |
-| GET · POST | `…/vault/role` | P3-2a — the vault roles; `{name, description?}` declares one (**409** when a live role holds the name) |
-| DELETE | `…/vault/role/{name}` | P3-2a — tombstone a role; **409** naming the live policies that still name it |
-| GET · POST | `…/vault/policy` | P3-2a — the guardrails, then the organization's policies (`{id, name, description, text, effect, guardrail, rev, …}`); `{name, description?, text}` adds one, checked first (**400** in words) |
-| GET · PUT · DELETE | `…/vault/policy/{id}` | P3-2a — one policy; `PUT {name, description?, text, rev}` replaces it from the revision read (**409** if it moved); a `guardrail:*` id is **400** for `PUT` and `DELETE` |
-| POST | `…/vault/simulate` | P3-2a — `{action: role:assume · secret:use, principal, resource, device: {os, tags, owner_id}, mode?, audience?, ttl_s?, approver_id?, with?, without?}` → `{decision, determining[{id, name, guardrail}], errors}`. Decides nothing for real; records nothing. Also `secret:list`, `net:socks`, `net:forward` and `ssh:run`, and (P3-9-1) `secret:connect`: `principal.user_id` must be the device's `owner_id`, with no `mode`, and (P3b-1a) `net:egress`: a `host` and a `port`, the host decided in its one spelling, with no `resource` ([vault.md](vault.md) §7, §24) |
-| POST | `…/vault/simulate/replay` | P3-2b — `{with?, without?, days?}` (1–7, default 7): the recorded Cedar decisions of those days, each decided again from the request it recorded → `{days, replayed, unreadable, flipped, flips[{at, action, op, user_id, target, session_id, device_id, was, now, determining}], truncated}`. Decides nothing for real; records nothing |
-
-### Knowhow (FR-90 P4-1, module `knowhow` — mounted only with `[modules] knowhow = true` or a `knowhow.tenants` list)
-
-The org gate reads like the vault's: `knowhow.tenants` (`ROOMLER__KNOWHOW__TENANTS`) names the
-organizations whose map is kept, a list mounts the module by itself, and a member of any other
-organization gets **404** (`knowhow is not available to this organization`) after the membership
-check. Reads need `KNOWHOW_VIEW` (from `member` up), writes `KNOWHOW_EDIT` (`admin`), which
-includes reading. Every id resolves within the organization, every write is a compare-and-set on
-`rev` appended to `knowhow_history`, and the map grants nothing. Full treatment:
-[knowhow.md](knowhow.md).
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `…/knowhow` | `{entities, edges}`, the live counts |
-| GET | `…/knowhow/search` | `?q=&kind=&env=&limit=` (1–200, default 50) → `{entities[{id, kind, key, name, env?, status, rev, updated_at}], truncated}`, by kind and key; `q` matched as written, case aside |
-| GET | `…/knowhow/entity?kind=…&key=…` | One live entity's card, by its name |
-| GET | `…/knowhow/entity/{id}` | Its card: `{entity{id, kind, key, name, env?, owner_id?, attrs, facts[{path, value, source, by?, device?, observed_at, verified_at?, verified?, status}], status, source, device?, rev, created_by?, created_at, updated_by?, updated_at}, links[{direction: out · in, edge, other}], truncated, probes, probes_truncated}`; `device` (P4-3a-2) names a scan's device; a fact's `verified` (P4-5) is `{at, probe, from_device, rtt_ms?, carrier?, ok}`, what the last probe that measured it found; `probes` (P4-5-4) holds each device's last probe of the entity that found something (`ok` or `unreachable`), a row of each kind (`tcp`, `tls`; P4-5-4b), at most 16 devices, the newest first, each as `GET …/knowhow/probe` shows one, and `probes_truncated` says there were more |
-| GET | `…/knowhow/map/{id}` | Its neighbourhood: `?depth=` 1 (default) or 2, `?kind=`, `?env=` → `{center, entities, edges, truncated}` |
-| GET | `…/knowhow/history` | The writes, newest first (`?entity=` one entity's, its links' included; `?limit=` 1–200) → `{history[{id, target, target_id, entity_ids, rev, op, source, by?, device?, at, set}]}` |
-| POST | `…/knowhow/entity` | `{kind, key, name, env?, owner_id?, attrs?, facts?: {path: value}}` — **201**; **409** when a live entity holds the kind and key; **400** for `machine` (the fleet's sync records machines) or a spelling outside the rules; **422** for an unknown field |
-| PATCH | `…/knowhow/entity/{id}` | `{rev, name?, env?, owner_id?, attrs?, facts?}` — `facts` merged by path, null removing one; `""` clears `env` and `owner_id`; **409** at a rev already gone; `kind` and `key` never change (**422**); P4-2a — a machine's name, owner and synced facts are the fleet's (**400**); P4-2b — a person's own facts on a machine stop at 49, beside the 15 the sync and its scans keep room for (**400**); P4-3a-2 — a scan entity's name, owner and scanned facts, a machine's `tunnel.declared` and any fact a scan said are its device's (**400**), and a person's own facts on a scan entity stop at 55 |
-| DELETE | `…/knowhow/entity/{id}?rev=…` | Archive it and its links: `{archived, links_archived}`; **400** for a machine, which leaves the map when its device is removed, and for a scan entity (P4-3a-2), which leaves when its device's scans no longer report it |
-| POST | `…/knowhow/edge` | `{from, to, kind, attrs?}` — **201**; **409** when already linked by that kind; **404** for an end that is not a live entity of the organization |
-| PATCH | `…/knowhow/edge/{id}` | `{rev, attrs}` — its attributes, replaced |
-| DELETE | `…/knowhow/edge/{id}?rev=…` | Archive the link: `{archived}` |
-| POST | `…/knowhow/scan` | P4-3a-1 — `{device}`: ask a device to scan, `KNOWHOW_EDIT` → **202** with the scan, or the device's pending one (never doubled); **409** for a device whose last hello did not advertise `knowhow-scan`, or a secondary enrollment; **404** for one that is not the organization's |
-| GET | `…/knowhow/scan?device=…` | A device's scans, newest first → `{scans[{id, device_id, requested_by, requested_at, state, delivered_at?, answered_at?, counts{checkouts, contexts, listeners, tunnel_routes, unknown, refused}, truncated?, detail?, written?{checkouts, endpoints, repos, clusters, links, retired, full}}]}`; `state` is `requested` · `delivered` · `done` · `no_roots` · `failed` · `expired`; `written` (P4-3a-2) once its findings are on the map |
-| POST | `…/knowhow/probe` | P4-5-1a — `{entity, device, kind: tcp · tls}`: ask a device to probe an entity, `KNOWHOW_EDIT` → **202** with the probe, or the device's pending one when it is this same probe; the target is read from the entity's facts (`address` or `host`, `port`, `sni`), never from the request. **400** for an entity whose facts say nowhere a probe reaches (no host or port, a link-local or metadata address, a listener's bind address, a loopback address from another device) or a kind not known; **409** for a device without `knowhow-probe`, a secondary enrollment, or one running another probe; **429** past 30 a minute for the device; **404** for an entity or a device that is not the organization's |
-| GET | `…/knowhow/probe?entity=…` or `?device=…` | An entity's probes or a device's, newest first → `{probes[{id, entity_id, device_id, requested_by?, requested_at, kind, target{host, from, port, sni?}, state, delivered_at?, answered_at?, rtt_ms?, address?, carrier?, tls?{names, fingerprint}, detail?, measured?[{path, ok}]}]}`; `state` is `requested` · `delivered` · `ok` · `unreachable` · `not_allowed` · `failed` · `expired` |
 
 ### Observability
 
