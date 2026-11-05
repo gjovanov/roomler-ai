@@ -756,7 +756,7 @@ test of the SIGKILL property itself.
   (`agents/roomlerd/src/presence.rs:277`). The capture reopens its stream on a mode change. Three gates that had kept
   a Mac out of the path were found reading it end to end and are open now: `decide_request`'s OS check, the
   "person comes back" watcher, and the unlock re-decision. On a supervised Mac the root forwards its kill switch and
-  its `display_match`, and the worker keeps the stricter of that and its own (`with_root_floor`, `display_match.rs:1211`). Kill switch
+  its `display_match`, and the worker keeps the stricter of that and its own (`with_root_floor`, `display_match.rs:1239`). Kill switch
   `ROOMLERD_MAC_DISPLAY_MATCH=0`. Details: `docs/display-match.md`.
 - **P2e, clipboard.** Image watching on the `NSPasteboard` change count (the Windows sequence-number shape); RTF as
   `public.rtf` beside the HTML lane.

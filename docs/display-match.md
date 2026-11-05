@@ -10,7 +10,7 @@
 > | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | shipped (0.4.140); field-verified on Windows |
 > | P2 | Linux virtual desktops: the desktop runs on Xorg with the dummy driver, which takes any mode, so the viewer's stage size becomes the mode exactly; restored at the end | shipped in 0.4.143 and field-verified on its released binary (FR-108 §8 row 14; the operator settled decision 4 on 2026-10-17) |
 > | FR-97 P3e-2 | a person's own X11 display (a per-user install in an X11 session): the one active output switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand | shipped in 0.4.148 (#2623); its release check's pointer-clamp hand-back fixed (#2644) |
-> | P1c | a recording holds the display ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)): a mode switched before it starts goes back first, and every request while it runs is refused `recording`, then decided again at its end | built; rides the next agent release, field read owed ([below](#a-recording-holds-the-display-3467)) |
+> | P1c | a recording holds the display ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)): a mode switched before it starts goes back first, and every request while it runs is refused `recording`, then decided again at its end | shipped in 0.4.201 and field-verified on its released binary on an X11 host (FR-108 §8 row 16; the operator settled decision 7 on 2026-11-05) ([below](#a-recording-holds-the-display-3467)) |
 > | P3–P4 | modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
@@ -221,10 +221,10 @@ sequenceDiagram
 | a session that ends during the recording | what it waited for is dropped, and its close restores nothing, since the mode went back already | [`display_match.rs:1677`](../agents/roomlerd/src/display_match.rs#L1677) `forget` |
 | the viewer turns display match off | what it waited for is dropped. Before this a `locked` wait survived it, and the unlock switched a screen whose viewer had turned the match off | [`display_match.rs:1685`](../agents/roomlerd/src/display_match.rs#L1685) `turn_off` |
 
-- ⚠️ **A recording wins under `always` too** (FR-108 decision 7). A switch under a recording freezes it or
-  ends its file, and the session's end would change the display under it anyway. Only the owner's `never`
-  answers first, because it outlasts the recording. One function decides it
-  ([`display_match.rs:1356`](../agents/roomlerd/src/display_match.rs#L1356) `a_recording_wins`), so
+- ⚠️ **A recording wins under `always` too** (FR-108 decision 7, settled by the operator on 2026-11-05). A
+  switch under a recording freezes it or ends its file, and the session's end would change the display under
+  it anyway. Only the owner's `never` answers first, because it outlasts the recording. One function decides
+  it ([`display_match.rs:1356`](../agents/roomlerd/src/display_match.rs#L1356) `a_recording_wins`), so
   giving `always` its rc.191 meaning back is a one-line change.
 - ⚠️ **One change of the mode at a time.** A decision with its switch, an owner's restore, and the hold
   with its hand-back take one lock
