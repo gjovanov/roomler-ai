@@ -74,6 +74,15 @@ ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran besi
 the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
 count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
 bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
+AC1's bound is held to hosts with a hardware encoder (decided 2026-11-05). Giving the recorder the CPU first on a
+host with no GPU is [#3492](https://github.com/gjovanov/roomler-ai/issues/3492).
+
+⚠️ **Measured: on a Mac, the recorder's own disk check costs a tick every 5 s.** On a MacBook (Apple M5 Pro,
+release 0.4.200, FR-85's field log), a 3024×1964 recording on `h264_videotoolbox` read 0.63 % late ticks with a
+relay-capped session on `hevc_videotoolbox` beside it, and 0.64 % with none: the session cost nothing measurable.
+The late ticks fall exactly one every 5.02 s. Every 5 s the paced loop asks `folder::available_space` how much room
+is left. That is a full `sysinfo` disk refresh, which on macOS queries every volume and walks IOKit for each one,
+and the loop's next tick waits for it. FR-85 P7 moves the check off the loop.
 
 ⚠️ **A recording holds the display** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)). On an X11
 host nobody had touched for five minutes, a viewer that connected made display match
