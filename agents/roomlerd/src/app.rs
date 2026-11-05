@@ -137,6 +137,13 @@ enum Command {
         /// something privileged enough to bring up a TUN.
         #[arg(long)]
         overlay: bool,
+        /// FR-43 P3d — a Mac's root half as its ONE row: writes
+        /// `macos_supervise_gui_worker` and `macos_one_row` beside the
+        /// enrollment, so the daemon serves the person's screen through a
+        /// worker that holds no enrollment, and the person enrolls nothing.
+        /// macOS and root only; off by default, so a Mac enrolls as before.
+        #[arg(long)]
+        one_row: bool,
         /// FR-102 — how this daemon was installed, for the server's install
         /// trace: one of `wizard`, `script-sh`, `script-ps1`, `msi`, `deb`,
         /// `pkg`, `manual`, `container`, `other`. Falls back to the
@@ -1671,6 +1678,7 @@ async fn daemon_main() -> Result<()> {
             replace,
             ephemeral,
             overlay,
+            one_row,
             install_method,
             install_scope,
         } => {
@@ -1678,6 +1686,10 @@ async fn daemon_main() -> Result<()> {
             // names nothing must be seen at the prompt, not after a browser
             // approval.
             let token = enroll_token_source(token.as_deref(), pair, pair_org.as_deref())?;
+            // FR-43 P3d — the same rule: a Mac's root half or nothing.
+            if let Some(why) = one_row_refusal(one_row, cfg!(target_os = "macos"), euid_is_root()) {
+                bail!("{why}");
+            }
             enroll_cmd(
                 &config_path,
                 EnrollOptions {
@@ -1689,6 +1701,7 @@ async fn daemon_main() -> Result<()> {
                     replace,
                     ephemeral,
                     overlay,
+                    one_row,
                     install_method: install_method.as_deref(),
                     install_scope: install_scope.as_deref(),
                 },
@@ -2625,6 +2638,9 @@ struct EnrollOptions<'a> {
     /// server's response (not this flag) decides what the CONFIG records.
     ephemeral: bool,
     overlay: bool,
+    /// FR-43 P3d — both macOS switches beside the enrollment
+    /// ([`one_row_refusal`] has already said it may).
+    one_row: bool,
     /// FR-102 P3 — the install trace, flag-first; `None` falls back to the
     /// env, then to `manual` / `unknown` (`enrollment::resolve_install`).
     install_method: Option<&'a str>,
@@ -2641,6 +2657,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         replace,
         ephemeral,
         overlay,
+        one_row,
         install_method,
         install_scope,
     } = opts;
@@ -2827,6 +2844,11 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // starts at `lock_on_end = auto`; a refresh keeps what the device had.
     if enrollment::takes_service_install_defaults(machine_global, &outcome) {
         enrollment::apply_service_install_defaults(&mut cfg);
+    }
+    // FR-43 P3d — set before the save, like `--overlay`, so the daemon's first
+    // start is already one row.
+    if one_row {
+        apply_one_row(&mut cfg);
     }
 
     config::save(&target_path, &cfg).map_err(|e| {
@@ -8393,6 +8415,94 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&kept).unwrap(),
             "overlay_enabled = ture\n"
+        );
+    }
+}
+
+/// FR-43 P3d — why `enroll --one-row` cannot run here; `None` when it can, or
+/// when it was not asked for. Pure, so every lane tests both refusals.
+fn one_row_refusal(asked: bool, is_macos: bool, is_root: bool) -> Option<&'static str> {
+    if !asked {
+        None
+    } else if !is_macos {
+        Some(
+            "--one-row is for a Mac: only a Mac has a root half and a person's half to make one row",
+        )
+    } else if !is_root {
+        Some("--one-row enrolls the Mac's root half: run it with sudo")
+    } else {
+        None
+    }
+}
+
+fn euid_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid never fails.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// FR-43 P3d — what `enroll --one-row` writes beside the enrollment, so the
+/// daemon's first start is already one row: the supervisor on, and its worker
+/// unenrolled.
+fn apply_one_row(cfg: &mut config::AgentConfig) {
+    cfg.macos_supervise_gui_worker = true;
+    cfg.macos_one_row = true;
+}
+
+#[cfg(test)]
+mod one_row_enroll_tests {
+    use super::*;
+
+    const SERVER: &str = "https://roomler.example";
+
+    fn enroll(extra: &[&str]) -> Option<bool> {
+        let mut argv = vec![
+            "roomlerd", "enroll", "--server", SERVER, "--name", "mac-1", "--token", "tok",
+        ];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).ok()?.command {
+            Some(Command::Enroll { one_row, .. }) => Some(one_row),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn one_row_is_a_flag_and_off_unless_given() {
+        assert_eq!(enroll(&[]), Some(false));
+        assert_eq!(enroll(&["--one-row"]), Some(true));
+        assert_eq!(enroll(&["--one-row", "--overlay"]), Some(true));
+    }
+
+    #[test]
+    fn one_row_is_a_macs_root_half_or_nothing() {
+        assert_eq!(one_row_refusal(false, false, false), None, "not asked");
+        let off_mac = one_row_refusal(true, false, true).unwrap();
+        assert!(off_mac.contains("for a Mac"), "{off_mac}");
+        let not_root = one_row_refusal(true, true, false).unwrap();
+        assert!(not_root.contains("sudo"), "{not_root}");
+        assert_eq!(one_row_refusal(true, true, true), None);
+    }
+
+    #[test]
+    fn one_row_writes_both_switches_and_nothing_else() {
+        let before = config::test_fixture();
+        assert!(!before.macos_supervise_gui_worker && !before.macos_one_row);
+        let mut after = before.clone();
+        apply_one_row(&mut after);
+        assert!(after.macos_supervise_gui_worker);
+        assert!(after.macos_one_row);
+        after.macos_supervise_gui_worker = before.macos_supervise_gui_worker;
+        after.macos_one_row = before.macos_one_row;
+        assert_eq!(
+            toml::to_string(&after).unwrap(),
+            toml::to_string(&before).unwrap(),
+            "every other key as it was"
         );
     }
 }

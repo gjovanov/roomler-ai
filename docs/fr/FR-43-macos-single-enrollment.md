@@ -625,6 +625,8 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 `roomlerd enroll --one-row` writes both keys beside the enrollment, and `install.sh --role daemon --token <one> --one-row` enrolls the root half alone: the marker, the package, the enrollment with the overlay on, the LaunchAgent removed, the daemon kickstarted (`scripts/install.sh:836`, `:929`). `--pair` takes the same flag. The two-row commands stay as they are (`--daemon-token`, `scripts/install.sh:265`), so a person without admin rights keeps the per-user half alone, which is a one-row Mac with no mesh. The wizard's `halves: 2` (`docs/device-pairing.md:153`) and the dashboard's commands follow only when the default flips.
 
+**Built: `roomlerd enroll --one-row`** (`agents/roomlerd/src/app.rs:146`). It is refused off macOS and without root, beside the token check and so before the token is spent (`agents/roomlerd/src/app.rs:1690`, `:8424`). It sets both switches before the save, as `--overlay` does, so the daemon's first start is one row (`agents/roomlerd/src/app.rs:2851`, `:8453`). On a Mac the package has just installed, its LaunchAgent still has to go: running the package again removes it, because P2d's guard reads the switch. `install.sh --one-row` does that in the same command, in its own PR, after the installer's owner has seen it. The tests (`agents/roomlerd/src/app.rs:8459`) cover the flag, both refusals and the two keys it writes.
+
 ### What does not move
 
 | Invariant | Under P3 |
