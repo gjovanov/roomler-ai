@@ -135,37 +135,6 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     description:
       'Record a device’s screen during a remote-control session. The device must allow it, and the person there sees it. A recording outlives the session, so no role gets this by default.',
   },
-  {
-    key: 'HIVE_RUN',
-    // FR-90 — the first flag above bit 31: `2 ** 32`, which a shift cannot
-    // even express in JS (`1 << 32` is 1).
-    bit: 2 ** 32,
-    label: 'Run agent sessions',
-    group: 'Fleet access',
-    description:
-      'Start and drive AI agent sessions on a device. A session runs as the account the device maps you to — never SYSTEM or root — and only where the device allows it. It runs commands on that device, so no role gets this by default.',
-  },
-  // ── Knowhow ──────────────────────────────────────────────────────
-  // FR-90 P4 — the organization's map. It grants nothing: the vault, the
-  // network and the device still decide every reach, so reading it is in the
-  // member preset (decision 37) and changing it in the admin one (36).
-  {
-    key: 'KNOWHOW_VIEW',
-    // `2 ** 33`: a shift cannot express it in JS.
-    bit: 2 ** 33,
-    label: 'View the map',
-    group: 'Knowhow',
-    description:
-      'Read the organization’s map: its machines, repositories, databases, clusters and services, and how each is reached. The map grants nothing: every reach is still decided by the vault, the network and the device.',
-  },
-  {
-    key: 'KNOWHOW_EDIT',
-    bit: 2 ** 34,
-    label: 'Edit the map',
-    group: 'Knowhow',
-    description:
-      'Add, change and archive what the map holds. Every change is recorded with who made it, and editing the map includes reading it.',
-  },
 ]
 
 /** Group names in display order (insertion order of the flags above). */
@@ -191,7 +160,6 @@ export const DEFAULT_MEMBER = byKeys([
   'CONNECT_VOICE',
   'SPEAK',
   'STREAM_VIDEO',
-  'KNOWHOW_VIEW',
 ])
 
 /**
@@ -221,12 +189,13 @@ export const DEFAULT_ADMIN = maskUnion(
     'VIEW_REMOTE_AUDIT',
     'VIEW_EXEC_AUDIT',
     'VIEW_SSH_AUDIT',
-    'KNOWHOW_EDIT',
   ]),
 )
 
 /**
- * Every defined bit — server `ALL = (1 << 35) - 1` = bits 0–34.
+ * Every defined bit — server `ALL = (1 << 35) - 1` = bits 0–34. Bits 32–34
+ * were FR-90's and are RESERVED since FR-137 (decision D1): stored masks keep
+ * them, so `ALL` does too, while the catalog above lists none of them.
  * Written as `2 ** 35 - 1` because the Rust spelling is not a JS expression
  * at all: a shift coerces to int32, so `1 << 35` is 8 (see the int32 note at
  * the top of this file).
@@ -468,16 +437,4 @@ export function canGrantDeviceSsh(mask: number | null, isOwner: boolean): boolea
   if (isOwner) return true
   if (mask === null) return false
   return hasPermission(mask, byKeys(['MANAGE_AGENTS', 'SSH_DEVICE']))
-}
-
-/**
- * FR-90 P2h-2 — may this caller set the organization's Hive replica policy:
- * designate archive replicas, and add one? Server gate: `ADMINISTRATOR`
- * (`crates/modules/hive/src/policy.rs`, `put_policy`). FAIL-CLOSED on
- * `mask === null`: the page shows its switches only once it knows.
- */
-export function canSetHivePolicy(mask: number | null, isOwner: boolean): boolean {
-  if (isOwner) return true
-  if (mask === null) return false
-  return hasPermission(mask, ADMINISTRATOR)
 }

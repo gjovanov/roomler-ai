@@ -53,12 +53,6 @@ pub const EXTRACTED: &[&str] = &[
     "remote",
     #[cfg(feature = "network")]
     "network",
-    #[cfg(feature = "hive")]
-    "hive",
-    #[cfg(feature = "vault")]
-    "vault",
-    #[cfg(feature = "knowhow")]
-    "knowhow",
 ];
 
 /// The modules this build links, initialised — `None` where the operator
@@ -86,19 +80,6 @@ pub struct Modules {
     /// tunnel routes are absent).
     #[cfg(feature = "network")]
     pub network: Option<roomler_ai_mod_network::NetworkState>,
-    /// FR-90 — agent sessions, built on `fleet`; `None` when switched off
-    /// (the default): the session routes are absent and a device's
-    /// `rc:hive.*` frames reach no handler.
-    #[cfg(feature = "hive")]
-    pub hive: Option<roomler_ai_mod_hive::HiveState>,
-    /// FR-90 P3-1 — the vault, on core alone; `None` when switched off (the
-    /// default): its routes are absent.
-    #[cfg(feature = "vault")]
-    pub vault: Option<roomler_ai_mod_vault::VaultState>,
-    /// FR-90 P4-1 — knowhow, the organization's map, on core alone; `None`
-    /// when switched off (the default): its routes are absent.
-    #[cfg(feature = "knowhow")]
-    pub knowhow: Option<roomler_ai_mod_knowhow::KnowhowState>,
     /// Every mounted module's WebSocket namespace handlers, collected at
     /// init so the socket dispatch can look one up per message.
     ws: Vec<WsHandlerSpec>,
@@ -111,11 +92,7 @@ impl Modules {
     /// module that is not extracted yet — that switch unmounts nothing.
     pub async fn init(core: Core, settings: &Settings) -> anyhow::Result<Self> {
         for id in settings.switched_off() {
-            // A default-off module (FR-90 `hive`) that this build does not
-            // link is the default state, not something an operator did.
-            if !EXTRACTED.contains(&id)
-                && !roomler_ai_config::ModulesSettings::DEFAULT_OFF.contains(&id)
-            {
+            if !EXTRACTED.contains(&id) {
                 warn!(
                     module = id,
                     "[modules] switch is OFF in config but that module is not yet extracted — \
@@ -191,56 +168,6 @@ impl Modules {
                 }
             }
         }
-        #[cfg(feature = "hive")]
-        {
-            // `hive → fleet`, the same seam: a session's frames ride the
-            // agent socket, and its gate reads the Hub's per-connection caps.
-            // `hive → chat` (P0d): a session is a room. Chat is stateless and
-            // hive re-creates what it needs of it, but a session nobody could
-            // read is no session — so chat switched off means no `hive` too.
-            if let Some(fleet) = modules.fleet.clone() {
-                if modules.chat.is_some() {
-                    modules.hive =
-                        init_one::<roomler_ai_mod_hive::HiveState>(core.clone(), settings, fleet)
-                            .await?;
-                    if let Some(m) = &modules.hive {
-                        modules.ws.extend(m.ws().handlers);
-                    }
-                } else if settings.hive_on() {
-                    warn!(
-                        "module hive is switched on but chat is off — hive is not mounted \
-                         (a session is a chat room)"
-                    );
-                }
-            }
-        }
-        #[cfg(feature = "vault")]
-        {
-            // No module state as a dependency: its `vault → hive` edge
-            // (P3-3b) reads session records through hive's stateless DAO, so
-            // a vault mounted without hive simply finds no session to lease
-            // for. Its switch defaults off, like hive's.
-            modules.vault =
-                init_one::<roomler_ai_mod_vault::VaultState>(core.clone(), settings, ()).await?;
-            if let Some(m) = &modules.vault {
-                modules.ws.extend(m.ws().handlers);
-            }
-        }
-        #[cfg(feature = "knowhow")]
-        {
-            // The map's store, the people's routes, and (P4-2a) the fleet's
-            // devices heard through core. No module state as a dependency: its
-            // `knowhow → hive` edge (P4-4-1) reads session records through
-            // hive's stateless DAO, as the vault's does, so a knowhow mounted
-            // without hive finds no session to answer. Defaults off, like the
-            // vault.
-            modules.knowhow =
-                init_one::<roomler_ai_mod_knowhow::KnowhowState>(core.clone(), settings, ())
-                    .await?;
-            if let Some(m) = &modules.knowhow {
-                modules.ws.extend(m.ws().handlers);
-            }
-        }
 
         // FR-129 A1 — the mounted set, copied into the core from the ONE
         // function `/api/capabilities` reads, so a module asking whether a
@@ -277,18 +204,6 @@ impl Modules {
         if self.network.is_some() {
             ids.push("network");
         }
-        #[cfg(feature = "hive")]
-        if self.hive.is_some() {
-            ids.push("hive");
-        }
-        #[cfg(feature = "vault")]
-        if self.vault.is_some() {
-            ids.push("vault");
-        }
-        #[cfg(feature = "knowhow")]
-        if self.knowhow.is_some() {
-            ids.push("knowhow");
-        }
         ids
     }
 
@@ -322,18 +237,6 @@ impl Modules {
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             api = api.merge(network.routes().with_state(()));
-        }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            api = api.merge(hive.routes().with_state(()));
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            api = api.merge(vault.routes().with_state(()));
-        }
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            api = api.merge(knowhow.routes().with_state(()));
         }
         api
     }
@@ -508,18 +411,6 @@ impl Modules {
         if let Some(network) = &self.network {
             root = root.merge(network.unlimited_routes().with_state(()));
         }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            root = root.merge(hive.unlimited_routes().with_state(()));
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            root = root.merge(vault.unlimited_routes().with_state(()));
-        }
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            root = root.merge(knowhow.unlimited_routes().with_state(()));
-        }
         root
     }
 
@@ -551,18 +442,6 @@ impl Modules {
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             sets.extend(network.indexes());
-        }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            sets.extend(hive.indexes());
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            sets.extend(vault.indexes());
-        }
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            sets.extend(knowhow.indexes());
         }
         sets
     }
@@ -597,18 +476,6 @@ impl Modules {
         if let Some(network) = &self.network {
             sets.extend(network.indexes_for(multi_block));
         }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            sets.extend(hive.indexes_for(multi_block));
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            sets.extend(vault.indexes_for(multi_block));
-        }
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            sets.extend(knowhow.indexes_for(multi_block));
-        }
         sets
     }
 
@@ -639,18 +506,6 @@ impl Modules {
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             jobs.extend(network.jobs());
-        }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            jobs.extend(hive.jobs());
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            jobs.extend(vault.jobs());
-        }
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            jobs.extend(knowhow.jobs());
         }
         jobs
     }
@@ -690,21 +545,6 @@ impl Modules {
         if let Some(network) = &self.network {
             core.hooks
                 .register(roomler_ai_mod_network::NetworkState::ID, network.hooks());
-        }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            core.hooks
-                .register(roomler_ai_mod_hive::HiveState::ID, hive.hooks());
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            core.hooks
-                .register(roomler_ai_mod_vault::VaultState::ID, vault.hooks());
-        }
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            core.hooks
-                .register(roomler_ai_mod_knowhow::KnowhowState::ID, knowhow.hooks());
         }
     }
 
@@ -760,18 +600,6 @@ impl Modules {
     /// Orderly stop of every mounted module, in REVERSE composition order
     /// (a module stops before the ones it depends on).
     pub async fn shutdown(&self) {
-        #[cfg(feature = "knowhow")]
-        if let Some(knowhow) = &self.knowhow {
-            knowhow.shutdown().await;
-        }
-        #[cfg(feature = "vault")]
-        if let Some(vault) = &self.vault {
-            vault.shutdown().await;
-        }
-        #[cfg(feature = "hive")]
-        if let Some(hive) = &self.hive {
-            hive.shutdown().await;
-        }
         #[cfg(feature = "network")]
         if let Some(network) = &self.network {
             network.shutdown().await;

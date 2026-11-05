@@ -60,8 +60,8 @@ from scratchpad to `scripts/`.
 
 ## FR-A — Encoder rate changes without an IDR (first)
 
-**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:302–251`, dispatch
-`encoder_smoke_cmd` :4059) with `--reconfigure-sweep [--width/--height 1280×800]
+**A0 — measure on silicon.** Extend `Command::EncoderSmoke` (`app.rs:430–482`, dispatch
+`encoder_smoke_cmd` :6273) with `--reconfigure-sweep [--width/--height 1280×800]
 [--frames-per-rung 30] [--constrained] [--json]`: synthetic desktop frame with a moving 200×200
 block (solid colours make P-frames ~0 bytes and hide CBR/QVBR); 30 frames at 6 M, then rungs
 `4.5M 3M 2M 1.5M 1M 750k 550k 400k 300k 200k` down and back (20 changes via `set_bitrate`). Per
@@ -71,7 +71,7 @@ mean_bytes/(rung/fps/8)`. **Pass** = 0 key packets after the opener, `set_bitrat
 ±25 % by frame 10, burst ≤ 2×. Hosts: CORPLAP-1 (`hevc_qsv`, `low_power` 1 and 0), an
 Arc/Meteor-Lake host (`av1_qsv`), the RTX box (`hevc/av1_nvenc`), one Apple Silicon Mac
 (`hevc_videotoolbox`); AMD recorded as unmeasured. Add a defaulted trait method
-`VideoEncoder::rate_stats()` (`encode/mod.rs:934`) so the sweep reads counters. The sweep bypasses
+`VideoEncoder::rate_stats()` (`encode/mod.rs:1280`) so the sweep reads counters. The sweep bypasses
 the coarsen gate (:1591–1594).
 
 **A1 — in-place applies, gated.** Replace `supports_dynamic_bitrate = name.contains("nvenc")`
@@ -85,7 +85,7 @@ targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `enc
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:203`; parity test :1935).
-Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:7096–7027`) with
+Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10035–10188`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:29`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
@@ -102,7 +102,7 @@ Windows by injecting `PATCHES` into the copied portfile's `vcpkg_from_github(` (
 technique :75–95). Drift gate: each builder writes `ROOMLER-PATCHES.txt` (sha256 per patch) into
 the asset and `release-agent.yml`'s three fetch steps (:341–352, :1002–1004, :1926–1934) assert it
 matches `.github/ffmpeg-patches/*`. `const NVENC_RECONFIG_FORCES_IDR: bool` flips to false in the
-asset-bump PR; the pump's `held_increase` arm (`peer.rs:6557–6524`) keys on it.
+asset-bump PR; the pump's `held_increase` arm (`peer.rs:9453–9459`) keys on it.
 
 **A3 — VideoToolbox / AMF.** From A0 on a Mac: patch 0002 + `InPlace`, or keep `Rebuild` on a
 simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same rule.
@@ -112,8 +112,8 @@ simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same
 | PR | delete | anchors | precondition |
 |---|---|---|---|
 | A2 | motion-defer: `deferred_bps`, `DEFER_QUIET`, `last_motion_at`, `last_deferred_apply_at`, `held_increase`; `rebuild_apply_allowed` + `relay_deferred_apply_allowed` (+tests); `relay_idr_thrift` narrows to settle-KF suppression | `peer.rs:5084, 5014–5021, 6350–6397, 6408–6444, 6501–6506`; `mod.rs:417–474` | A0 pass on QSV, switch ON one release |
-| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:5151–5149, 5180–5246`; `encoder.rs:1643–1546`; `aimd.rs:285–338`; `mod.rs:370–381` | VT measured or kept on the settle rule |
-| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:731–699`; `peer.rs:3986` | — |
+| A3 | background swap (`bg_rebuild`, `pending_swap`, `swap_wanted`, `SWAP_MIN_INTERVAL`, `last_swap_at`; `rebuild_spec`/`open_rebuilt`/`adopt_rebuilt`); **`coarsen_bitrate` + `BITRATE_LADDER_BPS`**; `bg_rebuild` key | `peer.rs:7222–7241, 7555–7648`; `encoder.rs:2548–2758`; `aimd.rs:285–338`; `mod.rs:488–499` | VT measured or kept on the settle rule |
+| A4 | unify `on_encoder_rebuilt_mirror_only` into `on_encoder_rebuilt` (VP9 divergence) | `governor.rs:1003–1019`; `peer.rs:4807` | — |
 
 Stays: dims/chroma/backend rebuilds (:5749–5813), FlipTracker rebuild (:5112–5136), error ladder,
 `kf_gate` (kf_policy.rs), `send_epoch` for those rebuilds.
@@ -138,7 +138,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:1303–1284`, parser `peer.rs:7763–7605`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:2433–2495`, parser `peer.rs:10989–11063`): `frames_lost`
 (chunk gaps, already in `rc-hevc-worker.ts:363`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:102–138` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
@@ -229,7 +229,7 @@ before B2).
    (`vendored/webrtc/src/api/setting_engine/mod.rs:195–197`, evaluated per address in
    `webrtc-ice/src/util/mod.rs:129–132`) with the addresses **on our own adapters**, not a CIDR:
    `if_addrs::get_if_addrs()` filtered by `is_overlay_iface(name)` on Windows/Linux, plus LocalAPI
-   `status().overlay_ip/ip6` (`localapi/src/lib.rs:97–101`) for macOS `utunN`. An ISP CGNAT
+   `status().overlay_ip/ip6` (`localapi/src/lib.rs:93–97`) for macOS `utunN`. An ISP CGNAT
    address lives on the physical NIC and is never dropped — this retires the objection at
    `peer.rs:337–340`.
 2. **srflx**: the mapped address bypasses every filter (`agent_gather.rs:729–758`) — a 3-line
@@ -238,11 +238,11 @@ before B2).
 3. **Remote candidates** in `add_remote_candidate` (`peer.rs:1286–1334`), after mDNS resolution:
    drop non-relay candidates whose address equals a LocalAPI `peers()` overlay IP or our own (same
    query as :1644–1651, 400 ms timeout, fail-open); relay-typed exempt (keeps the loopback TURN,
-   `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:693–690`).
+   `rc_local_turn.rs`, `relay_addr_is_fast_local` `encode/mod.rs:978–987`).
 
 Plus **PathClass-lite**: the class in the `per-session ICE path detected` line (`peer.rs:1527–1527`)
 and in the FR-35 memory key (`peer.rs:4766` → `"{ip}|{class}"`, which fixes "a fast day carried
-onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:32–38`
+onto a slow one"); an additive `carrier` field on the LocalAPI peer entry (`localapi/src/lib.rs:28–34`
 has only `Relay`) so DERP / TURN / org relay are distinguishable. Mitigation for the one path lost
 (proxy-only egress, 443 only): a `turns:` listener on 443 on coturn, or the loopback-TURN opt-in.
 Update `docs/multi-org.md:340–341` (its "ICE never gathers on roomler-*" is true only on Linux) and

@@ -18,9 +18,23 @@ pub struct LeaveOutcome {
     pub closed: bool,
     pub was_last_session: bool,
     /// Stats PR-2 — the `(joined_at, left_at)` of every session THIS call
-    /// closed (multi-close happens on the legacy user-level leave). The
-    /// caller books call minutes from these, clamped to the call window.
+    /// closed (multi-close happens on the legacy user-level leave, and on
+    /// #3416's miss). The caller books call minutes from these, clamped to
+    /// the call window.
     pub closed_sessions: Vec<(DateTime, DateTime)>,
+}
+
+/// Which of a member's open call sessions one close in `leave_participant`
+/// takes.
+#[derive(Debug, Clone, Copy)]
+enum CallSessions<'a> {
+    /// Every open one: the legacy leave that names no connection.
+    Open,
+    /// The open one of this connection.
+    Of(&'a str),
+    /// The open ones that no connection owns, while this connection never
+    /// held a session in the room (#3416).
+    Unscoped(&'a str),
 }
 
 /// FR-115 P5 — one call in progress, as the meeting-length sweep reads it.
@@ -162,49 +176,17 @@ impl RoomDao {
         self.base.find_by_id(room_id).await
     }
 
-    /// FR-90 — a room another module owns the meaning of: `Secret` (a
-    /// non-member gets 404, not proof it exists), not listed in Explore, at an
-    /// explicit `path` its owner guarantees unique (`hive-<session id>` — a
-    /// path derived from the name would collide with any room of that name),
-    /// carrying its `binding`. Built by the same constructor as every other
-    /// room, so it cannot drift from one; the creator joins it, as always.
-    pub async fn create_bound(
-        &self,
-        tenant_id: ObjectId,
-        name: String,
-        path: String,
-        creator_id: ObjectId,
-        binding: roomler_ai_db::models::Binding,
-    ) -> DaoResult<Room> {
-        let mut room = new_room(NewRoom {
-            tenant_id,
-            parent_id: None,
-            name,
-            path,
-            creator_id,
-            is_open: false,
-            media_settings: None,
-            conference_settings: None,
-            meeting_code: None,
-            join_url: None,
-        });
-        room.visibility = RoomVisibility::Secret;
-        room.binding = Some(binding);
-        let room_id = self.base.insert_one(&room).await?;
-        self.join(tenant_id, room_id, creator_id).await?;
-        self.base.find_by_id(room_id).await
-    }
-
     /// What counts as a CHANNEL against the plan's `max_channels` — for the
     /// gate below and for the plan-compliance report, which must agree.
     ///
     /// A live room that no other module owns. Soft-deleted rooms are
     /// excluded (FR-32: an archived channel is not occupying a seat the
-    /// customer is paying for), and so are BOUND rooms (FR-90): an agent
-    /// session's room is that module's object, one per session, and counting
-    /// it would let a handful of sessions lock an org out of creating
-    /// channels. `binding: null` also matches an absent field — every room
-    /// before FR-90 and every unbound one since.
+    /// customer is paying for), and so are BOUND rooms (FR-90): a bound room
+    /// is another module's object, one per agent session, and counting it
+    /// would let a handful of sessions lock an org out of creating channels.
+    /// FR-137 parked the module, not its rooms: the stored ones stay bound
+    /// and stay out of the count. `binding: null` also matches an absent
+    /// field — every room before FR-90 and every unbound one since.
     pub fn channel_filter() -> bson::Document {
         doc! { "deleted_at": null, "binding": null }
     }
@@ -572,57 +554,6 @@ impl RoomDao {
         Ok(found.is_some())
     }
 
-    /// FR-90 P2i-2 — which of `rooms` this user holds a membership row in, in
-    /// this tenant: [`Self::is_member`]'s rule for many rooms at once, in one
-    /// read. Scoped by tenant for the same reason.
-    pub async fn member_room_ids(
-        &self,
-        tenant_id: ObjectId,
-        user_id: ObjectId,
-        rooms: &[ObjectId],
-    ) -> DaoResult<Vec<ObjectId>> {
-        if rooms.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.room_ids_where(doc! {
-            "tenant_id": tenant_id,
-            "user_id": user_id,
-            "room_id": { "$in": rooms.to_vec() },
-        })
-        .await
-    }
-
-    /// FR-90 P2i-2 — every room this user holds a membership row in, in this
-    /// tenant: each one [`Self::is_member`] answers yes for.
-    pub async fn rooms_of_member(
-        &self,
-        tenant_id: ObjectId,
-        user_id: ObjectId,
-    ) -> DaoResult<Vec<ObjectId>> {
-        self.room_ids_where(doc! { "tenant_id": tenant_id, "user_id": user_id })
-            .await
-    }
-
-    async fn room_ids_where(&self, filter: bson::Document) -> DaoResult<Vec<ObjectId>> {
-        use futures::TryStreamExt;
-
-        let coll = self
-            .members
-            .collection()
-            .clone_with_type::<bson::Document>();
-        let mut cursor = coll
-            .find(filter)
-            .projection(doc! { "room_id": 1, "_id": 0 })
-            .await?;
-        let mut held = Vec::new();
-        while let Some(d) = cursor.try_next().await? {
-            if let Ok(room) = d.get_object_id("room_id") {
-                held.push(room);
-            }
-        }
-        Ok(held)
-    }
-
     pub async fn find_member_user_ids(&self, room_id: ObjectId) -> DaoResult<Vec<ObjectId>> {
         use futures::TryStreamExt;
 
@@ -967,6 +898,21 @@ impl RoomDao {
     /// that connection's session (multi-device: the user's other browsers keep
     /// theirs); `None` is the legacy user-level leave closing all open ones.
     ///
+    /// #3416 — a connection that never held a session in the room closes the
+    /// user's open sessions there that have no connection id instead. A page
+    /// opens one when its `call/join` goes out before its socket has an id,
+    /// and so does an older client. The page's leave and its socket's close
+    /// both name the connection, which the session never carried, so nothing
+    /// closed it: the person stayed listed, and a call they were alone in
+    /// never ended. A connection that holds a session of its own never
+    /// touches them, because one may be the person's other device, still in
+    /// the call. Nor does one that held a session and closed it: it is leaving
+    /// twice (a repeated leave, a leave racing its socket's close, a leave
+    /// after the call ended), and a closed session keeps its `connection_id`.
+    /// Such a session names no device, so the heal closes all of them: the
+    /// leaver's own is among them, and closing only some could leave the
+    /// leaver listed.
+    ///
     /// `participant_count` counts DISTINCT USERS, so it is decremented only
     /// when the user's last open session closed. The close runs as a single
     /// `find_one_and_update` whose filter DEMANDS a matching open session and
@@ -974,6 +920,8 @@ impl RoomDao {
     /// document, exactly one observes zero open sessions, and a duplicate
     /// leave matches nothing — the double-decrement that used to drive the
     /// count to 0 under another live user (ending their call) can't happen.
+    /// The miss is a second such close, run only when the first matched
+    /// nothing, so the same holds for it.
     pub async fn leave_participant(
         &self,
         room_id: ObjectId,
@@ -981,56 +929,15 @@ impl RoomDao {
         connection_id: Option<&str>,
     ) -> DaoResult<LeaveOutcome> {
         let now = DateTime::now();
-        let now_b = bson::Bson::DateTime(now);
-        let filter = match connection_id {
-            Some(cid) => doc! {
-                "room_id": room_id,
-                "user_id": user_id,
-                "sessions": { "$elemMatch": { "connection_id": cid, "left_at": null } },
-            },
-            None => doc! {
-                "room_id": room_id,
-                "user_id": user_id,
-                "sessions.left_at": null,
-            },
-        };
-        // Pipeline update (stats PR-2): array-filter `$set` can't write a
-        // DIFFERENT duration per matched element, so the close is a `$map`
-        // that stamps `left_at` AND the per-session `duration` (previously
-        // declared-but-never-written) in the same atomic write.
-        let close_cond = match connection_id {
-            Some(cid) => doc! { "$and": [
-                { "$eq": [ "$$s.connection_id", cid ] },
-                { "$eq": [ "$$s.left_at", null ] },
-            ]},
-            None => doc! { "$eq": [ "$$s.left_at", null ] },
-        };
-        let update = vec![doc! { "$set": {
-            "sessions": { "$map": { "input": "$sessions", "as": "s", "in": {
-                "$cond": [
-                    close_cond,
-                    { "$mergeObjects": [ "$$s", {
-                        "left_at": now_b.clone(),
-                        "duration": { "$toLong": { "$divide": [
-                            { "$subtract": [ now_b.clone(), "$$s.joined_at" ] },
-                            1000,
-                        ] } },
-                    } ] },
-                    "$$s",
-                ]
-            }}},
-            "updated_at": now_b,
-        }}];
-        let opts = mongodb::options::FindOneAndUpdateOptions::builder()
-            .return_document(mongodb::options::ReturnDocument::After)
-            .build();
-        let post = self
-            .members
-            .collection()
-            .find_one_and_update(filter, update)
-            .with_options(opts)
-            .await
-            .map_err(DaoError::Mongo)?;
+        let which = connection_id.map_or(CallSessions::Open, CallSessions::Of);
+        let mut post = self.close_sessions(room_id, user_id, which, now).await?;
+        if post.is_none()
+            && let Some(cid) = connection_id
+        {
+            post = self
+                .close_sessions(room_id, user_id, CallSessions::Unscoped(cid), now)
+                .await?;
+        }
 
         let Some(post) = post else {
             return Ok(LeaveOutcome {
@@ -1086,6 +993,82 @@ impl RoomDao {
             was_last_session,
             closed_sessions,
         })
+    }
+
+    /// One atomic close for [`Self::leave_participant`]: a
+    /// `find_one_and_update` whose filter DEMANDS an open session among
+    /// `which`, returning the member's post-image, or `None` when nothing
+    /// matched.
+    async fn close_sessions(
+        &self,
+        room_id: ObjectId,
+        user_id: ObjectId,
+        which: CallSessions<'_>,
+        now: DateTime,
+    ) -> DaoResult<Option<RoomMember>> {
+        let now_b = bson::Bson::DateTime(now);
+        let filter = match which {
+            CallSessions::Of(cid) => doc! {
+                "room_id": room_id,
+                "user_id": user_id,
+                "sessions": { "$elemMatch": { "connection_id": cid, "left_at": null } },
+            },
+            // A query's `null` matches an absent field too, and a session with
+            // no connection id has none (`skip_serializing_if`). `$ne` on the
+            // array: no session here, open or closed, was this connection's.
+            CallSessions::Unscoped(cid) => doc! {
+                "room_id": room_id,
+                "user_id": user_id,
+                "sessions": { "$elemMatch": { "connection_id": null, "left_at": null } },
+                "sessions.connection_id": { "$ne": cid },
+            },
+            CallSessions::Open => doc! {
+                "room_id": room_id,
+                "user_id": user_id,
+                "sessions.left_at": null,
+            },
+        };
+        // Pipeline update (stats PR-2): array-filter `$set` can't write a
+        // DIFFERENT duration per matched element, so the close is a `$map`
+        // that stamps `left_at` AND the per-session `duration` (previously
+        // declared-but-never-written) in the same atomic write.
+        let close_cond = match which {
+            CallSessions::Of(cid) => doc! { "$and": [
+                { "$eq": [ "$$s.connection_id", cid ] },
+                { "$eq": [ "$$s.left_at", null ] },
+            ]},
+            // `$ifNull` reads the absent field as null here as well.
+            CallSessions::Unscoped(_) => doc! { "$and": [
+                { "$eq": [ { "$ifNull": [ "$$s.connection_id", null ] }, null ] },
+                { "$eq": [ "$$s.left_at", null ] },
+            ]},
+            CallSessions::Open => doc! { "$eq": [ "$$s.left_at", null ] },
+        };
+        let update = vec![doc! { "$set": {
+            "sessions": { "$map": { "input": "$sessions", "as": "s", "in": {
+                "$cond": [
+                    close_cond,
+                    { "$mergeObjects": [ "$$s", {
+                        "left_at": now_b.clone(),
+                        "duration": { "$toLong": { "$divide": [
+                            { "$subtract": [ now_b.clone(), "$$s.joined_at" ] },
+                            1000,
+                        ] } },
+                    } ] },
+                    "$$s",
+                ]
+            }}},
+            "updated_at": now_b,
+        }}];
+        let opts = mongodb::options::FindOneAndUpdateOptions::builder()
+            .return_document(mongodb::options::ReturnDocument::After)
+            .build();
+        self.members
+            .collection()
+            .find_one_and_update(filter, update)
+            .with_options(opts)
+            .await
+            .map_err(DaoError::Mongo)
     }
 
     /// Room in which the given WS connection still holds an OPEN call session.

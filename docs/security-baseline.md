@@ -403,8 +403,7 @@ endpoint carries administrative verbs: exec, SSH grants, config, routes, restart
 Windows it is a named pipe whose security descriptor admits `SYSTEM`,
 `Administrators` and the interactive user. On Unix a root daemon's socket is
 `/var/run/roomler/roomler.sock`, 0700 / 0600, root only. Per-verb checks sit on top:
-the recording verbs require the console user (FR-85) and an update hold requires
-root (FR-90).
+the recording verbs require the console user (FR-85).
 
 ⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911; FR-97 P2g).** A
 Linux system install's companion runs as the desktop user and could not reach the root

@@ -32,17 +32,14 @@ pub enum NotificationType {
     /// A remote-control session is awaiting the device owner's approval
     /// (Phase 4 owner-consent). `link` points at the in-app consent page.
     ConsentRequest,
-    /// FR-90 P1a-2 — an agent session's tool call is waiting for a driver.
-    /// `link` points at the session's room; nothing in it says which tool or
-    /// what it would do.
-    ApprovalRequest,
     /// FR-52 P5 — someone from outside the org reached a device for the first
     /// time, or keeps guessing its password. `link` points at the org's external
     /// access log.
     ExternalAccess,
     /// A type this build does not know — a newer server's — read as itself
     /// rather than refused, so one new kind of notification cannot fail a
-    /// user's whole list on an older pod mid-roll.
+    /// user's whole list on an older pod mid-roll. FR-137 — and a retired
+    /// one: FR-90's `approval_request` rows (parked) read as this.
     #[serde(other)]
     Other,
 }
@@ -64,22 +61,21 @@ mod tests {
 
     /// The stored spelling of the newest kind, and a kind from a newer
     /// server read as `Other` — through BSON, which is how a list is read.
+    /// FR-137 — so is FR-90's retired `approval_request`, which stored rows
+    /// still carry.
     #[test]
     fn a_notification_kind_this_build_does_not_know_is_read_not_refused() {
-        assert_eq!(
-            bson::to_bson(&NotificationType::ApprovalRequest).unwrap(),
-            bson::Bson::String("approval_request".into())
-        );
         assert_eq!(
             bson::to_bson(&NotificationType::ExternalAccess).unwrap(),
             bson::Bson::String("external_access".into())
         );
-        let doc = bson::doc! { "t": "quorum_reached" };
         #[derive(Deserialize)]
         struct T {
             t: NotificationType,
         }
-        let t: T = bson::from_document(doc).unwrap();
-        assert!(matches!(t.t, NotificationType::Other));
+        for kind in ["quorum_reached", "approval_request"] {
+            let t: T = bson::from_document(bson::doc! { "t": kind }).unwrap();
+            assert!(matches!(t.t, NotificationType::Other), "{kind}");
+        }
     }
 }

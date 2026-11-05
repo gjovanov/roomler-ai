@@ -1088,8 +1088,8 @@ mod tests {
         }
         let buf = Buf::default();
         let writer = buf.clone();
-        // Two dispatchers, never one (`hive::view`'s tests: with one, a
-        // callsite's interest is taken once for every thread).
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread.
         let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let subscriber = tracing_subscriber::fmt()
             .with_target(false)

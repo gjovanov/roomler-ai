@@ -35,9 +35,11 @@ cd "$(dirname "$0")/.."
 BASELINE="scripts/anchor-range-baseline.txt"
 MODE="${1:-}"
 
-# A path with a code or doc extension, then `:N-M` or `#LN-LM` (`#LN-M` too).
+# A path with a code or doc extension, then `:N-M` or `#LN-LM` (`#LN-M` too). An en dash
+# (`:N–M`) is a range too: the docs write both, and on 2026-11-03 ten inverted en-dash ranges
+# sat on master where this audit could not see them.
 EXT='rs|ts|tsx|vue|js|mjs|cjs|yml|yaml|sh|ps1|toml|py|json|html|css|go|swift|c|h|md'
-PATTERN="[A-Za-z0-9_./-]+\\.(${EXT})(:|#L)[0-9]+-L?[0-9]+"
+PATTERN="[A-Za-z0-9_./-]+\\.(${EXT})(:|#L)[0-9]+(-|–)L?[0-9]+"
 
 # Every inverted range as `doc<TAB>anchor`, one per occurrence, sorted.
 current() {
@@ -45,7 +47,7 @@ current() {
     | xargs -0 grep -HoE "$PATTERN" 2>/dev/null \
     | awk -F'\t' '{
         i = index($0, ":"); doc = substr($0, 1, i - 1); a = substr($0, i + 1)
-        r = a; sub(/^.*(:|#L)/, "", r); split(r, n, "-"); s = n[1]; e = n[2]; sub(/^L/, "", e)
+        r = a; sub(/^.*(:|#L)/, "", r); split(r, n, /-|–/); s = n[1]; e = n[2]; sub(/^L/, "", e)
         if (e + 0 < s + 0) print doc "\t" a
       }' \
     | LC_ALL=C sort || true

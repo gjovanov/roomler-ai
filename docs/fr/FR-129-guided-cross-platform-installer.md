@@ -66,13 +66,13 @@ them:
 
 | Step | Where | Why it is not optional |
 |---|---|---|
-| package format follows the host | `scripts/install.sh:402-421` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
-| the macOS root-half marker | `scripts/install.sh:539-548` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
-| the per-user half as the console user | `scripts/install.sh:199-210` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
-| the macOS second enrollment | `scripts/install.sh:570-600` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
-| the FR-96 update helper | `scripts/install.sh:324-342` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
-| the desktop companion | `scripts/install.sh:843`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
-| digest verification | `scripts/install.sh:219-228` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
+| package format follows the host | `scripts/install.sh:438-457` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
+| the macOS root-half marker | `scripts/install.sh:575-584` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
+| the per-user half as the console user | `scripts/install.sh:202-222` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
+| the macOS second enrollment | `scripts/install.sh:606-636` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
+| the FR-96 update helper | `scripts/install.sh:360-378` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
+| the desktop companion | `scripts/install.sh:891`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
+| digest verification | `scripts/install.sh:232-241` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
 
 ## The mechanism, in the code (master `b4e72ff0d`)
 
@@ -99,7 +99,7 @@ it. Do not shift these anchors with code that moved later.*
 | platform strings | `crates/roomler-setup-core/src/asset_resolver.rs:265-300` | `windows-x86_64`, `linux-x86_64`, `linux-aarch64`, `macos` |
 | token step | `agents/roomler-setup/src/front/index.html:176-204`; `app.js:499-538`, `:718-769` | paste + a live, unverified JWT peek (`cmd_validate_token`, `commands.rs:248`); no polling anywhere in the frontend |
 | browser open | `agents/roomler-setup/tauri.conf.json:40-41` | the shell-open plugin is enabled and unused by the token step |
-| terminal installer | `scripts/install.sh:402-509` (Linux), `:511-576` (macOS), `:584-610` (root half), `:642` (enroll), `:842` (companion) | plain `sudo`, so it needs a terminal; no `pkexec` anywhere |
+| terminal installer | `scripts/install.sh:438-545` (Linux), `:547-612` (macOS), `:620-646` (root half), `:678` (enroll), `:890` (companion) | plain `sudo`, so it needs a terminal; no `pkexec` anywhere |
 
 ## Key design
 
@@ -204,7 +204,7 @@ The invariants, each closing a specific failure:
    - **No account:** register with the org inline (`register` already takes `tenant_name` and
      `tenant_slug`). An OAuth signup stays in one tab, so `pending_redirect` carries it. An
      email signup opens the activation link in a **new tab**, where sessionStorage is empty
-     (`ui/src/plugins/router.ts:396`). The page therefore also keeps the pending pairing in
+     (`ui/src/plugins/router.ts:370`). The page therefore also keeps the pending pairing in
      localStorage with its expiry, under the guard's same-origin rules, and the guard routes
      any signed-in tab back to `/pair` while it lives.
    - **Fallback, always:** the wizard keeps showing the code with an "Open the page again"
@@ -325,7 +325,7 @@ flowchart TB
 
 1. **The seam is decided by a spike (B0), then recorded here before B1.** The candidates:
    - **(i)** Run the whole script elevated. This breaks the per-user Linux path, which runs
-     `systemctl --user` as the invoking user (`install.sh:736`); under `pkexec` that is root's
+     `systemctl --user` as the invoking user (`install.sh:772`); under `pkexec` that is root's
      user manager.
    - **(ii)** Give `install.sh` a privileged-steps entry point and a user-steps entry point.
      The terminal path calls both in order and does not change; the wizard elevates only the
@@ -671,7 +671,7 @@ flowchart TB
    shows the terminal command. That command carries no secret; the wizard enrolls in-process
    once it detects the installed daemon.
 3. **Fail closed on a missing digest** when elevated, unlike the terminal's soft-skip
-   (`install.sh:409-430`). A root install of an unverified package is the thing to refuse.
+   (`install.sh:445-466`). A root install of an unverified package is the thing to refuse.
 4. **Roles.**
    - **Linux per-user** (the default for a desktop): screen sharing, plus the overlay through
      the userspace netstack.
@@ -932,8 +932,8 @@ sequenceDiagram
   build before this, harmless stand-ins beside the EXE ran with `admin=True`: `msiexec` under the
   shell's one UAC prompt and `icacls` under none (the log, 2026-11-02). Every spawn on this path
   now names its program by a full path from the kernel, because `%SystemRoot%` can be overridden
-  per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:113`), and `spawn_elevated`
-  refuses anything else (`agents/roomlerd/src/updater.rs:2702`).
+  per user (`appdirs::system32_tool`, `crates/agent-core/src/appdirs.rs:130`), and `spawn_elevated`
+  refuses anything else (`agents/roomlerd/src/updater.rs:2517`).
   `agents/roomler-setup/src/spawn_gate.rs` parses the source of everything the wizard runs on
   Windows and fails on a bare name, or on an expression it has not been told about.
 - **What an elevated run takes from its user.** A value in `HKCU\Environment` reaches an elevated
@@ -941,14 +941,14 @@ sequenceDiagram
   there, with no second prompt (the log, 2026-11-02). `launch::start_clean` (`launch.rs:275`),
   `main`'s second line (`agents/roomler-setup/src/main.rs:53`), therefore does three things. The
   machine's folders take their true values on every run (`appdirs::machine_folder_variables`,
-  `appdirs.rs:125`). The current directory moves to System32; an elevated copy otherwise keeps
+  `appdirs.rs:142`). The current directory moves to System32; an elevated copy otherwise keeps
   the limited one's. An elevated run drops `ROOMLER*`, `WEBVIEW2_*`, `TAURI_*` and `SSL_CERT_*`
   (`launch::distrusted_variable`, `launch.rs:254`). A limited run keeps those, because it crosses
   nothing its user cannot already do, and test fixtures use them. The elevated WebView2 folder
   sits where the limited user can write, so it is made new at each start and no link is followed
   (`make_elevated_folder`, `launch.rs:384`), and the page holds only the grants it uses
   (`agents/roomler-setup/capabilities/default.json`). The MSI's publisher and the `%TEMP%` swap stay
-  with #3246.
+  with #3246, which closed both in `setup-v0.4.199`.
 - **A desktop that refuses prompts.** `ConsentPromptBehaviorUser=0`, which the CIS and STIG baselines
   set, refuses every administrator prompt from a standard user. On C's first cut the default led
   that person through pairing and the download into the refusal. The wizard now reads the policy at
@@ -1197,6 +1197,13 @@ Each criterion's fail-first run is today's build, recorded in the log before its
         The Windows wizard is older and does not refuse: `orchestrator_agent.rs:401-409` skips a
         missing digest with a warning, and the wizard checks no publisher itself. That is
         [#3246](https://github.com/gjovanov/roomler-ai/issues/3246).
+      - *Windows, from `setup-v0.4.199` (2026-11-03):* the wizard checks too, and its anchor is the
+        publisher, not the digest (#3246; `docs/installation.md`, "What the wizard runs is what it
+        checked"). A tampered MSI, an unsigned one and one signed by another publisher are each
+        refused before any UAC prompt, and nothing is installed. A genuine MSI whose release
+        publishes no digest still installs, with a warning row, because the signature decides.
+        *Evidence (the log):* "AC12 on Windows, on the release" (2026-11-03), and
+        [#3246's result](https://github.com/gjovanov/roomler-ai/issues/3246#issuecomment-6607717620).
       - *Evidence (the log):* "AC12: the GUI refuses, says why, and places nothing" (2026-10-31):
         the wizard's system role on Ubuntu, the digests removed from a real feed, with the same
         wizard and the digests left in as its control. The script's half is B0's row.
@@ -1491,3 +1498,4 @@ All seven open decisions were resolved as the spec recommended
 | 2026-11-02 | the release's EXE as production serves it (`8efdf979…`), a Win11 guest, the wizard limited and read through its debugging port; `wizard-state.json` seeded with `{"step":"done","role":"tunnel-client"}` and an old device name, 13:19Z to 13:23Z | **AC17: the operator's own red on the release.** Over the background-service install: the background service selected, not the tunnel, with the note and its Restart as administrator. With nothing left on the machine: the background service selected, no note, Continue enabled, and the Server page offers the machine's own name with the overlay ticked. **Found between those two:** after `install.ps1 -Uninstall`, which leaves the hardened config folder, Welcome reads "Daemon: no existing install detected." and "This device already has the background service…" on one page, with Continue disabled. Restart as administrator is the right way on, and only the sentence is false ([#3247](https://github.com/gjovanov/roomler-ai/issues/3247#issuecomment-6578313265), item 11). |
 | 2026-11-02 | the release on the first Win11 guest above, a same-user administrator at the console, a real mouse, nothing attached | **AC18 on the signed EXE.** From File Explorer over the finished install: in front 0.1 s after its process started, "Daemon: existing perMachine install (version 0.4.197)", the background service selected, the note and the button, Continue disabled. The button: UAC on the secure desktop reads **"Roomler Setup, Verified publisher: G ROX LTD, File origin: Hard drive on this computer"**. No: "The administrator prompt was cancelled; Roomler Setup is still running without administrator rights.", the same process and only one. The button again, Yes at 12:57:21.398: the elevated copy at 21.457 with `--role daemon-system --session-data … --after-elevation …`, the limited one gone, in front at 22.049, 0.6 s after Yes, WebView2 in `…\ai.roomler.setup\elevated\EBWebView`, the background service selected, no note, Continue enabled. Its "Open roomler.ai/pair" opens Edge as the session's user. The code, approved at 12:59:04, Install at 12:59:38, no second prompt, the service restarted, `ROOMLERD_ENABLE_SYSTEM_SWAP=1`, the same row online with a new credential, Done. |
 | 2026-11-02 | the same EXE on a second Win11 guest with the service installed: 21 System32 DLLs and 16 stand-ins named like Windows tools beside it; the previous build (`532182c46`) beside it as the control | **AC19 on the signed EXE.** **DLLs:** every module listed in load order, nothing from the folder, 5 of 5: limited with the current directory the folder, limited with System32, a real double-click (parent `explorer.exe`), elevated twice. The previous build in the same run loads `SSPICLI.DLL` from the folder, 2 of 2. **After TLS, stand-ins and DLLs together:** the elevated copy (`--after-elevation` on its command line), Welcome 47 modules and Done 76: `secur32`, `SspiCli`, `schannel`, `ncrypt`, `ncryptsslp` from System32, nothing from the folder, MSI exit 0, `Enrolled`, "The Roomler service runs the new enrollment". Limited past the Server page, 65 modules, the same. The fired list is empty after every step. **Load flag and import gate:** from the published bytes, in this release's first row. **Its browser,** from a copy verified elevated: `msedge` as the session's user, integrity medium, parent `explorer.exe`, `--single-argument https://roomler.ai/pair`, then Done with no error. A first attempt at that read is void: a run stopped on Token resumes with its role, so that copy was a limited one, and that is the check to make first. **Per-user values:** the installer's address pointed at a dead loopback and `ProgramFiles` and `ProgramData` at a fake folder, in `HKCU\Environment`. The limited Welcome is unchanged; UAC Yes; the elevated copy downloads from production and reaches Done; the config is written at the true `C:\ProgramData\roomler\roomler\config.toml`, the service runs from `C:\Program Files\Roomler\roomlerd.exe`, and the fake folders hold only Windows's shell caches. |
+| 2026-11-03 | **`setup-v0.4.199`**, the first release with #3246's fix (PR #3339), as production serves it from `/api/setup/windows`: SHA-256 equal to the health digest and to the release's `.sha256`, Authenticode valid, signer `G ROX LTD`, a Microsoft timestamp; a fresh Win11 Enterprise evaluation guest (build 26200), unmanaged, behind the lab's NAT, attended desktop | **AC12 on Windows, on the release.** Each sample came through a stand-in for the server. A tampered MSI ("the payload does not match its signature — it was modified after signing"), an unsigned one ("the file is not signed"), one signed by another publisher this guest trusts, and one whose signer's name only contains the publisher's were each refused before any UAC prompt, in words a person can act on. Nothing was staged, installed or run. On the real server, a limited wizard under an administrator and a standard person's double-click with an administrator's password in the prompt each read *Download verified (SHA256)* and *Signed by G ROX LTD* before the prompt, then *MSI installer finished (exit 0, Success)*, *Enrolled* and Done, and the device came online on 0.4.199. Not read: Windows 10, a GPO-locked corporate desktop with EDR or TLS inspection, a locked screen, ARM64. [#3246's result](https://github.com/gjovanov/roomler-ai/issues/3246#issuecomment-6607717620) |
