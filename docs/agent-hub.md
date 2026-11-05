@@ -855,8 +855,8 @@ period's one try until a person types again. That is why the gate skips instead 
     left" while processes ran (0.4.1).
 
   The third hub, whose process predated the install, came onto the guard at a `/reload-plugins` on
-  2026-11-05 01:14, and onto a fresh process at 01:23. Still to show: a day with nothing left behind
-  (AC9).
+  2026-11-05 01:14, and onto a fresh process at 01:23. A day after the resume, at 11:30,
+  `hub.mjs procs` found nothing left in any of the three hubs, and FR-136 closed.
 
 P1 (the skill, the protocol and the helper) and P1b (the move to 2.1.314) are logged in the
 [spec](fr/FR-131-hub-coordinator.md#field-log).
