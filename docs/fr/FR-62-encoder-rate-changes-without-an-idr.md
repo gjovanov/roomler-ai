@@ -1,9 +1,23 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR · **VideoToolbox measured 2026-11-05** (Apple M5 Pro, 0.4.201): a rebuild on every rung, 8–12 ms, 20/20 IDRs · NVENC re-read on the released 0.4.187: **0/20** · **AC2/AC3 met on 0.4.201** (2026-11-05): a relayed `av1_nvenc` session under a window drag made 13 in-place rate moves, none with an IDR of its own, and each saturated window after a move landed at 0.97–1.00 of the new rung; the three unexplained IDRs of the 2026-11-03 passive read did not recur · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** **complete 2026-11-05**: AC1–AC3, AC5 and AC6 met; AC4 moved to FR-63 (its B4 and AC7) · A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR · **VideoToolbox measured 2026-11-05** (Apple M5 Pro, 0.4.201): a rebuild on every rung, 8–12 ms, 20/20 IDRs · NVENC re-read on the released 0.4.187: **0/20** · **AC2/AC3 met on 0.4.201** (2026-11-05): a relayed `av1_nvenc` session under a window drag made 13 in-place rate moves, none with an IDR of its own, and each saturated window after a move landed at 0.97–1.00 of the new rung; the three unexplained IDRs of the 2026-11-03 passive read did not recur · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
 
+- **2026-11-05 19:35Z — A4 and AC4 move to FR-63, and FR-62 is complete.** The operator's call,
+  on this case:
+  - The plan always sequenced A4's deletions after FR-63's B2 flip plus a release soak
+    (Sequencing row 5), and FR-63's B3 deletes `aimd.rs`, the coarsen ladder with it, after the
+    same flip.
+  - The measurements bound A4 to NVENC. QSV's A0 failed, and VideoToolbox, AMF, D3D12 and Vulkan
+    rebuild with an IDR on every move, so the rationing heuristics stay load-bearing everywhere
+    but NVENC.
+  - So FR-63 carries it, as phase B4 and AC7: retire the IDR-rationing heuristics through the
+    registry table, per backend, NVENC only while every other backend rebuilds with an IDR. The
+    registry (`rate-control.md` § Kill switches) and its A4 rows stay as they are.
+  - What FR-62 set out to prove holds. An NVENC rate move costs no IDR, on silicon (A0, 0/20) and
+    in the field on a relayed session (13 moves, none with an IDR), and every backend has its A0
+    row.
 - **2026-11-05 19:21Z — A3: VideoToolbox measured, a rebuild with an IDR on every rung. AC2's
   wording now matches its read.**
   - **VideoToolbox.** MacBook-1 (Apple M5 Pro, macOS 27.0.1) on the released 0.4.201, one sweep:
@@ -378,7 +392,8 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
   an IDR) and **load-bearing on QSV** (a move is a 0.34–2.0 s rebuild). Each retirement is therefore
   gated on the backend it is retired for, and `coarsen_bitrate` in particular stays until QSV has a
   cheap apply path — deleting it because "FR-62 removed the need" would pin every QSV session to the
-  rebuild cost it exists to avoid.
+  rebuild cost it exists to avoid. **Moved to FR-63 on 2026-11-05**, as its B4 and AC7 (the
+  Progress entry).
 - **A5 (later A/B)**: QSV to QVBR (`bit_rate = 0.9 × maxrate`, keeps `global_quality`) — stops CBR padding idle frames.
 
 ## Acceptance criteria
@@ -414,12 +429,13 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
       Δ`dims_swaps`, a Δ`frames_dropped_backpressure`, a `keyframe_requests` tick, a lock edge or
       another source from the 2026-11-03 table beside it, and an unexplained IDR beside a
       Δ`rate_moves` is the RED (the corrected read, 2026-10-31 above).
-- [ ] AC4 — Every deleted heuristic's kill switch is retired through the registry table with its evidence.
-      No heuristic has been deleted yet (A4 has not started). The registry table the plan names
-      (`rate-control-architecture.md`, rule 4) exists since 2026-10-31:
+- **AC4** moved to FR-63 (#1243) on 2026-11-05, the operator's call: its AC7 and phase B4 carry
+      it. It read "every deleted heuristic's kill switch is retired through the registry table
+      with its evidence". No heuristic had been deleted: the plan sequences every deletion after
+      FR-63's B2 flip plus one release soak, and the measurements limit them to NVENC. The
+      registry the plan names (`rate-control-architecture.md`, rule 4) stays in
       [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4),
-      18 switches plus the four A4 heuristics with no switch. Blocked on FR-63's B2 flip plus one
-      release soak, where the plan sequences every deletion, and on each row's own precondition.
+      18 switches plus the four A4 heuristics with no switch.
 - [x] AC5 — `encoder_inplace_rate = false` restores today's behaviour byte-for-byte (unit test + field check).
       Unit: `encoder::tests::rate_mode_resolves_per_backend_and_flag` (OFF ⇒ `Rebuild` for QSV,
       `InPlaceVbr` for NVENC) and `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window`
@@ -469,6 +485,7 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
   read an 8–12 ms rebuild with an IDR on every move, so the rebuild's time is no argument for the
   patch, and the IDR is. The macOS builder carries no patch today, so VideoToolbox keeps the
   rebuild path and the ladder rations its IDRs, as for AMF, until someone writes patch 0002.
+  Either patch (0002 here, 0004 for QSV) would widen FR-63's B4 past NVENC.
 - Whether to attach `mfxExtEncoderResetOption{StartNewSequence=OFF}` (patch 0004) if any QSV driver starts a new sequence on Reset.
 
 ## Out of scope
