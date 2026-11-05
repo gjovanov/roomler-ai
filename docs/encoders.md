@@ -1490,6 +1490,12 @@ the rates a slow link runs, while AMF, D3D12 and Vulkan rebuild in 40–80 ms an
 only the IDR. The rationing a backend needs follows from its row, which is why A4
 retires heuristics per backend rather than deleting them.
 
+In the field `av1_nvenc` moves the same way. A relayed CORPLAP-2 session on 0.4.201
+crossed 13 rungs in place, down to 550 k and back up to 3 M, with `rebuilds=0`, and
+none of the moves brought an IDR of its own (FR-62 AC2/AC3, 2026-11-05). Patch 0001
+is in `nvenc.c`'s `reconfig_encoder`, which `h264_nvenc`, `hevc_nvenc` and
+`av1_nvenc` share.
+
 ⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
 direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
 `target_bps` 34 → 65 Mbps in eight AIMD steps while `rate_moves` stayed 0: every step
