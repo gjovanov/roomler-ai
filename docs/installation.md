@@ -1606,15 +1606,34 @@ companion show the root half's row, and a verb that needs the server (`forward`,
 `exec`, `ssh`, a rename) says to run it with `sudo`. The worker's log lines go up on
 the root half's row, each marked `process: gui-worker`.
 
+```mermaid
+flowchart TB
+    subgraph server["roomler.ai"]
+        D["row: name-daemon, and the root's row in each other org"]
+    end
+    subgraph mac["The Mac"]
+        subgraph root["root, from boot"]
+            DAEMON["com.roomler.daemon: every enrollment, overlay, SSH, exec, consent"]
+        end
+        subgraph gui["the console user's session"]
+            WORKER["roomlerd run --supervised --unenrolled: capture, input, clipboard; no enrollment, no WS"]
+        end
+        DAEMON -- "spawns: launchctl asuser, sudo -u" --> WORKER
+        DAEMON <-- "every org's rc messages, the worker's caps and logs: /var/run/roomler-delegate" --> WORKER
+    end
+    D -- "control WS, one per org" --- DAEMON
+```
+
 A secondary org's session goes to the worker too (FR-43 P3b). Its prompt names the org
 that asks, each reply goes back on that org's connection, and no org reaches a session
 another org opened. A person's own `auto_grant_session = false` and their `rc_*` keys
 still bind every session on that Mac: the worker hands them to the daemon, which takes
 the stricter of the person's and its own.
 
-The switch is off by default and stays off until the
-[field proof](fr/FR-43-macos-single-enrollment.md#what-rides-what). It doesn't give one
-row alone: the switch leaves a person's enrollment in their file, so their row stays.
+The switch is off by default. Its field proof ran on released 0.4.200 on 2026-11-05
+([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3a-to-p3c-on-released-04200-one-row-end-to-end)),
+and the default flips only on the operator's word. It doesn't give one row alone: the
+switch leaves a person's enrollment in their file, so their row stays.
 
 **The migration (FR-43 P3c).** `sudo roomlerd one-row` makes a two-row Mac one row. It
 says its plan first and asks: `--dry-run` stops after the plan, and `--yes` goes ahead
@@ -1645,6 +1664,11 @@ ends only the command that waits for it. Its account also goes to
 every copy, the plist and the LaunchAgent, and restarts: two rows again, until a person
 deletes a retired row, whose token then cannot come back. The one-token install is
 P3d.
+
+⚠️ On 0.4.200 the command stops before it changes anything on a Mac where an entry
+under `/Users` links to another account's folder, as a tart image's `/Users/runner`
+does: it plans that person's file twice, and the second copy fails with `File exists`.
+#3498 has it read each folder once.
 
 ```bash
 # Screen sharing only (one token, one device row):
