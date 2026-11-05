@@ -180,7 +180,7 @@ and never outliving the daemon (FR-97 P0e).
 
 Release feature sets per OS, which decide what ships: Linux x86_64
 `.github/workflows/release-agent.yml:552`, Linux arm64 `:1185`, Windows x64 `:1714`, macOS arm64
-`:2654`. A feature that compiles but is not in an OS's set does not ship there.
+`:2915`. A feature that compiles but is not in an OS's set does not ship there.
 
 ## 8. Every ⛔, and why
 

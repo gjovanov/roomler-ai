@@ -232,7 +232,7 @@ grep -oE 'target is [0-9]+ MB.*' job.log                          # GC line, non
 | `tag run — skipping accretion GC` | expected on every tag run |
 
 A failed rehearsal opens a GitHub issue (`release-agent.yml:3848`), and the next green one
-closes it (`:3836`).
+closes it (`:3912`).
 
 ## 6. The waves that built this
 
