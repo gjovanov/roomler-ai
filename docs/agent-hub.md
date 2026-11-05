@@ -375,7 +375,8 @@ flowchart LR
     OP(["the operator"])
     subgraph T["a terminal: hubs"]
         H1["every hub<br/>two lines each"] -- Enter --> H2["one hub's workers<br/>grouped by what they need"]
-        H2 -- "→" --> H3["one worker's details"]
+        H2 -- "→, or Enter on a stopped worker" --> H3["one worker's details"]
+        H3 -- "Enter on a stopped worker, or c" --> CV["its conversation<br/>read-only, newest last"]
         H2 -- "Enter on a running worker" --> AT["claude attach<br/>in the same window"]
         AT -- "Ctrl+Z" --> H2
     end
@@ -392,9 +393,9 @@ flowchart LR
 
 `hubs` is `~/.claude/skills/hub/hubs.mjs`, a Node script with no dependencies, started by a launcher
 on the `PATH` (`hubs.cmd` on Windows, `~/bin/hubs` in Git Bash). It reads `hub.mjs status <dir>
---json --peek` for every hub folder, `hub.mjs convo` for a worker's last lines, and hub-guard's task
-records. It changes nothing until a key asks it to. Drawn from a made-up fixture with `--snapshot`,
-the top level and one hub look like this:
+--json --peek` for every hub folder, `hub.mjs convo` for a worker's last lines and, a page at a time,
+its whole conversation, and hub-guard's task records. It changes nothing until a key asks it to.
+Drawn from a made-up fixture with `--snapshot`, the top level and one hub look like this:
 
 ```text
  Hubs
@@ -423,20 +424,22 @@ the top level and one hub look like this:
   W-5 g0     Throwaway E                           ◌ queued    ctx 30%
  Done · 1 (d shows them)
 ────────────────────────────────────────────────────────────────────────────────────────────────
- ↑↓ j k move  Enter attach (running)  → details  ← back  / filter  d show done  q quit
+ ↑↓ j k move  Enter attach (running)  → details  c conversation  ← back  / filter  d show done  q quit
 ```
 
 A hub's workers come in six groups: **Needs you** (a question for the operator), **Running**,
 **Paused or stopped**, **Parked**, **Queued**, and **Done**, which stays folded until `d`. A `?`
 marks a question for the hub, `⚙ 0.4c 120M` what a worker's processes cost (from 110 columns; a
 narrower window drops it, then the cache, then the context), and `⚠ N left` what an ended generation
-left running.
+left running. On the top level, a hub's `● N running` counts its workers with a live session, the way
+their rows do, not the workers its own state says it runs.
 
 | Key | Does |
 |---|---|
-| `↑` `↓` `j` `k` · PgUp PgDn Home End | moves |
-| **Enter** | goes in. On a running worker it attaches in this window, and Ctrl+Z comes back to the navigator where it was. |
-| `→` or `i` · `←` or Backspace | a worker's details: its question with the options, tasks, processes, background tasks, links and last lines · back |
+| `↑` `↓` `j` `k` · PgUp PgDn Home End | moves; in a conversation they scroll it |
+| **Enter** | goes in. On a running worker it attaches in this window, and Ctrl+Z comes back to the navigator where it was. On a stopped one it shows the details first, and Enter again opens its conversation. |
+| `→` or `i` · `←` or Backspace | a worker's details: its question with the options, tasks, processes, background tasks, links and last lines · back, and from a conversation back to where it was opened |
+| `c` | a worker's conversation, running or stopped, read-only and newest last, up to 150 entries a page through `hub.mjs convo`. ↑, PgUp or Home at its top reads the page before, `r` reloads it, and Enter in it attaches a running worker. |
 | `t` | attaches in a new tab of this window |
 | `R` | restarts a stopped worker and attaches; twice when its hub stopped it, and never while the host holds new sessions. Enter never restarts one. |
 | `/` | filters every hub and worker by id, title, PR or issue; Esc clears it |
@@ -449,7 +452,7 @@ and starts the navigator again where it was once Ctrl+Z gives the terminal back.
 
 `node hubs.mjs --snapshot [--at hubs|hub:<id>|worker:<id>/<W-n>] [--keys '…'] [--fixture DIR]`
 prints one screen as text after those keys, attaching, posting, reaping and opening nothing. The
-11 cases in `node --test hubs.test.mjs` are built on it.
+15 cases in `node --test hubs.test.mjs` are built on it.
 
 ### 8.2 The pane
 
