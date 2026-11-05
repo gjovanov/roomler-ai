@@ -19,8 +19,8 @@ fleet, and what the watch itself costs (measured, FR-65 AC1).
 |---|---|
 | Verdict + bookkeeping | `encode::stall` (`agents/roomlerd/src/encode/stall.rs`) — a pure module on the **default** feature set, so `cargo test -p roomlerd --lib` covers it although the pump is behind `ffmpeg-encoder` |
 | The pump's sites | `peer.rs:6912` (the watch), `:6924` (the one phase list), `:7393` (the pass boundary), `:10212` (the heartbeat's rebase) |
-| Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:530`), restart required |
-| The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:618`) |
+| Kill switch | `pump_stall_watch` / `ROOMLERD_PUMP_STALL_WATCH=0` (`encode/mod.rs:533`), restart required |
+| The bar | `pump_stall_warn_ms` / `ROOMLERD_PUMP_STALL_WARN_MS`, default 100 (`encode/mod.rs:621`) |
 | Its own cost | `roomlerd stall-watch-cost` (`stall.rs:592`, §8) |
 | The census | `scripts/fr65-stall-census.sh`, a fleet-wide server read of `agent_logs` (§7) |
 
@@ -440,7 +440,7 @@ the Mongo pod's restart count read 1 before and after. That is P3's before.
 > `Instant::now()` is ~20–40 ns, and there are N of them") the switch's own
 > description used to quote.
 
-`roomlerd stall-watch-cost` (`stall.rs:592`, dispatched in `app.rs:1291` before
+`roomlerd stall-watch-cost` (`stall.rs:592`, dispatched in `app.rs:1308` before
 any runtime, config, log, lock or updater) runs the pump's per-pass watch work
 through the **real** `PassWatch`, once enabled and once disabled, rounds
 alternating which arm goes first. Everything else in a pass is the same in

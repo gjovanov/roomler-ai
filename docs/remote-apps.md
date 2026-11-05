@@ -136,7 +136,7 @@ Four rules the session arm enforces, each paid for somewhere:
   where an Xvfb the daemon owns could not (`linux.rs:310`).
 
 The same `loginctl` walk serves FR-27's consent companion and FR-45's capture
-helper (`agents/roomlerd/src/companion.rs:1068`) — one copy on purpose, because
+helper (`agents/roomlerd/src/companion.rs:1115`) — one copy on purpose, because
 a compositor that reports its session differently should break all three in
 the same place.
 
@@ -199,8 +199,8 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:1061`,
-`:624` via `with_config_lists` `:655`) — in the daemon, never in the
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4497`,
+`:2388` via `with_config_lists` `:2944`) — in the daemon, never in the
 caps-probe child (§4.3).
 
 | Tier / path | Hello `apps` on 0.4.102 | `rc:apps.list.reply` on 0.4.102 | Reason reached the screen? | After P6 |
@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:39`,
 `:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
-(`agents/roomlerd/src/signaling.rs:1485`, `:2192`)
+(`agents/roomlerd/src/signaling.rs:1480`, `:2154`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -325,12 +325,12 @@ restart changes it. That is why P6 added a fourth value:
   `enabled = false` — on every release's first boot, and on every boot of a
   host with no hardware cell (a no-hardware answer is never cached,
   `caps_cache.rs:332`). `apps` is now assigned in `detect()`, in the daemon,
-  and the child's struct carries none (`apps_caps`, `caps.rs:4234`; a test locks
+  and the child's struct carries none (`apps_caps`, `caps.rs:4424`; a test locks
   `compute_caps(..).apps.is_empty()`). The same move takes the
   privilege-dropped `loginctl`/`wmctrl` walk out of a process that exists to
   contain untrusted driver code. `files` followed in #1672 — its `browse`
   entry rode the same default the same way — and is assigned by the same
-  seam (`with_config_lists`, `caps.rs:2659`; `files_caps` `:4223`), which a
+  seam (`with_config_lists`, `caps.rs:2849`; `files_caps` `:4413`), which a
   test locks assignment by assignment: `detect()` itself cannot run in a
   unit test without spawning the probe child.
 - ⚠️ An agent older than P6 answers `supported: false` with nothing beside it.
@@ -381,7 +381,7 @@ Streaming **one application window** instead of the monitor reuses FR-45's
 whole portal pipeline with a single change: `SelectSources(types = WINDOW)`
 (`SOURCE_WINDOW`, `agents/roomlerd/src/capture/portal/screencast.rs:95`) behind
 `ROOMLERD_WINDOW_CAPTURE` (`agents/roomlerd/src/capture/portal/backend.rs:103`,
-config key `window_capture`, `crates/agent-core/src/config.rs:1189`). It is
+config key `window_capture`, `crates/agent-core/src/config.rs:998`). It is
 **attended by construction**: the portal answers by showing the person at the
 screen a window picker, and nothing agent-side can name a window — GNOME
 refuses the only API that could supply an id, so mutter's `RecordWindow` route
@@ -487,13 +487,13 @@ label    = "Safari"
 
 | Key | Where | Default | Notes |
 |---|---|---|---|
-| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:2050`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
+| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1854`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
 | `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux and macOS, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch. On a Mac a `terminal`/`tmux` entry opens a new Terminal window running it, and an app is `["open", "-b", "<bundle id>"]` (§2b) |
 | `ROOMLERD_APPS` | env (`apps::APPS_ENV`); published as `0` by `env_fallbacks` from a config that says `false` | unset | FR-97 P2c — a **floor**: `0`/`false`/`no`/`off` switches Remote Apps off (`switched_off`), nothing switches them on. A supervised Mac's root forwards it to its GUI worker, which is how the root's `enabled = false` reaches the sessions |
-| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1379`) | **off** | P4 — attended by construction; restart required |
+| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1183`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6854`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6764`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the
@@ -508,7 +508,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:3176`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2950`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.
@@ -522,12 +522,12 @@ must never write the device's config as a side effect of being run.
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/apps/macos.rs` | FR-97 P2c: the window server's list (`quartz_windows`), the AX focus (`ax_window`, `MacWm::focus`), the launcher (`run_launcher`) and the Terminal script (`write_script`, `person_temp_dir`), `availability` (a window-server session or `no_session`). Its pure halves are in `mod.rs`: `QuartzWindow`, `quartz_listing`, `quartz_title`, `parse_quartz_window_id`, `terminal_script`, `terminal_script_name`, and the env floor (`APPS_ENV`, `apps_switched_off`, `permitted`) |
 | `agents/roomlerd/src/delegate.rs` · `signaling.rs` · `macos_supervisor.rs` | FR-97 P2c on a supervised Mac: `effective_apps` (the worker's words), the hello and heartbeat that carry them, and `WORKER_ENV_FORWARD`'s `APPS` |
-| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:1612`, `:1618`), assigned by `with_config_lists` (`:777`) from `detect` (`:624`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:1657`, `:1664`); `CACHED_CAPS` (`:37`) — why the hello is a snapshot; `cached_or_probed` (`:789`) — why the child's struct must carry no `apps` |
+| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:4497`, `:4503`), assigned by `with_config_lists` (`:2944`) from `detect` (`:2388`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:4542`, `:4549`); `CACHED_CAPS` (`:39`) — why the hello is a snapshot; `cached_or_probed` (`:2956`) — why the child's struct must carry no `apps` |
 | `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
 | `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
-| `agents/roomlerd/src/app.rs` | `apps-probe` (`:4724`) — reads the device config through `read_if_present`, never `load` |
+| `agents/roomlerd/src/app.rs` | `apps-probe` (`:4739`) — reads the device config through `read_if_present`, never `load` |
 | `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
-| `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1446`, `:988`) |
+| `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1250`, `:792`) |
 | `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1105`, `parseAppsUnavailable` `:1181`), the request path (`:5474`, `refreshApps` `:5512`), the reply arm (`:8515`), the no-reason wording (`:890`) |
 | `ui/src/views/remote/RemoteControl.vue` | the *Remote apps* entry (`:1255`, gate `:3610`) and the dialog (`:1295`) |
 | `ui/src/__tests__/composables/useRemoteControl.spec.ts` | the wire-format locks, including the `missing_tools` test that is red on the pre-P6 parser (`:2184`) |

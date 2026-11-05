@@ -4,10 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A generic pointer from a chat object to the module that owns its meaning:
-/// `{module: "hive", ref: "<session id>"}` for an agent session's room, and
-/// `{module: "hive", ref: "<session id>#<turn>"}` for a turn's stub message
-/// (FR-90).
+/// A generic pointer from a chat object to the module that owns its meaning.
+/// FR-90 (parked by FR-137) wrote `{module: "hive", ref: "<session id>"}` on
+/// an agent session's room and `{module: "hive", ref: "<session id>#<turn>"}`
+/// on a turn's stub message. Those stored rows keep it; nothing writes one now.
 ///
 /// Chat STORES it and never interprets it — that is the whole contract. A room
 /// or message with a binding is still an ordinary room or message to every

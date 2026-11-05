@@ -208,7 +208,7 @@ competitors". Engineering may use the numbers; the public pages never print them
 | L0 | The harness, the synthetic source, the CI line, the planted-regression control | test-only | **merged** #2097 (`67d3ca9e8`): `agents/roomlerd/tests/l4_latency.rs` + the marker and clock in `capture/synthetic_backend.rs` + the `peer::l0` seam; local and CI runs in the field log |
 | L4 | The probe, the worker sampler, the upload, `probe-target`, the nightly spec; baselines on a direct and a relay pair | `ROOMLERD_BENCH` unset; the build feature; the viewer knob `roomler-rc-bench` | **agent half built**: `synthetic_backend::probe` + the bottom-right marker, the input-handler hook in `peer.rs`, `bench` in `AgentCaps.video`, the `probe`/`probe50` cells. **Viewer half built**: the TS marker decoder, the worker sampler in all three decode workers, the `<video>` sampler, the jittered prober, the `rc.l4` upload, the server's parse lock. **`probe-target` built**: the window (`probe_target.rs`) and the viewer's `target` mode. **End to end on a release build: done** against `probe-target` on vmtest guests (the field log, 2026-10-13; FR-98 P5's cells used it on 2026-10-16, on the RTP track and the DataChannel). Owed: the nightly spec, which needs the agent-e2e pods in bench mode (`ROOMLERD_BENCH=1` in `scripts/e2e-k8s/overlay-template/statefulset-agent-e2e.yaml`, and an agent-e2e image from 0.4.133 or later, built by hand on the build host), and the baselines on real hosts |
 | T | The StarDesk comparison cell on the spare box (private results) | — | — |
-| L1 | `roomlerd encoder-smoke --bench`: each cell opened through the constructor a session calls, a synthetic motion profile encoded on one thread holding its clock, one row per cell with encode ms p50/p95, produced vs target bitrate, IDR and delta sizes and the encoder that opened; the `fallback` verdict | the flag: `--bench` is opt-in, and every `--bench-*` flag requires it, so the release lane's `encoder-smoke --encoder hardware` runs the plain smoke as before | **built** (2026-10-30): `agents/roomlerd/src/encode/bench.rs`, the painter moved to the always-compiled `capture/synthetic_scene.rs` with its motion profiles, the flags flattened into `EncoderSmoke` (`app.rs:464`) and dispatched by `smoke_mode` (`app.rs:1997`). The container run is in the field log, the fleet run in [§ L1 fleet run](#l1-fleet-run-2026-10-31). Owed: the hosts it has not reached (AC1) |
+| L1 | `roomlerd encoder-smoke --bench`: each cell opened through the constructor a session calls, a synthetic motion profile encoded on one thread holding its clock, one row per cell with encode ms p50/p95, produced vs target bitrate, IDR and delta sizes and the encoder that opened; the `fallback` verdict | the flag: `--bench` is opt-in, and every `--bench-*` flag requires it, so the release lane's `encoder-smoke --encoder hardware` runs the plain smoke as before | **built** (2026-10-30): `agents/roomlerd/src/encode/bench.rs`, the painter moved to the always-compiled `capture/synthetic_scene.rs` with its motion profiles, the flags flattened into `EncoderSmoke` (`app.rs:481`) and dispatched by `smoke_mode` (`app.rs:1961`). The container run is in the field log, the fleet run in [§ L1 fleet run](#l1-fleet-run-2026-10-31). Owed: the hosts it has not reached (AC1) |
 | L2–L3 | As designed above | — | — |
 | D | Docs | — | L0 and L4: `docs/testing.md`, done. L1: `docs/testing.md` § The L1 encoder bench, done |
 
@@ -318,7 +318,7 @@ Linux runs were `nice -n 10`, and their `clock=` reads `clamped`. The Windows ru
   and `h264_qsv` in hardware on its next rows.
 - **The hello half knows.** On both hosts the same hello's FR-77 cell marks `h264/mf` as
   software. Only the legacy label overclaims, because it is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:3673`). A reader of `video_cells` is not misled.
+  (`agents/roomlerd/src/encode/caps.rs:3863`). A reader of `video_cells` is not misled.
 - **The join can pass too.** jupiter's two VAAPI encoders opened as its hello says, and mars
   advertises no hardware and opened none.
 - **`dc:vp9:444`'s `fallback` is a different thing.** It says this build has a VP9 hardware
@@ -329,10 +329,10 @@ Linux runs were `nice -n 10`, and their `clock=` reads `clamped`. The Windows ru
   kbps on both and in the 2026-10-30 container, and `dc:vp9:444` 3594 kbps on all four.
 - **A cell the hello advertises and a session may not open.** The laptop's hello lists `av1` in
   `codecs`, yet `rtp:av1` opened `noop`. FFmpeg's AV1 probe adds the codec
-  (`agents/roomlerd/src/encode/caps.rs:4017`), the RTP path tries only Media Foundation
-  (`agents/roomlerd/src/encode/mod.rs:1642`), and `pick_best_codec` ranks AV1 first with no
-  per-path filter (`agents/roomlerd/src/signaling.rs:3646`,
-  `agents/roomlerd/src/encode/caps.rs:4783`). The code logs `Session will have no video until
+  (`agents/roomlerd/src/encode/caps.rs:4207`), the RTP path tries only Media Foundation
+  (`agents/roomlerd/src/encode/mod.rs:1645`), and `pick_best_codec` ranks AV1 first with no
+  per-path filter (`agents/roomlerd/src/signaling.rs:3676`,
+  `agents/roomlerd/src/encode/caps.rs:4836`). The code logs `Session will have no video until
   reconnect` there. `agent_logs` holds that line 14 times in the org in 7 days, all on
   CORPLAP-3, whose hello has the same shape, the last on 2026-10-30. None of those batches
   carries a session id, so this shows the path fires, not that a viewer lost its picture. Not

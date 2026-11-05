@@ -403,8 +403,7 @@ endpoint carries administrative verbs: exec, SSH grants, config, routes, restart
 Windows it is a named pipe whose security descriptor admits `SYSTEM`,
 `Administrators` and the interactive user. On Unix a root daemon's socket is
 `/var/run/roomler/roomler.sock`, 0700 / 0600, root only. Per-verb checks sit on top:
-the recording verbs require the console user (FR-85) and an update hold requires
-root (FR-90).
+the recording verbs require the console user (FR-85).
 
 ⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911; FR-97 P2g).** A
 Linux system install's companion runs as the desktop user and could not reach the root
@@ -413,7 +412,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:1161` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:1208` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;
@@ -433,11 +432,11 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
   decision) `ConfigGet` — the listing, no secret being on that surface, with every key
   the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
   the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
-  `crates/localapi/src/lib.rs:3269`): the keys the daemon's own endpoint already
+  `crates/localapi/src/lib.rs:3156`): the keys the daemon's own endpoint already
   gated to that person because Windows' pipe admits every interactive user.
   Never the device-owned gates `exec_enabled`, `ssh_enabled` and
   `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
-  administrator's command (`not_on_the_person_socket_for_key`, `:3605`).
+  administrator's command (`not_on_the_person_socket_for_key`, `:3487`).
 
 The recording verbs (P2e) are the second widening past the safety surface, and
 **Stop** is safety on its own: without `RecordStop` the host could not end a remote
@@ -495,18 +494,18 @@ for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and l
 install pending a separate policy call. The dispatcher gates the peer again, three ways
 (#2871's review):
 - **who**: the connection's uid, which the kernel read, must be the person the socket was
-  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2506`, by
-  `person_peer_ok`, `:4593`). The listener makes that check before a byte is read, and a
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2474`, by
+  `person_peer_ok`, `:4428`). The listener makes that check before a byte is read, and a
   test drives the listener itself over a real socket: another account's connection is
   closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
-  (`serve_person_listener`, `:4657`). The gate makes the check again where the decision
+  (`serve_person_listener`, `:4492`). The gate makes the check again where the decision
   is, so the rule does not rest on that one call site. An unknown peer is refused;
 - **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
   and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
   daemon asks once more, fresh, whether that uid is at the seat
-  (`LocalApiState::at_the_seat_now`, `:2819`), so a person who switched away cannot change
+  (`LocalApiState::at_the_seat_now`, `:2758`), so a person who switched away cannot change
   the next person's settings over a connection still open. Root is not asked;
-- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3243`). The
+- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3130`). The
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 

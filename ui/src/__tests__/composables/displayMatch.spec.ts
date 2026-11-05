@@ -64,6 +64,11 @@ describe('the words', () => {
     expect(describeDisplayMatchRefusal('no_fitting_mode')).toMatch(/no display mode/)
     expect(describeDisplayMatchRefusal('switch_failed')).toMatch(/could not/)
     expect(describeDisplayMatchRefusal('unsupported')).toMatch(/can't/)
+    // #3467 — a recording holds the display while it runs.
+    expect(describeDisplayMatchRefusal('recording')).toBe('a recording is running on this computer')
+    expect(displayMatchSummary({ on: false, mode: null, refused: 'recording' })).toBe(
+      'not now: a recording is running on this computer',
+    )
   })
 
   it('shows a word from a newer agent as it came, never as a success', () => {

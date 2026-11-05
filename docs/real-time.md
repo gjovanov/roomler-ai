@@ -46,8 +46,6 @@ JSON messages, `{"type": "...", ...}`.
 | `media:view` | FR-127 P1 — the viewer's WHOLE rendered set, `{ room_id, seq, video: [{ producer_id, w, h }] }`: the server resumes those video consumers and pauses the viewer's others; no reply |
 | `media:play_audio` / `media:stop_audio` | Bot/audio playback control |
 | `presence:update` | Presence state |
-| `hive:view.open` / `offer` / `ice` / `renew` / `close` | FR-90 — read an agent session over a viewer peer (module `hive`) |
-| `hive:search.open` | FR-90 P2i-2 — search, over a peer of its own, the copies an archive replica holds of the sessions the asker may read; the peer then takes `hive:view.offer` / `ice` / `renew` / `close`, by its grant |
 | `ping` | Keepalive |
 
 **Server → client** (consumed by `ui/src/stores/ws.ts`)
@@ -61,8 +59,6 @@ JSON messages, `{"type": "...", ...}`.
 | `typing:start` | Typing indicators |
 | `notification:new` / `notification:unread_count` | Notification bell |
 | `task:update` | Background-task progress |
-| `hive:view.ready` / `refused` / `answer` / `ice` / `renewed` / `closed` | FR-90 — the viewer peer's handshake, addressed to the ONE connection that opened it |
-| `hive:search.ready` / `refused` | FR-90 P2i-2 — a search's grant confirmed by its archive replica (with how many sessions it names), or refused; the rest of its handshake is the view's above |
 
 The mediasoup signalling (`media:*`) carries router RTP capabilities, transport
 parameters, and producer/consumer ids — the SFU forwards RTP between participants
@@ -108,10 +104,10 @@ sequenceDiagram
 
 | Moment | Where | What happens |
 |---|---|---|
-| Join | `ConferenceView.vue:607`, `stores/rooms.ts:192` `callConnectionId`, `:198` `joinCall`; server `call.rs:133`, `dao/room.rs:806` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:182`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
-| Leave | `rooms.ts:207` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:1008`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
+| Join | `ConferenceView.vue:607`, `stores/rooms.ts:193` `callConnectionId`, `:199` `joinCall`; server `call.rs:133`, `dao/room.rs:723` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:183`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
+| Leave | `rooms.ts:208` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:925`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
 | Socket close | `ws_media.rs:59` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:110`), and the same leave runs naming the socket (`:117`) |
-| A miss | `dao/room.rs:1017`, the close itself `close_sessions` (`:1085`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
+| A miss | `dao/room.rs:934`, the close itself `close_sessions` (`:1002`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
 | Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:254`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
 
@@ -324,17 +320,6 @@ consumers held back by their viewers' views, never the owner's FR-30 pause
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
 two that follow it (simulcast, a room piped across workers), are in the FR's §3.0.
 
-The viewer peer's signalling (`hive:view.*`, FR-90) is a view grant and the SDP
-and ICE of a **data-only** WebRTC peer between the browser and the device that
-holds the session. The server tells the browser `ready` only after the device has
-confirmed the grant (FR-83), relays the handshake to and from the one connection
-that holds the grant, and never sees the transcript that then flows over the
-peer. A search (`hive:search.open`, P2i-2) is a grant of the same kind toward an
-archive replica, naming the sessions the asker may read whose copy it holds; its
-query and what it finds travel only over its peer. The server's half is
-[`crates/modules/hive/src/view.rs`](../crates/modules/hive/src/view.rs), the
-device's `agents/roomlerd/src/hive/view.rs`.
-
 ## The `rc:*` plane (agents, tunnel clients, controllers)
 
 Defined in `crates/remote_control/src/signaling.rs` (`ClientMsg` / `ServerMsg`,
@@ -349,7 +334,7 @@ tag is a deliberate wire break.
 | SDP / ICE | `rc:sdp.offer` · `rc:sdp.answer` · `rc:ice` | WebRTC negotiation relayed through the server |
 | Consent | `rc:consent` | Owner consent decision (pairs with the HTTP capability URLs) |
 | Keepalive | `rc:ping` / `rc:pong` | Application-level liveness |
-| Tunnel session | `rc:tunnel.hello` · `.open` · `.opened` · `.terminate` · `.revoked` | Client ⇄ agent tunnel establishment (`open_nonce` correlates concurrent opens; an agent session's `net_grant` rides `.open` from its own device, and `.opened` echoes its id as `net_grant_id`: [tunnels.md](tunnels.md#an-agent-sessions-grant-fr-90-p3-7-2a)) |
+| Tunnel session | `rc:tunnel.hello` · `.open` · `.opened` · `.terminate` · `.revoked` | Client ⇄ agent tunnel establishment (`open_nonce` correlates concurrent opens) |
 | Tunnel TCP flows | `rc:tunnel.tcp.request` → `.forward` → `.accept`/`.reject` · `.half_close` · `.closed` | Per-flow lifecycle |
 | Tunnel UDP flows | `rc:tunnel.udp.request` → `.forward` → `.accept`/`.reject` · `.closed` | SOCKS5 UDP ASSOCIATE flows |
 | Tunnel carriers | `rc:tunnel.sdp.offer`/`.answer` · `.ice` · `.quic.setup`/`.ready`/`.candidate` | WebRTC-DC and QUIC data-plane negotiation |
@@ -357,6 +342,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1170`), `RETIRED_RC_TAG_FAMILIES` (`:1199`), `RETIRED_USER_WS_NAMESPACES` (`:1204`) and `RETIRED_MODULE_IDS` (`:1208`), locked by `retired_rpc_verbs_are_never_reused` (`:7980`), `retired_wire_families_and_module_ids_are_never_reused` (`:8049`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5195`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 

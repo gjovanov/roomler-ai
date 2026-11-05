@@ -1524,7 +1524,7 @@ impl AgentPeer {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tick.tick().await;
-                        if !crate::display_match::owns_mode(sid) {
+                        if !crate::display_match::watch_due(sid) {
                             continue;
                         }
                         if let Ok(Some(answer)) =
@@ -11084,8 +11084,8 @@ fn attach_control_handler(
                                 // P3: only the owning session's toggle-off
                                 // restores; a non-owner disabling its OWN match
                                 // preference must not revert the mode another
-                                // session applied.
-                                if crate::display_match::restore_for(session_id) {
+                                // session applied. Its waiting request goes too.
+                                if crate::display_match::turn_off(session_id) {
                                     tracing::info!("display-match: restored original mode");
                                 } else {
                                     tracing::debug!(

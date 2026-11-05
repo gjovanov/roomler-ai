@@ -129,6 +129,12 @@ pub enum Asker {
         /// SSH prompt from mars timed out on a desktop whose native panel had
         /// just served three exec prompts in a row.
         indicator: crate::indicator::ViewerIndicator,
+        /// Whether the desktop companion can show the question: started if it
+        /// is installed and not running. [`Companion::System`] in the daemon;
+        /// a test holds its start open with a fixed one (#3442).
+        ///
+        /// [`Companion::System`]: crate::companion::Companion::System
+        companion: crate::companion::Companion,
     },
     /// FR-105 — the worker on the other end of this connection asks: the
     /// SYSTEM service's server, one relay per connection.
@@ -791,7 +797,8 @@ mod sshd {
         /// this reason when something is asked to run — a bare auth failure
         /// cannot explain itself, which is why the refusal is deferred.
         pub run_as: Result<crate::exec::RunAs, String>,
-        /// Sentinel the operator is prompted on before anything runs. `None`
+        /// The grant the operator is asked about before anything runs. Each
+        /// question is filed under an id of its own, not this (#3442). `None`
         /// = no prompt: either the policy said an explicit `Auto`, or this is
         /// a key-list session — the break-glass path, deliberately exempt
         /// from a gate the control plane owns.
@@ -817,10 +824,6 @@ mod sshd {
         /// row in `ssh_audit`. `None` for a key-list session, which no grant
         /// backs and which therefore has nothing to correlate to.
         pub grant_id: Option<String>,
-        /// FR-90 P3-8-2a — an agent session's: one `exec` on one channel, and
-        /// nothing else ([`super::Grant::one_command`]). Every request handler
-        /// that could do more reads it.
-        pub one_command: bool,
     }
 
     impl ResolvedSessionPolicy {
@@ -847,7 +850,6 @@ mod sshd {
                 account,
                 consent_mode,
                 session_secs,
-                one_command,
                 deadline,
             } = grant;
             // Two fields were spent BEFORE resolution, and that is their
@@ -879,7 +881,8 @@ mod sshd {
                 // `Email`, `Push` and a server that said NOTHING all ask —
                 // the fail-safe direction for a gate whose whole purpose is a
                 // human in the loop, and the same rule Fleet RPC applies. The
-                // grant id doubles as the sentinel the decision arrives on.
+                // question is about this grant; the decision arrives under the
+                // question's own id (#3442).
                 consent_sentinel: match consent_mode {
                     Some(ConsentMode::Auto) => None,
                     _ => Some(grant_id.clone()),
@@ -896,7 +899,6 @@ mod sshd {
                 ),
                 prompt_name: caller.clone(),
                 caller: format!("ssh:{caller}@{peer}"),
-                one_command,
             }
         }
 
@@ -928,9 +930,6 @@ mod sshd {
                 // a decision row to join against — the `(key-list)` suffix on
                 // `caller` is what identifies it.
                 grant_id: None,
-                // The device owner's own break-glass key: no agent session's
-                // grant backs it, so nothing limits it to one command.
-                one_command: false,
             }
         }
 
@@ -1035,18 +1034,6 @@ mod sshd {
         /// Who asks the person before anything runs: this process, or
         /// (FR-105) the worker that carried this connection.
         asker: Asker,
-        /// FR-90 P3-8-2a — what a session granted one command has used of it.
-        /// Read only when its policy says `one_command`.
-        used: OneCommandUse,
-    }
-
-    /// FR-90 P3-8-2a — a one-command session's one channel and one `exec`.
-    /// An attempt counts as used whether or not it runs, so a refused or
-    /// failed `exec` cannot be followed by another.
-    #[derive(Default)]
-    struct OneCommandUse {
-        channel: bool,
-        exec: bool,
     }
 
     impl Handler {
@@ -1069,14 +1056,7 @@ mod sshd {
                 exec_aborts: std::collections::HashMap::new(),
                 _awake: awake,
                 asker,
-                used: OneCommandUse::default(),
             }
-        }
-
-        /// FR-90 P3-8-2a — was this session granted one command? `false`
-        /// before authentication, when russh delivers no request anyway.
-        fn one_command(&self) -> bool {
-            self.policy.as_ref().is_some_and(|p| p.one_command)
         }
 
         /// Start the one-per-session watchdog that ends the connection when
@@ -1710,21 +1690,6 @@ mod sshd {
             reply: russh::server::ChannelOpenHandle,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // FR-90 P3-8-2a — a session granted one command gets ONE channel:
-            // a second could carry a second command.
-            if self.one_command() {
-                if self.used.channel {
-                    warn!(
-                        peer = %self.peer,
-                        "ssh: refused a second channel: this session was granted one command"
-                    );
-                    reply
-                        .reject(russh::ChannelOpenFailure::AdministrativelyProhibited)
-                        .await;
-                    return Ok(());
-                }
-                self.used.channel = true;
-            }
             reply.accept().await;
             self.arm_session_deadline(session);
             Ok(())
@@ -1775,25 +1740,6 @@ mod sshd {
                 return Ok(());
             };
             let caller = policy.caller.clone();
-
-            // FR-90 P3-8-2a — nor for a session granted one command, whatever
-            // this device's allowlist would let another session reach.
-            if policy.one_command {
-                warn!(
-                    peer = %self.peer, %caller, %host, port,
-                    "ssh: forward refused: this session was granted one command"
-                );
-                self.report(
-                    SshActivityKind::Forward,
-                    Some(format!("{host}:{port}")),
-                    None,
-                    false,
-                );
-                reply
-                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                    .await;
-                return Ok(());
-            }
 
             // FR-105 — no forward at all on the SYSTEM service's server.
             let verdict = match self.ctx.forward_refusal {
@@ -1871,20 +1817,6 @@ mod sshd {
             data: &[u8],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // FR-90 P3-8-2a — one command, asked once: the attempt is spent
-            // here, before anything can refuse or fail it.
-            if self.one_command() {
-                if self.used.exec {
-                    return refuse(
-                        session,
-                        channel,
-                        self.peer,
-                        "exec",
-                        "this session was granted one command, and has asked for it.",
-                    );
-                }
-                self.used.exec = true;
-            }
             // The SSH exec payload is bytes, not necessarily UTF-8. Refuse
             // rather than lossily convert: a command with replacement
             // characters in it is not the command the caller asked for.
@@ -1981,16 +1913,6 @@ mod sshd {
             channel: ChannelId,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // FR-90 P3-8-2a — never a shell for a session granted one command.
-            if self.one_command() {
-                return refuse(
-                    session,
-                    channel,
-                    self.peer,
-                    "shell",
-                    "this session was granted one command, not a shell.",
-                );
-            }
             if self.pty_req.is_some() {
                 // The shell's CONTENTS are never recorded; this row exists so
                 // a reader can see that an interactive session happened.
@@ -2020,16 +1942,6 @@ mod sshd {
             _modes: &[(russh::Pty, u32)],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // FR-90 P3-8-2a — nor a terminal: refused before it is recorded,
-            // so nothing a later request asks can find one.
-            if self.one_command() {
-                warn!(
-                    peer = %self.peer, %term,
-                    "ssh: refused a terminal: this session was granted one command"
-                );
-                session.channel_failure(channel)?;
-                return Ok(());
-            }
             // Recorded, not acted on: the terminal is allocated when the
             // shell starts, because that is when the identity it runs as
             // is known and when consent has been settled. Allocating here
@@ -2123,16 +2035,6 @@ mod sshd {
             name: &str,
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            // FR-90 P3-8-2a — nor a subsystem, `sftp` included.
-            if self.one_command() {
-                return refuse(
-                    session,
-                    channel,
-                    self.peer,
-                    name,
-                    "this session was granted one command, not a subsystem.",
-                );
-            }
             if name == "sftp" {
                 // File operations happen inside `sftp-server`; this records
                 // only that a transfer channel was opened.
@@ -2268,39 +2170,182 @@ mod sshd {
     /// "run a command", "transfer files"). FR-27 puts it in front of the person
     /// deciding, not just in the daemon log: "grant SSH" and "give this account
     /// a root shell on my machine right now" are not the same question.
+    ///
+    /// `grant` is what the question is about, never the id it is asked under
+    /// (#3442, [`question`]).
     async fn await_consent(
         asker: &Asker,
         handle: &russh::server::Handle,
         channel: ChannelId,
         caller: &str,
-        sentinel: &str,
-        what: &str,
+        grant: &str,
+        what: &'static str,
     ) -> Result<(), String> {
         let timeout = crate::consent::DEFAULT_PROMPT_TIMEOUT;
-        let _ = handle
-            .extended_data(
-                channel,
-                1,
-                format!(
-                    "roomler-ssh: waiting up to {}s for approval at the device…\r\n",
-                    timeout.as_secs()
-                )
-                .into_bytes(),
+        let (asked, joined) = question(asker, caller, grant, what, timeout);
+        // A channel that joins a standing question waits for what is left of
+        // that question's window, not for a window of its own.
+        let note = if joined {
+            format!(
+                "roomler-ssh: this is being asked at the device already; waiting up to the rest \
+                 of its {}s for that answer…\r\n",
+                timeout.as_secs()
             )
-            .await;
+        } else {
+            format!(
+                "roomler-ssh: waiting up to {}s for approval at the device…\r\n",
+                timeout.as_secs()
+            )
+        };
+        let _ = handle.extended_data(channel, 1, note.into_bytes()).await;
+        asked.await
+    }
+
+    /// A question to the person at the device, as every channel waiting on it
+    /// holds it.
+    type Asked = futures::future::BoxFuture<'static, Result<(), String>>;
+
+    /// What a question is about: its grant, and the activity it names.
+    type Topic = (String, &'static str);
+
+    /// A standing question, held weakly, with the turn it was asked on and
+    /// the id it is asked under.
+    type Standing = (u64, String, futures::future::WeakShared<Asked>);
+
+    /// The questions standing, by what each is about.
+    static ASKING: std::sync::Mutex<std::collections::BTreeMap<Topic, Standing>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    /// The question about `what` under `grant`: the one standing, if another
+    /// channel of the session asks it already, or a new one under an id of
+    /// its own.
+    ///
+    /// ⚠️ One question per grant AND activity (#3442). A grant is single-use,
+    /// so every channel under it belongs to one connection, and they can ask
+    /// at once: a command waits in a task of its own. Each used to ask under
+    /// the grant's id, and the broker keeps one question per id, the newer one
+    /// winning (#3434): the older question was withdrawn, and its channel
+    /// refused although nobody had said no. A channel asking about the same
+    /// activity now waits on the standing question, and one answer settles
+    /// every channel waiting on it. A different activity is a different
+    /// question, since the question names it (FR-27): an Allow given for a
+    /// command must never open a shell.
+    ///
+    /// ⚠️ An id of its own, never the grant's: two questions standing under
+    /// one grant must not share one. The broker would take the older off its
+    /// books, and a surface dismissed by id (a desktop notification) would
+    /// come down for both. The grant is logged beside it.
+    ///
+    /// The question stands while any channel waits on it: one channel closing
+    /// does not withdraw it from the others. It comes off [`ASKING`] once it
+    /// is answered, before the answer reaches any channel, or when the last
+    /// channel waiting on it goes. A channel that asks in between the answer
+    /// and that moment takes the answer: the same caller asked about the same
+    /// activity, so the person could not have told the two channels apart.
+    ///
+    /// The second value says whether this channel joined a question that was
+    /// standing already.
+    fn question(
+        asker: &Asker,
+        caller: &str,
+        grant: &str,
+        what: &'static str,
+        timeout: Duration,
+    ) -> (futures::future::Shared<Asked>, bool) {
+        use futures::FutureExt;
+        static TURN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let key = (grant.to_string(), what);
+        let mut asking = ASKING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((id, standing)) = asking
+            .get(&key)
+            .and_then(|(_, id, q)| q.upgrade().map(|q| (id.clone(), q)))
+        {
+            info!(%caller, %grant, question = %id, what, "ssh: this is asked already — waiting on that question");
+            return (standing, true);
+        }
+        let turn = TURN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = bson::oid::ObjectId::new().to_hex();
+        info!(%caller, %grant, question = %id, what, "ssh: asking the person at the device");
+        let leave = Leave {
+            key: key.clone(),
+            turn,
+        };
+        let asked_as = id.clone();
+        let (asker, caller, grant) = (asker.clone(), caller.to_string(), grant.to_string());
+        let asked = async move {
+            let verdict = ask(&asker, &caller, &grant, &id, what, timeout).await;
+            // Off the table before the answer reaches anyone.
+            drop(leave);
+            verdict
+        }
+        .boxed()
+        .shared();
+        let weak = asked.downgrade().expect("a question not yet polled");
+        asking.insert(key, (turn, asked_as, weak));
+        (asked, false)
+    }
+
+    /// Takes its question off [`ASKING`]: once it is answered, or with the
+    /// question when the last channel waiting on it goes. Only its own entry:
+    /// a newer question about the same thing has a turn of its own.
+    struct Leave {
+        key: Topic,
+        turn: u64,
+    }
+
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            let mut asking = ASKING
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if asking
+                .get(&self.key)
+                .is_some_and(|(turn, _, _)| *turn == self.turn)
+            {
+                asking.remove(&self.key);
+            }
+        }
+    }
+
+    /// Ask once, under `id`: here, or (FR-105) through the worker.
+    async fn ask(
+        asker: &Asker,
+        caller: &str,
+        grant: &str,
+        id: &str,
+        what: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
         match asker {
-            Asker::Here { broker, indicator } => {
-                ask_here(broker, indicator, caller, sentinel, what, timeout).await
+            Asker::Here {
+                broker,
+                indicator,
+                companion,
+            } => {
+                ask_here(
+                    broker,
+                    indicator,
+                    *companion,
+                    caller,
+                    Some(grant),
+                    id,
+                    what,
+                    timeout,
+                )
+                .await
             }
             Asker::Worker(relay) => {
-                let verdict = relay.ask(sentinel, caller, what, timeout).await;
+                let verdict = relay.ask(id, caller, what, timeout).await;
                 match &verdict {
                     Ok(()) => info!(
-                        %caller, %sentinel,
+                        %caller, %grant, question = %id,
                         "ssh-service: the person at the device approved the session"
                     ),
                     Err(why) => warn!(
-                        %caller, %sentinel, %why,
+                        %caller, %grant, question = %id, %why,
                         "ssh-service: the person at the device did not approve the session"
                     ),
                 }
@@ -2312,15 +2357,30 @@ mod sshd {
     /// Ask the person at this device from THIS process: the native panel,
     /// the desktop companion, the CLI sentinel. `Err` is what the caller's
     /// terminal is told. FR-105 — also how a worker answers the question its
-    /// SYSTEM service relays.
+    /// SYSTEM service relays. `sentinel` is the question's own id (#3442),
+    /// and `grant` what it is about, for the log: `None` where a worker asks
+    /// for its service, whose own line names the grant.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn ask_here(
         broker: &crate::consent::ConsentBroker,
         indicator: &crate::indicator::ViewerIndicator,
+        companion: crate::companion::Companion,
         caller: &str,
+        grant: Option<&str>,
         sentinel: &str,
         what: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        // ⚠️ Armed before anything shows it (#3442): an answer counts from the
+        // moment the question is up. The panel, the marker, the companion
+        // (which may have to be started, up to 3 s) and the notification all
+        // go up after this. Armed last, an answer given while they went up was
+        // refused ("no active prompt"), and the native panel went down with
+        // it, leaving the question asking with nothing on the screen. The
+        // window still runs from the show: the prompt starts its clock at its
+        // first look, below.
+        let asking = broker.request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout });
+
         // FR-27 — the same surface chain as a screen-control or exec prompt:
         // the daemon's own panel first, the desktop companion (started if it
         // is not running) second, the CLI sentinel always. SSH used to write
@@ -2369,12 +2429,7 @@ mod sshd {
             // refusal below say "nobody could be asked" instead of "nobody
             // answered" — different fixes, and the caller cannot tell them
             // apart afterwards.
-            let companion_up = tokio::time::timeout(
-                crate::signaling::COMPANION_START_BUDGET,
-                crate::companion::ensure_running(),
-            )
-            .await
-            .unwrap_or(false);
+            let companion_up = companion.up().await;
             // FR-93 P6f — the last on-screen surface, as for a screen-control
             // request: a desktop notification where the companion cannot show
             // the question.
@@ -2394,17 +2449,18 @@ mod sshd {
         }
         info!(%caller, %sentinel, native, notified, have_surface, "consent prompt surface (ssh)");
 
-        let decision = broker
-            .request_with_mode(sentinel, crate::consent::Mode::Prompt { timeout })
-            .await;
+        let decision = asking.await;
         // The single convergence point: answered, timed out, or resolved from
         // the CLI — the panel comes down here regardless of who decided.
         indicator.hide_prompt(sentinel);
+        // The grant beside the question's id: a channel that joined the
+        // question logs that id, and is matched to this answer by it.
+        let grant = grant.unwrap_or("-");
         if decision.granted() {
-            info!(%caller, %sentinel, "ssh: operator approved the session");
+            info!(%caller, %grant, %sentinel, "ssh: operator approved the session");
             return Ok(());
         }
-        warn!(%caller, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
+        warn!(%caller, %grant, %sentinel, ?decision, have_surface, "ssh: operator did not approve the session");
         Err(match decision {
             crate::consent::Decision::Timeout if !have_surface => {
                 "nobody could be asked at this device — it has no prompt surface (no one at its \
@@ -2866,12 +2922,6 @@ pub struct Grant {
     pub consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     /// Server-clamped session lifetime once redeemed.
     pub session_secs: u64,
-    /// FR-90 P3-8-2a — an agent session's grant: the session it opens is
-    /// served ONE `exec` on ONE channel, and refused a shell, a terminal, a
-    /// subsystem, a forward and any second channel. This device enforces it,
-    /// not the client: the daemon that holds the key could ask for anything a
-    /// key may ask for.
-    pub one_command: bool,
     /// LOCAL deadline after which this grant is dead.
     ///
     /// Deliberately an `Instant` derived from arrival rather than the server's
@@ -2956,7 +3006,6 @@ pub fn record_grant(
     consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     expires_at_ms: u64,
     session_secs: u64,
-    one_command: bool,
 ) -> Result<(), GrantRejected> {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -2988,7 +3037,6 @@ pub fn record_grant(
         account,
         consent_mode,
         session_secs: ssh_limits::clamp_session_secs(session_secs),
-        one_command,
         deadline: Instant::now() + window,
     };
 
@@ -3004,7 +3052,6 @@ pub fn record_grant(
     tracing::info!(
         grant_id = %grant.grant_id, caller = %grant.caller,
         account_mode = %grant.account_mode, ttl_secs = window.as_secs(),
-        one_command = grant.one_command,
         "ssh: grant recorded"
     );
     grants.push(grant);
@@ -3172,6 +3219,13 @@ mod tests {
     /// daemon hands the server — the startup mode is irrelevant because the
     /// server always prompts with an explicit per-session mode.
     fn test_services() -> super::SessionServices {
+        // No companion: a test must never start the real app.
+        test_services_with(crate::companion::Companion::Fixed(false))
+    }
+
+    /// [`test_services`] with the companion a test needs: one that is still
+    /// starting while the question is up, for one (#3442).
+    fn test_services_with(companion: crate::companion::Companion) -> super::SessionServices {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -3185,6 +3239,7 @@ mod tests {
                 broker: crate::consent::ConsentBroker::new(crate::consent::Mode::AutoGrant, dir)
                     .expect("a temp sentinel dir"),
                 indicator: crate::indicator::ViewerIndicator::disabled(),
+                companion,
             },
             // Reporting off in tests unless a case opts in — the default a
             // device ships with.
@@ -3209,7 +3264,15 @@ mod tests {
     async fn serve_one_with(
         cfg: &crate::config::AgentConfig,
     ) -> (std::net::SocketAddr, crate::consent::ConsentBroker) {
-        let services = test_services();
+        serve_one_asking(cfg, crate::companion::Companion::Fixed(false)).await
+    }
+
+    /// [`serve_one_with`], asking through `companion`.
+    async fn serve_one_asking(
+        cfg: &crate::config::AgentConfig,
+        companion: crate::companion::Companion,
+    ) -> (std::net::SocketAddr, crate::consent::ConsentBroker) {
+        let services = test_services_with(companion);
         let broker = broker_of(&services);
         let ctx = super::sshd::Ctx::build(cfg, services).expect("a usable host key");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3764,8 +3827,9 @@ mod tests {
         )
     }
 
-    /// Returns the grant id on success — it doubles as the consent sentinel,
-    /// which the operator-approval tests need to answer the prompt.
+    /// Returns the grant id on success. A question asked under the grant has
+    /// an id of its own (#3442): the operator-approval tests answer it under
+    /// the id [`questions_up`] reads off the broker, as every surface does.
     fn grant_for_with_consent(
         line: &str,
         ttl_ms: u64,
@@ -3781,26 +3845,6 @@ mod tests {
             consent,
             now_ms() + ttl_ms,
             0,
-            false,
-        )
-        .map(|()| grant_id)
-        .map_err(|e| e.to_string())
-    }
-
-    /// FR-90 P3-8-2a — an agent session's grant, held to one command, that
-    /// needs no operator approval (`Auto`, as [`grant_for`] says why).
-    fn one_command_grant_for(line: &str) -> Result<String, String> {
-        let grant_id = format!("g-one-{}", rand::random::<u32>());
-        super::record_grant(
-            grant_id.clone(),
-            line.to_string(),
-            "agent session 0 of someone (via a device)".into(),
-            "daemon".into(),
-            None,
-            Some(roomler_ai_remote_control::models::ConsentMode::Auto),
-            now_ms() + 30_000,
-            0,
-            true,
         )
         .map(|()| grant_id)
         .map_err(|e| e.to_string())
@@ -3884,7 +3928,6 @@ mod tests {
             None,
             0,
             0,
-            false,
         )
         .unwrap_err();
         assert!(matches!(expired, super::GrantRejected::ExpiredOnArrival));
@@ -3903,7 +3946,6 @@ mod tests {
             None,
             now_ms() + 30_000,
             0,
-            false,
         )
         .unwrap_err();
         assert_eq!(garbage.refusal(), SshGrantRefusal::Invalid);
@@ -3984,7 +4026,6 @@ mod tests {
             account: None,
             consent_mode: consent,
             session_secs,
-            one_command: false,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
         }
     }
@@ -4093,32 +4134,6 @@ mod tests {
         assert_eq!(key_list.run_as.unwrap(), crate::exec::RunAs::ConsoleUser);
     }
 
-    /// FR-90 P3-8-2a — a grant's `one_command` reaches the session's policy,
-    /// which every request handler reads; an ordinary grant's does not, and a
-    /// key-list session, the owner's break-glass path, never has it.
-    #[test]
-    fn resolve_carries_one_command_and_a_key_list_session_never_has_it() {
-        let mut grant = test_grant(None, 60);
-        grant.one_command = true;
-        let session = super::sshd::ResolvedSessionPolicy::from_grant(grant, test_peer(), false);
-        assert!(session.one_command);
-        let person = super::sshd::ResolvedSessionPolicy::from_grant(
-            test_grant(None, 60),
-            test_peer(),
-            false,
-        );
-        assert!(!person.one_command);
-
-        let ctx = super::sshd::Ctx::build(
-            &cfg_with_mode(vec![client_key(26).1], Some("daemon")),
-            test_services(),
-        )
-        .expect("a usable host key");
-        let key_list =
-            super::sshd::ResolvedSessionPolicy::from_key_list(&ctx, "roomler", test_peer());
-        assert!(!key_list.one_command);
-    }
-
     // ── M5: the device-side privilege ceiling ─────────────────────────────
 
     /// The hole this closes: every other gate on an SSH session is the
@@ -4209,6 +4224,86 @@ mod tests {
 
     // ── Operator consent ──────────────────────────────────────────────────
 
+    /// The questions standing at the device, by the id each is shown and
+    /// answered under: the `.pending` markers the companion and `roomlerd
+    /// consent --list` read.
+    fn questions_up(broker: &crate::consent::ConsentBroker) -> Vec<String> {
+        let mut ids: Vec<String> = std::fs::read_dir(broker.sentinel_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".pending"))
+                    .map(str::to_string)
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// What stands once `n` questions do, or after 5 s.
+    async fn questions_once_up(broker: &crate::consent::ConsentBroker, n: usize) -> Vec<String> {
+        for _ in 0..250 {
+            let ids = questions_up(broker);
+            if ids.len() >= n {
+                return ids;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        questions_up(broker)
+    }
+
+    /// What a channel said: stdout, stderr, exit status.
+    type Said = (String, String, Option<u32>);
+
+    /// Read `channel` to its end. `asked` fires once the server says the
+    /// channel waits on the person at the device.
+    async fn read_channel(
+        mut channel: russh::Channel<russh::client::Msg>,
+        mut asked: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Said {
+        let (mut out, mut err, mut exit) = (Vec::new(), Vec::new(), None);
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => {
+                    err.extend_from_slice(data);
+                    if String::from_utf8_lossy(&err).contains("waiting up to")
+                        && let Some(tx) = asked.take()
+                    {
+                        let _ = tx.send(());
+                    }
+                }
+                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
+                _ => {}
+            }
+        }
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+            exit,
+        )
+    }
+
+    /// A command running on a channel of its own.
+    struct Running {
+        /// Fires once the server says the channel waits on the person.
+        asked: tokio::sync::oneshot::Receiver<()>,
+        done: tokio::task::JoinHandle<Said>,
+    }
+
+    async fn exec_in_background(session: &russh::client::Handle<TestClient>, cmd: &str) -> Running {
+        let channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, cmd).await.unwrap();
+        let (tx, asked) = tokio::sync::oneshot::channel();
+        Running {
+            asked,
+            done: tokio::spawn(read_channel(channel, Some(tx))),
+        }
+    }
+
     /// Drive one exec through a consent-gated session and collect the outcome.
     /// The operator's decision is played through the SAME broker the server
     /// was built with — `record_decision` only lands while the prompt is
@@ -4223,20 +4318,22 @@ mod tests {
         let _slot = exec_slot().await;
         let (key, line) = client_key(key_seed);
         let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
-        let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
 
-        let operator = {
-            let sid = grant_id.clone();
-            tokio::spawn(async move {
-                for _ in 0..200 {
-                    if broker.record_decision(&sid, approve) {
-                        return true;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Answered under the id the question is shown under, as the panel,
+        // the companion and `roomlerd consent` answer it.
+        let operator = tokio::spawn(async move {
+            for _ in 0..200 {
+                if questions_up(&broker)
+                    .iter()
+                    .any(|id| broker.record_decision(id, approve))
+                {
+                    return true;
                 }
-                false
-            })
-        };
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        });
 
         let session = connect(addr, key).await; // auth SUCCEEDS — consent is not auth
         let mut channel = session.channel_open_session().await.unwrap();
@@ -4301,6 +4398,185 @@ mod tests {
         assert_eq!(exit, Some(1));
     }
 
+    /// #3442 — an answer given the moment the question is up counts, while
+    /// the desktop companion is still being started. The question used to be
+    /// shown first and armed last: an answer in between was refused ("no
+    /// active prompt"), and on the native panel the panel went down with it,
+    /// leaving the question asking with nothing on the screen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_answer_given_as_the_ssh_question_goes_up_counts() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(85);
+        // A companion that takes 2 s to start: the question is up, its marker
+        // written, for all of it.
+        let (addr, broker) = serve_one_asking(
+            &cfg_with(Vec::new()),
+            crate::companion::Companion::Starting(std::time::Duration::from_secs(2)),
+        )
+        .await;
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let session = connect(addr, key).await;
+        let command = exec_in_background(&session, "echo early-answer-ran").await;
+
+        // One answer, the moment the question is up, never retried: a refused
+        // answer fails the test rather than being tried until it lands.
+        let up = questions_once_up(&broker, 1).await;
+        let id = up.first().expect("the question went up");
+        assert!(
+            broker.record_decision(id, true),
+            "an answer given as the question went up was refused"
+        );
+        let (out, err, exit) = command.done.await.unwrap();
+        assert!(
+            out.contains("early-answer-ran"),
+            "stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// #3442 — two commands of one session that ask at once wait on ONE
+    /// question, and one Allow runs both. Each used to be asked under the
+    /// grant's id, so the second question withdrew the first (since #3434 the
+    /// newer question for an id wins), and the first command was refused
+    /// although nobody had said no.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_commands_asking_at_once_share_one_question() {
+        let [first, second] = two_commands_one_answer(true, 86).await;
+        let (out, err, exit) = first;
+        assert!(
+            out.contains("first-ran"),
+            "the first command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+        let (out, err, exit) = second;
+        assert!(
+            out.contains("second-ran"),
+            "the second command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
+    /// #3442 — one No reaches every channel waiting on the question: both
+    /// commands are refused, each told why, and neither runs. (A timeout
+    /// reaches them the same way, through the same shared answer, but the
+    /// window is the 30 s default with no seam to shorten it, so no test
+    /// waits it out.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_no_refuses_every_command_waiting_on_the_question() {
+        for (n, (out, err, exit)) in two_commands_one_answer(false, 88)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                !out.contains("-ran"),
+                "command {n} ran despite the No: stdout {out:?}"
+            );
+            assert!(
+                err.contains("denied"),
+                "command {n} must be told why it was refused, got stderr {err:?}"
+            );
+            assert_eq!(exit, Some(1), "command {n}");
+        }
+    }
+
+    /// Two commands of one session that ask at once, the second while the
+    /// first one's question stands, and ONE answer to the one question.
+    async fn two_commands_one_answer(allow: bool, key_seed: u8) -> [Said; 2] {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        // Two commands at once: two of the engine's slots, taken together.
+        let _slots = EXEC_TEST_SLOTS
+            .acquire_many(2)
+            .await
+            .expect("the slot semaphore is never closed");
+        let (key, line) = client_key(key_seed);
+        let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
+        grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let session = connect(addr, key).await;
+
+        let first = exec_in_background(&session, "echo first-ran").await;
+        questions_once_up(&broker, 1).await;
+        let second = exec_in_background(&session, "echo second-ran").await;
+        second
+            .asked
+            .await
+            .expect("the second command is told it waits");
+        // Past the poll that would find the first question withdrawn.
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let up = questions_up(&broker);
+        assert_eq!(up.len(), 1, "one question for both commands: {up:?}");
+        assert!(
+            broker.record_decision(&up[0], allow),
+            "the question was not asking"
+        );
+        [first.done.await.unwrap(), second.done.await.unwrap()]
+    }
+
+    /// #3442 — a command and a shell of one session that ask at once are two
+    /// questions, each under an id of its own, and neither withdraws the
+    /// other. The question names the activity (FR-27), so an Allow for one is
+    /// never stretched over the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_command_and_a_shell_asking_at_once_are_two_questions() {
+        use roomler_ai_remote_control::models::ConsentMode;
+
+        let _lock = grant_test().await;
+        let _slot = exec_slot().await;
+        let (key, line) = client_key(87);
+        let (addr, broker) = serve_one_with(&cfg_with(Vec::new())).await;
+        let grant_id = grant_for_with_consent(&line, 30_000, Some(ConsentMode::Prompt)).unwrap();
+        let session = connect(addr, key).await;
+
+        let command = exec_in_background(&session, "echo command-ran").await;
+        questions_once_up(&broker, 1).await;
+        let shell = session.channel_open_session().await.unwrap();
+        shell
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        shell.request_shell(true).await.unwrap();
+
+        let up = questions_once_up(&broker, 2).await;
+        assert_eq!(up.len(), 2, "one question per activity: {up:?}");
+        assert!(
+            !up.contains(&grant_id),
+            "a question's id is its own, not its grant's: {up:?}"
+        );
+        for id in &up {
+            assert!(broker.record_decision(id, true), "{id} was not asking");
+        }
+
+        let leave: &[u8] = if cfg!(windows) {
+            b"exit\r\n"
+        } else {
+            b"exit 0\n"
+        };
+        shell.data(leave).await.unwrap();
+        let (_, err, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            read_channel(shell, None),
+        )
+        .await
+        .expect("the shell leaves when told to");
+        // Past the line that says it waits, the server says nothing on
+        // stderr: a refusal would say why there.
+        let refused = err
+            .lines()
+            .any(|l| l.contains("roomler-ssh:") && !l.contains("waiting up to"));
+        assert!(!refused, "the shell did not start: {err:?}");
+        let (out, err, exit) = command.done.await.unwrap();
+        assert!(
+            out.contains("command-ran"),
+            "the command: stdout {out:?}, stderr {err:?}"
+        );
+        assert_eq!(exit, Some(0));
+    }
+
     /// THE session bound (A1): a grant's `session_secs` now ENDS the session.
     /// `ssh_limits::MAX_SESSION_SECS` always said "after which the agent
     /// closes it" — before this slice, nothing did, and the field was carried,
@@ -4321,7 +4597,6 @@ mod tests {
             Some(ConsentMode::Auto),
             now_ms() + 30_000,
             1, // a one-second session budget
-            false,
         )
         .unwrap();
 
@@ -4744,293 +5019,6 @@ mod tests {
         assert!(u16::try_from(65_536u32 + 22).is_err());
     }
 
-    // ── FR-90 P3-8-2a: an agent session's grant holds ONE command ─────────
-
-    /// What a channel said until the server closed it.
-    struct Heard {
-        successes: usize,
-        failures: usize,
-        out: String,
-        err: String,
-        exit: Option<u32>,
-    }
-
-    async fn hear(channel: &mut russh::Channel<russh::client::Msg>) -> Heard {
-        let (mut successes, mut failures, mut exit) = (0, 0, None);
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Success => successes += 1,
-                russh::ChannelMsg::Failure => failures += 1,
-                russh::ChannelMsg::Data { ref data } => out.extend_from_slice(data),
-                russh::ChannelMsg::ExtendedData { ref data, ext: 1 } => err.extend_from_slice(data),
-                russh::ChannelMsg::ExitStatus { exit_status } => exit = Some(exit_status),
-                _ => {}
-            }
-        }
-        Heard {
-            successes,
-            failures,
-            out: String::from_utf8_lossy(&out).into_owned(),
-            err: String::from_utf8_lossy(&err).into_owned(),
-            exit,
-        }
-    }
-
-    /// Read a channel until it has said `n` failures, or 10 s pass: the
-    /// answers to refused requests, which leave it open. Any acceptance is a
-    /// failure of the test.
-    async fn refusals_heard(
-        channel: &mut russh::Channel<russh::client::Msg>,
-        n: usize,
-    ) -> (usize, String) {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (mut failures, mut err) = (0, Vec::new());
-        while failures < n {
-            match tokio::time::timeout_at(deadline, channel.wait()).await {
-                Ok(Some(russh::ChannelMsg::Failure)) => failures += 1,
-                Ok(Some(russh::ChannelMsg::Success)) => panic!("a request was accepted"),
-                Ok(Some(russh::ChannelMsg::ExtendedData { ref data, ext: 1 })) => {
-                    err.extend_from_slice(data)
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
-        (failures, String::from_utf8_lossy(&err).into_owned())
-    }
-
-    /// FR-90 P3-8-2a — an agent session's grant runs its ONE command and no
-    /// more: a terminal is refused before it is recorded (the command runs
-    /// without one), a second `exec` on the same channel is refused while
-    /// the first runs, and a second channel is refused outright. The
-    /// device-owned key list is empty, so the grant alone let it in.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_session_granted_one_command_runs_it_once_and_nothing_more() {
-        let _lock = grant_test().await;
-        let _slot = exec_slot().await;
-        let (key, line) = client_key(60);
-        let addr = serve_one(&cfg_with(Vec::new())).await;
-        one_command_grant_for(&line).unwrap();
-        let session = connect(addr, key).await;
-
-        let mut channel = session.channel_open_session().await.unwrap();
-        channel
-            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
-            .await
-            .unwrap();
-        channel.exec(true, "sleep 1; echo once").await.unwrap();
-        channel.exec(true, "echo twice").await.unwrap();
-        let heard = hear(&mut channel).await;
-        assert!(
-            heard.out.contains("once"),
-            "the command ran: {:?}",
-            heard.out
-        );
-        assert!(!heard.out.contains("twice"), "and only it: {:?}", heard.out);
-        assert_eq!(heard.exit, Some(0));
-        assert_eq!(heard.successes, 1, "only the first exec is accepted");
-        assert_eq!(
-            heard.failures, 2,
-            "the terminal and the second exec are refused"
-        );
-        assert!(
-            heard.err.contains("has asked for it"),
-            "the second exec's refusal says why: {:?}",
-            heard.err
-        );
-
-        assert!(
-            session.channel_open_session().await.is_err(),
-            "a second channel must be refused"
-        );
-    }
-
-    /// FR-90 P3-8-2a — nor a forward, even to a destination this device
-    /// forwards to for any other session (the positive control first); nor a
-    /// shell or a subsystem, `sftp` included, on its one channel. Each
-    /// refusal of a request on the channel says why.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_session_granted_one_command_gets_no_forward_shell_or_subsystem() {
-        let _lock = grant_test().await;
-        let dest = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = dest.local_addr().unwrap().port();
-        let mut cfg = cfg_with(Vec::new());
-        cfg.forward_acl = acl_allowing("127.0.0.1", port, port);
-
-        // An ordinary grant on this device forwards there…
-        let (key, line) = client_key(61);
-        let addr = serve_one(&cfg).await;
-        grant_for(&line, 30_000).unwrap();
-        let session = connect(addr, key).await;
-        let forward = session
-            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
-            .await;
-        assert!(
-            forward.is_ok(),
-            "the positive control: this device forwards there"
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(5), dest.accept())
-            .await
-            .expect("the forward reached its destination")
-            .unwrap();
-
-        // …and does not for a session granted one command.
-        let (key, line) = client_key(62);
-        let addr = serve_one(&cfg).await;
-        one_command_grant_for(&line).unwrap();
-        let session = connect(addr, key).await;
-        let forward = session
-            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 5555)
-            .await;
-        assert!(
-            forward.is_err(),
-            "a forward for a session granted one command"
-        );
-
-        let mut channel = session.channel_open_session().await.unwrap();
-        channel.request_shell(true).await.unwrap();
-        channel.request_subsystem(true, "sftp").await.unwrap();
-        let (failures, why) = refusals_heard(&mut channel, 2).await;
-        assert_eq!(
-            failures, 2,
-            "the shell and the subsystem are refused: {why:?}"
-        );
-        assert!(
-            why.contains("not a shell") && why.contains("not a subsystem"),
-            "each refusal says why: {why:?}"
-        );
-    }
-
-    // ── FR-90 P3-8-2b: this daemon's own client, against this server ──────
-
-    /// The server's host key, as a client pins it.
-    fn served_key(cfg: &crate::config::AgentConfig) -> russh::keys::ssh_key::PublicKey {
-        russh::keys::ssh_key::PublicKey::from_openssh(&super::host_public_key(cfg)).unwrap()
-    }
-
-    /// FR-90 P3-8-2b — the daemon's client runs ONE command under an agent
-    /// session's grant, its key minted for the call and the target's host key
-    /// pinned: the exit status and the output come back, nothing cut, and the
-    /// grant is spent.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_daemons_client_runs_a_sessions_one_command() {
-        let _lock = grant_test().await;
-        let _slot = exec_slot().await;
-        let cfg = cfg_with(Vec::new());
-        let addr = serve_one(&cfg).await;
-        let key = crate::ssh_client::mint_key();
-        one_command_grant_for(&key.public_key().to_openssh().unwrap()).unwrap();
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let ran = crate::ssh_client::exec_one(
-            stream,
-            served_key(&cfg),
-            key,
-            "echo one",
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .expect("ran");
-        assert_eq!(ran.exit_code, Some(0), "{ran:?}");
-        assert!(ran.stdout.contains("one"), "{ran:?}");
-        assert!(!ran.truncated);
-        assert_eq!(super::pending_grants(), 0, "the grant was redeemed");
-    }
-
-    /// FR-90 P3-8-2b — a device that answers with another host key is not
-    /// the target: the client refuses it before it authenticates, so the
-    /// grant is not spent and nothing runs. And a key no grant admits is
-    /// refused by the target.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_daemons_client_pins_the_host_key_and_needs_its_grant() {
-        let _lock = grant_test().await;
-        let cfg = cfg_with(Vec::new());
-        let addr = serve_one(&cfg).await;
-        let key = crate::ssh_client::mint_key();
-        one_command_grant_for(&key.public_key().to_openssh().unwrap()).unwrap();
-        let other = crate::ssh_client::mint_key().public_key().clone();
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let got = crate::ssh_client::exec_one(
-            stream,
-            other,
-            key,
-            "echo one",
-            std::time::Duration::from_secs(30),
-        )
-        .await;
-        assert_eq!(got.unwrap_err(), crate::ssh_client::RunError::WrongHostKey);
-        assert_eq!(
-            super::pending_grants(),
-            1,
-            "it never authenticated, so its grant is not spent"
-        );
-
-        let addr = serve_one(&cfg).await;
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let got = crate::ssh_client::exec_one(
-            stream,
-            served_key(&cfg),
-            crate::ssh_client::mint_key(),
-            "echo one",
-            std::time::Duration::from_secs(30),
-        )
-        .await;
-        assert_eq!(got.unwrap_err(), crate::ssh_client::RunError::NotAdmitted);
-    }
-
-    /// FR-90 P3-8-2b — one call, whole, through the OS's routes: the request
-    /// presents the ticket and the call's key, the "server" grants that key
-    /// on this device and answers with the echo, and the client dials, pins,
-    /// and runs the command.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_daemons_client_runs_a_whole_call() {
-        use roomler_ai_remote_control::ClientMsg;
-
-        let _lock = grant_test().await;
-        let _slot = exec_slot().await;
-        let cfg = cfg_with(Vec::new());
-        let addr = serve_one(&cfg).await;
-        let host = super::host_public_key(&cfg);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let server = tokio::spawn(async move {
-            let Some(ClientMsg::SshRequest {
-                request_id,
-                public_key,
-                ssh_ticket,
-                ..
-            }) = rx.recv().await
-            else {
-                panic!("no rc:ssh.request");
-            };
-            assert_eq!(ssh_ticket.as_deref(), Some("the-ticket"));
-            one_command_grant_for(&public_key).unwrap();
-            crate::ssh_origin::deliver(
-                &request_id,
-                crate::ssh_origin::SshGrantAnswer {
-                    address: Some(addr.ip().to_string()),
-                    port: Some(addr.port()),
-                    host_pubkey: Some(host),
-                    ssh_ticket_id: Some("k1".into()),
-                    ..Default::default()
-                },
-            );
-        });
-        let ran = crate::ssh_client::run(
-            &tx,
-            &crate::ssh_client::OsDialer,
-            bson::oid::ObjectId::new(),
-            "the-ticket",
-            "k1",
-            "echo whole",
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .expect("ran");
-        server.await.unwrap();
-        assert_eq!(ran.exit_code, Some(0), "{ran:?}");
-        assert!(ran.stdout.contains("whole"), "{ran:?}");
-    }
-
     // ── P8: activity reporting ───────────────────────────────────────────
 
     /// Reporting is the DEVICE's decision and it is off unless asked for.
@@ -5235,7 +5223,13 @@ mod tests {
         assert_eq!(exit, Some(0));
         let asks = asks.lock().unwrap().clone();
         assert_eq!(asks.len(), 1, "asked once: {asks:?}");
-        assert_eq!(asks[0].sentinel, grant_id);
+        // #3442 — under an id of its own, which the worker files the answer
+        // under: never the grant's, which two questions of one session share.
+        assert_ne!(asks[0].sentinel, grant_id);
+        assert!(
+            crate::exec_service::valid_object_id(&asks[0].sentinel),
+            "the worker takes only an object id: {asks:?}"
+        );
         assert_eq!(asks[0].what, "run a command");
         assert!(asks[0].caller.contains("alice@example.com"), "{asks:?}");
     }

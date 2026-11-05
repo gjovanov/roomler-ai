@@ -17,7 +17,7 @@ rules that every FR worker follows are in
 The tooling is **not in this repo**: on 2026-10-30 the operator decided it stays local for now, in
 the user's Claude skills folder, with a source history of its own. Its files are cited below by
 section name (`SKILL.md §Signals`), never by line.
-*As of Claude Code 2.1.314, the hub skill of 2026-11-04, `hub-view` 0.3.0 and `hub-guard` 0.3.0.*
+*As of Claude Code 2.1.314, the hub skill of 2026-11-04, `hub-view` 0.4.0 and `hub-guard` 0.4.3.*
 
 ## 1. What it is, and why sessions
 
@@ -67,7 +67,8 @@ only when a local branch matches `^fr-?<N>`.
 | **Helper** `hub.mjs` | same | A Node script with no dependencies, the mechanical half: `init`, `add`, `spawn` (with `--rotate [--from-status]`), `stop`, `respawn`, `msg`, `status` (with a read-only `--peek`), `sync`, `set`, `attach`, `convo`, `self`, and since FR-136 `procs`, `reap`, `post`, `mail` and `role`. `node ~/.claude/skills/hub/hub.mjs help` lists them. The judgement stays with the hub. |
 | **Screen replay** `vt.mjs` | same | Replays a `claude logs` capture on a small VT grid and prints the last screen (`--all` prints every distinct one). §9 says why that is needed. |
 | **Build slots** `cargo-slot.sh` | same | One host-wide FIFO pool of build slots that every hub shares (§12.2). |
-| **Hub view** `hub-view` | `~/.claude/skills/hub-view/` | A function-hooks plugin. `/hub` with no arguments opens a pane that lists every worker of every hub under the host strip and one question list, enters one, answers it through its mailbox, activates, deactivates or attaches to it, and cleans up what an earlier generation left (§8). |
+| **Navigator** `hubs.mjs` | same, run as `hubs` | A terminal program with no dependencies: every hub, then one hub's workers grouped by what they need, then one worker, in one window, with a filter across every hub. It answers, cleans up, opens and attaches in the same window (§8.1). |
+| **Hub view** `hub-view` | `~/.claude/skills/hub-view/` | A function-hooks plugin. `/hub` with no arguments opens a pane with the host strip and one question list across hubs. A question enters its worker, which the operator can answer through its mailbox, activate, deactivate, attach to, or clean up after (§8.2). |
 | **Guard** `hub-guard` | `~/.claude/skills/hub-guard/` | A function-hooks plugin in every session. It ends what a stopped, interrupted or timed-out call started, refuses a bare build in a worker, delivers a worker's mail, and gates the idle handoff (§12). |
 | **Idle handoff** `hub-handoff` | `~/.claude/skills/hub-handoff/` | The skill the auto-handoff plugin runs in a session that sat idle; what it writes depends on whether the session is a worker, a hub or neither (§12.4). |
 
@@ -110,7 +111,8 @@ How the operator drives it:
 | `/hub <spec, issue list, or "the open FRs">` | Start |
 | `/hub tick <id>` (the heartbeat cron sends it too) | Tick |
 | `/hub resume <id>` | Resume after a `/clear`, a crash or a reboot, then Tick |
-| `/hub` with no arguments | Opens the hub view (§8) |
+| `/hub` with no arguments | Opens the hub view (§8.2) |
+| `hubs`, in a terminal | Nothing: the navigator only reads, until a key attaches, answers, cleans up or opens (§8.1) |
 | `W-3: <answer>` | Relays it as `ANSWER q<id>: <answer>` |
 | `taking W-3` · `W-3 back` | Holds the worker while the operator is inside it, then releases it |
 | `pause` · `status` | Pauses every worker · prints the board |
@@ -254,7 +256,7 @@ own words.
 |---|---|---|---|
 | `WAITING` | you | the session's `status` is `waiting`: a permission prompt or other input only a person can give | escalates, with the attach command |
 | `QUESTION` | act · you | `status.json` holds an unanswered question, for the hub or for the operator | answers it, or escalates it |
-| `CTX_SOFT` · `CTX_HARD` | warn · act | context at 40% · 60% of the window | `HANDOFF at your next phase boundary` · `HANDOFF now`, then rotates |
+| `CTX_SOFT` · `CTX_HARD` | warn · act | context at 20% · 30% of the window, 200k · 300k tokens of 1M | `HANDOFF at your next phase boundary` · `HANDOFF now`, then rotates |
 | `CACHE_PUSH` | act | idle, the cache cold within 10 min (2 min on a 5-minute cache), and a `next` step with nothing blocking it | `PUSH: <that step>`, which warms the cache and moves the work |
 | `CACHE_HANDOFF` | act | the same window, 150k tokens or more in context, and a wait longer than the cache lives | `HANDOFF now` while the cache is warm, then stops it |
 | `CACHE_COOL` | info | the same window with a small context or a short wait | lets it cool: a cold re-read of a small context costs less than a handoff |
@@ -275,7 +277,7 @@ own words.
 | `HELD` · `OPERATOR` | info | the operator is inside it, or typed there in the last 20 min | sends it nothing until "W-n back" |
 | `DISPATCH` | act | a slot is free and work is queued | dispatches |
 | `HOLD` · `PAUSED` · `DRAIN` | warn · info | an account window or the disk is at its cap (§7), or the host is (`host:` live sessions, free RAM or commit, CPU, §12.2) · the issue's controls | starts nothing |
-| `HUB_CTX` | act | the hub's own context at 40% | finishes the tick, writes `hub-handoff.md`, and asks the operator for `/clear` and `/hub resume <id>` |
+| `HUB_CTX` | act | the hub's own context at 20%, 200k tokens | finishes the tick, writes `hub-handoff.md`, and asks the operator for `/clear` and `/hub resume <id>` |
 
 ## 6. Tiers and effort
 
@@ -284,15 +286,22 @@ Every worker gets a tier (a model) and an effort when it is added. The defaults 
 
 | Work | Tier | Effort |
 |---|---|---|
-| **CLAUDE.md §3 scope**, at any size: remote desktop and control; the overlay, WireGuard, NAT traversal, relays, DERP, tunnels; WebRTC conferencing | complex | **max**. This is the floor, and nothing lowers it. |
-| design, debugging, cross-layer changes, security, anything near a release or deploy, field verification, writing an FR spec | complex | max |
-| judgement on non-pillar work: restructuring docs, summarising a review, synthesising research | complex | xhigh |
-| mechanical and fully specified: test-only additions, renames, link and anchor fixes, gathering data with citations | simple | max |
-| casual: triage, labels, status sweeps, issue hygiene | simple | xhigh |
+| **CLAUDE.md §3 scope**, at any size: remote desktop and control (capture, encode, input, consent, recording, the RC wire); the overlay, WireGuard, NAT traversal, relays, DERP, tunnels, roomler SSH; WebRTC conferencing, coturn included | complex | **max**. This is the floor, and nothing lowers it. |
+| fleet-critical outside §3: the updater, installers and their trust (MSI, signing), the daemon's lifecycle, server security, device identity, releases and deploys | complex | xhigh |
+| other code and judgement: server features, UI, flaky tests and CI, packaging bugs, removing code, merging finished work, restructuring docs, an FR spec outside the pillars | complex | high |
+| non-product or fully specified: promo, blog, attribution, test-only additions, renames, link and anchor fixes, gathering data with citations | simple | high |
+| casual: triage, labels, status sweeps, issue hygiene | simple | high |
 
-When unsure, the hub takes the higher row. A simple worker that runs into a row-one or row-two
-concern asks `QUESTION for hub: re-tier`, and is re-tiered and rotated. A running worker is never
-moved down a tier.
+Until 2026-11-04 most rows ran at max and the rest at xhigh. The 7-day window then ran fast with
+every worker on Opus at max, and the operator had the tiers set by each worker's need
+([FR-136](fr/FR-136-hub-process-hygiene.md), field log, 16:00). The hub judges by what a worker's
+code touches, not by its title: a "flaky tests" worker whose tests are consent and recording is §3.
+When unsure whether work is §3, it is.
+
+A worker below max that runs into a §3 surface asks `QUESTION for hub: re-tier`, and the hub sets
+`tier=complex effort=max` and rotates it. **A tier binds at `spawn` only**, for a new worker or at
+`--rotate`: `respawn` revives the same session on the model and effort it started with. So a
+re-tiered worker takes its new tier at its next rotation, never in place.
 
 **Why the effort goes through `--settings`.** This repo's `.claude/settings.json:4` sets
 `CLAUDE_CODE_EFFORT_LEVEL=max` in the project env, and that env beats the `--effort` flag: a worker
@@ -322,9 +331,13 @@ worker writes while it still holds everything.
 
 | Threshold | Signal | Action |
 |---|---|---|
-| context ≥ 40% (`handoff.soft_pct`) | `CTX_SOFT` | `HANDOFF at your next phase boundary` |
-| context ≥ 60% (`handoff.hard_pct`) | `CTX_HARD` | `HANDOFF now` |
+| context ≥ 20% (`handoff.soft_pct`), 200k tokens of a 1M window | `CTX_SOFT` | `HANDOFF at your next phase boundary` |
+| context ≥ 30% (`handoff.hard_pct`), 300k tokens | `CTX_HARD` | `HANDOFF now` |
 | idle, ≥ 150k tokens (`handoff.idle_min_tokens`), cache about to expire, a long wait ahead | `CACHE_HANDOFF` | `HANDOFF now` while the cache is warm, so the handoff is written from a cache read; stop it; rotate when the blocker clears |
+
+The marks were 40% and 60% until 2026-11-04. Every call re-reads the whole context, and those
+re-reads were most of what the hubs spent, so the operator moved them to 200k and 300k tokens, in
+each hub's `hub-config` and as the helper's default.
 
 1. The worker reaches a clean point and writes `handoff-g<N>.md`: Goal, Done with evidence,
    In flight (every changed file, what is verified and what is not), numbered Next steps, Traps
@@ -349,13 +362,105 @@ handoff, unless the hub would not hand it off either (§12.4).
 
 ## 8. The hub view
 
-`/hub` with no arguments opens the hub view, the `hub-view` plugin. `/hub-view` opens it too. The
-plugin is a `command.run` hook on `/hub`: with no arguments it answers the command itself, with the
-board as text, and opens the pane, so no model turn runs and the board costs nothing. With
-arguments it passes the command on, and `/hub tick <id>` still reaches the skill.
+The operator sees the hubs in two places. **`hubs`**, the navigator, runs in a terminal and lists
+every hub and worker. **The pane** that `/hub` opens in the chat holds what needs the operator now:
+the host and the open questions. Until 2026-11-04 the pane listed every hub and worker itself. The
+operator's look at it found too many at once, with no way to search them, and Attach opening another
+window. So the operator chose a navigator in the style of `claude agents` instead
+([FR-136](fr/FR-136-hub-process-hygiene.md) D5). The lists moved there (P9), and the pane shrank
+around the questions (P10).
 
-The hub view of 0.3.0, on the 2026-10-30 live check's scratch hub of two throwaway workers, with the
-host strip from the live check of 2026-11-04:
+```mermaid
+flowchart LR
+    OP(["the operator"])
+    subgraph T["a terminal: hubs"]
+        H1["every hub<br/>two lines each"] -- Enter --> H2["one hub's workers<br/>grouped by what they need"]
+        H2 -- "→" --> H3["one worker's details"]
+        H2 -- "Enter on a running worker" --> AT["claude attach<br/>in the same window"]
+        AT -- "Ctrl+Z" --> H2
+    end
+    subgraph C["the chat: /hub"]
+        P1["the pane<br/>host strip · open questions"] -- "Answer, 1–9" --> P2["the worker view<br/>answer · processes · tasks · conversation"]
+    end
+    OP --> H1
+    OP --> P1
+    S[("hub.mjs status --peek<br/>per hub, writes nothing")] --> H1
+    S --> P1
+```
+
+### 8.1 The navigator, `hubs`
+
+`hubs` is `~/.claude/skills/hub/hubs.mjs`, a Node script with no dependencies, started by a launcher
+on the `PATH` (`hubs.cmd` on Windows, `~/bin/hubs` in Git Bash). It reads `hub.mjs status <dir>
+--json --peek` for every hub folder, `hub.mjs convo` for a worker's last lines, and hub-guard's task
+records. It changes nothing until a key asks it to. Drawn from a made-up fixture with `--snapshot`,
+the top level and one hub look like this:
+
+```text
+ Hubs
+ host · CPU 20% · free 40 GB · sessions 9/15 · build slots 1/3
+────────────────────────────────────────────────────────────────────────────────────────────────
+> hvtest   hub-view live check (throwaway)
+>          ▰▰▰▰▰▱▱▱▱▱  50%  ● 2 running  ? 1 for you  ⚠ 2 left behind  ·  1 paused · 1 queued · 1 done
+  docs     Docs sweep
+           ▰▰▰▰▰▰▰▰▰▰ 100%  ● 0 running  ·  1 parked · 3 done
+────────────────────────────────────────────────────────────────────────────────────────────────
+ ↑↓ j k move  Enter open  / filter  r refresh  q quit
+```
+
+```text
+ Hubs › hvtest · hub-view live check (throwaway)
+ host · CPU 20% · free 40 GB · sessions 9/15 · build slots 1/3
+────────────────────────────────────────────────────────────────────────────────────────────────
+ Needs you · 1
+> W-2 g1     Throwaway B (asks a question)         ‖ paused    ctx 30%
+ Running · 2
+  W-1 g1     Throwaway A                           ● busy      ctx 30%  10m   ⚙ 0.4c 120M
+? W-3 g1     Throwaway C                           ● idle      ctx 30%
+ Paused or stopped · 1
+  W-4 g1     Throwaway D                           ‖ paused    ctx 30%                       ⚠ 2 left
+ Queued · 1
+  W-5 g0     Throwaway E                           ◌ queued    ctx 30%
+ Done · 1 (d shows them)
+────────────────────────────────────────────────────────────────────────────────────────────────
+ ↑↓ j k move  Enter attach (running)  → details  ← back  / filter  d show done  q quit
+```
+
+A hub's workers come in six groups: **Needs you** (a question for the operator), **Running**,
+**Paused or stopped**, **Parked**, **Queued**, and **Done**, which stays folded until `d`. A `?`
+marks a question for the hub, `⚙ 0.4c 120M` what a worker's processes cost (from 110 columns; a
+narrower window drops it, then the cache, then the context), and `⚠ N left` what an ended generation
+left running.
+
+| Key | Does |
+|---|---|
+| `↑` `↓` `j` `k` · PgUp PgDn Home End | moves |
+| **Enter** | goes in. On a running worker it attaches in this window, and Ctrl+Z comes back to the navigator where it was. |
+| `→` or `i` · `←` or Backspace | a worker's details: its question with the options, tasks, processes, background tasks, links and last lines · back |
+| `t` | attaches in a new tab of this window |
+| `R` | restarts a stopped worker and attaches; twice when its hub stopped it, and never while the host holds new sessions. Enter never restarts one. |
+| `/` | filters every hub and worker by id, title, PR or issue; Esc clears it |
+| `d` · `r` · `q` | shows or hides finished workers · refreshes (it also refreshes every 30 s) · quits |
+| in a worker: `a` · `u` · `w` · `p` · `o` | answers its question, into its mailbox · cleans up what earlier generations left (`hub.mjs reap`) · opens the worktree · the PR · the issue |
+
+**Attaching in the same window.** The navigator can't hand its own console to `claude attach`, so
+it writes the session to attach to into a file and exits. The launcher then runs `claude attach`,
+and starts the navigator again where it was once Ctrl+Z gives the terminal back.
+
+`node hubs.mjs --snapshot [--at hubs|hub:<id>|worker:<id>/<W-n>] [--keys '…'] [--fixture DIR]`
+prints one screen as text after those keys, attaching, posting, reaping and opening nothing. The
+11 cases in `node --test hubs.test.mjs` are built on it.
+
+### 8.2 The pane
+
+`/hub` with no arguments opens the pane, the `hub-view` plugin. `/hub-view` opens it too. The plugin
+is a `command.run` hook on `/hub`: with no arguments it answers the command itself, with what the pane
+draws as text, and opens the pane, so no model turn runs and it costs nothing. With arguments it
+passes the command on, and `/hub tick <id>` still reaches the skill. `/hub-view status` still answers
+the whole board as text, for a phone or a model.
+
+The pane of 0.4.0, laid out with the data of the earlier live checks (the 2026-10-30 scratch hub,
+the 2026-11-04 host strip):
 
 ```text
 [ Refresh ] refreshed 08:40Z
@@ -363,33 +468,21 @@ host · CPU 8% · free 54 GB (RAM 54, commit 126) · sessions 7/15 · build slot
 
 ❓ Questions · 1
 hvtest/W-2 q1 for operator: Draw progress as a bar or as dots?  [ Answer ]
-
-🧭 hvtest · hub-view live check (throwaway) · ▰▰▱▱▱▱▱▱ 29% · ● 2/2 running · ❓ 1 waiting on you
-
-W-1  Throwaway A  sonnet·xhigh  ● running
-▰▰▰▱▱▱▱▱▱▱ 33% · 3 total · 1 done · 1 in progress · 1 pending · ctx 7% · 59m left · ⚙ 1.0c · 2.3G
-○ idle
- [ Enter ] [ Deactivate ] [ Attach ] [ Copy attach ]
-
-❓ W-2  Throwaway B (asks a question)  sonnet·xhigh  ● running
-▰▰▰▱▱▱▱▱▱▱ 25% · 4 total · 1 done · 1 in progress · 2 pending · ctx 7% · 59m left · ⚙ · 3 left
-❓ q1 for operator: Draw progress as a bar or as dots?
- [ Enter ] [ Deactivate ] [ Attach ] [ Copy attach ]
+1 hub · 2 workers, 2 running · browse them with `hubs` in a terminal
 ```
 
 | Part | Shows | Comes from |
 |---|---|---|
-| Section | one per hub: id, title, overall %, running out of `max_parallel`, how many wait on the operator; a sub-hub's workers sit indented under their parent | each `state.json`, then `hub.mjs status --json --peek`, which writes no file |
-| Row | id, title, model·effort, state, a progress bar with total · done · in progress · pending (dropped steps leave the total), context %, the cache countdown, and ❓ with the open question | `status`'s view of the worker, and its `status.json` plan |
 | Host strip | CPU over the last minute (n/a until two samples 45 s apart exist), free RAM and commit, live sessions out of `max_sessions`, build slots in use, and what holds the host | `status`'s `host` (§12.2) |
-| Questions | every open question of every hub, the operator's first, each with **Answer**, which enters that worker | the rows' questions |
-| Badge | `⚙ cores · memory · N left`: the current generation's average cores and memory, and the processes ended generations left; red for a leftover or a runaway | `status`'s `procs` and `leftovers` (§12.1) |
+| Questions | every open question of every hub, the operator's first, each with **Answer**, which enters that worker; `No open questions.` when there are none | each worker's `status.json` question |
+| A hub it could not read | `⚠ <hub>: <why>`, so a question missing from the list has its reason beside it | `hub.mjs status` answering an error |
+| Where the workers are | how many hubs, workers and running workers, and where to browse them | the hubs' views |
 | Worker view | the header, the open question with its options and recommendation, the answer field with its route and the mailbox's counts, the tasks (✔ ▶ ○), the processes with what earlier generations left, the background tasks hub-guard recorded (▶ running, ✔ ended, ⏹ stopped, ⚠ stopped with processes still alive), and the whole conversation, oldest first, with each tool call as one dim line | `hub.mjs convo`, paged back from the transcript's end by byte offset, because `$.fs.read` refuses a file over 4 MiB and worker transcripts are bigger; `~/.claude/hub-guard/tasks/<session>.json` |
 
 | Key or button | Does |
 |---|---|
-| **Enter** (`1`–`9`) | opens the worker view |
-| **← Back** (`b`) · **Esc** | back to the hub view; Esc there closes the pane. An arrow key can't be a hotkey, which is why Back is `b`. |
+| **Answer** (`1`–`9`) | opens that question's worker view |
+| **← Back** (`b`) · **Esc** | back to the pane's first screen; Esc there closes the pane. An arrow key can't be a hotkey, which is why Back is `b`. |
 | **⇡ Older** (`o`) | loads the page before the one shown |
 | `g1 g2 …` | opens an earlier generation, read-only, with no answer field |
 | **Refresh** (`r`) | refreshes now; the view also refreshes on open and every 30 s while the pane is open |
@@ -401,9 +494,10 @@ W-1  Throwaway A  sonnet·xhigh  ● running
 | **Open worktree** (`w`) · **Open PR** (`p`) · **Open issue** (`i`) | `cmd /d /c code -n <worktree>`, refused for a path holding a cmd metacharacter · `rundll32 url.dll,FileProtocolHandler <url>`, for GitHub issue and PR pages only, since `explorer.exe` exits 1 even when the page opened |
 | **Clean up** (`u`) | asks first, then `hub.mjs reap <dir> W-n --gen N` for each generation that left processes; it refuses a generation that still runs |
 
-Activate, Deactivate and Clean up go through `hub.mjs`, so the hub's `state.json` and event log
-follow them. Each confirmation answers to `y` and `n`, so only one shows at a time. On a phone there
-is no text field, and the worker view says how to answer instead.
+Every button from ⇡ Older down is the worker view's; since 0.4.0 the pane has no worker rows to
+carry them. Activate, Deactivate and Clean up go through `hub.mjs`, so the hub's `state.json` and
+event log follow them. Each confirmation answers to `y` and `n`, so only one shows at a time. On a
+phone there is no text field, and the worker view says how to answer instead.
 
 | Route | When | What happens |
 |---|---|---|
@@ -422,9 +516,9 @@ the hub's notice, and the hub does not relay it a second time.
 
 | Command | |
 |---|---|
-| `/hub` · `/hub-view` | opens the view |
-| `/hub-view status` | the board as text; it works headless too |
-| `/hub-view enter <ref> [g<N>]` | opens the view on that worker, or read-only on its generation N |
+| `/hub` · `/hub-view` | opens the pane, and answers what it draws as text |
+| `/hub-view status` | the whole board as text: every hub and worker with its counts, context, cache, question and process badge (`⚙ cores · memory · N left`). It works headless too, and on a phone it is how to see the workers. |
+| `/hub-view enter <ref> [g<N>]` | opens the view on that worker, or read-only on its generation N; the way into a worker with no question |
 | `/hub-view answer <ref> <text>` | answers by the routes above, then waits up to 30 s to see it arrive |
 | `/hub-view activate <ref>` · `deactivate <ref>` · `attach <ref>` | the actions; a typed `deactivate` is its own confirmation, and `attach` copies the command |
 | `/hub-view open <ref> worktree\|pr\|issue` · `clean <ref>` | the Open buttons, and Clean up; a typed `clean` is its own confirmation |
@@ -432,8 +526,8 @@ the hub's notice, and the hub does not relay it a second time.
 `<ref>` is `W-2`, or `<hub>/W-2` when two hubs have a W-2. Each verb calls the same function as the
 pane's button or field, which is how a background session runs the view's own path and
 `claude logs` shows the result. Inside, `hooks/core.ts` is pure (rows, counts, routes, the received
-check, paging, the command grammar) and the tests drive it directly; `hooks/view.tsx` draws both
-screens; `hooks/register.ts` is the glue to the engine.
+check, paging, the pane and board text, the command grammar) and the tests drive it directly;
+`hooks/view.tsx` draws both screens; `hooks/register.ts` is the glue to the engine.
 
 ## 9. Mechanics and traps
 
@@ -482,7 +576,7 @@ four are in the generic skill, and two are specific to this repo and are kept he
 | 3 | **Anchor churn.** PRs that move a heavily anchored file conflict with each other, and with master, in many docs at once. | 24 docs anchor into `agents/roomlerd/src/app.rs`. After one merge to master, FR-16 L1's PR ([#3155](https://github.com/gjovanov/roomler-ai/pull/3155)) conflicted in 16 docs. FR-55 P4's conflicted in 4 to 11 docs a round. Every hunk differed only in anchor numbers. | One of the two methods in §11.2, each with its cross-check. Merging soon after green (lesson 2) keeps the rounds few. | here (repo-specific) |
 | 4 | **Disk.** Container target volumes grow fast. | One worker held about 72 GB: a 39 GB target volume, a 30 GB native target and a 3 GB image. The hub read C: falling 21 GB in 11 minutes. | Every brief tells the worker to run `df` before each build, build one feature set at a time, send `BLOCKED: disk` under 45 GB free, and tear down its containers, volumes and images at park. Under pressure, the hub may delete a parked or done worker's regenerable target cache, never a running one's. One such cache gave back 16 GB. The budget hold starts nothing under 40 GB free (§7). | `SKILL.md §Rails` |
 | 5 | **Missed cron fires can arrive back to back.** | While the hub was busy, the heartbeat's missed fires came in one after another, which reads like a doubled cron. | It is not a second cron: `CronList` shows one. Never add another. | `SKILL.md §Start` (Heartbeat) |
-| 6 | **Known flakes are not the worker's failure.** | The macOS lane's `thread_dump` test failed on three of the run's PRs ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148), [#3151](https://github.com/gjovanov/roomler-ai/pull/3151), #3155). On the loaded dev box, `exec::tests::concurrency_cap_refuses_rather_than_queues` ([`agents/roomlerd/src/exec.rs:2778`](../agents/roomlerd/src/exec.rs#L2778)) failed a native Windows `cargo test -p roomlerd --lib` for two workers. | Re-run the macOS job (`gh run rerun <run> --failed`) until it is green, and never merge red. The exec test passes alone. It also still fails with the PR's own tests skipped, which rules the PR out, and CI's Windows lane is the gate of record. | here (repo-specific) |
+| 6 | **Known flakes are not the worker's failure.** | The macOS lane's `thread_dump` test failed on three of the run's PRs ([#3148](https://github.com/gjovanov/roomler-ai/pull/3148), [#3151](https://github.com/gjovanov/roomler-ai/pull/3151), #3155). On the loaded dev box, `exec::tests::concurrency_cap_refuses_rather_than_queues` ([`agents/roomlerd/src/exec.rs:2542`](../agents/roomlerd/src/exec.rs#L2542)) failed a native Windows `cargo test -p roomlerd --lib` for two workers. | Re-run the macOS job (`gh run rerun <run> --failed`) until it is green, and never merge red. The exec test passes alone. It also still fails with the PR's own tests skipped, which rules the PR out, and CI's Windows lane is the gate of record. | here (repo-specific) |
 
 ### 11.1 Merge and deploy, once a PR is ready
 
@@ -556,13 +650,13 @@ flowchart LR
         G["hub-guard"]
     end
     G -- "tags each call · records its background task" --> B
-    G -- "TaskStop · Esc · a Monitor deadline · a subagent's end:<br/>ends what that call started" --> P
+    G -- "TaskStop · Esc · a Monitor deadline:<br/>ends what that call started" --> P
     G -- "refuses a bare cargo build in a worker" --> B
     CS["cargo-slot.sh<br/>one FIFO pool for every hub"] --> P
     HM["hub.mjs"] -- "stop · rotation · reap --ended:<br/>ends what a generation left" --> P
     HM -- "post" --> MB[("the worker's mailbox")]
     G -- "claims it · delivers it" --> MB
-    HM -- "procs · host.json" --> BOARD["the board and the view:<br/>host line · holds · LEFTOVER · RUNAWAY · HOT"]
+    HM -- "procs · host.json" --> BOARD["the board, hubs and the pane:<br/>host line · holds · LEFTOVER · RUNAWAY · HOT"]
 ```
 
 ### 12.1 A stopped task leaves nothing running
@@ -583,16 +677,33 @@ parallel calls can race on the variable. Then it ends a task's processes when th
 | When | It ends |
 |---|---|
 | TaskStop on a background task (`run_in_background`, or a call that timed out into the background) | the task's tree, listed before the stop and checked again after it, plus orphans that carry its tag; nothing when the stop was denied or failed |
-| a call interrupted with Esc | what carries that call's tag |
+| a call interrupted with Esc | what carries that call's tag, swept from a timer 1.5 s later |
 | a Monitor task, at TaskStop or at its deadline | the same |
-| a subagent's turn end | that subagent's background commands |
+| a subagent's background command, when it is stopped | what that command started |
 
 Each process is read again by pid and start time just before it is killed, so a stored pid is never
 trusted. MSYS2 processes get TERM, 5 s, then KILL; a native subtree gets `taskkill /T /F`; WSL
 processes get the same through a helper that reads `/proc`. The transcript gets one line, such as
-`hub-guard cleanup: ended 4 processes task … (sh, perl, sleep, bash)`, or what was left. **Never
-killed:** a `roomlerd*` (force-killing a test daemon can install the live release), a process started
-with `HUB_KEEP=1`, a browser, an editor, a terminal, `claude`, and anything without a marker.
+`hub-guard cleanup: ended 4 processes task … (sh, perl, sleep, bash)`, or what was left. A sweep that
+no tool call is waiting on, at a Monitor deadline or after an interrupt, rides on the next tool
+result instead: `hub-guard cleanup, after the interrupt: ended 5 processes …`. **Never killed:** a
+`roomlerd*` (force-killing a test daemon can install the live release), a process started with
+`HUB_KEEP=1`, a browser, an editor, a terminal, `claude`, and anything without a marker.
+
+Three things the field showed, each now handled:
+
+| What happens | So |
+|---|---|
+| Claude Code 2.1.314 answers Esc on a running call exactly as it answers a refused prompt: an error result, `Exit code 137` with `[Request interrupted by user for tool use]`, and never `interrupted: true`. A sweep run inside that call dies with it. | hub-guard treats a refused call as interrupted, and sweeps from a timer outside the call (0.4.2, 0.4.3). |
+| A subagent's background command outlives the subagent's final answer: Claude Code waits on it. | There is no end to sweep at the answer; stopping the command ends what it started. |
+| One native process's environment, seen on a PowerShell and on Blender, kills any MSYS2 reader of `/proc/<pid>/environ` with "cmalloc would have returned NULL", and a scan with bash builtins alone dies the same way. | `hg.pl` scans in child processes of 40 pids each, and names a pid it could not read `unreadable`. A reap that could not read one never says "nothing left running" (0.4.1). |
+
+> **A running session loads a newly installed plugin on `/reload-plugins` or in a fresh process,
+> never on `/clear`.** Four `/clear`s on 2026-11-04 left the calls after them untagged, while the
+> first background calls after a `/reload-plugins` carried their tags. So hub-guard guards every
+> session started after its install, and a hub that was already running needs `/reload-plugins`, or
+> `/exit`, `claude` and `/hub resume <id>`. Check a session with `echo $HUB_CALL`, or by hub-guard's
+> record of its background tasks, never by its start time.
 
 **A generation's leftovers.** For hub workers only, `spawn` marks every session with
 `HUB_WORKER=<hub>/<W-n>/g<N>`. `hub.mjs stop` and a rotation wait up to 30 s for that generation's
@@ -729,6 +840,23 @@ period's one try until a person types again. That is why the gate skips instead 
   it waited with `MAIL_WAITING` and no respawn, and a respawn delivered it with its RESUME 17 s later.
   `/hub-view status` drew the host strip and one questions line across five live hubs. Still to
   show: a real TaskStop inside a working hub, and a day with nothing left behind (AC9).
+- **2026-11-04 to 2026-11-05 — FR-136 in the field.** Two hubs resumed on it at 09:01, and at 12:12 a
+  real worker's TaskStop of its CI watch read `hub-guard cleanup: ended 3 processes … (bash, gh,
+  timeout)`. A real worker with 383k of context, waiting on CI under a tick an hour old, wrote its
+  handoff and reported HANDOFF READY, and its hub rotated it 8 s later. Four findings changed the
+  design:
+  - a running session loads a newly installed plugin on `/reload-plugins` or in a fresh process, but
+    never on `/clear` (the callout in §12.1);
+  - the operator's look at the full board failed it, so the lists moved to the navigator, and the pane
+    kept the host and the questions (§8);
+  - Claude Code reports Esc on a running call as a refused call, so the interrupt sweep had never run
+    until hub-guard 0.4.2, and only from outside the call since 0.4.3;
+  - one native process's environment crashed every `/proc` scan, so a reap could have said "nothing
+    left" while processes ran (0.4.1).
+
+  The third hub, whose process predated the install, came onto the guard at a `/reload-plugins` on
+  2026-11-05 01:14, and onto a fresh process at 01:23. A day after the resume, at 11:30,
+  `hub.mjs procs` found nothing left in any of the three hubs, and FR-136 closed.
 
 P1 (the skill, the protocol and the helper) and P1b (the move to 2.1.314) are logged in the
 [spec](fr/FR-131-hub-coordinator.md#field-log).

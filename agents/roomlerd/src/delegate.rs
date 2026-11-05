@@ -169,6 +169,91 @@ pub enum DelegateFrame {
     WorkerLogs {
         lines: Vec<crate::logs_upload::LogLine>,
     },
+    /// FR-43 P3b — worker → daemon: the person's own consent floor, from the
+    /// file their row used to run on. Sent at attach and again when it changes.
+    /// A one-row Mac's daemon takes the stricter of it and its own for every
+    /// org's session ([`DelegateHost::person_floor`]); any other daemon, and an
+    /// older one, skips it.
+    PersonFloor(PersonFloor),
+}
+
+/// FR-43 P3b — what the person at a one-row Mac asked of every session: the
+/// floor their own row's broker used to enforce. Before one row, a person's
+/// `auto_grant_session = false` bound their own row; with that row gone, the
+/// daemon's `Request` arm is the only consent there is, so the floor has to
+/// reach it.
+///
+/// It can only TIGHTEN the daemon's own floor, never loosen it, so it is not
+/// the authority over the root's gates that #2871 left open. A worker that
+/// sends a looser value than the daemon's changes nothing.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersonFloor {
+    /// The person's `auto_grant_session`. Absent reads as `false`, the
+    /// stricter value: a frame that does not say whether it may auto-grant
+    /// does not get to.
+    #[serde(default)]
+    pub auto_grant_session: bool,
+    /// The person's `rc_clipboard`, `rc_files` and `rc_audio`. An absent or
+    /// unknown value reads as `off` ([`FeaturePolicy`]'s rule).
+    ///
+    /// [`FeaturePolicy`]: roomler_ai_remote_control::models::FeaturePolicy
+    #[serde(default = "PersonFloor::closed_policy")]
+    pub session_policy: roomler_ai_remote_control::models::SessionPolicy,
+}
+
+impl PersonFloor {
+    /// What a frame that names no session policy is held to: everything off.
+    fn closed_policy() -> roomler_ai_remote_control::models::SessionPolicy {
+        use roomler_ai_remote_control::models::FeaturePolicy;
+        roomler_ai_remote_control::models::SessionPolicy {
+            clipboard: FeaturePolicy::Off,
+            files: FeaturePolicy::Off,
+            audio: FeaturePolicy::Off,
+        }
+    }
+
+    /// The local consent mode with the person's floor folded in: a person who
+    /// refuses to auto-grant turns the daemon's `AutoGrant` into a prompt.
+    /// Anything else keeps the daemon's own, which is already as strict.
+    pub fn consent(floor: Option<Self>, local: crate::consent::Mode) -> crate::consent::Mode {
+        match (floor, local) {
+            (Some(f), crate::consent::Mode::AutoGrant) if !f.auto_grant_session => {
+                crate::consent::Mode::from_config(false)
+            }
+            (_, local) => local,
+        }
+    }
+
+    /// The device's `rc_*` floor with the person's folded in, feature by
+    /// feature: `off` beats `ask` beats `on`.
+    pub fn session_policy(
+        floor: Option<Self>,
+        device: roomler_ai_remote_control::models::SessionPolicy,
+    ) -> roomler_ai_remote_control::models::SessionPolicy {
+        let Some(f) = floor else { return device };
+        let p = f.session_policy;
+        roomler_ai_remote_control::models::SessionPolicy {
+            clipboard: device.clipboard.stricter(p.clipboard),
+            files: device.files.stricter(p.files),
+            audio: device.audio.stricter(p.audio),
+        }
+    }
+}
+
+/// FR-43 P3b — is this process a one-row Mac's daemon: `macos_one_row` with the
+/// supervisor on, and not itself the worker? Only there does a secondary org's
+/// loop get the host, and only there does the host apply the person's floor
+/// and hand a session over only once its params crossed. Everywhere else a
+/// secondary org keeps [`Delegation::Off`], as before P3b.
+pub fn one_row_daemon(one_row: bool, supervise_gui_worker: bool, supervised: bool) -> bool {
+    one_row && supervise_gui_worker && !supervised
+}
+
+/// FR-43 P3b — the org a loop hands sessions over for: `None` for the primary,
+/// a secondary's `[[orgs]]` label otherwise. Keyed on `is_primary` and not on
+/// the label, so no label stands in for the primary.
+pub fn org_key(is_primary: bool, label: &str) -> Option<&str> {
+    (!is_primary).then_some(label)
 }
 
 /// FR-43 P3a — the most log lines one [`DelegateFrame::WorkerLogs`] carries.
@@ -292,6 +377,13 @@ pub struct DelegatedRecord {
 /// recording's session out by opening sessions while it records.
 const RECORD_SESSIONS_KEPT: usize = 1024;
 
+/// FR-43 P3b — how many handed-over sessions the daemon remembers the org of.
+/// Oldest out first; a reply for a session this far back goes to the primary,
+/// as every reply did before P3b. Generous for the same reason as
+/// [`RECORD_SESSIONS_KEPT`]: a controller cannot push a live session's org out
+/// by opening sessions.
+const SESSION_ORGS_KEPT: usize = 1024;
+
 /// What the worker's signalling loop receives over the delegation channel.
 ///
 /// Two shapes, and the ORDER between them is load-bearing: params must land
@@ -358,6 +450,13 @@ pub enum Delegation {
 }
 
 impl Delegation {
+    /// FR-43 P3b — what a SECONDARY org's loop is given: the host on a one-row
+    /// Mac's daemon ([`one_row_daemon`]), which is the only caller to pass
+    /// one, and [`Delegation::Off`] everywhere else.
+    pub fn for_secondary(host: Option<&DelegateHost>) -> Self {
+        host.map_or(Delegation::Off, |h| Delegation::Daemon(h.clone()))
+    }
+
     /// The daemon's channel, when this process is the daemon.
     pub fn host(&self) -> Option<&DelegateHost> {
         match self {
@@ -446,6 +545,57 @@ fn strictest_keep_busy(policies: &std::collections::BTreeMap<String, bool>) -> b
     policies.values().any(|d| *d)
 }
 
+/// FR-43 P3b — the session a delegable server message is about, as hex.
+fn server_session_of(msg: &ServerMsg) -> Option<String> {
+    match msg {
+        ServerMsg::SessionCreated { session_id, .. }
+        | ServerMsg::SdpOffer { session_id, .. }
+        | ServerMsg::SdpAnswer { session_id, .. }
+        | ServerMsg::Ice { session_id, .. }
+        | ServerMsg::Terminate { session_id, .. } => Some(session_id.to_hex()),
+        _ => None,
+    }
+}
+
+/// FR-43 P3b — the session a worker reply is about, as hex.
+fn client_session_of(msg: &ClientMsg) -> Option<String> {
+    match msg {
+        ClientMsg::SdpAnswer { session_id, .. }
+        | ClientMsg::Ice { session_id, .. }
+        | ClientMsg::Terminate { session_id, .. }
+        | ClientMsg::RecordingActivity { session_id, .. } => Some(session_id.to_hex()),
+        ClientMsg::SessionStats { session_id, .. } => Some(session_id.clone()),
+        _ => None,
+    }
+}
+
+/// FR-43 P3b — the org that handed `session` over (`Some(None)` = the
+/// primary), or `None` when no org did.
+fn owner_of(
+    held: &std::collections::VecDeque<(String, Option<String>)>,
+    session: &str,
+) -> Option<Option<String>> {
+    held.iter()
+        .find(|(s, _)| s == session)
+        .map(|(_, org)| org.clone())
+}
+
+/// FR-43 P3b — note that `org` handed `session` over. Once: a second note for
+/// the same session changes nothing. Oldest out past [`SESSION_ORGS_KEPT`].
+fn note_session(
+    held: &mut std::collections::VecDeque<(String, Option<String>)>,
+    session: String,
+    org: Option<&str>,
+) {
+    if held.iter().any(|(s, _)| *s == session) {
+        return;
+    }
+    held.push_back((session, org.map(str::to_string)));
+    while held.len() > SESSION_ORGS_KEPT {
+        held.pop_front();
+    }
+}
+
 /// #1882 — where a [`DelegateHost`] reads the overlay footprint it pushes to an
 /// attached worker: the overlay's v4 blocks as `(network, prefix length)`.
 pub type FootprintSource = fn() -> Vec<(std::net::Ipv4Addr, u8)>;
@@ -471,13 +621,34 @@ struct Inner {
     /// target which has gone hands the next session a black screen, which is
     /// the bug P2b existed to fix.
     worker_caps: Mutex<Option<AgentCaps>>,
-    /// Where a worker's replies go: the control WS's outbound queue.
+    /// Where a worker's replies go: the primary's control WS outbound queue.
     ///
     /// Re-set on every WS (re)connect, because the sender belongs to the
     /// connection and not to the daemon. `None` = no live WS, and a worker
     /// reply is then dropped with a log line rather than queued for a socket
     /// that may never come back.
     outbound: Mutex<Option<tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// FR-43 P3b — the same, for each secondary org by its label. Only a
+    /// one-row Mac's daemon gives a secondary the host, so everywhere else
+    /// this stays empty.
+    org_outbounds: Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<ClientMsg>>>,
+    /// FR-43 P3b — which org handed each session to a worker (`None` = the
+    /// primary), so its replies go back on that org's WS and no other org can
+    /// reach into it. Written where a session's params cross
+    /// ([`DelegateHost::send_params`]). Kept across a transient detach, since
+    /// the worker re-attaches with its sessions live and a session's org does
+    /// not change with the process serving it; forgotten on
+    /// [`DelegateHost::revoke`], like [`Inner::record_sessions`], because the
+    /// next worker is a new one. Bounded ([`SESSION_ORGS_KEPT`]), oldest out.
+    sessions: Mutex<std::collections::VecDeque<(String, Option<String>)>>,
+    /// FR-43 P3b — this is a one-row Mac's daemon ([`one_row_daemon`]). Set
+    /// once at start.
+    one_row: AtomicBool,
+    /// FR-43 P3b — the person's floor, as the worker last said it. Kept when
+    /// the worker leaves: it can only tighten, and a worker coming back must
+    /// not find a window in which the person's "ask me" lapsed. The next
+    /// worker's frame replaces it.
+    person_floor: Mutex<Option<PersonFloor>>,
     /// The queue toward the attached worker. Set while a worker is attached,
     /// `None` otherwise — so "is anyone there?" and "where do I send it?" are
     /// one question with one answer, and cannot disagree.
@@ -490,9 +661,11 @@ struct Inner {
     record_sessions: Mutex<std::collections::VecDeque<String>>,
     /// FR-92 — every org's last keep-busy policy (tenant hex → denied), as
     /// this daemon's control WS loops received it. On a supervised Mac the
-    /// WORKER runs keep busy, while delegation itself is primary-only — so
-    /// the daemon is the one place that hears every org, and it hands the
-    /// worker the strictest ([`DelegateHost::note_keep_busy_policy`]).
+    /// WORKER runs keep busy, and hears no org itself — so the daemon is the
+    /// one place that hears every org, and it hands the worker the strictest
+    /// ([`DelegateHost::note_keep_busy_policy`]). Off one row only the
+    /// primary's loop holds the host and notes its policy; FR-43 P3b gives
+    /// every org's loop the host, so there every org's is noted.
     keep_busy: Mutex<std::collections::BTreeMap<String, bool>>,
     /// #1882 — where the frame loop reads the overlay footprint it pushes to
     /// an attached worker ([`DelegateFrame::OverlayFootprint`]). Set by the
@@ -692,23 +865,76 @@ impl DelegateHost {
         secret
     }
 
-    /// Point the channel at the current control WS's outbound queue.
+    /// Point the channel at the current control WS's outbound queue, for the
+    /// org `org` ([`org_key`]: `None` = the primary).
     ///
     /// Called on every (re)connect. Until it is, a worker's replies are dropped
     /// — which is correct: there is no session without a WS, so a reply that
     /// arrives without one belongs to a session the server has already
     /// forgotten.
-    pub fn set_outbound(&self, tx: tokio::sync::mpsc::Sender<ClientMsg>) {
-        *self.inner.outbound.lock().expect("outbound mutex") = Some(tx);
+    pub fn set_outbound(&self, org: Option<&str>, tx: tokio::sync::mpsc::Sender<ClientMsg>) {
+        match org {
+            None => *self.inner.outbound.lock().expect("outbound mutex") = Some(tx),
+            Some(label) => {
+                self.inner
+                    .org_outbounds
+                    .lock()
+                    .expect("org outbounds mutex")
+                    .insert(label.to_string(), tx);
+            }
+        }
     }
 
-    /// Hand a server message to the attached worker.
+    /// FR-43 P3b — this is a one-row Mac's daemon ([`one_row_daemon`]).
+    pub fn set_one_row(&self) {
+        self.inner.one_row.store(true, Ordering::Release);
+    }
+
+    fn one_row(&self) -> bool {
+        self.inner.one_row.load(Ordering::Acquire)
+    }
+
+    /// FR-43 P3b — the person's floor, for a session's `Request` arm to fold
+    /// into the daemon's own ([`PersonFloor::consent`],
+    /// [`PersonFloor::session_policy`]). `None` until a worker has said it,
+    /// and always `None` on a daemon that is not one row's, so the root's
+    /// values stand there exactly as before.
+    pub fn person_floor(&self) -> Option<PersonFloor> {
+        if !self.one_row() {
+            return None;
+        }
+        *self.inner.person_floor.lock().expect("person floor mutex")
+    }
+
+    fn note_person_floor(&self, floor: PersonFloor) {
+        if !self.one_row() {
+            tracing::debug!(
+                "delegation: a person's floor on a daemon that is not one row's; ignoring"
+            );
+            return;
+        }
+        tracing::info!(
+            auto_grant_session = floor.auto_grant_session,
+            session_policy = ?floor.session_policy,
+            "delegation: the person's consent floor received"
+        );
+        *self.inner.person_floor.lock().expect("person floor mutex") = Some(floor);
+    }
+
+    /// Hand a server message to the attached worker, for the org `org`
+    /// ([`org_key`]: `None` = the primary).
     ///
     /// Returns `false` when there is no worker, which is the caller's signal to
     /// serve it locally exactly as before. ⚠️ It does NOT check
     /// [`delegable_inbound`] — that decision belongs at the call site, where
     /// the alternative (handling it locally) is visible.
-    pub fn send_to_worker(&self, msg: &ServerMsg) -> bool {
+    ///
+    /// FR-43 P3b — a message about a session crosses only for the org that
+    /// handed that session over, and on a one-row Mac only once its params did
+    /// ([`Self::send_params`]): a session crosses on its own org's consent and
+    /// no other. The primary off one row keeps P2's rule, where a session no
+    /// org has handed over still crosses.
+    pub fn send_to_worker(&self, org: Option<&str>, msg: &ServerMsg) -> bool {
         let tx = self
             .inner
             .to_worker
@@ -716,10 +942,45 @@ impl DelegateHost {
             .expect("to_worker mutex")
             .clone();
         let Some(tx) = tx else { return false };
+        if let Some(session) = server_session_of(msg) {
+            let held = self.inner.sessions.lock().expect("sessions mutex");
+            match owner_of(&held, &session) {
+                Some(owner) if owner.as_deref() != org => {
+                    tracing::warn!(
+                        %session,
+                        org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                        kind = server_msg_kind(msg),
+                        "delegation: a session another org handed over; not crossing"
+                    );
+                    return false;
+                }
+                Some(_) => {}
+                None if org.is_some() || self.one_row() => {
+                    tracing::debug!(
+                        %session,
+                        kind = server_msg_kind(msg),
+                        "delegation: a session whose params never crossed; served here"
+                    );
+                    return false;
+                }
+                None => {}
+            }
+        }
         tx.try_send(DelegateFrame::ToWorker {
             msg: Box::new(msg.clone()),
         })
         .is_ok()
+    }
+
+    /// FR-43 P3b — the org a worker reply belongs to: the one that handed its
+    /// session over. `None` = a session no org handed over (P2's rule, or one
+    /// older than [`SESSION_ORGS_KEPT`] crossings); it goes to the primary.
+    fn owner_of_reply(&self, msg: &ClientMsg) -> Option<Option<String>> {
+        let session = client_session_of(msg)?;
+        owner_of(
+            &self.inner.sessions.lock().expect("sessions mutex"),
+            &session,
+        )
     }
 
     /// FR-92 — one org's keep-busy policy arrived on this daemon's control
@@ -735,7 +996,8 @@ impl DelegateHost {
             m.insert(tenant.to_string(), denied);
             strictest_keep_busy(&m)
         };
-        if self.send_to_worker(&ServerMsg::KeepBusyPolicy { denied: strictest }) {
+        // About no session, so it crosses for any org.
+        if self.send_to_worker(None, &ServerMsg::KeepBusyPolicy { denied: strictest }) {
             tracing::info!(
                 denied = strictest,
                 "delegation: keep-busy policy handed to the GUI worker"
@@ -822,7 +1084,7 @@ impl DelegateHost {
     /// Must reach the worker BEFORE the `SdpOffer` that consumes them. It does,
     /// because both travel the same ordered channel and the daemon resolves
     /// them while handling `Request`, which the server always sends first.
-    pub fn send_params(&self, frame: DelegateFrame) -> bool {
+    pub fn send_params(&self, org: Option<&str>, frame: DelegateFrame) -> bool {
         // FR-85 P1e-mac — remembered HERE, where the grant crosses, so the
         // relay's admission of a worker's `RecordingActivity` cannot drift from
         // what the worker was actually given — and only once it DID cross: a
@@ -837,6 +1099,12 @@ impl DelegateHost {
             }
             _ => None,
         };
+        // FR-43 P3b — and the org that handed the session over, by the same
+        // rule: noted only once its params crossed.
+        let session = match &frame {
+            DelegateFrame::SessionParams(p) => Some(p.session_id.clone()),
+            _ => None,
+        };
         let tx = self
             .inner
             .to_worker
@@ -844,9 +1112,27 @@ impl DelegateHost {
             .expect("to_worker mutex")
             .clone();
         let Some(tx) = tx else { return false };
+        // Held across the crossing, so no other org's loop can note the same
+        // session between the check and the note.
+        let mut held = self.inner.sessions.lock().expect("sessions mutex");
+        if let Some(session) = &session
+            && let Some(owner) = owner_of(&held, session)
+            && owner.as_deref() != org
+        {
+            tracing::warn!(
+                %session,
+                org = org.unwrap_or(crate::config::PRIMARY_ORG_LABEL),
+                "delegation: params for a session another org handed over; not crossing"
+            );
+            return false;
+        }
         if tx.try_send(frame).is_err() {
             return false;
         }
+        if let Some(session) = session {
+            note_session(&mut held, session, org);
+        }
+        drop(held);
         if let Some(session_id) = recorded {
             let mut held = self
                 .inner
@@ -925,6 +1211,19 @@ impl DelegateHost {
         })
     }
 
+    /// FR-43 P3c — the worker as the LocalAPI's `Status` reports it
+    /// ([`NodeStatus::gui_worker`](tunnel_core::localapi::NodeStatus::gui_worker)):
+    /// attached or not, the permission words the row advertises because of it
+    /// ([`Self::effective_permissions`]), and whether this daemon runs one row.
+    /// What `roomlerd one-row` verifies after its restart.
+    pub fn worker_status(&self) -> tunnel_core::localapi::GuiWorkerStatus {
+        tunnel_core::localapi::GuiWorkerStatus {
+            attached: self.inner.attached.load(Ordering::Acquire),
+            permissions: self.effective_permissions().map(|(words, _)| words),
+            one_row: self.one_row(),
+        }
+    }
+
     /// Forget the current secret — the worker it belonged to is gone.
     ///
     /// [`crate::macos_supervisor`] calls this from `stop_worker`, which takes a
@@ -942,6 +1241,10 @@ impl DelegateHost {
             .lock()
             .expect("record sessions mutex")
             .clear();
+        // FR-43 P3b — and which org handed it what, by the same rule. The
+        // person's floor stays: it only tightens, and the next worker's first
+        // frames replace it.
+        self.inner.sessions.lock().expect("sessions mutex").clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -1072,6 +1375,8 @@ impl DelegateHost {
                 Ok(DelegateFrame::KeepBusyTold { id, info }) => self.keep_busy_told(id, *info),
                 // FR-43 P3a — a worker with no enrollment's log lines.
                 Ok(DelegateFrame::WorkerLogs { lines }) => self.worker_logs(lines),
+                // FR-43 P3b — and its person's consent floor.
+                Ok(DelegateFrame::PersonFloor(floor)) => self.note_person_floor(floor),
                 Ok(DelegateFrame::WorkerCaps { caps }) => {
                     tracing::info!(
                         permissions = ?caps.permissions,
@@ -1128,7 +1433,20 @@ impl DelegateHost {
             );
             return;
         }
-        let tx = self.inner.outbound.lock().expect("outbound mutex").clone();
+        // FR-43 P3b — back on the WS of the org that handed the session over.
+        // A secondary's reply with its WS down is dropped, never sent to the
+        // primary, whose server holds no such session. A session no org
+        // handed over goes to the primary, as every reply did before P3b.
+        let tx = match self.owner_of_reply(&msg) {
+            Some(Some(label)) => self
+                .inner
+                .org_outbounds
+                .lock()
+                .expect("org outbounds mutex")
+                .get(&label)
+                .cloned(),
+            Some(None) | None => self.inner.outbound.lock().expect("outbound mutex").clone(),
+        };
         match tx {
             Some(tx) => {
                 if tx.try_send(msg).is_err() {
@@ -1482,6 +1800,32 @@ mod tests {
             host.keep_busy_replay(),
             Some(DelegateFrame::ToWorker { .. })
         ));
+    }
+
+    /// FR-43 P3b — the person's floor crosses the real frame loop to a one-row
+    /// daemon, and a frame that leaves a value out is held to the strict one.
+    #[tokio::test]
+    async fn the_persons_floor_crosses_the_channel_to_a_one_row_daemon() {
+        let host = DelegateHost::new();
+        host.set_one_row();
+        let (_task, _lines, mut wr) = attached_worker(&host).await;
+        wr.write_all(b"{\"t\":\"person_floor\",\"d\":{\"auto_grant_session\":false}}\n")
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while host.person_floor().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the floor within 5 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let floor = host.person_floor().unwrap();
+        assert!(!floor.auto_grant_session);
+        assert_eq!(
+            floor.session_policy.clipboard,
+            roomler_ai_remote_control::models::FeaturePolicy::Off
+        );
     }
 
     /// Attach a fake worker and wait until the daemon's frame loop is up (its
@@ -2318,10 +2662,10 @@ mod params_tests {
         id: bson::oid::ObjectId,
         permissions: roomler_ai_remote_control::permissions::Permissions,
     ) -> bool {
-        host.send_params(DelegateFrame::SessionParams(Box::new(params(
-            &id.to_hex(),
-            permissions,
-        ))))
+        host.send_params(
+            None,
+            DelegateFrame::SessionParams(Box::new(params(&id.to_hex(), permissions))),
+        )
     }
 
     #[test]
@@ -2395,10 +2739,10 @@ mod params_tests {
             .back()
             .cloned()
             .unwrap();
-        host.send_params(DelegateFrame::SessionParams(Box::new(params(
-            &last,
-            Permissions::RECORD,
-        ))));
+        host.send_params(
+            None,
+            DelegateFrame::SessionParams(Box::new(params(&last, Permissions::RECORD))),
+        );
         assert_eq!(
             host.inner.record_sessions.lock().unwrap().len(),
             RECORD_SESSIONS_KEPT
@@ -2442,11 +2786,14 @@ mod params_tests {
         let sid = bson::oid::ObjectId::new();
         assert!(hand_over(&host, sid, Permissions::RECORD));
         assert!(host.records_session_of(&activity(sid)));
+        assert!(host.owner_of_reply(&activity(sid)).is_some());
         host.revoke();
         assert!(
             !host.records_session_of(&activity(sid)),
             "a replaced worker's sessions must not be reportable by the next one"
         );
+        // FR-43 P3b — nor is which org handed them over remembered.
+        assert!(host.owner_of_reply(&activity(sid)).is_none());
     }
 
     /// Review finding — the relay itself, end to end: a handed-over RECORD
@@ -2460,7 +2807,7 @@ mod params_tests {
         let host = DelegateHost::new();
         let _worker = attach_worker(&host);
         let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<ClientMsg>(8);
-        host.set_outbound(ws_tx);
+        host.set_outbound(None, ws_tx);
         let (recorded, other) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
         assert!(hand_over(
             &host,
@@ -2547,5 +2894,509 @@ mod params_tests {
             Some(Vec::new()),
             "an older worker says nothing, and so does the device"
         );
+    }
+
+    // ── FR-43 P3b — every org's session on one worker ──────────────────────
+
+    fn offer(session_id: bson::oid::ObjectId) -> ServerMsg {
+        ServerMsg::SdpOffer {
+            session_id,
+            sdp: String::new(),
+            ice_servers: Vec::new(),
+            extauth_mac: None,
+            peer_auth: None,
+        }
+    }
+
+    fn reply(session_id: bson::oid::ObjectId) -> ClientMsg {
+        ClientMsg::Ice {
+            session_id,
+            candidate: serde_json::Value::Null,
+        }
+    }
+
+    fn hand_over_for(host: &DelegateHost, org: Option<&str>, id: bson::oid::ObjectId) -> bool {
+        host.send_params(
+            org,
+            DelegateFrame::SessionParams(Box::new(params(
+                &id.to_hex(),
+                roomler_ai_remote_control::permissions::Permissions::empty(),
+            ))),
+        )
+    }
+
+    fn one_row_host() -> DelegateHost {
+        let host = DelegateHost::new();
+        host.set_one_row();
+        host
+    }
+
+    /// The switch decides who gets the host: a secondary org only on a one-row
+    /// Mac's daemon, never on the worker, never with the supervisor off.
+    #[test]
+    fn a_secondary_org_gets_the_host_only_on_a_one_row_daemon() {
+        assert!(one_row_daemon(true, true, false));
+        assert!(
+            !one_row_daemon(false, true, false),
+            "the switch off: P2's layout"
+        );
+        assert!(
+            !one_row_daemon(true, false, false),
+            "the switch means nothing without the supervisor"
+        );
+        assert!(
+            !one_row_daemon(true, true, true),
+            "the worker is never the daemon"
+        );
+        let host = DelegateHost::new();
+        assert!(Delegation::for_secondary(Some(&host)).host().is_some());
+        assert!(
+            Delegation::for_secondary(None).host().is_none(),
+            "no host given: Off, as before P3b"
+        );
+    }
+
+    /// The primary is a role, not a label: a secondary labelled `primary` by a
+    /// hand-edited file still routes as that secondary.
+    #[test]
+    fn the_primary_is_named_by_its_role_not_its_label() {
+        assert_eq!(org_key(true, crate::config::PRIMARY_ORG_LABEL), None);
+        assert_eq!(org_key(false, "acme"), Some("acme"));
+        assert_eq!(
+            org_key(false, crate::config::PRIMARY_ORG_LABEL),
+            Some(crate::config::PRIMARY_ORG_LABEL)
+        );
+    }
+
+    /// AC15's routing half: two orgs' sessions on one worker, and each reply
+    /// goes back on the WS of the org that handed its session over.
+    #[test]
+    fn each_reply_goes_back_to_the_org_that_handed_its_session_over() {
+        let host = one_row_host();
+        let mut worker = attach_worker(&host);
+        let (primary_tx, mut primary_ws) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        let (acme_tx, mut acme_ws) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        host.set_outbound(None, primary_tx);
+        host.set_outbound(Some("acme"), acme_tx);
+        let (ours, theirs) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        assert!(hand_over_for(&host, None, ours));
+        assert!(hand_over_for(&host, Some("acme"), theirs));
+        assert!(host.send_to_worker(None, &offer(ours)));
+        assert!(host.send_to_worker(Some("acme"), &offer(theirs)));
+        let mut crossed = 0;
+        while worker.try_recv().is_ok() {
+            crossed += 1;
+        }
+        assert_eq!(
+            crossed, 4,
+            "both orgs' params and offers reached the worker"
+        );
+
+        host.relay_upstream(reply(theirs));
+        match acme_ws.try_recv() {
+            Ok(ClientMsg::Ice { session_id, .. }) => assert_eq!(session_id, theirs),
+            other => panic!("acme's reply belongs on acme's WS, got {other:?}"),
+        }
+        assert!(primary_ws.try_recv().is_err(), "and not on the primary's");
+
+        host.relay_upstream(reply(ours));
+        match primary_ws.try_recv() {
+            Ok(ClientMsg::Ice { session_id, .. }) => assert_eq!(session_id, ours),
+            other => panic!("the primary's reply belongs on its WS, got {other:?}"),
+        }
+        assert!(acme_ws.try_recv().is_err(), "and not on acme's");
+
+        // A session no org handed over: the primary, as every reply before P3b.
+        host.relay_upstream(reply(bson::oid::ObjectId::new()));
+        assert!(primary_ws.try_recv().is_ok());
+        assert!(acme_ws.try_recv().is_err());
+
+        // `rc:session.stats` names its session as a string; same routing.
+        let stats: ClientMsg = serde_json::from_value(serde_json::json!({
+            "t": "rc:session.stats",
+            "session_id": theirs.to_hex(),
+            "bytes_sent": 0, "bytes_recv": 0, "fps": 0.0, "rtt_ms": 0.0,
+            "keyframe_requests": 0, "input_events": 0,
+        }))
+        .unwrap();
+        host.relay_upstream(stats);
+        assert!(matches!(
+            acme_ws.try_recv(),
+            Ok(ClientMsg::SessionStats { .. })
+        ));
+        assert!(primary_ws.try_recv().is_err());
+    }
+
+    /// A secondary's reply with its WS down is dropped. Sending it to the
+    /// primary would hand one org's session to another org's server.
+    #[test]
+    fn a_secondarys_reply_with_its_ws_down_never_reaches_the_primary() {
+        let host = one_row_host();
+        let _worker = attach_worker(&host);
+        let (primary_tx, mut primary_ws) = tokio::sync::mpsc::channel::<ClientMsg>(8);
+        host.set_outbound(None, primary_tx);
+        let theirs = bson::oid::ObjectId::new();
+        assert!(hand_over_for(&host, Some("acme"), theirs));
+        host.relay_upstream(reply(theirs));
+        assert!(primary_ws.try_recv().is_err());
+    }
+
+    /// A session one org handed over never crosses for another, whichever way
+    /// round: one org's server cannot reach into, or take the replies of, a
+    /// session another org's consent admitted.
+    #[test]
+    fn a_session_another_org_handed_over_never_crosses_for_this_one() {
+        let host = one_row_host();
+        let mut worker = attach_worker(&host);
+        let (theirs, ours) = (bson::oid::ObjectId::new(), bson::oid::ObjectId::new());
+        assert!(hand_over_for(&host, Some("acme"), theirs));
+        assert!(hand_over_for(&host, None, ours));
+        while worker.try_recv().is_ok() {}
+
+        assert!(
+            !hand_over_for(&host, None, theirs),
+            "params for acme's session"
+        );
+        assert!(
+            !host.send_to_worker(None, &offer(theirs)),
+            "an offer for acme's session"
+        );
+        assert!(!hand_over_for(&host, Some("other"), theirs));
+        assert!(!hand_over_for(&host, Some("acme"), ours), "and the reverse");
+        assert!(!host.send_to_worker(Some("acme"), &offer(ours)));
+        assert!(worker.try_recv().is_err(), "nothing crossed");
+
+        // The org that owns it still reaches it.
+        assert!(host.send_to_worker(Some("acme"), &offer(theirs)));
+        assert!(host.send_to_worker(None, &offer(ours)));
+    }
+
+    /// On one row a session crosses only once its params did, so every org's
+    /// session went through that org's consent first. Off one row the primary
+    /// keeps P2's rule (the control): byte-for-byte today's behaviour.
+    #[test]
+    fn on_one_row_a_session_crosses_only_once_its_params_did() {
+        let host = one_row_host();
+        let _worker = attach_worker(&host);
+        let id = bson::oid::ObjectId::new();
+        assert!(
+            !host.send_to_worker(None, &offer(id)),
+            "no params: served here"
+        );
+        assert!(!host.send_to_worker(Some("acme"), &offer(id)));
+        assert!(hand_over_for(&host, None, id));
+        assert!(host.send_to_worker(None, &offer(id)));
+
+        let p2 = DelegateHost::new();
+        let _w = attach_worker(&p2);
+        let id = bson::oid::ObjectId::new();
+        assert!(
+            p2.send_to_worker(None, &offer(id)),
+            "off one row the primary's session crosses as before"
+        );
+        assert!(
+            !p2.send_to_worker(Some("acme"), &offer(id)),
+            "a secondary's crosses only with its params, on any daemon"
+        );
+        // A message about no session (keep busy) crosses for anyone.
+        assert!(host.send_to_worker(Some("acme"), &ServerMsg::KeepBusyPolicy { denied: true }));
+    }
+
+    /// The memory of who handed what over is bounded: oldest out.
+    #[test]
+    fn the_session_org_memory_is_bounded() {
+        let host = one_row_host();
+        let _worker = attach_worker(&host);
+        let first = bson::oid::ObjectId::new();
+        assert!(hand_over_for(&host, Some("acme"), first));
+        for _ in 0..SESSION_ORGS_KEPT {
+            assert!(hand_over_for(&host, None, bson::oid::ObjectId::new()));
+        }
+        let held = host.inner.sessions.lock().unwrap();
+        assert_eq!(held.len(), SESSION_ORGS_KEPT);
+        assert!(
+            owner_of(&held, &first.to_hex()).is_none(),
+            "the oldest went first"
+        );
+    }
+
+    /// AC16's daemon half: the person's floor counts on a one-row daemon only,
+    /// and it only ever tightens.
+    #[test]
+    fn the_persons_floor_counts_only_on_one_row_and_only_tightens() {
+        use crate::consent::Mode;
+        use roomler_ai_remote_control::models::{FeaturePolicy, SessionPolicy};
+        let ask_me = PersonFloor {
+            auto_grant_session: false,
+            session_policy: SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Ask,
+                audio: FeaturePolicy::On,
+            },
+        };
+
+        let p2 = DelegateHost::new();
+        p2.note_person_floor(ask_me);
+        assert_eq!(
+            p2.person_floor(),
+            None,
+            "off one row: the root's values stand"
+        );
+        let host = one_row_host();
+        assert_eq!(host.person_floor(), None, "no worker has said it yet");
+        host.note_person_floor(ask_me);
+        assert_eq!(host.person_floor(), Some(ask_me));
+
+        assert!(matches!(
+            PersonFloor::consent(Some(ask_me), Mode::AutoGrant),
+            Mode::Prompt { .. }
+        ));
+        assert!(matches!(
+            PersonFloor::consent(None, Mode::AutoGrant),
+            Mode::AutoGrant
+        ));
+        let lets_it_through = PersonFloor {
+            auto_grant_session: true,
+            ..ask_me
+        };
+        assert!(
+            matches!(
+                PersonFloor::consent(Some(lets_it_through), Mode::from_config(false)),
+                Mode::Prompt { .. }
+            ),
+            "a root `false` holds whatever the person's file says"
+        );
+
+        let device = SessionPolicy {
+            clipboard: FeaturePolicy::On,
+            files: FeaturePolicy::On,
+            audio: FeaturePolicy::Off,
+        };
+        assert_eq!(
+            PersonFloor::session_policy(Some(ask_me), device),
+            SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Ask,
+                audio: FeaturePolicy::Off,
+            },
+            "feature by feature, the stricter: the person's `on` lifts nothing"
+        );
+        assert_eq!(PersonFloor::session_policy(None, device), device);
+    }
+
+    /// The frame's wire, and a frame that says nothing reads as the strictest.
+    #[test]
+    fn the_person_floor_frame_has_a_stable_wire_and_reads_strict_when_silent() {
+        use roomler_ai_remote_control::models::{FeaturePolicy, SessionPolicy};
+        let frame = DelegateFrame::PersonFloor(PersonFloor {
+            auto_grant_session: true,
+            session_policy: SessionPolicy::default(),
+        });
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({
+                "t": "person_floor",
+                "d": {
+                    "auto_grant_session": true,
+                    "session_policy": { "clipboard": "on", "files": "on", "audio": "on" },
+                },
+            })
+        );
+        let silent: DelegateFrame = serde_json::from_str(r#"{"t":"person_floor","d":{}}"#).unwrap();
+        let DelegateFrame::PersonFloor(f) = silent else {
+            panic!("not a person floor");
+        };
+        assert!(!f.auto_grant_session);
+        assert_eq!(
+            f.session_policy,
+            SessionPolicy {
+                clipboard: FeaturePolicy::Off,
+                files: FeaturePolicy::Off,
+                audio: FeaturePolicy::Off,
+            }
+        );
+    }
+}
+
+/// FR-43 P3b, end to end on the daemon's side: a SECONDARY org's real loop
+/// against a control plane that asks for a session and then offers it. The
+/// gates read whether the loop holds the host, so the switch, composed as
+/// `run_cmd` composes it, is what decides.
+#[cfg(test)]
+mod secondary_org_tests {
+    use super::*;
+    use crate::signaling::{self, OrgCtx};
+    use futures::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const PATIENCE: Duration = Duration::from_secs(20);
+
+    /// Asks for `session` (naming the org `Acme`) and offers it once the device
+    /// has answered the ask. Returns the URLs and what the device says.
+    async fn asking_server(
+        session: bson::oid::ObjectId,
+    ) -> (String, String, tokio::sync::mpsc::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (said_tx, said_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let request = serde_json::json!({
+                "t": "rc:request",
+                "session_id": session.to_hex(),
+                "controller_user_id": bson::oid::ObjectId::new().to_hex(),
+                "controller_name": "a controller",
+                "permissions": serde_json::to_value(
+                    roomler_ai_remote_control::permissions::Permissions::empty()
+                ).unwrap(),
+                "consent_timeout_secs": 30,
+                "tenant_name": "Acme",
+            });
+            if ws
+                .send(Message::Text(request.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut offered = false;
+            while let Some(Ok(frame)) = ws.next().await {
+                let Message::Text(text) = frame else { continue };
+                if !offered && text.contains("rc:consent") {
+                    offered = true;
+                    let offer = ServerMsg::SdpOffer {
+                        session_id: session,
+                        sdp: String::new(),
+                        ice_servers: Vec::new(),
+                        extauth_mac: None,
+                        peer_auth: None,
+                    };
+                    let _ = ws
+                        .send(Message::Text(serde_json::to_string(&offer).unwrap().into()))
+                        .await;
+                }
+                let _ = said_tx.send(text.to_string()).await;
+            }
+        });
+        (
+            format!("http://127.0.0.1:{port}"),
+            format!("ws://127.0.0.1:{port}/ws"),
+            said_rx,
+        )
+    }
+
+    /// Waits until the device has said something containing `needle`.
+    async fn says(said: &mut tokio::sync::mpsc::Receiver<String>, needle: &str) -> bool {
+        tokio::time::timeout(PATIENCE, async {
+            while let Some(line) = said.recv().await {
+                if line.contains(needle) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
+        for one_row in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let host = DelegateHost::new();
+            // A worker is attached either way: what changes is whether the
+            // secondary's loop is given the host.
+            let (to_worker, mut worker) = tokio::sync::mpsc::channel(64);
+            *host.inner.to_worker.lock().unwrap() = Some(to_worker);
+            let given = one_row_daemon(one_row, true, false).then(|| {
+                host.set_one_row();
+                host.clone()
+            });
+
+            let session = bson::oid::ObjectId::new();
+            let (server, ws, mut said) = asking_server(session).await;
+            let mut cfg = crate::config::test_fixture();
+            cfg.server_url = server;
+            cfg.ws_url = Some(ws);
+            cfg.agent_token = "tok".into();
+            let (stop, stop_rx) = tokio::sync::watch::channel(false);
+            let (view_tx, _view_rx) =
+                tokio::sync::watch::channel(tunnel_core::localapi::OverlayView::default());
+            let broker = crate::consent::ConsentBroker::new(
+                crate::consent::Mode::AutoGrant,
+                dir.path().join("consent"),
+            )
+            .unwrap();
+            let remote_cfg = crate::remote_config::RemoteConfigServices::new(
+                dir.path().join("config.toml"),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                false,
+            );
+            let task = tokio::spawn(signaling::run(
+                OrgCtx::secondary("acme", crate::token_slot::TokenSlot::new("tok")),
+                Delegation::for_secondary(given.as_ref()),
+                cfg,
+                crate::encode::EncoderPreference::Software,
+                stop_rx,
+                Arc::new(AtomicBool::new(false)),
+                view_tx,
+                Default::default(),
+                broker,
+                crate::tunnel::client_mgr::TunnelClientHub::new("test".into()),
+                remote_cfg,
+                crate::rc_sessions::RcSessionRegistry::new(),
+            ));
+
+            // The device answers the ask either way: the silence below, with
+            // the switch off, is the gate's and not a dead loop's.
+            assert!(
+                says(&mut said, "rc:consent").await,
+                "one_row={one_row}: the device answered the ask"
+            );
+            if one_row {
+                let frame = tokio::time::timeout(PATIENCE, worker.recv())
+                    .await
+                    .expect("the params within PATIENCE")
+                    .expect("a frame");
+                let DelegateFrame::SessionParams(p) = frame else {
+                    panic!("the params first, got {frame:?}");
+                };
+                assert_eq!(p.session_id, session.to_hex());
+                assert_eq!(
+                    p.asking_org.as_deref(),
+                    Some("Acme"),
+                    "the worker's banner names the org that asked"
+                );
+                let frame = tokio::time::timeout(PATIENCE, worker.recv())
+                    .await
+                    .expect("the offer within PATIENCE")
+                    .expect("a frame");
+                let DelegateFrame::ToWorker { msg } = frame else {
+                    panic!("then the offer, got {frame:?}");
+                };
+                assert!(
+                    matches!(*msg, ServerMsg::SdpOffer { session_id, .. } if session_id == session)
+                );
+            } else {
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), worker.recv())
+                        .await
+                        .is_err(),
+                    "the switch off: a secondary's session never reaches the worker"
+                );
+            }
+            let _ = stop.send(true);
+            let _ = tokio::time::timeout(PATIENCE, task).await;
+        }
     }
 }
