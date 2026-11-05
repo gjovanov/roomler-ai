@@ -698,11 +698,12 @@ Three things the field showed, each now handled:
 | A subagent's background command outlives the subagent's final answer: Claude Code waits on it. | There is no end to sweep at the answer; stopping the command ends what it started. |
 | One native process's environment, seen on a PowerShell and on Blender, kills any MSYS2 reader of `/proc/<pid>/environ` with "cmalloc would have returned NULL", and a scan with bash builtins alone dies the same way. | `hg.pl` scans in child processes of 40 pids each, and names a pid it could not read `unreadable`. A reap that could not read one never says "nothing left running" (0.4.1). |
 
-> **A running session loads a newly installed plugin only in a fresh process.** `/clear` and
-> `/reload-plugins` reload the plugins a session already has; one installed after it started stays
-> out until its process restarts. So hub-guard guards every session started after its install, and
-> a hub that was already running needs `/exit`, `claude` and `/hub resume <id>`. Check a session with
-> `echo $HUB_CALL`, never by its start time.
+> **A running session loads a newly installed plugin on `/reload-plugins` or in a fresh process,
+> never on `/clear`.** Four `/clear`s on 2026-11-04 left the calls after them untagged, while the
+> first background calls after a `/reload-plugins` carried their tags. So hub-guard guards every
+> session started after its install, and a hub that was already running needs `/reload-plugins`, or
+> `/exit`, `claude` and `/hub resume <id>`. Check a session with `echo $HUB_CALL`, or by hub-guard's
+> record of its background tasks, never by its start time.
 
 **A generation's leftovers.** For hub workers only, `spawn` marks every session with
 `HUB_WORKER=<hub>/<W-n>/g<N>`. `hub.mjs stop` and a rotation wait up to 30 s for that generation's
@@ -844,7 +845,8 @@ period's one try until a person types again. That is why the gate skips instead 
   timeout)`. A real worker with 383k of context, waiting on CI under a tick an hour old, wrote its
   handoff and reported HANDOFF READY, and its hub rotated it 8 s later. Four findings changed the
   design:
-  - a running session loads a newly installed plugin only in a fresh process (the callout in §12.1);
+  - a running session loads a newly installed plugin on `/reload-plugins` or in a fresh process, but
+    never on `/clear` (the callout in §12.1);
   - the operator's look at the full board failed it, so the lists moved to the navigator, and the pane
     kept the host and the questions (§8);
   - Claude Code reports Esc on a running call as a refused call, so the interrupt sweep had never run
@@ -852,8 +854,9 @@ period's one try until a person types again. That is why the gate skips instead 
   - one native process's environment crashed every `/proc` scan, so a reap could have said "nothing
     left" while processes ran (0.4.1).
 
-  Still to show: the one hub whose process predates the install, on a fresh process, and a day with
-  nothing left behind (AC9).
+  The third hub, whose process predated the install, came onto the guard at a `/reload-plugins` on
+  2026-11-05 01:14, and onto a fresh process at 01:23. Still to show: a day with nothing left behind
+  (AC9).
 
 P1 (the skill, the protocol and the helper) and P1b (the move to 2.1.314) are logged in the
 [spec](fr/FR-131-hub-coordinator.md#field-log).

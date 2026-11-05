@@ -3,7 +3,7 @@
 **Issue:** [#3457](https://github.com/gjovanov/roomler-ai/issues/3457) · **Status:** claimed 2026-11-04.
 P0–P8 shipped the same day. P9–P11 came out of the field runs: the navigator, the pane that shrank
 around it, and hub-guard 0.4.0–0.4.3. AC1–AC8 and AC10 are field-verified; AC9 waits on its
-day-later read and on the one hub still running an unguarded process. Builds on
+day-later read, now that all three hubs run guarded. Builds on
 [FR-131](FR-131-hub-coordinator.md), the hub. The engineering reference is
 [`agent-hub.md` §12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff),
 and §8 for the view.
@@ -215,9 +215,10 @@ hold a reaper.
       staggered.*
     - *A real worker stopped its `gh pr checks --watch` task, and its transcript read `hub-guard
       cleanup: ended 3 processes task … had started (bash, gh, timeout).` (12:12:45Z).*
-    - *Owed:*
-      - *unhive's hub, whose process predates the install, on a fresh process (decision D7);*
-      - *the day-later read.*
+  - *2026-11-05: unhive's hub, whose process predated the install, came onto the guard at a
+    `/reload-plugins` (01:14:49Z): its next background calls were recorded with their tags. It then
+    moved to a fresh process at 01:23Z (decision D7).*
+  - *Owed: the day-later read.*
 - [x] **AC10 — docs.** `docs/agent-hub.md` gains process hygiene, the host budget, the mailbox and the
   idle handoff, in house style (mermaid, tables), and its row in [`docs/README.md`](../README.md)
   says so. *2026-11-04: [§12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff),
@@ -236,7 +237,7 @@ Decided by the operator on 2026-11-04:
 | D4 | Where the idle handoff runs | In every session. Hubs and workers use the hub's own format; other sessions write outside every repository. |
 | D5 | What AC6's view becomes, after the full board failed the operator's look | A standalone navigator in the terminal, like `claude agents`: hubs at the top, Enter into one hub's workers, attach in the same window (P9). The pane shrinks to the host strip and the open questions (P10). |
 | D6 | How AC1's interrupted call is tested, after the operator's Esc never reached the session in five tries | Unattended: a throwaway interactive session in a console of its own, with the Esc written into that console's input. |
-| D7 | How unhive's hub gets the guard, since a running session never loads a newly installed plugin | A fresh process at its next context handoff: `/exit`, `claude`, `/hub resume unhive`. |
+| D7 | How unhive's hub gets the guard, since its process predates the install | A fresh process at its next context handoff: `/exit`, `claude`, `/hub resume unhive`. A `/reload-plugins` had loaded the guard into it first (field log, 2026-11-05 01:14). |
 
 ## Out of scope
 
@@ -262,7 +263,7 @@ Decided by the operator on 2026-11-04:
 | 2026-11-04 07:54–07:59 | P6, live, on a throwaway worker: mail posted while it was idle was delivered in 5 s, as a turn of plugin origin. Posted while it was stopped, mail waited with `MAIL_WAITING` and no respawn; a respawn delivered the waiting message and its RESUME together, 17 s later. `status --json --peek` on the five live hubs differed from the old helper only by the new mail counts. |
 | 2026-11-04 08:02 | Field, a working hub: the first rotation on the new helper, W-2 g1 → g2. `stop g1 … for rotation (ok)`, then `reap g1 (…/W-2/g1, pid …): ended 0`, on Windows and in WSL, and g2 started 1 s later with a mailbox, its hub-guard recording its background tasks. |
 | 2026-11-04 | P5: hub-view 0.3.0, 52 engine-kit tests. A `--bg` session's `/hub-view status` drew the host strip and one questions line across the five live hubs. Attach, Open and Clean up are covered by the kit only, since running them live opens windows on the operator's desktop. |
-| 2026-11-04 07:42–16:33 | **A running session loads a newly installed plugin only in a fresh process.** Every session started after hub-guard's install (about 01:59) tags its calls. Three plain `/clear`s after the install (07:42, 08:38, 12:04) left their processes untagged. So did a `/reload-plugins` in unhive's hub at 16:10: its background call at 16:19:47 carried no `HUB_CALL`, and nor did any of the 7 processes of its own seen from 16:26 to 16:33. A `/login` loaded it once, but it also switched that process's account, so it is no method. Decision D7. |
+| 2026-11-04 07:42–16:33 | Every session started after hub-guard's install (about 01:59) tags its calls, and **a `/clear` does not load the plugin into an older process**: three `/clear`s after the install (07:42, 08:38, 12:04) left their processes untagged. unhive's hub, started before the install, ran untagged too: its background call at 16:19:47 carried no `HUB_CALL`, and nor did any of the 7 processes of its own seen from 16:26 to 16:33. A `/login` loaded the plugin once, but it also switched that process's account, so it is no method. Decision D7. *Corrected 2026-11-05: this row first said a `/reload-plugins` at 16:10 had failed to load the plugin. That command never reached unhive's hub, whose transcript has no such row. See 2026-11-05 01:14.* |
 | 2026-11-04 09:01–12:13 | AC9 starts. Hubs bb and bl1 resume on the new helper and on hub-guard at 09:01, the host line on their first tick. At 12:12:45 a real worker's TaskStop of its CI watch carries its line: `ended 3 processes … (bash, gh, timeout)`. |
 | 2026-11-04 13:42–14:12 | AC6: the operator's look at the full board failed it. It showed too many hubs and workers at once, with no search, and Attach opened another window. The operator chose a standalone navigator (D5). |
 | 2026-11-04 13:42–22:58 | The operator's Esc never reached a running call in a VS Code CLI session, in five tries. In Windows Terminal it landed on an approval prompt, which refuses the call before it runs. Decision D6. |
@@ -276,3 +277,4 @@ Decided by the operator on 2026-11-04:
 | 2026-11-04 22:21 | P11, hub-guard 0.4.1, from hub bb's report. One native process's environment, seen on a PowerShell and on Blender, kills any MSYS2 reader of `/proc/<pid>/environ` with "cmalloc would have returned NULL". It took the whole scan down, so a reap could read "nothing left running" while processes ran. A scan with bash builtins alone crashed too. `hg.pl` now scans in children of 40 pids, reports such a pid as `unreadable`, and `procs` and `reap` say so. |
 | 2026-11-04 23:43 – 2026-11-05 00:04 | P11, hub-guard 0.4.2 and 0.4.3. **Claude Code 2.1.314 answers Esc on a running call exactly as it answers a refused prompt.** The result is an error, `Exit code 137` with `[Request interrupted by user for tool use]`, and never `interrupted: true`, so the interrupt branch had never run live. 0.4.2 sweeps on that shape. Its sweep ran inside the interrupted call and died with it, leaving perl, sh×2 and find. 0.4.3 runs the sweep from a timer 1.5 s later. The unattended run (D6), at 00:04:23, ended `sh, find, sh, perl, find`, left nothing with the tag, and the next result carried the line. |
 | 2026-11-05 00:28–00:30 | P10, hub-view 0.4.0, live. A fresh session's `/hub` answered the host strip, four questions and `5 hubs · 77 workers, 4 running · browse them with hubs in a terminal`, with no model turn (00:29:55). The first try went wrong. It passed `/hub` as a background session's prompt from Git Bash, which rewrote it into a path, `C:/Program Files/Git/hub`. That session started a model turn on the path and was stopped within 25 s, having only read files. `MSYS_NO_PATHCONV=1` keeps a slash command a slash command. |
+| 2026-11-05 01:14–01:55 | **`/reload-plugins` does load a newly installed plugin into a running session**, and the 2026-11-04 07:42 row is corrected. unhive's hub process, started before the install, had left every background call unrecorded: 6 from 16:09 to 23:44, and 2 at 00:13 after a `/clear` at 23:57. After a `/reload-plugins` at 01:14:49, its next two background calls (01:19:07, 01:19:09) were recorded with their tags. Then the operator moved the hub onto a fresh process (D7). A new session resumed it at 01:23:18, and at 01:55:32 its call's `bash` and `gh` carried `HUB_CALL=4cf14264`. All three hubs now run guarded. |
