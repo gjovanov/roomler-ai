@@ -542,6 +542,34 @@ frames (`scrap_backend::primary` preflights and warns for that shape);
 current macOS fails the open outright, which is what reaches the classifier
 here.
 
+⚠️ **On macOS the session question comes before the open** (#3260). A process
+outside every login session, the root LaunchDaemon in session 0, has no window
+server and never will, so it can never capture. The classifier always named
+that case `no_display` (`classify_capture_failure`,
+`agents/roomlerd/src/capture/mod.rs:2530`), but it asked only after the open had
+failed, and there the open took 30 s to fail. Read on the released 0.4.200 on a
+supervised lab Mac in FR-43's black-row layout (one root enrollment, no
+per-user config), with one viewer on the daemon's row:
+
+| seconds after the session started | |
+|---|---|
+| 0 | the pump starts |
+| 10 | the viewer's watchdog re-creates the session: no frame, no reason |
+| 30.0 | `no_display`, and "telling the controller", for that ended session |
+
+Every re-created session waited the same 30 s, so each notice reached a session
+already gone, and the page blamed the network
+([FR-43](fr/FR-43-macos-single-enrollment.md), the black rows). `scrap_open`
+(`agents/roomlerd/src/capture/mod.rs:4831`) now asks `tcc::has_gui_session`
+first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:4847`).
+Where it answers no, nothing runs that waits on a window server: TCC's
+preflight and request (`agents/roomlerd/src/capture/scrap_backend.rs:112`), the
+display wake (`agents/roomlerd/src/capture/scrap_backend.rs:160`) and
+`CGDisplayStream`. The refusal is an ordinary open failure, so the classifier
+and the notice above are unchanged, and its warn line carries what the question
+itself cost (`checked_in_us`). A supervised Mac's delegated sessions never reach
+this open: its GUI worker captures, as before.
+
 ⚠️ **A sleeping macOS display streams nothing, and fails nothing either.** The
 stream opens, `capture: backend=scrap` logs, and then no frame ever arrives:
 no encoder is built, and the viewer gives up after its no-picture window and
