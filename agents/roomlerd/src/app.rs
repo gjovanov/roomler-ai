@@ -8505,4 +8505,22 @@ mod one_row_enroll_tests {
             "every other key as it was"
         );
     }
+
+    /// `install.sh --one-row` asks this binary's own `enroll --help` for the
+    /// flag before it spends the token, then passes it with the overlay. A
+    /// rename on either side would stop every one-row install at that check.
+    #[test]
+    fn install_sh_asks_for_the_flag_this_binary_prints() {
+        use clap::CommandFactory;
+        let script = include_str!("../../../scripts/install.sh");
+        assert!(script.contains("enroll --help 2>/dev/null | grep -q -- '--one-row'"));
+        assert!(script.contains("enroll \"$@\" --overlay --one-row"));
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("enroll")
+            .expect("the enroll verb")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--one-row"), "{help}");
+    }
 }

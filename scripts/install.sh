@@ -133,6 +133,9 @@ MACOS_DAEMON_MARKER="/etc/roomler/enable-daemon"
 # the .pkg put it there, the user one kickstarts what runs from it.
 MACOS_DAEMON_BIN="/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd"
 DAEMON_TOKEN=""
+# FR-43 P3d — `--one-row`: the Mac's root half alone holds the enrollment (see
+# install_macos_one_row). Off by default, so a Mac installs as two rows.
+ONE_ROW=0
 NO_ENROLL=0
 # FR-27 — the Linux desktop companion. Empty = decide by probing for a
 # graphical session; --desktop / --no-desktop force it either way.
@@ -156,7 +159,7 @@ DIGEST_REQUIRED=0
 usage() {
     sed -n '2,51p' "$0" 2>/dev/null || true
     echo "usage: install.sh --role daemon|tunnel [--server URL] [--token JWT | --pair [--pair-org SLUG]]"
-    echo "                  [--name NAME] [--daemon-token JWT] [--system] [--download-only] [--no-enroll]"
+    echo "                  [--name NAME] [--daemon-token JWT | --one-row] [--system] [--download-only] [--no-enroll]"
     echo "                  [--desktop|--no-desktop]"
     echo "       install.sh --privileged-steps --role daemon [--system] [--config-from FILE]"
     echo "                  [--config-take KEYS] [--server URL] [--name NAME] [--desktop|--no-desktop]"
@@ -200,6 +203,15 @@ usage() {
     echo "                  device id, and the second connection displaces the first — so"
     echo "                  this takes a SECOND single-use enrollment token and the Mac"
     echo "                  appears as two devices."
+    echo
+    echo "  --one-row       macOS only, off by default. ONE token (or one --pair approval),"
+    echo "                  ONE device: the root LaunchDaemon holds the enrollment, runs the"
+    echo "                  overlay, and serves the screen through a worker it starts in the"
+    echo "                  login session, which holds none. The package, the root half's"
+    echo "                  enrollment, then the package again: its guard removes the per-user"
+    echo "                  LaunchAgent. Not with --daemon-token. On a Mac that is one row"
+    echo "                  already it only updates the package (no token needed). An enrolled"
+    echo "                  two-row Mac becomes one row with: sudo roomlerd one-row"
     exit 1
 }
 
@@ -212,6 +224,7 @@ while [ $# -gt 0 ]; do
         --pair-org) PAIR_ORG="$2"; shift 2 ;;
         --name) NAME="$2"; shift 2 ;;
         --daemon-token) DAEMON_TOKEN="$2"; shift 2 ;;
+        --one-row) ONE_ROW=1; shift ;;
         --system) SYSTEM=1; shift ;;
         --download-only) DOWNLOAD_ONLY=1; shift ;;
         --no-enroll) NO_ENROLL=1; shift ;;
@@ -265,6 +278,29 @@ fi
 if [ -n "$DAEMON_TOKEN" ] && { [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; }; then
     echo "error: --daemon-token applies to '--role daemon' on macOS only" >&2
     exit 1
+fi
+
+# FR-43 P3d — `--one-row`: one token, one device row. Refused here, before
+# anything is downloaded, wherever it cannot mean that. Whether the Mac needs a
+# token is install_macos_one_row's question: one that is one row already only
+# updates its package.
+if [ "$ONE_ROW" = 1 ]; then
+    if [ "$ROLE" != daemon ] || [ "$OS" != Darwin ]; then
+        echo "error: --one-row applies to '--role daemon' on macOS only: only a Mac has a root half and a person's half to make one row of" >&2
+        exit 1
+    fi
+    if [ -n "$DAEMON_TOKEN" ]; then
+        echo "error: --one-row enrolls ONE row from one token, and --daemon-token is the second token of a two-row install: pass one of them" >&2
+        exit 1
+    fi
+    if [ "$PRIV_STEPS" = 1 ] || [ "$USER_STEPS" = 1 ]; then
+        echo "error: --one-row is this script's terminal install: the halves a GUI runs (--privileged-steps, --user-steps) have no one-row form yet" >&2
+        exit 1
+    fi
+    if [ "$NO_ENROLL" = 1 ]; then
+        echo "error: --one-row enrolls the root half as this Mac's one row; it cannot be combined with --no-enroll" >&2
+        exit 1
+    fi
 fi
 
 # ─── FR-129 A4: --pair ──────────────────────────────────────────────────────
@@ -821,8 +857,20 @@ install_daemon_macos() {
 
     if [ "$DOWNLOAD_ONLY" = 1 ]; then
         say "download-only: would run: sudo installer -pkg $pkg -target /"
+        if [ "$ONE_ROW" = 1 ]; then
+            say "download-only: would run: sudo touch $MACOS_DAEMON_MARKER"
+            say "download-only: would run: sudo $daemon_bin --config $MACOS_DAEMON_CONFIG enroll --server $SERVER $(enroll_cred_hint) --name $NAME --overlay --one-row"
+            say "download-only: would run the package again: its guard removes the per-user LaunchAgent and starts the root half"
+            return 0
+        fi
         say "download-only: would run: $daemon_bin enroll --server $SERVER $(enroll_cred_hint) --name $NAME"
         [ -n "$DAEMON_TOKEN" ] && say "download-only: would also enroll the privileged half at $MACOS_DAEMON_CONFIG"
+        return 0
+    fi
+
+    # FR-43 P3d — one token, one row: a sequence of its own.
+    if [ "$ONE_ROW" = 1 ]; then
+        install_macos_one_row "$pkg" "$daemon_bin"
         return 0
     fi
 
@@ -934,6 +982,110 @@ install_macos_privileged_half() {
         || warn "launchctl kickstart failed for the daemon — it will start at next boot"
 }
 
+# Whether the root half's config sets KEY = true, read the way the package's
+# postinstall guard reads it.
+root_config_says() {
+    as_root grep -qE "^[[:space:]]*$1[[:space:]]*=[[:space:]]*true" "$MACOS_DAEMON_CONFIG"
+}
+
+# FR-43 P3d — `--one-row`: one token, one device row. The root half alone holds
+# the enrollment and runs the overlay, and it serves the person's screen through
+# a worker it starts in their login session, which holds no enrollment
+# (`macos_one_row`). The order is what makes it one command:
+#   1. the package, run as a per-user install runs it, so the LaunchAgent comes
+#      up as it always has;
+#   2. the marker, and the root half enrolled with the overlay on and both
+#      switches (`enroll --one-row`);
+#   3. the package again. Its postinstall's guard (P2d) reads the switch from
+#      the root half's config, removes the LaunchAgent and its plist, and starts
+#      the root half, which then owns the worker.
+# The guard decides here as it does at every update after, so the installer and
+# the daemon cannot disagree about who owns the worker. The marker waits for
+# step 2: a release without `enroll --one-row` then stops the install with no
+# root half requested and the token unspent.
+install_macos_one_row() {
+    pkg="$1"; daemon_bin="$2"
+    # A Mac whose root half is enrolled already. One row: this run only updates
+    # the package. A row of its own: making it one row is the migration's (P3c),
+    # which says its plan, keeps a copy of each file it changes and can put the
+    # Mac back. Enrolling over it here would leave both rows.
+    one_row_already=0
+    if as_root test -f "$MACOS_DAEMON_CONFIG"; then
+        if root_config_says macos_supervise_gui_worker && root_config_says macos_one_row; then
+            one_row_already=1
+        else
+            echo "error: this Mac's root half is enrolled already ($MACOS_DAEMON_CONFIG), as a row of its own. --one-row installs a Mac that is not enrolled yet; to make this one one row, run: sudo roomlerd one-row (it says its plan and asks first, and --revert puts the Mac back). Nothing was changed, and the token is not spent." >&2
+            exit 1
+        fi
+    elif [ -z "$TOKEN" ] && [ "$PAIR" != 1 ]; then
+        echo "error: --one-row enrolls this Mac's root half as its one row: pass --token <enrollment-jwt> or --pair" >&2
+        exit 1
+    fi
+
+    if [ "$one_row_already" = 1 ]; then
+        say "this Mac is one row already: the package updates, and its enrollment stays${TOKEN:+ (the token is not used)}"
+        # The marker is part of the one row: without it the package would
+        # remove the root half and put the LaunchAgent back.
+        as_root mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+        as_root touch "$MACOS_DAEMON_MARKER"
+    fi
+    say "installing roomlerd (.pkg — sudo required)"
+    as_root installer -pkg "$pkg" -target /
+    [ -x "$daemon_bin" ] || {
+        echo "error: the package did not install $daemon_bin" >&2
+        exit 1
+    }
+    if [ "$one_row_already" = 1 ]; then
+        macos_permissions_notice
+        return 0
+    fi
+
+    # A release from before P3d refuses the flag. Asked before the marker and
+    # before the token is spent, so the Mac keeps only the package.
+    if ! "$daemon_bin" enroll --help 2>/dev/null | grep -q -- '--one-row'; then
+        echo "error: this release's roomlerd has no 'enroll --one-row' yet. Nothing was enrolled, the token is not spent, and the package is installed. Run this again without --one-row for two rows (add --daemon-token <second-token> for the root half), or with it once a release carries it." >&2
+        exit 1
+    fi
+
+    say "requesting the root half (root LaunchDaemon: it holds this Mac's one row and runs the overlay)"
+    as_root mkdir -p "$(dirname "$MACOS_DAEMON_MARKER")"
+    as_root touch "$MACOS_DAEMON_MARKER"
+
+    if [ "$PAIR" = 1 ]; then
+        say "pairing this Mac as '$NAME' with $SERVER, as its one row, overlay on — open the page below and type the code"
+        set -- --pair --server "$SERVER" --name "$NAME"
+        [ -z "$PAIR_ORG" ] || set -- "$@" --pair-org "$PAIR_ORG"
+    else
+        say "enrolling this Mac as '$NAME' against $SERVER, as its one row, overlay on (token is single-use, never echoed)"
+        set -- --server "$SERVER" --token "$TOKEN" --name "$NAME"
+    fi
+    # stdin is /dev/null for the reason enroll_daemon gives: under `curl … | sh`
+    # it is the rest of this script. The trace's scope is `system`: the row is
+    # a root LaunchDaemon's.
+    # shellcheck disable=SC2046
+    if ! as_root $(install_trace system) "$daemon_bin" --config "$MACOS_DAEMON_CONFIG" \
+        enroll "$@" --overlay --one-row </dev/null; then
+        echo "error: not enrolled (see above), so this Mac has no row yet. Run this again with a new token, or --pair, and --one-row." >&2
+        exit 1
+    fi
+
+    say "installing the package again: its guard reads the switch, removes the per-user LaunchAgent and starts the root half"
+    if ! as_root installer -pkg "$pkg" -target /; then
+        echo "error: the root half is enrolled as this Mac's one row, but the package did not run again, so the per-user LaunchAgent may still hold the screen. Run this again with --one-row and no token: the Mac is one row already, so it only installs the package." >&2
+        exit 1
+    fi
+
+    # A person's own enrollment from an earlier install: a one-row Mac ignores
+    # it, and nothing runs it any more.
+    person_config="$(home_of "$CONSOLE_USER")/Library/Application Support/live.roomler.roomler/config.toml"
+    if as_root grep -qE '^[[:space:]]*agent_id[[:space:]]*=[[:space:]]*"[^"]' "$person_config" 2>/dev/null; then
+        say "NOTE: '$CONSOLE_USER' also has an enrollment of their own here, from an earlier"
+        say "      install. A one-row Mac ignores it and nothing runs it any more, so its row"
+        say "      stays offline: delete that row in the dashboard (Devices)."
+    fi
+    macos_permissions_notice
+}
+
 # macOS grants these two by hand, per binary, and never errors when they are
 # missing: capture silently returns wallpaper-only frames and injected input is
 # silently dropped. The agent logs both, but to a file under /tmp that nobody
@@ -954,7 +1106,13 @@ macos_permissions_notice() {
     say "remote keyboard and mouse do nothing. Neither reports an error. The 'Roomler'"
     say "entry is the menu-bar app, not roomlerd. macOS applies Screen Recording only"
     say "after roomlerd restarts:"
-    say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+    if [ "$ONE_ROW" = 1 ]; then
+        # FR-43 P3d — a one-row Mac has no LaunchAgent. The root half starts the
+        # worker, and a worker never outlives it, so its restart starts a fresh one.
+        say "  sudo launchctl kickstart -k system/com.roomler.daemon"
+    else
+        say "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+    fi
 }
 
 # FR-102 — the install trace: tell the server HOW this install happened, so
