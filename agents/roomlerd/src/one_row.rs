@@ -986,6 +986,75 @@ pub async fn run(dry_run: bool, revert: bool, yes: bool) -> Result<()> {
     }
 }
 
+/// One entry under `/Users` that leads to a folder, as [`scan_homes`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Home {
+    /// The entry's name: the account's short name, unless the entry is a link.
+    pub user: String,
+    /// The entry itself, `/Users/<user>`.
+    pub path: PathBuf,
+    /// The folder it leads to, every link resolved.
+    pub canonical: PathBuf,
+    /// The owner of that folder.
+    pub uid: u32,
+    /// The entry is a symbolic link.
+    pub via_link: bool,
+}
+
+/// One home per folder, sorted by name. A folder reached under two names is
+/// one person: the tart image's `/Users/runner` → `/Users/admin` planned the
+/// same file twice, and the second Keep stopped the migration with
+/// `File exists` (2026-11-05). The folder's own entry wins over a link to it.
+/// A folder reached only through links keeps the first of them by name, since
+/// its person still has a file to migrate.
+pub fn distinct_homes(mut homes: Vec<Home>) -> Vec<Home> {
+    // A folder's own entry before any link, then by name: the first of each folder stays.
+    homes.sort_by(|a, b| {
+        a.via_link
+            .cmp(&b.via_link)
+            .then_with(|| a.user.cmp(&b.user))
+    });
+    let mut seen = std::collections::HashSet::new();
+    homes.retain(|h| seen.insert(h.canonical.clone()));
+    homes.sort_by(|a, b| a.user.cmp(&b.user));
+    homes
+}
+
+/// Every entry under `root` (`/Users` on a Mac) that leads to a folder: not
+/// hidden, not `Shared`, and resolvable, a link followed and marked. Outside
+/// `mod mac`, so the Linux lane runs its tests.
+#[cfg(unix)]
+pub fn scan_homes(root: &Path) -> Vec<Home> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let user = entry.file_name().to_string_lossy().into_owned();
+        if user.starts_with('.') || user == "Shared" {
+            continue;
+        }
+        let path = entry.path();
+        let (Ok(meta), Ok(canonical)) = (std::fs::metadata(&path), std::fs::canonicalize(&path))
+        else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let via_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+        out.push(Home {
+            user,
+            path,
+            canonical,
+            uid: meta.uid(),
+            via_link,
+        });
+    }
+    out
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
@@ -1169,22 +1238,18 @@ mod mac {
     }
 
     /// Every account under `/Users` with a roomler folder or a LaunchAgent
-    /// plist. A file that does not parse stops Read: the plan would be a guess.
+    /// plist, one person per folder ([`distinct_homes`]). A file that does not
+    /// parse stops Read: the plan would be a guess.
     fn people() -> Result<Vec<Person>> {
         let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir("/Users") else {
-            return Ok(out);
-        };
-        for entry in entries.flatten() {
-            let user = entry.file_name().to_string_lossy().into_owned();
-            if user.starts_with('.') || user == "Shared" {
-                continue;
-            }
-            let home = entry.path();
-            let Ok(meta) = std::fs::metadata(&home) else {
-                continue;
-            };
-            if !meta.is_dir() || meta.uid() == 0 {
+        for found in distinct_homes(scan_homes(Path::new("/Users"))) {
+            let Home {
+                user,
+                path: home,
+                uid,
+                ..
+            } = found;
+            if uid == 0 {
                 continue;
             }
             let dir = crate::appdirs::macos_config_dir_in_home(&home, Path::exists);
@@ -1199,7 +1264,7 @@ mod mac {
             };
             let person = Person {
                 user,
-                uid: meta.uid(),
+                uid,
                 home,
                 dir,
                 config,
@@ -2218,5 +2283,74 @@ mod tests {
             !p.plist_aside()
                 .starts_with(p.home.join("Library").join("LaunchAgents"))
         );
+    }
+
+    fn home(user: &str, canonical: &str, via_link: bool) -> Home {
+        Home {
+            user: user.to_string(),
+            path: Path::new("/Users").join(user),
+            canonical: PathBuf::from(canonical),
+            uid: 501,
+            via_link,
+        }
+    }
+
+    #[test]
+    fn a_folder_reached_under_two_names_is_one_person_named_after_the_folder() {
+        // The tart image's `/Users/runner` → `/Users/admin` (2026-11-05).
+        let kept = distinct_homes(vec![
+            home("runner", "/Users/admin", true),
+            home("admin", "/Users/admin", false),
+        ]);
+        assert_eq!(kept, vec![home("admin", "/Users/admin", false)]);
+    }
+
+    #[test]
+    fn a_folder_reached_only_through_links_keeps_the_first_link() {
+        let kept = distinct_homes(vec![
+            home("zed", "/Volumes/Data/bob", true),
+            home("carol", "/Users/carol", false),
+            home("bob", "/Volumes/Data/bob", true),
+        ]);
+        assert_eq!(
+            kept,
+            vec![
+                home("bob", "/Volumes/Data/bob", true),
+                home("carol", "/Users/carol", false),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_homes_follows_a_link_and_marks_it() {
+        let users = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let u = users.path();
+        std::fs::create_dir(u.join("admin")).unwrap();
+        std::os::unix::fs::symlink(u.join("admin"), u.join("runner")).unwrap();
+        std::fs::create_dir(elsewhere.path().join("bob")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("bob"), u.join("bob")).unwrap();
+        // None of these is an account.
+        std::fs::create_dir(u.join("Shared")).unwrap();
+        std::fs::create_dir(u.join(".hidden")).unwrap();
+        std::fs::write(u.join("notes.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(u.join("gone"), u.join("dangling")).unwrap();
+
+        let mut found = scan_homes(u);
+        found.sort_by(|a, b| a.user.cmp(&b.user));
+        let seen: Vec<(&str, bool)> = found
+            .iter()
+            .map(|h| (h.user.as_str(), h.via_link))
+            .collect();
+        assert_eq!(seen, [("admin", false), ("bob", true), ("runner", true)]);
+        assert_eq!(
+            found[0].canonical, found[2].canonical,
+            "the link leads to admin's folder"
+        );
+        assert_eq!(found[2].path, u.join("runner"));
+
+        let kept: Vec<String> = distinct_homes(found).into_iter().map(|h| h.user).collect();
+        assert_eq!(kept, ["admin", "bob"]);
     }
 }

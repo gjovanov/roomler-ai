@@ -591,7 +591,7 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 | Step | What it does | If it fails |
 |---|---|---|
-| Read | Root and macOS. The root's file enrolled. The daemon answering `Status` on the system socket, served by root, and connected. A person at the console, since the verify needs their session. Every account under `/Users` with a roomler folder or a LaunchAgent plist, its folder found as that person's own process finds it (`crates/agent-core/src/appdirs.rs:85`) | Stops. Nothing has changed |
+| Read | Root and macOS. The root's file enrolled. The daemon answering `Status` on the system socket, served by root, and connected. A person at the console, since the verify needs their session. Every account under `/Users` with a roomler folder or a LaunchAgent plist, its folder found as that person's own process finds it (`crates/agent-core/src/appdirs.rs:85`). One person per folder: an entry that links to another account's folder, as the tart image's `/Users/runner` does to `/Users/admin`, is that account, and the folder's own entry names it (`agents/roomlerd/src/one_row.rs:1010`) | Stops. Nothing has changed |
 | Plan | Each enrollment in a person's file, the primary and every `[[orgs]]` entry, is **retired** where the root holds that server and tenant, and **moved** where it does not (`agents/roomlerd/src/one_row.rs:278`). An ephemeral one the root does not hold stops the plan: such a row lives only with the half that enrolled it. A Mac with no person's enrollment only gets the switches | `--dry-run` stops here, and so does a `*.pre-one-row` an earlier migration left |
 | Keep | Each file it writes copied to `*.pre-one-row`, mode 600, owned as the original, never over another copy | Puts back what it did, and stops |
 | LaunchAgent | `gui/<uid>/com.roomler.agent` booted out where it is loaded and waited out, then its plist moved aside, as `postinstall`'s guard does (`agents/roomlerd/packaging/macos/postinstall:231-232`). The plist goes to the person's roomler folder, not `~/Library/LaunchAgents`, which launchd reads at every login | The same |
@@ -603,9 +603,9 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 **One undo, in a fixed order** (`agents/roomlerd/src/one_row.rs:740`). The copies go back over the files, the plists go back, each LaunchAgent booted out is bootstrapped again, and only then does the daemon restart, onto what was put back. A copy that goes back is consumed, so a Mac put back holds no `*.pre-one-row`. A failed step runs the undo, and so do a restart that never brings a new daemon and a verify that runs out.
 
-**The undo outlives the restart.** Under `roomler exec` the command is the daemon's own child: `sh -c` hands a lone command its pid, and the daemon kills that pid when the restart stops it, before the verify and the undo. So after the yes the command applies nothing itself. A copy of it in a session of its own (`setsid`) does, and goes ahead only if its own plan has the digest of the one that was said (`agents/roomlerd/src/one_row.rs:1094`). The first waits for it and leaves with its code, and once the copy has started, a Ctrl-C or a dropped session ends only the one that waits. The copy never uses `println!`, which panics on a closed pipe (`agents/roomlerd/src/one_row.rs:1266`), and its account also goes to `/var/log/roomler/one-row.log`.
+**The undo outlives the restart.** Under `roomler exec` the command is the daemon's own child: `sh -c` hands a lone command its pid, and the daemon kills that pid when the restart stops it, before the verify and the undo. So after the yes the command applies nothing itself. A copy of it in a session of its own (`setsid`) does, and goes ahead only if its own plan has the digest of the one that was said (`agents/roomlerd/src/one_row.rs:1163`). The first waits for it and leaves with its code, and once the copy has started, a Ctrl-C or a dropped session ends only the one that waits. The copy never uses `println!`, which panics on a closed pipe (`agents/roomlerd/src/one_row.rs:1331`), and its account also goes to `/var/log/roomler/one-row.log`.
 
-**The system socket, by name** (`agents/roomlerd/src/one_row.rs:1361`). A client's default order asks a per-user daemon first, and on a two-row Mac that is the half being retired.
+**The system socket, by name** (`agents/roomlerd/src/one_row.rs:1426`). A client's default order asks a per-user daemon first, and on a two-row Mac that is the half being retired.
 
 **A moved enrollment's overlay starts off**, and so does any listener it had (`agents/roomlerd/src/one_row.rs:226`). A migration that brought up a TUN or a SOCKS port would change the root's network under its owner. The key moves with it, so `roomlerd org overlay` brings back the same node, and the plan says so for each one that ran the overlay.
 
@@ -613,7 +613,7 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 **`--revert`** (`agents/roomlerd/src/one_row.rs:935`) puts back every copy and every plist, bootstraps the console user's LaunchAgent where the root's file it puts back leaves that half to launchd (`agents/roomlerd/src/one_row.rs:928`), and restarts. A retired row a person has deleted since cannot come back: its token is dead, and that half needs `roomlerd enroll` again.
 
-**What the tests prove** (`agents/roomlerd/src/one_row.rs:1390`): the planner and both transforms; the undo after a failed copy, a failed write, a restart that never comes back and a verify that runs out, each leaving the files byte for byte as they were; the dry run writing nothing; a leftover copy refused; the digest that names a plan; and `--revert` giving back the files of a two-row Mac. All of it runs against a fake Mac in a temp dir. `launchctl`, `chown`, `setsid` and the 60 s on a real Mac are the field proof's (AC5, AC12, AC17).
+**What the tests prove** (`agents/roomlerd/src/one_row.rs:1455`): the planner and both transforms; one person per folder, read from a real `/Users`-shaped temp dir with a link in it in the Linux lane; the undo after a failed copy, a failed write, a restart that never comes back and a verify that runs out, each leaving the files byte for byte as they were; the dry run writing nothing; a leftover copy refused; the digest that names a plan; and `--revert` giving back the files of a two-row Mac. All of it runs against a fake Mac in a temp dir. `launchctl`, `chown`, `setsid` and the 60 s on a real Mac are the field proof's (AC5, AC12, AC17).
 
 **The retired row is deleted by a person, through the ordinary route.** `DELETE /api/tenant/{tid}/agent/{id}` (`crates/modules/fleet/src/agent.rs:1320`) is `remove_agent_device` (`crates/modules/fleet/src/removal.rs:43`): the lease released first, then the tombstone, then the kick. That is the order AC12 names. The command cannot do this itself: a device holds no user credential, and `POST /api/agent/self/unenroll` refuses a permanent row on purpose (`agent.rs:569`), so a compromised host cannot erase its own record. Deleting the row is therefore the person's second act, and the Mac works whether or not they have done it yet. A row left behind only reads offline.
 
@@ -1229,3 +1229,25 @@ The control WS held: 0 offline samples of 108, and no reconnect. The root log's 
 `rc:agent.hello sent` lines are the daemon's own connects, at 02:16:04Z and 02:17:14Z, and the
 first kill came at 02:18:49Z. One heartbeat fell inside a gap, at 02:22:14.9Z: the row read
 `no-gui-session` for that heartbeat and `screen-capture` again at the next. That is AC7's revert.
+
+### 2026-11-05 — P3c on released 0.4.200: a `/Users` link names one file twice
+
+The first `sudo roomlerd one-row --yes` on a throwaway tart Mac (macOS 15.7.7, two rows, the
+person at the console) stopped in Keep and put everything back. The tart image ships
+`/Users/runner` as a link to `/Users/admin`. Read followed it, so the plan listed the person's
+one enrollment twice, as `admin, primary` and `runner, primary`, the same row and agent id under
+both, each retired.
+
+| At 02:50:06Z | What the command said, or the Mac read |
+|---|---|
+| Keep | kept the root's file and admin's, then `stopped: keeping a copy of /Users/runner/Library/Application Support/live.roomler.roomler/config.toml: File exists (os error 17)` |
+| Undo | `put back` admin's file and the root's, then `the Mac is as it was` |
+| Root's file, SHA-256 | `7f4b6d43…` before and after |
+| Person's file, SHA-256 | `5edbc80f…` before and after |
+| `*.pre-one-row` left, restart | none, and no restart |
+
+It failed safe. The fix reads `/Users` once (`scan_homes`) and keeps one entry per folder
+(`distinct_homes`, `agents/roomlerd/src/one_row.rs:1010`): the folder's own entry wins over a
+link to it, and a folder reached only through links keeps the first of them by name, since its
+person still has a file to migrate. With the link removed by hand, the same command migrated the
+same Mac. GREEN with the link left in place waits for the release that carries the fix.
