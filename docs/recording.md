@@ -87,7 +87,8 @@ and the loop's next tick waited for it. **Since FR-85 P7 the check is off the lo
 thread every `disk_check_every` (5 s) and raises a flag. The loop only reads that flag and stops `disk_low` as
 before. [`folder.rs:300`](../agents/roomlerd/src/recording/folder.rs#L300) refreshes storage only, so the IOKit
 walks are gone too. A check that takes 120 ms, asked every 250 ms, cost a 3-second recording 25 late ticks inside
-the loop, and costs it none now (`tests/recorder.rs`).
+the loop, and costs it none now (`tests/recorder.rs`). On release 0.4.201, which carries P7, the same MacBook
+recorded 10:29 beside a relay-capped session with 0 late ticks of 18,871, and 2:33 with no session with 0 of 4,598.
 
 ⚠️ **A recording holds the display** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)). On an X11
 host nobody had touched for five minutes, a viewer that connected made display match
