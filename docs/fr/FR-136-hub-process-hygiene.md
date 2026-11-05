@@ -1,9 +1,8 @@
 # FR-136: Hub hygiene — a stopped task leaves nothing running, the host sets the pace, and workers get mail
 
-**Issue:** [#3457](https://github.com/gjovanov/roomler-ai/issues/3457) · **Status:** claimed 2026-11-04.
-P0–P8 shipped the same day. P9–P11 came out of the field runs: the navigator, the pane that shrank
-around it, and hub-guard 0.4.0–0.4.3. AC1–AC8 and AC10 are field-verified; AC9 waits on its
-day-later read, now that all three hubs run guarded. Builds on
+**Issue:** [#3457](https://github.com/gjovanov/roomler-ai/issues/3457) · **Status:** closed 2026-11-05 —
+every criterion field-verified. Claimed 2026-11-04, when P0–P8 shipped. P9–P11 came out of the field
+runs: the navigator, the pane that shrank around it, and hub-guard 0.4.0–0.4.3. Builds on
 [FR-131](FR-131-hub-coordinator.md), the hub. The engineering reference is
 [`agent-hub.md` §12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff),
 and §8 for the view.
@@ -207,18 +206,24 @@ hold a reaper.
       - *`its hub ticked 0 min ago and acts on the cache itself.` (14:04Z);*
       - *`the prompt cache is already cold (1h tier)` on a real worker (07:40:39Z, 13:15:00Z).*
     - *A session that was neither wrote its handoff under `~/.claude/handoffs/` (17:03:30Z).*
-- [ ] **AC9 — field.** The hubs bb, bl1 and unhive resume on it. The first tick shows the host line and
+- [x] **AC9 — field.** The hubs bb, bl1 and unhive resume on it. The first tick shows the host line and
   the badges, respawns are staggered, and a real TaskStop in a worker carries its cleanup line. A day
   later nothing is left behind.
   - *2026-11-04:*
-    - *bb and bl1 resumed on it at 09:01Z, the host line on their first tick, and their respawns
-      staggered.*
+    - *bb and bl1 resumed on it at 09:01Z, and their respawns came back staggered. bb's first tick
+      (09:01:32Z) read `host · CPU n/a · free 55 GB (RAM 55, commit 117) · sessions 9/15 · build slots
+      0/3`.*
+    - *That tick had no process to badge, since every worker was stopped after the reboot. The first
+      badge on a real hub's board came at 11:28:13Z: `W-18 HOT: its processes hold 8 GB (cargo×2,
+      rustc, bash×2, conhost)`.*
     - *A real worker stopped its `gh pr checks --watch` task, and its transcript read `hub-guard
       cleanup: ended 3 processes task … had started (bash, gh, timeout).` (12:12:45Z).*
   - *2026-11-05: unhive's hub, whose process predated the install, came onto the guard at a
     `/reload-plugins` (01:14:49Z): its next background calls were recorded with their tags. It then
     moved to a fresh process at 01:23Z (decision D7).*
-  - *Owed: the day-later read.*
+  - *2026-11-05 11:30Z, 26 hours after the resume: `hub.mjs procs` on bb, bl1 and unhive each read
+    `no worker processes`. The same scan, unfiltered, saw this session's own processes under their
+    call's tag and nothing unreadable, so the empty read is real.*
 - [x] **AC10 — docs.** `docs/agent-hub.md` gains process hygiene, the host budget, the mailbox and the
   idle handoff, in house style (mermaid, tables), and its row in [`docs/README.md`](../README.md)
   says so. *2026-11-04: [§12](../agent-hub.md#12-process-hygiene-the-host-budget-the-mailbox-and-the-idle-handoff),
@@ -278,3 +283,4 @@ Decided by the operator on 2026-11-04:
 | 2026-11-04 23:43 – 2026-11-05 00:04 | P11, hub-guard 0.4.2 and 0.4.3. **Claude Code 2.1.314 answers Esc on a running call exactly as it answers a refused prompt.** The result is an error, `Exit code 137` with `[Request interrupted by user for tool use]`, and never `interrupted: true`, so the interrupt branch had never run live. 0.4.2 sweeps on that shape. Its sweep ran inside the interrupted call and died with it, leaving perl, sh×2 and find. 0.4.3 runs the sweep from a timer 1.5 s later. The unattended run (D6), at 00:04:23, ended `sh, find, sh, perl, find`, left nothing with the tag, and the next result carried the line. |
 | 2026-11-05 00:28–00:30 | P10, hub-view 0.4.0, live. A fresh session's `/hub` answered the host strip, four questions and `5 hubs · 77 workers, 4 running · browse them with hubs in a terminal`, with no model turn (00:29:55). The first try went wrong. It passed `/hub` as a background session's prompt from Git Bash, which rewrote it into a path, `C:/Program Files/Git/hub`. That session started a model turn on the path and was stopped within 25 s, having only read files. `MSYS_NO_PATHCONV=1` keeps a slash command a slash command. |
 | 2026-11-05 01:14–01:55 | **`/reload-plugins` does load a newly installed plugin into a running session**, and the 2026-11-04 07:42 row is corrected. unhive's hub process, started before the install, had left every background call unrecorded: 6 from 16:09 to 23:44, and 2 at 00:13 after a `/clear` at 23:57. After a `/reload-plugins` at 01:14:49, its next two background calls (01:19:07, 01:19:09) were recorded with their tags. Then the operator moved the hub onto a fresh process (D7). A new session resumed it at 01:23:18, and at 01:55:32 its call's `bash` and `gh` carried `HUB_CALL=4cf14264`. All three hubs now run guarded. |
+| 2026-11-05 11:30 | AC9's day-later read, 26 hours after bb and bl1 resumed: `hub.mjs procs` on bb, bl1 and unhive each read `no worker processes`. As a positive control, the same scan unfiltered saw this session's own `sleep` and `node` under their call's tag and nothing unreadable, so the empty read is real. Every criterion is field-verified, and the FR closes. |
