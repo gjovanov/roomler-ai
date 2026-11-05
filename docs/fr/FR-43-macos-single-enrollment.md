@@ -716,10 +716,18 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       19:59:54.2Z, 6.4 s later, while the per-user row stayed online. Booted out again, the
       worker attached at 20:00:53.3Z and the row read `screen-capture` + `input` on the
       heartbeat of 20:00:54.2Z. No offline sample in 61.)*
-- [~] P2c: a device with no worker (every non-macOS agent, and a macOS one with
+- [x] P2c: a device with no worker (every non-macOS agent, and a macOS one with
       the switch off) sends no `caps` on a steady heartbeat, and exactly one when
       what it advertises changes — measured on the wire, not inferred from
       behaviour.
+      *(2026-11-05, Windows, released 0.4.200: the signed `roomlerd.exe` from the perMachine
+      MSI, whose SHA-256 matches its sidecar, taken out by an administrative install so nothing
+      was installed, against the same kind of capture server in a throwaway Win11 guest. 13 steady
+      heartbeats over 5.5 minutes, none with `caps`. The live `rc_clipboard off` from the guest's
+      SSH session, session 0, was refused ("only the person at this device's console can change
+      what a remote session may use here"), as it should be, so a second run made it from the
+      console session: 3 heartbeats without, the next one, 26 s after the flip, with `caps`, then
+      3 without. All three platforms are measured.)*
       *(Reworded 2026-10-31: it said "no `caps` at all", which stopped being true when later
       FRs made more of the caps live, so a heartbeat now re-announces on any change
       (`signaling.rs:2350-2361`). Measured with a capture server on released agents, a live
@@ -1378,6 +1386,18 @@ specified action", and only the root daemon running. The supervisor logged `NoGu
 console_uid=None`, the SSH server took the intercepted port 2.1 s after the daemon started, and
 the row read online, `no-gui-session`. Each end listed the other in `roomler peers`
 (`relay:derp/tcp`, 41–45 ms).
+
+**AC8 on Windows.** A throwaway Win11 guest in the lab ran the signed `roomlerd.exe` of the
+released 0.4.200 perMachine MSI (SHA-256 = its sidecar), taken out by `msiexec /a`, so no service
+and nothing else was installed. It dialled a capture server in the guest, with a config that
+points nowhere else. Run 1 held 5.5 minutes: the hello, then 13 heartbeats every 30 s, none with
+`caps`. Its live `rc_clipboard off` came from the SSH session, which is session 0, and the
+LocalAPI refused it: "only the person at this device's console can change what a remote session
+may use here (clipboard, files, audio)". That is the guard working
+(`crates/localapi/src/lib.rs:2406-2418`). Run 2 made the same change from the console session,
+through a one-shot interactive task as the person logged on there ("in effect now — no restart
+needed"). The heartbeats read 3 without `caps`, then the next one, 26 s after the flip, with
+`caps` (2,101 bytes against about 400), then 3 without. The guest was destroyed by name.
 
 **MacBook-1's TCC log (AC4).** MacBook-1 (macOS 27.0.1) took 0.4.200 at 22:54Z on 11-04. Its
 unified log keeps TCC lines for every hour back past the update, 17 in the update's hour, and
