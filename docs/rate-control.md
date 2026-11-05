@@ -1335,8 +1335,8 @@ still waiting for its evidence.
 | `RATECTL` (env only) | `:582` | FR-63 B1 | shadow | whether the shadow controller runs beside the governor | B2 turns it into the `ratectl` tribool (`shadow`, `live`, `off`) | FR-63 B2 | — |
 | `SHARED_RATE_SPLIT` (env only) | `:895` | shared pipeline | on | a constrained shared encoder divides its ceiling by the live viewer count | ⚠️ an open row: the plan's B3 list does not name it | — | — |
 
-**Heuristics with no switch of their own.** These are FR-62's A4 deletions. Each one
-retires through this table too, and its deletion PR cites the precondition below.
+**Heuristics with no switch of their own.** FR-62's A4 deletions, FR-63's B4 since 2026-11-05.
+Each one retires through this table too, and its deletion PR cites the precondition below.
 
 | Heuristic | Anchor | Plan row | Precondition | State |
 |---|---|---|---|---|

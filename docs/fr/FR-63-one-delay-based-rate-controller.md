@@ -27,6 +27,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 | B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
+| B4 | FR-62's A4, moved here 2026-11-05: retire the IDR-rationing heuristics through the registry, per backend. NVENC only, while every other backend rebuilds with an IDR on every move (AC7) | none of their own: each deletion PR cites its row's precondition in [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) | not started; after B2 plus one release soak |
 
 **B-opener** was not in the original plan; it was added because the field
 evidence on #1243 showed the opener over-driving from *both* directions on
@@ -392,6 +393,7 @@ checkout it runs from.
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
 - [ ] AC5 — The eight replaced estimators and their six switches are deleted; `ratectl = off` restores the prior behaviour for one release.
 - [x] AC6 — **docs.** `docs/rate-control.md` documents the shadow controller — its state machine (mermaid), the six `shadow_*` heartbeat fields, the `ROOMLERD_RATECTL` kill switch and the containment property — and `docs/README.md`'s rate-control row names it. (FR-63's issue opened after the docs-before-close rule reached master, so it carries this criterion; ticked with the docs shipped in the B1 PR.)
+- [ ] AC7 — Every IDR-rationing heuristic FR-62's A4 named is retired through the registry table with its evidence, per backend (B4). Moved from FR-62's AC4 on 2026-11-05. While QSV, VideoToolbox, AMF, D3D12 and Vulkan rebuild with an IDR on every move ([FR-62](FR-62-encoder-rate-changes-without-an-idr.md) AC1), a retirement covers NVENC only.
 
 ## The ramp-exit rule — measured, not argued
 
