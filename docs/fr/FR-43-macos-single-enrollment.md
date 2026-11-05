@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3a, P3b and P3c are field-verified on released 0.4.200** (2026-11-05, a throwaway tart Mac): with the switch on, one row streams and takes input for every org, asks in each org's name under the person's own floor, carries the worker's logs, and serves `roomler ssh` with nobody logged in, and `sudo roomlerd one-row` migrates a two-row Mac, keeping its overlay address and its signature, or puts everything back. The switch is still off by default, so a Mac is two rows until a person migrates it. **P3d is built, default off, with no field proof yet**: `roomlerd enroll --one-row` and `install.sh --one-row` install a Mac as one row from one token. Left: P3d's field read, which waits for a release that carries it and the server roll that serves the script, and the operator's flip of the default: see [P3 design](#p3-design--one-enrollment). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
+**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3a, P3b and P3c are field-verified on released 0.4.200** (2026-11-05, a throwaway tart Mac): with the switch on, one row streams and takes input for every org, asks in each org's name under the person's own floor, carries the worker's logs, and serves `roomler ssh` with nobody logged in, and `sudo roomlerd one-row` migrates a two-row Mac, keeping its overlay address and its signature, or puts everything back. The switch is still off by default, so a Mac is two rows until a person migrates it. **P3d is field-verified on released 0.4.201** (2026-11-05, a fresh tart Mac): the script the server serves, `install.sh --one-row`, installs a Mac as one row from one token, and on its first start that row streams, takes input and serves `roomler ssh`. It is off by default too. Left: the operator's flip of the default: see [P3 design](#p3-design--one-enrollment). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
 
 ⚠️ Anchors RE-VERIFIED against master `c6e8ec58` on 2026-09-06, when this record was
 landed 27 releases after the field run. `remote_control`'s hub moved to
@@ -638,7 +638,7 @@ Built (`agents/roomlerd/src/one_row.rs`), and off in the only way a command can 
 
 A Mac whose root half is a row of its own stops before any change and is pointed to `sudo roomlerd one-row`, since enrolling over it would leave both rows; one that is one row already, both keys read the way the guard reads them, only updates its package and needs no token (`scripts/install.sh:1013`). It is refused, with a message that names the flag, off macOS, on the tunnel role, beside `--daemon-token`, with the halves the wizard runs, and with `--no-enroll` (`scripts/install.sh:287`). A person's enrollment left from an earlier install is ignored by the one row and nothing runs it any more, so the script says its row stays offline (`scripts/install.sh:1080`). On a one-row Mac the grant notice restarts the root half rather than a LaunchAgent that is gone (`scripts/install.sh:1112`). The wizard has no one-row control: FR-129's next phase decides. A unit test pins the check and the arguments against the binary's own help (`agents/roomlerd/src/app.rs:8513`), so a rename on either side fails CI rather than every one-row install.
 
-Before it shipped, the macOS path ran under `dash` with stand-ins for `installer`, `launchctl`, `sudo` and `roomlerd`; the stand-in `installer` reads the guard's two conditions as the postinstall does. Of 18 cases, the script before the change passed 2: the two-row install, which is the control, and one refusal its unknown-flag error happened to satisfy. The change passed all 18. That proves the order, the refusals and the messages, not macOS. AC1's install half is the field read: a fresh tart Mac, one token, one row on its first start, once a release carries `enroll --one-row` and the server's roll serves the script.
+Before it shipped, the macOS path ran under `dash` with stand-ins for `installer`, `launchctl`, `sudo` and `roomlerd`; the stand-in `installer` reads the guard's two conditions as the postinstall does. Of 18 cases, the script before the change passed 2: the two-row install, which is the control, and one refusal its unknown-flag error happened to satisfy. The change passed all 18. That proves the order, the refusals and the messages, not macOS. AC1's install half is the field read, done on released 0.4.201 with the script the server serves: a fresh tart Mac, one token, one row on its first start ([field log](#2026-11-05--p3d-on-released-04201-one-token-one-row)).
 
 ### What does not move
 
@@ -665,7 +665,7 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
 
 ## Acceptance criteria
 
-- [~] A fresh install with **one** token produces **one** device row, and that row serves
+- [x] A fresh install with **one** token produces **one** device row, and that row serves
       both a remote-desktop session and `roomler ssh`.
       *(2026-11-05, released 0.4.200, tart Mac, the switches set by hand: everything but the
       install itself, which is P3d's. RED: one token on the root alone, the switch off. The worker
@@ -675,6 +675,13 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       `screen-capture` + `input`, and a viewer decoded lit pixels (99.4 %, VP9 4:4:4). On the
       migrated Mac, one boot served both on the same row: `roomler ssh` as root and an RD session
       (99.6 % lit). Field log.)*
+      *(2026-11-05, released 0.4.201, the install itself: a fresh tart Mac and the script the
+      server serves, `install.sh --one-row` with one token. RED: before the server's roll, the
+      served script answered `unknown flag: --one-row`. GREEN: one row on the first start, both
+      switches in the root's file, no LaunchAgent, and the worker `run --supervised --unenrolled`
+      attached 193 ms after its spawn. After the grants and the restart the script names, a
+      viewer decoded lit pixels (99.6 %, VP9 4:4:4) and its input arrived, and `roomler ssh` ran
+      as root on the same row. Field log.)*
 - [x] `roomler exec <mac>` reaches root-owned paths **and** the GUI session's log from the
       same row (today this needs two different rows).
       *(2026-10-31, 0.4.190, read-only on MacBook-1. It needs no P3: the "two rows" above was
@@ -1326,7 +1333,15 @@ It failed safe. The fix reads `/Users` once (`scan_homes`) and keeps one entry p
 (`distinct_homes`, `agents/roomlerd/src/one_row.rs:1010`): the folder's own entry wins over a
 link to it, and a folder reached only through links keeps the first of them by name, since its
 person still has a file to migrate. With the link removed by hand, the same command migrated the
-same Mac. GREEN with the link left in place waits for the release that carries the fix.
+same Mac.
+
+**GREEN on released 0.4.201**, the same afternoon: a second fresh tart Mac, made two rows by the
+script the server serves (`--token` and `--daemon-token`), the link left in place. `one-row
+--dry-run` listed the person once, as `admin, primary`, and `one-row --yes` went through: it kept
+both files, booted the LaunchAgent out and moved its plist aside, wrote both files, restarted, and
+said "the root half is connected, and its GUI worker attached (screen-capture, input)", the
+overlay address as before. The retired row read offline with its `DELETE`, and a session on the
+one row streamed (99.6 % lit).
 
 ### 2026-11-05 — P3a to P3c on released 0.4.200: one row, end to end
 
@@ -1427,3 +1442,43 @@ switch off) got `no_display` 30 s in, after the viewer had re-created it at 10 s
 of #3497, 0.4.252, in the same layout, the page named `no_display` 2.04 s after it connected,
 with no stall and no re-create in 50 s, and the root refused 98 ms after the request
 (`checked_in_us=274`).
+
+### 2026-11-05 — P3d on released 0.4.201: one token, one row
+
+A throwaway tart Mac (macOS 15.7.7, the person logged in by auto-login), cloned fresh for this
+read and deleted after it. Before the install it held nothing of roomler: no bundle, no config
+in either place, no LaunchAgent or LaunchDaemon, no package receipt, no process. The command was
+the documented one, piped from the server:
+
+```bash
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --token <token> --one-row --server https://roomler.ai --name <name>
+```
+
+The script that ran was byte-identical to master's at the 0.4.201 bump. It picked the released
+0.4.201 `.pkg` and checked its SHA-256. RED, at 04:52Z, before the server's roll: the script it
+served then answered `unknown flag: --one-row`.
+
+| At | What the script said, or the Mac and the server read |
+|---|---|
+| 15:18:34Z – 15:18:52Z | The package; the check; the marker; `enroll … --overlay --one-row`, "Enrollment successful"; the package again, whose guard "removes the per-user LaunchAgent and starts the root half"; the grant notice, naming `sudo launchctl kickstart -k system/com.roomler.daemon`. Exit 0 |
+| 15:18:51Z | The root half: `macOS GUI-worker supervisor ON … one_row=true`, the worker spawned as the person, the delegation channel attached 193 ms later |
+| 15:18:57Z | One row in the org, online, 0.4.201, and no other |
+| 15:19:09Z | The root's file: `macos_one_row = true`, `macos_supervise_gui_worker = true`, `overlay_enabled = true` and the enrollment. The person's file: no enrollment. No `~/Library/LaunchAgents/com.roomler.agent.plist`, and no `gui/501/com.roomler.agent`. `system/com.roomler.daemon` running, and the worker `run --supervised --unenrolled` |
+
+Then the two grants, written into TCC as the lab's stand-in for the person's two toggles, and
+the restart the notice names. The worker logged both grants held, and the row read
+`screen-capture`, `input`.
+
+| On the one row | Result |
+|---|---|
+| A session from the private headless viewer | Its input arrived: the pointer on three test points within 1 pt, a wheel notch, and "hello 123A" typed into a Terminal. The stream: 99.6 % lit, VP9 4:4:4 |
+| `roomler ssh` from an originator (the released 0.4.201 `.deb` in a container on the lab host), with the org's switch and both rows' policies on, as in the entry above | First "roomler SSH is switched off on the device itself", since the install leaves the device's own `ssh_enabled` off. With it on and the root half restarted: `uid=0(root)`, console `admin`, the worker running, exit 0 |
+| A second session, on the same daemon after the SSH read | 99.6 % lit |
+
+The vmtest org's `remote_ssh_enabled` was on from 15:23:44Z to 15:25:10Z and read back off. Both
+rows' SSH policies were closed before the delete. The originator, the Mac and both rows were
+deleted.
+
+On its first start macOS also asked whether `roomlerd` may find devices on local networks, and
+announced the new background item. The session waited on neither.
