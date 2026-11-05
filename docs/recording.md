@@ -96,8 +96,11 @@ host nobody had touched for five minutes, a viewer that connected made display m
 session let the display go, and a remote recording started in that session was recorded at the matched size. Now
 the recording holds the display from just before its recorder launches until it has stopped: a mode a session
 switched goes back first, and display match refuses `recording` meanwhile, then decides those requests again at
-its end ([`display-match.md`](display-match.md#a-recording-holds-the-display-3467)). The fix rides the next agent
-release. Until a device runs it, `display_match = never` in its config avoids the problem.
+its end ([`display-match.md`](display-match.md#a-recording-holds-the-display-3467)). **Fixed in agent 0.4.201**,
+read on that release on the same kind of host on 2026-11-05
+([FR-108 §8 row 16](fr/FR-108-display-follows-the-viewer.md#8-field-verification-log)): the viewer that joined was
+refused `recording`, the clock in the file moved to its last frame, and a remote recording started in a switched
+session was recorded at 1920×1080. On an older agent, `display_match = never` in its config avoids the problem.
 
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
