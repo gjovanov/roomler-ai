@@ -1705,6 +1705,14 @@ that stays down until the next boot or `service start --as-service`: the plist
 restarts only a failed exit, and the clean stop exits 0 (measured). The
 per-user `roomlerd service stop` works the same way.
 
+**One token, one row (FR-43 P3d).** On a Mac whose person has not enrolled, add
+`--one-row` to that root enroll. It writes both switches with the enrollment, so the
+daemon's first start is one row, and it is refused off macOS and without root before
+the token is spent. The LaunchAgent the package put in place still has to go: running
+the package again removes it, because its guard reads the switch, and then
+`service install --as-service` starts the root half. `install.sh --one-row` does all of
+this in one command, in a later release.
+
 ### Grant the two permissions — nothing works until you do
 
 macOS gates capture and input, and **it never reports an error when a grant is
