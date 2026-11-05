@@ -519,7 +519,7 @@ Join «Acme» (acme) as approved by «Dana» (@dana)? [y/N]
 > reason for the byte-for-byte match, and an early draft that case-folded let exactly such a
 > lookalike through on the dev stack.
 
-**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:256-295`) is refused
+**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:269-331`) is refused
 beside `--token` or `--no-enroll`, for the tunnel role (the `roomler` CLI has no `--pair` yet),
 beside `--daemon-token`, and on a B0 half. The slug is checked against a spelled-out character
 class, because a range like `a-z` follows the locale's collation in some shells. The enroll
