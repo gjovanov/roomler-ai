@@ -66,13 +66,13 @@ them:
 
 | Step | Where | Why it is not optional |
 |---|---|---|
-| package format follows the host | `scripts/install.sh:402-421` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
-| the macOS root-half marker | `scripts/install.sh:539-548` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
-| the per-user half as the console user | `scripts/install.sh:199-210` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
-| the macOS second enrollment | `scripts/install.sh:570-600` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
-| the FR-96 update helper | `scripts/install.sh:324-342` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
-| the desktop companion | `scripts/install.sh:843`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
-| digest verification | `scripts/install.sh:219-228` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
+| package format follows the host | `scripts/install.sh:438-457` | a `.deb` on a host without dpkg downloads and then fails; non-dpkg hosts take the tarball, mirroring the updater |
+| the macOS root-half marker | `scripts/install.sh:575-584` | must exist **before** the `.pkg` runs — its absence actively removes the LaunchDaemon; "nothing in the product ever created this file, which is why the privileged half was unreachable through the advertised one-liner despite shipping for months" |
+| the per-user half as the console user | `scripts/install.sh:202-222` | a root run re-targets the per-user enroll at the console user; a root-owned config is the documented failure mode |
+| the macOS second enrollment | `scripts/install.sh:606-636` | the overlay needs root, and the hub keys sessions on `agent_id`, so the root half is a separate device with its own token (FR-43 P2c/P3 have not collapsed it yet) |
+| the FR-96 update helper | `scripts/install.sh:360-378` | a per-user Linux install cannot write `/usr`; the root helper installs its updates |
+| the desktop companion | `scripts/install.sh:891`, header `:36-40` | the companion is the device's consent **prompt surface**; a "Prompt on host" device without one cannot ask anybody |
+| digest verification | `scripts/install.sh:232-241` | soft-skips when a release publishes no digest — tolerable in a terminal, **not** for a GUI that elevates to root (Phase B fails closed instead) |
 
 ## The mechanism, in the code (master `b4e72ff0d`)
 
@@ -99,7 +99,7 @@ it. Do not shift these anchors with code that moved later.*
 | platform strings | `crates/roomler-setup-core/src/asset_resolver.rs:265-300` | `windows-x86_64`, `linux-x86_64`, `linux-aarch64`, `macos` |
 | token step | `agents/roomler-setup/src/front/index.html:176-204`; `app.js:499-538`, `:718-769` | paste + a live, unverified JWT peek (`cmd_validate_token`, `commands.rs:248`); no polling anywhere in the frontend |
 | browser open | `agents/roomler-setup/tauri.conf.json:40-41` | the shell-open plugin is enabled and unused by the token step |
-| terminal installer | `scripts/install.sh:402-509` (Linux), `:511-576` (macOS), `:584-610` (root half), `:642` (enroll), `:842` (companion) | plain `sudo`, so it needs a terminal; no `pkexec` anywhere |
+| terminal installer | `scripts/install.sh:438-545` (Linux), `:547-612` (macOS), `:620-646` (root half), `:678` (enroll), `:890` (companion) | plain `sudo`, so it needs a terminal; no `pkexec` anywhere |
 
 ## Key design
 
@@ -325,7 +325,7 @@ flowchart TB
 
 1. **The seam is decided by a spike (B0), then recorded here before B1.** The candidates:
    - **(i)** Run the whole script elevated. This breaks the per-user Linux path, which runs
-     `systemctl --user` as the invoking user (`install.sh:736`); under `pkexec` that is root's
+     `systemctl --user` as the invoking user (`install.sh:772`); under `pkexec` that is root's
      user manager.
    - **(ii)** Give `install.sh` a privileged-steps entry point and a user-steps entry point.
      The terminal path calls both in order and does not change; the wizard elevates only the
@@ -671,7 +671,7 @@ flowchart TB
    shows the terminal command. That command carries no secret; the wizard enrolls in-process
    once it detects the installed daemon.
 3. **Fail closed on a missing digest** when elevated, unlike the terminal's soft-skip
-   (`install.sh:409-430`). A root install of an unverified package is the thing to refuse.
+   (`install.sh:445-466`). A root install of an unverified package is the thing to refuse.
 4. **Roles.**
    - **Linux per-user** (the default for a desktop): screen sharing, plus the overlay through
      the userspace netstack.

@@ -1215,7 +1215,7 @@ and loses nothing: its daemon could not start before either, so no updater runs
 there, and re-running the install heals it.
 
 **`install.sh` installs a `.deb` in two steps** (`deb_install`,
-`scripts/install.sh:1328`), and the wizard's root half is the same code:
+`scripts/install.sh:1486`), and the wizard's root half is the same code:
 
 ```mermaid
 flowchart TD
@@ -1241,7 +1241,7 @@ left half-configured.
 The companion takes the same two steps and comes off again if they fail, because a
 half-configured companion blocks apt for the whole host. The CLI's arm keeps
 `apt-get -f install` on purpose: it checks the result and falls back to the tarball
-(`scripts/install.sh:1062`, #2472).
+(`scripts/install.sh:1220`, #2472).
 
 **What checks all this.** `scripts/deb-bare-check.sh` installs the finished packages
 on Ubuntu 22.04, 24.04 and 26.04 and Debian 12 and 13, with
@@ -1680,6 +1680,11 @@ curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --token <token> --daemon-token <second-token> \
   --server https://roomler.ai --name "$(hostname)"
 
+# Both on ONE device row, from one token (FR-43 P3d, off by default; see below):
+curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
+  --role daemon --token <token> --one-row \
+  --server https://roomler.ai --name "$(hostname)"
+
 # Or pair in the browser instead of pasting a token (FR-129 A4): the per-user half …
 curl -fsSL https://roomler.ai/api/setup/install.sh | sh -s -- \
   --role daemon --pair --server https://roomler.ai --name "$(hostname)"
@@ -1705,13 +1710,32 @@ that stays down until the next boot or `service start --as-service`: the plist
 restarts only a failed exit, and the clean stop exits 0 (measured). The
 per-user `roomlerd service stop` works the same way.
 
-**One token, one row (FR-43 P3d).** On a Mac whose person has not enrolled, add
-`--one-row` to that root enroll. It writes both switches with the enrollment, so the
-daemon's first start is one row, and it is refused off macOS and without root before
-the token is spent. The LaunchAgent the package put in place still has to go: running
-the package again removes it, because its guard reads the switch, and then
-`service install --as-service` starts the root half. `install.sh --one-row` does all of
-this in one command, in a later release.
+**One token, one row (FR-43 P3d).** `install.sh --one-row` installs a Mac that is not
+enrolled yet as one row, from one token or one `--pair` approval. It runs the package as
+a per-user install runs it, then writes the marker and enrolls the root half with the
+overlay on and both switches (`roomlerd enroll --one-row`), then runs the package again.
+On that second run the package's guard reads the switch, removes the per-user
+LaunchAgent and its plist, and starts the root half, which starts the person's worker.
+The guard decides it here as it does at every update after.
+
+| The Mac | What `install.sh --one-row` does |
+|---|---|
+| Not enrolled yet | The three steps above: one row |
+| One row already | Updates the package and keeps the enrollment; no token needed |
+| Its root half is a row of its own | Stops before changing anything and names `sudo roomlerd one-row`, the migration above |
+| The agent release predates P3d | Installs the package, then stops before the marker: nothing enrolled, the token not spent |
+| Its person enrolled in an earlier install | Goes ahead, and says that row now stays offline, to be deleted in the device list |
+
+It is refused, with a message that names the flag, off macOS, with `--role tunnel`,
+beside `--daemon-token`, with `--privileged-steps` or `--user-steps`, and with
+`--no-enroll`. It is the script's alone for now: the wizard has no one-row control, and
+FR-129's next phase decides whether it gets one. The script a server hands out changes
+with that server's roll.
+
+By hand, add `--one-row` to the root enroll above. It writes both switches with the
+enrollment, so the daemon's first start is one row, and it is refused off macOS and
+without root before the token is spent. Then the package has to run again, so that its
+guard removes the LaunchAgent, and `service install --as-service` starts the root half.
 
 ### Grant the two permissions — nothing works until you do
 
@@ -1760,6 +1784,11 @@ on macOS 15.7). Restart it in any of three ways:
 | **Quit & Reopen** — the button macOS offers when you turn the toggle on | System Settings sends the agent a Quit AppleEvent (with a log-out's reason, `'rlgo'`); the agent tells it from a real log-out by its sender (only `loginwindow` quits a session that is ending), leaves with its restart code, and launchd relaunches it within milliseconds. Finder may still say "The application “roomlerd” is not open anymore": its *Reopen* looks for the process that quit, while launchd has already brought the agent back. ⚠️ Agents up to 0.4.189 exited 0 instead, which launchd does not relaunch: the device stayed **offline** until a `kickstart`. Fixed in 0.4.190 (2026-10-31), field-verified on that release |
 | **Restart roomlerd** in the menu-bar app's permission card | the LocalAPI `RestartDaemon` verb (the same as Settings' *Apply now*) |
 | `launchctl kickstart -k gui/$(id -u)/com.roomler.agent` in Terminal | the restart that works on every version |
+
+A one-row Mac has no LaunchAgent to kickstart. There `sudo launchctl kickstart -k
+system/com.roomler.daemon` restarts the root half, and since a worker never outlives its
+daemon, the worker it starts next holds the grant. That is the line `install.sh
+--one-row` prints.
 
 Accessibility is read live: input works from the next remote event, with no
 restart (up to 0.4.189 the first session's failed input backend was kept until
@@ -2147,7 +2176,7 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 ### The order is the design
 
-`scripts/install.sh:1270` (the section) — `uninstall_linux` at `:1714`,
+`scripts/install.sh:1428` (the section) — `uninstall_linux` at `:1872`,
 `uninstall_macos` at `:1494`.
 
 ```mermaid
