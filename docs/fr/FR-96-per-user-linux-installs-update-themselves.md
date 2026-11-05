@@ -82,7 +82,7 @@ sequenceDiagram
 | the install, as root | reused | `linux_install_candidates(0, …)` `:2009-2023`; `install_tarball_linux(0, …)` `:2075-2198` |
 | the opt-out, `/etc/roomler/disable-auto-update` | reused | the helper's `OPT_OUT` `:3527-3534` (shared by macOS and Linux) |
 | the wake file: content ignored, never followed through a symlink | generalised | `MACOS_UPDATE_TRIGGER` `:3028`, `LINUX_UPDATE_TRIGGER` `:3033`, `queue_update_check` / `queue_update_check_at` `:3248-3267` (was `macos_queue_update_check`) |
-| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1780-1808`) |
+| `roomlerd update-helper` on Linux | new (P1) | the `Command::UpdateHelper` arm, macOS and Linux (`app.rs:1885-1900`) |
 | `roomler-update.{service,timer,path}` | new (P1) | shipped in the `.deb` (`agents/roomlerd/Cargo.toml` assets `:779-818`) and the tarball (`scripts/stage-linux-tarball.sh:55-58`, `TARBALL_INSTALL_IF_ABSENT` `updater.rs:1917-1927`) |
 | the download's private staging dir (mkdtemp, 0755, `O_EXCL` write) — the security review's finding 1 | new | `stage_dir` / `write_installer` / `discard_staging` (`updater.rs`) |
 | the run-spacing gate — launchd's `ThrottleInterval` twin, the security review's finding 2 | new | `UPDATE_HELPER_MIN_GAP` / `helper_gate_wait` / `stamp_helper_gate` (`updater.rs`) |
@@ -216,7 +216,7 @@ at `:452` and `:461-469`):
   served by the server and ships with a promote, while the daemon ships with an agent release, and the two need not
   arrive in order. A word is never renamed or removed: `the_capabilities_are_the_words_install_sh_matches` pins
   the pair.
-- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1420-1430`, `updater.rs:3952-3980`),
+- ⚠️ **The query is read off argv before clap parses anything** (`app.rs:1446-1456`, `updater.rs:3952-3980`),
   and only its exact form (`only_the_exact_capabilities_query_is_answered_before_parsing`). It was a clap flag at
   first, a `--capabilities` field on `Command::UpdateHelper`, and CI's Windows recorder lane (FR-85) went red: the
   debug binary died before printing a line, twice on the same commit, while the parent PR passed on the same base.
