@@ -1502,6 +1502,230 @@ mod tests {
             }
         }
     }
+
+    /// #3472 — how the pump's idle keepalive reaches libvpx. The X11 capture
+    /// is damage-gated (FR-29), so a screen that changes every `period_ms`
+    /// hands the pump one real frame per period and `None` in between, and
+    /// 60 ms after each real frame the pump re-encodes it (`IDLE_KEEPALIVE`
+    /// in `peer.rs`): the SAME `Arc<Frame>`, so the same `monotonic_us`, which
+    /// `encode_sync` hands libvpx as the pts.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Ka {
+        /// The keepalive repeats its real frame's pts: the pump today.
+        Repeat,
+        /// The keepalive carries the time it is encoded.
+        Fresh,
+        /// No keepalive at all.
+        None,
+    }
+
+    struct Issue3472Run {
+        bps: f64,
+        encodes_per_real: f64,
+        real_q: f64,
+        ka_q: f64,
+        real_kb: f64,
+        ka_kb: f64,
+    }
+
+    /// One run of that pattern, measured after a 2 s warm-up. `target_bps`
+    /// `None` skips `set_bitrate`, leaving libvpx at the boot target a
+    /// rebuilt encoder keeps (`DEFAULT_BITRATE_BPS`).
+    fn issue3472_run(
+        w: u32,
+        h: u32,
+        target_bps: Option<u32>,
+        ka: Ka,
+        period_ms: u64,
+        keepalives: u64,
+        secs: u64,
+    ) -> Issue3472Run {
+        use crate::encode::VideoEncoder;
+        fn rnd(s: &mut u64) -> u64 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        }
+        // A glyph-like 8x14 cell of 1-2 px strokes, as a terminal draws text.
+        fn glyph(buf: &mut [u8], w: u32, x0: u32, y0: u32, bits: u64, ink: u8) {
+            for yy in 1..13u32 {
+                for xx in 1..7u32 {
+                    if (bits >> ((yy * 6 + xx) % 63)) & 1 == 1 {
+                        let i = (((y0 + yy) * w + x0 + xx) * 4) as usize;
+                        buf[i..i + 3].fill(ink);
+                    }
+                }
+            }
+        }
+        // A maximized terminal of static grey text, and a smaller window
+        // whose text is redrawn at random on every real capture: the shape
+        // of the field's stimulus (FR-85 AC1, 2026-11-03 and 11-04).
+        let mut seed = 0x3472_5EED_u64;
+        let mut base = vec![0u8; (w * h * 4) as usize];
+        for px in base.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        for y0 in (0..h.saturating_sub(14)).step_by(14) {
+            for x0 in (0..w.saturating_sub(8)).step_by(8) {
+                if rnd(&mut seed) % 10 < 6 {
+                    let bits = rnd(&mut seed);
+                    glyph(&mut base, w, x0, y0, bits, 170);
+                }
+            }
+        }
+        let (wx, wy, ww, wh) = (w / 2, h / 3, w * 9 / 20, h * 2 / 5);
+        let mut window_frame = |t_us: u64| -> Frame {
+            let mut buf = base.clone();
+            for y in wy..wy + wh {
+                let row = ((y * w + wx) * 4) as usize;
+                buf[row..row + (ww * 4) as usize]
+                    .chunks_exact_mut(4)
+                    .for_each(|px| px[..3].fill(0));
+            }
+            for y0 in (wy..wy + wh - 14).step_by(14) {
+                for x0 in (wx..wx + ww - 8).step_by(8) {
+                    let bits = rnd(&mut seed);
+                    glyph(&mut buf, w, x0, y0, bits, 255);
+                }
+            }
+            Frame {
+                width: w,
+                height: h,
+                stride: w * 4,
+                pixel_format: PixelFormat::Bgra,
+                data: buf.into(),
+                monotonic_us: t_us,
+                monitor: 0,
+                damage: crate::capture::Damage::Unknown,
+                source: None,
+            }
+        };
+        // The pump's encoder: `target_fps` 60 (the software tier), 4:4:4,
+        // CBR, a relay's uncapped worst quality.
+        let mut enc =
+            Vp9Encoder::new_with_fps_chroma(w, h, 60, Vp9Chroma::Yuv444).expect("encoder init");
+        if let Some(t) = target_bps {
+            VideoEncoder::set_bitrate(&mut enc, t);
+        }
+        let (warm_us, end_us, period_us) = (2_000_000, secs * 1_000_000, period_ms * 1_000);
+        let (mut bytes, mut periods, mut real_n, mut ka_n) = (0usize, 0u64, 0u64, 0u64);
+        let (mut real_q, mut ka_q, mut real_b, mut ka_b) = (0f64, 0f64, 0usize, 0usize);
+        let mut t_us = 1_000u64;
+        while t_us < end_us {
+            let measured = t_us >= warm_us;
+            let frame = window_frame(t_us);
+            let pkts = enc.encode_sync(&frame).expect("encode");
+            if measured {
+                periods += 1;
+                real_n += 1;
+                let b: usize = pkts.iter().map(|p| p.data.len()).sum();
+                bytes += b;
+                real_b += b;
+                real_q += pkts.iter().filter_map(|p| p.qp).max().unwrap_or(0) as f64;
+            }
+            for k in 1..=keepalives {
+                let t_ka = t_us + 60_000 * k;
+                if ka == Ka::None || t_ka >= t_us + period_us {
+                    break;
+                }
+                let pkts = if ka == Ka::Repeat {
+                    enc.encode_sync(&frame)
+                } else {
+                    let mut f = frame.clone();
+                    f.monotonic_us = t_ka;
+                    enc.encode_sync(&f)
+                }
+                .expect("encode");
+                if measured {
+                    ka_n += 1;
+                    let b: usize = pkts.iter().map(|p| p.data.len()).sum();
+                    bytes += b;
+                    ka_b += b;
+                    ka_q += pkts.iter().filter_map(|p| p.qp).max().unwrap_or(0) as f64;
+                }
+            }
+            t_us += period_us;
+        }
+        let secs_measured = (periods * period_us) as f64 / 1e6;
+        Issue3472Run {
+            bps: bytes as f64 * 8.0 / secs_measured,
+            encodes_per_real: (real_n + ka_n) as f64 / real_n.max(1) as f64,
+            real_q: real_q / real_n.max(1) as f64,
+            ka_q: ka_q / ka_n.max(1) as f64,
+            real_kb: real_b as f64 / real_n.max(1) as f64 / 1000.0,
+            ka_kb: ka_b as f64 / ka_n.max(1) as f64 / 1000.0,
+        }
+    }
+
+    /// #3472 — the OFFLINE measurement: the same frames through the pump's
+    /// encoder with the keepalive's pts repeated (today), fresh, or with no
+    /// keepalive, plus `repeat-boot` (no `set_bitrate`: a rebuilt encoder).
+    /// Knobs: `ISSUE3472_DIMS` (`800x600`), `ISSUE3472_PERIOD_MS` (100),
+    /// `ISSUE3472_KEEPALIVES` (1), `ISSUE3472_TARGET` (3000000),
+    /// `ISSUE3472_SECS` (30).
+    #[test]
+    #[ignore = "a measurement: run by name with --ignored --nocapture"]
+    fn issue3472_offline_keepalive_pts() {
+        let knob = |k: &str, d: u64| -> u64 {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(d)
+        };
+        let (w, h) = std::env::var("ISSUE3472_DIMS")
+            .ok()
+            .and_then(|v| {
+                let (a, b) = v.trim().split_once('x')?;
+                Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
+            })
+            .unwrap_or((800, 600));
+        let period = knob("ISSUE3472_PERIOD_MS", 100);
+        let kas = knob("ISSUE3472_KEEPALIVES", 1);
+        let target = knob("ISSUE3472_TARGET", 3_000_000) as u32;
+        let secs = knob("ISSUE3472_SECS", 30);
+        for (arm, tgt, ka) in [
+            ("repeat", Some(target), Ka::Repeat),
+            ("fresh", Some(target), Ka::Fresh),
+            ("none", Some(target), Ka::None),
+            ("repeat-boot", None, Ka::Repeat),
+        ] {
+            let r = issue3472_run(w, h, tgt, ka, period, kas, secs);
+            println!(
+                "S3472 arm={arm} dims={w}x{h} period_ms={period} keepalives={kas} target={} mbps={:.2} x_target={:.2} encodes_per_real={:.2} real_q={:.0} ka_q={:.0} real_kb={:.1} ka_kb={:.1}",
+                tgt.unwrap_or(DEFAULT_BITRATE_BPS),
+                r.bps / 1e6,
+                r.bps / tgt.unwrap_or(DEFAULT_BITRATE_BPS) as f64,
+                r.encodes_per_real,
+                r.real_q,
+                r.ka_q,
+                r.real_kb,
+                r.ka_kb
+            );
+        }
+    }
+
+    /// #3472 — RED on master. Fed as the pump feeds it on a screen that
+    /// changes every 100 ms (a keepalive 60 ms after each real capture,
+    /// carrying that capture's own pts), libvpx spends about twice its
+    /// target: it reads its frame rate off the pts gaps, a repeated pts adds
+    /// no time, and every encode is still granted target ÷ that rate. Field,
+    /// 2026-11-03 and 11-04: 6.1–7.2 Mbps against a 3 Mbps relay ceiling, with
+    /// twice as many encodes as captures. Un-ignore it with the fix.
+    #[test]
+    #[ignore = "#3472: red on master until a re-fed frame stops repeating its pts"]
+    fn issue3472_repeated_pts_keepalives_hold_the_target() {
+        let target = 3_000_000u32;
+        let r = issue3472_run(800, 600, Some(target), Ka::Repeat, 100, 1, 12);
+        assert!(
+            r.bps <= 1.25 * target as f64,
+            "spent {:.2} Mbps against a {:.1} Mbps target ({:.2}x), {:.2} encodes per real frame",
+            r.bps / 1e6,
+            target as f64 / 1e6,
+            r.bps / target as f64,
+            r.encodes_per_real
+        );
+    }
 }
 
 #[cfg(test)]
