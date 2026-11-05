@@ -17,7 +17,7 @@ rules that every FR worker follows are in
 The tooling is **not in this repo**: on 2026-10-30 the operator decided it stays local for now, in
 the user's Claude skills folder, with a source history of its own. Its files are cited below by
 section name (`SKILL.md §Signals`), never by line.
-*As of Claude Code 2.1.314, the hub skill of 2026-11-04, `hub-view` 0.4.0 and `hub-guard` 0.4.3.*
+*As of Claude Code 2.1.314, the hub skill of 2026-11-05, `hub-view` 0.4.1 and `hub-guard` 0.4.3.*
 
 ## 1. What it is, and why sessions
 
@@ -245,7 +245,10 @@ stands alone and the exact commands to answer (in the hub's terminal, from the v
 the worker with `claude attach <short>`). An answer from the hub view arrives as mail headed
 `[hub mail · from the operator, in the hub view]`, or, sent to an older generation, with
 `(the operator, from the hub view)` on its second line, and the worker treats it as the operator's
-own words.
+own words. A question the worker marks `"typed": true` is the exception. It counts only when the
+operator types the answer in the worker's own session, because the permission check refuses an OK
+that anyone relays. So the hub gives only the ways in (`hubs`, `claude attach <short>`), and no view
+sends an answer to it.
 
 ## 5. Signals
 
@@ -444,7 +447,7 @@ their rows do, not the workers its own state says it runs.
 | `R` | restarts a stopped worker and attaches; twice when its hub stopped it, and never while the host holds new sessions. Enter never restarts one. |
 | `/` | filters every hub and worker by id, title, PR or issue; Esc clears it |
 | `d` · `r` · `q` | shows or hides finished workers · refreshes (it also refreshes every 30 s) · quits |
-| in a worker: `a` · `u` · `w` · `p` · `o` | answers its question, into its mailbox · cleans up what earlier generations left (`hub.mjs reap`) · opens the worktree · the PR · the issue |
+| in a worker: `a` · `u` · `w` · `p` · `o` | answers its question, into its mailbox (a typed question gets nothing: `a` says Enter or `R` instead) · cleans up what earlier generations left (`hub.mjs reap`) · opens the worktree · the PR · the issue |
 
 **Attaching in the same window.** The navigator can't hand its own console to `claude attach`, so
 it writes the session to attach to into a file and exits. The launcher then runs `claude attach`,
@@ -507,9 +510,10 @@ phone there is no text field, and the worker view says how to answer instead.
 | **m** | the worker's current generation was spawned with a mailbox, running or not | `hub.mjs post --verb ANSWER --q q<id> --from operator --text <text>` (or `FYI`), one argv with no shell; it reads `✉ in its mailbox`, or `✉ waits` while the worker is stopped, then `✔ delivered <time>` once hub-guard moves it to `delivered/` |
 | **a** | the worker runs, and this session's permission mode equals the worker's (or either mode is unknown) | `$.session.send` straight to the worker: `ANSWER q<id>: <text>` while a question is open, else `FYI: <text>`, with `(the operator, from the hub view)` as the second line |
 | **b** | this session is the hub, and the modes differ | `W-n: <text>` goes into the hub's own prompt, and the hub relays it as `ANSWER` |
-| **c** | anything else, or the worker is not running | nothing is sent; `claude attach <short>` is copied, and the view says why |
+| **c** | anything else, or the worker is not running; and, since hub-view 0.4.1, any typed question, mailbox or not | nothing is sent; `claude attach <short>` is copied, and the view says why. A typed question's worker view says so under the question, and the Questions list marks it `(typed)`. |
 
-Routes a, b and c serve only generations spawned before the mailbox.
+Routes a and b serve only generations spawned before the mailbox, and c serves those and every
+typed question.
 **A route-a answer counts as received only once it shows in the worker's transcript.** The send's
 `isDelivered` only means *queued*. A session in another permission mode holds a cross-session
 message for a person there and lets it expire, while the sender still reads it as delivered. So
