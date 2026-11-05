@@ -1,6 +1,6 @@
 # FR-43: One macOS device row — a supervising daemon and an unenrolled GUI worker
 
-**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3 is designed, on the operator's three decisions of 2026-11-02, and P3a, P3b and P3c are built, the first two behind a default-off switch and the third a command a person runs, with no field proof yet**, so a Mac is still two rows: see [P3 design](#p3-design--one-enrollment). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
+**Status:** P0, P1, P2, P2c and P2d are shipped and field-verified (0.4.33 → 0.4.192): the daemon's row streams real pixels, accepts input and reports the worker's permissions, and a package update no longer undoes that. **P3a, P3b and P3c are field-verified on released 0.4.200** (2026-11-05, a throwaway tart Mac): with the switch on, one row streams and takes input for every org, asks in each org's name under the person's own floor, carries the worker's logs, and serves `roomler ssh` with nobody logged in, and `sudo roomlerd one-row` migrates a two-row Mac, keeping its overlay address and its signature, or puts everything back. The switch is still off by default, so a Mac is two rows until a person migrates it. Left: P3d, one token at install and default off, and the operator's flip of the default: see [P3 design](#p3-design--one-enrollment). A worst-phase `kill -9` of the worker takes 6.19 s on 0.4.192, down from 10.09 s on 0.4.191. Tracking issue: `FR-43`.
 
 ⚠️ Anchors RE-VERIFIED against master `c6e8ec58` on 2026-09-06, when this record was
 landed 27 releases after the field run. `remote_control`'s hub moved to
@@ -650,16 +650,31 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
 
 ## Acceptance criteria
 
-- [ ] A fresh install with **one** token produces **one** device row, and that row serves
+- [~] A fresh install with **one** token produces **one** device row, and that row serves
       both a remote-desktop session and `roomler ssh`.
+      *(2026-11-05, released 0.4.200, tart Mac, the switches set by hand: everything but the
+      install itself, which is P3d's. RED: one token on the root alone, the switch off. The worker
+      died on arrival five times and the supervisor stopped ("no per-user enrollment"), the row
+      read `no-gui-session`, and a viewer had no picture. GREEN, the switch on: the worker ran
+      `run --supervised --unenrolled`, the channel attached 51 ms after the spawn, the row read
+      `screen-capture` + `input`, and a viewer decoded lit pixels (99.4 %, VP9 4:4:4). On the
+      migrated Mac, one boot served both on the same row: `roomler ssh` as root and an RD session
+      (99.6 % lit). Field log.)*
 - [x] `roomler exec <mac>` reaches root-owned paths **and** the GUI session's log from the
       same row (today this needs two different rows).
       *(2026-10-31, 0.4.190, read-only on MacBook-1. It needs no P3: the "two rows" above was
       already wrong for reads. The daemon's row runs as `root`, lists the `-rw------- root wheel`
       `/etc/roomler/config.toml`, and `tail`s the worker's log under the person's Library. On
       the per-user row the same `cat` answers `Permission denied`, which is the control.)*
-- [~] After a reboot with **nobody logged in**, the Mac is present in `roomler peers` and
+- [x] After a reboot with **nobody logged in**, the Mac is present in `roomler peers` and
       `roomler ssh` works — the capability the daemon half exists for.
+      *(2026-11-05, released 0.4.200, tart Mac, one row. The vmtest org's `remote_ssh_enabled` was
+      on for 4 minutes and read back off; `SshPolicy` was set on the run's two throwaway rows only;
+      the Mac's own `ssh_enabled` in the root's file. From an originator on the released `.deb`,
+      each gate refused first, in turn and by name. After a reboot with auto-login off: up 55 s,
+      0 users, the console owned by root, no `gui/501`, only the root daemon, the row online as
+      `no-gui-session`. Each end listed the other in `roomler peers`, and `roomler ssh` exited 0
+      as root with 0 console sessions and no worker. Field log.)*
       *(2026-10-31, 0.4.191, tart Mac. The mesh half is met: auto-login removed and rebooted, the
       console owned by root, 0 sessions, no `gui/501`, the daemon the only `roomlerd`. The Mac's
       `roomler peers` showed the anchor on `relay:derp/tcp`, a `roomler ping` to it round-tripped
@@ -667,8 +682,15 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       the control. No ping started from the far side: the anchor runs 0.4.48, whose `roomler
       ping` errored, and its container has no `ping`. **`roomler ssh` is not measured**: the
       vmtest org's `remote_ssh_enabled` is off, and an org switch is the operator's to flip.)*
-- [~] A remote-desktop session started while logged in streams real pixels and accepts
+- [x] A remote-desktop session started while logged in streams real pixels and accepts
       input, with `caps` reporting `has_input_permission: true` and **no TCC re-prompt**.
+      *(2026-11-05, decided per the recommendation: read from the Mac, not asked. MacBook-1
+      (macOS 27.0.1) took 0.4.200 at 22:54Z on 11-04. Its unified log keeps TCC lines for every
+      hour back past the update, 17 in the update's hour, and none of them, then or since, names
+      roomler; the worker's first start on 0.4.200 logged both grants held. The read's own access
+      to a protected file did log as roomler's, so TCC would have named roomler had it asked. The
+      confirmation seen over the tart Mac's streams names `com.apple.sshd-session`, the lab's own
+      screenshot through Apple's sshd, not roomlerd. Field log.)*
       *(2026-10-31, 0.4.191. Pixels, input and `has_input_permission: true` are met, in one
       delegated session on the daemon's row of a throwaway tart Mac: field log. **The re-prompt
       half is partly met, and a VM cannot finish it.** MacBook-1's 67 retained worker starts
@@ -676,7 +698,10 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       reads the grant, not the screen. The VM's own grant is seeded, and macOS still showed
       its screen-recording confirmation over a working stream. Whether a person on a real Mac
       is asked again is the operator's to say.)*
-- [ ] `codesign -d -r-` on the bundle is byte-identical before and after the migration.
+- [x] `codesign -d -r-` on the bundle is byte-identical before and after the migration.
+      *(2026-11-05, released 0.4.200, tart Mac: its SHA-256 read `dfb59ad7…` before and after
+      every run of `one-row`, the two that stopped, the one that migrated, the `--revert` and the
+      final migration.)*
 - [x] P2c: with a worker attached, the daemon's row reports `screen-capture` +
       `input` and the dashboard stops calling it "not a capture target".
       *Field-verified 2026-09-24 end to end — the daemon's send AND the row the dashboard
@@ -736,8 +761,15 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       1.36–6.19 s from the kill to the channel attached, 0 offline samples in 108, no reconnect.
       RED on 0.4.191, same rig and phases: 5.29–10.09 s, so the worst phase missed the 10 s. The
       fix wakes on the backoff (`next_tick_in`).)*
-- [ ] An existing two-row Mac migrates to one row keeping its overlay address, and the
+- [x] An existing two-row Mac migrates to one row keeping its overlay address, and the
       retired row is tombstoned per `release_overlay_node`'s ordering (never re-issued).
+      *(2026-11-05, released 0.4.200, tart Mac, two rows in one org and the root also in a
+      second. After `sudo roomlerd one-row` the root's row kept its node: `100.65.20.9` and its
+      IPv6 twin before and after, in `Status` and in `GET …/overlay-node`. The retired per-user
+      row read offline. It held no node, so its `DELETE` answered `{"deleted":true,
+      "overlay_released":false,"overlay_ip":null}`, a `GET` of it then answered 404, and the
+      root's node was unchanged. A retired row that holds a node is released by the same route
+      in the order the P3c design gives (lease, then tombstone).)*
 - [x] With the kill switch off, behaviour is byte-for-byte today's.
       *(2026-10-31, tart Mac, switch off. On 0.4.190: no `--supervised` process, no
       `/var/run/roomler-delegate`, no supervisor or delegation line in the root log, launchd
@@ -746,20 +778,41 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       none. That is the pre-P1 pair. In the code the switch stops the supervisor before it does
       anything (`macos_supervisor.rs:977-984`). "Byte-for-byte" is read off those surfaces;
       nothing here diffs two builds.)*
-- [ ] **Docs:** `docs/installation.md` describes the one-row Mac, with a mermaid diagram of the
+- [~] **Docs:** `docs/installation.md` describes the one-row Mac, with a mermaid diagram of the
       daemon, the worker and the delegation channel, its migration and its kill switch, under
       the `docs/README.md` index row it already has, and `docs/platform-support.md` stops
       saying two rows. *(The layout that ships today is documented there, with the diagram, as
       of 2026-10-31. This stays open until P3 changes it.)*
-- [ ] P3b: with the switch on, a session on a secondary org's row streams real pixels and takes
+      *(2026-11-05: `docs/installation.md` describes the one-row Mac with its own diagram, its
+      migration and its switch. `docs/platform-support.md` says two rows by default, which is
+      still true: it changes when the default flips.)*
+- [x] P3b: with the switch on, a session on a secondary org's row streams real pixels and takes
       input, and its consent prompt names that org. With the switch off the same row reads
       `no-gui-session` and shows no pixels, as today.
-- [ ] P3b: a person's `auto_grant_session = false` in their own file makes a session on the one
+      *(2026-11-05, released 0.4.200, tart Mac in two orgs. RED, the switch off: the second
+      org's row on the root read `no-gui-session`, and a viewer had no frame. GREEN, one row:
+      that row streamed (99.6 % lit); the pointer landed on three test points within 1 pt, a
+      click and a wheel arrived, and "hello 123A" reached a Terminal. The prompt, read from the
+      native panel itself in another org's held session, said "On behalf of" the second org.)*
+- [x] P3b: a person's `auto_grant_session = false` in their own file makes a session on the one
       row ask them, in every org, and a root value of `false` holds whatever the person's file
       says.
-- [ ] P3c: a migration whose verify fails leaves the Mac as it was, both files restored, and
+      *(2026-11-05, released 0.4.200, tart Mac. RED, two rows: with the person's `false`, the
+      daemon's row granted without asking (`AutoGrant`). GREEN, one row: the same person value
+      made a session in each org ask, each prompt naming its org; a root `false` with the
+      person's `true` asked too.)*
+- [x] P3c: a migration whose verify fails leaves the Mac as it was, both files restored, and
       `--revert` before the delete gives back a two-row Mac that streams.
-- [ ] P3a: a one-row Mac's worker logs reach `agent_logs`, on the row.
+      *(2026-11-05, released 0.4.200, tart Mac. Screen Recording revoked: after 60 s the verify
+      said "the GUI worker holds no Screen Recording grant (it reports: input)", put back both
+      files, restarted, and said "the Mac is as it was"; whole-file copies kept beforehand
+      compared identical right after and 20 s later. `--revert` before the delete put both files
+      back identical to the copies from before the migration, and the per-user row streamed
+      again (99.6 % lit). Field log, with one earlier run that is not explained.)*
+- [x] P3a: a one-row Mac's worker logs reach `agent_logs`, on the row.
+      *(2026-11-05, released 0.4.200, tart Mac. RED: before the switch-on, no line on the daemon's
+      row came from the worker, and on the Mac's two-row layout that day none of its 510 did. GREEN: from the switch-on at 02:40:57Z, 159 lines marked
+      `gui-worker` on the row, the first at the switch-on.)*
 
 ## Dead hypotheses — do not re-run these
 
@@ -1251,3 +1304,91 @@ It failed safe. The fix reads `/Users` once (`scan_homes`) and keeps one entry p
 link to it, and a folder reached only through links keeps the first of them by name, since its
 person still has a file to migrate. With the link removed by hand, the same command migrated the
 same Mac. GREEN with the link left in place waits for the release that carries the fix.
+
+### 2026-11-05 — P3a to P3c on released 0.4.200: one row, end to end
+
+One throwaway tart Mac (macOS 15.7.7, grants seeded into TCC, the person logged in by
+auto-login) on the released 0.4.200 `.pkg`, whose SHA-256 starts `1f9ab8c4a137a3ae` and matches
+its sidecar. The root was enrolled in the vmtest org with the overlay on, and in a second org
+through `[[orgs]]` with it off. The viewer was a private headless browser on the dev box. Every
+switch was set by hand or by `one-row`, MacBook-1 was only read, and the Mac was deleted
+afterwards.
+
+**The switch (AC1's stream half, AC18).**
+
+| | RED: one token on the root, the switch off | GREEN: the switch on |
+|---|---|---|
+| The worker | `exit status: 1` after 5 s, five times, then "died on arrival too many times — NOT retrying: almost always this Mac has no per-user enrollment" | `run --supervised --unenrolled`: the channel attached 51 ms after the spawn, its caps 113 ms later |
+| The row | `no-gui-session` | `screen-capture`, `input` |
+| A viewer | no picture | 99.4 % lit, VP9 4:4:4 over the data channel |
+| The worker's lines on the row | none | 159 from the switch-on, each `process: gui-worker` |
+
+**A second org (AC15, AC16).**
+
+| | RED: the switch off | GREEN: one row |
+|---|---|---|
+| A session on the second org's row | `no-gui-session`, no frame | 99.6 % lit; the pointer on three test points within 1 pt; a click, a wheel, and "hello 123A" into a Terminal |
+| Its prompt | | the root daemon's native panel: "Remote control request … On behalf of" the second org "… Deny · Approve" |
+| A person's `auto_grant_session = false` | the daemon's row granted without asking (`AutoGrant`) | both orgs asked, a 300 s prompt naming each |
+| A root `false` with the person's `true` | | asked |
+
+The native panel is on screen on a one-row Mac: the root daemon's AppKit window, at layer 1000
+and shared with nothing, so `screencapture` cannot see it, but the stream of a second, already
+approved session can. It was read there. FR-27 lists the macOS native panel as its one
+unverified surface.
+
+**The migration (AC5, AC12, AC17).** In order, after the stop in the entry above:
+
+| Run | Result |
+|---|---|
+| Screen Recording revoked, so the verify fails | "the verify failed: after 60 s, the GUI worker holds no Screen Recording grant (it reports: input)", both files put back, a restart, "the Mac is as it was" |
+| A plain restart | wrote nothing to either file |
+| The same failure again, whole-file copies kept first | the same words; both files identical to the copies right after and 20 s later |
+| Screen Recording back, `one-row --yes` | one row: the worker attached with `screen-capture` + `input`, and the retired row listed with its `DELETE` |
+| `--revert`, before the delete | both files identical to the copies from before the migration, and the per-user row back and streaming (99.6 % lit) |
+| `one-row --yes` again, then the `DELETE` | one row; the root's node `100.65.20.9` before and after; the retired row, which held no node, deleted and then 404 |
+
+`codesign -d -r-` read `dfb59ad7…` before and after every run.
+
+🔍 **Not explained, kept:** in the first verify-failure run, both files read other hashes after the
+undo than in the snapshot taken before it (root `7f4b6d43…` → `277a2eb0…`, person `5edbc80f…` →
+`ccbdf2b2…`). A plain restart writes nothing, and the repeat with whole-file copies kept
+beforehand compared identical. That run's files were not kept, so what changed is not known. If
+it happens again, keep the files.
+
+**Nobody logged in (AC3), and AC1's ssh half.** The vmtest org's `remote_ssh_enabled` was on
+from 03:34:26Z to 03:38:29Z and read back off, and before it went on no device in the org had a
+policy. `SshPolicy` went on the run's two throwaway rows only: the Mac's (`on`, `daemon`, `auto`)
+and the originator's (`can_originate`). The originator was the released 0.4.200 `.deb` in a
+container on the lab host, the overlay on a TUN, deleted afterwards.
+
+| Step | `roomler ssh` from the originator to the Mac's one row |
+|---|---|
+| The org's switch off | "roomler SSH is disabled for this organization (an admin must enable it)" |
+| On; the Mac's policy unset | "this device does not accept SSH sessions (its policy is off)" |
+| The Mac's policy on | "the device you are calling from is not permitted to originate SSH sessions" |
+| The originator's `can_originate` | "roomler SSH is switched off on the device itself (its own ssh_enabled setting) …" |
+| The Mac's `ssh_enabled` and a restart; logged in | `uid=0(root)`, console `admin`, 1 session, exit 0 |
+| A reboot with auto-login off | `root`, console `root`, 0 sessions, no worker, exit 0 |
+| The switch off again | "roomler SSH is disabled for this organization" |
+
+In the logged-in boot an RD session on the same row streamed (99.6 % lit). After the reboot the
+Mac was up 55 s with 0 users, the console owned by root, `gui/501` "Domain does not support
+specified action", and only the root daemon running. The supervisor logged `NoGuiSession
+console_uid=None`, the SSH server took the intercepted port 2.1 s after the daemon started, and
+the row read online, `no-gui-session`. Each end listed the other in `roomler peers`
+(`relay:derp/tcp`, 41–45 ms).
+
+**MacBook-1's TCC log (AC4).** MacBook-1 (macOS 27.0.1) took 0.4.200 at 22:54Z on 11-04. Its
+unified log keeps TCC lines for every hour back past the update, 17 in the update's hour, and
+none, then or since, names roomler. The worker's first start on 0.4.200, at 22:54:37Z, logged
+both grants held. The read's own access to a protected file did log as roomler's, so TCC would
+have named roomler had it asked. On the tart Mac, tccd logs every check roomler makes (3,439
+lines in 40 minutes), and the confirmation over its streams names `com.apple.sshd-session`, the
+lab's screenshot through Apple's sshd.
+
+**#3260 on this Mac.** On 0.4.200 a session the root serves itself (the second org's row, the
+switch off) got `no_display` 30 s in, after the viewer had re-created it at 10 s. On a candidate
+of #3497, 0.4.252, in the same layout, the page named `no_display` 2.04 s after it connected,
+with no stall and no re-create in 50 s, and the root refused 98 ms after the request
+(`checked_in_us=274`).
