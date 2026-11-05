@@ -1,9 +1,26 @@
 # FR-62 — Encoder rate changes without an IDR
 
-**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR; VideoToolbox still unmeasured · NVENC re-read on the released 0.4.187: **0/20** · **AC2/AC3 met on 0.4.201** (2026-11-05): a relayed `av1_nvenc` session under a window drag made 13 in-place rate moves, none with an IDR of its own, and each saturated window after a move landed at 0.97–1.00 of the new rung; the three unexplained IDRs of the 2026-11-03 passive read did not recur · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
+**Issue:** [#1242](https://github.com/gjovanov/roomler-ai/issues/1242) · **Status:** A0 measured on BOTH silicon — NVENC passes, **QSV in-place is broken and the flag stays OFF**; **both** recorded causes are REFUTED (the second by measurement on 0.4.62); patch 0004 is what is left; A1 shipped inert; A2 + const flip shipped (0.4.51) · **A3 — AMF measured** on the Radeon 610M (0.4.187, 2026-10-29): a rebuild on every rung, **41–55 ms, 20/20 IDRs** — the 0.4.187 harness filed them as periodic, fixed in the same PR · **VideoToolbox measured 2026-11-05** (Apple M5 Pro, 0.4.201): a rebuild on every rung, 8–12 ms, 20/20 IDRs · NVENC re-read on the released 0.4.187: **0/20** · **AC2/AC3 met on 0.4.201** (2026-11-05): a relayed `av1_nvenc` session under a window drag made 13 in-place rate moves, none with an IDR of its own, and each saturated window after a move landed at 0.97–1.00 of the new rung; the three unexplained IDRs of the 2026-11-03 passive read did not recur · docs: [`encoders.md` § A rate move, per backend](../encoders.md#a-rate-move-per-backend-fr-62) · the kill-switch registry (AC4's instrument): [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) · **Plan:** `rate-control-architecture` (approved 2026-09-02)
 
 ## Progress
 
+- **2026-11-05 19:21Z — A3: VideoToolbox measured, a rebuild with an IDR on every rung. AC2's
+  wording now matches its read.**
+  - **VideoToolbox.** MacBook-1 (Apple M5 Pro, macOS 27.0.1) on the released 0.4.201, one sweep:
+    `encoder-smoke --reconfigure-sweep --name hevc_videotoolbox --codec hevc --json`, run as root
+    over `roomler exec`, with no lab VM running. `hevc_videotoolbox` rebuilt on all 20 moves
+    (`total_rate_idr: 20`, `total_periodic_idr: 0`): 8.3–12.1 ms each, median 11.5 ms. Each
+    rung's first frames peaked at 1.3–3.2 KB, against 0.3–0.7 KB after them. `pass: false` on
+    `idr+apply`.
+  - So VideoToolbox has AMF's shape at about a quarter of AMF's cost. The rebuild's time is no
+    argument for patch 0002; its IDR is. Until someone writes that patch, VideoToolbox keeps the
+    rebuild path, and the coarsen ladder rations its IDRs. A4 row 2's precondition ("VideoToolbox
+    is measured") now holds, and the reading keeps the ladder.
+  - The sweep's log names every rebuild "QSV/AMF encoder rebuilt", a message older than the
+    VideoToolbox arm.
+  - **AC2's wording**, on the operator's go: it now says what the corrected read judges, the first
+    complete window after each rate move under motion that saturates the cap. It read "≈ 1.0
+    within 2 s of every target change", a CBR's contract.
 - **2026-11-05 18:53Z — the motion read: 13 in-place rate moves on a relayed NVENC session, and
   not one IDR of their own. AC2 and AC3 are met.**
   CORPLAP-2 on 0.4.201, `av1_nvenc` 1920×1080, `constrained=true` on all 217 heartbeats over
@@ -353,8 +370,9 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 - **A2 — FFmpeg patches** carried in `.github/ffmpeg-patches/` and applied by all three vendor builders (Linux/macOS from source, Windows via the vcpkg overlay port's `PATCHES`), with a `ROOMLER-PATCHES.txt` hash gate in `release-agent.yml`: `0001-nvenc-no-idr-on-bitrate-reconfig`, `0002-videotoolbox-runtime-bitrate` (as WebRTC's VT encoder does), `0003-amf-runtime-bitrate` (disabled, unmeasured).
 - **A3 — VideoToolbox/AMF** per A0. **AMF measured 2026-10-29** (Radeon 610M, 0.4.187): a 41–55 ms
   rebuild with an IDR on every rung — the D3D12/Vulkan shape, so AMF keeps `Rebuild` and patch 0003
-  stays disabled; its rationing question is the IDR alone. VideoToolbox remains the open decision
-  below (a Mac with an Apple Silicon encoder runs the same sweep). **A4 — retire** the nine rationing heuristics one shippable PR at
+  stays disabled; its rationing question is the IDR alone. **VideoToolbox measured 2026-11-05**
+  (Apple M5 Pro, 0.4.201): a rebuild with an IDR on every rung, 8–12 ms, so it keeps `Rebuild`
+  until patch 0002 exists (the open decision below). **A4 — retire** the nine rationing heuristics one shippable PR at
   a time (anchors in the spec). ⚠️ **Amended after A0-QSV**: this cannot be a flat delete. A
   heuristic that rations rate moves is dead weight on NVENC (a move is 0.004 ms and no longer costs
   an IDR) and **load-bearing on QSV** (a move is a 0.34–2.0 s rebuild). Each retirement is therefore
@@ -366,13 +384,15 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 ## Acceptance criteria
 
 - [x] AC1 — A0 report per backend on real hardware, attached here, with the pass/fail per codec.
-      **Done for the three backends measured**: NVENC on an RTX 5090 (PASS — 20/20 rate-caused
+      **Done for all four backends**: NVENC on an RTX 5090 (PASS — 20/20 rate-caused
       IDRs before A2, 0 after; apply 0.001–0.008 ms; re-read 0/20 on the released 0.4.187,
       2026-10-29), QSV on an Iris Xe (**FAIL** — Reset refuses in both `low_power` modes; rebuild
-      0.34–2.0 s) and AMF on a Radeon 610M (**FAIL** — a 41–55 ms rebuild with an IDR on every rung,
-      0.4.187, 2026-10-29, read on #1242). VideoToolbox remains unmeasured and is recorded as such
-      rather than assumed; A3 still owns it.
-- [x] AC2 — On a constrained session the bytes-per-frame ratio is ≈ 1.0 within 2 s of every target change (FR-59's instrument).
+      0.34–2.0 s), AMF on a Radeon 610M (**FAIL** — a 41–55 ms rebuild with an IDR on every rung,
+      0.4.187, 2026-10-29, read on #1242) and VideoToolbox on an Apple M5 Pro (**FAIL** — an
+      8–12 ms rebuild with an IDR on every rung, 0.4.201, 2026-11-05).
+- [x] AC2 — On a constrained session, under motion that saturates the cap, the bytes-per-frame ratio is ≈ 1.0 of the new rung in the first complete window after every rate move (FR-59's instrument).
+      Amended 2026-11-05 on the operator's go: it read "≈ 1.0 within 2 s of every target change", a
+      CBR's contract, and a target change inside a rung moves nothing.
       **Met on 0.4.201, 2026-11-05** (the Progress entry): CORPLAP-2, `av1_nvenc`, constrained
       over the overlay's DERP carrier, under a 220 s window drag. The first complete window after
       each move the drag saturated landed at 0.967, 1.001, 0.992 and 0.978 of the new rung (one
@@ -426,6 +446,7 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
 | 2026-10-31 22:47 | **0.4.191** (released) | CORPLAP-2 `hevc_nvenc` 1920×1200, **relayed**, passive | `constrained=true` on 158 of 158 heartbeats over 318 s; `rate_moves=0`, `rebuilds=0`, `swaps=0`, `dims_swaps=0`; `idr_count` 18 (the opener + `dc_unopen_drops=17`), flat after the first heartbeat; 1 keyframe on the wire in 6,006 frames; bytes per frame p50 0.063, max 0.491 of the cap. No rate move, so it proves neither AC2 nor AC3 |
 | 2026-11-03 22:23 | **0.4.199** (released) | CORPLAP-2 `hevc_nvenc` 1920×1200, **relayed** (the overlay's DERP carrier), passive | `constrained=true` on 57 of 57 heartbeats over 113 s; `rate_moves=0`, `rebuilds=0`, `swaps=0`, `dims_swaps=0`, no drops; `idr_count` 14 (the opener + `dc_unopen_drops=13`) → 17; 4 keyframes on the wire in 3,544 frames, three of them explained by nothing the read counted (open). No rate move, so it proves neither AC2 nor AC3. The approved motion was refused, because the OK reached the worker through another session |
 | 2026-11-05 18:53 | **0.4.201** (released) | CORPLAP-2 `av1_nvenc` 1920×1080, **relayed** (the overlay's DERP carrier), a 220 s window drag, one `rc:keyframe`, a resize to 1600×1000 and back | `constrained=true` on 217 of 217 heartbeats over 439 s; `rate_moves` 0 → 13 (down to 550 k, back up to 3 M), `rebuilds=0`; `idr_count` 1 → 5 = our keyframe + 2 `dims_swaps` + the viewer's own keyframe, none from a move; 6 keyframes on the wire in 10,914 frames; the saturated windows after a move 0.967–1.001 of the new rung, at most 1.228 of the cap. **AC2 and AC3 met** |
+| 2026-11-05 19:21 | **0.4.201** (released) | MacBook-1 Apple M5 Pro, macOS 27.0.1, `hevc_videotoolbox` via `--name`, as root | 20 rebuilds, 8.3–12.1 ms each (median 11.5), an IDR on every rung (`first3_max` 1.3–3.2 KB vs 0.3–0.7 KB trailing); `total_rate_idr:20, total_periodic_idr:0`, `pass:false` on `idr+apply`. A3's VideoToolbox read |
 
 ## Open decisions
 
@@ -440,11 +461,14 @@ Also found while reading the sources: **our QSV sessions run CBR, not QVBR** (`s
   its one IDR near the churn was the viewer's own request. A read that captures every tell in the
   2026-11-03 table settles it. Until then, a read rules out each of those sources before it calls
   an IDR rate-caused.
-- **AC2 and AC3's wording.** AC3's inequality omits the opener and the drop-burst resync; read
-  from the first heartbeat, with no drop burst, it held as written on 2026-11-05. AC2's ≈ 1.0 is a
-  CBR's contract: NVENC met it in the windows the drag saturated and read 0.17–0.71 on a still
-  screen. The operator decides whether either is amended.
-- VideoToolbox: patch 0002 vs. "rebuild at settle, ≥ 15 s apart" (A0 on a Mac decides).
+- **AC2 and AC3's wording**, settled 2026-11-05 on the operator's go. AC2 now says what the
+  corrected read judges: the first complete window after each rate move, under motion that
+  saturates the cap. AC3 keeps its wording: its inequality omits the opener and the drop-burst
+  resync, but read from the first heartbeat, with no drop burst, it held as written.
+- **VideoToolbox: patch 0002 vs. "rebuild at settle, ≥ 15 s apart".** A0 on a Mac (2026-11-05)
+  read an 8–12 ms rebuild with an IDR on every move, so the rebuild's time is no argument for the
+  patch, and the IDR is. The macOS builder carries no patch today, so VideoToolbox keeps the
+  rebuild path and the ladder rations its IDRs, as for AMF, until someone writes patch 0002.
 - Whether to attach `mfxExtEncoderResetOption{StartNewSequence=OFF}` (patch 0004) if any QSV driver starts a new sequence on Reset.
 
 ## Out of scope
