@@ -153,9 +153,6 @@ impl AgentDao {
             // Unknown until the device's first hello — enrolment does not
             // reach the machine, so there is nothing to record yet.
             ssh_host_pubkey: String::new(),
-            // FR-137 — FR-90's vault key is parked: the model keeps the field
-            // until P2 drops it from the wire, and nothing writes it.
-            vault_key: String::new(),
             // FR-100 P1a — and the device key is made on the device, at its
             // first hello.
             peer_auth_key: String::new(),

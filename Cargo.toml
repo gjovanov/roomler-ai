@@ -7,9 +7,6 @@ members = [
     "crates/remote_control",
     "crates/localapi",
     "crates/agent-core",
-    # FR-90 — Hive on the device: transcript events, the replica store, the
-    # stream-json adapter, the launch spec. Daemon-side only (MPL).
-    "crates/hive-node",
     "crates/tunnel-core",
     # P5 — the webrtc-ice fork's substance (TURNS/TCP Conn adapter), extracted
     # so the vendored tree is a mechanical patch. Consumed by tunnel-core AND
@@ -38,6 +35,7 @@ members = [
     "agents/roomler-desktop",
     "agents/roomler-cli-shim",
     "agents/roomlerdw",
+    "agents/roomler-msi-ca",
     "agents/roomler-setup",
     "agents/roomler-cli",
 ]
@@ -153,7 +151,7 @@ wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 scrap = { path = "crates/vendored/scrap" }
 
 [workspace.package]
-version = "0.4.199"
+version = "0.4.200"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 
@@ -230,10 +228,6 @@ genpdf = "0.2"
 # File handling
 tempfile = "3"
 
-# FR-90 Hive — the device-side replica store and its event hash chain
-rusqlite = { version = "0.40", features = ["bundled"] }
-blake3 = "1.8"
-
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
@@ -279,13 +273,6 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
-
-zeroize = "1"
-# FR-90 P3-3 — a leased value crosses to a device as a libsodium-compatible
-# sealed box (`crypto_box_seal`: X25519, XSalsa20-Poly1305) for the key the
-# daemon holds. The device's half is `roomlerd`'s `vault` feature. RustCrypto,
-# on the `curve25519-dalek` 4 and `aead` 0.5 the tree already builds.
-crypto_box = { version = "0.9.1", features = ["seal"] }
 
 # Agent-specific
 clap = { version = "4", features = ["derive"] }

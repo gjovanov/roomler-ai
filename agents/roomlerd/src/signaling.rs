@@ -562,16 +562,6 @@ pub struct OrgCtx {
     /// FR-28 — the flat redial on a load balancer's 502, for this org's loop.
     /// As the config says unless a test passes its own ([`Self::with_flat_redial`]).
     pub flat_redial: crate::ws_connect::FlatRedial,
-    /// FR-90 P4-3b-1 — the device's knowhow scanner, on the primary's context
-    /// alone (decision 43): `None` on a secondary's, and on a daemon with no
-    /// config file to read its roots from.
-    #[cfg(all(hive_host, unix))]
-    pub knowhow: Option<Arc<crate::hive::knowhow::Scanner>>,
-    /// FR-90 P4-5-1b — the device's knowhow prober, on the primary's context
-    /// alone, as the scanner is: `None` on a secondary's, and on a daemon
-    /// with no config file to read `knowhow_probe_reach` from.
-    #[cfg(hive_host)]
-    pub prober: Option<Arc<crate::hive::knowhow_probe::Prober>>,
 }
 
 impl OrgCtx {
@@ -587,10 +577,6 @@ impl OrgCtx {
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
             flat_redial: crate::ws_connect::FlatRedial::from_config(),
-            #[cfg(all(hive_host, unix))]
-            knowhow: None,
-            #[cfg(hive_host)]
-            prober: None,
         }
     }
 
@@ -608,11 +594,6 @@ impl OrgCtx {
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
             flat_redial: crate::ws_connect::FlatRedial::from_config(),
-            // Decision 43: a secondary enrollment never scans, nor probes.
-            #[cfg(all(hive_host, unix))]
-            knowhow: None,
-            #[cfg(hive_host)]
-            prober: None,
         }
     }
 
@@ -633,22 +614,6 @@ impl OrgCtx {
     /// FR-28 — replace the flat redial the config picked (a test passes its own).
     pub fn with_flat_redial(mut self, flat_redial: crate::ws_connect::FlatRedial) -> Self {
         self.flat_redial = flat_redial;
-        self
-    }
-
-    /// FR-90 P4-3b-1 — the scanner `rc:knowhow.scan` runs on (`run_cmd`
-    /// passes the daemon's; a test passes one that reads in-process).
-    #[cfg(all(hive_host, unix))]
-    pub fn with_knowhow(mut self, scanner: Arc<crate::hive::knowhow::Scanner>) -> Self {
-        self.knowhow = Some(scanner);
-        self
-    }
-
-    /// FR-90 P4-5-1b — the prober `rc:knowhow.probe` runs on (`run_cmd`
-    /// passes the daemon's; a test passes one reading its own config).
-    #[cfg(hive_host)]
-    pub fn with_prober(mut self, prober: Arc<crate::hive::knowhow_probe::Prober>) -> Self {
-        self.prober = Some(prober);
         self
     }
 
@@ -840,6 +805,22 @@ struct PendingCodec {
     /// handed it to this GUI worker: that came from the daemon's answer, not this
     /// process's.
     browser_caps: Option<Vec<String>>,
+}
+
+/// #3468, from review — will the peer a re-offer builds carry the session's
+/// recording? Only with RECORD in its grant AND a record context, both stashed
+/// by a request that came before this offer. A second offer for a session has
+/// neither: the first one took both, and the peer gets the default grant and
+/// no context. The hub never forwards one (`admit_offer`), so today this is
+/// always `false`, and a replaced channel's end is the recording's end.
+#[cfg_attr(not(feature = "recording"), allow(dead_code))]
+fn reoffer_carries_record(
+    permissions: Option<&roomler_ai_remote_control::permissions::Permissions>,
+    meta: Option<&SessionMeta>,
+) -> bool {
+    permissions
+        .is_some_and(|p| p.contains(roomler_ai_remote_control::permissions::Permissions::RECORD))
+        && meta.is_some_and(|m| m.3.is_some())
 }
 
 /// #3280 — the codec and transport a session's offer builds its peer with. The
@@ -1303,13 +1284,6 @@ pub async fn run(
                 // no restart will run the boot reconciler, so drop any exit-node
                 // split-default now or the host stays blackholed until reboot.
                 crate::purge_exit_routes();
-                // #2294 — and the removal purge Hive started (FR-90 P2g-4a)
-                // finishes first: the removal's goodbye follows its frame on
-                // this socket, and a pod roll mid-purge ends in this same
-                // goodbye at the reconnect. Bounded; none in flight, no wait.
-                // The build's `hive-purge-drain` is what lets the kick tell it.
-                #[cfg(hive_host)]
-                crate::hive::finish_removal_purge(crate::hive::REMOVAL_PURGE_LIMIT).await;
                 std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
             }
             Err(ConnectError::KeyRotated {
@@ -1749,17 +1723,6 @@ async fn connect_once(
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
-    // FR-90 P2c-3 — copies are held for the primary organization only: a
-    // secondary org's connection never offers them, so its placement never
-    // picks this device.
-    if !ctx.is_primary {
-        strip_replica_verbs(&mut hello_caps.rpc);
-    }
-    // FR-90 P3-4a — `vault` exactly where the hello carries the key.
-    crate::vault::apply_word(
-        &mut hello_caps.rpc,
-        crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
-    );
     // FR-94 — `exec-system` on exactly the connection of the device this
     // machine's SYSTEM service is anchored for, and the heartbeat re-announces
     // when that changes (an anchor written or removed while connected).
@@ -1839,11 +1802,6 @@ async fn connect_once(
         // it dialled. Empty here is meaningful ("this device cannot prove
         // itself"), never "trust anything".
         ssh_host_pubkey: ssh_host_pubkey_for(cfg),
-        // FR-90 P3-3a — the vault key's public half, made on this first ask
-        // and held in memory for the life of the process: the primary
-        // enrollment's connection only, and only while the owner's
-        // `vault_enabled` is on.
-        vault_key: crate::vault::hello_key(cfg.vault_enabled, ctx.is_primary),
         // FR-100 P1a — THIS enrollment's device key, on every org's
         // connection (one key per org, never shared): made on the first
         // hello, kept beside the config, and offered only once it is on disk.
@@ -1892,29 +1850,6 @@ async fn connect_once(
     // FR-99 P1d — the curtains the previous process died holding, reported as
     // `worker_exit` on the first healthy connection of the org each belonged to.
     crate::privacy::drain_leftovers(&cfg.tenant_id, &outbound_tx);
-    // FR-90 P3-4a — the primary enrollment's connection carries this
-    // device's lease requests: the vault answers each on the connection it
-    // came from. P3-4b — set BEFORE the supervisor below is pointed here, so
-    // a run it launches from now on knows whether its toolbelt offers the
-    // vault tools.
-    #[cfg(feature = "vault")]
-    if ctx.is_primary {
-        crate::vault::on_connected(
-            outbound_tx.clone(),
-            crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
-            cfg.vault_activity_log,
-        );
-    }
-    // FR-90 — and its Hive state reports: point the supervisor at THIS one,
-    // which also replays the latest state of every session a dropped
-    // connection may have lost. P4-4-1b — and its sessions' questions about
-    // the map, whose server's word that the map is there is forgotten until
-    // this connection's knowhow says it again (`rc:knowhow.served`).
-    #[cfg(hive_host)]
-    if ctx.is_primary {
-        crate::hive::knowhow_tools::on_connected(outbound_tx.clone());
-        crate::hive::on_connected(outbound_tx.clone());
-    }
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // FR-43 P2b — point the delegation channel at THIS connection's outbound
     // queue, so a worker's `SdpAnswer` / `Ice` reach the server.
@@ -1972,6 +1907,7 @@ async fn connect_once(
             asker: crate::ssh::Asker::Here {
                 broker: consent_broker.clone(),
                 indicator: indicator.clone(),
+                companion: crate::companion::Companion::System,
             },
             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
         },
@@ -2227,6 +2163,7 @@ async fn connect_once(
                             asker: crate::ssh::Asker::Here {
                                 broker: consent_broker.clone(),
                                 indicator: indicator.clone(),
+                                companion: crate::companion::Companion::System,
                             },
                             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
@@ -2590,13 +2527,6 @@ async fn connect_once(
                     // stay OURS, because we are the half that answers
                     // `rc:session.request` (the P2b-3 lesson).
                     let mut c = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
-                    if !ctx.is_primary {
-                        strip_replica_verbs(&mut c.rpc);
-                    }
-                    crate::vault::apply_word(
-                        &mut c.rpc,
-                        crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
-                    );
                     crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
                     crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
                     c.record = record_now;
@@ -3194,10 +3124,7 @@ async fn connect_once(
                         // better than exiting, and an old agent meeting a new
                         // frame family must keep running. It just has to SAY so.
                         Err(e) => {
-                            let tag = serde_json::from_str::<serde_json::Value>(&text)
-                                .ok()
-                                .and_then(|v| v.get("t")?.as_str().map(str::to_string));
-                            match tag {
+                            match undecodable_frame_tag(&text) {
                                 Some(t) if t.starts_with("rc:") => warn!(
                                     %e, %t,
                                     "DROPPED a roomler frame this build cannot decode — the \
@@ -4059,6 +3986,21 @@ async fn handle_server_msg(
             // the controller as "nobody could be asked" rather than as a deny.
             let will_prompt = !owner_side_consent
                 && matches!(effective_mode, crate::consent::Mode::Prompt { .. });
+            // ⚠️ Armed before anything shows it (#3442), and here on the WS
+            // loop, not inside the task below (#1632). `request_with_mode`
+            // registers the session as pending synchronously, so an answer
+            // counts from the moment the panel, the marker, a companion this
+            // may have to start (up to 3 s) or a notification shows the
+            // question, and a `Terminate` that is the very next frame this
+            // loop reads finds the prompt whether or not the task has been
+            // polled yet. (A spawned task has no ordering guarantee against
+            // the loop that spawned it.) Armed after the show, an answer given
+            // while the surfaces went up was refused. The window still runs
+            // from the show: the prompt starts its clock at its first look, in
+            // the task. Owner-side consent asks nobody here, and auto-grant
+            // arms nothing: its answer is ready at once.
+            let prompt = (!owner_side_consent)
+                .then(|| consent_broker.request_with_mode(&session_hex, effective_mode));
             let mut have_surface = true;
             if will_prompt {
                 // FR-27 — NATIVE surface first, companion as the fallback.
@@ -4235,21 +4177,9 @@ async fn handle_server_msg(
                     });
                 }
             }
-            if owner_side_consent {
-                info!(
-                    %session_id, ?consent_mode,
-                    "owner-side consent (email/push) — agent waits for the server to resolve"
-                );
-            } else {
+            if let Some(prompt) = prompt {
                 let outbound = outbound_tx.clone();
                 let ind = indicator.clone();
-                // #1632 — armed HERE, on the WS loop, not inside the task:
-                // `request_with_mode` registers the session as pending
-                // synchronously, so a `Terminate` that is the very next frame
-                // this loop reads finds the prompt whether or not the task
-                // below has been polled yet. (A spawned task has no ordering
-                // guarantee against the loop that spawned it.)
-                let prompt = consent_broker.request_with_mode(&session_hex, effective_mode);
                 // FR-52 P4 — only an external session carries the config in.
                 let external_cfg = external_consent.map(|_| remote_cfg.clone());
                 tokio::spawn(async move {
@@ -4308,6 +4238,11 @@ async fn handle_server_msg(
                         tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
                     }
                 });
+            } else {
+                info!(
+                    %session_id, ?consent_mode,
+                    "owner-side consent (email/push) — agent waits for the server to resolve"
+                );
             }
         }
 
@@ -4326,6 +4261,26 @@ async fn handle_server_msg(
             // exists (controller retry?), close it first so the browser sees
             // a clean answer.
             if let Some(old) = peers.remove(&session_id) {
+                // #3451 — said BEFORE the close: the old peer's `record`
+                // channel ending is not the session's end, and a recording
+                // launching for it carries on under the new peer.
+                //
+                // ⚠️ Only when the new peer carries the recording (#3468, from
+                // review). The hub forwards one offer per session
+                // (`admit_offer`), so a second one comes only from an older or
+                // hostile server, and the peer built from it gets the default
+                // grant, without RECORD, and no record context: nothing on it
+                // can pick the recording up. Said for that peer, a recording
+                // launching under the old one waited in the grace past the
+                // host's Disconnect. Not said, the old channel's end is the
+                // session's end for the recording, as on master.
+                #[cfg(feature = "recording")]
+                if reoffer_carries_record(
+                    pending_permissions.get(&session_id),
+                    pending_session_meta.get(&session_id),
+                ) {
+                    crate::recording::remote::peer_replaced(session_id);
+                }
                 // FR-101 P3 — the session goes on under a new peer, and the
                 // old one's drop forgets its counters: carry the transfer
                 // readings across, so the cumulative tallies never go back.
@@ -4437,6 +4392,9 @@ async fn handle_server_msg(
                     },
                 )
                 .await;
+                // #3468, from review — the session ends here, for a recording it held too.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::session_ended(session_id);
                 return Ok(());
             }
 
@@ -4489,6 +4447,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4550,6 +4511,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4579,6 +4543,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4644,6 +4611,9 @@ async fn handle_server_msg(
                 crate::lock_on_end::session_aborted(session_id);
                 indicator.hide_session(session_id.to_hex());
                 close_within_budget(peer.close(), session_id, "answer_send_failed").await;
+                // #3468, from review — the session ends here, for a recording it held too.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::session_ended(session_id);
                 return Err(ConnectError::Transient(e.context("sending answer")));
             }
             // FR-101 P4b-2 — the session is live: its idle limit runs from
@@ -5536,6 +5506,16 @@ async fn handle_server_msg(
                 consent_broker.mode(),
                 crate::consent::DEFAULT_PROMPT_TIMEOUT,
             );
+            // ⚠️ Armed here on the loop, before anything shows the question
+            // (#3442). It used to be armed inside the task below, so the panel
+            // and the marker were up before it was: a click on the native
+            // panel, which this same loop reads, could come before the task's
+            // first poll, and it was refused and took the panel down with it.
+            // An answer through the companion or the CLI in that gap was
+            // refused too. The window still runs from the show: the prompt
+            // starts its clock at its first look, in the task. Auto-grant arms
+            // nothing: its answer is ready at once.
+            let asking = consent_broker.request_with_mode(&request_id, consent_mode);
 
             // FR-27 — exec has ALWAYS prompted through this broker and NEVER
             // written a marker, so its prompt reached no UI: the only way to
@@ -5605,7 +5585,6 @@ async fn handle_server_msg(
                 }
             }
 
-            let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
             let req = crate::exec::ExecRequest {
                 request_id: request_id.clone(),
@@ -5632,12 +5611,7 @@ async fn handle_server_msg(
                 // closed is withdrawn. Here it matters more, since an Approve
                 // given to a stale panel would run the command for a caller
                 // no longer waiting for it, and twice if that caller retried.
-                let decision = await_prompt_or_socket_end(
-                    broker.request_with_mode(&request_id, consent_mode),
-                    &outbound,
-                    &request_id,
-                )
-                .await;
+                let decision = await_prompt_or_socket_end(asking, &outbound, &request_id).await;
                 // FR-27 — same convergence point as the RC path: take the
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
@@ -5724,11 +5698,6 @@ async fn handle_server_msg(
             session_secs,
             consent_mode,
             via_service,
-            // FR-90 P3-8-2a — an agent session's grant, held to ONE command by
-            // this device's SSH server (`ssh::Grant::one_command`), whichever
-            // of the two serves it: the worker's below, or the SYSTEM
-            // service's, which takes it from its own claim.
-            one_command,
         } => {
             #[cfg(feature = "ssh-server")]
             if via_service {
@@ -5793,16 +5762,14 @@ async fn handle_server_msg(
                         }
                     });
                 }
-                // The service pulled what it needs from the server, its claim
-                // carrying `one_command` too; nothing here is the worker's to
-                // hold.
+                // The service pulled what it needs from the server; nothing
+                // here is the worker's to hold.
                 let _ = (
                     public_key,
                     account,
                     consent_mode,
                     expires_at_ms,
                     session_secs,
-                    one_command,
                 );
             } else {
                 use roomler_ai_remote_control::models::SshGrantRefusal;
@@ -5822,7 +5789,6 @@ async fn handle_server_msg(
                         consent_mode,
                         expires_at_ms,
                         session_secs,
-                        one_command,
                     ) {
                         Ok(()) => None,
                         Err(e) => {
@@ -5851,607 +5817,12 @@ async fn handle_server_msg(
                     expires_at_ms,
                     session_secs,
                     via_service,
-                    one_command,
                 );
                 warn!(
                     %grant_id, %caller,
                     "rc:ssh.grant ignored — this build lacks the `ssh-server` feature"
                 );
             }
-        }
-
-        // FR-90 — start an agent session. Answered with `rc:hive.start_ack`
-        // on THIS connection, from a task of its own (launching is I/O this
-        // loop must not wait on), after the device's own gates.
-        ServerMsg::HiveStart {
-            session_id,
-            harness,
-            harness_session,
-            fence,
-            folder,
-            user_id,
-            user_email,
-            caller,
-            resume,
-            replicated,
-            lease,
-            fork_of,
-            from_terminal,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_start(
-                crate::hive::StartOrder {
-                    session_id,
-                    harness,
-                    harness_session,
-                    fence,
-                    folder,
-                    user_id,
-                    user_email,
-                    caller,
-                    resume,
-                    // P2c-3 — the server placed members besides this device:
-                    // checkpoint each turn's end (P2b-3b).
-                    replicated,
-                    // P2e-2 — and hold it to the server's word on each
-                    // connection from now on.
-                    lease,
-                    // P2f-3a — a fork: started from its parent's copy here.
-                    fork_of,
-                    // P2f-4a — a terminal session this device adopted, made a
-                    // managed one: started from the terminal's own history.
-                    from_terminal,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // No ack from this build: it does not advertise `hive`, so no
-            // server sends it a start or waits on one.
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    &harness,
-                    &harness_session,
-                    fence,
-                    &folder,
-                    user_id,
-                    &user_email,
-                    resume,
-                    replicated,
-                    lease,
-                    &fork_of,
-                    from_terminal,
-                );
-                warn!(
-                    session = %session_id, %caller,
-                    "rc:hive.start ignored — this build does not run agent sessions"
-                );
-            }
-        }
-
-        // FR-90 — stop an agent session; its `ended` arrives as
-        // `rc:hive.state` once the harness is gone.
-        ServerMsg::HiveStop {
-            session_id,
-            fence,
-            reason,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_stop(session_id, fence, reason, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (fence, &reason);
-                debug!(session = %session_id, "rc:hive.stop ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2g-1 — the session purged from this device, its own copy and
-        // what its account holds of it, answered per part on this connection.
-        ServerMsg::HivePurge {
-            purge_id,
-            session_id,
-            leaving,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_purge(
-                purge_id,
-                session_id,
-                leaving,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (purge_id, leaving);
-                debug!(session = %session_id, "rc:hive.purge ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2g-4a — this device's enrollment is being removed: every
-        // session it holds is purged.
-        ServerMsg::HivePurgeAll { purge_id } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_purge_all(purge_id, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            debug!(purge = %purge_id, "rc:hive.purge_all ignored — this build does not run agent sessions");
-        }
-
-        // FR-90 P2g-3d — what keeps each copy this device asked about: the
-        // device's own clock counts from it.
-        ServerMsg::HiveRetain { words } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_retain(words, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            debug!(
-                words = words.len(),
-                "rc:hive.retain ignored — this build does not run agent sessions"
-            );
-        }
-
-        // FR-90 P2e-2 — the server's word, on THIS connection, that this
-        // device holds the session at that fence: a leased run calls the model
-        // again, and a leased session it hosted launches.
-        ServerMsg::HiveLease { session_id, fence } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_lease(session_id, fence, ctx.is_primary, outbound_tx.clone());
-            #[cfg(not(hive_host))]
-            {
-                let _ = fence;
-                debug!(session = %session_id, "rc:hive.lease ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-1 — the session's lease moved past this device: what runs
-        // here at an older fence ends, and nothing here resumes it.
-        ServerMsg::HiveDemote {
-            session_id,
-            fence,
-            reason,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_demote(session_id, fence, reason, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (fence, &reason);
-                debug!(session = %session_id, "rc:hive.demote ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-4 — the session's lease is about to leave this device: no
-        // new prompt, the running turn ends or is cut, a last checkpoint, and
-        // `rc:hive.drained` back on THIS connection with where the copy ends.
-        // Taken up before the next frame is read, so a lease word right
-        // behind it lifts it.
-        ServerMsg::HiveDrain { session_id, fence } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_drain(session_id, fence, ctx.is_primary, outbound_tx.clone());
-            #[cfg(not(hive_host))]
-            {
-                let _ = fence;
-                debug!(session = %session_id, "rc:hive.drain ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-5 — could this device take the session over? A start's
-        // every gate, as configured now, and none of its side effects; the
-        // answer goes back on THIS connection. P2f-1a — a teleport's asks
-        // every gate but the copy, which the device takes after it.
-        ServerMsg::HivePrepare {
-            session_id,
-            fence,
-            harness,
-            harness_session,
-            folder,
-            user_id,
-            user_email,
-            caller,
-            teleport,
-            have_want,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_prepare(
-                crate::hive::StartOrder {
-                    session_id,
-                    harness,
-                    harness_session,
-                    fence,
-                    folder,
-                    user_id,
-                    user_email,
-                    caller,
-                    resume: true,
-                    replicated: true,
-                    lease: true,
-                    // P2f-3a — a prepare launches nothing; the moved start
-                    // that follows says whether the session is a fork.
-                    fork_of: None,
-                    from_terminal: false,
-                },
-                teleport,
-                have_want,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    fence,
-                    &harness,
-                    &harness_session,
-                    &folder,
-                    user_id,
-                    &user_email,
-                    &caller,
-                    teleport,
-                    have_want,
-                );
-                debug!(session = %session_id, "rc:hive.prepare ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-5 — the record's word for the start right behind it: the
-        // turns the session has had, and where it ran. Kept for that start,
-        // which takes the session over from its copy when it ran elsewhere.
-        ServerMsg::HiveMove {
-            session_id,
-            fence,
-            turns,
-            from_device_id,
-            from_device_name,
-            from_folder,
-            moved_by: _,
-            moved_by_name,
-            moved_at_ms,
-            earlier,
-        } => {
-            info!(
-                session = %session_id, fence, from = %from_device_name,
-                by = %moved_by_name, earlier = earlier.len(), "the session moves to this device"
-            );
-            // P2e-7 — where it came from and who moved it, for the resume
-            // note; P2f-5 — and every place before. A build without Hive keeps
-            // none of it.
-            #[cfg(not(hive_host))]
-            let _ = (&from_folder, moved_at_ms, &earlier);
-            #[cfg(hive_host)]
-            crate::hive::handle_move(
-                crate::hive::Moved {
-                    session_id,
-                    fence,
-                    turns,
-                    from_device_id,
-                    from_device_name,
-                    from_folder,
-                    moved_by_name,
-                    moved_at_ms,
-                    earlier,
-                },
-                ctx.is_primary,
-            );
-            #[cfg(not(hive_host))]
-            let _ = (turns, from_device_id);
-        }
-
-        // FR-90 P1e — a session's core memory, just ahead of its start. Kept
-        // for that start's launch; whether the session sees it is the
-        // device's own `hive_core_memory`.
-        ServerMsg::HiveMemory {
-            session_id,
-            fence,
-            brain_rev,
-            claude_md,
-            memory_md,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_memory(
-                crate::hive::CoreMemory {
-                    session_id,
-                    fence,
-                    brain_rev,
-                    claude_md,
-                    memory_md,
-                },
-                ctx.is_primary,
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (fence, brain_rev, &claude_md, &memory_md);
-                debug!(session = %session_id, "rc:hive.memory ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P1j — the server's word on a terminal session this device
-        // offered. Only a build that adopts sends offers.
-        ServerMsg::HiveAdoptAck {
-            adopt_id,
-            session_id,
-            fence,
-            refused,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_adopt_ack(&adopt_id, session_id, fence, refused, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (session_id, fence, refused);
-                debug!(
-                    adopt_id,
-                    "rc:hive.adopt_ack ignored — this build does not adopt"
-                );
-            }
-        }
-
-        // FR-90 P0d-2 — the viewer peer. A grant is answered with
-        // `rc:hive.view.grant_ack` on THIS connection, from a task (it reads
-        // the replica store); the rest feeds the grant's own actor. A build
-        // without `hive` does not advertise `hive-view`, so no server sends
-        // it any of these.
-        ServerMsg::HiveViewGrant {
-            grant_id,
-            session_id,
-            user_id,
-            user_name,
-            may_prompt,
-            user_email,
-            ttl_secs,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_grant(
-                crate::hive::ViewGrant {
-                    grant_id,
-                    session_id,
-                    user_id,
-                    user_name,
-                    may_prompt,
-                    user_email,
-                    driving_refused: None,
-                    copy: false,
-                    ttl_secs,
-                    search: None,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    session_id,
-                    user_id,
-                    &user_name,
-                    may_prompt,
-                    &user_email,
-                    ttl_secs,
-                );
-                debug!(grant = %grant_id, "rc:hive.view.grant ignored — this build does not serve agent sessions");
-            }
-        }
-        // FR-90 P2i-1 — a search over this device's copies: answered as a view
-        // grant is, and served by the same actor, so the rest rides the view's
-        // frames. Only a connection advertising `hive-search` is sent one.
-        ServerMsg::HiveSearchGrant {
-            grant_id,
-            user_id,
-            sessions,
-            ttl_secs,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_search_grant(
-                crate::hive::SearchGrant {
-                    grant_id,
-                    user_id,
-                    sessions,
-                    ttl_secs,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (user_id, &sessions, ttl_secs);
-                debug!(grant = %grant_id, "rc:hive.search.grant ignored — this build does not serve agent sessions");
-            }
-        }
-        ServerMsg::HiveViewOffer {
-            grant_id,
-            sdp,
-            ice_servers,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_offer(grant_id, sdp, ice_servers, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (&sdp, &ice_servers);
-                debug!(grant = %grant_id, "rc:hive.view.offer ignored");
-            }
-        }
-        ServerMsg::HiveViewIce {
-            grant_id,
-            candidate,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_ice(grant_id, candidate, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = &candidate;
-                debug!(grant = %grant_id, "rc:hive.view.ice ignored");
-            }
-        }
-        ServerMsg::HiveViewRenew { grant_id, ttl_secs } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_renew(grant_id, ttl_secs, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = ttl_secs;
-                debug!(grant = %grant_id, "rc:hive.view.renew ignored");
-            }
-        }
-        ServerMsg::HiveViewClose { grant_id, reason } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_close(grant_id, reason, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = &reason;
-                debug!(grant = %grant_id, "rc:hive.view.close ignored");
-            }
-        }
-        // FR-90 P2c-3 — hold a copy of a session. Answered with
-        // `rc:hive.replica.join_ack` on THIS connection, after the device's
-        // own gates; a secondary org's connection is refused there.
-        ServerMsg::HiveReplicaJoin {
-            session_id,
-            fence,
-            role,
-            fences,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_join(
-                session_id,
-                fence,
-                role,
-                fences,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // No answer from this build: it does not advertise
-            // `hive-replica`, so no server sends it a join.
-            #[cfg(not(hive_host))]
-            {
-                let _ = fences;
-                debug!(
-                    session = %session_id, fence, ?role,
-                    "rc:hive.replica.join ignored — this build holds no copies"
-                );
-            }
-        }
-
-        // FR-90 P2d — serve a stream of a session this device holds to one
-        // of its members. Answered with `rc:hive.replica.ready` on THIS
-        // connection; a secondary org's is refused there.
-        ServerMsg::HiveReplicaGrant {
-            grant_id,
-            session_id,
-            fence,
-            member_id,
-            path,
-            token,
-            ice_servers,
-            ttl_secs,
-            member_derp_pubkey,
-        } => {
-            #[cfg(hive_host)]
-            {
-                crate::hive::handle_replica_grant(
-                    grant_id,
-                    session_id,
-                    fence,
-                    member_id,
-                    path,
-                    token,
-                    ice_servers,
-                    member_derp_pubkey,
-                    ttl_secs,
-                    ctx.is_primary,
-                    outbound_tx.clone(),
-                );
-            }
-            // No answer from this build: it does not advertise
-            // `hive-stream`, so no server grants it a stream to serve.
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    session_id,
-                    fence,
-                    member_id,
-                    path,
-                    token,
-                    ice_servers,
-                    ttl_secs,
-                    member_derp_pubkey,
-                );
-                debug!(grant = %grant_id, "rc:hive.replica.grant ignored — this build carries no streams");
-            }
-        }
-
-        // FR-90 P2d — the source this device asked for is ready: dial it.
-        ServerMsg::HiveReplicaDial {
-            grant_id,
-            session_id,
-            fence,
-            source_id,
-            path,
-            token,
-            cert_fingerprint,
-            addrs,
-            derp_pubkey,
-            ice_servers,
-            ttl_secs,
-        } => {
-            #[cfg(hive_host)]
-            {
-                crate::hive::handle_replica_dial(
-                    grant_id,
-                    session_id,
-                    fence,
-                    source_id,
-                    path,
-                    token,
-                    cert_fingerprint,
-                    addrs,
-                    ice_servers,
-                    derp_pubkey,
-                    ttl_secs,
-                    ctx.is_primary,
-                );
-            }
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    session_id,
-                    fence,
-                    source_id,
-                    path,
-                    token,
-                    cert_fingerprint,
-                    addrs,
-                    derp_pubkey,
-                    ice_servers,
-                    ttl_secs,
-                );
-                debug!(grant = %grant_id, "rc:hive.replica.dial ignored — this build carries no streams");
-            }
-        }
-
-        // FR-90 P2d-2b — the member's relayed address, for the `relay` rung's
-        // TURN permission on this source's allocation; and a want the server
-        // refused, which the member's ladder acts on (P2d-3b).
-        ServerMsg::HiveReplicaCandidate { grant_id, addr } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_candidate(grant_id, addr, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            debug!(grant = %grant_id, %addr, "rc:hive.replica.candidate ignored — this build carries no streams");
-        }
-        ServerMsg::HiveReplicaRefused {
-            session_id,
-            fence,
-            path,
-            reason,
-            detail,
-        } => {
-            info!(
-                session = %session_id, fence, path = ?path, reason = ?reason, detail = ?detail,
-                "rc:hive.replica.refused"
-            );
-            // FR-90 P2d-3b — the answer to this device's ask: the ladder acts
-            // on it.
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_refused(session_id, fence, path, reason, ctx.is_primary);
-        }
-
-        // FR-90 P2d — the server ended a stream this device is a side of.
-        ServerMsg::HiveReplicaClose { grant_id, reason } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_close(grant_id, reason);
-            #[cfg(not(hive_host))]
-            debug!(grant = %grant_id, %reason, "rc:hive.replica.close ignored — this build carries no streams");
         }
 
         // Roomler SSH — the answer to a session THIS device asked for
@@ -6465,9 +5836,6 @@ async fn handle_server_msg(
             host_pubkey,
             expires_at_ms,
             error,
-            // FR-90 P3-8-2b — the echo of an agent session's ticket: its
-            // daemon dials only on an answer that echoes the ticket it sent.
-            ssh_ticket_id,
         } => {
             // The key itself is never logged — only whether one arrived. It is
             // public, but a log line is the wrong place to start treating key
@@ -6477,7 +5845,6 @@ async fn handle_server_msg(
                 %request_id,
                 address = ?address, port = ?port, grant_id = ?grant_id,
                 verifiable = host_pubkey.is_some(), error = ?error,
-                ssh_ticket_id = ?ssh_ticket_id,
                 "rc:ssh.response"
             );
             crate::ssh_origin::deliver(
@@ -6489,7 +5856,6 @@ async fn handle_server_msg(
                     grant_id,
                     expires_at_ms,
                     error,
-                    ssh_ticket_id,
                 },
             );
         }
@@ -6721,159 +6087,6 @@ async fn handle_server_msg(
             });
         }
 
-        // FR-90 P3-4a — the vault's answers to this daemon's lease requests,
-        // and its revocations. Leases are the primary enrollment's only: a
-        // secondary org's connection never asks, so what arrives there is
-        // dropped unopened. Never logged with the frame: `sealed` is a value,
-        // if a sealed one.
-        ServerMsg::VaultLeased {
-            req_id,
-            lease_id,
-            n,
-            sealed,
-            expires_at_ms,
-            provider,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                // P3-6b — with a dynamic secret's provider, if it names one.
-                crate::vault::on_leased(
-                    &req_id,
-                    &lease_id,
-                    n,
-                    &sealed,
-                    expires_at_ms,
-                    provider.as_deref(),
-                );
-            } else {
-                debug!(%lease_id, "rc:vault.leased on a secondary org's connection — dropped unopened");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (req_id, n, sealed, expires_at_ms, provider);
-                debug!(%lease_id, "rc:vault.leased ignored — this build takes no leases");
-            }
-        }
-        ServerMsg::VaultRefused {
-            req_id,
-            reason,
-            approval_id,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_refused(&req_id, &reason, approval_id.as_deref());
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (req_id, reason, approval_id);
-        }
-        // FR-90 P3-4b — a session's listing and description: metadata.
-        ServerMsg::VaultListed {
-            req_id,
-            secrets,
-            more,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_listed(&req_id, secrets, more);
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (req_id, secrets, more);
-        }
-        ServerMsg::VaultDescribed { req_id, secret } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_described(&req_id, secret);
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (req_id, secret);
-        }
-        ServerMsg::VaultRevoke { lease_ids, reason } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_revoke(&lease_ids, &reason);
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (lease_ids, reason);
-        }
-        // FR-90 P3-7-3a — the vault's grant of a session's own egress, the
-        // answer to this daemon's `rc:vault.net`: the primary's only, as a
-        // lease is. Never logged with the frame (nor by the catch-all below,
-        // which would): `grant` is a credential until its end.
-        ServerMsg::VaultNetGranted {
-            req_id,
-            grant_id,
-            grant,
-            expires_at_ms,
-            host,
-            port,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_net_granted(
-                    &req_id,
-                    &grant_id,
-                    &grant,
-                    expires_at_ms,
-                    &host,
-                    port,
-                );
-            } else {
-                debug!(%grant_id, "rc:vault.net.granted on a secondary org's connection — dropped");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (req_id, grant, expires_at_ms, host, port);
-                debug!(%grant_id, "rc:vault.net.granted ignored — this build asks for none");
-            }
-        }
-        // FR-90 P3-8-2b — the vault's ticket for a session's command on
-        // another device, the answer to this daemon's `rc:vault.ssh`: the
-        // primary's only, as a lease is. Never logged with the frame (nor by
-        // the catch-all below, which would): `ticket` is a credential until
-        // its end.
-        ServerMsg::VaultSshGranted {
-            req_id,
-            ticket_id,
-            ticket,
-            expires_at_ms,
-            os,
-            account,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_ssh_granted(
-                    &req_id,
-                    &ticket_id,
-                    &ticket,
-                    expires_at_ms,
-                    &os,
-                    &account,
-                );
-            } else {
-                debug!(%ticket_id, "rc:vault.ssh.granted on a secondary org's connection — dropped");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (req_id, ticket, expires_at_ms, os, account);
-                debug!(%ticket_id, "rc:vault.ssh.granted ignored — this build asks for none");
-            }
-        }
-        // FR-90 P3b-1b-1 — the vault's allow for a session's egress proxy,
-        // the answer to this daemon's `rc:vault.egress`: the primary's only,
-        // as a lease is. No credential in it.
-        ServerMsg::VaultEgressAllowed { req_id, host, port } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_egress_allowed(&req_id, &host, port);
-            } else {
-                debug!(%req_id, "rc:vault.egress.allowed on a secondary org's connection — dropped");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (host, port);
-                debug!(%req_id, "rc:vault.egress.allowed ignored — this build asks for none");
-            }
-        }
         // FR-52 P3c — an outsider's login, relayed by the server. Answered in
         // a task, not inline: the live config read waits on the config lock,
         // which `rc password set` holds across an Argon2 derivation, and the
@@ -6908,150 +6121,6 @@ async fn handle_server_msg(
                         .await;
                 let _ = tx.send(reply).await;
             });
-        }
-
-        // FR-90 P4-3b-1 — the server asks this device to scan the roots its
-        // owner lists. Run off this loop, on the primary's scanner alone,
-        // and always answered: the scan's record waits on it.
-        ServerMsg::KnowhowScan { scan_id } => {
-            #[cfg(all(hive_host, unix))]
-            crate::hive::knowhow::handle_scan(
-                ctx.knowhow.as_ref(),
-                scan_id,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // A build that does not scan never advertises `knowhow-scan`, so
-            // no server asks it; one that asks anyway is told, not left to
-            // expire.
-            #[cfg(not(all(hive_host, unix)))]
-            {
-                let tx = outbound_tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(ClientMsg::KnowhowScanned {
-                            scan_id,
-                            outcome: roomler_ai_remote_control::knowhow::ScanOutcome::Failed,
-                            detail: Some("this build does not scan".into()),
-                            truncated: false,
-                            findings: Vec::new(),
-                        })
-                        .await;
-                });
-            }
-        }
-
-        // FR-90 P4-5-1b — the server asks this device to probe one place the
-        // map says: within what its owner lists, on the primary's prober
-        // alone, run off this loop and always answered, since the probe's
-        // record waits on it.
-        ServerMsg::KnowhowProbe {
-            probe_id,
-            kind,
-            host,
-            port,
-            sni,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::knowhow_probe::handle(
-                ctx.prober.as_ref(),
-                crate::hive::knowhow_probe::Asked {
-                    id: probe_id,
-                    kind,
-                    host,
-                    port,
-                    sni,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // A build that does not probe never advertises `knowhow-probe`,
-            // so no server asks it; one that asks anyway is told.
-            #[cfg(not(hive_host))]
-            {
-                let _ = (kind, host, port, sni);
-                let tx = outbound_tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(ClientMsg::KnowhowProbed {
-                            probe_id,
-                            outcome: roomler_ai_remote_control::knowhow::ProbeOutcome::Failed,
-                            rtt_ms: None,
-                            address: None,
-                            tls: None,
-                            detail: Some("this build does not probe".into()),
-                        })
-                        .await;
-                });
-            }
-        }
-
-        // FR-90 P4-4-1b — the map is there for this device's sessions, and
-        // the answers to their questions: taken on the primary's connection
-        // alone, the one the questions go out on. A build that runs no
-        // session never advertises `knowhow-tools`, so it is sent none.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowServed { tools } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_served(&tools);
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowFound {
-            req_id,
-            entities,
-            truncated,
-        } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_found(&req_id, entities, truncated);
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowCard { req_id, card } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_card(&req_id, card);
-            }
-        }
-        // P4-4-2b — a proposal, written.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowProposed {
-            req_id,
-            what,
-            id,
-            left,
-        } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_proposed(&req_id, what, id, left);
-            }
-        }
-        // P4-5-2b — a verify's two answers: its probe, asked, and what the
-        // probe measured. The probe itself arrives as `KnowhowProbe`, before
-        // or after the first, and runs as any probe does.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowVerifying { req_id, probe_id } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_verifying(&req_id, probe_id.to_hex());
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowVerified { probe_id, probe } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_verified(&probe_id.to_hex(), probe);
-            }
-        }
-        // P4-6-1b — what reaching an entity takes, for a session's
-        // `roomler_connect`.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowAccess { req_id, access } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_access(&req_id, access);
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowRefused { req_id, reason } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_refused(&req_id, reason);
-            }
         }
 
         // Remaining tunnel-flow `ServerMsg` variants
@@ -7126,6 +6195,16 @@ fn server_msg_tag(text: &str) -> Option<&str> {
         t: &'a str,
     }
     serde_json::from_str::<Tag<'_>>(text).ok().map(|tag| tag.t)
+}
+
+/// The `t` of a text frame that did not decode as a [`ServerMsg`]: the
+/// decode-failure arm WARNs for an `rc:` tag (a frame of ours this build
+/// cannot read) and logs anything else at debug. Owned, unlike
+/// [`server_msg_tag`], so an escaped tag still reads.
+fn undecodable_frame_tag(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("t")?.as_str().map(str::to_string))
 }
 
 /// T2.10d: tear down every tunnel peer on WS disconnect. Cheap
@@ -7665,21 +6744,6 @@ fn privacy_words_in(rpc: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// FR-90 P2c-3 — take the replica words out of a secondary org's caps: a
-/// device holds copies for its primary organization only, so another org's
-/// placement must never see it offer them. Equality, never a prefix: `hive`
-/// is a prefix of each, and stays. P2d: nor does it carry another org's
-/// streams (`hive-stream`). P2i-1: nor does it answer a search over them
-/// (`hive-search`).
-fn strip_replica_verbs(rpc: &mut Vec<String>) {
-    rpc.retain(|v| {
-        v != RpcCap::HiveReplica.wire()
-            && v != RpcCap::HiveArchive.wire()
-            && v != RpcCap::HiveStream.wire()
-            && v != RpcCap::HiveSearch.wire()
-    });
-}
-
 /// FR-85 P3b — `AgentCaps.record` as it stands NOW: the owner's live gate
 /// and whether a recorder can run here. Config-dependent and live, so it is
 /// filled at every announcement (the hello, a heartbeat that re-announces),
@@ -7819,6 +6883,39 @@ mod tests {
         );
     }
 
+    /// #3468, from review — a re-offer's peer carries the recording only with
+    /// RECORD in its grant AND a record context. A second offer, the only way
+    /// a re-offer comes, finds neither stashed (the first one took them), so
+    /// the old channel's end stays the recording's end. Red when the grant
+    /// alone, or nothing at all, counts.
+    #[test]
+    fn only_a_reoffer_with_record_and_its_context_carries_the_recording() {
+        use roomler_ai_remote_control::permissions::Permissions;
+        let meta = |record: bool| -> SessionMeta {
+            (
+                "Controller".to_string(),
+                None,
+                None,
+                record.then_some(RecordMeta {
+                    controller_user_id: bson::oid::ObjectId::new(),
+                    prompt_window: None,
+                }),
+                crate::rc_overlay::RcOverlay::resolve(false),
+                None,
+                None,
+            )
+        };
+        let record = Permissions::default() | Permissions::RECORD;
+        assert!(!reoffer_carries_record(None, None), "a second offer");
+        assert!(!reoffer_carries_record(
+            Some(&Permissions::default()),
+            Some(&meta(true))
+        ));
+        assert!(!reoffer_carries_record(Some(&record), Some(&meta(false))));
+        assert!(!reoffer_carries_record(Some(&record), None));
+        assert!(reoffer_carries_record(Some(&record), Some(&meta(true))));
+    }
+
     /// #2551 — a `ws.text` stage is refined to the message's wire tag, read
     /// straight from the JSON. Anything without a plain `t` gives `None`, and
     /// the arm then names `?` rather than failing.
@@ -7841,6 +6938,24 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(server_msg_tag(&json), Some("rc:goodbye"));
+    }
+
+    /// FR-137 compatibility test 3 — a frame in one of FR-90's retired
+    /// families (an older server's `rc:hive.start`, say) no longer decodes as
+    /// a `ServerMsg`. The decode-failure arm reads its tag, which starts
+    /// `rc:`, so the frame is named in a WARN and dropped; that arm only logs,
+    /// so the socket stays up.
+    #[test]
+    fn a_retired_family_frame_fails_to_decode_and_is_named_by_its_tag() {
+        for text in [
+            r#"{"t":"rc:hive.start","session_id":"s","prompt":"x"}"#,
+            r#"{"t":"rc:vault.leased","req_id":"r"}"#,
+            r#"{"t":"rc:knowhow.scan","scan_id":"k"}"#,
+        ] {
+            assert!(serde_json::from_str::<ServerMsg>(text).is_err(), "{text}");
+            let tag = undecodable_frame_tag(text).expect("a `t`");
+            assert!(tag.starts_with("rc:"), "{tag}: the WARN arm, not debug");
+        }
     }
 
     /// #2221 — a dropped session that lived restarts the reconnect ladder. A
@@ -8074,28 +7189,6 @@ mod tests {
             ctx.note_ws_down(),
             "after a hello, the next failure starts a new one"
         );
-    }
-
-    /// FR-90 P2c-3 — a secondary org's caps lose the replica words, by
-    /// equality: `hive` and every other `hive-*` word stays. P2d: and
-    /// `hive-stream`, so it carries no other org's streams. P2i-1: and
-    /// `hive-search`, so it answers no other org's search.
-    #[test]
-    fn a_secondary_connection_never_offers_copies() {
-        let mut rpc: Vec<String> = [
-            "exec",
-            "hive",
-            "hive-replica",
-            "hive-archive",
-            "hive-stream",
-            "hive-search",
-            "hive-view",
-            "hive-adopt",
-        ]
-        .map(String::from)
-        .to_vec();
-        strip_replica_verbs(&mut rpc);
-        assert_eq!(rpc, ["exec", "hive", "hive-view", "hive-adopt"]);
     }
 
     /// FR-27 P10 — the host's Disconnect names itself on the wire. The

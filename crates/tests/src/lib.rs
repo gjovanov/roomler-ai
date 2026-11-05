@@ -202,6 +202,10 @@ mod pagination_tests;
 /// one, the address and account ceilings, the kill switch, the audit trail.
 #[cfg(test)]
 mod pairing_tests;
+/// FR-137 P2 — FR-90's two parse-only wire fields are refused, never served as
+/// the owner's, and the audit rows Hive left still list.
+#[cfg(test)]
+mod parked_wire_tests;
 #[cfg(test)]
 mod pdf_export_tests;
 /// FR-100 P1a — a device's identity key as the fleet stores and shows it, and

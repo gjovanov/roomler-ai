@@ -1,6 +1,6 @@
 # FR-137: Hive leaves master — FR-90 parked on a branch, the fleet kept whole
 
-**Issue:** [#3458](https://github.com/gjovanov/roomler-ai/issues/3458) · **Status:** **claimed** 2026-11-04; D1–D11 confirmed the same day; P1 in review ·
+**Issue:** [#3458](https://github.com/gjovanov/roomler-ai/issues/3458) · **Status:** **claimed** 2026-11-04; D1–D11 confirmed the same day; P1 merged and promoted, P2 merged, P3 in review ·
 **Anchors:** master `8f7533e96` (2026-11-04) unless a row says otherwise ·
 **Parks:** [FR-90](https://github.com/gjovanov/roomler-ai/blob/park/hive-fr90/docs/fr/FR-90-hive-agent-sessions.md)
 ([#1827](https://github.com/gjovanov/roomler-ai/issues/1827)), parked on
@@ -270,9 +270,9 @@ Each field check is run **RED first** on the current deploy, then GREEN.
 | Phase | What | Verified by | Status |
 |---|---|---|---|
 | **P0** | this spec, the claim, the inventories (`inventory-{A,B,C}.md`), the compatibility facts (`compat.md`) and the anchor check | 627 inventory anchors + 2 in range, and every spec anchor, checked on master `8f7533e96` | drafted 2026-11-04 |
-| **P1** | PR-A (`inventory-A.md`): the server and the UI, stubs S-A1…S-A8 | §4.1 | RED read 2026-11-04; PR-A in review |
-| **P2** | PR-B (`inventory-B.md`): the device, the wire and the shared crates, stubs S-B1…S-B8, the compatibility tests | §4.2 | — |
-| **P3** | PR-C (`inventory-C.md`): the six docs leave, 28 files cleaned, FR-90's row parked, and this FR's docs: the reserved surfaces, each in its home doc, a checklist section with a mermaid diagram of where each retired surface lands, linked from `docs/README.md` | §4.3 | — |
+| **P1** | PR-A (`inventory-A.md`): the server and the UI, stubs S-A1…S-A8 | §4.1 | merged 2026-11-04 as `97dea2554` and promoted as `hosted-20261104-97dea25`; GREEN 2026-11-04 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6636996599)) |
+| **P2** | PR-B (`inventory-B.md`): the device, the wire and the shared crates, stubs S-B1…S-B8, the compatibility tests | §4.2 | merged 2026-11-04 as `9da76c4e6` (#3475); it rides 0.4.201, not cut yet |
+| **P3** | PR-C (`inventory-C.md`): the six docs leave, 28 files cleaned, FR-90's row parked, and this FR's docs: the reserved surfaces, each in its home doc, a checklist section with a mermaid diagram of where each retired surface lands, linked from `docs/README.md` | §4.3 | RED read 2026-11-04 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6635837269)); PR-C (#3490) in review |
 
 ### 4.1 P1: what proves it
 
@@ -346,7 +346,7 @@ Each field check is run **RED first** on the current deploy, then GREEN.
   a `hive` or `vault` feature. And §2.1's regex over `crates agents ui .github scripts Cargo.toml
   Dockerfile* docker-compose*` returns only §3.3's stubs and §2.1's false-positive classes, with the list
   recorded in §8.
-- [ ] **AC2, P1 is promoted and production holds.** §4.1's RED reading before, and every GREEN item after.
+- [x] **AC2, P1 is promoted and production holds.** §4.1's RED reading before, and every GREEN item after. *(GREEN 2026-11-04: [#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6636996599).)*
 - [ ] **AC3, P2 is promoted and released, and the fleet holds.** §4.2's rehearsal, server, canary and fleet
   readings. The first release after P2 builds from its tag on all four platforms and re-pins the MSI size
   baseline (D10).
@@ -442,3 +442,9 @@ record, the confirmed one first.
 | 2026-11-04 | The operator's decisions | D1–D11 confirmed as recommended ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6625433694)) |
 | 2026-11-04 07:44–07:47Z | P1 RED, on production before the merge (`hosted-20261103-5f12695`, server 0.4.197) | `/health` and `/api/capabilities` name `hive`, `vault` and `knowhow` under `compiled` (6 of 6 reads); the test organization's admin gets 200 from `GET /api/tenant/{id}/hive`, another organization 404, no credential 401 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6625555835)) |
 | 2026-11-04 | AC5's "before" read, bounded | 13 of the plan's 21 collections exist, with 48 indexes: the vault's eight never existed (the vault was never mounted), and six TTL indexes are live, not ten. §2.2, fact 12, D2 and AC5 corrected to match |
+| 2026-11-04 13:47–15:18Z | D4: the test organization's live Hive sessions, before and after the promote | 0 live in four reads, the third with the stop armed and the fourth after the roll; all 73 sessions kept; no stop needed ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6632302719)) |
+| 2026-11-04 13:51Z, 15:13Z | P1 merged as `97dea2554` (#3461), and promoted as `hosted-20261104-97dea25` | both pods Ready with 0 restarts; the online-agent count 22 before and 22 after ([step log](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6632438977)) |
+| 2026-11-04 15:14–17:09Z | P1 GREEN, on production after the promote | every §4.1 item GREEN, the test-organization row with a caveat: its one connected device predates FR-90, and the Hive-capable hello is shown on 20 of 20 0.4.199 devices. Two earlier reads corrected: the probe's device list was its first page (25 of 48), and the pre-roll `rc:*` regex could never match ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6636996599)) |
+| 2026-11-04 16:19–16:20Z | P3 RED, on master `14c8937c9` and the live site, before PR-C | the six docs present (18,312 lines); FR-90's row linked its spec by relative path; 40 links on 34 lines of 9 surviving docs pointed into the six; the public configuration reference listed 13 `hive_*` rows ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6635837269)) |
+| 2026-11-04 23:41Z | P2 merged as `9da76c4e6` (#3475), after 0.4.200 was published (22:14Z) | its squash tree equals PR-B's tested head `fb3577c05` (tree `a9eb97648`); P2 rides 0.4.201 |
+| 2026-11-04 | P3 on PR-C's head (#3490), static | `fr-registry`, `anchor-ranges` and `mermaid-sequences` report 0 faults, and the docs-site build passes (98 pages, its link and anchor checks included); 0 links into the six docs; FR-90's row links the branch by full URL; `CLAUDE.md` and the modular-monolith rule hold no Hive text, and `docs/README.md` only its retired-names row's pointer to the checklist |

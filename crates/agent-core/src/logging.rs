@@ -343,9 +343,7 @@ fn open_log_appender<A>(
     }
 }
 
-/// The filter this binary's logs are kept by: [`init`]'s, and (FR-90
-/// P8-2a-5) a session's worker's, so its lines are kept as the daemon's own
-/// would be.
+/// The filter this binary's logs are kept by: [`init`]'s.
 pub fn filter() -> EnvFilter {
     // Default filter. `RUST_LOG` (env, or the SCM service Environment
     // block for the SystemContext service) overrides wholesale when
