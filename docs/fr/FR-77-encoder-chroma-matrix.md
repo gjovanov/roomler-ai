@@ -36,7 +36,7 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
   `h264/hevc/av1 × nvenc/qsv/amf/videotoolbox` + `vp9_qsv` (profile 0 only, `:655-659`).
   VAAPI was never wired (`agents/roomlerd/Cargo.toml:185-186` still promises it for
   "rc.74"); no `*_mf` name exists anywhere. macOS ships FFmpeg again since 2026-08-25
-  (`release-agent.yml:2500-2523`) — several docs still say it does not.
+  (`release-agent.yml:2512-2535`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
   (`ui/src/composables/useRemoteControl.ts:3027-3057`).

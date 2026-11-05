@@ -2324,8 +2324,20 @@ jobs:
           # FR-97, FR-99, FR-118/119), not a stray payload. So the baseline is
           # the measured 22.00 and the ceiling 26: the same ~4 MB of headroom,
           # the warning back at +2 (24).
-          $p4bBaseline = 22.00
-          $ceilingMB = 26
+          # FR-137 D10 re-baseline (2026-11-05). P2 (#3475) took FR-90's Hive
+          # out of the agent. 0.4.201, the first release built without it
+          # (run 42042701635), measured the per-User MSI at 19.15 MB and the
+          # per-Machine at 19.28: -2.94 each against 0.4.200 (22.09, 22.22),
+          # and the Linux amd64 .deb -2.46 (18.80 -> 16.34), so it is the
+          # agent's code, not a Windows payload. Left at 22.00, the baseline
+          # sat 2.72 MB above the real size: the next ~4.7 MB of accidental
+          # growth would have passed with no warning, the high-baseline
+          # failure this guard exists to catch. So the baseline is the larger
+          # flavour's measured 19.28 (the guard compares the max) and the
+          # ceiling moves 26 -> 23: ~3.7 MB of headroom, the warning at +2
+          # (21.28) before the fail.
+          $p4bBaseline = 19.28
+          $ceilingMB = 23
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
