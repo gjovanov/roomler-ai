@@ -1333,7 +1333,15 @@ It failed safe. The fix reads `/Users` once (`scan_homes`) and keeps one entry p
 (`distinct_homes`, `agents/roomlerd/src/one_row.rs:1010`): the folder's own entry wins over a
 link to it, and a folder reached only through links keeps the first of them by name, since its
 person still has a file to migrate. With the link removed by hand, the same command migrated the
-same Mac. GREEN with the link left in place waits for the release that carries the fix.
+same Mac.
+
+**GREEN on released 0.4.201**, the same afternoon: a second fresh tart Mac, made two rows by the
+script the server serves (`--token` and `--daemon-token`), the link left in place. `one-row
+--dry-run` listed the person once, as `admin, primary`, and `one-row --yes` went through: it kept
+both files, booted the LaunchAgent out and moved its plist aside, wrote both files, restarted, and
+said "the root half is connected, and its GUI worker attached (screen-capture, input)", the
+overlay address as before. The retired row read offline with its `DELETE`, and a session on the
+one row streamed (99.6 % lit).
 
 ### 2026-11-05 — P3a to P3c on released 0.4.200: one row, end to end
 
