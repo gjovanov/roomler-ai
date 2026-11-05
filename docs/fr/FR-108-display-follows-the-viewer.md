@@ -2,7 +2,9 @@
 
 **Issue:** [#2322](https://github.com/gjovanov/roomler-ai/issues/2322) · **Status:** in progress — P0
 measured; P1, P1b and P2 built and field-verified ([`docs/display-match.md`](../display-match.md)); P3 waits
-for the virtual display; P4 designed (3g) · **Owner:** the Windows agent (`display_match.rs`, the user-context worker), the viewer (the
+for the virtual display; P4 designed (3g); P1c (a recording holds the display,
+[#3467](https://github.com/gjovanov/roomler-ai/issues/3467)) built, its field read owed on the release that carries
+it · **Owner:** the Windows agent (`display_match.rs`, the user-context worker), the viewer (the
 display-match toggle); later the Linux virtual desktop · **Anchors:** master `f02e6cc6a` · **Program:**
 [StarDesk teardown](../plans/stardesk-teardown-program.md), wave 2 (§5.3) · **Builds on:** rc.191's display
 match, [FR-92](FR-92-keep-busy.md) (a person told from the controller without hooks),
@@ -90,7 +92,7 @@ Every request gets one answer, `rc:display-match.state`:
 ```
 
 `refused` ∈ `attended`, `locked` (waiting for an unlock, 3a), `disabled_on_device`, `no_fitting_mode`,
-`switch_failed`, `unsupported`.
+`switch_failed`, `unsupported`, and since P1c `recording` (waiting for the recording's end, 3e2).
 - **An older viewer** ignores the unknown `t`.
 - **A newer viewer facing an older agent** gets no answer, and shows the toggle as it does today.
 - ⚠️ **A refusal word the viewer does not know** (from a newer agent) is shown verbatim, never read as success.
@@ -124,7 +126,10 @@ stateDiagram-v2
     [*] --> Asked: rc:display-match, the stage size
     Asked --> Refused: never · attended · no fitting mode
     Asked --> Waiting: locked (the worker cannot switch it)
+    Asked --> Waiting: a recording holds the display (P1c)
     Waiting --> Matched: unlocked, and no person since (P1b)
+    Waiting --> Asked: the recording ended, decided again (P1c)
+    Matched --> Waiting: a recording starts, the mode goes back first (P1c)
     Waiting --> Refused: unlocked by the person
     Asked --> Matched: unattended, or always
     Matched --> Restored: toggle off · session end · peer drop
@@ -133,6 +138,33 @@ stateDiagram-v2
     Restored --> Asked: the viewer asks again
     Restored --> [*]
 ```
+
+### 3e2. A recording holds the display (P1c, [#3467](https://github.com/gjovanov/roomler-ai/issues/3467))
+
+A recording is made at the display's own mode, by a capturer of its own that opens once
+([FR-85](FR-85-hq-screen-recording.md)). The guard above never asked whether one was running, so on an
+unattended host a viewer that connected switched the display under it. Read on release 0.4.199 on an X11
+guest: a local recording kept its frame size and froze outside the matched area, and a remote one started in
+a switched session was recorded at the matched size. So from just before its recorder launches until it has
+stopped, a recording holds the display:
+
+- **The rule.** While a recording runs, local or remote, every request is refused `recording` and waits. The
+  owner's `never` still answers first, because it outlasts the recording.
+- **Its start hands the screen back.** A mode a session switched goes back before the recorder launches, as
+  `attended` hands it back, and that session's viewer is told `recording`.
+- **Its end decides again.** Each request it refused is decided again once it has stopped, through the whole
+  guard, so an attended screen still refuses. Decision 2 is about a person coming back, and a recording's end
+  is not one.
+- **One change of the mode at a time.** A decision with its switch, an owner's restore, and the recording's
+  hold with its hand-back are serialized. No request switches after the hold looked, and no restore is still
+  running when the recorder opens its capture.
+- **Under `always` too** (decision 7).
+- **Turning display match off drops a waiting request.** Before P1c a viewer that turned it off while its
+  request waited for the unlock was still switched at the unlock. P1c makes waiting more common, so it fixes
+  that too.
+
+[`docs/display-match.md`](../display-match.md#a-recording-holds-the-display-3467) has the table and the
+anchors.
 
 ### 3f. Linux, modes no monitor offers, several displays (P2–P4)
 
@@ -206,6 +238,7 @@ monitor.
 | P0 | This spec and the claim. Three probes on vmtest: (1) does `GetLastInputInfo`, read in the worker, move on the person's input (QMP) and on the controller's injection, and can the two be told apart; (2) what `ChangeDisplaySettingsExW(CDS_FULLSCREEN)` does at the lock screen and at the logon screen (SystemContext); (3) a guest with several modes, a display driver beyond the Basic Render Driver, so a real switch and restore can be seen | docs only | **done 2026-10-16** (§8 rows 2–4): (1) the idle clock moves for both the person and the controller, so the guard must subtract the arbiter's injections; (2) at the lock screen the switch **fails** (`rc=-1`), which reshaped 3a. The logon screen is still owed. By the code it takes the same path: `lock_state` reads any input desktop but `Default` as `Locked`, so P1 answers it `locked` and it waits. Its cell rides AC2's locked half on the release; (3) a virtio video model plus `viogpudo` gives session 1 23 modes, and the red was recorded on it |
 | P1 | The guard (3a), the owner's key (3b), the answer (3c) and the viewer's words (3d), on Windows | `display_match = always` restores rc.191 | **built** ([`docs/display-match.md`](../display-match.md)): `presence.rs` (a tracker that keeps the last idle-clock move the machine does not explain, its 500 ms sampler from the worker's start, the decision), `display_match.rs` (the owner's policy, `may_switch`, `request_for`, the answer), the arbiter's and keep busy's tick notes, the console-only and never-pushable key, the viewer's answer and words. Unit tests on Windows and Linux with four negative controls: the tracker counting machine input as a person failed three tests, `auto` ignoring presence failed one, a planted `SetWindowsHookExW` failed the scan, and the gate removed failed the console test. **Shipped in agent 0.4.140 and field-verified there:** AC1 and AC4 (§8 row 8), AC2's idle half (§8 rows 7 and 9), AC5 both ways (§8 row 10) |
 | P1b | The locked host's request applies at the unlock when nobody is at the screen (3a), and the person coming back restores their mode (3e) | `display_match = always` (no hand-back) | **built** (3e "as built"): `away_since_lock` in the tracker, the waiting request and `on_unlock` from the session's lock watcher, the 250 ms `on_tick` watcher with `hand_back`. Unit tests on Windows and Linux with two negative controls: an `away_since_lock` that never reads a lock as away failed the two lock tests, and a `hand_back` that keeps the mode under `never` failed the hand-back test. **Shipped in agent 0.4.140 and field-verified there:** AC2's locked half (§8 row 6), AC3 (§8 row 7) |
+| P1c | A recording holds the display (3e2, [#3467](https://github.com/gjovanov/roomler-ai/issues/3467)): refused `recording` while one runs, the mode a session switched handed back before its recorder launches, and the requests it refused decided again at its end. With it, turning display match off drops a waiting request | none of its own: it only refuses and restores, and `display_match = never` keeps display match out of a recording's way | **built** (`display_match.rs` `hold_for_recording`, taken by `RecordingManager::start_inner` for a local and a remote start alike; `Refusal::Recording`; the waiting request generalised to wait for the unlock or the recording's end; `recording_turn` in the session's watcher; one lock for every change of the mode; `turn_off`). Unit tests beside `may_switch`, four of them shown red with their code taken out, and the recorder's end-to-end test reads the hold. **Its field read (AC13) is owed on the release that carries it** |
 | P2 | Linux virtual desktops: switch the virtual desktop's mode to the one asked (Xorg + dummy, open decision 4), reopen the capture after a switch, restore at the end | `display_match = never` | **probe done 2026-10-16** (§8 row 5): Xvfb cannot switch at all; Xorg + dummy switches to any size. **Built** (decision 4 settled 2026-10-17: Xorg + dummy where installed, Xvfb otherwise): the server pick and its kill switch `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb`, the config (an exact start mode, `ReducedBlanking`, no input devices, an empty config dir), the request as the mode exactly, `xrandr` switch and restore, the capture reopened on a mode generation. Tests: the config, the argv, the server pick, the kill switch, the modeline, the mode fitting, `xrandr --current` parsing |
 | P3 | Modes no monitor offers, through the virtual display | — | — |
 | P4a | Choose the display (3g): one display table, `display-select`, `rc:display`, the capture reopened on the shown display, and the input, the pointer, shared pipelines and display match following it. First a probe: a vmtest guest with two heads, so there is a second display to test on | `display-select` left out of the hello: no picker, and `mon` stays 0 | **designed 2026-10-21** (3g); **waits for the first multi-display host** (open decision 5, decided 2026-10-28) |
@@ -272,6 +305,12 @@ monitor.
 - [ ] **AC12 (old and new together, P4):** an older viewer with a P4 agent streams the primary, as today,
   and its clicks land there. A P4 viewer with an older agent shows no picker.
 
+- [ ] **AC13 (a recording holds the display, P1c, red first):** on an unattended X11 host with display match at
+  `auto`, a viewer that joins during a local recording leaves the display as it is: the device logs the
+  `recording` refusal and no switch, the viewer reads why, and the recording's frames after 60 s show the top
+  bar's clock moving. A remote recording started in a switched session is recorded at the display's own size
+  (its sidecar), the switch handed back first. Red first: release 0.4.199 (#3467) and again on the release
+  before the fix. The control: the attended guard still hands the screen back on a person's input.
 ## 6. Open decisions
 
 1. **`N`, the time without a person's input before a host counts as unattended.** Recommended: 5 minutes,
@@ -295,6 +334,12 @@ monitor.
    multi-display host enrolls, not sooner for the parity row alone.
 6. **How P4b splits the pipe.** By the pixels each display streams (recommended), or most of it to the
    window the controller used last.
+7. **A recording under `always` (P1c, raised by #3467).** `always` is the owner's "switch whenever a
+   controller asks". A: a recording wins under `always` too, refused and the switched mode handed back at its
+   start. B: `always` keeps switching under a recording. Recommended: A, because a switch under a recording
+   freezes it outside the matched area or ends its file, and the session's end would change the display under
+   it anyway. **Built as A**, in one place (`a_recording_wins`), so B is a one-line change. The hub put it to
+   the operator on 2026-11-04 with the recommendation; the answer is pending.
 
 ## 7. Out of scope
 

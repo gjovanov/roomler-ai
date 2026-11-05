@@ -1326,6 +1326,9 @@ mod process {
                 .is_some_and(|p| Path::new(p).starts_with(&out))
         );
         assert!(is_recording(), "the updater's defer gate sees it");
+        // #3467 — and the recording holds the display: display match refuses
+        // `recording` while it runs.
+        assert!(roomlerd::display_match::recording_holds());
         assert!(
             matches!(m.start(software()).await, Response::Error { .. }),
             "one recording at a time"
@@ -1337,6 +1340,10 @@ mod process {
             other => panic!("stop: {other:?}"),
         };
         assert!(!st.active && !is_recording());
+        assert!(
+            !roomlerd::display_match::recording_holds(),
+            "a stop answers with the display let go"
+        );
         let last = st.last.expect("how it ended");
         assert_eq!(last.reason, "requested");
         assert!(last.duration_ms >= 1000, "{last:?}");
@@ -1410,6 +1417,8 @@ mod process {
         assert!(!st.active, "a killed recorder started anyway: {st:?}");
         assert!(st.path.is_none(), "it reported `started` after all: {st:?}");
         assert_eq!(st.last.map(|l| l.reason).as_deref(), Some("start_timeout"));
+        // #3467 — and a stopped recorder holds the display no longer.
+        assert!(!roomlerd::display_match::recording_holds());
         // (A killed child may not even have created the folder.)
         let written = std::fs::read_dir(&out)
             .map(|d| {
