@@ -58,14 +58,14 @@ and the places where the policy is set say so (§2).
 The policy belongs to the device. A server cannot push it (whether it should is
 an open decision in the spec). It is set in two places, and both carry the
 clamshell sentence from the key's description
-([`config_surface.rs:331`](../crates/agent-core/src/config_surface.rs#L331)):
+([`config_surface.rs:418`](../crates/agent-core/src/config_surface.rs#L418)):
 
 - **The companion's settings row** (Settings → Essentials), which renders the
   description under the control
-  ([`settings.js:350`](../agents/roomler-desktop/src/front/settings.js#L350)).
+  ([`settings.js:354`](../agents/roomler-desktop/src/front/settings.js#L354)).
 - **`roomler config set power_policy <value>`**, which on a Mac prints the
   description's ⚠️ sentence after the change
-  ([`localclient.rs:1611`](../agents/roomler-cli/src/localclient.rs#L1611)
+  ([`localclient.rs:1629`](../agents/roomler-cli/src/localclient.rs#L1629)
   `config_set_note`).
 
 A test pins the sentence in the description, so a rewrite that drops it fails
@@ -175,8 +175,8 @@ sleep would say hello again and erase the reason.
 
 | surface | field | reads |
 |---|---|---|
-| `roomler status` | `power` ([`lib.rs:207`](../crates/localapi/src/lib.rs#L207)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2441`](../agents/roomler-cli/src/localclient.rs#L2441)) |
-| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3351`](../agents/roomler-cli/src/localclient.rs#L3351)) |
+| `roomler status` | `power` ([`lib.rs:207`](../crates/localapi/src/lib.rs#L207)) | `policy on-ac, on mains — held awake`, `policy never — held awake for a live session`, or `policy never — free to sleep (a sleep reads "asleep" in the device lists)`. On a Mac a held line adds `; a closed lid still sleeps a Mac with no external display` ([`localclient.rs:2459`](../agents/roomler-cli/src/localclient.rs#L2459)) |
+| `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3369`](../agents/roomler-cli/src/localclient.rs#L3369)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:640`](../crates/modules/fleet/src/agent.rs#L640)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |

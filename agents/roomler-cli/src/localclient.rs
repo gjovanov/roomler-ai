@@ -1557,12 +1557,30 @@ pub async fn config_ls(json: bool) -> Result<()> {
         } else {
             "live"
         };
-        println!("{:key_w$}  {:9}  {:8}  {value}", e.key, e.kind, applies);
+        // #2871 — a key this connection cannot set: the daemon's own word
+        // (`read_only`), on the person-at-the-device socket of a system
+        // install, where only the keys that are the person's own call change.
+        let note = if e.read_only.is_some() {
+            "  (an administrator's)"
+        } else {
+            ""
+        };
+        println!(
+            "{:key_w$}  {:9}  {:8}  {value}{note}",
+            e.key, e.kind, applies
+        );
     }
     println!(
         "\n`restart` keys take effect on the next daemon restart, `live` keys at once — \
          `roomler config set <key> <value>`"
     );
+    if entries.iter().any(|e| e.read_only.is_some()) {
+        println!(
+            "keys marked `(an administrator's)` are the root daemon's to change: this is its \
+             person-at-the-device socket, which serves them read-only — \
+             `sudo roomler config set <key> <value>`"
+        );
+    }
     print_other_daemon_hint(CONFIG_IS_THE_PER_USER_HALFS).await;
     Ok(())
 }

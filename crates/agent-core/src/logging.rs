@@ -1307,6 +1307,35 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn every_target_kept_at_info_is_a_real_crate_or_module() {
+        // A tracing target is its crate's lib name, then the module path. A rename that left
+        // `KEPT_AT_INFO` behind would drop these lines again with no error anywhere, and #2871's
+        // record of a change the person at the device made is one of `roomler_localapi`'s.
+        let localapi = std::any::type_name::<roomler_localapi::Request>();
+        assert!(
+            KEPT_AT_INFO
+                .iter()
+                .any(|target| localapi.starts_with(&format!("{target}::"))),
+            "{localapi}"
+        );
+        let logging = module_path!().trim_end_matches("::tests");
+        assert!(KEPT_AT_INFO.contains(&logging), "{logging}");
+    }
+
+    #[test]
+    fn the_mac_root_halfs_spec_keeps_the_person_sockets_record_line() {
+        use tracing::Level;
+        // The root half serves the person socket on a Mac, under `com.roomler.daemon.plist`'s
+        // `RUST_LOG=info`: a bare level that keeps the line already, and that nothing caps.
+        assert!(kept(Some("info"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::INFO)
+        }));
+        assert!(!kept(Some("info"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::DEBUG)
+        }));
+    }
+
     use super::*;
 
     #[test]

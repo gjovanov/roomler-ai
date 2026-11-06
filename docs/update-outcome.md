@@ -176,7 +176,7 @@ record's file. Two topologies split roles:
   (`com.roomler.update`, FR-96 / P4); the per-user half answers its own
   `<log_dir>`, where no root install ever writes. `roomler status` as the
   console user therefore reads `Absent` for the per-user half, and
-  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:245`) lends it
+  `with_machine_network` (`agents/roomlerd/src/person_socket.rs:248`) lends it
   the root half's **network** fields only, never its install record — the
   verdict is per daemon, and the half that answers must not claim another's.
 
@@ -198,8 +198,8 @@ $ roomler status
   status` (fleet RPC, `docs/fleet-rpc.md`), or `roomler status --json` and read
   `.last_install`. The line sits right under `version` — the record and the
   binary it produced, together — and is printed only when the daemon reports
-  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2474`;
-  the sentence per word, `last_install_line`, `:2869`).
+  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2492`;
+  the sentence per word, `last_install_line`, `:2887`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
   called from `run_cmd`, `agents/roomlerd/src/app.rs:4105`). `journalctl -u

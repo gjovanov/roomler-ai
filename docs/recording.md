@@ -497,8 +497,11 @@ sequenceDiagram
   peer it could not name is refused. Without these the Recordings view is
   dead, and the banner's and the tray's **Stop recording** answer nothing:
   the host could not stop a remote recording of their own screen. `ConfigSet`
-  stays refused on that socket, so where recordings go and the two remote
-  switches are `sudo roomler config set`.
+  of `record_dir` stays refused on that socket, so where recordings go is
+  `sudo roomler config set`, pending a check of the folder each time a
+  recording starts. Since #2871's design A the two remote switches are that
+  person's there, the seat asked again before a change is written
+  (`at_the_seat_now`).
 - ⚠️ **The recorder runs as the person signed in at the device, at normal
   integrity, whatever the daemon runs as** (P1e, `recording/launch.rs`, see
   "Who the recorder runs as" below). Where there is nobody to record as —

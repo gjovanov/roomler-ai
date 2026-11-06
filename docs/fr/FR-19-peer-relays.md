@@ -997,8 +997,8 @@ COTURN flush on a host serving live conference media.
 Then take mars's relay down and assert re-selection to zeus without a DERP round trip.
 ⚠️ **Not via `roomler config set`.** The first draft claimed that was *"a config change, not
 a service restart"* — false: `config_surface.rs:19` states *"Every key is read at daemon
-startup, so the whole surface is `restart_required = true`"* (hardcoded `:408`, `:422`,
-asserted by `every_key_gets_and_applies` `:2839`), and the CLI's live-apply allowlist is
+startup, so the whole surface is `restart_required = true`"* (hardcoded `:495`, `:509`,
+asserted by `every_key_gets_and_applies` `:2929`), and the CLI's live-apply allowlist is
 exactly `exec_enabled | remote_config_enabled` (`localclient.rs:988`). A bound UDP socket
 does not close on a TOML write, and restarting `roomlerd` on **mars** would kill the host
 driving every `roomler exec` in this plan. **Revoke server-side** (`Agent.peer_relay_policy`

@@ -51,7 +51,7 @@ boot); the GUI-session process becomes an **unenrolled worker** it spawns and dr
   the launchd analogue of `spawn_in_session`. Console-user changes (login, logout, fast
   user switch) drive respawn, mirroring `decide_spawn`'s session-change handling.
 - **Transport**: the LocalAPI unix socket, which already solves exactly this addressing
-  problem — `crates/localapi/src/lib.rs:3881-3891` documents `/var/run/roomler` as the
+  problem — `crates/localapi/src/lib.rs:4227-4237` documents `/var/run/roomler` as the
   root daemon's well-known socket precisely because "a per-user path cannot serve a root
   daemon … that is the trap the macOS LaunchDaemon split walks into".
 - **Division**: signalling + consent + policy in the daemon; the rc session's WebRTC
@@ -129,7 +129,7 @@ session setup and then nothing.
 ### The transport problem, stated honestly
 
 LocalAPI is **strictly request→response**: `serve_connection` reads newline-delimited JSON,
-answers each line, and loops to EOF (`crates/localapi/src/lib.rs:3185`); `TailLog`'s
+answers each line, and loops to EOF (`crates/localapi/src/lib.rs:3596`); `TailLog`'s
 own doc calls itself "poll-based follow (no streaming)" (`lib.rs:1548`). There is no server
 push, and delegation needs it in both directions — trickle ICE arrives whenever the network
 decides, not when someone asks.
@@ -157,7 +157,7 @@ screen appears".
 ⚠️ `RcAttach` must be **daemon-only**, not something any local process can call: it would
 otherwise let any user-session process on the box volunteer to serve remote-control
 sessions. The socket's own ACL is the trust boundary today
-(`lib.rs:3881-3891` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
+(`lib.rs:4227-4237` — `/var/run/roomler`, 0600), which is *not* sufficient on its own here,
 because the worker is an ordinary user process and so is an attacker's. The attach must
 carry the one-shot secret the daemon passed to the worker in its spawn environment, and the
 daemon must accept exactly one attached worker at a time.
@@ -546,9 +546,9 @@ The WebRTC peers, the SSH server and the relay responder need an offer or an ove
 | Crash upload (`app.rs:4466`), log upload (`app.rs:4509`) | on its own token | no token: the supervisor records a crash on the root's enrollment, and the log lines go to the daemon (below) |
 | Self-unenroll on a stop (`app.rs:5612`) | if its row is ephemeral | never: this process is not that row |
 
-**What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:269`, `:294`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:172`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:88`), which lets the daemon's word fill it in (`:156`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:1425`, `:1522`).
+**What the person sees.** A worker with no enrollment answers `Status` with the root half's identity and link, not its own blanks, over the person socket it already uses for the network fields (`agents/roomlerd/src/person_socket.rs:272`, `:297`). `connected` comes from the root half only, since the stand-in always reads connected. With no answer from the root half the status reads disconnected and lists no org: the companion opens a row's server in a browser, and a row here would name the stand-in. `network_from` goes, because with one row nothing is lent. `Devices` and `Mesh` go straight to the root half (`person_socket.rs:175`) and never to the worker's own `self_view`, whose row points at the stand-in. The companion's `enrolled` stops meaning "a file exists" (`agents/roomler-desktop/src/commands.rs:88`), which lets the daemon's word fill it in (`:156`), and "Open Roomler" and "View screen" read the server and tenant from the daemon's rows when the person's file has none (`:1771`, `:1868`).
 
-⚠️ **A verb that needs the server or a host role answers at once.** As the console user it reaches the worker, and the person socket refuses it on the root half (`crates/localapi/src/lib.rs:3052`). So on a one-row Mac it answers with an error that says to run it with `sudo`, which reaches the root's own socket (`agents/roomlerd/src/localapi_state.rs:658`):
+⚠️ **A verb that needs the server or a host role answers at once.** As the console user it reaches the worker, and the person socket refuses it on the root half (`crates/localapi/src/lib.rs:3403`). So on a one-row Mac it answers with an error that says to run it with `sudo`, which reaches the root's own socket (`agents/roomlerd/src/localapi_state.rs:658`):
 
 | Verbs | Without that answer |
 |---|---|
@@ -1185,6 +1185,20 @@ down as `WORKER_ENV_FORWARD` already does. Whether the console user may set the 
 half's device-owned gates from the app *before* P3 — a new authorization path on the
 person socket — is the decision open on #2871.
 
+**Design A shipped (#2871, the operator's decision, 2026-10-25).** The root half's person
+socket now serves the configuration — the listing, marked per key, and `ConfigSet` of
+exactly the console person's own keys (`localapi::CONSOLE_PERSON_KEYS`,
+`crates/localapi/src/lib.rs:3156`) — and the companion shows the Mac as one device, each
+row from the half that reads the key, by its group (`config_surface::Owner`,
+`crates/agent-core/src/config_surface.rs:210`): the session groups to the worker, the
+rest to the root half ([desktop-companion.md](../desktop-companion.md) §5). The
+device-owned gates stay root's; P3 remains the home. Two P2 facts the split records for
+P3: the root half forwards a few session knobs to the worker as a floor
+(`WORKER_ENV_FORWARD`), and a delegated session's policies are judged against both halves'
+configs — the root's signalling first (the browser check, the session-policy mask,
+consent), then the worker's as it serves the delegated `SessionCreated` through the same
+code — so the worker's copy, the one the app edits, only ever tightens the root's.
+
 ### 2026-10-31 — the open criteria on the released agent (0.4.190 → 0.4.191)
 
 Most of the open criteria had shipped and never been read. MacBook-1 was read only, through
@@ -1482,3 +1496,37 @@ deleted.
 
 On its first start macOS also asked whether `roomlerd` may find devices on local networks, and
 announced the new background item. The session waited on neither.
+
+### 2026-11-06 — #2871 on a two-half Mac: RED on 0.4.202, GREEN on the 0.4.340 candidate
+
+A throwaway tart Mac (macOS 15.7.7, 2 CPU, 4 GiB) in the root-mode two-half layout, installed from
+the released `.pkg`: the per-user half on the person's own file (uid 501), and the root half on
+`/etc/roomler/config.toml`. Both halves were enrolled in the vmtest org, with Roomler SSH closed on
+both rows and auto-update off. For GREEN, the signed and notarized candidate of #2912 (0.4.340,
+built with `publish_release=false`) was installed over the same install. The person's moves on the
+companion's Device configuration page went through the accessibility API, as the signed-in user.
+Each change was read back from both files and both daemons' logs
+([the read on #2871](https://github.com/gjovanov/roomler-ai/issues/2871#issuecomment-6697158874)).
+
+| | 🔴 released 0.4.202 | 🟢 the candidate 0.4.340 |
+|---|---|---|
+| The banner | #2879's note: "This page edits the per-user half of this Mac" | "This Mac runs two Roomler daemons, and this page shows both" |
+| `exec_enabled`, `ssh_enabled`, `overlay_enabled` | Editable menus holding the per-user half's values. `overlay_enabled` read `off`, while the root half, which runs the mesh, had it `on` | No control. Each shows the root half's value (`overlay_enabled` `true`), an "administrator's" chip, and "Changed by an administrator in a terminal: `sudo roomler config set <key> <value>`" |
+| `external_access_enabled` → `on`, from the page | "Saved — in effect now", but written to the per-user file. `/etc/roomler/config.toml` stayed `false`, and only the per-user half logged the change | Before the change the menu showed the root half's `off`, while the per-user file still held RED's `true`. "Saved — in effect now", and `/etc/roomler/config.toml` read `true` |
+| `rc_clipboard`, from the page | The per-user file | The per-user file, while the root file kept its value |
+| `ConfigSet` by hand on `/var/run/roomler-person/501.sock`: `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `allow_plaintext_server` | Each refused in the person socket's blanket words. Neither file changed | Each refused by name ("`exec_enabled` is an administrator's on this device …"). Neither file changed |
+| The root half's log | — | `config key set by the person at the device over the person-at-the-device socket (#2871) key=external_access_enabled peer_uid=Some(501)`, with no value, beside the daemon's own `config key updated` line for the key |
+
+The control ran on the candidate with the root half booted out, which took its person socket with it,
+and the companion restarted. There was no two-daemon banner, and the gates were editable menus again
+on the per-user half's own file. So a per-user-only install reads and writes its own file, as it did
+before #2912.
+
+🔍 **WebKit's `<select>` shows no menu items to the accessibility API.** `AXPress` opens the
+menu, and no item can be found in it. Focusing the closed menu and typing the option chooses it, as
+a person's keyboard does, and fires the page's change and save. The evidence is the page's own
+"Saved" line and the two files.
+
+🔍 **`screencapture` over SSH on macOS 15 raises a system alert.** It asks whether
+`com.apple.sshd-session` may bypass the private window picker, and it covers the page in every shot
+taken after it appears. Pressing Allow through the accessibility API clears it for the session.
