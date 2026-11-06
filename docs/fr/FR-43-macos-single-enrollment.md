@@ -1438,7 +1438,7 @@ points nowhere else. Run 1 held 5.5 minutes: the hello, then 13 heartbeats every
 `caps`. Its live `rc_clipboard off` came from the SSH session, which is session 0, and the
 LocalAPI refused it: "only the person at this device's console can change what a remote session
 may use here (clipboard, files, audio)". That is the guard working
-(`crates/localapi/src/lib.rs:2435-2447`). Run 2 made the same change from the console session,
+(`crates/localapi/src/lib.rs:2406-2418`). Run 2 made the same change from the console session,
 through a one-shot interactive task as the person logged on there ("in effect now — no restart
 needed"). The heartbeats read 3 without `caps`, then the next one, 26 s after the flip, with
 `caps` (2,101 bytes against about 400), then 3 without. The guest was destroyed by name.
@@ -1496,3 +1496,37 @@ deleted.
 
 On its first start macOS also asked whether `roomlerd` may find devices on local networks, and
 announced the new background item. The session waited on neither.
+
+### 2026-11-06 — #2871 on a two-half Mac: RED on 0.4.202, GREEN on the 0.4.340 candidate
+
+A throwaway tart Mac (macOS 15.7.7, 2 CPU, 4 GiB) in the root-mode two-half layout, installed from
+the released `.pkg`: the per-user half on the person's own file (uid 501), and the root half on
+`/etc/roomler/config.toml`. Both halves were enrolled in the vmtest org, with Roomler SSH closed on
+both rows and auto-update off. For GREEN, the signed and notarized candidate of #2912 (0.4.340,
+built with `publish_release=false`) was installed over the same install. The person's moves on the
+companion's Device configuration page went through the accessibility API, as the signed-in user.
+Each change was read back from both files and both daemons' logs
+([the read on #2871](https://github.com/gjovanov/roomler-ai/issues/2871#issuecomment-6697158874)).
+
+| | 🔴 released 0.4.202 | 🟢 the candidate 0.4.340 |
+|---|---|---|
+| The banner | #2879's note: "This page edits the per-user half of this Mac" | "This Mac runs two Roomler daemons, and this page shows both" |
+| `exec_enabled`, `ssh_enabled`, `overlay_enabled` | Editable menus holding the per-user half's values. `overlay_enabled` read `off`, while the root half, which runs the mesh, had it `on` | No control. Each shows the root half's value (`overlay_enabled` `true`), an "administrator's" chip, and "Changed by an administrator in a terminal: `sudo roomler config set <key> <value>`" |
+| `external_access_enabled` → `on`, from the page | "Saved — in effect now", but written to the per-user file. `/etc/roomler/config.toml` stayed `false`, and only the per-user half logged the change | Before the change the menu showed the root half's `off`, while the per-user file still held RED's `true`. "Saved — in effect now", and `/etc/roomler/config.toml` read `true` |
+| `rc_clipboard`, from the page | The per-user file | The per-user file, while the root file kept its value |
+| `ConfigSet` by hand on `/var/run/roomler-person/501.sock`: `exec_enabled`, `ssh_enabled`, `remote_config_enabled`, `allow_plaintext_server` | Each refused in the person socket's blanket words. Neither file changed | Each refused by name ("`exec_enabled` is an administrator's on this device …"). Neither file changed |
+| The root half's log | — | `config key set by the person at the device over the person-at-the-device socket (#2871) key=external_access_enabled peer_uid=Some(501)`, with no value, beside the daemon's own `config key updated` line for the key |
+
+The control ran on the candidate with the root half booted out, which took its person socket with it,
+and the companion restarted. There was no two-daemon banner, and the gates were editable menus again
+on the per-user half's own file. So a per-user-only install reads and writes its own file, as it did
+before #2912.
+
+🔍 **WebKit's `<select>` shows no menu items to the accessibility API.** `AXPress` opens the
+menu, and no item can be found in it. Focusing the closed menu and typing the option chooses it, as
+a person's keyboard does, and fires the page's change and save. The evidence is the page's own
+"Saved" line and the two files.
+
+🔍 **`screencapture` over SSH on macOS 15 raises a system alert.** It asks whether
+`com.apple.sshd-session` may bypass the private window picker, and it covers the page in every shot
+taken after it appears. Pressing Allow through the accessibility API clears it for the session.

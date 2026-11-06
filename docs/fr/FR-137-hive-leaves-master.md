@@ -197,7 +197,7 @@ Two decisions also keep lines that name Hive. They are not stubs, and AC1's read
 | **D3's retired-switch test**: `a_retired_module_switch_loads_and_switches_nothing` | `crates/config/src/settings.rs:1786`, its two `toml::from_str` lines at `:1788` and `:1792` | A config that still sets `hive`, `vault` or `knowhow` under `[modules]` must load and switch nothing. D3 removed production's Hive env on 2026-11-05 (AC8), but an older deploy or a self-host config can still carry a switch. | No supported config can carry a retired switch, or never: the test costs nothing. |
 
 LocalAPI needs no verb stubs. An unknown verb answers `Error("bad request: …")` and the connection lives on
-(`crates/localapi/src/lib.rs:3788`). The 0.4.199 macOS update helper therefore installs without a Hive hold,
+(`crates/localapi/src/lib.rs:3614`). The 0.4.199 macOS update helper therefore installs without a Hive hold,
 failing open by design (`agents/roomlerd/src/updater.rs:3861`). Remote config needs nothing either:
 `DesiredConfig` has no Hive key (`crates/remote_control/src/models.rs:2970`), and an absent field leaves the
 device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).

@@ -4750,6 +4750,11 @@ mod tests {
         for hidden in [
             "agent_token",
             "overlay_wg_secret_key",
+            // #2871 — the host's SSH private key, and the per-org tokens and WG
+            // keys under `[[orgs]]`. `ConfigSet` logs the value it saved, so a
+            // secret that reached this surface would also reach the daemon's log.
+            "ssh_host_key",
+            "orgs",
             "machine_id",
             "machine_name",
             "tunnel_routes",
