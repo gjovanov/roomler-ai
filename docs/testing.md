@@ -26,9 +26,11 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2554`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2535`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
+| Self-host quickstart | `bash scripts/selfhost-pull-check.sh` (lane `Self-host pull`, amd64 and arm64) | a throwaway machine with Docker, since it ends with `down -v`: no registry login, an empty image cache, `pull` then `up -d`, and every image pinned |
+| A call over the self-host relay | `cd ui && E2E_EXPECT_TURN_RELAY=1 bun x playwright test e2e/selfhost-turn-relay.spec.ts` | a compose stack started with `ROOMLER__TURN__FORCE_RELAY=true` and an announced address outside its deny list, with the browser on the same machine as the server. Fails unless every connected peer connection selected a `relay` pair and both sides decode advancing remote frames |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
 | Soft-keyboard harness | `cd ui && bun run test:harness` | nothing — one harness page on the Vite dev server, in a real Chromium (`ui/e2e-harness/`, #2888) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
@@ -47,50 +49,7 @@ multi-tenancy · pagination · rate-limit · CORS · export (xlsx/pdf) · confer
 (+messages, +the FR-127 view: a view client's video consumers against its `media:view`
 reports, the viewer's pause against the owner's, the kill switch, a report through the
 other pod) · cluster · stats · relay-region · remote-control · agent
-(+e2e, +crash, +exec, +presence) · overlay · tunnel · hive.
-
-> [!NOTE]
-> **`tests/hive_canary.rs` is a second test binary, on purpose.** FR-90's
-> canary test (AC2) drives a real in-process device with the Hive supervisor
-> on, and that supervisor is process-global. In the lib's binary every other
-> in-process agent would re-point it at its own socket. `cargo test -p
-> roomler-ai-tests` runs both binaries, and the lane's count sums them. The
-> test is Linux-only and turns on `roomlerd`'s `hive-test-launcher` feature
-> through a Linux-only dev-dependency. That feature launches sessions as the
-> test's own account and refuses to run as root. Its log checks run under a
-> thread-default subscriber around a current-thread runtime, so they see
-> every task of the server and the device without `RUST_LOG`.
->
-> **Since P2d-6 it starts a second device, a member, as a child process: the
-> same binary**, running its `member_device_process` test with
-> `HIVE_CANARY_MEMBER` set, a no-op in an ordinary run (so it counts one
-> passed test). A `[[bin]]` could not do it: binaries get no
-> dev-dependencies, and the test launcher is one on purpose. Under that
-> feature a device takes its checkpoints in process, because the binary is a
-> test's and knows no `hive-checkpoint`.
->
-> **`tests/hive_drivers.rs` is a third, for the same reason** (FR-90 P1c-2b,
-> AC6): a reader's message in the session's room and a prompt over their own
-> viewer peer must reach no harness, while the owner's and a named driver's
-> do, each labelled `[Name] …`. Its harness writes every line it reads on
-> stdin to a file — what a model would be sent — and the test reads that
-> file. The scaffolding both binaries share (the server, the in-process
-> device, a browser's socket and viewer peer, the harness's side of a
-> toolbelt) is `tests/hive_support/mod.rs`, a module each includes, not a
-> test target of its own.
->
-> **`tests/hive_memory.rs` and `tests/hive_memory_off.rs` are a fourth and a
-> fifth** (FR-90 P1e-4, AC8): the same device, with its owner's
-> `hive_core_memory` on and then off. The gate is read once, when the
-> supervisor starts, and a process has one supervisor. The harness
-> (`MEMORY_HARNESS`) copies out what it finds where Claude Code reads core
-> memory — `$CLAUDE_CONFIG_DIR/CLAUDE.md` and the auto-memory `MEMORY.md` —
-> when it starts and at every turn.
->
-> | gate | what the test asserts |
-> |---|---|
-> | on | An org fact kept before a session starts is in its `CLAUDE.md`, and a device fact is in its `MEMORY.md`. A fact kept while it runs is not, even at its next turn. The next session has both, at a later revision. A write past the org's budget is `409 over_budget` with the numbers, and nothing is evicted |
-> | off | The transcript shows the frame arrived (its revision, and that the gate is off). Nothing reached the session's config directory, nor even the daemon's own disk |
+(+e2e, +crash, +exec, +presence) · overlay · tunnel.
 
 ## Frontend tests
 
@@ -146,7 +105,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14854`,
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14869`,
   `:14334`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
@@ -195,9 +154,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
 The load-bearing ones: `remote_control` locks the **wire format** (every `rc:*`
 tag pinned, ObjectId-as-hex, pipe-separated `Permissions`) so a rename is a
 deliberate break; agent-side crates cover encoder cascades, config migration,
-ACLs, and overlay internals under their feature flags. `roomlerd`'s Hive
-supervisor tests (`--features hive -- hive::`) run twice: on Linux in the agent job, and on macOS
-in the macOS job (FR-90 P1h-1), which before it never compiled the supervisor for a Mac. The
+ACLs, and overlay internals under their feature flags. The
 **whole** `roomlerd --lib` suite also runs natively on Windows, in `ci.yml`'s
 `windows-agent-sessions` job (#2886) — every `#[cfg(windows)]` test, with the features the
 table below names; before it, the Windows jobs ran filtered subsets and a Windows-only failure
@@ -216,8 +173,8 @@ the Windows path. A new spawn on that path is a decision someone writes down in 
 > capture set on the test's own thread then never sees that line. Keep a second dispatcher
 > registered for the capture's life (a `NoSubscriber` will do), so every callsite asks per
 > event; and assert a line the capture must see before one it must not, since a capture that
-> sees nothing passes every absence check. The pattern: `Logs::capture` in
-> [`tests.rs:746`](../agents/roomlerd/src/hive/view/tests.rs#L746).
+> sees nothing passes every absence check. The pattern: `LogCapture::install` in
+> [`extauth_tests.rs:1164`](../crates/tests/src/extauth_tests.rs#L1164).
 
 Flakes fixed on 2026-10-30, and what each one teaches:
 
@@ -227,15 +184,18 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > description (`ErrNoRemoteDescription`), and a test that ignores the refusal and loses every
 > candidate both ways never connects. `privacy_dc` (10-30) and `control_dc_record` (10-28) hit
 > their 30 s `on_data_channel` timeout that way in CI. The pattern: `exchange` in
-> [`privacy_dc.rs:416`](../agents/roomlerd/tests/privacy_dc.rs#L416), as `dc_throughput.rs`'s
+> [`privacy_dc.rs:424`](../agents/roomlerd/tests/privacy_dc.rs#L424), as `dc_throughput.rs`'s
 > `connect` always did; `control_dc_record` and `file_dc` follow it too.
 
 > [!WARNING]
 > **A Mongo TTL index deletes on a monitor pass every 60 s, at any moment after expiry.** A test
 > that expires a row and then reads it races that pass: "one pairing row … 0" once in the
-> integration lane. `pairing_tests`' expiry test reads `serverStatus.metrics.ttl.passes`
-> ([`pairing_tests.rs:201`](../crates/tests/src/pairing_tests.rs#L201)) around each try, and
-> reruns only a try that a pass ran through. A missing row with no pass is still a failure.
+> integration lane (#3084). Don't count passes around the read to excuse a missing row:
+> `serverStatus.metrics.ttl.passes` moves when a pass *ends*, so a pass still running has
+> deleted the row and not been counted. Hold the sweep off in the test's own database instead:
+> `pairing_tests`' `hold_off_the_ttl_sweep`
+> ([`pairing_tests.rs:206`](../crates/tests/src/pairing_tests.rs#L206)) checks the index is
+> the product's, then gives it an hour's grace with `collMod`.
 
 > [!WARNING]
 > **An external tool's deadline in a test is the test's, sized for the busiest runner.**
@@ -251,16 +211,17 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 
 | Lane | What it does |
 |---|---|
-| `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the twelve heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1309`). A push to master always runs everything |
+| `ci.yml` | fmt + clippy (`--workspace --all-targets --all-features -D warnings`) + tests + frontend build on every push to master and every PR. A **docs-only PR** (every changed path under `docs/`, a top-level `*.md` or `.claude/`, renames by both paths) skips the thirteen heavy jobs: the Rust lanes, the macOS and Windows jobs, both FFmpeg jobs and the profiles build. The docs audits and the frontend build, which builds the docs site, still run (FR-6 wave 35, the `changes` job at `ci.yml:54`, its path rule at `:75`). "Rust checks" passes a docs PR whose lanes all skipped, and fails if the `changes` job did not succeed (`:1289`). A push to master always runs everything |
 | `installer-smoke.yml` | Installs and uninstalls the freshly-built per-user MSI on a Windows runner |
 | `deb-bare-image.yml` | On a PR that changes what a `.deb` declares: packages the latest release's binaries with the checkout's control file through the lane's own `cargo deb`, installs them on five bare images on both arches, by apt and by the real `install.sh`, and starts them. A control proves the check still refuses agent-v0.4.190. The release lane runs the same script on what it is about to publish (`verify-linux-debs`) — [installation.md](installation.md#what-a-bare-host-needs-3204) |
+| `selfhost-coturn.yml` | On a PR or a master push that changes either compose file, `turnserver.conf`, `.env.selfhost.example` or the check: starts the file's own coturn, with the stack it needs, and runs `scripts/selfhost-coturn-check.sh`, which fails a crash loop, a coturn left outside the server's namespace, a refused CreatePermission to the public address, a relay that carries no bytes, and a hole in the deny list. It runs on `docker-compose.selfhost.yml` with a documentation address as the public one, three times in a row, because a run that costs too many relay ports fails on its own leftovers; then after a `kill -9` of the server's process, on the same file with the example's defaults, and on `docker-compose.yml`. It pulls the published server image and compiles no Rust, so a run takes minutes. `scripts/selfhost-smoke.sh` runs the same check after a full install — [self-hosting.md](self-hosting.md#the-turn-relay) |
 | `integration-tests.yml` | The integration suite against a real MongoDB and Redis, as **four shards** (FR-6 waves 24 and 27). Each shard lists the same test binaries, sorts the (test, binary) pairs and runs every fourth with `--exact`, so between them the shards run each test once. Each shard must report every test it was handed, and the whole listing must clear a floor. 2 threads per shard, each with its own mongod: at 4 threads against one mongod, the dropped test databases' files reached the 64,000-descriptor ceiling and mongod aborted. Dispatch inputs: `filter`, `threads`, `mongo_tmpfs`, `report_time` (per-test durations and the slowest tests, in the step summary) |
 | k8s e2e (`scripts/e2e-k8s.sh`, `Dockerfile.agent-e2e`) | The suite against a standing cluster namespace — validates the real multi-pod topology |
 | Nightly (`scripts/e2e-nightly.sh`) | Full E2E against the current prod tag, **with the specs from the commit that image was built from** (master's can run ahead of the image: #2573), diffed against an expected-failures list; regressions file an issue. With the **agent-e2e harness** up, its six remote-session specs run against three synthetic-frame agents — [below](#the-agent-e2e-lane-fr-114) |
 | vmtest (`roomler-ai-deploy/vmtest/vmtest.sh`, on demand) | Installs the product the way users do on throwaway Win11 / Ubuntu-Wayland / ARM / macOS VMs, enrols against prod, proves remote desktop + overlay + `roomler-desktop`, destroys the VM; one issue per failing condition, closed on green — [vmtest.md](vmtest.md) |
 | **Overlay stress lane** (FR-81, `vmtest.sh run --lane stress`) | A throwaway VM enrolled into the **fleet** org measures latency distributions, SSH success, bulk transfer and carrier stability against the real fleet, on a direct and a forced-relay arm — [below](#the-overlay-stress-lane-fr-81) |
 | **L0 latency harness** (FR-16, `ci.yml` recorder job) | A real remote-desktop session in one process measures capture → decode latency, and the bench probe's input → decoded-frame round trip (L4 in process), on one clock, over a simulated link, and proves it can fail — [below](#the-l0-latency-harness-fr-16) |
-| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,hive,vault,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002) |
+| **The Windows `roomlerd --lib` suite** (#2886, `ci.yml` job `windows-agent-sessions`) | The whole agent unit-test suite natively on Windows — `cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast`, about 2,400 tests, one step, every test in parallel. Until 2026-10-25 the three Windows jobs each ran a **filtered subset**, so tests compiled into this very binary (`replaced_binary`, `win_service::companion_spawn`) ran on Windows nowhere, and two Windows-only failures went unseen until #2889. The filter was the only cost: about 8 s of a 5.5–7.2 min job is tests, the rest builds the binary from the restored cache. The media half (`full-hw`, `vp9-444`, `ffmpeg-encoder`) stays with `windows-recorder` and `windows-overlay-clippy`, which compile its Windows-only cells. ⚠️ Three things the first full runs surfaced were fixed at the source rather than retried or ignored: a `config_set` of **any** key re-seeded the process-global `files_dir` (now only a set of `files_dir` does); a sync `#[test]` was the first caller of `netstate::handle()`, whose lazy spawn needs a tokio context; and on the runner itself — a host no daemon has ever written under `%PROGRAMDATA%\roomler` — the staging sentinel's fallback to that root errored, so it now lists the nearest existing ancestor. A failure green on every enrolled dev box and red on a fresh runner is what this lane exists to find. ⚠️ On this runner, a clock reading is not a unique name. Two staging tests spawned back to back read the same 100 ns tick and shared one folder, so the first to finish deleted the other's upload (#2956). A temp name shared by parallel tests needs a counter as well as the time. ⚠️ A test's deadline is sized for that runner unless the deadline is what it tests. Under the whole suite, a PowerShell one-liner (the auto shell `exec::tests` use) took 8–10+ s to run, and a 10 s deadline made those tests the lane's most frequent red (#3002) |
 
 Known environmental failures (conference specs without forwarded RTC ports,
 mailpit-dependent flows, the containerized-Chromium Google-OAuth redirect test)
@@ -611,7 +572,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1824`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7433`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7754`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -634,7 +595,7 @@ VP9 DataChannel is 4:4:4 by default), less what the build cannot open (`BuildCap
 | `rtp:h264` | `encode::open_for_codec`: Media Foundation's cascade on Windows, then OpenH264 | `mf-encoder` (Windows) |
 | `rtp:h265` | FFmpeg's HEVC cascade, then MF's | FFmpeg or MF |
 | `rtp:av1` | MF's AV1 | MF |
-| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5379`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
+| `dc:h264`, `dc:h265` (`:444` too), `dc:av1` | `FfmpegEncoder::new_*_adaptive`, as the pump's `FfmpegDcCodec::open` (`peer.rs:5392`) opens it first: no remembered backend, no quality bias, a direct transport | FFmpeg |
 | `dc:vp9`, `dc:vp9:444` | the session's quick probe at 480×270, then FFmpeg's VP9 if it opened, else libvpx | FFmpeg |
 | `named` | `encode::open_named`, past every cascade and the denylist | FFmpeg |
 
@@ -690,7 +651,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:3673`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:3863`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.
@@ -792,7 +753,7 @@ flowchart LR
 | arm | how the VM gets its carrier | why it exists |
 |---|---|---|
 | `direct` | the overlay's defaults — the carrier ladder picks the best path that works | the real-world numbers |
-| `relay` | `overlay_direct = false` on the VM only ([`config.rs:411`](../crates/agent-core/src/config.rs#L411)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
+| `relay` | `overlay_direct = false` on the VM only ([`config.rs:424`](../crates/agent-core/src/config.rs#L424)), which leaves only relayed carriers | the relayed baseline for every target, including the servers that the direct arm reaches directly |
 
 The direct arm's corp-laptop rows are the **control** for the relay arm: those laptops have no
 direct path at all, so where both arms relay, matching numbers show the forcing knob is not what
@@ -835,9 +796,9 @@ corporate laptop, a real relay path, or both:
 
 | found | defect | fix |
 |---|---|---|
-| round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1104`](../agents/roomlerd/src/ssh.rs#L1104)) |
-| round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:404`](../agents/roomlerd/src/ssh.rs#L404)) |
-| round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:587`](../crates/modules/network/src/routes/agent_ssh.rs#L587)) |
+| round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1084`](../agents/roomlerd/src/ssh.rs#L1084)) |
+| round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:410`](../agents/roomlerd/src/ssh.rs#L410)) |
+| round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:465`](../crates/modules/network/src/routes/agent_ssh.rs#L465)) |
 | round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:617`](../agents/roomler-cli/src/localclient.rs#L617)) |
 
 ### Reference run — `20260924-155559`, every target on agent 0.4.101

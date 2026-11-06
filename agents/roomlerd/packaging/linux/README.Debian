@@ -25,7 +25,7 @@ nobody logged in? Use the system unit.
 Desktop host (systemd --user)
 -----------------------------
 
-  # 1. Generate an enrollment JWT at https://roomler.ai/ (Admin -> Agents).
+  # 1. Generate an enrollment JWT at https://roomler.ai/ (Devices -> Enroll -> Device).
   # 2. Enroll as your normal user, NOT root:
   roomlerd enroll --server https://roomler.ai \
                   --token <paste-enrollment-jwt> \

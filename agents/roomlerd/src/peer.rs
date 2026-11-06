@@ -1524,7 +1524,7 @@ impl AgentPeer {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tick.tick().await;
-                        if !crate::display_match::owns_mode(sid) {
+                        if !crate::display_match::watch_due(sid) {
                             continue;
                         }
                         if let Ok(Some(answer)) =
@@ -2919,7 +2919,7 @@ async fn media_pump(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc, None) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -4109,6 +4109,12 @@ async fn media_pump_vp9_444_dc(
         },
         session_id,
     );
+    // #3260 — and a capturer that cannot capture tells every viewer of this
+    // pipeline, the ones that join later included. Here rather than beside
+    // this session's own notice above: the pipeline exists only from here.
+    if let Some(reason) = capturer.unavailable() {
+        pipeline.tell_unavailable(reason);
+    }
     let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
@@ -4535,6 +4541,8 @@ async fn media_pump_vp9_444_dc(
                 frames_captured += 1;
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
@@ -4549,7 +4557,12 @@ async fn media_pump_vp9_444_dc(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(
+                    capturer.waits_for(),
+                    session_id,
+                    &control_dc,
+                    Some(&pipeline),
+                ) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -4608,7 +4621,7 @@ async fn media_pump_vp9_444_dc(
                 capturer = capture::open_default_async(
                     target_fps,
                     downscale,
-                    media_waiting_hook(session_id, control_dc.clone()),
+                    shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
                 encoder = None;
@@ -5609,11 +5622,14 @@ fn capture_unavailable_payload(reason: &crate::capture::CaptureUnavailable) -> S
 ///
 /// Bounded: a session that never opens its control DC must not leave a task
 /// spinning for the life of the process.
+///
+/// #3260 — a shared pipeline's followers are told through here too, each
+/// under its own session (`media_share::Pipeline::tell_unavailable`).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-fn spawn_capture_unavailable_notice(
+pub(crate) fn spawn_capture_unavailable_notice(
     session_id: bson::oid::ObjectId,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     reason: crate::capture::CaptureUnavailable,
@@ -5944,12 +5960,14 @@ impl CaptureWait {
 
     /// The pumps' half: on a "no frame", `true` when the capture waits on its
     /// host (told now, earlier, or once the pump has been quiet for
-    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out.
+    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out. #3423 — `share`
+    /// is the pump's shared pipeline, whose followers are told with its owner.
     fn hold(
         &mut self,
         waits: Option<crate::capture::WaitFor>,
         session_id: bson::oid::ObjectId,
         control_dc: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+        share: Option<&crate::media_share::Pipeline>,
     ) -> bool {
         if !media_waiting_enabled() {
             return false;
@@ -5958,10 +5976,14 @@ impl CaptureWait {
             return false;
         };
         if tell {
-            media_waiting_hook(session_id, control_dc.clone())(crate::capture::OpenWait {
+            let wait = crate::capture::OpenWait {
                 gives_up_in: Self::TOLD_FOR,
                 why,
-            });
+            };
+            media_waiting_hook(session_id, control_dc.clone())(wait);
+            if let Some(pipeline) = share {
+                pipeline.tell_waiting(wait);
+            }
         }
         true
     }
@@ -5990,9 +6012,6 @@ fn media_waiting_hook(
     let asking: std::sync::Mutex<Option<crate::rc_sessions::AskingMark>> =
         std::sync::Mutex::new(None);
     Box::new(move |wait| {
-        const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
-        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-        const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
         // FR-93 P6h — while the desktop's own dialog asks the person at the
         // screen, nothing is shared yet, and the companion's "Being viewed"
         // banner would cover the very window that asks (measured on KDE,
@@ -6001,28 +6020,73 @@ fn media_waiting_hook(
         let mark = matches!(wait.why, crate::capture::WaitFor::Dialog { .. })
             .then(|| crate::rc_sessions::AskingMark::new(session_id));
         *asking.lock().unwrap_or_else(|p| p.into_inner()) = mark;
-        let payload = media_waiting_payload(wait);
-        info!(
-            %session_id,
-            gives_up_in_s = wait.gives_up_in.as_secs(),
-            why = ?wait.why,
-            "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
-        );
         // FR-93 P5g — one open can wait twice (the switch, then the unlock).
-        let control_dc = control_dc.clone();
-        runtime.spawn(async move {
-            // Bounded by the wait's own deadline too: past it, the notice
-            // would describe a wait that is already over.
-            let deadline = DEADLINE.min(wait.gives_up_in);
-            if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await
-            {
-                warn!(
-                    %session_id,
-                    "media-waiting notice never reached the controller within its deadline"
-                );
-            }
-        });
+        spawn_media_waiting_notice(&runtime, session_id, control_dc.clone(), wait);
     })
+}
+
+/// #3423 — [`media_waiting_hook`] for an open whose pump already owns a shared
+/// pipeline (`media_share`): the viewers following it are told what the owner's
+/// own viewer is, and so are the ones that join while the open waits. The
+/// FFmpeg pump registers its pipeline before its first open, and both DC pumps
+/// reopen inside their loops.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn shared_media_waiting_hook(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pipeline: &crate::media_share::Pipeline,
+) -> crate::capture::OnOpenWait {
+    let own = media_waiting_hook(session_id, control_dc);
+    if !media_waiting_enabled() {
+        return own;
+    }
+    let share = pipeline.wait_teller();
+    Box::new(move |wait| {
+        own(wait);
+        share.tell(wait);
+    })
+}
+
+/// FR-93 P2d-2 — deliver [`media_waiting_payload`] to one controller, retrying
+/// until its control channel takes it. `runtime` spawns the sender, because an
+/// open's hook fires on the blocking pool.
+///
+/// #3423 — a shared pipeline's followers are told through here too, each under
+/// its own session (`media_share::Pipeline::tell_waiting`).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn spawn_media_waiting_notice(
+    runtime: &tokio::runtime::Handle,
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    wait: crate::capture::OpenWait,
+) {
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let payload = media_waiting_payload(wait);
+    info!(
+        %session_id,
+        gives_up_in_s = wait.gives_up_in.as_secs(),
+        why = ?wait.why,
+        "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
+    );
+    runtime.spawn(async move {
+        // Bounded by the wait's own deadline too: past it, the notice
+        // would describe a wait that is already over.
+        let deadline = DEADLINE.min(wait.gives_up_in);
+        if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await {
+            warn!(
+                %session_id,
+                "media-waiting notice never reached the controller within its deadline"
+            );
+        }
+    });
 }
 
 /// Retry one control-DC message until it is sent or `deadline` passes. The
@@ -6649,7 +6713,7 @@ async fn media_pump_ffmpeg_dc(
     let mut capturer = capture::open_default_async(
         target_fps,
         downscale,
-        media_waiting_hook(session_id, control_dc.clone()),
+        shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
     )
     .await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
@@ -6657,6 +6721,9 @@ async fn media_pump_ffmpeg_dc(
     // backend answers `None`, so a healthy session sends nothing.
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+        // #3260 — and so is every viewer sharing this pipeline: the ones
+        // that joined while the capture opened, and the ones that join later.
+        pipeline.tell_unavailable(reason);
     }
     // FR-93 P6g — and an arm the compositor shows nothing for still says, at
     // the screen, who is viewing it.
@@ -7638,7 +7705,11 @@ async fn media_pump_ffmpeg_dc(
                             capturer = capture::open_default_async(
                                 target_fps,
                                 downscale,
-                                media_waiting_hook(session_id, control_dc.clone()),
+                                shared_media_waiting_hook(
+                                    session_id,
+                                    control_dc.clone(),
+                                    &pipeline,
+                                ),
                             )
                             .await;
                             PassWatch::stop(t, &mut recapture_us);
@@ -8131,6 +8202,8 @@ async fn media_pump_ffmpeg_dc(
                 crate::session_idle::note_frame(&arc);
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 frames_captured += 1;
                 is_real_frame = true;
                 // Motion continues — the settle gate counts the episode.
@@ -8176,7 +8249,12 @@ async fn media_pump_ffmpeg_dc(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(
+                    capturer.waits_for(),
+                    session_id,
+                    &control_dc,
+                    Some(&pipeline),
+                ) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -8336,7 +8414,7 @@ async fn media_pump_ffmpeg_dc(
                 capturer = capture::open_default_async(
                     target_fps,
                     downscale,
-                    media_waiting_hook(session_id, control_dc.clone()),
+                    shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
                 PassWatch::stop(t, &mut recapture_us);
@@ -11006,8 +11084,8 @@ fn attach_control_handler(
                                 // P3: only the owning session's toggle-off
                                 // restores; a non-owner disabling its OWN match
                                 // preference must not revert the mode another
-                                // session applied.
-                                if crate::display_match::restore_for(session_id) {
+                                // session applied. Its waiting request goes too.
+                                if crate::display_match::turn_off(session_id) {
                                     tracing::info!("display-match: restored original mode");
                                 } else {
                                     tracing::debug!(
@@ -14516,6 +14594,44 @@ mod codec_cap_tests {
             w.on_empty(Some(DisplayWake), t0 + q * 3),
             Some((DisplayWake, true))
         );
+    }
+
+    /// #3423 — a capture that waits inside its session (P3e's dark display,
+    /// P5f's user switch) is told to the pump's shared pipeline as it is told
+    /// to the owner's own viewer, so the viewers sharing the capture hear it
+    /// too, and the pipeline keeps it until the next frame. Red without
+    /// `hold`'s `share`.
+    // The pipeline registry's test guard is held across an await on purpose,
+    // as in `media_share`'s own tests: it serializes whole tests.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_held_wait_is_told_to_the_shared_pipeline() {
+        use super::CaptureWait;
+        use crate::capture::WaitFor::DisplayWake;
+        use std::time::Duration;
+        let _serial = crate::media_share::test_serial();
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-3423-HOLD");
+        let owner = bson::oid::ObjectId::new();
+        let pipeline = crate::media_share::Pipeline::register(key, owner);
+        let control_dc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let mut w = CaptureWait::default();
+        assert!(
+            w.hold(Some(DisplayWake), owner, &control_dc, Some(&pipeline)),
+            "held at once"
+        );
+        assert_eq!(pipeline.kept_wait(), None, "not told yet: the quiet spell");
+        tokio::time::sleep(CaptureWait::QUIET_BEFORE_TELL + Duration::from_millis(100)).await;
+        assert!(w.hold(Some(DisplayWake), owner, &control_dc, Some(&pipeline)));
+        let (why, left) = pipeline
+            .kept_wait()
+            .expect("the pipeline was told with the owner's own viewer");
+        assert_eq!(why, DisplayWake);
+        assert!(
+            left > CaptureWait::TOLD_FOR - Duration::from_secs(5),
+            "the owner's whole notice: {left:?}"
+        );
+        pipeline.on_frame();
+        assert_eq!(pipeline.kept_wait(), None, "the next frame ends it");
     }
 
     #[test]

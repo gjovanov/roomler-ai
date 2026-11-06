@@ -13,7 +13,7 @@ to `Off` at enrolment with no way to change it short of hand-editing
 
 ## Root cause, with anchors
 
-`crates/agent-core/src/enrollment.rs:348` — every appended org, unconditionally:
+`crates/agent-core/src/enrollment.rs:323` — every appended org, unconditionally:
 
 ```rust
 let mut entry = crate::config::OrgEntry {
@@ -23,7 +23,7 @@ let mut entry = crate::config::OrgEntry {
     overlay_mode: crate::config::OrgOverlayMode::Off,
 ```
 
-`agents/roomlerd/src/app.rs:1791-1731` — `--overlay` exists, and sets the
+`agents/roomlerd/src/app.rs:2840-2842` — `--overlay` exists, and sets the
 **primary's** flag regardless of which identity was just enrolled:
 
 ```rust
@@ -44,8 +44,8 @@ device is genuinely, silently absent from the second org's mesh, and:
 
 | Surface | What it shows | What it omits |
 |---|---|---|
-| `roomlerd enroll` output (`app.rs:1928`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
-| `roomlerd org ls` (`app.rs:2135`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
+| `roomlerd enroll` output (`app.rs:2898`) | "Enrolled into an ADDITIONAL org as …" + "manage them with `roomlerd org ls`" | any mention of the mesh |
+| `roomlerd org ls` (`app.rs:3264`) | LABEL · PRIMARY · ENABLED · ORG · SERVER | **no overlay column** |
 | `roomler status` (`localapi::OrgStatus`) | label · agent id · enabled · connected · stopped · update-ignored | **no overlay field** — the org's WS *is* connected, so it reads healthy |
 | `roomler peers` (`localclient.rs:1417`) | one `── org: <label> ──` section per org **that has peers** | an overlay-off org produces **no section at all** — identical to an org whose peers are simply offline |
 | the dashboard | the device row, online | it is the server's view; the server was never told |
@@ -62,7 +62,7 @@ must not render identically.
 ## And there is no supported way to turn it on
 
 `roomlerd org` offers `ls · rm · enable · disable · set-primary`
-(`app.rs:606-627`). None of them touches `overlay_mode`. The only path is to
+(`app.rs:945-992`). None of them touches `overlay_mode`. The only path is to
 open `config.toml` — the file that also holds the agent token and the SSH host
 private key, is written atomically with a `.prev` sibling, and on Windows lives
 under a machine-global ACL-restricted directory. Hand-editing it is not a
@@ -119,21 +119,31 @@ five-minute fix and the two days this cost in the field.
 
 ## Acceptance criteria
 
-- [ ] on a device in two orgs, `roomlerd org ls` shows each org's overlay mode
-- [ ] `roomler status` shows it per org
-- [ ] `roomler peers` renders an overlay-off org **differently** from an org with
+- [x] on a device in two orgs, `roomlerd org ls` shows each org's overlay mode
+- [x] `roomler status` shows it per org
+- [x] `roomler peers` renders an overlay-off org **differently** from an org with
       an overlay and no peers — verified by producing both states on one device
 - [x] `roomlerd org overlay <label> tun` puts the device on that org's mesh after
       a restart, verified by a ping across it *(FR-97 P1d, 2026-10-18 on
       0.4.143: a Mac's secondary on a utun of its own, the org's anchor 5/5;
       FR-97 §8)*
-- [ ] `enroll --overlay` into a second org enables **that** org, and leaves the
+- [x] `enroll --overlay` into a second org enables **that** org, and leaves the
       primary's flag untouched
-- [ ] `enroll` without `--overlay` on an org that already had one does not turn
+- [x] `enroll` without `--overlay` on an org that already had one does not turn
       it off (regression lock on the one-way invariant)
-- [ ] `roomler peers --org <label>` prints only that org
-- [ ] an older daemon reporting no `overlay_mode` renders as it does today, not
+- [x] `roomler peers --org <label>` prints only that org
+- [x] an older daemon reporting no `overlay_mode` renders as it does today, not
       as "off" (absent ≠ off — the same trap as an absent age reading 0 ms)
+
+Evidence for all eight: field-verified on `agent-v0.4.41`, 2026-09-01, with the
+live output for each — including the older daemon rendering `overlay ?` and the
+round trip back to the mesh at 0 % loss
+([#1084 — Result](https://github.com/gjovanov/roomler-ai/issues/1084#issuecomment-5490117524)).
+The Result prints the output for every criterion but the two `enroll` ones, which it
+lists as checked; those two are also locked by
+`overlay_flag_enables_the_org_that_was_actually_enrolled` and
+`overlay_flag_never_downgrades_an_org_that_already_participates` in `org_join.rs`,
+which `--lib` CI runs. *Ticked 2026-11-02: verified on 09-01, never ticked in the spec.*
 
 ## Out of scope
 

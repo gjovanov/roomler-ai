@@ -354,7 +354,7 @@ Three states by the session (`ui/src/views/pair/PairView.vue`):
 |---|---|
 | **Signed out** | says what this is ("This connects the installer running on your computer to your account…") and offers every way in: Sign in, Create an account, and the OAuth providers. Each leaves **both** returns before leaving (`keepReturn`, `:289-296`): `pending_redirect = /pair` in sessionStorage for the same tab, and the pending-pairing marker in localStorage for the tab that comes back (below) |
 | **Signed in, no code** | the code field, normalised as it is typed and shown `XXXX-XXXX`; **Look up** posts `/pair/lookup` (`:328-345`). A 404 says "No pending pairing with that code. Check the code in your installer; a pairing lasts 15 minutes, and the installer can start a new one. If this server does not offer pairing, paste a token into your installer instead." — the same 404 a server with pairing switched off answers, and the words cover both without claiming either (`en.json:119`). A 429 shows the server's lock message |
-| **The review** | the device card (§5.1), the warning, and the organization: a picker over the person's orgs, defaulting to the current one (`:334`), or — with none — "Create an organization" inline, name and slug, the slug following the name until edited, a taken slug said in words (`:135-162`, `:398-414`). **Approve** posts `/pair/approve {user_code, tenant_id}`; **Deny** posts `/pair/deny` (`decide`, `:422-454`). Then `approved` ("your installer continues on its own. You can close this tab"), `denied`, or `gone` on a 404 (expired, or already decided — "Enter another code") |
+| **The review** | the device card (§5.1), the warning, and the organization: a picker over the person's orgs, defaulting to the current one (`:334`), or — with none — "Create an organization" inline, name and slug, the slug following the name until edited, a taken slug said in words (`:135-162`, `:398-414`). **Approve** posts `/pair/approve {user_code, tenant_id}`; **Deny** posts `/pair/deny` (`decide`, `:422-454`). Then `approved` ("go back to your installer to finish. You can close this tab": the installer waits for its Install click, #3247), `denied`, or `gone` on a 404 (expired, or already decided — "Enter another code") |
 
 A **403** on Approve is an answer, not an expired credential: the page says, in the product's
 words, that the org needs the *Manage devices* permission (or, for a tunnel client,
@@ -379,7 +379,7 @@ same-origin `pending_redirect` it already honoured:
 
 | Decision point | Where |
 |---|---|
-| the router guard's signed-in branch | `ui/src/plugins/router.ts:448-452` |
+| the router guard's signed-in branch | `ui/src/plugins/router.ts:454-458` |
 | the sign-in page | `ui/src/views/auth/LoginView.vue:153-157` |
 | the OAuth callback | `ui/src/views/auth/OAuthCallbackView.vue:91-94` |
 | the sign-up page: with a session (the auto-verified overlay) straight back; with none it **stays** and says "Registration successful. Please check your email to activate your account. Then sign in, and you will be brought back to the pairing page. The code in your installer stays valid for 15 minutes; if it ran out, start the pairing again there." | `ui/src/views/auth/RegisterView.vue:279-287`; `en.json:95-96` |
@@ -503,7 +503,7 @@ Join «Acme» (acme) as approved by «Dana» (@dana)? [y/N]
 | | What it does | Where |
 |---|---|---|
 | **The flags** | `--pair` stands in for `--token`: one of the two is required, and both together are refused. `--pair-org SLUG` belongs to `--pair`, and a blank one is refused rather than read as absent, because a scripted `--pair-org "$SLUG"` with an empty variable must not quietly turn into the question. `--pair` also refuses `--ephemeral` | `enroll_token_source`, `agents/roomlerd/src/app.rs:2480-2507` |
-| **When it pairs** | after every preflight (the target path, the install trace, the archive replica's), so a refusal costs nobody an approval; and **before** the existing config is read, because a daemon running on this machine saves its own config during the wait, and a copy read earlier would be merged and saved over those changes. From that read on, the enroll is exactly the `--token` path: the same machine id, the same `apply_enrollment` merge, the same save | `app.rs:2577-2620` |
+| **When it pairs** | after every preflight (the target path, the install trace), so a refusal costs nobody an approval; and **before** the existing config is read, because a daemon running on this machine saves its own config during the wait, and a copy read earlier would be merged and saved over those changes. From that read on, the enroll is exactly the `--token` path: the same machine id, the same `apply_enrollment` merge, the same save | `app.rs:2691-2728` |
 | **The code** | the page and the user code, printed. The device code never is (`code_block`, `crates/agent-core/src/pairing_terminal.rs:308`) | |
 | **The poll** | the shared client's RFC 8628 back-off, as in the wizard (§6). A poll that fails on the network retries with its own back-off, capped at 30 s, until the pairing's own clock runs out, rather than giving up early (`interval_after_poll_error`, `:100`; `poll_until`, `:512`) | |
 | **The guard** | the org's name **and** slug, and the approver's name **and** username. A warning sits beside a slug the admin UI could not have made, or a username with spaces or non-ASCII characters — what a lookalike has to use (`approved_block`, `:320`). Every server-sent string is shown with its control and invisible characters escaped (ESC, CR, bidi overrides, zero-width marks), so a display name cannot repaint the line the person is reading (`shown`, `:277`) | |
@@ -519,7 +519,7 @@ Join «Acme» (acme) as approved by «Dana» (@dana)? [y/N]
 > reason for the byte-for-byte match, and an early draft that case-folded let exactly such a
 > lookalike through on the dev stack.
 
-**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:256-295`) is refused
+**The scripts.** `install.sh --pair [--pair-org SLUG]` (`scripts/install.sh:269-331`) is refused
 beside `--token` or `--no-enroll`, for the tunnel role (the `roomler` CLI has no `--pair` yet),
 beside `--daemon-token`, and on a B0 half. The slug is checked against a spelled-out character
 class, because a range like `a-z` follows the locale's collation in some shells. The enroll

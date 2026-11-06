@@ -7,8 +7,8 @@
 //! `roomlerd.exe run` as the active user via
 //! `WTSQueryUserToken` + `CreateProcessAsUserW`, then watches it.
 //! The worker exiting non-zero triggers a respawn with exponential
-//! backoff (parity with the Scheduled Task `RestartOnFailure` PT1M
-//! × 10 we ship for the user-mode model).
+//! backoff. The per-user Scheduled Task has nothing like this: its
+//! `RestartOnFailure` restarts no exit (measured, #3292).
 //!
 //! Session change notifications from the SCM (LOGON / LOGOFF /
 //! CONSOLE_CONNECT / etc.) flow into the supervisor via a
@@ -932,6 +932,44 @@ fn system_swap_enabled() -> bool {
 /// external.
 pub const SESSION_TEARDOWN_EXIT_CODE: u32 = 0x4001_0004;
 
+/// #3289 — the word for a worker this host ended itself, after a session change.
+/// `terminate()` exits it with code 1, and only this host knows that was its doing.
+pub const ENDED_BY_HOST: &str = "ended-by-host";
+
+/// #3289 — the word this host hands the next worker (`--prior-end`) when a worker
+/// ended with `code` and that was not the worker failing, so that start does not
+/// count the last run as a crash. Only the worker keeps the crash count, and only
+/// this host sees how a worker ended: Windows ends a session's processes before
+/// the service hears of a restart, so the worker never gets to mark a clean stop.
+///
+/// A second table beside [`should_record_supervisor_crash`], on purpose. That one
+/// is about a sidecar in the fleet's crash metrics, and `STALL_EXIT_CODE` stays out
+/// of it only because the watchdog wrote its own. A stall is a failure of the build
+/// that ran, so it counts here, as does every code nobody named. The already-running
+/// exit says nothing either way: that worker never took the run from the last one.
+pub fn worker_end_is_no_crash(code: u32) -> Option<&'static str> {
+    if code == 0 {
+        Some("clean-exit")
+    } else if code == crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32 {
+        Some("restart-requested")
+    } else if code == crate::watchdog::AGENT_DELETED_EXIT_CODE as u32 {
+        Some("agent-deleted")
+    } else if code == SESSION_TEARDOWN_EXIT_CODE {
+        Some("session-teardown")
+    } else {
+        None
+    }
+}
+
+/// #3289 — the arguments that carry [`worker_end_is_no_crash`]'s word to the next
+/// worker, and nothing when there is no word.
+pub fn prior_end_args(prior_end: Option<&str>) -> Vec<String> {
+    match prior_end {
+        Some(word) => vec!["--prior-end".to_string(), word.to_string()],
+        None => Vec::new(),
+    }
+}
+
 /// Decide how to react to a worker exit. Returns the reaction plus
 /// the new value for `consecutive_failures`.
 pub fn decide_exit_reaction(code: u32, consecutive_failures: u32) -> (ExitReaction, u32) {
@@ -1281,6 +1319,9 @@ pub fn run(
     // `last_active_session` is a longer memory of "who was here
     // last".
     let mut last_active_session: Option<u32> = None;
+    // #3289 — how the last worker ended, when this host saw it and it was not the
+    // worker failing. The next spawn hands it over, however long after.
+    let mut prior_end: Option<&'static str> = None;
 
     // #2465 — a crash ends a host, not its worker. A worker an earlier host of
     // this service left running holds this config's single-instance lock, so
@@ -1413,6 +1454,7 @@ pub fn run(
                     };
                     let (reaction, next_failures) = decide_exit_reaction(code, prior);
                     consecutive_failures = next_failures;
+                    prior_end = worker_end_is_no_crash(code);
                     match reaction {
                         ExitReaction::Respawn => {
                             // 0 = a clean exit (an auto-update's, or FR-84
@@ -1679,10 +1721,13 @@ pub fn run(
                         // as the person, renews for full GPU clocks above
                         // 60 fps; this (SYSTEM) host is what pins them.
                         let pin_args = super::gpu_pin_relay::worker_args();
+                        // #3289 — what this host saw of the last worker's end.
+                        let end_args = prior_end_args(prior_end);
                         let mut spawn_args: Vec<&str> = args_borrow.clone();
                         spawn_args.extend(ev_args.iter().map(String::as_str));
                         spawn_args.extend(sas_args.iter().map(String::as_str));
                         spawn_args.extend(pin_args.iter().map(String::as_str));
+                        spawn_args.extend(end_args.iter().map(String::as_str));
                         // SAFETY: `spawn_handle` is a live primary/user
                         // token — either the WTSQueryUserToken result or
                         // its duplicated elevated linked token; both
@@ -1703,6 +1748,7 @@ pub fn run(
                                     spawned_at: Instant::now(),
                                     stop_event: stop_ev,
                                 });
+                                prior_end = None;
                                 // rc.51: do NOT reset consecutive_failures
                                 // here — a successful SPAWN is not a healthy
                                 // RUN. The reset is now uptime-gated in the
@@ -1761,6 +1807,7 @@ pub fn run(
                         "supervisor: spawn target changed (session/context); terminating old worker"
                     );
                     old.process.terminate();
+                    prior_end = Some(ENDED_BY_HOST);
                     // Wait for reap so the next-iteration spawn doesn't
                     // race the instance lock — same rationale as the
                     // shutdown-path wait above.
@@ -1787,6 +1834,7 @@ pub fn run(
                         "supervisor: console session went idle (logout / lock screen); terminating worker"
                     );
                     old.process.terminate();
+                    prior_end = Some(ENDED_BY_HOST);
                     let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
             }
@@ -1831,10 +1879,13 @@ pub fn run(
                 let sas_args = super::sas_relay::worker_args();
                 // FR-119 P2b-16 — the same lease as the user-context arm.
                 let pin_args = super::gpu_pin_relay::worker_args();
+                // #3289 — the same word as the user-context arm.
+                let end_args = prior_end_args(prior_end);
                 let mut spawn_args: Vec<&str> = args_borrow.clone();
                 spawn_args.extend(ev_args.iter().map(String::as_str));
                 spawn_args.extend(sas_args.iter().map(String::as_str));
                 spawn_args.extend(pin_args.iter().map(String::as_str));
+                spawn_args.extend(end_args.iter().map(String::as_str));
                 let cmdline = winlogon_token::build_cmdline(&worker_exe, &spawn_args);
                 let res = (|| -> anyhow::Result<Option<OwnedProcess>> {
                     let Some(pid) = winlogon_token::find_winlogon_pid_in_session(sid)
@@ -1865,6 +1916,7 @@ pub fn run(
                             spawned_at: Instant::now(),
                             stop_event: stop_ev,
                         });
+                        prior_end = None;
                         // rc.51: no consecutive_failures reset here —
                         // the reset is uptime-gated in the reap path.
                         respawn_at = None;
@@ -1912,6 +1964,7 @@ pub fn run(
                         "supervisor: swap to SYSTEM-context worker; terminating old worker"
                     );
                     old.process.terminate();
+                    prior_end = Some(ENDED_BY_HOST);
                     let _ = old.process.wait_for_exit(TERMINATE_WAIT);
                 }
             }
@@ -2317,6 +2370,44 @@ impl JobObject {
         self.0.raw()
     }
 
+    /// Put `process` in the job. Under the per-user Scheduled Task the process
+    /// is already in the task's job, and this job nests inside that one.
+    pub(crate) fn assign(&self, process: HANDLE) -> Result<()> {
+        // SAFETY: a live job handle we own; the caller keeps `process` alive
+        // across the call.
+        if unsafe { AssignProcessToJobObject(self.0.raw(), process) } == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("AssignProcessToJobObject failed (err {err})");
+        }
+        Ok(())
+    }
+
+    /// #3303 — close the job without ending what is in it: the kill-on-close
+    /// limit goes first, so the last handle closing leaves those processes
+    /// running, out of anyone's reach. On failure the limit stands and closing
+    /// the job ends them, which is what this job was made to do.
+    pub fn let_go(self) -> Result<()> {
+        // SAFETY: all-zero is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION:
+        // no limit set.
+        let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` matches the class being set and outlives the call.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.0.raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION as *const c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: thread-local error read.
+            let err = unsafe { GetLastError() };
+            bail!("SetInformationJobObject(no limit) failed (err {err})");
+        }
+        Ok(())
+    }
+
     /// End every process in the job. Asynchronous, like `TerminateProcess`:
     /// wait on a process, or poll [`active_processes`](Self::active_processes),
     /// to see them gone.
@@ -2363,6 +2454,53 @@ impl JobObject {
         }
         Ok(inside != FALSE)
     }
+}
+
+/// #3303 — start a process that `CREATE_SUSPENDED` holds at its first
+/// instruction, knowing only its id: `tokio::process` keeps the thread handle
+/// `CreateProcess` returned to itself. A process with none of its threads
+/// resumed never runs, so `Err` means the caller must end it.
+pub fn resume_suspended_process(pid: u32) -> Result<()> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
+
+    // SAFETY: a documented call; the snapshot is owned below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        // SAFETY: thread-local error read.
+        let err = unsafe { GetLastError() };
+        bail!("CreateToolhelp32Snapshot failed (err {err})");
+    }
+    let snapshot = OwnedHandle::new(snapshot)
+        .ok_or_else(|| anyhow!("CreateToolhelp32Snapshot returned no handle"))?;
+    // SAFETY: all-zero is valid for this struct, and it carries its own size,
+    // as the walk requires.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut resumed = 0u32;
+    // SAFETY: a live snapshot and a valid out-param, for each call of the walk.
+    let mut more = unsafe { Thread32First(snapshot.raw(), &mut entry) };
+    while more != 0 {
+        if entry.th32OwnerProcessID == pid {
+            // SAFETY: a documented call; a thread gone since the snapshot
+            // answers null. The handle is owned by the wrapper.
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID) };
+            if let Some(thread) = OwnedHandle::new(thread)
+                // SAFETY: the handle was opened with the right this needs.
+                && unsafe { ResumeThread(thread.raw()) } != u32::MAX
+            {
+                resumed += 1;
+            }
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot.raw(), &mut entry) };
+    }
+    if resumed == 0 {
+        bail!("no thread of process {pid} could be resumed");
+    }
+    Ok(())
 }
 
 /// Who a process started into a job runs as.
@@ -3095,6 +3233,67 @@ mod tests {
         );
     }
 
+    // ─── #3289: what the next worker is told of the last one's end ───
+
+    /// The field read: `shutdown /r` ended the worker with this code 2.5 s after
+    /// it was asked, 3.5 s before the host heard of the restart, and the next
+    /// worker counted that as a crash.
+    #[test]
+    fn a_session_teardown_is_no_crash_of_the_worker() {
+        assert_eq!(
+            worker_end_is_no_crash(1_073_807_364),
+            Some("session-teardown")
+        );
+    }
+
+    #[test]
+    fn the_ends_that_were_not_the_worker_failing_each_have_a_word() {
+        assert_eq!(worker_end_is_no_crash(0), Some("clean-exit"));
+        assert_eq!(
+            worker_end_is_no_crash(crate::watchdog::RESTART_REQUESTED_EXIT_CODE as u32),
+            Some("restart-requested")
+        );
+        assert_eq!(
+            worker_end_is_no_crash(crate::watchdog::AGENT_DELETED_EXIT_CODE as u32),
+            Some("agent-deleted")
+        );
+    }
+
+    /// A real crash loop must still reach the rollback, so anything nobody named
+    /// counts: a kill from outside, an access violation, a stack overflow, a panic,
+    /// an abort, and a stall, which is the build's own failure even though the
+    /// sidecar table above leaves it out.
+    #[test]
+    fn everything_else_is_left_to_count_as_a_crash() {
+        for code in [
+            1,
+            2,
+            101,
+            134,
+            255,
+            0xC000_0005,
+            0xC000_00FD,
+            0xC000_0409,
+            crate::watchdog::STALL_EXIT_CODE as u32,
+            crate::watchdog::ALREADY_RUNNING_EXIT_CODE as u32,
+        ] {
+            assert_eq!(worker_end_is_no_crash(code), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn the_word_travels_only_when_there_is_one() {
+        assert!(prior_end_args(None).is_empty());
+        assert_eq!(
+            prior_end_args(Some(ENDED_BY_HOST)),
+            ["--prior-end", "ended-by-host"]
+        );
+        assert_eq!(
+            prior_end_args(worker_end_is_no_crash(SESSION_TEARDOWN_EXIT_CODE)),
+            ["--prior-end", "session-teardown"]
+        );
+    }
+
     // ─── B2 regression: supervisor crash-record exclusion ────────────
 
     #[test]
@@ -3495,6 +3694,31 @@ mod tests {
             child.process.wait_for_exit(Duration::from_secs(10)),
             "closing the job's last handle must end its processes"
         );
+    }
+
+    /// #3303 — a job let go leaves what is in it running: the installer a
+    /// finished command left behind goes on.
+    #[test]
+    fn a_job_let_go_leaves_its_processes_running() {
+        let job = JobObject::kill_on_close().unwrap();
+        // SAFETY: `Daemon` carries no token.
+        let child = unsafe {
+            spawn_into_job(
+                SpawnAs::Daemon,
+                &cmd("ping -n 60 127.0.0.1 >NUL"),
+                None,
+                &[],
+                false,
+                &job,
+            )
+        }
+        .unwrap();
+        job.let_go().unwrap();
+        assert!(
+            !child.process.wait_for_exit(Duration::from_secs(2)),
+            "a job let go must not end its processes"
+        );
+        child.process.terminate();
     }
 
     /// #1908 — a console-user command holds no handle it was not given. The

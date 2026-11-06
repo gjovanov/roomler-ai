@@ -1,7 +1,7 @@
 # FR-52: Cross-org remote access — an outsider, a device password, and a server that cannot use it
 
 **Issue:** [#1100](https://github.com/gjovanov/roomler-ai/issues/1100) ·
-**Status:** in progress — P1 · P2a–c · P3a–d · P4a–f shipped: an outsider proves the password to a device through the server, from any pod, and opens ONE session bound to that login by MACs over both DTLS fingerprints — decided by the device, proven against the real agent, and in a real browser through the `/connect` page. **P4f's first run on an installed daemon (2026-10-20) found the one bug none of P1–P4e's CI could see** — the controller tore down its own external session as a "ghost" the instant it was created — fixed in #2612 and re-verified green end to end: a real outsider reached `connected` with live frames through the real `/connect` page against production. **P5a built (2026-10-31)**: the open criteria each got a real refusal and a real proof, and three of them turned out not to be met as written. All but AC7's field half are ticked; that half needs a promote and a real relayed session. **P5 built (2026-10-31)**: the org hears of a person's first session and of a password being guessed, an admin can bar one person from one device, and both logs are on a page. **Field-verified 2026-11-01** on `hosted-20261101-7c9c23e` and agent 0.4.192, with a real outsider. Two things stay open: AC7's word "zero" (decision 17) and the web-push half of the first-session criterion. §12 ·
+**Status:** in progress — P1 · P2a–c · P3a–d · P4a–f shipped: an outsider proves the password to a device through the server, from any pod, and opens ONE session bound to that login by MACs over both DTLS fingerprints — decided by the device, proven against the real agent, and in a real browser through the `/connect` page. **P4f's first run on an installed daemon (2026-10-20) found the one bug none of P1–P4e's CI could see** — the controller tore down its own external session as a "ghost" the instant it was created — fixed in #2612 and re-verified green end to end: a real outsider reached `connected` with live frames through the real `/connect` page against production. **P5a built (2026-10-31)**: the open criteria each got a real refusal and a real proof, and three of them turned out not to be met as written. All but AC7's field half are ticked; that half needs a promote and a real relayed session. **P5 built (2026-10-31)**: the org hears of a person's first session and of a password being guessed, an admin can bar one person from one device, and both logs are on a page. **Field-verified 2026-11-01** on `hosted-20261101-7c9c23e` and agent 0.4.192, with a real outsider. **AC7 reworded and ticked 2026-11-02** (decision 17). **P5b and P5c**, which build decisions 16 and 8, **shipped and were field-verified 2026-11-04** on `hosted-20261104-97dea25`, and the web-push half of the first-session criterion was read in the same run: **every acceptance criterion is ticked.** P6 has not started, and no criterion here asks for it. §12 ·
 **Owner:** remote-control (pillar 1) + control plane ·
 **Anchors verified against master `b94793e77`** (re-derived 2026-10-18, after the stack merged)
 
@@ -418,7 +418,7 @@ does not advertise it cannot be gate-2 approved, which is what keeps §3's
 
 ### F1 — the hub keys controllers by `ObjectId`, so an anonymous principal forks everything
 
-`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1259`),
+`Hub::register_controller(user_id: ObjectId)` (`crates/modules/fleet/src/hub.rs:1274`),
 `RemoteSession.controller_user_id: ObjectId` (`models.rs:5530`), the `remote_audit`
 rows and the TURN credential all key on a real user id. A synthetic principal would
 fork the session record, the audit, the credential and the rate limiter — and leave
@@ -453,7 +453,7 @@ P5, do not assume.**
 ### F4 — `local_relay` is validated as *an* overlay address, not as *the caller's*
 
 `is_overlay_relay_ip` (`crates/modules/fleet/src/hub.rs:65`) accepts any
-`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2166` hands it to the agent as a
+`100.64.0.0/10` or `fc00::/7` literal, and `hub.rs:2181` hands it to the agent as a
 TURN URL. An external controller has no overlay presence, so for them the field must
 be **rejected outright** — otherwise it is a probe into the org's mesh, dialled by
 the agent, from outside the org.
@@ -480,7 +480,7 @@ CAS. P6 follows it rather than inventing one.
 | P1 | Addressing + policy, **no access path**: connect code (globally unique, rotatable), the org switch, `external_access_policy`, admin UI, `external_rc_audit` (90 d TTL). `decide_approval()` returns `Result<(), ExternalRcDenyReason>` so one place records both arms. | `external_rc_enabled = false` (default) | **SHIPPED** — 19 unit + 10 route + 6 integration tests, two guards falsified |
 | P2a | **The device can SAY it understands cross-org access, and opt in.** `RpcCap::ExternalAccess` on the hello (unconditional — a BUILD property, the `config` reasoning, never derived from the opt-in) + `external_access_enabled` (gate 3, default off) with its config-surface entry. The whole `external_*` surface is absent from `DesiredConfig`, guarded by a PREFIX test (FR-19's `relay_*` rule). ⚠️ Without this, gate 2 refuses EVERY device — no agent advertises the verb — so P1 is field-unverifiable until it lands. | `external_access_enabled = false` (default) | **SHIPPED** — both guards falsified |
 | P2b | The device-side CREDENTIAL as a *type*: the OPAQUE suite (Ristretto255 · TripleDh · **Argon2id** Ksf), the registration record, `external_consent_mode`, `external_max_permissions`. Registration runs entirely on the device — it plays both halves, nothing crosses a network — which is *why* the dashboard can show *set / not set* and CLEAR but never SET. | `external-access` feature, off in every release build | **SHIPPED** — 7 unit tests incl. a full login round-trip |
-| P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. ⚠️ **Narrowed since, to the CONSOLE user** (the 2026-10-14 restack), the rule `files_dir` and `keep_busy_enabled` already had: the LocalAPI admits RDP guests too, and these gates decide who may take the console's screen. The narrowing covers setting and clearing the password and every `external_*` key (`crates/localapi/src/lib.rs:3508`, `:3515`, the refusal at `:3069`), locked by `only_the_console_user_opens_the_device_to_outsiders`. `status` stays readable by anyone. The companion does not write the file after the daemon refused (`is_daemon_owned_key`, `agents/roomler-desktop/src/commands.rs`, locked by `recording_keys_are_the_daemons_to_accept`), and the three keys are live (`the_external_access_keys_are_live`). | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
+| P2c | The way to actually set one: `roomler rc password set\|clear\|status` over a new LocalAPI verb, and the length floor. Registration + persistence happen in the DAEMON (it owns the config path and the write lock); the CLI only carries the plaintext across the local pipe, the same channel and the same authority that already flips `exec_enabled`. ⚠️ No `--password` flag, ever — argv is world-readable through `/proc/<pid>/cmdline`. ⚠️ **Narrowed since, to the CONSOLE user** (the 2026-10-14 restack), the rule `files_dir` and `keep_busy_enabled` already had: the LocalAPI admits RDP guests too, and these gates decide who may take the console's screen. The narrowing covers setting and clearing the password and every `external_*` key (`crates/localapi/src/lib.rs:3374`, `:3381`, the refusal at `:2965`), locked by `only_the_console_user_opens_the_device_to_outsiders`. `status` stays readable by anyone. The companion does not write the file after the daemon refused (`is_daemon_owned_key`, `agents/roomler-desktop/src/commands.rs`, locked by `recording_keys_are_the_daemons_to_accept`), and the three keys are live (`the_external_access_keys_are_live`). | the P2a flag; nothing verifies the record until P3 | **SHIPPED** — 6 unit tests, incl. the surface allowlist and the derived-`Debug` leak |
 | P3a | **The compatibility surface, fixed before any wire exists.** Pinned KSF (`PinnedArgon2`, §4-0), the device's login half (`login_start` KE1→KE2, `login_finish` KE3→session key), and a cross-implementation harness (`examples/extauth_interop.rs`). **Proven against the real browser library**: RED with the old crate-default KSF (the correct password refused), GREEN after pinning with both sides deriving the same session key, and a wrong password decided at KE2 with no KE3 ever sent — the measurement §4b's counting rule rests on. Corrected the spec's browser library (`@cloudflare/opaque-ts` is draft-07 + scrypt; cannot interoperate). | `external-access` feature, in no release build | **SHIPPED** |
 | P3b | The device's login **state machine** (`external_logins.rs`): guesses debited when a KE2 leaves the device (§4b), check-and-debit in ONE critical section (a concurrent burst cannot outrun it), a success refunds only its own guess, 5 free then 30 s doubling to a 1 h cap over a 24 h window, bounded pending/verified tables with TTLs, and a verified login retained **single-use** as `AppKey = HKDF-SHA512(session key, label ‖ attempt ‖ principal)` — the principal is bound after the login because the browser library binds no OPAQUE `context`. Known-answer test against an independent HKDF. Open decisions 6 + 7. | same | **SHIPPED** |
 | P3c | The wire: `rc:extauth.*` frames (4 client, 4 server; the device's refusal decoded leniently — anything present is a refusal), the server as a blind relay (`crates/modules/remote/src/extauth.rs`: byte-identical `unavailable` for no-such-code / gate 1 / gate 2 / offline, reply before the audit write, park-before-push, only the starter finishes, gates re-checked at KE3), the device's answer in **every** build (`agents/roomlerd/src/extauth.rs`: gate 3 and the record read LIVE from the config file, primary org only), and a `login` audit action. **Proven on loopback against the real agent**: `crates/tests/src/extauth_tests.rs`, 4 tests. ⚠️ **Single-pod only** — see P3d. | P2's flag; no client surface ships | **SHIPPED** |
@@ -493,8 +493,10 @@ CAS. P6 follows it rather than inventing one.
 | P4e | **The `/connect` page** (`ui/src/views/remote/ConnectView.vue`, `useExternalLogin.ts`, `utils/extauth.ts`): an org-less account types the connect code and the device's password; `@serenity-kit/opaque@1.1.0` (pinned exact — a wire surface, §4-0) runs the login in a LAZY chunk, so no other page pays for the WASM; WebCrypto derives the AppKey and both MACs (KATs shared with the device's); the key is handed to the viewer in memory, once, and never touches storage. The viewer's external mode (`useRemoteControl(…, { external: true })`): asks by connect code, seals its offer, checks the answer's MAC BEFORE `setRemoteDescription` and ends the session on a missing or wrong one, never probes a local relay, and turns a reconnect into "log in again" (decision 10). A grant without CLIPBOARD closes the clipboard channel before it is negotiated (decision 9). `'wasm-unsafe-eval'` added to the CSP (decision 12). | `external-access` is in no release agent build, so every device answers `unavailable` | **SHIPPED** |
 | P4f | Turn it on: `external-access` into the release feature sets; the first field run on an installed daemon with a real second account; `vs-teamviewer.md`. | gate 3 per device, default off | **SHIPPED** — `external-access` in `full` (decision 11); field-verified 2026-10-20 on 0.4.146/0.4.147 against production (§12): a real outsider account reached `connected` with live frames through the real `/connect` page, after fixing the one bug the run found (#2612) |
 | P5a | **The open criteria get real refusals and real proofs.** `ANSWER_FLOOR` and the `finish`/`session` oracle (§5); a `DesiredConfig` push naming an `external_*` key refused and audited as `device_owned_key`, by prefix; an external `local_relay` refused with a log line (F4); the viewer's TURN leg charged to the device's org (F3); the Hub's mint path driven directly at a real agent; the password captured across two pods and on the page itself. | `external_rc_enabled = false` (default) | **BUILT** — §8, §12. F3's field half follows the promote |
-| P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures (`extauth_notice.rs`, `external_principals`); audit UI beside `SshAuditSection` (`/audit/external`); per-principal revocation (`PUT …/external-principals/{user_id}`, read in `gates`, ended by `terminate_external_of` on whichever pod holds the session). The plan limit was FR-115 P3b's (decision 4). (Relay bytes metered to the device's tenant, F3, moved to P5a.) | `external_rc_enabled = false` ends the whole path. A bar acts only when an admin uses one | **SHIPPED** (#3241), field-verified 2026-11-01 — §8, §12. Web push not read |
+| P5 | Visibility + accounting: owner notification on a first-ever external session by a principal and on repeated failures (`extauth_notice.rs`, `external_principals`); audit UI beside `SshAuditSection` (`/audit/external`); per-principal revocation (`PUT …/external-principals/{user_id}`, read in `gates`, ended by `terminate_external_of` on whichever pod holds the session). The plan limit was FR-115 P3b's (decision 4). (Relay bytes metered to the device's tenant, F3, moved to P5a.) | `external_rc_enabled = false` ends the whole path. A bar acts only when an admin uses one | **SHIPPED** (#3241), field-verified 2026-11-01 — §8, §12. Web push field-verified 2026-11-04 |
 | P5-docs | [`docs/external-access.md`](../external-access.md), a row in `docs/README.md`, the routes in `docs/api.md`, both collections in `docs/data-model.md` | n/a | **DONE**, in the P5 PR |
+| P5b | **An off switch ends what it covers** (decision 16): gate 1 off ends the org's external sessions and gate 2 cleared ends the device's, on whichever pod holds them, on the shape a bar already uses, and a gate that crosses an opening session ends it too. | none needed: it acts only when an admin turns a gate off | **SHIPPED** (#3317, `a2c2cc410`): red run, compile, the integration lane read by test name, the falsification on CI and the field red in §12. Field-verified 2026-11-04 on `hosted-20261104-97dea25` |
+| P5c | **The prompt says what the server knows of who is asking** (decision 8): the name the device is told carries the account's proven address first, or marks the chosen name unverified. It needs no wire change and no agent change, because every surface and the banner already render that name. | revert the server change: the chosen name comes back on every device | **SHIPPED** (#3321, `627643a62`): red run, compile, CI read by test name, the falsification (units and CI) and the journal's field red in §12. Field-verified 2026-11-04 on `hosted-20261104-97dea25`, the panel included |
 | P6 | Ad-hoc attended support: host generates a short one-time code from tray/CLI. **Same wire** — the one-time secret takes the password's place. | separate `external_rc_mode` value; independent of unattended access | not started |
 
 ## 8. Acceptance criteria
@@ -578,18 +580,19 @@ CAS. P6 follows it rather than inventing one.
       gated on `VIEW_REMOTE_AUDIT`. **P1** — `approval_is_compound_clearing_is_not_and_both_arms_are_audited`
       asserts 2 refusals + 1 approve + 1 clear = 4 rows, and that a plain member gets 403
       from the reader. Falsified: dropping half the gate turns it red.
-- [~] Relay bytes from an external session appear against the **device's** org in the
-      FR-20 ledger (F3), with a direct-path arm metering zero. **Met in code, P5a**:
+- [x] Relay bytes from an external session appear against the **device's** org in the
+      FR-20 ledger (F3), and a direct path's own bytes are not metered. **Met in code, P5a**:
       `an_external_sessions_relay_is_charged_to_the_devices_org` takes the username out
       of the real `rc:ready`, plays coturn with it, and finds the bytes on the device's
       org and none on the outsider's own, with the booking at zero until coturn reports.
-      **The relay half is field-verified** (§12, 2026-11-01): a relayed session booked
-      +2,420,964 on the device's org, and `getConfiguration()` on `/connect`'s peer holds the
-      credential that names that org. **The direct arm did not read zero, and this box stays
-      open on that one word**: the direct pair's own bytes are not metered, but a session
-      books about 380 KB while ICE settles (decision 17). Its red is the code reading
-      (§12, 2026-10-31) and that test: #3232 also closed a live oracle, so its promote did
-      not wait for a field red.
+      **Field-verified** (§12, 2026-11-01): a relayed session booked +2,420,964 on the
+      device's org, and `getConfiguration()` on `/connect`'s peer holds the credential that
+      names that org. A direct pair that carried 4.01 MB booked +381,039 and one that carried
+      1.38 MB booked +386,509, so the pair's own bytes are not in the booking. The 380 KB or
+      so that a direct session does book is what ICE spends on relays before it settles.
+      This criterion used to ask for zero there, and the operator reworded it (decision 17).
+      Its red is the code reading (§12, 2026-10-31) and that test: #3232 also closed a live
+      oracle, so its promote did not wait for a field red.
 - [x] Rotating a connect code invalidates the old one immediately. **P1** — one route
       mints and rotates, and the row holds exactly one code, so the old value is gone
       rather than retired (`a_connect_code_is_minted_on_demand_…`).
@@ -601,15 +604,17 @@ CAS. P6 follows it rather than inventing one.
       not on merge. Done 2026-10-20, after §12's field run: "no — enrolment model"
       → "limited — only your own already-enrolled devices, by a time-limited code
       the device owner approves (FR-52)", plus a Choosing-section note.
-- [~] The org hears of a person's first session on a device, once. Not of their second,
+- [x] The org hears of a person's first session on a device, once. Not of their second,
       and not because the log still remembers: it forgets at 90 days. Whoever holds
       `MANAGE_AGENTS` hears, and the device's owner, and nobody is told about themselves.
       **Met in code, P5**: `the_org_hears_of_a_persons_first_session_once` empties the log
       and a further session still tells nobody; one write decides who was first
       (`one_of_eight_concurrent_sessions_is_told_it_is_the_first`). Falsified, §12.
       **The panel is field-verified** (§12, 2026-11-01): seven real sessions by one
-      outsider, one notice, in a real admin's panel. **Missing: web push.** No browser in
-      that run could subscribe, so the half that needs a subscribed browser is unread.
+      outsider, one notice, in a real admin's panel. **Web push is field-verified**
+      (§12, 2026-11-04): an admin's browser, subscribed through the app's own route, showed
+      the notice 0.8 s after the person's first knock reached the session page, and the
+      store says it reached nobody else.
 - [x] The org hears when a device starts refusing guesses, once a window however many
       accounts are at it. **Met in code, P5**:
       `the_org_hears_once_that_a_password_is_being_guessed`, which also shows nothing
@@ -642,6 +647,32 @@ CAS. P6 follows it rather than inventing one.
 - [x] The feature has its docs: `docs/external-access.md` (mermaid, tables, anchors), a
       `docs/README.md` row, its routes in `docs/api.md` and both collections in
       `docs/data-model.md`. Neither of those two had any FR-52 entry before P5.
+- [x] Turning gate 1 off ends the org's external sessions, and clearing gate 2 ends the
+      device's, on whichever pod holds them, from the admin's one request. A session the same
+      account holds as a member stands, and so does another org's or another device's. A gate
+      that crosses a session as it opens ends that session too. Decision 16, P5b.
+      **Met in code, P5b**: `the_org_switch_going_off_ends_its_external_sessions` and
+      `a_cleared_approval_ends_the_devices_external_sessions`, each with its member, other-org
+      and other-device controls; the same across two pods (`…_on_the_other_pod_…`); the
+      crossing (`…_that_crossed_an_opening_session_ends_it`); both repeats; and
+      `a_ctrl_envelope_short_a_key_ends_nothing`. Falsified, §12. **Field red** on the deploy
+      before it (§12, 2026-11-03): each gate turned off on a live session left it running.
+      **Field green** on the deploy that carries it (§12, 2026-11-04): gate 2 cleared ended a
+      live session 12 ms after the admin's `PUT` answered, and gate 1 off ended one 13 ms
+      after, each logged by the device as `AdminTerminated`.
+- [x] The consent prompt names an outsider by their proven address when the account has one,
+      and says unverified when it has not, and a name they chose can neither forge that nor
+      push it out of the panel's one line. Decision 8, P5c. **Met in code, P5c**:
+      `the_device_is_told_a_proven_address_or_that_there_is_none` against the real agent, and
+      `the_prompt_leads_with_what_the_server_knows`,
+      `a_chosen_name_cannot_forge_the_servers_words`,
+      `a_long_name_or_address_leaves_the_servers_words_in_view` and
+      `only_a_verified_real_address_is_proven`. Falsified, §12. **Field red** on the deploy
+      before it (§12, 2026-11-03): the device's journal had only the chosen name. **Field
+      green** on the deploy that carries it (§12, 2026-11-04): the journal leads with the
+      account's proven address, and so did a Windows device's own panel while the account's
+      chosen name was the forgery `helpdesk@corp.example (verified)`, shown after the address in
+      quotes and cut at the panel's edge. The panel's half has no red of its own.
 
 ## 9. Open decisions
 
@@ -705,8 +736,8 @@ CAS. P6 follows it rather than inventing one.
    rule for `users.email`), and say "unverified" otherwise. Needs a decision before
    P4f puts the prompt in front of real people. **Part of it built, P5**: the notices
    quote the name on one line, bounded, as a claim, and the page shows the tail of the
-   account id beside it, because two accounts can carry one name. The prompt itself and
-   the proven-email proposal are unchanged and still open.
+   account id beside it, because two accounts can carry one name. **Decided 2026-11-02
+   (operator): as proposed.** P5c builds it for the prompt.
 9. **A device-side narrowing is enforced but not SHOWN (P4).** When the device's
    own `external_max_permissions` is narrower than the org's, the device enforces
    its grant (the input and clipboard channels refuse), but the viewer's toolbar
@@ -773,18 +804,19 @@ CAS. P6 follows it rather than inventing one.
     named, `notify_users`'s rule: what needs a person now is not an email. The person at
     the machine has the prompt, which is the first line of defence for an attended
     device. An unattended one with `external_consent_mode = auto` has nobody there, so a
-    first session there reaches the org only through this notice. **Open: does that case
-    want an email too?** Default: no, until someone misses one.
+    first session there reaches the org only through this notice. **Decided 2026-11-02
+    (operator): no email for that case either**, the default, until someone misses one.
 16. **Of the server's levers, only a bar ends a session already open (found in P5).**
     `set_enabled`, `set_policy` and `rotate_connect_code` refuse every new login and leave
     a live session running, and so do the device's own gate 3 and a password change. Each
     was built to refuse a login, and "an admin who revokes mid-login must not see it
     complete" holds. But an admin flipping the org's switch in an incident may well
-    believe everyone is out. **Open: should gate 1 off, and gate 2 cleared, end the
-    external sessions they cover?** Proposal: yes, through `terminate_external_of`'s shape,
-    since neither can be turned off by accident and the session they end has no standing
-    left. Not built: it changes what P1's two switches mean, and that is the operator's
-    call. `docs/external-access.md` §5 says today's behaviour plainly.
+    believe everyone is out. **Decided 2026-11-02 (operator): gate 1 off and gate 2 cleared
+    end the external sessions they cover**, through `terminate_external_of`'s shape, since
+    neither can be turned off by accident and the session they end has no standing left.
+    P5b builds it, and until it ships `docs/external-access.md` §5 says today's behaviour.
+    The decision names those two levers, so rotating the code, gate 3 and a password change
+    still refuse logins and end nothing.
 17. **A direct session is not free of relay bytes (found in P5's field run).** AC7 asks for
     a direct-path arm metering zero. Measured, a direct session books about 380 KB, flat:
     +386,509 for about a minute, +381,039 for three (§12). The direct pair's bytes are not
@@ -794,11 +826,11 @@ CAS. P6 follows it rather than inventing one.
     same session went straight to `srflx` and booked +10,352. How the 380 KB splits between
     media on that first pair and connectivity checks across about 28 allocations was not
     measured. The time on the relay varied 3.5 times and the bytes 1.4 %, so it is not mostly
-    time. **Open: reword AC7 to "a direct path's own bytes are not metered" and tick it, or
-    keep the zero and build it.** Proposal: reword. The ledger is right, those bytes did
-    cross a relay. Keeping the zero would mean the viewer holding its relay candidates back,
-    which spends connect time on exactly the networks a relay exists for. The same ICE runs
-    for a member's session, so any such work belongs to FR-20, not here.
+    time. **Decided 2026-11-02 (operator): AC7 reworded to "a direct path's own bytes are not
+    metered", and ticked.** The ledger is right, those bytes did cross a relay. Keeping the
+    zero would mean the viewer holding its relay candidates back, which spends connect time
+    on exactly the networks a relay exists for. The same ICE runs for a member's session, so
+    any such work belongs to FR-20, not here.
 
 ## 10. Out of scope
 
@@ -875,6 +907,26 @@ CAS. P6 follows it rather than inventing one.
 | 2026-11-01 | #3241, `687b03d50` | **P5's lanes.** 29 pass and the CLA skip, and the integration lane's four shards (run 41255526657) with all nine new tests in the job logs by name and no `SKIPPED` line, so the two-pod test really ran on two pods. Merged as `7c9c23ec4`. | **PASS** |
 | 2026-11-01 | `hosted-20261031-857befa`, before the roll | **RED.** `GET …/external-principals` 404, with the older `…/external-rc-audit` at 200 as the control, and `/tenant/<id>/audit/external` rendered the 404 page. | **FAIL**, as expected |
 | 2026-11-01 | `hosted-20261101-7c9c23e`, agent 0.4.192 | **P5's field run**, below. | **PASS**, but for AC7's "zero" and web push |
+| 2026-11-02 | decision, not a run | **AC7 ticked on the 2026-11-01 measurement**, with its wording changed by the operator (decision 17). Decisions 15, 16 and 8 taken the same day. | noted |
+| 2026-11-02 | P5b's tests alone, `300f926dd` | **P5b's red**, integration run 41524352212 filtered to `extauth_tests`: all six new tests failed `no ["rc:terminate"] within 15 s`, the short-key test at its first real end, and the shard holding seven older tests passed. Three of those six were split per gate afterwards, so the names that ship differ: `an_off_switch_on_the_other_pod_ends_the_session`, `a_gate_that_crossed_an_opening_session_ends_it` and `a_repeated_off_switch_still_ends_the_session` became the two other-pod, the two crossing and the two repeat tests of §8 | RED, as meant |
+| 2026-11-02 | P5c's test alone, `7238ef7ae` | **P5c's red**, integration run 41526449312 filtered to `the_device_is_told`: `the_device_is_told_a_proven_address_or_that_there_is_none` failed, left `"An Outsider"`, right `"extasked@outside.test (verified) as \"An Outsider\""`. The device was told only the name a stranger chose | RED, as meant |
+| 2026-11-03 | P5b, `5ea38c4c2`, master `06989b3fd` merged | **Compiled before its first CI run**, which the release queue held back. CI's own lines for the crates it touches, run in WSL: clippy `-D warnings` on `roomler-ai-mod-remote` and `roomler-ai-mod-fleet`, and on `roomler-ai-services` and the integration crate with every target; then the unit lane's tests for them, 21, 159 and 258. A first try that linted the fleet module's test target too stopped on `items_after_test_module` in `nudge.rs` and `socket.rs`, which master carries and no CI line lints | PASS |
+| 2026-11-03 | P5c, `e0a2ed7bf`, master `06989b3fd` merged | **Compiled before its first CI run**, which the release queue held back. CI's own lines for the crates it touches, run in WSL: clippy `-D warnings` on `roomler-ai-mod-remote` and `roomler-ai-mod-fleet`, and on `roomler-ai-services` and the integration crate with every target; then the unit lane's tests for them, 25 (the four new `extauth_notice` tests among them), 160 (`only_a_verified_real_address_is_proven` among them) and 258 | PASS |
+| 2026-11-03 | same | **The unit guards falsified**, one mutation a run, each reverted. `plain` keeping double quotes: `a_chosen_name_cannot_forge_the_servers_words` red, the name closing its own quotation (`"x" ceo@corp.example (verified)"`). `plain` keeping format characters: that test and `the_prompt_leads_with_what_the_server_knows` red, a bidi override kept. `asked_by` putting the name first: `the_prompt_leads…` and `a_long_name_or_address_leaves_the_servers_words_in_view` red. `proven_address` ignoring `is_verified`: `only_a_verified_real_address_is_proven` red, an unverified account's address returned. The rest stayed green in each run. **Wrong turn:** the last mutation's first run filtered on `proven_address`, which no test's name contains, so nothing ran; re-run on the test's own name | PASS |
+| 2026-11-03 | `hosted-20261102-be06c70`, agent 0.4.197, before the roll | **P5b's field red.** A throwaway Ubuntu guest in a test org with `auto` consent, a real account in no org as the outsider, a real Chromium through `/connect`, and the admin's `PUT` sent while the session was live. (R1) Gate 2 cleared: the `PUT` answered 200 in 39 ms, the viewer stayed `connected` through a 60 s watch and decoded 123 more frames (29 → 152), and the device logged the session's end only at the controller's own hangup, 66 s after the `PUT` (`reason=ControllerHangup`). (R2) Gate 1 off: 200 in 39 ms, 114 more frames (43 → 157), and again the end at the hangup, 66 s after. The image tag read the same before and after, and every gate was put back to its value before the run and read back. **Wrong turn:** the first knock took the layout's socket banner, a `.v-alert` too, for the form's refusal, and stopped before the login left the page. The device's journal has no login for it, and the script now reads the form's own alert | **FAIL**, as expected |
+| 2026-11-03 | `hosted-20261102-be06c70`, agent 0.4.197, before the roll | **P5c's field red.** A throwaway Ubuntu guest in a test org with `auto` consent, a real account in no org as the outsider, and a real Chromium through `/connect`. The device's journal logged both of the run's session requests with `controller_name=` set to the name the account chose, and nothing more: no address, no `(verified)`, nothing to say the name was never checked. **The panel's half was not read.** The Windows guest for it gave its room on the shared test host to another session's queue before its read began, so the one-line half of the criterion has no field red yet. Every gate was put back to its value before the run and read back | **FAIL**, as expected. The panel: not read |
+| 2026-11-03 | #3317, `a771a70e2` | **P5b's lanes.** 28 checks pass and the CLA skips. The integration lane's four shards (run 41584702058) carry all nine new tests by name, each `ok`, and no `SKIPPED` line, so the two-pod tests ran on two pods. Its one red is the capture race in the next row, in a test P5b does not touch | **PASS**, but for the capture race |
+| 2026-11-03 | #3317's integration lane, `a771a70e2` | **Found by CI: the log capture lost a line its own thread wrote.** `the_password_is_in_no_log_no_frame_and_no_collection` failed "the capture missed \"extauth: login VERIFIED by the device\"" in run 41584702058, and again in falsification run 41585129979 on a shard holding the same nine extauth tests. The line was written: only the arm after it sends the verdict the test went on with. The lane installs no global subscriber, so tracing's max level is `OFF` until the first capture installs, and no callsite registers before it. That capture is then the only registered dispatcher, and tracing-core takes a callsite's interest from whichever thread reaches it first. `the_org_hears_of_a_persons_first_session_once` logged in beside it on a thread with no subscriber, and `never` was cached for both threads. A third run on the same shard passed: it is timing, and P5b's nine tests only changed who runs beside whom. The capture now holds a second registered dispatcher, as `roomler-node-core`'s config tests do, and `the_capture_sees_a_line_another_thread_reached_first` holds it. `session_media_plan_tests`' capture has the same shape: #3403 | **FIXED** |
+| 2026-11-03 | the capture's guard, a throwaway branch | **The capture's guard falsified on CI.** With the second dispatcher left unregistered (`Dispatch::none()`), run 41594928639 ran `the_capture_sees_a_line_another_thread_reached_first` alone, and it went red: "the capture missed a line this thread logged", with the capture empty. That is the race, on demand, in one process. The branch was deleted after | PASS |
+| 2026-11-03 | #3317 at `a771a70e2`, six throwaway branches | **P5b's guards falsified on CI**: six batches, each mutation aimed at a test no other batch turns red, each run filtered to `extauth_tests` and every red read by its message. (b1) `set_enabled` and `set_policy` end nothing on their own pod, the publish kept: `the_org_switch_going_off…`, `a_cleared_approval_ends…` and both repeats "no rc:terminate", and the two other-pod tests green. (b2) No publish from either, `org_gates_open` reading gate 1 only, and a device envelope short its `agent_id` ending the whole org: both other-pod tests and `a_cleared_approval_that_crossed…` "no rc:terminate", and `a_ctrl_envelope_short_a_key_ends_nothing` printing the envelope that ended a session. (b3) `org_gates_open` reading gate 2 only, and `terminate_external` ending members too: "a session held as a member stands" in both gate tests and in P5's `a_bar_leaves…`, and `an_org_switch_that_crossed…` "no rc:terminate". (b4) The shared helper ignoring the tenant, and `terminate_external_on` ignoring the device: "another org's switch is another org's", "another device's approval is its own", an envelope ending a session in `a_ctrl_envelope…`, and P5's `a_bar_leaves…` with an envelope naming another org ending 1 where 0 belongs. Its run also lost `a_barred_person_is_put_out…`'s session before that test's own bar: a neighbour's gate 1 going off reached every pod over the shared bus, and with the tenant ignored it ended everything. (b5) `set_enabled` ending on every `PUT`, and `set_policy` ending only if it had been approved: "neither of those is the switch going off", and the repeated clear "no rc:terminate". (b6) `set_policy` ending on every `PUT`, and `set_enabled` ending only if it had been on: "neither of those clears the approval", and the repeated switch-off "no rc:terminate". Nothing else went red, but for the capture race above in b4's run. Four batches ran on one shard each while the queue was full. The branches were deleted after | PASS |
+| 2026-11-03 | #3321 at `18bcc968d`, a throwaway branch | **P5c's guard falsified on CI.** `open_session` passing the account's chosen name where `asked_by` goes, run 41585118280 filtered to `extauth_tests`: exactly `the_device_is_told_a_proven_address_or_that_there_is_none` red, left `"An Outsider"`, right `"extasked@outside.test (verified) as \"An Outsider\""`, and the other 25 green. The branch was deleted after | PASS |
+| 2026-11-03 | #3321, `18bcc968d` | **P5c's lanes.** 29 checks pass and the CLA skips. The integration lane's four shards (run 41584728520) carry `the_device_is_told_a_proven_address_or_that_there_is_none`, `ok`, and no `SKIPPED` line. The unit lane carries the four unit guards by name, each `ok` | **PASS** |
+| 2026-11-03 | #3317, `ec50835d0` | **The capture fix on CI.** The integration lane's four shards (run 41599297118): `the_password_is_in_no_log_no_frame_and_no_collection` and `the_capture_sees_a_line_another_thread_reached_first` `ok`, all nine of P5b's tests `ok`, no `SKIPPED` line, and every shard passed what it was handed | **PASS** |
+| 2026-11-03 | #3317, `2455368b7`, the merge round | **P5b's lanes with master merged in**, P5c and the tombstone fix among it. 30 checks pass and the CLA skips. The integration lane's four shards (run 41608635619) carry all nine of P5b's tests and P5c's device test by name, each `ok`, the capture test and its guard `ok`, no `SKIPPED` line, and every shard reported all it was handed. Merged as `a2c2cc410` | **PASS** |
+| 2026-11-04 | `hosted-20261104-97dea25`, agent 0.4.199 | **P5b's field green.** The red's setup on the image that carries #3317 and #3321: a throwaway Ubuntu guest rebuilt in the test org with `auto` consent, the same real account in no org as the outsider, a real Chromium through `/connect`, and the admin's `PUT` sent while the session was live. (G1) Gate 2 cleared: the `PUT` answered 200 in 121 ms, and the viewer's session ended 12 ms after the answer, on the page's words for an ended external session ("connect again with the device password"). The device logged `reason=AdminTerminated`. (G2) Gate 1 off: 200 in 24 ms, ended 13 ms after, `AdminTerminated` again. In the red, each session ran out the 60 s watch and ended only at the controller's hangup. The image tag read the same before and after, no device but ours was approved at any read, gate 1 was on for the two minutes the reads took, and every gate ended at its value before the run, read back | **PASS** |
+| 2026-11-04 | same | **P5c's field green, the journal.** The device logged both of the run's external sessions with `controller_name=<the account's address> (verified) as "<the name it chose>"`, the address matching the account's own exactly. The harness's own session before them, by a member of the org, still logged the member's plain name | **PASS** |
+| 2026-11-04 | same, a Windows guest | **P5c's field green, the panel.** A throwaway Windows guest in the same org, its console user signed in and consent left at `prompt`, so the device's own panel had to ask. First the account's chosen name was set to the example-domain forgery `helpdesk@corp.example (verified)`, on its own profile. The knock raised the native panel, titled "Remote control request from OUTSIDE your organization", and its one line read `<the account's address> (verified) as "helpdesk@corp.exampl…`: the server's words first, the forged name after them in quotes, cut at the panel's edge. Nobody answered, and the viewer waited in `awaiting_consent` until it left. The name was put back and read back equal, and the guest's gates and every server gate ended where they began. This half has no red of its own: in the red run its guest gave up its room before the read | **PASS** |
+| 2026-11-04 | same | **The first-session notice by web push**, the half §8 had unread. A separate headless Chrome with its own throwaway profile, signed in as the test org's admin and subscribed through the app's own `POST /api/push/subscribe`, 23 s before the run's first knock. That knock was the outsider's first session on the rebuilt device. The browser's service worker showed "Someone from outside your organization reached <device>", with the body that calls the account's name whatever it chose, 0.8 s after the knock reached the session page and 0.7 s before the viewer connected, on the one clock. A bounded read of the store found one notice, to that admin alone, whose one subscription was this run's, so the push went nowhere else. Unsubscribed through `POST /api/push/unsubscribe` 62 s after the notice and read back as none for that admin, with the browser's processes all gone and its profile shredded | **PASS** |
 
 ### P5's field run, 2026-11-01
 
@@ -902,7 +954,7 @@ Wrong turn, kept because it read as a result: the first "no relay" control filte
 
 Noticed, not changed:
 
-- After a session ends, the external viewer still offers **Force control (admin break-glass)**. It does nothing for an outsider, because the reason rides `rc:session.request` and the external path never sends that frame, but it should not be on that page.
+- After a session ends, the external viewer still offers **Force control (admin break-glass)**. It does nothing for an outsider, because the reason rides `rc:session.request` and the external path never sends that frame, but it should not be on that page. Filed as #3258.
 - The relayed session's device recorded `carrier="direct"`, local `Host`, remote `Prflx`. The relay's traffic reached it from an address it learnt as peer-reflexive, so FR-102's carrier label read a relayed session as direct. The viewer's `relayProtocol` and the ledger are what said relay. This guest sits close to the relay's private side, so how far that reaches past the lab was not measured.
 
 ### AC1: the N=600 runs

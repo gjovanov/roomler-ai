@@ -501,7 +501,6 @@ async fn a_displaced_connections_late_offline_leaves_the_newer_hello_online() {
             "",
             "",
             "",
-            "",
             false,
             conn,
         )
@@ -523,4 +522,156 @@ async fn a_displaced_connections_late_offline_leaves_the_newer_hello_online() {
         "the connection that holds the row writes its own offline"
     );
     assert!(matches!(status().await, AgentStatus::Offline));
+}
+
+/// The module id [`HoldFirstClosed`] registers under. Its lifecycle runs last
+/// in `HOOK_ORDER`, so every other module's `closed` has run when it holds.
+/// Whatever that module registered itself is kept and called through.
+const HOLD_UNDER: &str = "saas";
+
+/// #2552 — holds the FIRST connection's teardown at `closed`: after the Hub
+/// removal, before fleet's `Offline` write (`roomler_core::agent_socket`, the
+/// teardown order). Every other call passes straight through.
+struct HoldFirstClosed {
+    inner: Option<std::sync::Arc<dyn roomler_core::AgentSocketLifecycle>>,
+    first_conn: std::sync::Mutex<Option<String>>,
+    removal_was_ours: std::sync::atomic::AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    returned: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl roomler_core::AgentSocketLifecycle for HoldFirstClosed {
+    async fn hello(&self, ctx: &roomler_core::AgentCtx) {
+        self.first_conn
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| ctx.conn_id.clone());
+        if let Some(inner) = &self.inner {
+            inner.hello(ctx).await;
+        }
+    }
+
+    async fn heartbeat(&self, ctx: &roomler_core::AgentCtx, warm_relay: Option<&str>) {
+        if let Some(inner) = &self.inner {
+            inner.heartbeat(ctx, warm_relay).await;
+        }
+    }
+
+    async fn closing(&self, ctx: &roomler_core::AgentCtx) {
+        if let Some(inner) = &self.inner {
+            inner.closing(ctx).await;
+        }
+    }
+
+    async fn closed(&self, ctx: &roomler_core::AgentCtx, removal_was_ours: bool) {
+        if let Some(inner) = &self.inner {
+            inner.closed(ctx, removal_was_ours).await;
+        }
+        let first = self.first_conn.lock().unwrap().clone();
+        if first.as_deref() == Some(ctx.conn_id.as_str()) {
+            self.removal_was_ours
+                .store(removal_was_ours, std::sync::atomic::Ordering::SeqCst);
+            self.reached.notify_one();
+            self.release.notified().await;
+            self.returned.notify_one();
+        }
+    }
+}
+
+/// #2552, through the socket handler itself: the losing order, forced. The
+/// old connection closes, its teardown removes it from the Hub (its own
+/// removal, since nothing has replaced it yet) and is held right there. The
+/// reconnect's hello writes `Online` and registers. Then the held teardown
+/// goes on to its `Offline` write. Before #2621 that write was
+/// `mark_status(Offline)`, and the row read `offline` under the live
+/// connection until its next heartbeat. Now the row names the reconnect, so
+/// the old connection's write matches nothing.
+#[tokio::test]
+async fn a_held_teardowns_late_offline_leaves_the_reconnect_online() {
+    use std::time::Duration;
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("p2552h").await;
+    let (agent_id, agent_token) = enroll(&app, &seeded, "mach-2552-held").await;
+    let aid = bson::oid::ObjectId::parse_str(&agent_id).unwrap();
+    let hub_holds = |app: &TestApp| app.state.fleet().rc_hub.is_agent_online(aid);
+
+    let registry = app.state.agent_socket.clone();
+    let hold = std::sync::Arc::new(HoldFirstClosed {
+        inner: registry
+            .lifecycles()
+            .into_iter()
+            .find(|(id, _)| *id == HOLD_UNDER)
+            .map(|(_, lifecycle)| lifecycle),
+        first_conn: std::sync::Mutex::new(None),
+        removal_was_ours: std::sync::atomic::AtomicBool::new(false),
+        reached: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        returned: tokio::sync::Notify::new(),
+    });
+    registry.register(
+        HOLD_UNDER,
+        roomler_core::AgentSocketHooks {
+            handler: registry.handler(HOLD_UNDER),
+            lifecycle: Some(hold.clone()),
+        },
+    );
+
+    let mut old = connect_agent(&app, &agent_token).await;
+    let mut registered = false;
+    for _ in 0..200 {
+        if hub_holds(&app) && hold.first_conn.lock().unwrap().is_some() {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(registered, "the first connection never registered");
+
+    // The old connection goes. Its teardown stops between its Hub removal and
+    // its Offline write.
+    let _ = old.close(None).await;
+    tokio::time::timeout(Duration::from_secs(10), hold.reached.notified())
+        .await
+        .expect("the old connection's teardown never reached `closed`");
+    assert!(
+        hold.removal_was_ours
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the old connection's Hub removal must be its own, or this is not the losing order"
+    );
+    assert!(!hub_holds(&app), "the Hub let go of the old connection");
+
+    // The reconnect: its hello writes Online, then it registers.
+    let mut new = connect_agent(&app, &agent_token).await;
+    let mut registered = false;
+    for _ in 0..200 {
+        if hub_holds(&app) {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(registered, "the reconnect never registered");
+    let row = fetch_agent_row(&app, &seeded, &agent_id).await;
+    assert_eq!(row["status"], "online", "the reconnect's hello: {row}");
+
+    // The old teardown goes on, and its Offline write lands after the
+    // reconnect's Online. The write comes straight after `closed` returns.
+    hold.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), hold.returned.notified())
+        .await
+        .expect("the held teardown never went on");
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(hub_holds(&app), "the Hub holds the reconnect");
+        let row = fetch_agent_row(&app, &seeded, &agent_id).await;
+        assert_eq!(
+            row["status"], "online",
+            "the old connection's late Offline landed under the live reconnect: {row}"
+        );
+    }
+
+    let _ = new.close(None).await;
 }

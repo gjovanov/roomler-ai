@@ -51,6 +51,12 @@ static FIRST_SHORT: Mutex<Option<child::Shortfall>> = Mutex::new(None);
 static LAST_ASK: Mutex<Option<Instant>> = Mutex::new(None);
 /// #3280 — the GPU-input forms of the answer in force, for [`weigh`].
 static GPU_IN_FORCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// #3439 — what the async path answers before the first probe has ([`answer_now`]).
+static INTERIM_CAPS: OnceLock<AgentCaps> = OnceLock::new();
+/// #3439 — the first answer is news, once ([`detect`]).
+static FIRST_IS_NEWS: std::sync::Once = std::sync::Once::new();
+/// #3439 — wakes every connection when [`generation`] moves ([`news`]).
+static NEWS: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
 
 fn late_caps() -> Option<AgentCaps> {
     LATE_CAPS.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -62,17 +68,76 @@ fn late_caps() -> Option<AgentCaps> {
 /// LocalAPI serves this on every Overview poll, and the first `detect()` in a
 /// process spawns the probe children (vendor driver code, the reason the
 /// probe is out-of-process at all); a control-surface read must never be what
-/// launches that. The probe runs at the first `rc:agent.hello`, so before a
-/// daemon has reached its server this is `None`, and the Overview says
-/// "not probed yet" and asks again later.
+/// launches that. The probe starts with the daemon's signalling loop
+/// ([`start_probing`]), so until its first answer this is `None`, and the
+/// Overview says "not probed yet" and asks again later.
 pub fn cached() -> Option<AgentCaps> {
     late_caps().or_else(|| CACHED_CAPS.get().cloned())
 }
 
 /// #3280 — a number that changes when the answer [`detect`] gives does. Read it
 /// BEFORE reading the answer: a change in between then reads as news next time.
+/// #3439 — the first answer moves it too: a connection that said hello with the
+/// interim answer has to hear of the real one.
 pub fn generation() -> u64 {
     CAPS_GENERATION.load(Ordering::SeqCst)
+}
+
+/// #3439 — wakes when [`generation`] moves. Each connection holds one, so a new
+/// answer reaches its row at once rather than within a heartbeat. Subscribe
+/// before reading the generation, so a change in between wakes it.
+pub fn news() -> tokio::sync::watch::Receiver<u64> {
+    news_sender().subscribe()
+}
+
+fn news_sender() -> &'static tokio::sync::watch::Sender<u64> {
+    NEWS.get_or_init(|| tokio::sync::watch::channel(generation()).0)
+}
+
+/// The answer [`detect`] gives has changed. Called once the new answer is stored:
+/// the generation, then the wake, so whoever wakes finds the new answer.
+fn answer_moved() {
+    let now = CAPS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    news_sender().send_replace(now);
+}
+
+/// #3439 — whether the first probe has answered. Before it has, a session request
+/// waits for it (`crate::held_requests`).
+pub fn answered() -> bool {
+    CACHED_CAPS.get().is_some()
+}
+
+/// #3439 — the answer in force, or before the first probe has answered, the
+/// interim one ([`interim`]). It never waits for a probe: this is what the
+/// signalling loop reads, where a wait on the probe is a stalled pump.
+pub fn answer_now() -> AgentCaps {
+    cached().unwrap_or_else(|| INTERIM_CAPS.get_or_init(interim_answer).clone())
+}
+
+/// #3439 — build the interim answer, on a blocking thread: it reads the host the
+/// way a cache hit does. `signaling::run` builds it before it connects with it.
+pub fn interim() {
+    let _ = INTERIM_CAPS.get_or_init(interim_answer);
+}
+
+/// #3439 — how long a start waits for the first answer before it connects with
+/// the interim one. Above every healthy host the field has read (`probe_ms` 50
+/// to 6811, `docs/encoders.md`), so such a host's hello carries its whole answer,
+/// as it always did. A starved host is online after this, while its children run.
+pub const FIRST_ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+/// #3439 — wait for the first answer, `within` at most. Whether it came.
+pub async fn first_answer_within(within: Duration) -> bool {
+    let mut news = news();
+    let came = async {
+        while !answered() {
+            if news.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(within, came).await;
+    answered()
 }
 
 /// Whether this build carries ANY video encoder. A signalling-only build
@@ -275,6 +340,8 @@ mod child {
     /// until the next start. So it is long for a scheduler, and short for a
     /// device waiting to come online.
     const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// #3439 — a child that took longer than this to start is said so in the log.
+    const SLOW_SPAWN: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// What the child hands back: the caps, plus the per-host verdicts the
     /// probe measured that are NOT wire capabilities.
@@ -1318,28 +1385,59 @@ mod child {
                 return None;
             }
         };
+        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
+        let phase = phase.map(|(_, v)| v.as_str());
+        // #3439 — on #3439's loaded guest the first child started 5 to 8 s after
+        // the cache miss. Said only when slow, so a field read can tell process
+        // creation itself from what came before it.
+        let spawn_took = started.elapsed();
+        if spawn_took > SLOW_SPAWN {
+            tracing::warn!(
+                spawn_ms = spawn_took.as_millis() as u64,
+                ?phase,
+                "caps probe: starting the probe child was slow; this host is busy"
+            );
+        }
+        // #3439 — the host's CPU from here, so a child that runs out of time can
+        // say whether it was starved or stuck.
+        let host_at_spawn = crate::encode::host_cpu::HostTimes::now();
         // #2717 — the child ends with this process: a worker told to stop
         // mid-probe leaves without waiting it out (`signaling::run`).
         #[cfg(windows)]
         let _ends_with_us = tie_to_this_process(&childp);
 
         let bounds = this.bounds;
+        let mut at_bound = None;
         let (waited, output) =
             wait_for_child(childp, bounds.child, bounds.kill_wait, this.stop, |c| {
+                at_bound = Some((
+                    crate::encode::host_cpu::HostTimes::now(),
+                    crate::encode::host_cpu::of_child(c),
+                ));
                 let _ = c.kill();
             });
+        let (host_at_bound, child_cpu) = at_bound.unwrap_or((None, None));
+        let ran = crate::encode::host_cpu::Ran::of(
+            host_at_spawn,
+            host_at_bound,
+            crate::encode::host_cpu::HostTimes::now(),
+            child_cpu,
+            bounds.child,
+        );
+        let idle_running = crate::encode::host_cpu::pct(ran.idle_running);
+        let idle_dying = crate::encode::host_cpu::pct(ran.idle_dying);
+        let child_cpu_ms = crate::encode::host_cpu::ms(ran.child_cpu);
         let Output {
             text: stdout,
             cut_off,
         } = output;
-        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
-        let phase = phase.map(|(_, v)| v.as_str());
         let last_open = last_progress(&stdout).unwrap_or_default();
         if cut_off {
             tracing::warn!(
                 kill_wait_s = bounds.kill_wait.as_secs(),
                 ?phase,
                 %last_open,
+                host_idle = %idle_running,
                 "caps probe: the child's stdout had not ended at the bound, so anything it wrote \
                  after that is lost, a report included. Something it started may hold the pipe, \
                  or this host is too busy to read it in time."
@@ -1348,21 +1446,53 @@ mod child {
         let status = match waited {
             Waited::Exited(status) => status,
             Waited::Hung { gone } => {
-                // A hung driver. Carry on without this phase.
-                if gone {
+                // A hung driver, or a host with no CPU to give it (#3439). Carry
+                // on without this phase.
+                if gone && ran.starved_running() {
                     tracing::warn!(
                         timeout_s = bounds.child.as_secs(),
                         ?phase,
                         %last_open,
+                        host_idle = %idle_running,
+                        child_cpu_ms = %child_cpu_ms,
+                        "caps probe: the probe child ran out of time on a host with no idle CPU, \
+                         so it was most likely starved rather than hung — the daemon is \
+                         unaffected."
+                    );
+                } else if gone {
+                    tracing::warn!(
+                        timeout_s = bounds.child.as_secs(),
+                        ?phase,
+                        %last_open,
+                        host_idle = %idle_running,
+                        child_cpu_ms = %child_cpu_ms,
                         "caps probe: the probe child hung — the daemon is unaffected; this is \
                          the process boundary doing its job."
                     );
+                } else if ran.starved_dying() {
+                    tracing::error!(
+                        timeout_s = bounds.child.as_secs(),
+                        kill_wait_s = bounds.kill_wait.as_secs(),
+                        ?phase,
+                        %last_open,
+                        host_idle = %idle_running,
+                        host_idle_while_dying = %idle_dying,
+                        child_cpu_ms = %child_cpu_ms,
+                        "caps probe: the probe child ran out of time and had not died by the end \
+                         of its kill wait, on a host with no idle CPU: most likely it was never \
+                         scheduled to finish, not stuck in a driver. Going on without it; the \
+                         daemon is unaffected."
+                    );
+                    stuck_reaches_the_daemon(this);
                 } else {
                     tracing::error!(
                         timeout_s = bounds.child.as_secs(),
                         kill_wait_s = bounds.kill_wait.as_secs(),
                         ?phase,
                         %last_open,
+                        host_idle = %idle_running,
+                        host_idle_while_dying = %idle_dying,
+                        child_cpu_ms = %child_cpu_ms,
                         "caps probe: the probe child hung and did not die when killed. It is \
                          most likely stuck in a kernel call in a driver, and stays until that \
                          call returns. Going on without it; the daemon is unaffected."
@@ -2252,6 +2382,9 @@ pub(crate) fn in_probe_child() -> bool {
 /// <10ms on boxes with no HW encoder); subsequent calls return the
 /// cached result, or a later try's if one was adopted (#3280). This never waits
 /// for a try.
+///
+/// ⚠️ The first call blocks until the probe answers, and so does every call made
+/// while it runs. The signalling loop reads [`answer_now`] instead (#3439).
 pub fn detect() -> AgentCaps {
     let first = CACHED_CAPS.get_or_init(|| {
         let caps = cached_or_probed();
@@ -2267,7 +2400,41 @@ pub fn detect() -> AgentCaps {
             short.as_ref(),
         )
     });
+    // #3439 — after the store, so a connection woken by it finds the answer.
+    FIRST_IS_NEWS.call_once(answer_moved);
     late_caps().unwrap_or_else(|| first.clone())
+}
+
+/// #3439 — the first probe, on a thread of its own, so the start does not wait
+/// for it: `signaling::run` waits [`FIRST_ANSWER_WAIT`] at most, then connects with
+/// the interim answer. Once per process, so a second organization's loop finds it
+/// running. Once the first answer exists, the same thread arms #3280's retry with
+/// `live`.
+///
+/// A thread and not `spawn_blocking`, for [`arm_retry`]'s reason: a runtime's
+/// shutdown waits on those, and `signaling::run` must be able to leave. A child
+/// still running then ends with the process (`child::tie_to_this_process`).
+///
+/// `false` when no thread could start: the caller probes in place, as before.
+pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-caps-probe".into())
+        .spawn(move || {
+            let _ = detect();
+            arm_retry(live);
+        });
+    match spawned {
+        Ok(_) => true,
+        Err(e) => {
+            STARTED.store(false, Ordering::SeqCst);
+            tracing::warn!(%e, "caps probe: no thread for the probe; the start waits for it");
+            false
+        }
+    }
 }
 
 /// What the daemon says over whatever `cached_or_probed` answered, on every
@@ -2294,6 +2461,29 @@ pub const LEARNED_CODE: &str = "learned-deny";
 /// #3280 — the same key's code on a host short of time with no cell to name, so
 /// that one with no hardware says why instead of looking like it has none.
 pub const SHORT_CODE: &str = "probe-short";
+/// #3439 — and on a host whose first probe has not answered yet, so a row that
+/// came online early says it is still probing rather than that it has no hardware.
+pub const PROBING_CODE: &str = "probing";
+
+/// #3439 — what a host says before its first probe has answered: what it says
+/// when no probe child comes back ([`cached_or_probed`]), everything that needs no
+/// driver, with the daemon's own words over it, and why the rest is missing.
+fn interim_answer() -> AgentCaps {
+    let caps = assigned_by_the_daemon(compute_caps(false, false), &HostFacts::here(), &[], None);
+    with_probing_word(caps)
+}
+
+fn with_probing_word(mut caps: AgentCaps) -> AgentCaps {
+    caps.unavailable.insert(
+        LEARNED_WORD.into(),
+        roomler_ai_remote_control::models::Unavailable::new(
+            PROBING_CODE,
+            "The capability probe is still running on this host, so this answer has only the \
+             encoders that need no driver. The hardware ones follow when it answers",
+        ),
+    );
+    caps
+}
 
 /// #3267 — a host that lost a cell to a driver fault says so: which cell, and
 /// how its probe child ended. The collapse this replaces went unnoticed for
@@ -3261,7 +3451,7 @@ fn offered_forms(caps: &AgentCaps) -> std::collections::BTreeMap<String, bool> {
 /// finds the new answer.
 fn install_late(answer: AgentCaps) {
     *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
-    CAPS_GENERATION.fetch_add(1, Ordering::SeqCst);
+    answer_moved();
 }
 
 /// #3280 — a later try's child that would not die costs Media Foundation as a first
@@ -4456,13 +4646,6 @@ fn rpc_caps() -> Vec<String> {
         // hold the caller for it. A property of the BUILD, like `ssh`: the
         // ack is sent even when the device refuses — that is the point.
         caps.push(RpcCap::SshGrantAck);
-        // FR-90 P3-8-2a. This build's SSH server holds an agent session's
-        // grant (`one_command`) to ONE `exec` and nothing else. Distinct from
-        // `ssh`, its prefix, because every build before it would read past
-        // the field and serve that session's key a shell: the server sends a
-        // session's grant only to a device that says this. A property of the
-        // BUILD; the SYSTEM service says it for itself, when it publishes.
-        caps.push(RpcCap::SshOneCommand);
     }
     // FR-52 P4 — this build can ADMIT an external session: bind it to a
     // verified login, check its offer's MAC, seal its answer. The server opens
@@ -4493,136 +4676,6 @@ fn rpc_caps() -> Vec<String> {
     // refuse (`overlay_key_rotation=false`), and says so in its report.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     caps.push(RpcCap::KeyRotate);
-    // FR-90 — a build that runs agent sessions answers `rc:hive.start` and
-    // reports with `rc:hive.state`. A property of the BUILD, like `ssh`: the
-    // device still refuses unless its owner switched `hive_enabled` on, and
-    // says so in the ack. Every `hive_host` build: Linux, macOS, Windows.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::Hive);
-    // FR-90 P0d-2 — and serves a session's transcript to a browser over a
-    // viewer peer: answers `rc:hive.view.grant` before the browser dials.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveView);
-    // FR-90 P1e — and understands a session's core memory (`rc:hive.memory`).
-    // A property of the BUILD: whether a session ever sees it is the device's
-    // own `hive_core_memory`, default off.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveMemory);
-    // FR-90 P1j — and mirrors terminal sessions its people adopted. NOT a
-    // property of the build alone: advertised only while the device's owner
-    // allows it (`hive_adopt`), and the server honours an offer only from a
-    // connection that advertises it.
-    #[cfg(hive_host)]
-    if crate::hive::adopt_enabled() {
-        caps.push(RpcCap::HiveAdopt);
-    }
-    // FR-90 P2c-3 — and holds copies of its owner's sessions run elsewhere:
-    // answers `rc:hive.replica.join`. Not a property of the build alone:
-    // only while the owner's `hive_replica` is on and the store is open, and
-    // on the primary enrollment's connection only (the hello strips both
-    // words from any other). `hive-archive` only ever with it.
-    #[cfg(hive_host)]
-    if crate::hive::replica_enabled() {
-        caps.push(RpcCap::HiveReplica);
-    }
-    #[cfg(hive_host)]
-    if crate::hive::archive_enabled() {
-        caps.push(RpcCap::HiveArchive);
-    }
-    // FR-90 P2i-1 — and answers a search over those copies, as an archive
-    // replica: `hive-search`, only with `hive-archive` and `hive-replica`,
-    // which the device's own gate asks again at each grant.
-    #[cfg(hive_host)]
-    if crate::hive::archive_enabled() && crate::hive::replica_enabled() {
-        caps.push(RpcCap::HiveSearch);
-    }
-    // FR-90 P2d-3b — and carries the replica stream: serves a member's grant
-    // as a source and follows a dial as a member. While its store is open,
-    // whatever its owner says of holding copies: a primary serves its own
-    // sessions' members. Stripped from any connection but the primary
-    // enrollment's (the hello), like every Hive word.
-    #[cfg(hive_host)]
-    if crate::hive::stream_enabled() {
-        caps.push(RpcCap::HiveStream);
-    }
-    // FR-90 P2e-2 — and holds a leased session to the server's word on each
-    // connection (`rc:hive.lease`): after a restart or a reconnect it runs
-    // one only once the server has said so there. A property of the BUILD,
-    // like `hive`, and kept on a secondary org's connection like it: that
-    // org's Hive frames are refused there either way.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveLease);
-    // FR-90 P2e-5c — and takes part in a promotion at either end: as the
-    // primary it drains (`rc:hive.drain`), as the member it prepares
-    // (`rc:hive.prepare`) and takes the session over from its copy at the
-    // move (`rc:hive.move`), and its joins take where each superseded fence
-    // ended (P2e-5b). A property of the BUILD, like `hive-lease`: the device
-    // still refuses a drain or a prepare its own gates do not pass, in its
-    // own words, and a secondary org's connection refuses both.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePromote);
-    // FR-90 P2f-1a — and takes part in a teleport, a move to a device that
-    // holds no copy yet: as the target, a teleport's prepare passes every
-    // start gate but the copy and admits that one session's join, whatever
-    // `hive_replica` says; as the primary, a join in the primary's role
-    // checkpoints at once when no turn runs and says where its copy ends. A
-    // property of the BUILD, like `hive-promote`, and kept on a secondary
-    // org's connection like it: no placement chooses a teleport's target, and
-    // that org's prepare and join are refused there either way.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveTeleport);
-    // FR-90 P2f-3a — and starts a fork of a session it holds a copy of: a
-    // start carrying `fork_of` takes the parent's last checkpoint under the
-    // fork's ids and launches `--resume <parent> --fork-session --session-id
-    // <fork>`. A property of the BUILD; a build before it would start the
-    // fork empty.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveFork);
-    // FR-90 P2f-4a — and makes a terminal session it adopted, whose terminal
-    // ended here, a managed one: a start carrying `from_terminal` puts the
-    // terminal's own history in place as the account it ran as, by this
-    // device's record of whose terminal it was, and resumes it. A property of
-    // the BUILD, Unix only: Windows adopts since FR-97 P4c, but putting a
-    // terminal's history in place runs as the account through Unix tools. The
-    // device's start gates still decide, `hive_enabled` first.
-    #[cfg(all(hive_host, unix))]
-    caps.push(RpcCap::HiveManage);
-    // FR-90 P2g-1 — and purges a session on `rc:hive.purge`, answering per
-    // part: its own copy, then as the session's account its state directory
-    // and its checkpoints' refs. A property of the BUILD, on every platform
-    // that runs sessions.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurge);
-    // FR-90 P2g-4a — and purges every session it holds on
-    // `rc:hive.purge_all`, which its enrollment's removal sends. A property
-    // of the BUILD, as `hive-purge` is.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurgeAll);
-    // #2294 — and finishes that purge before it exits on the removal's
-    // goodbye (`hive::finish_removal_purge`), so the server's kick may tell
-    // it. A property of the BUILD, as `hive-purge-all` is.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurgeDrain);
-    // FR-90 P4-3b-1 — and scans the roots its owner lists on
-    // `rc:knowhow.scan`, each as the account that owns it. A property of the
-    // BUILD, as `hive-purge` is: an empty `knowhow_scan_roots` is an answer
-    // (`no_roots`), never a reason to stay silent. Linux and macOS; Windows
-    // advertises it from P4-3b-4.
-    #[cfg(all(hive_host, unix))]
-    caps.push(RpcCap::KnowhowScan);
-    // FR-90 P4-4-1b — and its sessions can ask the organization's map, so
-    // its server tells it at each hello whether the map is there for them
-    // (`rc:knowhow.served`, decision 49). A property of the BUILD: every OS
-    // that runs sessions, the toolbelt's tools apart from the scanner.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::KnowhowTools);
-    // FR-90 P4-5-1b — and probes, on `rc:knowhow.probe`, what the map says
-    // within what its owner lists in `knowhow_probe_reach`. A property of the
-    // BUILD, as `knowhow-scan` is: an empty list is an answer
-    // (`not_allowed`), never a reason to stay silent. Every OS that runs
-    // sessions.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::KnowhowProbe);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.
@@ -5012,14 +5065,6 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::SshGrantAck.wire()),
             cfg!(feature = "ssh-server"),
             "ssh-grant-ack must be advertised exactly when the SSH server is built"
-        );
-        // FR-90 P3-8-2a — and so does one command: the server sends an agent
-        // session's grant only where this is said, and the SSH server is what
-        // holds it there.
-        assert_eq!(
-            advertised.iter().any(|v| v == RpcCap::SshOneCommand.wire()),
-            cfg!(feature = "ssh-server"),
-            "ssh-one-command must be advertised exactly when the SSH server is built"
         );
         // FR-97 P5a — `console-user` on every Unix build and never on
         // Windows, whose `console_user` is its SYSTEM service's: a Windows
@@ -9681,5 +9726,61 @@ mod tests {
         let answered = assigned_by_the_daemon(p0c_caps(), &facts, &[], None);
         let over = word_after_the_climb(answered, &[]);
         assert!(!over.unavailable.contains_key(LEARNED_WORD));
+    }
+
+    /// #3439 — a host that came online before its first answer says it is still
+    /// probing, and offers nothing that needs a driver or an encoder open: no
+    /// hardware cell, no DataChannel transport.
+    #[test]
+    fn the_interim_answer_says_the_probe_is_still_running() {
+        let _fixture = probe_fixture();
+        let caps = interim_answer();
+        let word = &caps.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, PROBING_CODE);
+        assert!(word.reason.contains("still running"), "{}", word.reason);
+        assert!(
+            caps.video_cells.iter().all(|c| !c.hw),
+            "{:?}",
+            caps.video_cells
+        );
+        assert!(caps.transports.is_empty(), "{:?}", caps.transports);
+        assert_eq!(caps.probe_ms, None);
+        assert!(!caps.probe_cached);
+        // The daemon's own lists, as on every other path.
+        assert_eq!(caps.files, files_caps());
+    }
+
+    /// #3439 — an answer that moves wakes every connection, with the generation
+    /// already moved, so whoever wakes reads the new one.
+    #[test]
+    fn a_moved_answer_wakes_every_connection() {
+        let _fixture = probe_fixture();
+        let (mut one, mut two) = (news(), news());
+        let before = generation();
+        answer_moved();
+        assert_eq!(generation(), before + 1);
+        for news in [&mut one, &mut two] {
+            assert!(
+                news.has_changed()
+                    .expect("the sender lives as long as the process")
+            );
+            assert_eq!(*news.borrow_and_update(), before + 1);
+        }
+    }
+
+    /// #3439 — the start's wait for a first answer is a bound, not a wait for the
+    /// probe. No test in this binary runs the probe, so nothing answers here.
+    #[test]
+    fn the_wait_for_a_first_answer_ends_at_its_bound() {
+        if answered() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let started = Instant::now();
+        assert!(!rt.block_on(first_answer_within(Duration::from_millis(50))));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

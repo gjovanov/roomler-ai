@@ -68,7 +68,6 @@ pub async fn handle_agent_socket(
             advertised_routes,
             supports_relay_regions,
             ssh_host_pubkey,
-            vault_key,
             peer_auth_key,
         }) => (
             machine_name,
@@ -79,7 +78,7 @@ pub async fn handle_agent_socket(
             caps,
             advertised_routes,
             supports_relay_regions,
-            (ssh_host_pubkey, vault_key, peer_auth_key),
+            (ssh_host_pubkey, peer_auth_key),
         ),
         other => {
             warn!(?other, "agent opened WS without rc:agent.hello — closing");
@@ -95,23 +94,8 @@ pub async fn handle_agent_socket(
         caps,
         advertised_routes,
         supports_relay_regions,
-        (ssh_host_pubkey, vault_key, peer_auth_key),
+        (ssh_host_pubkey, peer_auth_key),
     ) = hello;
-    // FR-90 P3-3a — a vault key is stored only as one the vault can seal to;
-    // anything else is stored as none, so the device takes no leases until a
-    // hello carries a key that is well formed.
-    let vault_key = if vault_key.is_empty()
-        || roomler_ai_remote_control::signaling::vault_key_is_well_formed(&vault_key)
-    {
-        vault_key
-    } else {
-        warn!(
-            %agent_id,
-            len = vault_key.len(),
-            "agent hello carried a malformed vault key — storing none"
-        );
-        String::new()
-    };
     // FR-100 P1a — likewise a device key: stored only in its one canonical
     // shape, so a browser's first pin never starts from a key no browser can
     // import. A hint either way (the browser pins what signed), so this
@@ -146,7 +130,6 @@ pub async fn handle_agent_socket(
             &caps,
             &advertised_routes,
             &ssh_host_pubkey,
-            &vault_key,
             &peer_auth_key,
             &arch,
             arch_emulated,
@@ -188,54 +171,6 @@ pub async fn handle_agent_socket(
     // a recorder at all (`available`). Equality-matched: `remote` is a
     // prefix of `remote-audio`.
     let records = crate::hub::RecordSupport::from_caps(&caps);
-    // FR-90 — this connection runs Hive sessions. Equality-matched: the
-    // replica verb the design names next will have `hive` as its prefix.
-    let runs_hive = caps.has_rpc(RpcCap::Hive);
-    // FR-90 P0d-2 — and serves viewer peers. `hive` is its prefix and NOT
-    // the same promise: a P0c agent drops every view frame.
-    let serves_hive_views = caps.has_rpc(RpcCap::HiveView);
-    // FR-90 P1e — and understands core memory; `hive` is its prefix too.
-    let takes_hive_memory = caps.has_rpc(RpcCap::HiveMemory);
-    // FR-90 P1j — and mirrors adopted terminal sessions; `hive` is its
-    // prefix too.
-    let adopts_hive = caps.has_rpc(RpcCap::HiveAdopt);
-    // FR-90 P2c-3 — and holds copies of the org's sessions: it answers a
-    // join, and its owner's `hive_replica` is on. `hive` is its prefix too.
-    let holds_hive_copies = caps.has_rpc(RpcCap::HiveReplica);
-    // FR-90 P2d — and carries replica streams: it serves a session it holds
-    // to a member, and dials one as a member. `hive` is its prefix too.
-    let carries_hive_streams = caps.has_rpc(RpcCap::HiveStream);
-    // FR-90 P2e-2 — and holds a leased session to the server's word on each
-    // connection. `hive` is its prefix too.
-    let holds_hive_leases = caps.has_rpc(RpcCap::HiveLease);
-    // FR-90 P2e-3 — and takes part in a promotion, at either end. `hive` is
-    // its prefix too.
-    let takes_hive_promotions = caps.has_rpc(RpcCap::HivePromote);
-    // FR-90 P2f-1 — and in a teleport, at either end. `hive` is its prefix
-    // too.
-    let takes_hive_teleports = caps.has_rpc(RpcCap::HiveTeleport);
-    // FR-90 P2f-3 — and starts a fork from its parent's copy. `hive` is its
-    // prefix too: a build before it would start a fork empty.
-    let starts_hive_forks = caps.has_rpc(RpcCap::HiveFork);
-    // FR-90 P2f-4b — and makes a terminal session it adopted a managed one.
-    // `hive` is its prefix too: a build before it would start the
-    // conversation afresh.
-    let makes_hive_managed = caps.has_rpc(RpcCap::HiveManage);
-    // FR-90 P2g-2 — and purges a session on `rc:hive.purge`. `hive` is its
-    // prefix too: a build before it does not know the frame.
-    let purges_hive = caps.has_rpc(RpcCap::HivePurge);
-    // FR-90 P2g-4a — and purges every session it holds at its removal.
-    // `hive` and `hive-purge` are its prefixes too: a build of P2g-1 to P2g-3d
-    // purges a session and cannot decode `rc:hive.purge_all`.
-    let purges_hive_at_removal = caps.has_rpc(RpcCap::HivePurgeAll);
-    // #2294 — and finishes that purge before it exits on the removal's
-    // goodbye, so the kick may tell it. Its own word: a build before it
-    // exits at once.
-    let drains_hive_purge = caps.has_rpc(RpcCap::HivePurgeDrain);
-    // FR-90 P2i-2 — and, as an archive replica, answers a search over the
-    // copies it holds. `hive` is its prefix too: a build before P2i-1 drops
-    // `rc:hive.search.grant` unread.
-    let searches_hive = caps.has_rpc(RpcCap::HiveSearch);
     // FR-92 — it parses the org's keep-busy policy. Equality, never a prefix.
     let supports_keep_busy = advertises_keep_busy(&caps);
     let (registered_tx, cancel, rx) = state.rc_hub.register_agent(
@@ -298,49 +233,12 @@ pub async fn handle_agent_socket(
     state
         .rc_hub
         .set_agent_keep_busy_support(agent_id, supports_keep_busy);
-    state.rc_hub.set_agent_hive_support(agent_id, runs_hive);
+    // FR-132 P1b — whether a saved desired config can be pushed to it. Before
+    // the row read below, so a save that finds this unset is one that read
+    // carries. Equality-matched through `has_rpc`.
     state
         .rc_hub
-        .set_agent_hive_view_support(agent_id, serves_hive_views);
-    state
-        .rc_hub
-        .set_agent_hive_memory_support(agent_id, takes_hive_memory);
-    state
-        .rc_hub
-        .set_agent_hive_adopt_support(agent_id, adopts_hive);
-    state
-        .rc_hub
-        .set_agent_hive_replica_support(agent_id, holds_hive_copies);
-    state
-        .rc_hub
-        .set_agent_hive_stream_support(agent_id, carries_hive_streams);
-    state
-        .rc_hub
-        .set_agent_hive_lease_support(agent_id, holds_hive_leases);
-    state
-        .rc_hub
-        .set_agent_hive_promote_support(agent_id, takes_hive_promotions);
-    state
-        .rc_hub
-        .set_agent_hive_teleport_support(agent_id, takes_hive_teleports);
-    state
-        .rc_hub
-        .set_agent_hive_fork_support(agent_id, starts_hive_forks);
-    state
-        .rc_hub
-        .set_agent_hive_manage_support(agent_id, makes_hive_managed);
-    state
-        .rc_hub
-        .set_agent_hive_purge_support(agent_id, purges_hive);
-    state
-        .rc_hub
-        .set_agent_hive_purge_all_support(agent_id, purges_hive_at_removal);
-    state
-        .rc_hub
-        .set_agent_hive_purge_drain_support(agent_id, drains_hive_purge);
-    state
-        .rc_hub
-        .set_agent_hive_search_support(agent_id, searches_hive);
+        .set_agent_config_support(agent_id, caps.has_rpc(RpcCap::Config));
     let pump_socket_tx = socket_tx.clone();
     let pump = tokio::spawn(pump_server_messages(rx, pump_socket_tx));
 
@@ -407,17 +305,19 @@ pub async fn handle_agent_socket(
         let _ = registered_tx.try_send(ServerMsg::RelayRegions { regions, rev });
     }
 
-    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is the only
-    // delivery path, deliberately: a device that was offline for a week and one
-    // that was online when an admin hit save converge through the same code,
-    // so the offline case is exercised on every connect rather than only when
-    // nobody is watching.
+    // Remote config (docs/remote-config.md) — RECONCILE-ON-CONNECT is what a
+    // device converges by, deliberately: a device that was offline for a week
+    // and one that missed a save converge through the same code, so the offline
+    // case is exercised on every connect rather than only when nobody is
+    // watching. FR-132 P1b — a save also nudges a connected device with this
+    // same frame (`remote_config::set_desired_config`), through the same hub
+    // call, which keeps the two from racing. A nudge that is lost costs nothing
+    // but the wait for this one.
     if let Some(desired) = desired_config {
         if caps.has_rpc(RpcCap::Config) {
-            let _ = registered_tx.try_send(ServerMsg::ConfigPush {
-                revision: desired.revision,
-                desired,
-            });
+            let _ = state
+                .rc_hub
+                .push_desired_config(agent_id, tenant_id, desired);
         } else {
             // Unlike `Goodbye`/`UpdateNow`, this one must not be sent blind.
             // A pre-feature agent drops the unknown tag in its `debug!` branch

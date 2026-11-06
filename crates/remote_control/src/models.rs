@@ -937,174 +937,6 @@ pub enum RpcCap {
     /// `ssh` would wait out its whole bound on every grant to such a device.
     /// Equality-matched, locked by test.
     SshGrantAck,
-    /// FR-90 — `rc:hive.start` / `rc:hive.stop`: the agent runs Hive agent
-    /// sessions — it answers a start with `rc:hive.start_ack` and reports
-    /// each session's lifecycle with `rc:hive.state`
-    /// (`docs/roomler-hive-design.md` §3.4).
-    ///
-    /// ⚠️ Never sent blind, for the `exec` reason: a caller waits for the
-    /// start's answer, and a pre-feature agent drops the unknown tag at
-    /// `debug!`. Advertising it says the frames are UNDERSTOOD — the device's
-    /// own `hive_enabled` (default off), `hive_accounts` and `hive_roots`
-    /// still decide whether anything runs.
-    ///
-    /// ⚠️ `hive` is the prefix of `hive-replica` (P2c), and the two mean
-    /// different things — running sessions is not holding copies of other
-    /// devices' — so matching stays equality, as for `ssh` / `ssh-consent`.
-    Hive,
-    /// FR-90 P0d-2 — `rc:hive.view.*`: the agent serves a session's
-    /// transcript to a browser over a data-only WebRTC peer. It answers a view
-    /// grant with `rc:hive.view.grant_ack` before the browser is told to dial,
-    /// answers the relayed offer, and closes the peer when the grant ends.
-    ///
-    /// ⚠️ `hive` is its prefix and the two are different promises — a P0c
-    /// agent runs sessions and drops every `rc:hive.view.*` frame at `debug!`,
-    /// so a server that read `hive-view` out of `hive` would leave the viewer
-    /// waiting out its bound on every open. Equality-matched, locked by test.
-    HiveView,
-    /// FR-90 P1e — `rc:hive.memory`: the agent understands a session's
-    /// core-memory snapshot, sent just before its start. Advertising it says
-    /// the frame is UNDERSTOOD; the device's own `hive_core_memory` (default
-    /// off) still decides whether a session ever sees it, because the model
-    /// reads core memory as the user's own overriding instructions.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: an agent before P1e
-    /// drops the frame at `debug!`. Equality-matched, locked by test.
-    HiveMemory,
-    /// FR-90 P1j — `rc:hive.adopt`: the agent mirrors terminal sessions its
-    /// accounts adopted (`roomler hive adopt`), and its own `hive_adopt` (default
-    /// off, never pushable) is on. Advertised only then: a device whose owner
-    /// has not allowed adopting offers nothing, and the server honours an
-    /// offer only from a device that advertises it.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise — running sessions
-    /// a person starts from Roomler is not mirroring the ones they started in a
-    /// terminal. Equality-matched, locked by test.
-    HiveAdopt,
-    /// FR-90 P2c — the agent holds copies of its owner's sessions run on other
-    /// devices: its own `hive_replica` (default off, never pushable) is on.
-    /// Advertised only then — the gate that survives a compromised server — so
-    /// a device that does not advertise it is never placed in a replicaset,
-    /// and it refuses a join on its own word too.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: running sessions is
-    /// not holding copies of other devices'. Equality-matched, locked by test.
-    HiveReplica,
-    /// FR-90 P2c — the agent offers itself as an archive replica: its own
-    /// `hive_archive` (default off, never pushable) is on, beside
-    /// `hive_replica`. An archive holds every session the org's rules allow
-    /// once an `ADMINISTRATOR` designates it: offering is the device's,
-    /// designating the org's.
-    ///
-    /// ⚠️ Neither `hive` nor `hive-replica` is this promise: a replica that is
-    /// no archive holds its owner's own sessions only. Equality-matched,
-    /// locked by test.
-    HiveArchive,
-    /// FR-90 P2d — the agent carries replica streams: it serves a session it
-    /// holds to a member over QUIC (`rc:hive.replica.grant`), and, as a
-    /// member, asks for and dials one (`rc:hive.replica.want`). A build
-    /// capability, advertised while its store is open: a primary serves the
-    /// sessions it runs whether or not its owner lets it hold copies of
-    /// others' (`hive-replica`).
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before P2d
-    /// drops every stream frame. Equality-matched, locked by test.
-    HiveStream,
-    /// FR-90 P2e-2 — the agent holds a leased session to the server's word:
-    /// it runs one, and lets it call the model, after a restart or a
-    /// reconnect only once the server has said on THAT connection that it
-    /// still holds the session (`rc:hive.lease`). Only a connection with it
-    /// is sent the word, or a start that asks for it (`lease`).
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before P2e-2
-    /// runs what it hosts on its own word. Equality-matched, locked by test.
-    HiveLease,
-    /// FR-90 P2e-3 — the agent takes part in a promotion at either end: as
-    /// the member a session moves to, it answers `rc:hive.prepare` with
-    /// `rc:hive.prepare_ack` and runs the move (`rc:hive.move`, then the
-    /// start); as the primary it moves from, it answers `rc:hive.drain` with
-    /// `rc:hive.drained`, and a later `rc:hive.lease` at the same fence lifts
-    /// the drain. The server promotes only between two connections that
-    /// advertise it.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
-    /// drops every one of those frames, so a server that read it out of
-    /// `hive` would wait out every bound of a promotion and leave the
-    /// primary drained. Equality-matched, locked by test.
-    HivePromote,
-    /// FR-90 P2f-1a — the agent takes part in a teleport, a move to a device
-    /// that holds no copy of the session yet, at either end: as the target,
-    /// a `rc:hive.prepare` with `teleport` passes every start gate but the
-    /// copy, and admits that one session's `teleport` join whatever its
-    /// owner's `hive_replica`; as the primary, a join in the primary's role
-    /// takes the session's first checkpoint at once when no turn runs, and
-    /// says where its copy ends either way. A build property, like
-    /// `hive-promote`: the device still refuses what its own gates refuse.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
-    /// refuses a teleport's prepare for want of a copy, and its primary says
-    /// nothing at a join, so a server that read it out of `hive` would wait
-    /// out a teleport's every bound. Equality-matched, locked by test.
-    HiveTeleport,
-    /// FR-90 P2f-3a — `hive-fork`: the device starts a fork of a session it
-    /// holds a copy of. A start carrying `fork_of` takes the parent's last
-    /// checkpoint under the fork's ids and launches `--resume <parent>
-    /// --fork-session --session-id <fork>`, and the fork's checkpoints keep
-    /// the parent's history beside its own. A build property.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
-    /// ignores `fork_of` and starts the fork EMPTY, a new conversation in
-    /// the folder as it is. Equality-matched, locked by test.
-    HiveFork,
-    /// FR-90 P2f-4a — `hive-manage`: the device makes a terminal session it
-    /// adopted, whose terminal ended there, a managed one. A start carrying
-    /// `from_terminal` puts the terminal's own history in place as the
-    /// account it ran as, by this device's record of whose terminal it was,
-    /// and resumes it. A build property, on the platforms that adopt.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
-    /// ignores `from_terminal` and starts the conversation afresh, under the
-    /// terminal's session id. Equality-matched, locked by test.
-    HiveManage,
-    /// FR-90 P2g-1 — `hive-purge`: the device purges a session on
-    /// `rc:hive.purge` and answers `rc:hive.purge_ack` per part: its own copy,
-    /// and, as the session's account, its state directory and the refs its
-    /// checkpoints left. A build property, on every build that runs sessions.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
-    /// drops the frame, so a purge pushed to it would wait for an answer that
-    /// never comes. Equality-matched, locked by test.
-    HivePurge,
-    /// FR-90 P2g-4a — `hive-purge-all`: the device purges every session it
-    /// holds on `rc:hive.purge_all`, which its enrollment's removal sends. A
-    /// build property, on every build that runs sessions.
-    ///
-    /// ⚠️ `hive` and `hive-purge` are its prefixes and NOT the same promise:
-    /// `agent-v0.4.136` purges a session but cannot decode this frame, and
-    /// would log a dropped frame at every removal. Nothing waits on the frame,
-    /// so a build without it is sent nothing and keeps what it held, as one
-    /// offline at its removal does. Equality-matched, locked by test.
-    HivePurgeAll,
-    /// #2294 — `hive-purge-drain`: on a goodbye (`AgentDeleted`) the daemon
-    /// finishes the removal purge `rc:hive.purge_all` started before it exits,
-    /// bounded. So a removal's kick may tell it at once: the goodbye that
-    /// follows the purge's frame no longer cuts the purge short. A build
-    /// property, on every build that runs sessions.
-    ///
-    /// ⚠️ `hive` and `hive-purge` are its prefixes and NOT the same promise:
-    /// `agent-v0.4.137` purges at its removal but exits at once on the
-    /// goodbye, so the kick leaves its socket open instead. Equality-matched,
-    /// locked by test.
-    HivePurgeDrain,
-    /// FR-90 P2i-1 — `hive-search`: the device answers full-text search over
-    /// the copies it holds, for the sessions a `rc:hive.search.grant` names,
-    /// to that grant's viewer peer. Only while it offers itself as an
-    /// archive replica (`hive-archive`), whose copies it serves.
-    ///
-    /// ⚠️ `hive` is its prefix and NOT the same promise: a build before it
-    /// drops the grant, and a viewer would wait for an answer that never
-    /// comes. Equality-matched, locked by test.
-    HiveSearch,
     /// FR-94 — a Windows device runs Fleet RPC as SYSTEM through its
     /// session-0 service. An administrator anchored the device (the service
     /// holds its own credential, in a file only SYSTEM and Administrators can
@@ -1129,21 +961,10 @@ pub enum RpcCap {
     /// worker runs an SSH server", which on an attended install is the
     /// signed-in user. Equality-matched, locked by test.
     SshSystem,
-    /// FR-90 P3-8 — the device's SSH server holds a grant marked
-    /// `one_command` to one `exec` and refuses anything else on it: a shell,
-    /// a PTY, a forward, a subsystem. The server sends an agent session's
-    /// grant only to a device saying so (P3-8-1b); the device's half is
-    /// P3-8-2a.
-    ///
-    /// ⚠️ `ssh` is its prefix and NOT the same promise: an `ssh` device that
-    /// cannot read the field would serve a session's key a shell.
-    /// Equality-matched, locked by test.
-    SshOneCommand,
     /// FR-99 — the device serves privacy mode: it understands the `PRIVACY`
     /// permission, can cover the local screen with a curtain the capture
     /// does not see, and its owner allowed it (`privacy_mode_allowed`,
-    /// device-owned, default off, never pushable). Advertised only then, like
-    /// [`Self::HiveAdopt`].
+    /// device-owned, default off, never pushable). Advertised only then.
     ///
     /// ⚠️ The hub sends `PRIVACY` ONLY to a connection advertising this. The
     /// `rc:*` wire carries `Permissions` as names, and an agent that does not
@@ -1201,15 +1022,6 @@ pub enum RpcCap {
     /// session's `console_user` itself ("a Windows concept"), so that half
     /// fails closed either way, and the server still refuses to store it.
     ConsoleUser,
-    /// FR-90 P3-3b — the agent takes vault leases: it sends `rc:vault.lease`
-    /// for its sessions and opens the sealed `rc:vault.leased` with the key
-    /// its hello carried (`AgentHello::vault_key`). Advertised only while that
-    /// key is, on the primary enrollment's connection.
-    ///
-    /// ⚠️ The vault answers a lease request only from a connection that
-    /// advertises this AND whose hello stored a key: an agent without it
-    /// cannot open what it would be sent.
-    Vault,
     /// FR-52 — this device understands **cross-org remote access**: it honours
     /// `external_access_enabled` (gate 3), can verify the device-held password
     /// (gate 4), and tells the person at the machine that the controller is
@@ -1252,34 +1064,6 @@ pub enum RpcCap {
     /// advertising this. No other verb starts with `peer`, and matching stays
     /// equality regardless.
     PeerAuth,
-    /// FR-90 P4-3 — this build answers `rc:knowhow.scan`: it reads the roots
-    /// its owner lists in `knowhow_scan_roots` (decision 38) and answers
-    /// `rc:knowhow.scanned`. The server asks no device that does not
-    /// advertise it, since one that cannot scan would never answer.
-    ///
-    /// A BUILD property: a device whose owner lists no root still advertises
-    /// it, and answers `no_roots`.
-    KnowhowScan,
-    /// FR-90 P4-4-1 — this build's agent sessions can ask the organization's
-    /// map (`rc:knowhow.search`, `rc:knowhow.get`) through their toolbelt.
-    /// The server tells such a device at each hello whether the map is there
-    /// for it (`rc:knowhow.served`, decision 49), and tells no other: an
-    /// older agent would log the frame it cannot read.
-    ///
-    /// A BUILD property, like `knowhow-scan`, which it is not a prefix of:
-    /// matching stays equality regardless.
-    KnowhowTools,
-    /// FR-90 P4-5 — this build answers `rc:knowhow.probe`: it reaches the
-    /// target the server read from the map only when its owner's
-    /// `knowhow_probe_reach` allows it (decision 53), connects and never
-    /// converses (decision 55), and answers `rc:knowhow.probed`. The server
-    /// asks no device that does not advertise it, since one that cannot probe
-    /// would never answer.
-    ///
-    /// A BUILD property: a device whose owner lists nothing still advertises
-    /// it, and answers `not_allowed`. Not a prefix of another verb, nor
-    /// another of it, and matching stays equality regardless.
-    KnowhowProbe,
     /// FR-121 — this device reports its loopback-TURN relay to the server
     /// (`rc:agent.local_relay`), so a viewer on it can be handed the relay
     /// without fetching 127.0.0.1. The viewer lists only such devices as
@@ -1323,38 +1107,17 @@ impl RpcCap {
             Self::RelayServer => "relay-server",
             Self::KeyRotate => "key-rotate",
             Self::SshGrantAck => "ssh-grant-ack",
-            Self::Hive => "hive",
-            Self::HiveView => "hive-view",
-            Self::HiveMemory => "hive-memory",
-            Self::HiveAdopt => "hive-adopt",
-            Self::HiveReplica => "hive-replica",
-            Self::HiveArchive => "hive-archive",
-            Self::HiveStream => "hive-stream",
-            Self::HiveLease => "hive-lease",
-            Self::HivePromote => "hive-promote",
-            Self::HiveTeleport => "hive-teleport",
-            Self::HiveFork => "hive-fork",
-            Self::HiveManage => "hive-manage",
-            Self::HivePurge => "hive-purge",
-            Self::HivePurgeAll => "hive-purge-all",
-            Self::HivePurgeDrain => "hive-purge-drain",
-            Self::HiveSearch => "hive-search",
             Self::ExecSystem => "exec-system",
             Self::SshSystem => "ssh-system",
-            Self::SshOneCommand => "ssh-one-command",
             Self::PrivacyMode => "privacy-mode",
             Self::PrivacyAvailable => "privacy-available",
             Self::SessionPolicy => "session-policy",
             Self::IdleTimeout => "idle-timeout",
             Self::LockOnEnd => "lock-on-end",
             Self::ConsoleUser => "console-user",
-            Self::Vault => "vault",
             Self::ExternalAccess => "external-access",
             Self::ExternalSession => "external-session",
             Self::PeerAuth => "peer-auth",
-            Self::KnowhowScan => "knowhow-scan",
-            Self::KnowhowTools => "knowhow-tools",
-            Self::KnowhowProbe => "knowhow-probe",
             Self::LocalRelay => "local-relay",
             Self::RcOverlayAuto => "rc-overlay-auto",
             Self::MediaPlan => "media-plan",
@@ -1362,7 +1125,7 @@ impl RpcCap {
     }
 
     /// Every verb THIS build knows about.
-    pub const ALL: [RpcCap; 44] = [
+    pub const ALL: [RpcCap; 23] = [
         Self::Exec,
         Self::Originate,
         Self::Ssh,
@@ -1372,38 +1135,17 @@ impl RpcCap {
         Self::RelayServer,
         Self::KeyRotate,
         Self::SshGrantAck,
-        Self::Hive,
-        Self::HiveView,
-        Self::HiveMemory,
-        Self::HiveAdopt,
-        Self::HiveReplica,
-        Self::HiveArchive,
-        Self::HiveStream,
-        Self::HiveLease,
-        Self::HivePromote,
-        Self::HiveTeleport,
-        Self::HiveFork,
-        Self::HiveManage,
-        Self::HivePurge,
-        Self::HivePurgeAll,
-        Self::HivePurgeDrain,
-        Self::HiveSearch,
         Self::ExecSystem,
         Self::SshSystem,
-        Self::SshOneCommand,
         Self::PrivacyMode,
         Self::PrivacyAvailable,
         Self::SessionPolicy,
         Self::IdleTimeout,
         Self::LockOnEnd,
         Self::ConsoleUser,
-        Self::Vault,
         Self::ExternalAccess,
         Self::ExternalSession,
         Self::PeerAuth,
-        Self::KnowhowScan,
-        Self::KnowhowTools,
-        Self::KnowhowProbe,
         Self::LocalRelay,
         Self::RcOverlayAuto,
         Self::MediaPlan,
@@ -1415,6 +1157,55 @@ impl RpcCap {
         Self::ALL.into_iter().find(|c| c.wire() == s)
     }
 }
+
+/// FR-137 S-B4 — the 21 verbs FR-90 (Hive) added, retired with it when it was
+/// parked, and RESERVED: no new verb may ever be spelled like one of them.
+///
+/// ⚠️ Agents up to 0.4.199 keep advertising these until they update, and a
+/// verb is matched by EQUALITY ([`AgentCaps::has_rpc`]). A new [`RpcCap`]
+/// reusing one of these spellings would read as present on every such device,
+/// fleet-wide, the day it shipped: a silent claim, not an error. `hive` is a
+/// prefix of every `hive-*`, which is one more reason matching stays equality.
+/// Locked by `retired_rpc_verbs_are_never_reused`. Never removable.
+pub const RETIRED_RPC_VERBS: [&str; 21] = [
+    "hive",
+    "hive-view",
+    "hive-memory",
+    "hive-adopt",
+    "hive-replica",
+    "hive-archive",
+    "hive-stream",
+    "hive-lease",
+    "hive-promote",
+    "hive-teleport",
+    "hive-fork",
+    "hive-manage",
+    "hive-purge",
+    "hive-purge-all",
+    "hive-purge-drain",
+    "hive-search",
+    "ssh-one-command",
+    "vault",
+    "knowhow-scan",
+    "knowhow-tools",
+    "knowhow-probe",
+];
+
+/// FR-137 S-B4 — the `rc:*` tag families FR-90 used, RESERVED for the reason
+/// [`RETIRED_RPC_VERBS`] is: a 0.4.199 agent still sends and expects frames
+/// under them, so a new `ClientMsg` or `ServerMsg` named into one would be
+/// fed, or would feed, a build that means something else by it. Locked by
+/// `retired_wire_families_and_module_ids_are_never_reused`.
+pub const RETIRED_RC_TAG_FAMILIES: [&str; 3] = ["rc:hive.", "rc:vault.", "rc:knowhow."];
+
+/// FR-137 S-B4 — the user socket's retired namespace: a browser tab opened
+/// before FR-90 was parked still speaks `hive:view.*` and `hive:search.*`.
+/// No module may register it again (checked in `composition_tests`).
+pub const RETIRED_USER_WS_NAMESPACES: [&str; 1] = ["hive"];
+
+/// FR-137 S-B4 — FR-90's module ids: no [`crate::signaling::Owner`] and no
+/// module in the server's graph may be named one again.
+pub const RETIRED_MODULE_IDS: [&str; 3] = ["hive", "vault", "knowhow"];
 
 /// FR-85 P3 — a remote-recording capability word in [`AgentCaps::record`].
 /// The [`RpcCap`] pattern: variant → [`RecordCap::wire`] (the compatibility
@@ -2433,18 +2224,6 @@ pub struct Agent {
     /// key on the device is enough to move the fleet view with it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ssh_host_pubkey: String,
-    /// FR-90 P3-3a — the public half of the vault key the device's daemon
-    /// holds now, as its last hello reported it (standard base64 of 32 bytes,
-    /// [`crate::signaling::vault_key_is_well_formed`]): what the vault seals
-    /// a leased value to.
-    ///
-    /// Written on EVERY hello, the empty string included, so it never outlives
-    /// the process that made it: the daemon makes a new key at each start and
-    /// keeps it in memory only. Empty = the device takes no leases (its
-    /// `vault_enabled` is off, a build without the `vault` feature, an agent
-    /// before P3-3a, or a hello whose key was not well formed).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub vault_key: String,
     /// FR-100 P1a — the public half of this enrollment's device key, as its
     /// last hello reported it ([`crate::signaling::peer_auth_key_is_well_formed`]).
     /// A HINT for a browser's first pin, never an authority: the browser
@@ -2573,8 +2352,8 @@ pub struct Agent {
     /// the valid one?" has to be answerable from the row as well as the audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_code_rotated_at: Option<DateTime>,
-    /// Device config an operator has ASKED for, reconciled by the agent when
-    /// it next connects (`docs/remote-config.md` step 2).
+    /// Device config an operator has ASKED for, reconciled by the agent on
+    /// connect or on a save's nudge (`docs/remote-config.md` step 2).
     ///
     /// Desired state, not applied state: writing here records an intent, and
     /// the device remains free to refuse it — a device without
@@ -2820,7 +2599,7 @@ pub enum SshMode {
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SshAccountMode {
-    /// The daemon's own identity — SYSTEM on Windows, root under systemd.
+    /// The daemon's identity: root under systemd; on Windows the worker's or the service's.
     ///
     /// The default *today* because it is what P2 can actually do, and it is
     /// why `SshMode::On` is root-equivalent until the P5 privilege-drop slice
@@ -2835,10 +2614,9 @@ pub enum SshAccountMode {
 }
 
 impl SshAccountMode {
-    /// FR-90 P3-8-1a — the word for each mode, as serde spells it: what
-    /// `rc:ssh.grant` carries, and what the vault's `ssh:run` reads as
-    /// `context.account` and its ticket names. ⚠️ A compatibility surface,
-    /// locked by test against serde's own spelling.
+    /// The word for each mode, as serde spells it: what `rc:ssh.grant`
+    /// carries in `account_mode`. ⚠️ A compatibility surface, locked by test
+    /// against serde's own spelling.
     pub const fn wire(self) -> &'static str {
         match self {
             Self::Daemon => "daemon",
@@ -2901,13 +2679,6 @@ pub struct SshServiceEndpoint {
     /// requires it to name the device's CURRENT anchor.
     pub anchor_id: String,
     pub published_at: DateTime,
-    /// FR-90 P3-8-2a — the service said it holds an agent session's grant to
-    /// one command. Only then is such a grant routed to it: the worker's
-    /// `ssh-one-command` speaks for the worker's own server, never for a
-    /// service that may be older. Absent (false) in every record published
-    /// before it.
-    #[serde(default)]
-    pub one_command: bool,
 }
 
 /// Device config an operator has requested, for the agent to reconcile
@@ -3155,8 +2926,8 @@ pub enum ConfigOutcome {
     /// down is in `live` / `needs_restart` — see [`ConfigReport`].
     Applied,
     /// The device already matched; nothing was written. Distinct from
-    /// `Applied` with two empty lists so a reader can tell "converged" from
-    /// "applied nothing, and I am not sure why".
+    /// `Applied` with two empty lists, which says a key was written back to the
+    /// value the daemon runs (FR-132 P1c): the file changed and nothing waits.
     Noop,
     /// The device has not opted in: `remote_config_enabled` is off. This is
     /// gate 4 doing its job, not an error — the operator's move is to set the
@@ -3238,8 +3009,16 @@ pub struct KeyRotationRequest {
     /// lets a report about an EARLIER order be told apart from the answer to
     /// this one — compare ids, never outcomes alone.
     pub request_id: String,
+    /// The operator who ordered it. The zero id when no user asked: see
+    /// [`Self::trigger`].
     pub requested_by: ObjectId,
     pub requested_at: DateTime,
+    /// FR-40 P2 — `None`: an operator's order. `Some(why)`: the SERVER placed
+    /// it, and `requested_by` is the zero id — today only
+    /// [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]. A string, not an enum, because
+    /// this rides the agent row every agent request reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     /// When the order was actually pushed to a live socket. Absent = queued
     /// for the device's next connect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3321,6 +3100,61 @@ pub struct OverlayIdentity {
     #[serde(default)]
     pub key_epoch: u32,
     pub joined_at: DateTime,
+}
+
+/// FR-40 P2 — the [`KeyRotationRequest::trigger`] of an order the SERVER
+/// placed: the device presented a retired key at its join, and it advertises
+/// `key-rotate`, so it is ordered to rotate instead of being left off the mesh.
+pub const KEY_ROTATION_TRIGGER_KEY_RETIRED: &str = "key_retired";
+
+/// FR-40 P2 — one overlay public key a node has moved away from, kept on its
+/// [`OverlayNode`] row (`retired_keys`) so that the key can never be used to
+/// join this network again (`docs/overlay-key-rotation.md` § Retired keys).
+///
+/// Written at ONE moment only: an accepted join under a different key, which
+/// is the verified identity change (the P1c proof). Never on a device's
+/// report — a report is a claim, and it can be lost or raced.
+///
+/// ⚠️ PUBLIC halves only. The server never sees a private key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct RetiredKey {
+    /// Base64 WireGuard public key.
+    pub public_key: String,
+    /// The epoch the key carried while it was live.
+    #[serde(default)]
+    pub key_epoch: u32,
+    pub retired_at: DateTime,
+    pub reason: RetiredKeyReason,
+}
+
+/// Why a key left a node — forensic, never acted on.
+///
+/// `Deserialize` is hand-written for the reason [`RetiredKeyMode`]'s is: these
+/// entries ride the node row the netmap build lists for the WHOLE network, so
+/// a reason this build does not know must not fail every row read. Unknown
+/// decodes to [`Rejoin`](RetiredKeyReason::Rejoin), the claim-free arm.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RetiredKeyReason {
+    /// The join that replaced it is the one that satisfied a standing
+    /// rotation order (an operator's, or the server's own for a retired key).
+    Rotate,
+    /// Any other key change at a join: a re-enrollment, a restored or
+    /// rolled-back config, a second install on the same machine.
+    Rejoin,
+}
+
+impl<'de> Deserialize<'de> for RetiredKeyReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "rotate" => RetiredKeyReason::Rotate,
+            _ => RetiredKeyReason::Rejoin,
+        })
+    }
 }
 
 /// Per-device roomler-SSH policy — gate 3 of four, the exact shape of
@@ -4006,6 +3840,65 @@ pub enum PeerRelayMode {
     Warn,
     /// Mint.
     On,
+}
+
+/// FR-40 P2 — the org's switch for refusing RETIRED overlay keys
+/// (`docs/overlay-key-rotation.md` § Retired keys).
+///
+/// The ledger ([`OverlayNode::retired_keys`]) records in every mode; this
+/// decides only what a join or a DERP registration presenting a retired key
+/// gets. A switch exists although a refusal fails closed: a WRONG refusal
+/// still costs a legitimate device the mesh, which is exactly what the P1b,
+/// P1c and P1d field runs found in this same flow.
+///
+/// `Deserialize` is hand-written, unlike [`OverlayAclMode`]'s, because this
+/// lives on the row EVERY join reads: a value a rolled-back build does not
+/// know must not fail the row and refuse the whole org's mesh. Unknown
+/// decodes to [`Off`](RetiredKeyMode::Off), today's behaviour.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetiredKeyMode {
+    /// Nothing is checked: a retired key is admitted as before P2. The
+    /// default, so deploying P2 changes no device's behaviour.
+    #[default]
+    Off,
+    /// Check and LOG what would be refused (`would refuse — key_retired`), but
+    /// admit, and order nothing.
+    Warn,
+    /// Refuse `key_retired`, and order a device that advertises `key-rotate`
+    /// to rotate instead of leaving it off the mesh.
+    Enforce,
+}
+
+impl RetiredKeyMode {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Warn => "warn",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// The STRICT parse, for an admin's write: a typo must be a 400, never a
+    /// quiet `off`. Only a stored row decodes leniently (the `Deserialize`).
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "warn" => Some(Self::Warn),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RetiredKeyMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::from_wire(&s).unwrap_or(Self::Off))
+    }
 }
 
 /// FR-19 gate 3 — may THIS device serve as an org relay for its tenant?
@@ -5021,17 +4914,6 @@ pub struct TunnelAuditEvent {
     /// `"dial: connection refused"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// FR-90 P3-7-2a — the agent SESSION whose own flows this tunnel
-    /// carries, under a grant the vault signed. `origin_agent_id` is then
-    /// the device it runs on, and `user_id` the session's owner. `None`
-    /// for every tunnel that carries a device's or a person's flows, and in
-    /// every row from before P3-7-2a.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<ObjectId>,
-    /// FR-90 P3-7-2a — the grant's id, as the vault recorded its allow
-    /// (`vault_audit`, target `grant:<id>`). Set with `session_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant_id: Option<String>,
 }
 
 impl TunnelAuditEvent {
@@ -5175,16 +5057,20 @@ pub enum SshDenyReason {
     /// or another device's. Not told apart, so a forged ring learns nothing.
     /// Audited with no user: the device's service asked, not a person.
     ClaimRefused,
-    /// FR-90 P3-8-1b — an agent session's request carried a ticket that does
-    /// not hold: not one this server signed, ended, for another organization,
-    /// device or target, or naming an account the target's policy no longer
-    /// maps. Never served as the owner's request instead.
+    /// FR-137 S-B5 (decision D7) — the request carried FR-90's retired
+    /// agent-session ticket (`SshRequest::ssh_ticket`, kept parse-only by
+    /// S-B3). Still written: a 0.4.199 agent can send one, and the server
+    /// refuses it, never serving it as the owner's request instead.
     TicketRefused,
-    /// FR-90 P3-8-1b — gate 3 for an agent session: no SSH policy names
-    /// sessions yet (decision 22), so none admits one.
+    /// FR-137 S-B5 (decision D7) — FR-90's gate 3 for an agent session.
+    /// Retired with FR-90 and written by no build now, but stored `ssh_audit`
+    /// rows hold it, and this enum has no `#[serde(other)]`: one unknown word
+    /// fails a whole listing. Removable 90 days (the collection's TTL) after
+    /// P1's roll.
     SessionNotAllowed,
-    /// FR-90 P3-8-1b — the target does not advertise `ssh-one-command`, so it
-    /// could not hold an agent session's grant to one command.
+    /// FR-137 S-B5 (decision D7) — FR-90's refusal for a target that could
+    /// not hold an agent session's grant to one command. Kept for stored rows,
+    /// as [`Self::SessionNotAllowed`] is.
     TargetTooOld,
 }
 
@@ -5235,8 +5121,8 @@ impl SshDenyReason {
                  it (unknown, already claimed, withdrawn, expired or another device's)"
             }
             Self::TicketRefused => {
-                "the agent session's SSH ticket does not hold for this request (ended, \
-                 for another device or target, or the target's account changed)"
+                "the request carried an agent session's SSH ticket, which this server no \
+                 longer honours (agent sessions are retired)"
             }
             Self::SessionNotAllowed => "no SSH policy on this device admits agent sessions",
             Self::TargetTooOld => {
@@ -5455,17 +5341,9 @@ pub struct SshAuditEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_id: Option<String>,
     /// `cli` (device LocalAPI leg) | `api` (authenticated HTTP caller) |
-    /// (FR-90 P3-8-1b) `session` (an agent session's request, with its ticket).
+    /// `session` (a request carrying FR-90's retired agent-session ticket,
+    /// refused: FR-137 S-B3). A plain string, so every stored row parses.
     pub source: String,
-    /// FR-90 P3-8-1b — the agent session that asked, once its ticket held:
-    /// the acting principal then, with `user_id` the person it acts for.
-    /// Absent on every other row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<ObjectId>,
-    /// FR-90 P3-8-1b — the vault's ticket the session presented, by its id
-    /// (`ticket:<id>` in `vault_audit`). Absent on every other row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_ticket_id: Option<String>,
     /// Display name of the principal, as it was pushed to the device.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caller: String,
@@ -5515,11 +5393,6 @@ pub struct SshPending {
     pub session_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consent_mode: Option<ConsentMode>,
-    /// FR-90 P3-8-1b — an agent session's grant: the SYSTEM service holds it
-    /// to one `exec`, as `rc:ssh.grant`'s `one_command` says. False on every
-    /// other row.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub one_command: bool,
     /// [`SshPending::PENDING`] → [`SshPending::CLAIMED`], or
     /// [`SshPending::CANCELLED`] when the caller stopped waiting first.
     pub state: String,
@@ -5587,10 +5460,15 @@ pub struct KeyRotationAuditEvent {
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
     pub agent_id: ObjectId,
-    /// Who asked.
+    /// Who asked. The zero id when no user did: see [`Self::trigger`].
     pub user_id: ObjectId,
     pub at: DateTime,
     pub request_id: String,
+    /// FR-40 P2 — `None`: an operator's order. `Some(why)`: the server's own
+    /// (today only [`KEY_ROTATION_TRIGGER_KEY_RETIRED`]), with the zero
+    /// `user_id`. Copied onto the order it audits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
     /// `pushed` (a live socket took it) or `queued` (the device was offline
     /// and will be ordered on connect). `None` on a refusal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6795,6 +6673,14 @@ pub struct OverlayNode {
     /// Bumped on key rotation (Phase 5). `0` at first join.
     #[serde(default)]
     pub key_epoch: u32,
+    /// FR-40 P2 — every key this node has moved away from, oldest first:
+    /// appended when a join under a DIFFERENT key is accepted, deduplicated by
+    /// key, capped at [`Self::MAX_RETIRED_KEYS`]. Kept on tombstones too, as
+    /// the forensic record. A join or a DERP registration presenting a key
+    /// found here, on any row of the network, is refused `key_retired` when
+    /// the org's [`OverlayNetwork::retired_key_mode`] is `enforce`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_keys: Vec<RetiredKey>,
     /// Current connectivity candidates (srflx / relay), as `host:port`
     /// strings the peer can dial. REPLACED on each `rc:overlay.endpoints`
     /// trickle from the relay coordinator.
@@ -6950,6 +6836,11 @@ pub struct OverlayNode {
 impl OverlayNode {
     pub const COLLECTION: &'static str = "overlay_nodes";
 
+    /// FR-40 P2 — how many retired keys a node row keeps (the newest win).
+    /// A device rotating weekly fills it in over a year; the cap only bounds
+    /// a pathological flapper (two installs fighting over one node).
+    pub const MAX_RETIRED_KEYS: i32 = 64;
+
     /// FR-97 P0b — the routes this node may carry for its peers: those an admin
     /// APPROVED **and** the device still ADVERTISES.
     ///
@@ -7026,6 +6917,12 @@ pub struct OverlayNetwork {
     /// is [`PeerRelayMode::Off`] so nothing is minted until an admin opts in.
     #[serde(default)]
     pub peer_relay_mode: PeerRelayMode,
+    /// FR-40 P2 — whether a join or a DERP registration presenting a RETIRED
+    /// overlay key is refused here. `#[serde(default)]` for the reason
+    /// `acl_mode` gives, and the default is [`RetiredKeyMode::Off`]: today's
+    /// behaviour, byte for byte, until an admin opts the org in.
+    #[serde(default)]
+    pub retired_key_mode: RetiredKeyMode,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -8059,58 +7956,134 @@ mod tests {
         assert_eq!(RpcCap::ConfigReport.wire(), "config-report");
         assert_eq!(RpcCap::KeyRotate.wire(), "key-rotate");
         assert_eq!(RpcCap::SshGrantAck.wire(), "ssh-grant-ack");
-        assert_eq!(RpcCap::Hive.wire(), "hive");
-        assert_eq!(RpcCap::HiveView.wire(), "hive-view");
-        assert_eq!(RpcCap::HiveMemory.wire(), "hive-memory");
-        assert_eq!(RpcCap::HiveAdopt.wire(), "hive-adopt");
-        assert_eq!(RpcCap::HiveReplica.wire(), "hive-replica");
-        assert_eq!(RpcCap::HiveArchive.wire(), "hive-archive");
-        assert_eq!(RpcCap::HiveStream.wire(), "hive-stream");
-        assert_eq!(RpcCap::HiveLease.wire(), "hive-lease");
-        assert_eq!(RpcCap::HivePromote.wire(), "hive-promote");
-        assert_eq!(RpcCap::HiveTeleport.wire(), "hive-teleport");
-        assert_eq!(RpcCap::HiveFork.wire(), "hive-fork");
-        assert_eq!(RpcCap::HiveManage.wire(), "hive-manage");
-        assert_eq!(RpcCap::HivePurge.wire(), "hive-purge");
-        assert_eq!(RpcCap::HivePurgeAll.wire(), "hive-purge-all");
-        assert_eq!(RpcCap::HivePurgeDrain.wire(), "hive-purge-drain");
-        assert_eq!(RpcCap::HiveSearch.wire(), "hive-search");
         assert_eq!(RpcCap::PrivacyMode.wire(), "privacy-mode");
         assert_eq!(RpcCap::PrivacyAvailable.wire(), "privacy-available");
         assert_eq!(RpcCap::SessionPolicy.wire(), "session-policy");
         assert_eq!(RpcCap::IdleTimeout.wire(), "idle-timeout");
         assert_eq!(RpcCap::LockOnEnd.wire(), "lock-on-end");
         assert_eq!(RpcCap::ConsoleUser.wire(), "console-user");
-        assert_eq!(RpcCap::Vault.wire(), "vault");
         assert_eq!(RpcCap::ExternalAccess.wire(), "external-access");
         assert_eq!(RpcCap::ExternalSession.wire(), "external-session");
         assert_eq!(RpcCap::PeerAuth.wire(), "peer-auth");
-        assert_eq!(RpcCap::KnowhowScan.wire(), "knowhow-scan");
-        assert_eq!(RpcCap::KnowhowTools.wire(), "knowhow-tools");
-        assert_eq!(RpcCap::KnowhowProbe.wire(), "knowhow-probe");
         assert_eq!(RpcCap::LocalRelay.wire(), "local-relay");
         assert_eq!(RpcCap::RcOverlayAuto.wire(), "rc-overlay-auto");
         assert_eq!(RpcCap::MediaPlan.wire(), "media-plan");
     }
 
-    /// FR-90 P4-4-1 — `knowhow-tools` and `knowhow-scan` are two verbs: a
-    /// device that scans says nothing of its sessions' tools, and the reverse.
+    /// FR-137 S-B4 — FR-90's 21 verbs are retired and RESERVED. A 0.4.199
+    /// agent keeps advertising them until it updates, and a verb matches by
+    /// equality, so a new verb spelled like one would be claimed by every such
+    /// device at once. The list is spelled out so a change to it is a
+    /// deliberate edit, and checked against `ALL` both ways: no verb this
+    /// build knows equals a retired one, and no retired one parses as a verb.
     #[test]
-    fn knowhow_tools_and_knowhow_scan_are_matched_whole() {
-        let caps = |rpc: &[&str]| AgentCaps {
-            rpc: rpc.iter().map(|s| s.to_string()).collect(),
+    fn retired_rpc_verbs_are_never_reused() {
+        assert_eq!(
+            RETIRED_RPC_VERBS,
+            [
+                "hive",
+                "hive-view",
+                "hive-memory",
+                "hive-adopt",
+                "hive-replica",
+                "hive-archive",
+                "hive-stream",
+                "hive-lease",
+                "hive-promote",
+                "hive-teleport",
+                "hive-fork",
+                "hive-manage",
+                "hive-purge",
+                "hive-purge-all",
+                "hive-purge-drain",
+                "hive-search",
+                "ssh-one-command",
+                "vault",
+                "knowhow-scan",
+                "knowhow-tools",
+                "knowhow-probe",
+            ]
+        );
+        let unique: std::collections::BTreeSet<&str> = RETIRED_RPC_VERBS.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            RETIRED_RPC_VERBS.len(),
+            "a retired verb listed twice"
+        );
+        for cap in RpcCap::ALL {
+            assert!(
+                !RETIRED_RPC_VERBS.contains(&cap.wire()),
+                "`{}` reuses a retired FR-90 verb: every 0.4.199 agent would claim it",
+                cap.wire()
+            );
+        }
+        for verb in RETIRED_RPC_VERBS {
+            assert_eq!(RpcCap::from_wire(verb), None, "{verb}");
+        }
+        // A 0.4.199 device's hello lists them; this build reads none of them
+        // as a verb it gates on, and still reads the verbs it does know.
+        let old = AgentCaps {
+            rpc: RETIRED_RPC_VERBS
+                .iter()
+                .map(|v| v.to_string())
+                .chain(["ssh".to_string(), "exec".to_string()])
+                .collect(),
             ..Default::default()
         };
-        assert!(caps(&["knowhow-tools"]).has_rpc(RpcCap::KnowhowTools));
-        assert!(!caps(&["knowhow-tools"]).has_rpc(RpcCap::KnowhowScan));
-        assert!(!caps(&["knowhow-scan"]).has_rpc(RpcCap::KnowhowTools));
-        assert!(!caps(&["knowhow-tool", "knowhow"]).has_rpc(RpcCap::KnowhowTools));
-        // P4-5 — and `knowhow-probe` a third: scanning or offering a session
-        // the map says nothing of probing, and the reverse.
-        assert!(caps(&["knowhow-probe"]).has_rpc(RpcCap::KnowhowProbe));
-        assert!(!caps(&["knowhow-scan", "knowhow-tools"]).has_rpc(RpcCap::KnowhowProbe));
-        assert!(!caps(&["knowhow-probe"]).has_rpc(RpcCap::KnowhowScan));
-        assert!(!caps(&["knowhow-probes", "knowhow-prob"]).has_rpc(RpcCap::KnowhowProbe));
+        assert!(old.has_rpc(RpcCap::Ssh) && old.has_rpc(RpcCap::Exec));
+        for cap in RpcCap::ALL {
+            if !matches!(cap, RpcCap::Ssh | RpcCap::Exec) {
+                assert!(
+                    !old.has_rpc(cap),
+                    "{} read out of a retired verb",
+                    cap.wire()
+                );
+            }
+        }
+    }
+
+    /// FR-137 S-B4 — the `rc:hive.`, `rc:vault.` and `rc:knowhow.` families and
+    /// FR-90's module ids stay retired. Read from the wire's one source: every
+    /// `rename` in `signaling.rs` (both directions) and the client owner table.
+    #[test]
+    fn retired_wire_families_and_module_ids_are_never_reused() {
+        let source = include_str!("signaling.rs");
+        let mut renames = 0;
+        let mut rest = source;
+        while let Some(i) = rest.find("rename = \"") {
+            rest = &rest[i + "rename = \"".len()..];
+            let end = rest.find('"').expect("a closed rename string");
+            let tag = &rest[..end];
+            renames += 1;
+            for family in RETIRED_RC_TAG_FAMILIES {
+                assert!(
+                    !tag.starts_with(family),
+                    "`{tag}` reuses the retired family `{family}`"
+                );
+            }
+            rest = &rest[end..];
+        }
+        // A positive control: the scan found the wire, not nothing.
+        assert!(
+            renames >= 80,
+            "only {renames} renames found in signaling.rs"
+        );
+        for (tag, owner) in crate::signaling::CLIENT_MSG_OWNERS {
+            for family in RETIRED_RC_TAG_FAMILIES {
+                assert!(!tag.starts_with(family), "`{tag}` reuses `{family}`");
+            }
+            assert!(
+                !RETIRED_MODULE_IDS.contains(&owner.id()),
+                "`{tag}` is owned by the retired module `{}`",
+                owner.id()
+            );
+        }
+        assert_eq!(RETIRED_MODULE_IDS, ["hive", "vault", "knowhow"]);
+        assert_eq!(RETIRED_USER_WS_NAMESPACES, ["hive"]);
+        assert_eq!(
+            RETIRED_RC_TAG_FAMILIES,
+            ["rc:hive.", "rc:vault.", "rc:knowhow."]
+        );
     }
 
     /// FR-101 P4b-2 — the device's idle setting as a limit: unset and `0`
@@ -8251,70 +8224,19 @@ mod tests {
     /// right on the devices that already exist.
     #[test]
     fn the_only_prefix_related_verbs_are_the_deliberate_ones() {
-        const KNOWN: [(RpcCap, RpcCap); 23] = [
+        const KNOWN: [(RpcCap, RpcCap); 5] = [
             (RpcCap::Ssh, RpcCap::SshConsent),
             (RpcCap::Config, RpcCap::ConfigReport),
             // FR-83 — the third, and the same idea again: "runs an SSH
             // server" is not "confirms a grant". Locked by
             // `ssh_does_not_imply_ssh_grant_ack`.
             (RpcCap::Ssh, RpcCap::SshGrantAck),
-            // FR-90 P0d-2 — "runs sessions" is not "serves them to a
-            // browser". Locked by `hive_does_not_imply_hive_view`.
-            (RpcCap::Hive, RpcCap::HiveView),
-            // FR-90 P1e — nor "understands core memory". Locked by
-            // `hive_does_not_imply_hive_memory`.
-            (RpcCap::Hive, RpcCap::HiveMemory),
-            // FR-90 P1j — nor "mirrors adopted terminal sessions". Locked by
-            // `hive_does_not_imply_hive_adopt`.
-            (RpcCap::Hive, RpcCap::HiveAdopt),
-            // FR-90 P2c — nor "holds copies of other devices' sessions", nor
-            // "offers itself as an archive". Locked by
-            // `hive_replica_and_hive_archive_are_promises_of_their_own`.
-            (RpcCap::Hive, RpcCap::HiveReplica),
-            (RpcCap::Hive, RpcCap::HiveArchive),
-            // FR-90 P2d — nor "carries replica streams". Locked by
-            // `hive_stream_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HiveStream),
-            // FR-90 P2e-2 — nor "holds a leased session to the server's
-            // word". Locked by `hive_lease_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HiveLease),
-            // FR-90 P2e-3 — nor "takes part in a promotion". Locked by
-            // `hive_promote_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HivePromote),
-            // FR-90 P2f-1a — nor "takes part in a teleport". Locked by
-            // `hive_teleport_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HiveTeleport),
-            // FR-90 P2f-3a — nor "starts a fork from a copy". Locked by
-            // `hive_fork_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HiveFork),
-            // FR-90 P2f-4a — nor "makes an ended terminal session a managed
-            // one". Locked by `hive_manage_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HiveManage),
-            // FR-90 P2g-1 — nor "purges a session and answers it". Locked by
-            // `hive_purge_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HivePurge),
-            // FR-90 P2g-4a — nor "purges everything it holds at its removal",
-            // and neither is "purges a session". Locked by
-            // `hive_purge_all_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HivePurgeAll),
-            (RpcCap::HivePurge, RpcCap::HivePurgeAll),
-            // #2294 — nor "finishes a removal purge before its goodbye exit",
-            // and neither is "purges a session". Locked by
-            // `hive_purge_drain_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HivePurgeDrain),
-            (RpcCap::HivePurge, RpcCap::HivePurgeDrain),
-            // FR-90 P2i-1 — nor "answers a search over its copies". Locked by
-            // `hive_search_is_a_promise_of_its_own`.
-            (RpcCap::Hive, RpcCap::HiveSearch),
             // FR-94 — "runs Fleet RPC" is not "runs it as SYSTEM through a
             // service". Locked by `exec_does_not_imply_exec_system`.
             (RpcCap::Exec, RpcCap::ExecSystem),
             // FR-105 — "runs an SSH server" is not "serves SSH from the
             // SYSTEM service". Locked by `ssh_does_not_imply_ssh_system`.
             (RpcCap::Ssh, RpcCap::SshSystem),
-            // FR-90 P3-8 — nor "holds a session's grant to one command".
-            // Locked by `ssh_does_not_imply_ssh_one_command`.
-            (RpcCap::Ssh, RpcCap::SshOneCommand),
         ];
         for a in RpcCap::ALL {
             for b in RpcCap::ALL {
@@ -8693,39 +8615,9 @@ mod tests {
         assert_eq!(RpcCap::from_wire("ssh-system"), Some(RpcCap::SshSystem));
     }
 
-    /// FR-90 P3-8 — every SSH-capable agent advertises `ssh`, and one that
-    /// cannot read `one_command` would serve an agent session's key a shell.
-    /// A prefix matcher would send a session's grant to exactly that device.
-    #[test]
-    fn ssh_does_not_imply_ssh_one_command() {
-        let ssh_only = AgentCaps {
-            rpc: vec![
-                "ssh".into(),
-                "ssh-consent".into(),
-                "ssh-grant-ack".into(),
-                "ssh-system".into(),
-            ],
-            ..Default::default()
-        };
-        assert!(ssh_only.has_rpc(RpcCap::Ssh));
-        assert!(
-            !ssh_only.has_rpc(RpcCap::SshOneCommand),
-            "an agent before P3-8-2a must NOT read as holding a grant to one command"
-        );
-        let both = AgentCaps {
-            rpc: vec!["ssh".into(), "ssh-one-command".into()],
-            ..Default::default()
-        };
-        assert!(both.has_rpc(RpcCap::Ssh) && both.has_rpc(RpcCap::SshOneCommand));
-        assert_eq!(RpcCap::SshOneCommand.wire(), "ssh-one-command");
-        assert_eq!(
-            RpcCap::from_wire("ssh-one-command"),
-            Some(RpcCap::SshOneCommand)
-        );
-    }
-
-    /// FR-90 P3-8-1b — an agent session's three refusals, spelled out so a
-    /// rename is a deliberate edit: a session's daemon shows them in words.
+    /// FR-137 S-B5 (decision D7) — FR-90's three refusals stay, spelled out:
+    /// stored `ssh_audit` rows hold them, and an unknown word would fail a
+    /// whole listing (`BaseDao` reads a page with `try_next()?`).
     #[test]
     fn ssh_session_refusals_are_locked() {
         for (reason, word) in [
@@ -8742,6 +8634,38 @@ mod tests {
                 reason
             );
             assert!(!reason.message().is_empty(), "{word}");
+        }
+    }
+
+    /// FR-137 compatibility test 6 (S-B5) — `ssh_audit` rows written before P2
+    /// load as they are: FR-90's three refusals, its `session` source, and the
+    /// two fields this model no longer has (`session_id`, `ssh_ticket_id`).
+    /// `BaseDao` decodes a page this way, row by row, and one row that failed
+    /// would fail the whole listing.
+    #[test]
+    fn ssh_audit_rows_written_before_p2_still_load() {
+        let id = ObjectId::new();
+        for word in ["ticket_refused", "session_not_allowed", "target_too_old"] {
+            let row = bson::doc! {
+                "_id": ObjectId::new(),
+                "tenant_id": id,
+                "agent_id": id,
+                "user_id": id,
+                "grant_id": "g-1",
+                "source": "session",
+                "session_id": ObjectId::new(),
+                "ssh_ticket_id": "t-1",
+                "caller": "an agent session",
+                "at": DateTime::now(),
+                "denied": word,
+            };
+            let ev: SshAuditEvent =
+                bson::from_document(row).unwrap_or_else(|e| panic!("{word}: {e}"));
+            assert_eq!(ev.source, "session");
+            assert_eq!(
+                serde_json::to_value(ev.denied).unwrap(),
+                serde_json::json!(word)
+            );
         }
     }
 
@@ -8769,9 +8693,8 @@ mod tests {
         assert!(acking.has_rpc(RpcCap::SshGrantAck));
     }
 
-    /// FR-90 P3-8-1a — an account mode's word is serde's, spelled out here so
-    /// a rename is a deliberate edit: a policy's `context.account ==
-    /// "daemon"` and a ticket's account must read what `rc:ssh.grant` sends.
+    /// An account mode's word is serde's, spelled out here so a rename is a
+    /// deliberate edit: what `rc:ssh.grant` carries is what a device reads.
     #[test]
     fn ssh_account_mode_words_are_locked_and_are_serdes() {
         let words: Vec<&str> = SshAccountMode::ALL.iter().map(|m| m.wire()).collect();
@@ -8785,362 +8708,6 @@ mod tests {
         }
         assert_eq!(SshAccountMode::from_wire("root"), None);
         assert_eq!(SshAccountMode::from_wire("Daemon"), None);
-    }
-
-    /// FR-90 — `hive` is matched by equality, in both directions that
-    /// matter: the replica verb (P2c) must not read as "runs sessions", and no
-    /// other verb reads as `hive`. A device that holds copies of other
-    /// devices' sessions has not agreed to run them.
-    #[test]
-    fn hive_is_matched_by_equality() {
-        let runs = AgentCaps {
-            rpc: vec!["exec".into(), "hive".into()],
-            ..Default::default()
-        };
-        assert!(runs.has_rpc(RpcCap::Hive));
-
-        let replica_only = AgentCaps {
-            rpc: vec!["hive-replica".into(), "hives".into()],
-            ..Default::default()
-        };
-        assert!(
-            !replica_only.has_rpc(RpcCap::Hive),
-            "a verb that merely starts with `hive` must not read as `hive`"
-        );
-        assert_eq!(
-            RpcCap::from_wire("hive-replica"),
-            Some(RpcCap::HiveReplica),
-            "its own verb, never `hive`'s"
-        );
-    }
-
-    /// FR-90 P0d-2 — `hive` (runs sessions) does not imply `hive-view`
-    /// (serves them to a browser), nor the other way round: a P0c agent drops
-    /// every view frame, and a server that read the view verb out of `hive`
-    /// would leave each viewer waiting out its bound.
-    #[test]
-    fn hive_does_not_imply_hive_view() {
-        let runs = AgentCaps {
-            rpc: vec!["hive".into()],
-            ..Default::default()
-        };
-        assert!(runs.has_rpc(RpcCap::Hive));
-        assert!(!runs.has_rpc(RpcCap::HiveView));
-
-        let serves = AgentCaps {
-            rpc: vec!["hive-view".into()],
-            ..Default::default()
-        };
-        assert!(serves.has_rpc(RpcCap::HiveView));
-        assert!(!serves.has_rpc(RpcCap::Hive));
-        assert_eq!(RpcCap::HiveView.wire(), "hive-view");
-        assert_eq!(RpcCap::from_wire("hive-view"), Some(RpcCap::HiveView));
-        assert!(RpcCap::from_wire("hive-views").is_none());
-    }
-
-    /// FR-90 P1e — a device that runs sessions may still drop the core-memory
-    /// frame (every build before P1e does), so `hive` never implies it, and
-    /// `hive-memory` alone says nothing about running sessions.
-    #[test]
-    fn hive_does_not_imply_hive_memory() {
-        let runs = AgentCaps {
-            rpc: vec!["hive".into(), "hive-view".into()],
-            ..Default::default()
-        };
-        assert!(!runs.has_rpc(RpcCap::HiveMemory));
-        let understands = AgentCaps {
-            rpc: vec!["hive-memory".into()],
-            ..Default::default()
-        };
-        assert!(understands.has_rpc(RpcCap::HiveMemory));
-        assert!(!understands.has_rpc(RpcCap::Hive));
-        assert_eq!(RpcCap::from_wire("hive-memory"), Some(RpcCap::HiveMemory));
-        assert!(RpcCap::from_wire("hive-memories").is_none());
-    }
-
-    /// FR-90 P1j — running sessions is not mirroring adopted terminal ones:
-    /// a device advertising `hive` has not been allowed to adopt.
-    #[test]
-    fn hive_does_not_imply_hive_adopt() {
-        let runs = AgentCaps {
-            rpc: vec!["hive".into(), "hive-view".into(), "hive-memory".into()],
-            ..Default::default()
-        };
-        assert!(!runs.has_rpc(RpcCap::HiveAdopt));
-        let adopts = AgentCaps {
-            rpc: vec!["hive-adopt".into()],
-            ..Default::default()
-        };
-        assert!(adopts.has_rpc(RpcCap::HiveAdopt));
-        assert!(!adopts.has_rpc(RpcCap::Hive));
-        assert_eq!(RpcCap::from_wire("hive-adopt"), Some(RpcCap::HiveAdopt));
-        assert!(RpcCap::from_wire("hive-adopted").is_none());
-    }
-
-    /// FR-90 P2c — holding copies of other devices' sessions, and offering to
-    /// be an archive of the org's, are promises of their own: neither follows
-    /// from running sessions, nor one from the other. A device placed by a
-    /// verb it never advertised would be handed sessions its owner never
-    /// agreed to hold.
-    #[test]
-    fn hive_replica_and_hive_archive_are_promises_of_their_own() {
-        let runs = AgentCaps {
-            rpc: vec!["hive".into(), "hive-view".into(), "hive-adopt".into()],
-            ..Default::default()
-        };
-        assert!(!runs.has_rpc(RpcCap::HiveReplica));
-        assert!(!runs.has_rpc(RpcCap::HiveArchive));
-        let replica = AgentCaps {
-            rpc: vec!["hive-replica".into()],
-            ..Default::default()
-        };
-        assert!(replica.has_rpc(RpcCap::HiveReplica));
-        assert!(
-            !replica.has_rpc(RpcCap::HiveArchive),
-            "a replica is no archive"
-        );
-        assert!(!replica.has_rpc(RpcCap::Hive), "nor runs sessions");
-        let archive = AgentCaps {
-            rpc: vec!["hive-archive".into()],
-            ..Default::default()
-        };
-        assert!(archive.has_rpc(RpcCap::HiveArchive));
-        assert!(!archive.has_rpc(RpcCap::HiveReplica));
-        assert_eq!(RpcCap::from_wire("hive-archive"), Some(RpcCap::HiveArchive));
-        assert!(RpcCap::from_wire("hive-replicas").is_none());
-        assert!(RpcCap::from_wire("hive-archives").is_none());
-    }
-
-    /// FR-90 P2d — carrying replica streams is a promise of its own: a build
-    /// that runs sessions or holds copies but predates P2d drops every stream
-    /// frame, so a grant pushed to it would wait out its whole timeout. Nor
-    /// does carrying streams imply holding copies: a primary serves its own
-    /// sessions whatever its owner said of others'.
-    #[test]
-    fn hive_stream_is_a_promise_of_its_own() {
-        let older = AgentCaps {
-            rpc: vec!["hive".into(), "hive-replica".into(), "hive-archive".into()],
-            ..Default::default()
-        };
-        assert!(!older.has_rpc(RpcCap::HiveStream));
-        let streams = AgentCaps {
-            rpc: vec!["hive".into(), "hive-stream".into()],
-            ..Default::default()
-        };
-        assert!(streams.has_rpc(RpcCap::HiveStream));
-        assert!(
-            !streams.has_rpc(RpcCap::HiveReplica),
-            "serving its own sessions is not holding others'"
-        );
-        assert_eq!(RpcCap::from_wire("hive-stream"), Some(RpcCap::HiveStream));
-        assert!(RpcCap::from_wire("hive-streams").is_none());
-    }
-
-    /// FR-90 P2e-2 — holding a leased session to the server's word is its own
-    /// promise: a build that runs sessions but predates it runs what it hosts
-    /// on its own word, so it must never be read as one that waits.
-    #[test]
-    fn hive_lease_is_a_promise_of_its_own() {
-        let older = AgentCaps {
-            rpc: vec!["hive".into(), "hive-stream".into(), "hive-replica".into()],
-            ..Default::default()
-        };
-        assert!(!older.has_rpc(RpcCap::HiveLease));
-        let leased = AgentCaps {
-            rpc: vec!["hive".into(), "hive-lease".into()],
-            ..Default::default()
-        };
-        assert!(leased.has_rpc(RpcCap::HiveLease));
-        assert!(!leased.has_rpc(RpcCap::HiveStream));
-        assert_eq!(RpcCap::from_wire("hive-lease"), Some(RpcCap::HiveLease));
-        assert!(RpcCap::from_wire("hive-leases").is_none());
-    }
-
-    /// FR-90 P2e-3 — taking part in a promotion is a promise of its own: an
-    /// agent that holds leases (P2e-2) answers no prepare and no drain, and a
-    /// server that read the one out of the other would leave a primary
-    /// drained until every bound ran out.
-    #[test]
-    fn hive_promote_is_a_promise_of_its_own() {
-        let leased = AgentCaps {
-            rpc: vec![
-                "hive".into(),
-                "hive-replica".into(),
-                "hive-stream".into(),
-                "hive-lease".into(),
-            ],
-            ..Default::default()
-        };
-        assert!(!leased.has_rpc(RpcCap::HivePromote));
-        let promotes = AgentCaps {
-            rpc: vec!["hive".into(), "hive-promote".into()],
-            ..Default::default()
-        };
-        assert!(promotes.has_rpc(RpcCap::HivePromote));
-        assert!(!promotes.has_rpc(RpcCap::HiveLease));
-        assert_eq!(RpcCap::from_wire("hive-promote"), Some(RpcCap::HivePromote));
-        assert!(RpcCap::from_wire("hive-promotes").is_none());
-    }
-
-    /// FR-90 P2f-1a — taking part in a teleport is a promise of its own: an
-    /// agent that takes part in a promotion (P2e-3) refuses a teleport's
-    /// prepare for want of a copy, and its primary says nothing at a join, so
-    /// a server that read the one out of the other would wait out a
-    /// teleport's every bound.
-    #[test]
-    fn hive_teleport_is_a_promise_of_its_own() {
-        let promotes = AgentCaps {
-            rpc: vec![
-                "hive".into(),
-                "hive-stream".into(),
-                "hive-lease".into(),
-                "hive-promote".into(),
-            ],
-            ..Default::default()
-        };
-        assert!(!promotes.has_rpc(RpcCap::HiveTeleport));
-        let teleports = AgentCaps {
-            rpc: vec!["hive".into(), "hive-teleport".into()],
-            ..Default::default()
-        };
-        assert!(teleports.has_rpc(RpcCap::HiveTeleport));
-        assert!(!teleports.has_rpc(RpcCap::HivePromote));
-        assert_eq!(
-            RpcCap::from_wire("hive-teleport"),
-            Some(RpcCap::HiveTeleport)
-        );
-        assert!(RpcCap::from_wire("hive-teleports").is_none());
-    }
-
-    /// FR-90 P2f-3a — `hive-fork` is its own promise: a build before it would
-    /// start a fork empty, so a server that read it out of `hive`, or out of
-    /// `hive-teleport`, would hand a person a fresh conversation for a fork.
-    #[test]
-    fn hive_fork_is_a_promise_of_its_own() {
-        let teleports = AgentCaps {
-            rpc: vec!["hive".into(), "hive-teleport".into()],
-            ..Default::default()
-        };
-        assert!(!teleports.has_rpc(RpcCap::HiveFork));
-        let forks = AgentCaps {
-            rpc: vec!["hive".into(), "hive-fork".into()],
-            ..Default::default()
-        };
-        assert!(forks.has_rpc(RpcCap::HiveFork));
-        assert!(!forks.has_rpc(RpcCap::HiveTeleport));
-        assert_eq!(RpcCap::from_wire("hive-fork"), Some(RpcCap::HiveFork));
-        assert!(RpcCap::from_wire("hive-forks").is_none());
-    }
-
-    /// FR-90 P2f-4a — `hive-manage` is its own promise: a build before it
-    /// would start an adopted session's conversation afresh, so a server that
-    /// read it out of `hive`, or out of `hive-adopt`, would hand a person an
-    /// empty session for the terminal they ran.
-    #[test]
-    fn hive_manage_is_a_promise_of_its_own() {
-        let adopts = AgentCaps {
-            rpc: vec!["hive".into(), "hive-adopt".into(), "hive-fork".into()],
-            ..Default::default()
-        };
-        assert!(!adopts.has_rpc(RpcCap::HiveManage));
-        let manages = AgentCaps {
-            rpc: vec!["hive".into(), "hive-manage".into()],
-            ..Default::default()
-        };
-        assert!(manages.has_rpc(RpcCap::HiveManage));
-        assert!(!manages.has_rpc(RpcCap::HiveAdopt));
-        assert_eq!(RpcCap::from_wire("hive-manage"), Some(RpcCap::HiveManage));
-        assert!(RpcCap::from_wire("hive-managed").is_none());
-    }
-
-    /// FR-90 P2g-1 — `hive-purge` is its own promise: a build before it drops
-    /// `rc:hive.purge`, so a server that read it out of `hive` would push a
-    /// purge to a device that never answers, and wait on it for ever.
-    #[test]
-    fn hive_purge_is_a_promise_of_its_own() {
-        let runs = AgentCaps {
-            rpc: vec!["hive".into(), "hive-promote".into(), "hive-manage".into()],
-            ..Default::default()
-        };
-        assert!(!runs.has_rpc(RpcCap::HivePurge));
-        let purges = AgentCaps {
-            rpc: vec!["hive".into(), "hive-purge".into()],
-            ..Default::default()
-        };
-        assert!(purges.has_rpc(RpcCap::HivePurge));
-        assert!(!purges.has_rpc(RpcCap::HivePromote));
-        assert_eq!(RpcCap::from_wire("hive-purge"), Some(RpcCap::HivePurge));
-        assert!(RpcCap::from_wire("hive-purged").is_none());
-    }
-
-    /// FR-90 P2g-4a — `hive-purge-all` is its own promise: `agent-v0.4.136`
-    /// says `hive` and `hive-purge` and cannot decode `rc:hive.purge_all`, so
-    /// a server that read it out of either would send every such device, at
-    /// its removal, a frame it drops. Nor does it imply purging a session.
-    #[test]
-    fn hive_purge_all_is_a_promise_of_its_own() {
-        let v0_4_136 = AgentCaps {
-            rpc: vec!["hive".into(), "hive-purge".into()],
-            ..Default::default()
-        };
-        assert!(!v0_4_136.has_rpc(RpcCap::HivePurgeAll));
-        let at_removal = AgentCaps {
-            rpc: vec!["hive".into(), "hive-purge-all".into()],
-            ..Default::default()
-        };
-        assert!(at_removal.has_rpc(RpcCap::HivePurgeAll));
-        assert!(!at_removal.has_rpc(RpcCap::HivePurge));
-        assert_eq!(
-            RpcCap::from_wire("hive-purge-all"),
-            Some(RpcCap::HivePurgeAll)
-        );
-        assert!(RpcCap::from_wire("hive-purge-alls").is_none());
-    }
-
-    /// #2294 — `hive-purge-drain` is its own promise: `agent-v0.4.137` purges
-    /// at its removal (`hive-purge-all`) but exits at once on the goodbye that
-    /// follows, so a server that read the drain out of `hive-purge-all` (or
-    /// out of `hive-purge`, its prefix) would cut that purge short.
-    #[test]
-    fn hive_purge_drain_is_a_promise_of_its_own() {
-        let v0_4_137 = AgentCaps {
-            rpc: vec!["hive".into(), "hive-purge".into(), "hive-purge-all".into()],
-            ..Default::default()
-        };
-        assert!(!v0_4_137.has_rpc(RpcCap::HivePurgeDrain));
-        let drains = AgentCaps {
-            rpc: vec!["hive".into(), "hive-purge-drain".into()],
-            ..Default::default()
-        };
-        assert!(drains.has_rpc(RpcCap::HivePurgeDrain));
-        assert!(!drains.has_rpc(RpcCap::HivePurge));
-        assert!(!drains.has_rpc(RpcCap::HivePurgeAll));
-        assert_eq!(
-            RpcCap::from_wire("hive-purge-drain"),
-            Some(RpcCap::HivePurgeDrain)
-        );
-        assert!(RpcCap::from_wire("hive-purge-drains").is_none());
-    }
-
-    /// FR-90 P2i-1 — `hive-search` is its own promise: a device that holds
-    /// copies, an archive replica among them, but predates it drops
-    /// `rc:hive.search.grant`, so a server that read it out of `hive`,
-    /// `hive-replica` or `hive-archive` would leave a searcher waiting.
-    #[test]
-    fn hive_search_is_a_promise_of_its_own() {
-        let archive_before = AgentCaps {
-            rpc: vec!["hive".into(), "hive-replica".into(), "hive-archive".into()],
-            ..Default::default()
-        };
-        assert!(!archive_before.has_rpc(RpcCap::HiveSearch));
-        let searches = AgentCaps {
-            rpc: vec!["hive-archive".into(), "hive-search".into()],
-            ..Default::default()
-        };
-        assert!(searches.has_rpc(RpcCap::HiveSearch));
-        assert!(!searches.has_rpc(RpcCap::Hive));
-        assert_eq!(RpcCap::from_wire("hive-search"), Some(RpcCap::HiveSearch));
-        assert!(RpcCap::from_wire("hive-searches").is_none());
     }
 
     /// Forward compatibility: a NEWER agent may advertise verbs this build has
@@ -9803,12 +9370,11 @@ mod tests {
         // FR-84 D3 — nor may the server switch the LOCAL restart on, or ask
         // for a restart at all: the daemon restarts itself only when a local
         // client asks over the LocalAPI.
-        // FR-90 — nor any Hive gate. Which local account runs an agent
-        // session (`hive_accounts`) and where it may run (`hive_roots`) are
-        // exactly what a compromised server must not be able to choose, and
-        // `hive_enabled` is the device's refusal like `exec_enabled` is. (The
-        // design allows `hive_enabled` to become pushable to devices that
-        // opted into remote config; until a change argues that here, none is.)
+        // FR-137 S-B6 — nor any of FR-90's 23 retired keys. Every device's
+        // config.toml still carries them (the unknown-key merge keeps them
+        // through each save), and a build from a revert reads them again: a
+        // server able to push one could switch agent sessions on, or choose
+        // their accounts, on that rollback. Never pushable, then or now.
         for forbidden in [
             "remote_config_enabled",
             "ssh_max_privilege",
@@ -9816,60 +9382,25 @@ mod tests {
             "hive_enabled",
             "hive_accounts",
             "hive_roots",
+            "hive_max_sessions",
             "hive_harness",
             "hive_api_key_helper",
             "hive_api_workspace_id",
-            "hive_max_sessions",
             "hive_update_wait_secs",
-            // FR-90 P1e — the one gate on server-authored text reaching a
-            // session's model; a server that could set it would vouch for
-            // itself.
             "hive_core_memory",
-            // FR-90 P1j — whether this machine reports on its terminals at
-            // all (decision 11): the device owner's alone.
             "hive_adopt",
-            // FR-90 decision 15 — whether an agent on a Mac may be root; a
-            // server that could set it could give itself root on the device.
             "hive_allow_passwordless_sudo",
-            // FR-90 P2c — whether this device holds copies of other devices'
-            // sessions, offers itself as the org's archive, and how much it
-            // keeps: a server that could set them could copy every session to
-            // a device of its choosing.
             "hive_replica",
             "hive_archive",
-            "hive_store_quota",
-            // FR-90 P3-3 — whether org secrets are ever decrypted on this
-            // machine: a server that could set it would choose where its own
-            // vault's values are opened.
+            "hive_store_quota_mib",
             "vault_enabled",
-            // FR-90 P3-4d-2 — whether the device describes what it does with
-            // its leases: the device's own word about itself, as
-            // `ssh_activity_log` is.
             "vault_activity_log",
-            // FR-90 P3-7-3c — whether a session here may reach a network
-            // beyond this device: a server that could set it could open
-            // that path from every device it runs sessions on.
             "hive_net",
-            // FR-90 P3-8-2b-2 — whether a session here may run a command on
-            // another device over SSH: a server that could set it could
-            // reach from every device it runs sessions on into every device
-            // whose SSH policy admits a session.
             "hive_ssh",
-            // FR-90 P3b-1b-2 — whether every session here runs sandboxed,
-            // its egress decided by the vault: a server that could clear it
-            // would hand every session here the device's own network.
             "hive_egress",
-            // FR-90 P4-3b-1 — which folders a knowhow scan reads (decision
-            // 38): a server that could set it could make every device read,
-            // and describe to the map, whatever folder it named.
+            "hive_worker",
             "knowhow_scan_roots",
-            // FR-90 P4-3b-3 — whether a scan reports the ports a device
-            // listens on (decision 47): the owner's word about what the
-            // machine runs, never the server's.
             "knowhow_scan_listeners",
-            // FR-90 P4-5-1b — where a knowhow probe may go (decision 53): a
-            // server that could set it could make every device connect from
-            // inside its own network to whatever the map names.
             "knowhow_probe_reach",
             // FR-99 — whether a controller may cover this screen: a server
             // that could set it could curtain any device it controls.
@@ -10652,6 +10183,24 @@ pub fn should_redeliver(
     }
 }
 
+/// FR-40 P2 — is a standing order being EXECUTED right now? Then a join that
+/// presents a retired key gets no second order: the one on the row is seconds
+/// from its answer (the P1b window, [`REDELIVER_AFTER_SECS`]). An order that
+/// is satisfied, answered, still queued, or delivered longer ago than that is
+/// not in flight, and a device presenting a retired key past it may be ordered
+/// again — under the per-device ceiling.
+pub fn order_in_flight(
+    request: &KeyRotationRequest,
+    report: Option<&KeyRotationReport>,
+    identity: Option<&OverlayIdentity>,
+    now: DateTime,
+) -> bool {
+    !order_is_satisfied(request, identity)
+        && report.is_none_or(|r| r.request_id != request.request_id)
+        && request.delivered_at.is_some()
+        && !should_redeliver(request, report, now)
+}
+
 #[cfg(test)]
 mod power_brief_tests {
     use super::*;
@@ -10689,5 +10238,163 @@ mod power_brief_tests {
         let back: SleepNotice = bson::from_document(b).expect("decode");
         assert_eq!(back, n);
         assert!(!back.power.by_policy(), "held: it slept past the hold");
+    }
+}
+
+/// FR-40 P2 — the retired-key shapes. Each rides a row that every join or
+/// every agent request reads, so each decodes leniently from storage, and the
+/// lock that nothing here carries a private key stays with them.
+#[cfg(test)]
+mod retired_key_tests {
+    use super::*;
+
+    fn network_doc(mode: Option<&str>) -> bson::Document {
+        let mut d = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "cidr": "100.64.0.0/10",
+            "next_host": 1_i64,
+            "mtu": 1280_i32,
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        if let Some(m) = mode {
+            d.insert("retired_key_mode", m);
+        }
+        d
+    }
+
+    /// A row from before P2 has no switch; a row written by a newer build may
+    /// hold a mode this one does not know. Both must decode, as `off` — a
+    /// failed decode here refuses every join of the org `network_unavailable`.
+    #[test]
+    fn a_missing_or_unknown_mode_reads_as_off() {
+        let read = |m| -> RetiredKeyMode {
+            bson::from_document::<OverlayNetwork>(network_doc(m))
+                .expect("the network row must decode")
+                .retired_key_mode
+        };
+        assert_eq!(read(None), RetiredKeyMode::Off);
+        assert_eq!(read(Some("enforce_strictly_v9")), RetiredKeyMode::Off);
+        assert_eq!(read(Some("warn")), RetiredKeyMode::Warn);
+        assert_eq!(read(Some("enforce")), RetiredKeyMode::Enforce);
+        assert_eq!(RetiredKeyMode::default(), RetiredKeyMode::Off);
+    }
+
+    /// An admin's write is parsed strictly: a typo is refused, never stored as
+    /// a quiet `off`. The wire strings are what the route and the docs name.
+    #[test]
+    fn the_admin_write_is_strict_and_the_wire_strings_are_locked() {
+        for m in [
+            RetiredKeyMode::Off,
+            RetiredKeyMode::Warn,
+            RetiredKeyMode::Enforce,
+        ] {
+            assert_eq!(RetiredKeyMode::from_wire(m.wire()), Some(m));
+            assert_eq!(serde_json::to_value(m).unwrap(), m.wire());
+        }
+        assert_eq!(RetiredKeyMode::Enforce.wire(), "enforce");
+        assert_eq!(RetiredKeyMode::from_wire("enforced"), None);
+        assert_eq!(RetiredKeyMode::from_wire("Enforce"), None);
+        assert_eq!(RetiredKeyMode::from_wire(""), None);
+    }
+
+    /// The ledger rides the node row the netmap build lists for the whole
+    /// network: a reason this build does not know must not fail that read.
+    #[test]
+    fn an_unknown_retirement_reason_reads_as_rejoin() {
+        let entry = |reason: &str| -> RetiredKey {
+            bson::from_document(bson::doc! {
+                "public_key": "OLD==",
+                "key_epoch": 2_i64,
+                "retired_at": DateTime::now(),
+                "reason": reason,
+            })
+            .expect("a ledger entry must decode")
+        };
+        assert_eq!(entry("rotate").reason, RetiredKeyReason::Rotate);
+        assert_eq!(entry("rejoin").reason, RetiredKeyReason::Rejoin);
+        assert_eq!(entry("revoked_v9").reason, RetiredKeyReason::Rejoin);
+        assert_eq!(
+            serde_json::to_value(RetiredKeyReason::Rotate).unwrap(),
+            "rotate"
+        );
+    }
+
+    /// A node row from before P2 decodes with an empty ledger and is written
+    /// back without the field: P2 changes no existing row's shape until a key
+    /// actually retires.
+    #[test]
+    fn a_pre_p2_node_row_has_an_empty_ledger_and_keeps_its_shape() {
+        let now = DateTime::now();
+        let row = bson::doc! {
+            "tenant_id": ObjectId::new(),
+            "node_ref": { "kind": "agent", "id": ObjectId::new() },
+            "network_id": ObjectId::new(),
+            "machine_id": "m",
+            "overlay_ip": "100.64.0.9",
+            "wg_public_key": "CURRENT==",
+            "status": "online",
+            "last_seen_at": now,
+            "created_at": now,
+            "updated_at": now,
+            "deleted_at": bson::Bson::Null,
+        };
+        let node: OverlayNode = bson::from_document(row).expect("decode");
+        assert!(node.retired_keys.is_empty());
+        let back = bson::to_document(&node).expect("encode");
+        assert!(!back.contains_key("retired_keys"), "{back:?}");
+    }
+
+    /// The order the SERVER places, and its audit row, name no user and say
+    /// why — and neither holds a private key: the only key-shaped field on
+    /// the order is the PUBLIC key it snapshots, and the audit row holds none.
+    #[test]
+    fn the_server_order_and_its_audit_row_hold_no_private_key() {
+        let req = KeyRotationRequest {
+            request_id: "r1".into(),
+            requested_by: ObjectId::from_bytes([0; 12]),
+            requested_at: DateTime::now(),
+            trigger: Some(KEY_ROTATION_TRIGGER_KEY_RETIRED.to_string()),
+            delivered_at: None,
+            public_key_before: Some("RETIRED==".into()),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["trigger"], "key_retired");
+        for k in v.as_object().unwrap().keys() {
+            let k = k.to_ascii_lowercase();
+            assert!(
+                !k.contains("secret") && !k.contains("priv"),
+                "a private-key-shaped field on the order: {k}"
+            );
+            assert!(
+                !k.contains("key") || k == "public_key_before",
+                "the only key on the order is the public one it snapshots: {k}"
+            );
+        }
+        // An operator's order keeps its pre-P2 shape: no `trigger` at all.
+        let mut operator = req.clone();
+        operator.trigger = None;
+        let v = serde_json::to_value(&operator).unwrap();
+        assert!(v.get("trigger").is_none(), "{v}");
+
+        let audit = KeyRotationAuditEvent {
+            id: None,
+            tenant_id: ObjectId::new(),
+            agent_id: ObjectId::new(),
+            user_id: ObjectId::from_bytes([0; 12]),
+            at: DateTime::now(),
+            request_id: "r1".into(),
+            trigger: Some(KEY_ROTATION_TRIGGER_KEY_RETIRED.to_string()),
+            dispatch: Some("pushed".into()),
+            denied: None,
+        };
+        let v = serde_json::to_value(&audit).unwrap();
+        for k in v.as_object().unwrap().keys() {
+            assert!(
+                !k.to_ascii_lowercase().contains("key"),
+                "the audit row stores no key of any kind: {k}"
+            );
+        }
+        assert_eq!(v["trigger"], "key_retired");
     }
 }

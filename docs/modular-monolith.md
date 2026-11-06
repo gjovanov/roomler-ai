@@ -27,31 +27,21 @@ flowchart BT
     remote["modules/remote<br/>RC sessions · rc:* controller dispatch<br/>/turn/credentials · /relay/regions · cross-pod relay"]
     network["modules/network<br/>overlay IPAM + netmaps + ACL · tunnels · /derp<br/>peer relays · Roomler SSH · MagicDNS"]
     saas["modules/saas (add-on)<br/>Stripe · newsletter · plan compliance"]
-    hive["modules/hive (FR-90, default OFF)<br/>agent sessions: the record + lifecycle<br/>rc:hive.* · hive_audit · turn stubs · never content"]
-    vault["modules/vault (FR-90 P3, default OFF)<br/>secrets under envelope encryption (an age KEK)<br/>RRNs · vault_audit · never a value in an answer"]
-    knowhow["modules/knowhow (FR-90 P4, default OFF)<br/>the organization's map: entities · links<br/>knowhow_history · a map, never a gate"]
     fleet --> core
     chat --> core
     saas --> core
     conference -->|"rooms are the container calls run in"| chat
     remote -->|"the Hub is ONE live object"| fleet
     network -->|"agents, presence, the socket"| fleet
-    hive -->|"a session's frames ride the agent socket"| fleet
-    hive -->|"a session IS a secret room"| chat
-    vault -->|"P3-3b: a lease is believed from the session's record"| hive
-    knowhow -->|"P4-4-1: a session's question is believed from its record"| hive
     style core fill:#e8f0fe
     style saas fill:#fff4e5
-    style hive fill:#f3e8fd
-    style vault fill:#f3e8fd
-    style knowhow fill:#f3e8fd
 ```
 
 Three rules keep it a monolith rather than a pile of crates:
 
 | Rule | What it means in code |
 |---|---|
-| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the seven edges (`conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`, `vault → hive`, `knowhow → hive`); FR-90 P3-3b added `vault → hive` (a lease is believed only from the session record's device at its fence), and `vault → fleet` arrives with P3-3c. FR-90 P4-4-1 added `knowhow → hive` (a session's question about the map is believed the same way); P4-2 and P4-3a needed no edge to `fleet` or `network`. Any module may call core; core **never** calls a module. |
+| **The DAG is data** | `crates/core/src/graph.rs` lists the modules and the three edges (`conference → chat`, `remote → fleet`, `network → fleet`). Any module may call core; core **never** calls a module. |
 | **Core membership is narrow** | Something is in `roomler-core` only if at least two modules need it **and** it is identity, tenancy or infrastructure. Everything else belongs to exactly one module. |
 | **Inverse flows are hooks** | When core must reach "up" (a tenant is archived, an agent is removed), it invokes a registry of hooks in a fixed order — see §6. |
 
@@ -74,9 +64,6 @@ inside one (FR-24, FR-69 AC10).
 | RC session routes, `rc:*` controller dispatch + authz + consent-mode gate, the cross-pod RC relay, `/turn/credentials`, `/relay/regions` | **remote** | the session state machine stays in fleet's Hub; the controller path is a host → module **call**, not a `ws` namespace |
 | overlay engine (IPAM, netmaps, leases, L3 ACL, relay grants), the org relay mint, the DERP ACL cache + `/derp` upgrade + cluster convergence, tunnel clients + policies, peer relays, Roomler SSH, the ephemeral reaper | **network** | `Module::indexes_for(multi_block)` is born here — `overlay_blocks` has two schemas |
 | Stripe, the public updates list + newsletter, plan compliance | **saas** | an add-on feature on the api crate; no self-host image carries it |
-| agent sessions: `agent_sessions` + `hive_audit`, the start/stop routes and their gates, the devices' `rc:hive.*` answers, reconcile-on-connect, each session's room notes and turn stubs | **hive** (FR-90) | built ON fleet (`Module::Deps = FleetState`: the Hub) **and** chat (the session room) — chat is stateless, so hive re-creates `chat::bound::BoundChat` from the core rather than taking chat's state (rule 5). Chat stores a room's or message's `binding {module, ref}` and never interprets it; one of the two modules whose switch defaults **off** (`ModulesSettings::DEFAULT_OFF`, with `vault`), so `switched_off` lists it until an operator turns it on (`[modules] hive`, or a `hive.tenants` list — FR-90 P1g-2); leads `HOOK_ORDER` as a session holder |
-| the vault: `vault_secrets` + `vault_versions` (each value sealed under its own data key, wrapped to an `age` KEK) + `vault_audit`, the administrator's metadata routes — none answers a value; P3-2a's `vault_roles` + `vault_policies` (Cedar, checked on write) and `simulate`; P3-3b's leases (`rc:vault.lease` answered on the asking connection) and `vault_leases`; P3-3c's revocation (`rc:vault.revoke`); P3-4d's device reports (`rc:vault.activity`, fire-and-forget) into `vault_activity`, a claim kept apart from `vault_audit`; P3-4e's approval cards (`vault_approvals`, the answer route) | **vault** (FR-90 P3-1, P3-2a, P3-2b, P3-3b, P3-3c, P3-4d, P3-4e) | `Module::Deps = ()`: its one edge, `vault → hive` (P3-3b), reads session records through hive's stateless DAO, which is not a `Deps` (rule 5), so a vault mounted without hive finds no session to lease for. P3-4e calls hive's public `access::may_answer` and `room::post_approval_card` over the same edge; each builds what it needs from the core (chat's `BoundChat` is stateless), so there is still no `Deps` and no `vault → chat` edge. It registers an agent-socket handler for the `rc:vault.*` namespace (`Owner::Vault`), with one lease queue per connection. Its switch defaults **off** like hive's, and a `vault.tenants` list mounts it by itself. Second in `HOOK_ORDER`, right after `hive`: from P3-3 it holds leases that sessions hold, so it revokes them once the sessions have ended and while the device is still there to be told. P3-2b — it registers the **session gate** (`Hooks.session`, a `SessionGate`): hive asks it, through core, before a session takes a vault role or moves with one, since hive must never call the vault ([vault.md](vault.md) §8). P3-3c — it registers a `FleetLifecycle` for `agent_removed` (a removed device's leases taken back and told, a failure logged rather than refusing the removal), and pushes a revocation itself: each pod tells the devices connected to it on the connections its lease socket holds, so it needs neither fleet's Hub nor a `vault → fleet` edge ([vault.md](vault.md) §11) |
-| knowhow, the organization's map: `knowhow_entities` + `knowhow_edges` + `knowhow_history` (every write a compare-and-set on `rev`, appended after it), the people's routes (search, a card, a neighbourhood, create, update, archive), read with `KNOWHOW_VIEW` and written with `KNOWHOW_EDIT`. It grants nothing | **knowhow** (FR-90 P4) | `Module::Deps = ()`: its one edge, `knowhow → hive` (P4-4-1), reads session records through hive's stateless DAO, as the vault's does, so a knowhow mounted without hive finds no session to answer; the `knowhow` feature implies `hive`. P4-4-1 also answers a session's questions (`rc:knowhow.search`, `rc:knowhow.get`) on the asking connection, one queue a connection, through the same agent-socket handler as its scans, the socket keeping one a module, and tells a device at its hello that the map is there (`rc:knowhow.served`, [knowhow.md](knowhow.md) §12). Composed last and last in `HOOK_ORDER`. P4-2a mirrors fleet's devices as machines, hearing of them through core's agent socket and `FleetLifecycle` hooks (never the cascade's refusal) and reading them through the shared `AgentDao`; P4-2b adds the network's word on each, read through the shared overlay DAOs. A shared stateless DAO is no edge (rule 5), so it needs none for them. P4-3a-1 registers an agent-socket handler for the `rc:knowhow.*` namespace (`Owner::Knowhow`: a device's `rc:knowhow.scanned`), and sends `rc:knowhow.scan` the vault's way, on the connections each pod holds, with `knowhow_scans` as the bus, so it needs neither fleet's Hub nor a `knowhow → fleet` edge ([knowhow.md](knowhow.md) §11). P4-5-1a sends `rc:knowhow.probe` on the same links, with `knowhow_probes` as the bus, and takes a device's `rc:knowhow.probed` in the same handler; the organization's overlay network, which says a probe's carrier, is read through the shared overlay DAO ([knowhow.md](knowhow.md) §13). P4-5-2a answers a session's `rc:knowhow.verify` in the same queue as its other questions, asking the probe as the route does, and sends `rc:knowhow.verified` on the device's own connection when its answer comes in ([knowhow.md](knowhow.md) §13.3). P4-6-1a answers a session's `rc:knowhow.connect` in the same queue with `rc:knowhow.access`, read from the entity and its probes alone: it grants nothing, and neither the vault nor the network is asked from the server ([knowhow.md](knowhow.md) §13.6) |
 | the device listing (`/tenant/{tid}/device`) | **the host** | a view over fleet (required) and network (optional) — see §4's lesson |
 
 ---
@@ -114,8 +101,7 @@ What the host drives, and in which order — each of these is a rule paid for in
   is initialised before its dependant by construction, and a module that needs a *live object*
   of another (remote needs fleet's Hub — one registry, or it would dispatch into an empty one)
   receives that module's state as `Deps`. A stateless dependency (a DAO over `core.db`, a pure
-  guard) is **not** a `Deps`: re-create it, as conference does with chat's room guards and hive with
-  chat's `BoundChat`.
+  guard) is **not** a `Deps`: re-create it, as conference does with chat's room guards.
 - **`WsHandler::closed(ctx)`** is called by the host for every handler of the socket's role after
   its own cleanup and before it logs the disconnect; a module holding per-connection state
   (conference: transports + the call session) releases it there — never by watching the registry.
@@ -134,7 +120,7 @@ What the host drives, and in which order — each of these is a rule paid for in
 ```mermaid
 flowchart LR
     subgraph feats["Cargo features on crates/api"]
-        F1["profile-full = chat + conference + fleet + remote + network + hive + vault + knowhow"]
+        F1["profile-full = chat + conference + fleet + remote + network"]
         F2["profile-collab = chat + conference"]
         F3["profile-remote = fleet + remote"]
         F4["profile-mesh = fleet + network"]
@@ -317,6 +303,13 @@ of the new `Online`, which only the next heartbeat repairs. So each hello names 
 the row (`conn_id`), and a teardown writes `Offline` only while the row still names it
 (`AgentDao::mark_offline_if_conn`, `crates/services/src/dao/agent.rs`). A newer hello makes the
 late write a no-op, in whichever order the two land, on this pod or another.
+The losing order is pinned through the socket handler itself by
+`a_held_teardowns_late_offline_leaves_the_reconnect_online`
+(`crates/tests/src/agent_presence_tests.rs:592`). A test lifecycle holds the old connection's
+teardown in `closed`, after its Hub removal and before its write
+(`crates/modules/fleet/src/socket.rs:957`), while the reconnect's hello lands and registers.
+Then it lets the write go. With the pre-#2621 `mark_status(Offline)` the row reads `offline`
+under the live connection; with the compare-and-set it stays `online`.
 ⚠️ The pod's shutdown sweep (`mark_status_many`) still writes `Offline` for every agent it held,
 300 ms after cancelling their sockets. An agent that reconnects to another pod within that window
 reads `Offline` until its next heartbeat.
@@ -355,29 +348,14 @@ Core never calls a module, so the cascades that cross modules are **hooks** core
 `hooks::HOOK_ORDER`: session holders → lease holders → the record owner. A failing holder stops
 the cascade.
 
-FR-90 P4-1 puts `knowhow` last. It holds nothing a device or a member needs released, only a map
-of them. Its mirror of a removed machine (P4-2a's `FleetLifecycle`) is archived after every holder
-has let go, so a holder that fails, stopping the cascade, leaves the map still showing the device
-that is still there. Its own failure is logged, never the cascade's refusal: a map is not a gate.
-
-FR-90 P3-2b adds a hook that is a **question**, not a cascade: `SessionGate`
-(`Hooks.session`), which only the vault registers. Hive owns the session, and `vault → hive` is
-the edge, so hive asks the vault whether a session may take, or move with, a vault role through
-`core.hooks.session_gate()`. ⚠️ No gate registered is a refusal for any ask that names a role,
-never a pass ([vault.md](vault.md) §8).
-
 ```mermaid
 sequenceDiagram
     participant O as owner of the cascade (fleet::removal)
     participant C as core.hooks (HookRegistry)
-    participant H as hive (session holder)
-    participant V as vault (lease holder)
     participant R as remote (session holder)
     participant N as network (lease holder)
     participant F as fleet (record owner)
     O->>C: agent_removed(agent)
-    C->>H: FleetLifecycle — end its agent sessions (an end note in each room), rc:hive.stop while the socket is still there
-    C->>V: FleetLifecycle — take back its vault leases, rc:vault.revoke while the socket is still there (P3-3c, a failure is logged, never a refusal)
     C->>R: FleetLifecycle — end RC sessions
     C->>N: FleetLifecycle — release the overlay lease (tombstone, pool the host, netmap_delta removes)
     C->>F: FleetLifecycle — delete the row, kick the socket
@@ -390,17 +368,8 @@ Two more shapes the registry carries:
   answers with `Option<&'static str>` (`origin_busy` / `tunnel_busy`) — a bool would lose the
   reason the outcome names.
 - **A tenant archive** is a `TenantLifecycle` run: `core.hooks.tenant_archived` sums the results
-  in `HOOK_ORDER` (hive ends every agent session; fleet revokes every device; network releases
-  every node and quarantines the block).
-- **A member removal** (FR-90) is one too: the remove-member route runs `core.hooks.member_removed`
-  BEFORE the membership row goes — hive ends the member's agent sessions — so a failing holder
-  refuses the removal instead of leaving sessions running for someone a retry would find gone.
-  A device that was away when its session ended is told on its next report of that session —
-  the replay it sends on every connection — because nothing is left pending for reconcile.
-- **A change a holder decides from** (FR-90 P2c-4): fleet's update route runs
-  `core.hooks.agent_updated` once a device's tags or owner are stored, and hive decides again
-  where the org's sessions are copied. A failing holder is the route's 500: a tag taken off that
-  did not reach placement must not read as done, and a retry decides again from what is stored.
+  in `HOOK_ORDER` (fleet revokes every device; network releases every node and quarantines the
+  block).
 
 ---
 

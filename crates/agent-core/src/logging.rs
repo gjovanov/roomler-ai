@@ -162,7 +162,8 @@ fn mirror_legacy_log_target(spec: &str) -> String {
     out.join(",")
 }
 
-/// Initialise tracing subscribers. Always installs a stdout layer; adds
+/// Initialise tracing subscribers. Installs a stdout layer, except on a
+/// console nobody reads while the file has every line (#3438); adds
 /// a daily-rolling file layer + panic hook when the platform log dir
 /// is writeable. Infallible — file logging failure falls back to
 /// stdout-only without erroring out the agent (the agent's signaling
@@ -203,6 +204,8 @@ pub fn init() {
             .map_err(std::io::Error::other)
     });
     let _ = LOG_DIR.set(opened.as_ref().map(|(d, _)| d.clone()));
+    // #3438 — no line goes to a console nobody reads while the file has them all.
+    let quiet = opened.is_some() && console_nobody_reads();
 
     if let Some((dir, appender)) = opened {
         let d = dir.as_path();
@@ -215,7 +218,7 @@ pub fn init() {
             .with_ansi(false);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
-            .with(stdout)
+            .with((!quiet).then_some(stdout))
             .with(file)
             .with(upload_layer)
             .try_init();
@@ -235,6 +238,46 @@ pub fn init() {
     for note in notes {
         tracing::warn!(%note, "logging: the log directory could not be used (#3073)");
     }
+    // #3438 — and what only stderr carries goes to that file too, as #3292 does
+    // for the per-user daemon: the watchdog's last words, a panic, FFmpeg.
+    #[cfg(windows)]
+    if quiet {
+        send_stderr_to_the_log();
+        tracing::info!(
+            "logging: this console has no window, so every line goes to the log file, \
+             stderr's too (#3438)"
+        );
+    }
+}
+
+/// #3438 — whether this process's stdout is a console nobody reads: a service
+/// process's console that has no window. The supervisor starts the SystemContext
+/// worker with `CREATE_NO_WINDOW` and no standard handles, so the worker's stdio
+/// is such a console, served by a `conhost.exe` of its own at Normal priority. A
+/// write there waits for that conhost, which a host busy with higher-priority work
+/// runs only now and then: the exit-DNS purge's 10 s bound was logged 40-46 s
+/// after the purge began. Only a process with a [`ServiceLogRole`] is asked, so a
+/// verb a person runs keeps its console lines, in a terminal or over SSH.
+#[cfg(windows)]
+fn console_nobody_reads() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetConsoleWindow, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    if SERVICE_ROLE.get().is_none() {
+        return false;
+    }
+    let mut mode = 0;
+    // SAFETY: reads this process's standard handle and its console; `mode` is a
+    // valid out-pointer.
+    unsafe {
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0
+            && GetConsoleWindow().is_null()
+    }
+}
+
+#[cfg(not(windows))]
+fn console_nobody_reads() -> bool {
+    false
 }
 
 /// #3073 — where [`init`] logs when the resolved directory cannot be used:
@@ -246,6 +289,14 @@ fn fallback_log_dir() -> Option<PathBuf> {
     }
     let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.data_local_dir().join("logs"))
+}
+
+/// #3302 — where a process with no [`ServiceLogRole`] logs, whatever role this one
+/// has: the per-profile data dir. A SystemContext worker logs to `service-logs`, and
+/// the post-install watcher it spawns has no role, so the watcher's install record
+/// lands here, in SYSTEM's profile. `None` under `cfg(test)`, as [`resolve_log_dir`].
+pub fn profile_log_dir() -> Option<PathBuf> {
+    fallback_log_dir()
 }
 
 /// #3073 — open the log appender in `primary`, else in `fallback`. The notes
@@ -292,9 +343,7 @@ fn open_log_appender<A>(
     }
 }
 
-/// The filter this binary's logs are kept by: [`init`]'s, and (FR-90
-/// P8-2a-5) a session's worker's, so its lines are kept as the daemon's own
-/// would be.
+/// The filter this binary's logs are kept by: [`init`]'s.
 pub fn filter() -> EnvFilter {
     // Default filter. `RUST_LOG` (env, or the SCM service Environment
     // block for the SystemContext service) overrides wholesale when
@@ -393,6 +442,142 @@ pub fn say_on_stdout(msg: impl std::fmt::Display) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{msg}");
     let _ = out.flush();
+}
+
+/// #3292 — a daemon the per-user Scheduled Task started has no console: its
+/// launcher (`roomlerdw.exe`) gives it `NUL` for stdio, so that no window opens
+/// on the person's desktop. Its stdout carries only what its rolling log carries
+/// too, but its stderr carries what nothing else does: a panic's message, a stack
+/// overflow's, the single-instance refusal, and FFmpeg's `av_log`. So this points
+/// stderr at today's rolling log, and keeps it on the current day's file.
+///
+/// A file handle and not a pipe to a reader, because the process that is crashing
+/// writes the file itself: a reader thread dies before it reads a fatal message,
+/// and a pipe's reader outside this process hands every grandchild that inherited
+/// the write end a broken pipe when it goes (#2934).
+///
+/// Call it after [`init`], which resolves the directory. The launcher must not
+/// do this: `appdirs::use_old_segment` is new-if-present, so creating the log
+/// folder from outside the daemon would switch a legacy host to the empty new tree
+/// and orphan its enrolled config.
+#[cfg(windows)]
+pub fn send_stderr_to_the_log() {
+    if let Some(dir) = log_dir() {
+        stderr_file::keep_on_the_rolling_log(dir);
+    }
+}
+
+#[cfg(windows)]
+mod stderr_file {
+    use super::*;
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    /// What one day's rolling log may reach before stderr stops going there.
+    /// FFmpeg prints to stderr at INFO with nothing limiting its rate: 87 lines in
+    /// one start on an idle guest, and one line per frame from an encoder that is
+    /// failing. A console threw that away as it scrolled. A file would keep it until
+    /// the disk is full.
+    pub(super) const DAILY_CAP: u64 = 256 * 1024 * 1024;
+    /// How often the day and the cap are looked at.
+    const CHECK_EVERY: Duration = Duration::from_secs(60);
+
+    unsafe extern "C" {
+        fn _open_osfhandle(handle: isize, flags: i32) -> i32;
+        fn _dup2(from: i32, to: i32) -> i32;
+        fn _close(fd: i32) -> i32;
+        fn _get_osfhandle(fd: i32) -> isize;
+    }
+
+    pub(super) fn keep_on_the_rolling_log(dir: PathBuf) {
+        let mut date = utc_date_now();
+        let mut on_the_file = repoint(&dir, &date);
+        let keeper = move || {
+            loop {
+                std::thread::sleep(CHECK_EVERY);
+                let now = utc_date_now();
+                if now != date {
+                    on_the_file = repoint(&dir, &now);
+                    date = now;
+                } else if on_the_file && !has_room(&rolling_file(&dir, &date)) {
+                    on_the_file = repoint(&dir, &date);
+                }
+            }
+        };
+        let _ = std::thread::Builder::new()
+            .name("stderr-to-log".into())
+            .spawn(keeper);
+    }
+
+    /// The name tracing-appender's daily roll gives `date`'s file, in UTC. The
+    /// tests hold this against a real `RollingFileAppender`.
+    pub(super) fn rolling_file(dir: &Path, date: &str) -> PathBuf {
+        dir.join(format!("{}.{date}", log_basename()))
+    }
+
+    pub(super) fn utc_date_now() -> String {
+        format_utc_date(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        )
+    }
+
+    fn has_room(file: &Path) -> bool {
+        std::fs::metadata(file).map_or(true, |m| m.len() < DAILY_CAP)
+    }
+
+    /// Point stderr at `date`'s file, or at `NUL` when that file is at its cap or
+    /// cannot be opened. Says whether it is on the file.
+    pub(super) fn repoint(dir: &Path, date: &str) -> bool {
+        let file = rolling_file(dir, date);
+        if has_room(&file) && point_stderr_at(&file).is_ok() {
+            return true;
+        }
+        let _ = point_stderr_at(Path::new("NUL"));
+        false
+    }
+
+    /// Point this process's two stderrs at `path`. The C runtime's is fd 2, in the
+    /// UCRT every module of this process shares, and that is where FFmpeg's
+    /// `fprintf(stderr, …)` lands. Rust's reads `GetStdHandle` on every write, and
+    /// panics and stack overflows go through it. Each gets its own handle.
+    ///
+    /// In this order, because in a console program `_dup2` also sets the standard
+    /// handle, to the duplicate the next `_dup2` closes. The handle given to
+    /// `SetStdHandle` is never closed: a write racing this call may still hold the
+    /// old value, and that value could be reused by anything by then. One or two a
+    /// day is a leak that does not matter.
+    ///
+    /// `_dup2`'s duplicate is inheritable, and a child started with inherited handles
+    /// would keep that day's log open for its lifetime. `Command` hands a child its
+    /// stderr with a duplicate of its own, so a child that asks for it still gets it.
+    fn point_stderr_at(path: &Path) -> std::io::Result<()> {
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        };
+        let for_rust = open()?.into_raw_handle();
+        let for_crt = open()?.into_raw_handle();
+        // SAFETY: `_open_osfhandle` takes ownership of `for_crt`, and `_dup2`,
+        // `_close` and `_get_osfhandle` run under the C runtime's own per-fd locks.
+        // `for_rust` is a valid handle, owned from here on by the process's
+        // standard-handle table. A failed `_get_osfhandle` gives an invalid handle,
+        // which `SetHandleInformation` refuses.
+        unsafe {
+            let fd = _open_osfhandle(for_crt as isize, 0);
+            if fd >= 0 {
+                _dup2(fd, 2);
+                _close(fd);
+            }
+            SetStdHandle(STD_ERROR_HANDLE, for_rust);
+            SetHandleInformation(_get_osfhandle(2) as HANDLE, HANDLE_FLAG_INHERIT, 0);
+        }
+        Ok(())
+    }
 }
 
 /// Path of TODAY's rolling log file, if file logging is active.
@@ -580,8 +765,9 @@ pub fn resolve_log_dir() -> Option<PathBuf> {
     // file layer writing into the live daemon log, a panic hook that turns
     // a failing test into a crash of this device (the daemon uploads it),
     // and a prune of the real dir. `None` takes init's stdout-only branch.
+    // #3438: except in a child a test started with a directory of its own.
     if cfg!(test) {
-        return None;
+        return std::env::var_os("ROOMLER_TEST_LOG_DIR").map(PathBuf::from);
     }
     #[cfg(target_os = "windows")]
     if SERVICE_ROLE.get().is_some() {
@@ -1006,6 +1192,321 @@ mod tests {
         // No directory at all (tests, no home): stdout-only, quietly, as ever.
         let (got, notes) = open_log_appender(None, Some(fallback), |_| Ok(()));
         assert!(got.is_none() && notes.is_empty());
+    }
+
+    /// #3292 — the windowless task daemon's stderr. Each `child_*` test does nothing
+    /// unless a parent test started this binary again with the directory in the
+    /// environment, because the point is what reaches the file when the process
+    /// dies, and a test's own process has to stay alive to read it.
+    #[cfg(windows)]
+    mod stderr_capture {
+        use super::super::log_basename;
+        use super::super::stderr_file::*;
+        use std::path::{Path, PathBuf};
+
+        const CHILD_DIR: &str = "ROOMLER_TEST_STDERR_DIR";
+
+        unsafe extern "C" {
+            fn __acrt_iob_func(index: u32) -> *mut std::ffi::c_void;
+            fn fputs(text: *const std::ffi::c_char, stream: *mut std::ffi::c_void) -> i32;
+        }
+
+        /// The way FFmpeg's default `av_log` callback writes.
+        fn crt_stderr(line: &std::ffi::CStr) {
+            // SAFETY: index 2 is the C runtime's `stderr`, and `line` ends in NUL.
+            unsafe {
+                fputs(line.as_ptr(), __acrt_iob_func(2));
+            }
+        }
+
+        fn child(name: &str, dir: &Path) -> std::process::ExitStatus {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::stderr_capture::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        fn child_dir() -> Option<PathBuf> {
+            std::env::var_os(CHILD_DIR).map(Into::into)
+        }
+
+        fn today(dir: &Path) -> String {
+            std::fs::read_to_string(rolling_file(dir, &utc_date_now())).unwrap()
+        }
+
+        #[test]
+        fn child_panics() {
+            let Some(dir) = child_dir() else { return };
+            keep_on_the_rolling_log(dir);
+            eprintln!("from-rust-eprintln");
+            crt_stderr(c"from-the-c-runtime\n");
+            panic!("from-a-panic");
+        }
+
+        #[test]
+        fn eprintln_the_c_runtime_and_a_panic_reach_the_rolling_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_panics", dir.path());
+            assert!(!status.success(), "the child panics");
+            let log = today(dir.path());
+            for line in ["from-rust-eprintln", "from-the-c-runtime", "from-a-panic"] {
+                assert!(log.contains(line), "{line} missing from: {log}");
+            }
+        }
+
+        #[allow(unconditional_recursion)]
+        fn overflow(depth: u64) -> u64 {
+            let frame = std::hint::black_box([depth; 256]);
+            overflow(depth + 1) + frame[0]
+        }
+
+        #[test]
+        fn child_overflows_its_stack() {
+            let Some(dir) = child_dir() else { return };
+            keep_on_the_rolling_log(dir);
+            overflow(0);
+        }
+
+        /// The process dies inside the runtime's handler: no reader thread would
+        /// have lived to see this line.
+        #[test]
+        fn a_stack_overflow_reaches_the_rolling_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_overflows_its_stack", dir.path());
+            assert!(!status.success(), "the child dies");
+            let log = today(dir.path());
+            assert!(log.contains("overflowed its stack"), "{log}");
+        }
+
+        #[test]
+        fn child_rolls_to_a_new_day_and_past_the_cap() {
+            let Some(dir) = child_dir() else { return };
+            assert!(repoint(&dir, "2026-01-01"));
+            eprintln!("on-day-one");
+            crt_stderr(c"crt-on-day-one\n");
+            assert!(repoint(&dir, "2026-01-02"));
+            eprintln!("on-day-two");
+            crt_stderr(c"crt-on-day-two\n");
+            let full = std::fs::File::create(rolling_file(&dir, "2026-01-03")).unwrap();
+            full.set_len(DAILY_CAP).unwrap();
+            drop(full);
+            assert!(!repoint(&dir, "2026-01-03"));
+            eprintln!("past-the-cap");
+            crt_stderr(c"crt-past-the-cap\n");
+            assert!(repoint(&dir, "2026-01-04"));
+            eprintln!("on-day-four");
+            crt_stderr(c"crt-on-day-four\n");
+        }
+
+        #[test]
+        fn stderr_follows_the_day_and_stops_at_the_cap_with_no_panic() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_rolls_to_a_new_day_and_past_the_cap", dir.path());
+            assert!(status.success(), "the child must not panic: {status:?}");
+            let read = |date| std::fs::read_to_string(rolling_file(dir.path(), date)).unwrap();
+            assert_eq!(read("2026-01-01"), "on-day-one\ncrt-on-day-one\n");
+            assert_eq!(read("2026-01-02"), "on-day-two\ncrt-on-day-two\n");
+            assert_eq!(read("2026-01-04"), "on-day-four\ncrt-on-day-four\n");
+            let capped = std::fs::metadata(rolling_file(dir.path(), "2026-01-03")).unwrap();
+            assert_eq!(capped.len(), DAILY_CAP, "nothing past the cap");
+        }
+
+        #[test]
+        fn child_keeps_a_handle_across_a_roll() {
+            use std::io::Write;
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::Foundation::{
+                GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+            };
+            use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+            unsafe extern "C" {
+                fn _get_osfhandle(fd: i32) -> isize;
+            }
+            let Some(dir) = child_dir() else { return };
+            let inheritable = |handle: HANDLE| {
+                let mut flags = 0u32;
+                // SAFETY: `flags` is a valid out-pointer for the call.
+                assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                flags & HANDLE_FLAG_INHERIT != 0
+            };
+            assert!(repoint(&dir, "2026-01-01"));
+            // SAFETY: reads the process's standard handle.
+            let before_the_roll = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+            assert!(repoint(&dir, "2026-01-02"));
+            // SAFETY: as above, and fd 2 is open.
+            let (rust, crt) =
+                unsafe { (GetStdHandle(STD_ERROR_HANDLE), _get_osfhandle(2) as HANDLE) };
+            assert_ne!(rust, crt, "the next roll closes the C runtime's");
+            assert!(!inheritable(rust));
+            assert!(!inheritable(crt));
+            // A panic that read the handle just before the roll: `from_raw_handle`
+            // borrows here, and `ManuallyDrop` keeps it open as the code under test does.
+            // SAFETY: a handle the code under test says it never closes.
+            let raced = unsafe { std::fs::File::from_raw_handle(before_the_roll) };
+            let mut raced = std::mem::ManuallyDrop::new(raced);
+            raced.write_all(b"raced-the-roll\n").unwrap();
+            eprintln!("after-the-roll");
+            crt_stderr(c"crt-after-the-roll\n");
+        }
+
+        /// Findings of the independent read of #3296: `_dup2` set the standard handle
+        /// to its own duplicate, so the next roll closed it under a racing write, and
+        /// that duplicate was inheritable.
+        #[test]
+        fn a_write_racing_a_roll_lands_and_no_child_inherits_the_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child("child_keeps_a_handle_across_a_roll", dir.path());
+            let read = |date| std::fs::read_to_string(rolling_file(dir.path(), date)).unwrap();
+            assert!(status.success(), "{}", read("2026-01-02"));
+            assert_eq!(read("2026-01-01"), "raced-the-roll\n");
+            assert_eq!(read("2026-01-02"), "after-the-roll\ncrt-after-the-roll\n");
+        }
+
+        /// A second name would split one day's story across two files, and
+        /// `active_log_path` reads only this one.
+        #[test]
+        fn the_file_is_the_one_the_rolling_appender_writes() {
+            use std::io::Write;
+            let dir = tempfile::tempdir().unwrap();
+            let before = utc_date_now();
+            let mut appender = tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix(log_basename())
+                .build(dir.path())
+                .unwrap();
+            appender.write_all(b"x\n").unwrap();
+            let after = utc_date_now();
+            assert!(
+                rolling_file(dir.path(), &before).exists()
+                    || rolling_file(dir.path(), &after).exists()
+            );
+        }
+
+        /// #3438 — what `resolve_log_dir` reads in a test's child.
+        const CHILD_LOG_DIR: &str = "ROOMLER_TEST_LOG_DIR";
+
+        /// `child`, in a console with no window, the way the supervisor starts the
+        /// SystemContext worker (`CREATE_NO_WINDOW`, `supervisor.rs:331`). The
+        /// supervisor passes no standard handles, so the worker's are that console's.
+        /// `Command` always passes some, so the child takes its console (`CONOUT$`)
+        /// as its stdout and stderr itself.
+        fn child_in_a_console_with_no_window(name: &str, dir: &Path) -> std::process::ExitStatus {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::stderr_capture::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir)
+                .env(CHILD_LOG_DIR, dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        /// This process's console text, up to the cursor's row.
+        fn console_text() -> String {
+            use windows_sys::Win32::System::Console::{
+                CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo, GetStdHandle,
+                ReadConsoleOutputCharacterW, STD_OUTPUT_HANDLE,
+            };
+            // SAFETY: `info`, `text` and `read` are valid for the sizes passed.
+            unsafe {
+                let out = GetStdHandle(STD_OUTPUT_HANDLE);
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+                if GetConsoleScreenBufferInfo(out, &mut info) == 0 {
+                    return format!("(no screen buffer: {})", std::io::Error::last_os_error());
+                }
+                let rows = info.dwCursorPosition.Y.max(0) as u32 + 1;
+                let cells = info.dwSize.X.max(0) as u32 * rows;
+                let mut text = vec![0u16; cells as usize];
+                let mut read = 0u32;
+                let origin = COORD { X: 0, Y: 0 };
+                ReadConsoleOutputCharacterW(out, text.as_mut_ptr(), cells, origin, &mut read);
+                String::from_utf16_lossy(&text[..text.len().min(read as usize)])
+            }
+        }
+
+        /// A SystemContext worker's logging, in a console that has no window. It
+        /// leaves the parent whether the console has a window and the console's text.
+        /// Nothing after `init` may panic: the hook would record a crash.
+        #[test]
+        fn child_logs_in_a_console_with_no_window() {
+            use std::os::windows::io::IntoRawHandle;
+            use windows_sys::Win32::System::Console::{
+                GetConsoleWindow, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+            };
+            let Some(dir) = child_dir() else { return };
+            let report = dir.join("console.txt");
+            let console = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("CONOUT$")
+            };
+            let (Ok(out), Ok(err)) = (console(), console()) else {
+                let _ = std::fs::write(&report, "(no console)");
+                return;
+            };
+            // SAFETY: two valid handles, owned by the standard-handle table from here on.
+            unsafe {
+                SetStdHandle(STD_OUTPUT_HANDLE, out.into_raw_handle());
+                SetStdHandle(STD_ERROR_HANDLE, err.into_raw_handle());
+            }
+            super::super::set_service_logging(super::super::ServiceLogRole::Worker);
+            super::super::init();
+            tracing::warn!("a-line-for-the-log");
+            super::super::say_on_stderr("the-last-words");
+            super::super::say_on_stdout("a-line-on-the-console");
+            // SAFETY: takes no arguments.
+            let window = if unsafe { GetConsoleWindow() }.is_null() {
+                "none"
+            } else {
+                "some"
+            };
+            let _ = std::fs::write(&report, format!("window={window}\n{}", console_text()));
+        }
+
+        /// #3438 — the SystemContext worker's console has no window and nobody reads
+        /// it, yet every log line went there first and waited for its `conhost`: on a
+        /// starved host a 10 s bound's warning was stamped 40-46 s late. No line goes
+        /// to such a console, and what only stderr carries goes to the rolling log.
+        #[test]
+        fn a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child_in_a_console_with_no_window(
+                "child_logs_in_a_console_with_no_window",
+                dir.path(),
+            );
+            assert!(status.success(), "{status:?}");
+            let console = std::fs::read_to_string(dir.path().join("console.txt")).unwrap();
+            // The premise, and a control that the console is read at all.
+            assert!(console.starts_with("window=none\n"), "{console}");
+            assert!(console.contains("a-line-on-the-console"), "{console}");
+            assert!(
+                !console.contains("a-line-for-the-log"),
+                "a log line reached the console: {console}"
+            );
+            assert!(
+                !console.contains("the-last-words"),
+                "stderr reached the console: {console}"
+            );
+            let log = today(dir.path());
+            assert!(log.contains("the-last-words"), "{log}");
+        }
     }
 }
 // RETIRED-NAME-ANCHOR-END

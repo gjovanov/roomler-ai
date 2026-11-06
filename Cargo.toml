@@ -7,9 +7,6 @@ members = [
     "crates/remote_control",
     "crates/localapi",
     "crates/agent-core",
-    # FR-90 — Hive on the device: transcript events, the replica store, the
-    # stream-json adapter, the launch spec. Daemon-side only (MPL).
-    "crates/hive-node",
     "crates/tunnel-core",
     # P5 — the webrtc-ice fork's substance (TURNS/TCP Conn adapter), extracted
     # so the vendored tree is a mechanical patch. Consumed by tunnel-core AND
@@ -30,15 +27,6 @@ members = [
     "crates/modules/fleet",
     "crates/modules/remote",
     "crates/modules/network",
-    # FR-90 — agent sessions, the server side: the session record and its
-    # lifecycle, never what is in a session.
-    "crates/modules/hive",
-    # FR-90 P3 — the vault: secrets under envelope encryption, and the audit
-    # of every decision. Never a value in an answer.
-    "crates/modules/vault",
-    # FR-90 P4 — knowhow: the organization's map, and the history of every
-    # write to it. A map, not a gate: it grants nothing.
-    "crates/modules/knowhow",
 
     "crates/api",
     "crates/tests",
@@ -46,6 +34,8 @@ members = [
     "agents/roomlerd",
     "agents/roomler-desktop",
     "agents/roomler-cli-shim",
+    "agents/roomlerdw",
+    "agents/roomler-msi-ca",
     "agents/roomler-setup",
     "agents/roomler-cli",
 ]
@@ -161,7 +151,7 @@ wintun-bindings = { path = "crates/vendored/wintun-bindings" }
 scrap = { path = "crates/vendored/scrap" }
 
 [workspace.package]
-version = "0.4.197"
+version = "0.4.201"
 edition = "2024"
 authors = ["Goran Jovanov <goran.jovanov@gmail.com>"]
 
@@ -238,10 +228,6 @@ genpdf = "0.2"
 # File handling
 tempfile = "3"
 
-# FR-90 Hive — the device-side replica store and its event hash chain
-rusqlite = { version = "0.40", features = ["bundled"] }
-blake3 = "1.8"
-
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
@@ -287,27 +273,6 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
-
-# FR-90 P3 — the vault's envelope encryption: an XChaCha20-Poly1305 data key
-# per version (the version the tree already builds), wrapped to an `age`
-# X25519 KEK. `age` is the reference implementation's library, so a wrapped
-# key opens with the stock `age` tool and the KEK is an `age-keygen` file.
-# ⚠️ 0.11, not 0.12: 0.12's post-quantum recipients pull `ml-kem` 0.2, which
-# needs `kem` 0.3.0-pre.0 — while russh already resolves `ml-kem` 0.3 onto
-# `kem` 0.3.0, and one lockfile holds one `kem` 0.3.x. The X25519 recipient and
-# the file format are the same in both.
-age = { version = "0.11", default-features = false }
-# FR-90 P3-2 — the vault's policy language (design §8.4): Rust-native,
-# schema-validated, formally analysed. No extensions: the vault's policies
-# compare strings, sets and integers.
-cedar-policy = { version = "4.14", default-features = false }
-chacha20poly1305 = "0.10"
-zeroize = "1"
-# FR-90 P3-3 — a leased value crosses to a device as a libsodium-compatible
-# sealed box (`crypto_box_seal`: X25519, XSalsa20-Poly1305) for the key the
-# daemon holds. The device's half is `roomlerd`'s `vault` feature. RustCrypto,
-# on the `curve25519-dalek` 4 and `aead` 0.5 the tree already builds.
-crypto_box = { version = "0.9.1", features = ["seal"] }
 
 # Agent-specific
 clap = { version = "4", features = ["derive"] }

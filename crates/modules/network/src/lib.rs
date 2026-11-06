@@ -540,6 +540,13 @@ impl Module for NetworkState {
             "/",
             get(routes::agent_ssh::get_org_settings).put(routes::agent_ssh::set_org_settings),
         );
+        // FR-40 P2 — the org's retired-key switch (off | warn | enforce). Off by
+        // default, which is the pre-P2 join and DERP path byte for byte.
+        let retired_keys = Router::new().route(
+            "/",
+            get(routes::overlay_key::get_retired_key_mode)
+                .put(routes::overlay_key::set_retired_key_mode),
+        );
         // Phase 2 MagicDNS — the tenant's overlay DNS domain + upstreams.
         let magic_dns = Router::new().route(
             "/",
@@ -593,6 +600,7 @@ impl Module for NetworkState {
             .nest("/tenant/{tenant_id}/tunnel-policy", tunnel_policy)
             .nest("/tenant/{tenant_id}/overlay-node", overlay_node)
             .nest("/tenant/{tenant_id}/overlay-acl", overlay_policy)
+            .nest("/tenant/{tenant_id}/overlay-retired-keys", retired_keys)
             .nest("/tenant/{tenant_id}/magic-dns", magic_dns)
             .nest("/tenant/{tenant_id}/overlay-block", overlay_block)
             .nest("/tenant/{tenant_id}/peer-relay", peer_relay)
@@ -623,8 +631,8 @@ impl Module for NetworkState {
     }
 
     /// The eleven collections this module owns, for an explicit `multi_block`
-    /// schema. The specs are the ones the db crate's plan held before P7a,
-    /// unchanged, in the plan's order.
+    /// schema. The specs are the ones the db crate's plan held before P7a, in
+    /// the plan's order, plus the two FR-40 P2 added to `overlay_nodes`.
     fn indexes_for(&self, multi_block: bool) -> Vec<IndexSet> {
         // Multi-org P2b — the GLOBAL overlay block registry. Deliberately NOT
         // tenant-scoped: its entire job is guaranteeing that two tenants can
@@ -773,6 +781,15 @@ impl Module for NetworkState {
                     ),
                     // Backs the by-node_ref lookups on the removal paths.
                     index(bson::doc! { "tenant_id": 1, "node_ref.id": 1 }),
+                    // FR-40 P2 — `wg_key_taken_by_other`, run on every join,
+                    // was an unindexed `find_one`. Plain, not partial: its
+                    // `deleted_at: null` predicate cannot use a `$type`
+                    // partial index (see above).
+                    index(bson::doc! { "network_id": 1, "wg_public_key": 1 }),
+                    // FR-40 P2 — the retired-key ledger, read network-wide
+                    // (live rows and tombstones) at a join and at a DERP
+                    // registration. Multikey over the array.
+                    index(bson::doc! { "network_id": 1, "retired_keys.public_key": 1 }),
                 ],
             },
             // Tunnel policies — tenant-scoped allowlists. The server-side ACL
@@ -899,7 +916,6 @@ impl Module for NetworkState {
             tenant: Some(Arc::new(hooks::NetworkTenantHooks {
                 state: self.clone(),
             })),
-            session: None,
         }
     }
 

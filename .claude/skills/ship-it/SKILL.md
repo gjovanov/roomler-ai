@@ -87,9 +87,9 @@ source.
 
 ## 3 · The updater's trust chain
 
-The updater runs what it downloads **as the daemon identity — SYSTEM on Windows,
-root under systemd**. The manifest's SHA-256 is *not* a tamper anchor: the digest
-arrives in the same manifest, from the same origin, as the `browser_download_url`.
+The updater runs what it downloads **as the daemon identity: root under systemd;
+on Windows the worker's, SYSTEM in SystemContext mode, else the signed-in user**.
+The manifest's SHA-256 is *not* a tamper anchor: the digest arrives in the same manifest, from the same origin, as the `browser_download_url`.
 
 | Platform | Anchor |
 |---|---|
@@ -109,7 +109,7 @@ carries no digest.
 
 - Every azure-signing job **must** carry `environment: release` — the tenant
   rejects wildcard tag-subject federated credentials.
-- MSI **payload** (`roomlerd.exe`, `roomler-shim.exe`) is signed **before**
+- MSI **payload** (`roomlerd.exe`, `roomler-shim.exe`, per-user's `roomlerdw.exe`) is signed **before**
   `cargo wix` harvests; third-party DLLs (wintun, VC-CRT) are staged **after**
   signing and must keep their original signers (CI asserts).
 - **Nothing after payload signing may `cargo build`** — a relink strips

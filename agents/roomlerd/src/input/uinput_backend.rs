@@ -621,6 +621,8 @@ impl InputInjector for UinputInjector {
                 }
                 self.sync()
             }
+            // #3046: `mods` is left out because the arbiter has already pressed
+            // what it names, as frames of their own.
             InputMsg::Key { code, down, .. } => {
                 let Some(key) = hid_to_evdev(code) else {
                     // Same contract as the enigo backend (FR-13): an unmapped
@@ -1041,6 +1043,33 @@ mod tests {
                 (EV_KEY, KEY_A, 0),
                 SYN,
                 (EV_KEY, KEY_RIGHTSHIFT, 0),
+                SYN,
+            ]
+        );
+    }
+
+    /// #3046 — a chord the arbiter tapped is four reports in its order, with
+    /// nothing added for the letter's `mods`. Each edge syncs alone, or a
+    /// compositor can read the press and the release as one event.
+    #[test]
+    fn a_tapped_chord_is_four_reports_in_its_order() {
+        const KEY_LEFTCTRL: u16 = 29;
+        let frame = |code, down, mods| InputMsg::Key { code, down, mods };
+        assert_eq!(
+            written_seq(vec![
+                frame(0xe0, true, 0),
+                frame(0x04, true, 1),
+                frame(0x04, false, 0),
+                frame(0xe0, false, 0),
+            ]),
+            [
+                (EV_KEY, KEY_LEFTCTRL, 1),
+                SYN,
+                (EV_KEY, KEY_A, 1),
+                SYN,
+                (EV_KEY, KEY_A, 0),
+                SYN,
+                (EV_KEY, KEY_LEFTCTRL, 0),
                 SYN,
             ]
         );

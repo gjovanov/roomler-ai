@@ -54,6 +54,41 @@ use super::{Button, InputMsg};
 /// the set the cross-session fence releases.
 pub const MODIFIER_CODES: std::ops::RangeInclusive<u32> = 0xe0..=0xe7;
 
+/// #3046 — the bits of `InputMsg::Key.mods` with the two keys that answer each
+/// (left, right), in the order a chord presses them.
+const MOD_BITS: [(u8, u32, u32); 4] = [
+    (0x01, 0xe0, 0xe4), // Ctrl
+    (0x04, 0xe2, 0xe6), // Alt
+    (0x02, 0xe1, 0xe5), // Shift
+    (0x08, 0xe3, 0xe7), // Meta
+];
+
+/// #3046 — the modifiers `mods` names for a key press that this session does
+/// not hold: the left key of each, in press order. Empty for nearly every
+/// frame, because a physical keyboard's modifiers arrive as frames of their own
+/// and stay held. `mods` alone carries the soft keyboard's sticky Ctrl, a
+/// controller's one-key chord, and a Ctrl+V flushed after its Ctrl came up.
+///
+/// `ctrl_may_be_cmd`: a viewer turns Ctrl into Cmd for a Mac host in the key's
+/// code and not in `mods` (FR-13), so there a held Cmd answers the Ctrl bit.
+/// Without it every Ctrl+C from a viewer would press a second, literal Ctrl.
+fn chord_tap(code: u32, mods: u8, held: &HashSet<Held>, ctrl_may_be_cmd: bool) -> Vec<u32> {
+    if MODIFIER_CODES.contains(&code) {
+        return Vec::new();
+    }
+    let holds = |key: u32| held.contains(&Held::Key(key));
+    MOD_BITS
+        .iter()
+        .filter(|(bit, left, right)| {
+            mods & bit != 0
+                && !holds(*left)
+                && !holds(*right)
+                && !(ctrl_may_be_cmd && *bit == 0x01 && (holds(0xe3) || holds(0xe7)))
+        })
+        .map(|(_, left, _)| *left)
+        .collect()
+}
+
 /// A floor request against a holder who has produced no input for this
 /// long is auto-granted (walk-away takeover); an ACTIVE holder keeps the
 /// floor and the requester is told who has it.
@@ -154,8 +189,12 @@ impl KeepBusyRefusal {
 pub enum EventPlan {
     /// Floor-denied (exclusive mode, not the holder) or no INPUT grant.
     Deny,
-    /// Inject `pre` (fence releases) then the event itself.
-    Inject { pre: Vec<InputMsg> },
+    /// Inject `pre` (fence releases, then a chord's modifiers), the event
+    /// itself, then `post` (the release of a chord tapped whole, #3046).
+    Inject {
+        pre: Vec<InputMsg>,
+        post: Vec<InputMsg>,
+    },
 }
 
 /// Pure decision core. All methods take `now` so tests inject time.
@@ -310,7 +349,10 @@ impl ArbiterState {
         // Heartbeats carry no input; pass them through un-fenced so their
         // timing diagnostics stay honest.
         if matches!(msg, InputMsg::Heartbeat { .. }) {
-            return EventPlan::Inject { pre: Vec::new() };
+            return EventPlan::Inject {
+                pre: Vec::new(),
+                post: Vec::new(),
+            };
         }
         let can_input = self
             .sessions
@@ -354,11 +396,33 @@ impl ArbiterState {
         }
 
         // Held-state tracking for THIS session.
+        let mut post = Vec::new();
         if let Some(core) = self.sessions.get_mut(&session) {
             core.last_input = now;
             match msg {
-                InputMsg::Key { code, down, .. } => {
-                    if *down {
+                InputMsg::Key { code, down, mods } => {
+                    let chord = if *down {
+                        chord_tap(*code, *mods, &core.held, cfg!(target_os = "macos"))
+                    } else {
+                        Vec::new()
+                    };
+                    if !chord.is_empty() {
+                        // #3046 — a chord with no modifier frame of its own is
+                        // one press and one release, on this frame. The input
+                        // channel is unreliable: a later frame that has to let
+                        // go of the modifier could be lost, and a stuck Ctrl on
+                        // the host is worse than a bare letter. Nothing here is
+                        // left down or tracked, so the viewer's up frame finds
+                        // nothing to release.
+                        core.held.remove(&Held::Key(*code));
+                        pre.extend(chord.iter().map(|&code| InputMsg::Key {
+                            code,
+                            down: true,
+                            mods: 0,
+                        }));
+                        post.push(Held::Key(*code).release_msg());
+                        post.extend(chord.iter().rev().map(|&m| Held::Key(m).release_msg()));
+                    } else if *down {
                         core.held.insert(Held::Key(*code));
                     } else {
                         core.held.remove(&Held::Key(*code));
@@ -383,7 +447,7 @@ impl ArbiterState {
                 _ => {}
             }
         }
-        EventPlan::Inject { pre }
+        EventPlan::Inject { pre, post }
     }
 
     /// Floor request. Returns `(granted, releases)` — on a takeover the
@@ -908,16 +972,16 @@ fn worker(rx: std::sync::mpsc::Receiver<Cmd>, handle: tokio::runtime::Handle) {
                 }
                 match state.plan(session, &msg, Instant::now()) {
                     EventPlan::Deny => {}
-                    EventPlan::Inject { pre } => {
+                    EventPlan::Inject { pre, post } => {
                         if !pre.is_empty() {
                             tracing::debug!(
                                 %session,
-                                fenced = pre.len(),
-                                "input arbiter: cross-session modifier fence"
+                                before = pre.len(),
+                                after = post.len(),
+                                "input arbiter: modifier fence or chord"
                             );
-                            inject_all(&mut injector, &mut regrant, &pre);
                         }
-                        inject_all(&mut injector, &mut regrant, std::slice::from_ref(&msg));
+                        inject_planned(&mut injector, &mut regrant, &pre, &msg, &post);
                         // FR-92 — a controller's input reached the OS: a
                         // remote person is active. A heartbeat is not input.
                         if !matches!(msg, InputMsg::Heartbeat { .. }) {
@@ -1045,16 +1109,33 @@ fn warm(injector: &mut Option<Box<dyn super::InputInjector + Send>>) {
 /// asked at most once per [`Regrant::EVERY`] while events arrive (a stubborn
 /// backend then costs one open a second, not one per event), and at once for
 /// the first event of each new session.
+///
+/// #2066 — off macOS there is no grant to ask about. A Noop there means no
+/// backend opened (a Linux daemon before its display or `/dev/uinput` exists),
+/// and only trying again can tell that one would now. Each failed open warns,
+/// and a root daemon with no `DISPLAY` never gets one, so the wait doubles with
+/// every open, up to [`Regrant::AT_MOST`], and starts over with each new session.
 #[derive(Debug, Default)]
 struct Regrant {
     asked_at: Option<Instant>,
+    /// Opens tried since this session began or an injector last had permission.
+    opens: u32,
 }
 
 impl Regrant {
     const EVERY: Duration = Duration::from_secs(1);
+    const AT_MOST: Duration = Duration::from_secs(60);
+
+    /// How long after the last question the next one may come: [`Self::EVERY`]
+    /// until the first open and right after it, then doubling.
+    fn wait(&self) -> Duration {
+        Self::EVERY
+            .saturating_mul(1 << self.opens.saturating_sub(1).min(6))
+            .min(Self::AT_MOST)
+    }
 
     /// Whether to drop the cached injector and open another: it lacks the OS's
-    /// permission, the OS was not asked within [`Self::EVERY`], and asked now
+    /// permission, the OS was not asked within [`Self::wait`], and asked now
     /// (`os_grants`, only then) it grants it.
     fn reopen(
         &mut self,
@@ -1063,26 +1144,33 @@ impl Regrant {
         os_grants: impl FnOnce() -> bool,
     ) -> bool {
         if has_permission {
+            self.opens = 0;
             return false;
         }
         if self
             .asked_at
-            .is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY)
+            .is_some_and(|at| now.saturating_duration_since(at) < self.wait())
         {
             return false;
         }
         self.asked_at = Some(now);
-        os_grants()
+        let granted = os_grants();
+        if granted {
+            self.opens = self.opens.saturating_add(1);
+        }
+        granted
     }
 
     /// A session opened: its first event asks the OS again.
     fn session_opened(&mut self) {
         self.asked_at = None;
+        self.opens = 0;
     }
 }
 
 /// The cached injector, unless it no longer fits: stale (FR-95 P2,
-/// `input::stale`), or opened without a grant the OS has given since (#3164).
+/// `input::stale`), or opened without a permission it may have now (#3164,
+/// #2066).
 fn refresh(injector: &mut Option<Box<dyn super::InputInjector + Send>>, regrant: &mut Regrant) {
     refresh_with(injector, regrant, super::os_grants_input);
 }
@@ -1101,8 +1189,8 @@ fn refresh_with(
         *injector = None;
     } else if regrant.reopen(inj.has_permission(), Instant::now(), os_grants) {
         tracing::info!(
-            "input: the OS grants this agent input now — opening the injector again, no restart \
-             needed (#3164)"
+            "input: this injector has no permission — opening it again, no restart needed (#3164, \
+             #2066). A failed open warns right after this line; no warning means it worked."
         );
         *injector = None;
     }
@@ -1137,15 +1225,29 @@ fn inject_all(
     }
 }
 
+/// One event as [`ArbiterState::plan`] planned it. ⚠️ `post` runs whatever
+/// `msg` did: it is the release of what `pre` pressed.
+fn inject_planned(
+    injector: &mut Option<Box<dyn super::InputInjector + Send>>,
+    regrant: &mut Regrant,
+    pre: &[InputMsg],
+    msg: &InputMsg,
+    post: &[InputMsg],
+) {
+    inject_all(injector, regrant, pre);
+    inject_all(injector, regrant, std::slice::from_ref(msg));
+    inject_all(injector, regrant, post);
+}
+
 /// FR-92 — run one keep-busy request against the ONE injector.
 ///
-/// ⚠️ The injector is created lazily and then cached for the life of the
-/// process — a `NoopInjector` included. Remote control's first event used to
-/// be the only creator, and a session implies a display. Keep-busy may be
-/// first (a boot-time restore), so an injector without the OS's permission
-/// is answered for and NOT cached: a Noop cached before a display exists
-/// would silently break every later controller's input. (The engine also
-/// sends nothing before its host confirms an interactive session.)
+/// ⚠️ The injector is created lazily and then cached, a `NoopInjector` included
+/// until [`Regrant`] opens it again. Remote control's first event used to be
+/// the only creator, and a session implies a display. Keep-busy may be first (a
+/// boot-time restore), so an injector without the OS's permission is answered
+/// for and NOT cached: a Noop cached before a display exists would cost a later
+/// controller its first input. (The engine also sends nothing before its host
+/// confirms an interactive session.)
 fn keep_busy_op(
     state: &ArbiterState,
     injector: &mut Option<Box<dyn super::InputInjector + Send>>,
@@ -1349,11 +1451,14 @@ mod tests {
         // A holds Left-Ctrl (0xe0).
         assert_eq!(
             st.plan(a, &key(0xe0, true), now),
-            EventPlan::Inject { pre: vec![] }
+            EventPlan::Inject {
+                pre: vec![],
+                post: vec![]
+            }
         );
         // B clicks — A's held Ctrl must be released FIRST.
         match st.plan(b, &click(true), now) {
-            EventPlan::Inject { pre } => {
+            EventPlan::Inject { pre, .. } => {
                 assert_eq!(pre.len(), 1);
                 assert!(matches!(
                     pre[0],
@@ -1370,7 +1475,7 @@ mod tests {
         // new, and switching back to A fences B's held button? No: the fence
         // covers MODIFIERS only; B's held left button is untouched.
         match st.plan(a, &key(0xe0, false), now) {
-            EventPlan::Inject { pre } => assert!(pre.is_empty(), "no modifiers left to fence"),
+            EventPlan::Inject { pre, .. } => assert!(pre.is_empty(), "no modifiers left to fence"),
             p => panic!("expected inject, got {p:?}"),
         }
     }
@@ -1385,7 +1490,7 @@ mod tests {
         // A holds the letter W (0x1a) — a game-style hold, not a modifier.
         st.plan(a, &key(0x1a, true), now);
         match st.plan(b, &click(true), now) {
-            EventPlan::Inject { pre } => assert!(pre.is_empty(), "letters are not fenced"),
+            EventPlan::Inject { pre, .. } => assert!(pre.is_empty(), "letters are not fenced"),
             p => panic!("expected inject, got {p:?}"),
         }
     }
@@ -1422,11 +1527,17 @@ mod tests {
         st.open(w, "W".into(), false, None, now);
         assert_eq!(
             st.plan(a, &InputMsg::MousePress { btn: Button::Left }, now),
-            EventPlan::Inject { pre: vec![] }
+            EventPlan::Inject {
+                pre: vec![],
+                post: vec![]
+            }
         );
         assert_eq!(
             st.plan(a, &InputMsg::MouseRel { dx: 30, dy: 0 }, now),
-            EventPlan::Inject { pre: vec![] }
+            EventPlan::Inject {
+                pre: vec![],
+                post: vec![]
+            }
         );
         assert_eq!(
             st.plan(w, &InputMsg::MouseRel { dx: 30, dy: 0 }, now),
@@ -2070,15 +2181,324 @@ mod tests {
         assert!(fresh.asked_at.is_none());
     }
 
-    /// Off macOS no grant is waited on: an injector opened without permission
-    /// (a Noop where enigo would not open) stays as it was, as before #3164.
+    fn chord(code: u32, down: bool, mods: u8) -> InputMsg {
+        InputMsg::Key { code, down, mods }
+    }
+
+    fn one_session() -> (ArbiterState, ObjectId, Instant) {
+        let mut st = ArbiterState::default();
+        let a = sid();
+        let now = Instant::now();
+        st.open(a, "A".into(), true, None, now);
+        (st, a, now)
+    }
+
+    fn plain() -> EventPlan {
+        EventPlan::Inject {
+            pre: vec![],
+            post: vec![],
+        }
+    }
+
+    /// #3046 — a chord sent as one key plus `mods`, with no modifier frame:
+    /// the soft keyboard's sticky Ctrl, a controller's one-key chord. The whole
+    /// press goes out on the `down`, and nothing is left for a lost frame to
+    /// strand: a session that dies right after it has nothing to release.
+    #[test]
+    fn a_chord_in_mods_is_tapped_whole_and_leaves_nothing_down() {
+        let (mut st, a, now) = one_session();
+        assert_eq!(
+            st.plan(a, &chord(0x06, true, 0x01), now),
+            EventPlan::Inject {
+                pre: vec![key(0xe0, true)],
+                post: vec![key(0x06, false), key(0xe0, false)],
+            }
+        );
+        assert!(st.release_held(a).is_empty());
+        assert!(st.close(a).is_empty());
+    }
+
+    /// The viewer's up frame for a tapped key presses nothing and releases no
+    /// modifier: the tap already let go of both.
+    #[test]
+    fn the_up_frame_after_a_tap_is_only_itself() {
+        let (mut st, a, now) = one_session();
+        st.plan(a, &chord(0x06, true, 0x01), now);
+        assert_eq!(st.plan(a, &chord(0x06, false, 0x01), now), plain());
+    }
+
+    /// A physical Ctrl is already down: pressing another would be a double
+    /// press, and the tap's release would lift the one the person still holds.
+    #[test]
+    fn a_held_modifier_is_not_pressed_again() {
+        let (mut st, a, now) = one_session();
+        st.plan(a, &chord(0xe0, true, 0x01), now);
+        assert_eq!(st.plan(a, &chord(0x06, true, 0x01), now), plain());
+        assert_eq!(st.plan(a, &chord(0x06, false, 0x01), now), plain());
+        assert_eq!(
+            st.close(a),
+            vec![key(0xe0, false)],
+            "the person's Ctrl stays theirs"
+        );
+    }
+
+    #[test]
+    fn the_right_hand_key_answers_the_bit_too() {
+        for (right, bit) in [(0xe4, 0x01), (0xe5, 0x02), (0xe6, 0x04), (0xe7, 0x08)] {
+            let (mut st, a, now) = one_session();
+            st.plan(a, &chord(right, true, bit), now);
+            assert_eq!(st.plan(a, &chord(0x06, true, bit), now), plain());
+        }
+    }
+
+    /// A modifier's own frame carries its own bit (`ev.ctrlKey` is true on
+    /// Ctrl's keydown), and a second modifier carries the first's. Those are
+    /// held like any key, never tapped.
+    #[test]
+    fn a_modifiers_own_frame_is_never_a_chord() {
+        let (mut st, a, now) = one_session();
+        assert_eq!(st.plan(a, &chord(0xe0, true, 0x01), now), plain());
+        let (mut st, a, now) = one_session();
+        assert_eq!(st.plan(a, &chord(0xe1, true, 0x03), now), plain());
+        assert_eq!(st.close(a), vec![key(0xe1, false)]);
+    }
+
+    #[test]
+    fn an_up_frame_never_taps() {
+        let (mut st, a, now) = one_session();
+        assert_eq!(st.plan(a, &chord(0x06, false, 0x0f), now), plain());
+    }
+
+    #[test]
+    fn a_chord_of_several_presses_in_order_and_releases_in_reverse() {
+        let (mut st, a, now) = one_session();
+        assert_eq!(
+            st.plan(a, &chord(0x06, true, 0x0f), now),
+            EventPlan::Inject {
+                pre: vec![
+                    key(0xe0, true),
+                    key(0xe2, true),
+                    key(0xe1, true),
+                    key(0xe3, true),
+                ],
+                post: vec![
+                    key(0x06, false),
+                    key(0xe3, false),
+                    key(0xe1, false),
+                    key(0xe2, false),
+                    key(0xe0, false),
+                ],
+            }
+        );
+    }
+
+    /// One bit held, one missing: only the missing one is pressed and let go,
+    /// and the one the person holds stays down.
+    #[test]
+    fn only_the_missing_bit_is_pressed() {
+        let (mut st, a, now) = one_session();
+        st.plan(a, &chord(0xe0, true, 0x01), now);
+        assert_eq!(
+            st.plan(a, &chord(0x06, true, 0x03), now),
+            EventPlan::Inject {
+                pre: vec![key(0xe1, true)],
+                post: vec![key(0x06, false), key(0xe1, false)],
+            }
+        );
+        assert_eq!(st.close(a), vec![key(0xe0, false)]);
+    }
+
+    /// FR-13: a viewer rewrites Ctrl to Cmd for a Mac host in the code and not
+    /// in `mods`, so there Cmd answers the Ctrl bit. Anywhere else it must not:
+    /// Win held is not Ctrl held.
+    #[test]
+    fn a_held_cmd_answers_the_ctrl_bit_only_on_a_mac_host() {
+        for cmd in [0xe3, 0xe7] {
+            let held = HashSet::from([Held::Key(cmd)]);
+            assert!(chord_tap(0x06, 0x01, &held, true).is_empty());
+            assert_eq!(chord_tap(0x06, 0x01, &held, false), vec![0xe0]);
+        }
+        // Held Ctrl never answers the Meta bit, on a Mac host or anywhere.
+        let held = HashSet::from([Held::Key(0xe0)]);
+        assert_eq!(chord_tap(0x06, 0x08, &held, true), vec![0xe3]);
+        assert_eq!(chord_tap(0x06, 0x08, &held, false), vec![0xe3]);
+    }
+
+    /// A key repeat from a chord with no modifier frame is one more whole tap.
+    #[test]
+    fn a_repeat_is_another_tap() {
+        let (mut st, a, now) = one_session();
+        let tap = EventPlan::Inject {
+            pre: vec![key(0xe0, true)],
+            post: vec![key(0x06, false), key(0xe0, false)],
+        };
+        assert_eq!(st.plan(a, &chord(0x06, true, 0x01), now), tap);
+        assert_eq!(st.plan(a, &chord(0x06, true, 0x01), now), tap);
+    }
+
+    /// A key the session was holding, then seen again with a chord the session
+    /// does not hold, ends released, so it can't be released a second time at
+    /// the session's end.
+    #[test]
+    fn a_held_key_a_chord_taps_is_no_longer_held() {
+        let (mut st, a, now) = one_session();
+        st.plan(a, &key(0x06, true), now);
+        st.plan(a, &chord(0x06, true, 0x01), now);
+        assert!(st.close(a).is_empty());
+    }
+
+    #[test]
+    fn a_denied_session_taps_nothing() {
+        let now = Instant::now();
+        let mut st = ArbiterState::default();
+        let w = sid();
+        st.open(w, "W".into(), false, None, now);
+        assert_eq!(st.plan(w, &chord(0x06, true, 0x01), now), EventPlan::Deny);
+    }
+
+    /// The other session's modifier is let go before this one's is pressed.
+    #[test]
+    fn the_fence_comes_before_the_chords_press() {
+        let (mut st, a, now) = one_session();
+        let b = sid();
+        st.open(b, "B".into(), true, None, now);
+        st.plan(a, &chord(0xe0, true, 0x01), now);
+        assert_eq!(
+            st.plan(b, &chord(0x06, true, 0x01), now),
+            EventPlan::Inject {
+                pre: vec![key(0xe0, false), key(0xe0, true)],
+                post: vec![key(0x06, false), key(0xe0, false)],
+            }
+        );
+    }
+
+    /// A viewer whose Ctrl was fenced away by another session still means
+    /// Ctrl+C when it presses C: the bit is answered by what it holds now.
+    #[test]
+    fn a_modifier_fenced_away_is_tapped_back() {
+        let (mut st, a, now) = one_session();
+        let b = sid();
+        st.open(b, "B".into(), true, None, now);
+        st.plan(a, &chord(0xe0, true, 0x01), now);
+        st.plan(b, &click(true), now);
+        assert_eq!(
+            st.plan(a, &chord(0x06, true, 0x01), now),
+            EventPlan::Inject {
+                pre: vec![key(0xe0, true)],
+                post: vec![key(0x06, false), key(0xe0, false)],
+            }
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct FailsOnLetters(Arc<std::sync::Mutex<Vec<InputMsg>>>);
+
+    impl crate::input::InputInjector for FailsOnLetters {
+        fn inject(&mut self, event: InputMsg) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(event.clone());
+            match event {
+                InputMsg::Key { code, .. } if !MODIFIER_CODES.contains(&code) => {
+                    anyhow::bail!("no such key")
+                }
+                _ => Ok(()),
+            }
+        }
+        fn has_permission(&self) -> bool {
+            true
+        }
+    }
+
+    /// ⚠️ What `pre` pressed is let go even when the key itself failed: the OS
+    /// refusing one letter must not cost the host a stuck Ctrl.
+    #[test]
+    fn a_failed_key_still_lets_go_of_its_chord() {
+        let sent = FailsOnLetters::default();
+        let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
+            Some(Box::new(sent.clone()));
+        inject_planned(
+            &mut injector,
+            &mut Regrant::default(),
+            &[key(0xe0, true)],
+            &chord(0x06, true, 0x01),
+            &[key(0x06, false), key(0xe0, false)],
+        );
+        assert_eq!(
+            *sent.0.lock().unwrap(),
+            vec![
+                key(0xe0, true),
+                chord(0x06, true, 0x01),
+                key(0x06, false),
+                key(0xe0, false),
+            ]
+        );
+    }
+
+    /// #2066 — off macOS no grant is waited on, so a Noop a first event cached
+    /// before a display or `/dev/uinput` existed is dropped, and the next event
+    /// opens whatever can open now. Master kept it until a restart.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn off_macos_an_unpermitted_injector_stays() {
-        assert!(!crate::input::os_grants_input());
+    fn off_macos_a_noop_is_opened_again() {
+        assert!(crate::input::os_grants_input());
         let mut injector: Option<Box<dyn crate::input::InputInjector + Send>> =
             Some(Box::new(crate::input::NoopInjector));
         refresh(&mut injector, &mut Regrant::default());
-        assert!(injector.is_some());
+        assert!(injector.is_none());
+    }
+
+    /// #2066 — a host that can never open one (a root daemon with no `DISPLAY`)
+    /// pays one open, and one warning, a minute while events arrive, not one a
+    /// second. A new session asks at once, from the shortest wait again.
+    #[test]
+    fn a_failing_open_backs_off_to_a_minute_and_a_session_starts_it_over() {
+        let mut at = Instant::now();
+        let mut r = Regrant::default();
+        for secs in [1, 2, 4, 8, 16, 32, 60, 60, 60] {
+            assert!(r.reopen(false, at, || true), "due after {at:?}");
+            let next = at + Duration::from_secs(secs);
+            assert!(
+                !r.reopen(false, next - Duration::from_millis(1), || panic!(
+                    "asked inside the wait of {secs} s"
+                )),
+                "inside the wait of {secs} s"
+            );
+            at = next;
+        }
+        r.session_opened();
+        assert!(r.reopen(false, at, || true), "a new session asks at once");
+        assert!(!r.reopen(false, at + Duration::from_millis(999), || panic!(
+            "asked inside the shortest wait"
+        )));
+        assert!(r.reopen(false, at + Regrant::EVERY, || true));
+    }
+
+    /// An open that worked ends the back-off: an injector that later loses its
+    /// permission starts from the shortest wait, not the longest.
+    #[test]
+    fn a_permitted_injector_ends_the_back_off() {
+        let mut at = Instant::now();
+        let mut r = Regrant::default();
+        for _ in 0..8 {
+            r.reopen(false, at, || true);
+            at += Regrant::AT_MOST;
+        }
+        assert_eq!(r.wait(), Regrant::AT_MOST);
+        assert!(!r.reopen(true, at, || panic!(
+            "a permitted injector is never asked about"
+        )));
+        assert_eq!(r.wait(), Regrant::EVERY);
+    }
+
+    /// macOS's 1 s poll of a grant nobody has given yet must not slow down: the
+    /// wait grows only with an open, never with a "no" from the OS.
+    #[test]
+    fn a_grant_not_given_keeps_the_shortest_wait() {
+        let mut at = Instant::now();
+        let mut r = Regrant::default();
+        for _ in 0..4 {
+            assert!(!r.reopen(false, at, || false));
+            assert_eq!(r.wait(), Regrant::EVERY);
+            at += Regrant::EVERY;
+        }
     }
 }

@@ -16,7 +16,6 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::acl::AgentForwardAcl;
@@ -131,9 +130,9 @@ pub struct AgentConfig {
     /// refusal that survives a compromised server. Defaulting it on would
     /// make the other three the whole story.
     ///
-    /// Commands inherit the daemon's identity — SYSTEM under a perMachine
-    /// Windows install, root under systemd. Turning this on is granting
-    /// root, and the admin UI says so.
+    /// Commands run as root under systemd; on Windows as SYSTEM once anchored
+    /// (FR-94), else as the console worker: the signed-in user, or SYSTEM in
+    /// SystemContext mode. Turning this on grants that, as the admin UI says.
     #[serde(default)]
     pub exec_enabled: bool,
 
@@ -150,6 +149,20 @@ pub struct AgentConfig {
     /// No effect on any other platform.
     #[serde(default)]
     pub macos_supervise_gui_worker: bool,
+
+    /// FR-43 P3 — on macOS, ONE device row: the GUI worker holds no enrollment
+    /// of its own (`run --supervised --unenrolled`), so the root daemon's row
+    /// serves every session. Read by the root daemon at its start, and only
+    /// with [`Self::macos_supervise_gui_worker`] on: with no supervisor there
+    /// is no worker to run that way.
+    ///
+    /// Default OFF: a person's enrollment on this Mac stays what the worker
+    /// runs on, and a Mac with none has no worker. Device-owned like the key
+    /// above, so it is absent from `DesiredConfig` and no server can push it.
+    ///
+    /// No effect on any other platform.
+    #[serde(default)]
+    pub macos_one_row: bool,
 
     /// FR-55 — whether this device asks the OS to stay awake so it remains
     /// reachable: `never` (default) | `on-ac` | `always`.
@@ -458,196 +471,6 @@ pub struct AgentConfig {
     #[serde(default)]
     pub ssh_activity_log: bool,
 
-    // ─── FR-90: Hive agent sessions ─────────────────────────────────────
-    // The device's own gates, every one of them default-deny, and none of them
-    // settable by the server: which local account runs a session and where it
-    // may run are the DEVICE's answer, so a compromised server can neither
-    // pick SYSTEM/root nor point a session at `/etc` (design §4.2, §13).
-    /// May this device RUN agent sessions (`rc:hive.start`)? Default
-    /// **`false`** — gate 4, the refusal that survives a compromised server,
-    /// like [`Self::exec_enabled`] and [`Self::ssh_enabled`]. A session is a
-    /// model running commands on this machine as one of its accounts.
-    #[serde(default)]
-    pub hive_enabled: bool,
-
-    /// Which local account a Roomler user's sessions run as:
-    /// `{ "<user id, or the user's proven email>" = "<account>" }`.
-    ///
-    /// **Unmapped means refused** (`no_account`) — never a fallback to the
-    /// daemon's own identity, and never an account the server names (the
-    /// start frame carries none). A mapping to a uid-0 account is refused at
-    /// launch too, by the same privilege path exec and SSH use.
-    #[serde(default)]
-    pub hive_accounts: BTreeMap<String, String>,
-
-    /// The folders sessions may run in, checked on the resolved path, so
-    /// `..` and a symlink out of a root do not count. **Empty means nowhere**,
-    /// never anywhere — the overlay ACL's `Some([])` lesson, applied before
-    /// anyone ships the other reading.
-    #[serde(default)]
-    pub hive_roots: Vec<String>,
-
-    /// The most sessions this device runs at once (`at_capacity` past it).
-    /// `None` = 4.
-    #[serde(default)]
-    pub hive_max_sessions: Option<u32>,
-
-    /// The harness binary (Claude Code), absolute. `None` = the first of
-    /// `~/.local/bin/claude`, `/usr/local/bin/claude`, `/usr/bin/claude` that
-    /// exists, the first one resolved in the mapped account's home.
-    #[serde(default)]
-    pub hive_harness: Option<String>,
-
-    /// FR-90 P0e — the command the DAEMON runs (as SYSTEM/root) to print the
-    /// model provider's API key. The key stays in the daemon: a session's
-    /// Claude Code gets a per-session token for the loopback model sidecar,
-    /// which checks it (this session, still running here at its fence, and a
-    /// device not offline past `offline_grace`) and swaps the key in on the
-    /// way out. Unset = no model credential, and a session's model calls fail
-    /// (a per-session config directory holds no login of its own).
-    #[serde(default)]
-    pub hive_api_key_helper: Option<String>,
-    /// FR-90 P0g — the provider workspace the model calls are made in, for
-    /// a key that is not scoped to one: the API then requires an
-    /// `anthropic-workspace-id` header on every call. The sidecar adds it
-    /// with the key; a session never sets it (field, 2026-10-07: such a key
-    /// answered every call `400 This API key is not scoped to a workspace`).
-    /// Unset = no header — right for a workspace-scoped key.
-    #[serde(default)]
-    pub hive_api_workspace_id: Option<String>,
-    /// FR-90 P1d-1 (AC7) — how long an update waits for running agent turns
-    /// before it restarts the daemon, which cuts every session's turn, in
-    /// seconds. A turn is a person's work in progress, so the wait holds a
-    /// server-pushed update too; it is bounded, so a busy session cannot hold
-    /// the device's updates back. `None` = 1800 (30 min); `0` = never wait.
-    #[serde(default)]
-    pub hive_update_wait_secs: Option<u32>,
-    /// FR-90 P1e — show the org's core memory to the sessions on this device:
-    /// the snapshot the server sends with a start, written into the session's
-    /// own config dir as `CLAUDE.md` and the auto-memory `MEMORY.md`. Default
-    /// OFF, and never pushable: Claude Code reads `CLAUDE.md` as the user's
-    /// own OVERRIDING instructions, so this is the one place server-authored
-    /// text reaches a session's model, and whether it may is the device
-    /// owner's call alone.
-    #[serde(default)]
-    pub hive_core_memory: bool,
-    /// FR-90 P1j — let the people who use this device adopt the Claude Code
-    /// sessions they run in a terminal (`roomler hive adopt`): mirrored into
-    /// this device's store and listed for their owner alone, read-only.
-    /// Default OFF, and never pushable: a terminal session passed none of
-    /// Hive's start gates, so whether this machine reports on its terminals
-    /// at all is the device owner's call alone. Each person still opts in
-    /// themselves, and their account must map in `hive_accounts`.
-    #[serde(default)]
-    pub hive_adopt: bool,
-    /// FR-90 decision 15 — on a Mac, run sessions as an account whose `sudo`
-    /// needs no password. Default OFF: such a start is refused, because
-    /// macOS's `sudo` reads the account's groups from the directory, so the
-    /// session would have root whatever groups it drops. Never pushable:
-    /// whether an agent on this machine may be root is the device owner's
-    /// call alone. Linux needs no such key: a session there cannot `sudo`.
-    #[serde(default)]
-    pub hive_allow_passwordless_sudo: bool,
-    /// FR-90 P2c — hold copies of the sessions this device's owner runs on
-    /// their other devices: a replica, which a promotion can move a session
-    /// to once its device is gone. Default OFF, and never pushable: a replica
-    /// is a plaintext copy of everything the agent saw, so whether this
-    /// device holds one is its owner's call alone. Off, it advertises no
-    /// `hive-replica` and refuses a join on its own word.
-    #[serde(default)]
-    pub hive_replica: bool,
-    /// FR-90 P2c — offer this device as an archive replica of the org: once
-    /// an `ADMINISTRATOR` designates it, it holds every session the org's
-    /// rules allow, for their retention. Counts only with `hive_replica` on.
-    /// Default OFF, never pushable: offering is the device owner's, as
-    /// designating is the org's.
-    #[serde(default)]
-    pub hive_archive: bool,
-    /// FR-90 P2c — the most this device keeps of the sessions it holds as a
-    /// replica, in MiB; `None` = no bound but the disk's. Never pushable: the
-    /// device owner's disk.
-    #[serde(default)]
-    pub hive_store_quota_mib: Option<u32>,
-    /// FR-90 P3-3 — let the org's vault lease values to the agent sessions on
-    /// this device. On, the daemon makes a vault key at start (in memory
-    /// only, a new one each start) and publishes its public half in the
-    /// primary enrollment's hello; off, it makes none, publishes none, and
-    /// the vault leases it nothing. Default OFF, and never pushable: whether
-    /// org secrets are ever decrypted on this machine is the device owner's
-    /// call alone, as whether sessions run here at all is `hive_enabled`'s.
-    #[serde(default)]
-    pub vault_enabled: bool,
-    /// FR-90 P3-4d-2 — report to the organization what this device does with
-    /// the values its vault leases it: each command a session ran with them
-    /// (the program and how it ended) and each file it wrote (the name),
-    /// never a value. Off by default because it is the DEVICE that decides
-    /// what it says about itself, as `ssh_activity_log` is; the org's record
-    /// of what it released lives in `vault_audit` and does not depend on this
-    /// key. Never pushable.
-    #[serde(default)]
-    pub vault_activity_log: bool,
-    /// FR-90 P3-7-3c — offer the agent sessions on this device their own
-    /// egress: `net_socks` and `net_forward`, a loopback listener per call,
-    /// served to the session's account alone, its flows leaving from another
-    /// device of the organization as its vault and tunnel policies decide.
-    /// Only beside `vault_enabled`. Default OFF, and never pushable: whether
-    /// a session here reaches a network beyond this device is the owner's call.
-    #[serde(default)]
-    pub hive_net: bool,
-    /// FR-90 P3-8-2b-2 — offer the agent sessions on this device `ssh_run`:
-    /// one command on another device of the organization over Roomler SSH,
-    /// as the account that device's SSH policy maps (which may be SYSTEM or
-    /// root there), its key minted by this daemon for the one call. Only
-    /// beside `vault_enabled`: the vault decides each call, and a person
-    /// approves it. Default OFF, and never pushable: whether a session here
-    /// reaches into another device is the owner's call.
-    #[serde(default)]
-    pub hive_ssh: bool,
-    /// FR-90 P3b-1b-2 — run every agent session on this device in Claude
-    /// Code's sandbox, its commands' connections sent through the session's
-    /// egress proxy, each host decided by the organization's vault
-    /// (`net:egress`; decisions 27 and 28). Only beside `vault_enabled`. On
-    /// Windows, where no sandbox runs, every session gets the proxy named in
-    /// its environment, advisory (P3b-5-1, decision 30). Default OFF, and
-    /// never pushable: whether a session here reaches the network only as
-    /// the vault decides is the owner's call.
-    #[serde(default)]
-    pub hive_egress: bool,
-    /// FR-90 P8-2a-1 — run a worker beside each agent session on this device
-    /// (`roomlerd hive-worker`, the same binary as the daemon's supervised
-    /// child) and, P8-2d-1, one for the device itself, so a fault in what one
-    /// serves costs that worker and never the daemon. Default OFF, and never
-    /// pushable: how this device's own processes are arranged is the owner's
-    /// call. Read as the daemon starts: a change waits for its next start.
-    #[serde(default)]
-    pub hive_worker: bool,
-    /// FR-90 P4-3b-1 — what this device's knowhow scans read (decision 38):
-    /// absolute paths, a folder walked for its git checkouts, each read as
-    /// the account that owns it and never as the daemon, for metadata alone.
-    /// **Empty means nothing is read** (the scan answers `no_roots`), never
-    /// everything. Read from this file again at each scan, so an edit takes
-    /// the next one, and never pushable: what a device reads is its owner's
-    /// call, not the server's.
-    #[serde(default)]
-    pub knowhow_scan_roots: Vec<String>,
-    /// FR-90 P4-3b-3 — whether this device's knowhow scans report the TCP
-    /// ports it listens on (decision 47): each port, its bound address and
-    /// the process holding it, read by the daemon from the system's own
-    /// table. Default **off**: a listener is under no root, and its process
-    /// names software a person runs. Read from this file again at each scan,
-    /// and never pushable.
-    #[serde(default)]
-    pub knowhow_scan_listeners: bool,
-    /// FR-90 P4-5-1b — where this device's knowhow probes may go (decision
-    /// 53), in [`crate::probe_reach`]'s syntax (`100.64.0.0/10:22`,
-    /// `db.example.com:5432`, `*.example.com:443`). **Empty means nowhere**:
-    /// every probe is answered `not_allowed`, since a probe leaves from
-    /// inside this device's own network. Link-local and the cloud metadata
-    /// addresses are never reached, whatever it lists. Read from this file
-    /// again at each probe, and never pushable: where a device connects to on
-    /// the map's word is its owner's call, not the server's.
-    #[serde(default)]
-    pub knowhow_probe_reach: Vec<String>,
     /// FR-89 — stream a one-shot command's output (`ssh <node> 'cmd'`) to
     /// the client as it is produced. Default **on**.
     ///
@@ -794,6 +617,12 @@ pub struct AgentConfig {
     /// needed none of it (`ROOMLERD_WS_REPLACED_EXIT`).
     #[serde(default)]
     pub ws_replaced_exit: Option<bool>,
+    /// FR-28 — redial the control WS and the central `/derp` WS at a flat pace
+    /// while the front load balancer answers 502, instead of climbing the ladder
+    /// (`ROOMLERD_WS_FLAT_REDIAL`). Built-in default: OFF. See `ws_flat_redial`
+    /// in the config surface.
+    #[serde(default)]
+    pub ws_flat_redial: Option<bool>,
     /// C4 stage 1 — the standing warm TURN/UDP allocation, established
     /// while UDP works and kept alive so corp-VPN flow-grandfathering
     /// preserves a UDP relay leg across a VPN connect. Measurement-only
@@ -847,6 +676,13 @@ pub struct AgentConfig {
     /// Built-in default: 750.
     #[serde(default)]
     pub overlay_netmon_debounce_ms: Option<u32>,
+    /// FR-65 P3 — seconds a signal burst with no snapshot delta waits behind
+    /// the last forced revalidation
+    /// (`ROOMLERD_OVERLAY_NETCHANGE_POKE_QUIET_SECS`, 0–3600). Built-in
+    /// default: 60. `0` restores the arm as it was before the gate. A real
+    /// network move never waits on this.
+    #[serde(default)]
+    pub overlay_netchange_poke_quiet_secs: Option<u32>,
     /// Force overlay coturn allocations onto the TURNS/TCP (TLS) tier —
     /// the corp-VPN field probe (`ROOMLERD_OVERLAY_RELAY_TLS`).
     /// Built-in default: off.
@@ -1854,6 +1690,13 @@ pub struct AgentConfig {
     #[serde(default)]
     pub last_run_unhealthy: bool,
 
+    /// #3289 — the boot of the OS the last run started in
+    /// ([`crate::boot_id::current`]), so the next start can tell a crash from
+    /// the OS restarting under the daemon ([`previous_run`]). `None` on a
+    /// config an older build wrote, or where the OS cannot say.
+    #[serde(default)]
+    pub last_run_boot: Option<String>,
+
     /// Last config-schema version this file was migrated to. Used by
     /// [`migrate`] to decide which migration steps to apply at startup.
     /// `None` (or missing in TOML) on pre-rc.18 configs — those run
@@ -2247,6 +2090,75 @@ impl AgentConfig {
         c.tunnel_routes = Vec::new();
         c.orgs = Vec::new();
         c
+    }
+
+    /// FR-43 P3a — the config a GUI worker with no enrollment runs on: this
+    /// file with every enrollment and every host-global role taken out, and
+    /// its signalling loop pointed at the stand-in control plane
+    /// (`roomlerd::unenrolled`). The person's session knobs stay: they are why
+    /// the worker reads the file at all.
+    ///
+    /// ⚠️ A VIEW, and never written back. An unmigrated person's enrollment is
+    /// still in the file, which is what makes `macos_one_row = false` a real
+    /// off: [`StartupWrites::read_only`] keeps the daemon's startup saves off
+    /// it, and every later writer reloads the file first.
+    ///
+    /// The root holds what this takes out, so a worker running any of it would
+    /// be a second one on the machine. Crash bookkeeping goes too: a worker
+    /// cannot install a package, so it has no rollback to count towards, and the
+    /// supervisor records its crashes on the root's enrollment.
+    pub fn for_unenrolled_worker(&self, server_url: &str, ws_url: &str, secret: &str) -> Self {
+        let mut c = self.clone();
+        c.server_url = server_url.to_string();
+        c.ws_url = Some(ws_url.to_string());
+        c.agent_token = secret.to_string();
+        c.agent_id = String::new();
+        c.tenant_id = String::new();
+        c.ephemeral = false;
+        c.orgs = Vec::new();
+        c.tunnel_routes = Vec::new();
+        c.overlay_enabled = false;
+        c.overlay_multi_org = false;
+        c.netstack_socks_port = None;
+        c.overlay_wg_secret_key = None;
+        c.overlay_exit_node_enabled = false;
+        c.overlay_exit_node = None;
+        c.overlay_advertised_routes = Vec::new();
+        c.advertise_routes = Vec::new();
+        c.advertise_local_subnets = false;
+        c.relay_server_enabled = None;
+        c.ssh_enabled = false;
+        c.ssh_host_key = None;
+        c.ssh_authorized_keys = Vec::new();
+        c.exec_enabled = false;
+        c.remote_config_enabled = false;
+        c.external_access_enabled = false;
+        c.auto_update = Some(false);
+        c.crash_count = 0;
+        c.last_crash_unix = 0;
+        c.last_run_unhealthy = false;
+        c.rollback_attempted = false;
+        c
+    }
+
+    /// FR-43 P3a — the file a worker with no enrollment writes when the person
+    /// has none: blank identity fields, and every default. `caps`, `record` and
+    /// `config set` load this file, and a person's own settings land in it.
+    pub fn for_person_with_no_enrollment(machine_name: &str) -> Result<Self> {
+        let mut cfg: Self = toml::from_str(
+            "server_url = \"\"\nagent_token = \"\"\nagent_id = \"\"\ntenant_id = \"\"\n\
+             machine_id = \"\"\nmachine_name = \"\"\n",
+        )
+        .context("the defaults of an empty config")?;
+        cfg.machine_name = machine_name.to_string();
+        Ok(cfg)
+    }
+
+    /// Does this file hold a primary enrollment? A person's file on a one-row
+    /// Mac does not (FR-43 P3): [`Self::for_person_with_no_enrollment`], or an
+    /// enrolled file the migration blanked.
+    pub fn has_primary_enrollment(&self) -> bool {
+        !self.agent_token.trim().is_empty() && !self.agent_id.trim().is_empty()
     }
 
     /// Per-entry runnability partition for the daemon supervisor: each
@@ -2657,6 +2569,48 @@ pub fn mark_clean_shutdown(cfg: &mut AgentConfig) {
     cfg.last_run_unhealthy = false;
 }
 
+/// #3289 — how the run before this one ended, as far as this start can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviousRun {
+    /// It marked itself clean or reached the clean-run threshold, or there was
+    /// no run before this one.
+    Clean,
+    /// It went away unannounced while the OS stayed up. The one case that counts
+    /// against this version ([`record_crash_at`]).
+    Crashed,
+    /// The OS restarted during it: a restart, a power cut, a kernel fault.
+    EndedWithTheOs,
+    /// Its service host watched it end, and that was not the daemon failing: the
+    /// session it ran in went away, or the host replaced it.
+    EndedByItsHost,
+}
+
+/// #3289 — a crash is the daemon dying on its own while the OS was up and nobody
+/// had asked it to go. `last_run_unhealthy` alone says only that nothing marked
+/// the last run clean, and Windows can end a worker before its service host hears
+/// of a restart: three ordinary restarts within five minutes of a self-update read
+/// as a crash loop, and a healthy device tried to roll itself back.
+///
+/// `boot_now` is [`crate::boot_id::current`]. Either boot unknown reads as the same
+/// boot, and `host_saw_no_crash` is true only when a service host says so: when in
+/// doubt this counts, because a real crash loop must still reach the rollback.
+pub fn previous_run(
+    cfg: &AgentConfig,
+    boot_now: Option<&str>,
+    host_saw_no_crash: bool,
+) -> PreviousRun {
+    if !cfg.last_run_unhealthy {
+        return PreviousRun::Clean;
+    }
+    if host_saw_no_crash {
+        return PreviousRun::EndedByItsHost;
+    }
+    match (cfg.last_run_boot.as_deref(), boot_now) {
+        (Some(then), Some(now)) if then != now => PreviousRun::EndedWithTheOs,
+        _ => PreviousRun::Crashed,
+    }
+}
+
 /// Record a crash at the given unix timestamp. Increments the
 /// counter when the prior crash was within `CRASH_WINDOW_SECS` of
 /// `now_unix`; otherwise starts a fresh crash window at 1.
@@ -2874,6 +2828,7 @@ pub fn test_fixture() -> AgentConfig {
         auto_grant_session: true,
         exec_enabled: false,
         macos_supervise_gui_worker: false,
+        macos_one_row: false,
         power_policy: String::new(),
         companion_autostart: true,
         remote_config_enabled: false,
@@ -2890,29 +2845,6 @@ pub fn test_fixture() -> AgentConfig {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
-        hive_enabled: false,
-        hive_accounts: BTreeMap::new(),
-        hive_roots: Vec::new(),
-        hive_max_sessions: None,
-        hive_harness: None,
-        hive_api_key_helper: None,
-        hive_api_workspace_id: None,
-        hive_update_wait_secs: None,
-        hive_core_memory: false,
-        hive_adopt: false,
-        hive_allow_passwordless_sudo: false,
-        hive_replica: false,
-        hive_archive: false,
-        hive_store_quota_mib: None,
-        vault_enabled: false,
-        vault_activity_log: false,
-        hive_net: false,
-        hive_ssh: false,
-        hive_egress: false,
-        hive_worker: false,
-        knowhow_scan_roots: Vec::new(),
-        knowhow_scan_listeners: false,
-        knowhow_probe_reach: Vec::new(),
         ssh_exec_streaming: true,
         overlay_quic: None,
         overlay_direct: None,
@@ -2932,6 +2864,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -2941,6 +2874,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -3074,6 +3008,7 @@ pub fn test_fixture() -> AgentConfig {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         config_schema_version: None,
         forward_acl: AgentForwardAcl::default(),
         virtual_desktop_apps: crate::apps_config::VirtualDesktopAppsConfig::default(),
@@ -3170,7 +3105,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3235,6 +3170,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
         ("OVERLAY_INIT_AUTH_FIRST", cfg.overlay_init_auth_first),
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
+        ("WS_FLAT_REDIAL", cfg.ws_flat_redial),
         ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
         ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),
@@ -3283,7 +3219,7 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 94]
 
 /// rc.280 — numeric twin of [`env_bridge_bools`] (decimal strings on the
 /// same fallback map).
-pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 32] {
+pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 33] {
     [
         ("OVERLAY_IFACE_METRIC", cfg.overlay_iface_metric),
         ("RATE_FACTOR_H264", cfg.rate_factor_h264),
@@ -3322,6 +3258,10 @@ pub fn env_bridge_numerics(cfg: &AgentConfig) -> [(&'static str, Option<u32>); 3
         ("SCALE_THREADS", cfg.scale_threads),
         ("RC_MAX_SESSIONS", cfg.rc_max_sessions),
         ("OVERLAY_DIRECT_PORT", cfg.overlay_direct_port),
+        (
+            "OVERLAY_NETCHANGE_POKE_QUIET_SECS",
+            cfg.overlay_netchange_poke_quiet_secs,
+        ),
         ("RELAY_SERVER_PORT", cfg.relay_server_port),
     ]
 }
@@ -3515,8 +3455,22 @@ pub fn default_config_path() -> Result<PathBuf> {
 ///   inherited ones go.
 ///
 /// A child keeps its owner: only the directory is taken for Administrators.
+///
+/// #3291 — a directory that already holds exactly what the steps write is
+/// left alone ([`already_hardened`], read in-process). Each save ran four
+/// `icacls` children, and one save is on every start's way to the capability
+/// probe: on a starved host each child waited as long as the load lasted.
+/// On that directory the steps change nothing. What a skip leaves out is the
+/// last step's `/T`: it took Users and Authenticated Users ACEs off entries
+/// BELOW the directory, and only SYSTEM, an administrator or the entry's own
+/// owner can put one there. The first two hold full control of the tree
+/// anyway, and an owner can grant its own SID again at any time, which the
+/// sweep never removed: it held none of them off.
 #[cfg(windows)]
 fn harden_machine_global_dir(dir: &std::path::Path) {
+    if already_hardened(dir) {
+        return;
+    }
     let d = dir.display().to_string();
     for (i, args) in HARDEN_STEPS.iter().enumerate() {
         match std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
@@ -3557,6 +3511,225 @@ const HARDEN_STEPS: [&[&str]; 4] = [
     &["/inheritance:r"],
     &["/remove", "*S-1-5-32-545", "*S-1-5-11", "/T"],
 ];
+
+/// #3291 — what [`harden_machine_global_dir`] reads of the directory before
+/// it runs anything: the owner, whether the DACL is protected, and each ACE.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirAcl {
+    /// The owner's SID, `S-1-5-32-544`.
+    owner: String,
+    /// `SE_DACL_PROTECTED`: the directory inherits nothing from its parent.
+    protected: bool,
+    /// `None` is a NULL DACL, which lets everyone do everything.
+    dacl: Option<Vec<AclEntry>>,
+}
+
+/// One ACE of a [`DirAcl`], in the order the DACL holds them.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AclEntry {
+    /// `ACE_HEADER.AceType`: [`ACE_ALLOW`], [`ACE_DENY`], or a kind that is
+    /// read no further, its `mask` 0 and its `sid` empty.
+    kind: u8,
+    /// `ACE_HEADER.AceFlags`.
+    flags: u8,
+    mask: u32,
+    sid: String,
+}
+
+/// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_DENIED_ACE_TYPE`.
+#[cfg(any(windows, test))]
+const ACE_ALLOW: u8 = 0;
+#[cfg(any(windows, test))]
+const ACE_DENY: u8 = 1;
+
+/// #3291 — `Ok` only when `acl` is exactly what [`HARDEN_STEPS`] leave on the
+/// directory: owned by Administrators, protected, and holding two ACEs and no
+/// other, full control with `(OI)(CI)` for SYSTEM and for Administrators. On
+/// such a directory the steps change nothing. Anything else is a reason to
+/// run them, an extra, deny or unknown ACE included, and `Err` names it.
+#[cfg(any(windows, test))]
+fn hardened(acl: &DirAcl) -> std::result::Result<(), String> {
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
+    const SYSTEM: &str = "S-1-5-18";
+    // icacls's `(OI)(CI)F`: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE, and
+    // FILE_ALL_ACCESS.
+    const OI_CI: u8 = 0x1 | 0x2;
+    const FULL: u32 = 0x001F_01FF;
+    if acl.owner != ADMINISTRATORS {
+        return Err(format!("it is owned by {}", acl.owner));
+    }
+    if !acl.protected {
+        return Err("it inherits from its parent".into());
+    }
+    let Some(aces) = &acl.dacl else {
+        return Err("it has no DACL".into());
+    };
+    // Each of the two grants once, in either order.
+    let mut wanted = vec![SYSTEM, ADMINISTRATORS];
+    for ace in aces {
+        let full_grant = ace.kind == ACE_ALLOW && ace.flags == OI_CI && ace.mask == FULL;
+        match wanted.iter().position(|sid| full_grant && *sid == ace.sid) {
+            Some(i) => {
+                wanted.swap_remove(i);
+            }
+            None => {
+                return Err(format!(
+                    "it holds an ACE of type {} with flags {:#x} and mask {:#x} for {}",
+                    ace.kind, ace.flags, ace.mask, ace.sid
+                ));
+            }
+        }
+    }
+    match wanted.first() {
+        Some(sid) => Err(format!("it grants {sid} no full control")),
+        None => Ok(()),
+    }
+}
+
+/// #3291 — whether [`harden_machine_global_dir`] may leave `dir` as it is:
+/// its owner and DACL, read in-process, are exactly the hardened state
+/// ([`hardened`]). A read that fails is a no.
+#[cfg(windows)]
+fn already_hardened(dir: &std::path::Path) -> bool {
+    let why = match dir_acl(dir) {
+        Ok(acl) => match hardened(&acl) {
+            Ok(()) => return true,
+            Err(why) => why,
+        },
+        Err(e) => format!("its ACL could not be read: {e}"),
+    };
+    tracing::debug!(dir = %dir.display(), %why, "config: hardening the machine-global dir");
+    false
+}
+
+/// #3291 — the owner and DACL of `dir`, read in-process: the check that saves
+/// a start four `icacls` children must not be a child itself.
+#[cfg(windows)]
+fn dir_acl(dir: &std::path::Path) -> std::io::Result<DirAcl> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
+        GetAce, GetAclInformation, GetSecurityDescriptorControl, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    };
+
+    let sid_string = |sid: PSID| -> std::io::Result<String> {
+        let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a SID inside the descriptor read below; on success `text`
+        // is a LocalAlloc'd string, freed here.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the NUL-terminated string the call above wrote.
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        // SAFETY: `len` units were just read from `text`.
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: allocated by ConvertSidToStringSidW, freed once.
+        unsafe { LocalFree(text as _) };
+        Ok(s)
+    };
+
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated path; `owner` and `dacl` point into `sd`, a
+    // LocalAlloc'd descriptor freed below.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+    let read = (|| {
+        let owner = sid_string(owner)?;
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: the descriptor read above.
+        if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let protected = control & SE_DACL_PROTECTED != 0;
+        if dacl.is_null() {
+            return Ok(DirAcl {
+                owner,
+                protected,
+                dacl: None,
+            });
+        }
+        let mut info = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        // SAFETY: `dacl` is an ACL inside `sd`; `info` is sized for the class.
+        let ok = unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut aces = Vec::with_capacity(info.AceCount as usize);
+        for i in 0..info.AceCount {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `i` < AceCount; `ace` points into the ACL.
+            if unsafe { GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: every ACE starts with an ACE_HEADER.
+            let header = unsafe { std::ptr::read_unaligned(ace as *const ACE_HEADER) };
+            // An allow or a deny ACE is the header (4 bytes), the mask (4),
+            // then the SID. Any other kind differs on its type alone.
+            let (mask, sid) = if header.AceType == ACE_ALLOW || header.AceType == ACE_DENY {
+                // SAFETY: the type says this is the layout, and GetAce hands
+                // back an ACE that lies whole inside the ACL.
+                let mask =
+                    unsafe { std::ptr::read_unaligned((ace as *const u8).add(4) as *const u32) };
+                // SAFETY: the SID starts 8 bytes in, inside the ACE.
+                (
+                    mask,
+                    sid_string(unsafe { (ace as *mut u8).add(8) } as PSID)?,
+                )
+            } else {
+                (0, String::new())
+            };
+            aces.push(AclEntry {
+                kind: header.AceType,
+                flags: header.AceFlags,
+                mask,
+                sid,
+            });
+        }
+        Ok(DirAcl {
+            owner,
+            protected,
+            dacl: Some(aces),
+        })
+    })();
+    // SAFETY: the descriptor GetNamedSecurityInfoW allocated, freed once.
+    unsafe { LocalFree(sd as _) };
+    read
+}
 
 #[cfg(target_os = "windows")]
 pub fn machine_global_config_path() -> PathBuf {
@@ -3829,9 +4002,8 @@ pub fn describe_unreadable(
     }
 }
 
-/// An error chain on one line, bounded: a TOML parse error carries a source
-/// snippet over several lines, which a progress row or a terminal line cannot
-/// show.
+/// An error chain on one line, bounded, which is what a progress row or a
+/// terminal line can show.
 fn one_line(text: &str) -> String {
     let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() > 300 {
@@ -3840,6 +4012,40 @@ fn one_line(text: &str) -> String {
     } else {
         joined
     }
+}
+
+/// #3086 — what may be said about a config that does not parse: where it stopped,
+/// and a key the schema wanted. Nothing of the file. A `toml` error quotes the
+/// line it stopped at in its `Display` and its `Debug`, and its message can quote
+/// a value (`invalid type: string "…"`), and this file holds the agent token and
+/// the overlay keys. A daemon's log goes to the server, and a wizard's page and a
+/// terminal show the same words.
+///
+/// So the parser's error ends here: what leaves is a string with no source, and
+/// nothing built on it can reach those words, however it is printed. The file is
+/// there to open at that line.
+fn parse_failure(raw: &str, e: &toml::de::Error) -> String {
+    let mut said = String::from("TOML parse error");
+    if let Some(before) = e.span().and_then(|span| raw.get(..span.start)) {
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        said.push_str(&format!(" at line {line}, column {column}"));
+    }
+    // The schema's word for a key it wanted, which no file can put there. It is
+    // the one message kept: a lost key otherwise reads as something near line 1.
+    // A key name read off the file never is, because a broken line can turn a
+    // value into one.
+    if let Some(field) = e
+        .message()
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.strip_suffix('`'))
+        && field
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        said.push_str(&format!(": missing field `{field}`"));
+    }
+    said
 }
 
 fn try_load(path: &PathBuf) -> Result<AgentConfig> {
@@ -3855,8 +4061,13 @@ fn try_load(path: &PathBuf) -> Result<AgentConfig> {
             raw.len()
         );
     }
-    let mut cfg: AgentConfig =
-        toml::from_str(&raw).with_context(|| format!("parsing config at {}", path.display()))?;
+    let mut cfg: AgentConfig = toml::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!(
+            "parsing config at {}: {}",
+            path.display(),
+            parse_failure(&raw, &e)
+        )
+    })?;
     // FR-101 P1b — TLS to the server whatever the file says, unless its owner
     // kept plaintext (`allow_plaintext_server`). Here, because every reader
     // parses through this function: the daemon, the probe, the recovery.
@@ -3886,12 +4097,14 @@ enum KeyStep {
 /// that knows it or left behind by a rollback. Paths only, never values: the
 /// file holds the agent token and the overlay keys.
 ///
-/// `Err` when `raw` does not parse as a config at all.
-fn unknown_keys(raw: &str) -> Result<Vec<Vec<KeyStep>>> {
+/// `None` when `raw` does not parse as a config at all. Not the parser's error,
+/// which quotes the file (#3086): no caller wants it, so none can print it.
+fn unknown_keys(raw: &str) -> Option<Vec<Vec<KeyStep>>> {
     let mut found = Vec::new();
-    let de = toml::de::Deserializer::parse(raw)?;
-    let _: AgentConfig = serde_ignored::deserialize(de, |path| found.push(key_steps(&path)))?;
-    Ok(found)
+    let de = toml::de::Deserializer::parse(raw).ok()?;
+    let _: AgentConfig =
+        serde_ignored::deserialize(de, |path| found.push(key_steps(&path))).ok()?;
+    Some(found)
 }
 
 fn key_steps(path: &serde_ignored::Path<'_>) -> Vec<KeyStep> {
@@ -4043,9 +4256,13 @@ fn merge_unknown_keys(
 /// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
 /// holds that this build does not model. `base` is the file being replaced:
 /// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
-/// the live file it then writes over parses as nothing. Before this, every
-/// save erased them: a key set ahead of the update that knows it was gone by
-/// the old daemon's stop, and a rollback erased every newer key for good.
+/// that live file may not even be there. Before this, every save erased them:
+/// a key set ahead of the update that knows it was gone by the old daemon's
+/// stop, and a rollback erased every newer key for good.
+///
+/// #3087 — a `base` that is there and does not read as a config holds no keys
+/// this can see, and its last good copy does. That is the config a recovery has
+/// just loaded, and [`read_merge_base`]'s callers name no base when they save it.
 ///
 /// A base with no such key is written exactly as before, byte for byte, and
 /// any failure to keep them saves `cfg` alone and says so: the worst case is
@@ -4056,31 +4273,29 @@ fn serialise_for(
     cfg: &AgentConfig,
 ) -> Result<String> {
     let plain = toml::to_string_pretty(cfg).context("serialising config")?;
-    let raw = match std::fs::read_to_string(base) {
-        Ok(raw) => raw,
-        // No file yet: a first save, nothing to keep.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(plain),
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                base = %base.display(),
-                error = %e,
-                "the config being replaced could not be read: keys this build does not know \
-                 in it, if any, are NOT kept through this save"
-            );
-            return Ok(plain);
-        }
+    let read = |file: &std::path::Path| {
+        let raw = std::fs::read_to_string(file).ok()?;
+        let unknown = unknown_keys(&raw)?;
+        Some((raw, unknown))
     };
-    // Said with a fixed string: a parse error quotes the line it stopped at,
-    // and the file holds the agent token and the overlay keys. A live file
-    // that does not parse is what `load` recovers from `.prev`, and a save
-    // over it keeps the copy's keys only when its caller names the copy.
-    let Ok(unknown) = unknown_keys(&raw) else {
+    // No file yet: a first save, nothing to keep.
+    if matches!(base.try_exists(), Ok(false)) {
+        return Ok(plain);
+    }
+    let copy = prev_path(path);
+    let (raw, base, unknown) = if let Some((raw, unknown)) = read(base) {
+        (raw, base, unknown)
+    } else if let Some((raw, unknown)) = read(&copy) {
+        (raw, copy.as_path(), unknown)
+    } else {
+        // Said with a fixed string: a parse error quotes the line it stopped
+        // at, and the file holds the agent token and the overlay keys.
         tracing::warn!(
             path = %path.display(),
             base = %base.display(),
-            "the config being replaced does not parse: keys this build does not know in it, \
-             if any, are NOT kept through this save"
+            "the config being replaced does not read as a config, and neither does its last \
+             good copy: keys this build does not know in them, if any, are NOT kept through \
+             this save"
         );
         return Ok(plain);
     };
@@ -4118,22 +4333,62 @@ fn serialise_for(
 /// process and file: after a rollback, or a key set ahead of the update that
 /// knows it, "my setting did nothing" has its answer in the log. Key paths
 /// only; the file holds secrets.
+/// FR-137 S-B7 (decision D11) — FR-90's 23 config keys, retired with Hive.
+/// Every recent agent wrote them, Hive host or not (`false` and `[]` included),
+/// so nearly every `config.toml` in the fleet carries them. They stay through
+/// every save (the unknown-key merge, S-B6: never add `deny_unknown_fields`),
+/// and a build from a revert reads them again. What they are not is news: the
+/// once-per-start WARN below leaves them out, or every host would log the same
+/// twenty-odd keys at every start.
+pub(crate) const RETIRED_KEYS: [&str; 23] = [
+    "hive_enabled",
+    "hive_accounts",
+    "hive_roots",
+    "hive_max_sessions",
+    "hive_harness",
+    "hive_api_key_helper",
+    "hive_api_workspace_id",
+    "hive_update_wait_secs",
+    "hive_core_memory",
+    "hive_adopt",
+    "hive_allow_passwordless_sudo",
+    "hive_replica",
+    "hive_archive",
+    "hive_store_quota_mib",
+    "vault_enabled",
+    "vault_activity_log",
+    "hive_net",
+    "hive_ssh",
+    "hive_egress",
+    "hive_worker",
+    "knowhow_scan_roots",
+    "knowhow_scan_listeners",
+    "knowhow_probe_reach",
+];
+
+/// Is this dotted path one of [`RETIRED_KEYS`], or inside one (the
+/// `hive_accounts` table)?
+fn is_retired_key(dotted: &str) -> bool {
+    RETIRED_KEYS.contains(&dotted.split('.').next().unwrap_or(dotted))
+}
+
 fn note_unknown_keys(path: &PathBuf) {
     static NOTED: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
     let Ok(raw) = std::fs::read_to_string(path) else {
         return;
     };
-    let Ok(unknown) = unknown_keys(&raw) else {
+    let Some(unknown) = unknown_keys(&raw) else {
         return;
     };
-    if unknown.is_empty() {
-        return;
-    }
     let keys = unknown
         .iter()
         .map(|s| dotted(s))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .filter(|k| !is_retired_key(k))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return;
+    }
+    let keys = keys.join(", ");
     {
         let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
         if noted.iter().any(|(p, k)| p == path && *k == keys) {
@@ -4174,6 +4429,9 @@ pub struct StartupWrites {
     /// after each of its own saves. `None` when it could not be read, which
     /// leaves the saves unguarded, as they all were before.
     seen: Option<Vec<u8>>,
+    /// FR-43 P3a — this daemon runs on a view of the file, so its copy is
+    /// never the file's to write ([`Self::read_only`]).
+    read_only: bool,
 }
 
 impl StartupWrites {
@@ -4186,6 +4444,18 @@ impl StartupWrites {
         Self {
             path: path.to_path_buf(),
             seen: std::fs::read(path).ok(),
+            read_only: false,
+        }
+    }
+
+    /// FR-43 P3a — for a process running on
+    /// [`AgentConfig::for_unenrolled_worker`]'s view: every save succeeds and
+    /// writes nothing, so a view never lands on the person's file.
+    pub fn read_only(path: &std::path::Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            seen: None,
+            read_only: true,
         }
     }
 
@@ -4194,6 +4464,9 @@ impl StartupWrites {
     /// read back, is not written either: an uninstall or an unenroll removed
     /// it, and a startup save must not bring the enrollment back.
     pub fn save(&mut self, cfg: &AgentConfig) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
         if let Some(seen) = &self.seen {
             let now = std::fs::read(&self.path).with_context(|| {
                 format!(
@@ -4570,6 +4843,58 @@ machine_name = "devbox"
         assert_eq!(try_load(&path).unwrap().machine_name, "renamed");
     }
 
+    /// FR-137 S-B6 / S-B7 — FR-90's 23 real keys, as a 0.4.199 save wrote
+    /// them (`hive_accounts` a whole table), survive two saves of a build that
+    /// no longer knows them, so a build from a revert finds every one of them
+    /// again, `hive_enabled = true` included. And they are no news: the
+    /// once-per-start WARN leaves them out, and only them.
+    #[test]
+    fn fr90s_retired_keys_survive_two_saves_and_are_not_warned_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let hive = "hive_enabled = true\nhive_roots = [\"/srv/work\"]\nhive_max_sessions = 2\n\
+            hive_harness = \"claude\"\nhive_api_key_helper = \"/usr/local/bin/key\"\n\
+            hive_api_workspace_id = \"ws1\"\nhive_update_wait_secs = 600\n\
+            hive_core_memory = false\nhive_adopt = true\nhive_allow_passwordless_sudo = false\n\
+            hive_replica = false\nhive_archive = false\nhive_store_quota_mib = 512\n\
+            vault_enabled = false\nvault_activity_log = false\nhive_net = false\n\
+            hive_ssh = false\nhive_egress = true\nhive_worker = false\n\
+            knowhow_scan_roots = []\nknowhow_scan_listeners = false\nknowhow_probe_reach = []\n";
+        let raw = format!(
+            "{hive}{}\n[hive_accounts]\nalice = \"alice\"\n",
+            minimal_toml()
+        );
+        std::fs::write(&path, raw).unwrap();
+        let mut want: Vec<String> = RETIRED_KEYS.iter().map(|k| k.to_string()).collect();
+        want.sort();
+        assert_eq!(unknown_names(&path), want, "all 23, and nothing else");
+
+        let mut cfg = load(&path).expect("a 0.4.199 file still loads");
+        cfg.machine_name = "renamed".into();
+        save(&path, &cfg).unwrap();
+        let back = try_load(&path).unwrap();
+        assert_eq!(back.machine_name, "renamed", "the change the save was for");
+        save(&path, &back).unwrap();
+        assert_eq!(unknown_names(&path), want, "and through the next save");
+        let table = saved_table(&path);
+        assert_eq!(table["hive_enabled"].as_bool(), Some(true));
+        assert_eq!(table["hive_egress"].as_bool(), Some(true));
+        assert_eq!(table["hive_store_quota_mib"].as_integer(), Some(512));
+        assert_eq!(table["hive_accounts"]["alice"].as_str(), Some("alice"));
+        assert_eq!(table["hive_roots"][0].as_str(), Some("/srv/work"));
+
+        for k in RETIRED_KEYS {
+            assert!(is_retired_key(k), "{k}");
+        }
+        assert!(is_retired_key("hive_accounts.alice"), "inside the table");
+        assert!(!is_retired_key("a_key_from_a_newer_build"));
+        assert!(!is_retired_key("hive"), "a prefix is not a key");
+        assert!(
+            !is_retired_key("forward_acl.hive_enabled"),
+            "nor a key elsewhere"
+        );
+    }
+
     /// #2078 — only keys this build IGNORES are carried over. One it knows and
     /// the save cleared stays cleared, though the file being replaced had it.
     #[test]
@@ -4767,8 +5092,8 @@ machine_name = "devbox"
     /// for every thread: a parallel test with no subscriber of its own makes
     /// it `never`, and the capture misses that line for good, though this
     /// thread emitted it. Measured in CI on two of the save tests. With two,
-    /// every registered dispatcher is asked, as `pairing_terminal`'s and the
-    /// hive tests' captures hold. The scope ends first, then the second.
+    /// every registered dispatcher is asked, as `pairing_terminal`'s captures
+    /// hold. The scope ends first, then the second.
     struct CaptureGuard {
         _scoped: tracing::dispatcher::DefaultGuard,
         _second: tracing::Dispatch,
@@ -4894,6 +5219,194 @@ machine_name = "devbox"
             "a recovered config's unknown keys are named, as every load's are; got: {log}"
         );
         assert!(!log.contains("NOT kept"), "{log}");
+    }
+
+    /// #3087 — the two callers of [`read_merge_base`] (the setup wizard's
+    /// enrollment and `adopt-enrollment`) recover from `.prev` and then
+    /// [`save`] over the live file that does not parse. The save read the keys
+    /// to keep off that file, found nothing, and the recovered host lost them
+    /// with a WARN, which is the case [`load`]'s own recovery already handled.
+    #[test]
+    fn a_save_over_a_corrupt_live_file_keeps_the_last_good_copys_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).unwrap();
+        std::fs::write(
+            &path,
+            format!("a_key_from_a_newer_build = true\n{}", minimal_toml()),
+        )
+        .unwrap();
+        save(&path, &cfg).unwrap();
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"],
+            "the premise: the last good copy holds the key"
+        );
+
+        // The live file breaks; what those callers do next.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        let recovered = read_merge_base(&path)
+            .into_config()
+            .expect("recovered from .prev");
+        let (cap, _guard) = captured();
+        save(&path, &recovered).unwrap();
+        assert_eq!(
+            unknown_names(&path),
+            ["a_key_from_a_newer_build"],
+            "the recovered file lost the copy's key: {}",
+            cap.text()
+        );
+        assert!(!cap.text().contains("NOT kept"), "{}", cap.text());
+
+        // …and it survives the next save, whose rotation the copy goes through.
+        save(&path, &recovered).unwrap();
+        assert_eq!(unknown_names(&path), ["a_key_from_a_newer_build"]);
+        assert_eq!(
+            unknown_names(&prev_path(&path)),
+            ["a_key_from_a_newer_build"]
+        );
+
+        // With no copy that parses there is nothing to keep, and it says so.
+        std::fs::write(&path, "agent_token = \"broken\n").unwrap();
+        std::fs::write(prev_path(&path), "agent_token = \"broken too\n").unwrap();
+        save(&path, &recovered).unwrap();
+        assert!(unknown_names(&path).is_empty());
+        assert!(cap.text().contains("NOT kept"), "{}", cap.text());
+        assert_eq!(
+            std::fs::read_to_string(prev_path(&path)).unwrap(),
+            "agent_token = \"broken too\n",
+            "a save never rotates a file that does not parse into .prev"
+        );
+    }
+
+    /// Shaped like an agent token, and not one. Built at run time, because the
+    /// secret scanner reads a literal of this shape as a live credential.
+    fn token_shaped() -> String {
+        let segment = |word: &str| format!("eyJ{}", word.repeat(3));
+        [
+            segment("notreal"),
+            segment("alsofake"),
+            "nosignature".repeat(2),
+        ]
+        .join(".")
+    }
+
+    /// Every way a hand edit leaves a value on a line the parser stops at: the
+    /// syntax errors, whose `Display` quotes the line, and the schema errors,
+    /// whose message can quote the value itself.
+    fn lines_that_do_not_parse() -> Vec<(&'static str, String)> {
+        let t = token_shaped();
+        vec![
+            ("an unterminated string", format!("agent_token = \"{t}")),
+            ("a lost opening quote", format!("agent_token = {t}\"")),
+            ("no quotes at all", format!("agent_token = {t}")),
+            ("a value with no key", t.clone()),
+            (
+                "a string where a bool belongs",
+                format!("agent_token = \"tok\"\noverlay_enabled = \"{t}\""),
+            ),
+            ("an array of it", format!("agent_token = [\"{t}\"]")),
+            (
+                "the key twice",
+                format!("agent_token = \"{t}\"\nagent_token = \"{t}\""),
+            ),
+        ]
+    }
+
+    fn with_token_line(line: &str) -> String {
+        let raw = minimal_toml();
+        assert!(raw.contains("agent_token = \"tok\""), "the premise");
+        raw.replace("agent_token = \"tok\"", line)
+    }
+
+    fn assert_no_value(shape: &str, what: &str, text: &str) {
+        let token = token_shaped();
+        for part in token.split('.') {
+            assert!(
+                !text.contains(part),
+                "{shape}: {what} carries a value from the file: {text}"
+            );
+        }
+    }
+
+    /// #3086 — a config that does not parse puts nothing of the file in any error
+    /// or log. A `toml` error quotes the line it stopped at, so a typo on
+    /// `agent_token` printed the token: in the daemon's log, which uploads to the
+    /// server, on the wizard's page and in the terminal. Every reader goes
+    /// through [`try_load`], so nothing built on its error can carry a value.
+    #[test]
+    fn a_config_that_does_not_parse_puts_no_value_in_any_error_or_log() {
+        for (shape, line) in lines_that_do_not_parse() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            let raw = with_token_line(&line);
+            std::fs::write(&path, &raw).unwrap();
+            let (cap, _guard) = captured();
+
+            let err = try_load(&path).expect_err(shape);
+            assert_no_value(shape, "Display", &format!("{err}"));
+            assert_no_value(shape, "the chain", &format!("{err:#}"));
+            assert_no_value(shape, "Debug", &format!("{err:?}"));
+            for cause in err.chain() {
+                assert_no_value(shape, "a cause", &cause.to_string());
+            }
+
+            // What the wizard and `adopt-enrollment` show the person.
+            match read_merge_base(&path) {
+                MergeBase::Unreadable { reason, recovered } => {
+                    assert!(recovered.is_none(), "{shape}: no .prev yet");
+                    assert_no_value(shape, "the reason", &reason);
+                    let kept = Ok(unreadable_copy_path(&path));
+                    let told = describe_unreadable(&path, &reason, false, &kept);
+                    assert_no_value(shape, "what the person is told", &told);
+                }
+                other => panic!("{shape}: {other:?}"),
+            }
+
+            // The probe's DEBUG line, and both of `load`'s: the live file's error
+            // alone, then with the same line in the copy it falls back to.
+            assert!(read_if_present(&path).is_none(), "{shape}");
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+            std::fs::write(prev_path(&path), &raw).unwrap();
+            let err = load(&path).expect_err(shape);
+            assert_no_value(shape, "load's error", &format!("{err:?}"));
+
+            let log = cap.text();
+            assert!(
+                log.contains("config unreadable") && log.contains("treating as absent"),
+                "the premise: the loggers ran: {log}"
+            );
+            assert_no_value(shape, "the log", &log);
+        }
+    }
+
+    /// #3086 — what is left is still useful: the error says where, so the person
+    /// can open the file and look, and a lost key is named, because otherwise it
+    /// reads as a problem somewhere near line 1.
+    #[test]
+    fn a_parse_error_still_says_where_and_names_a_lost_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, with_token_line("agent_token = \"unterminated")).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("line 3"), "{err}");
+
+        // The schema's own word for it, not the file's.
+        let raw = minimal_toml().replace("agent_token = \"tok\"\n", "");
+        std::fs::write(&path, raw).unwrap();
+        let err = format!("{:#}", try_load(&path).unwrap_err());
+        assert!(err.contains("missing field `agent_token`"), "{err}");
+
+        // An unreadable file is still read apart from a parse error.
+        match read_merge_base(&path) {
+            MergeBase::Unreadable { reason, .. } => {
+                assert!(reason.contains("parsing config"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// #2078 — a key a newer build wrote into a route's entry follows THAT
@@ -5906,6 +6419,141 @@ tenant_id = "tid2"
         assert_eq!(cfg.last_crash_unix, 1_000_000);
     }
 
+    /// #3289 — one start, through the calls `run_cmd` makes at the top of a run.
+    fn start_a_run(cfg: &mut AgentConfig, boot: Option<&str>, host_word: bool, now: u64) {
+        if previous_run(cfg, boot, host_word) == PreviousRun::Crashed {
+            record_crash_at(cfg, now);
+        }
+        mark_run_starting(cfg);
+        cfg.last_run_boot = boot.map(str::to_string);
+    }
+
+    /// A device a self-update has just moved to 0.4.197: 0.4.196 is proven, the
+    /// new version is not yet, and the run the update's exit ended was clean.
+    fn just_updated() -> AgentConfig {
+        let mut cfg = fixture();
+        cfg.last_known_good_version = Some("0.4.196".into());
+        cfg
+    }
+
+    #[test]
+    fn a_clean_last_run_is_clean_whatever_the_boot_or_the_host_says() {
+        let mut cfg = fixture();
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, Some("8"), false), PreviousRun::Clean);
+        assert_eq!(previous_run(&cfg, Some("7"), true), PreviousRun::Clean);
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Clean);
+    }
+
+    #[test]
+    fn an_unhealthy_last_run_is_a_crash_only_while_the_os_stayed_up() {
+        let mut cfg = fixture();
+        mark_run_starting(&mut cfg);
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, Some("7"), false), PreviousRun::Crashed);
+        assert_eq!(
+            previous_run(&cfg, Some("8"), false),
+            PreviousRun::EndedWithTheOs
+        );
+        assert_eq!(
+            previous_run(&cfg, Some("7"), true),
+            PreviousRun::EndedByItsHost
+        );
+    }
+
+    /// When in doubt it counts: a real crash loop must still reach the rollback,
+    /// on a host that cannot name its boot and on a config an older build wrote.
+    #[test]
+    fn an_unknown_boot_reads_as_the_same_boot() {
+        let mut cfg = fixture();
+        mark_run_starting(&mut cfg);
+        assert_eq!(cfg.last_run_boot, None);
+        assert_eq!(previous_run(&cfg, Some("8"), false), PreviousRun::Crashed);
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Crashed);
+        cfg.last_run_boot = Some("7".into());
+        assert_eq!(previous_run(&cfg, None, false), PreviousRun::Crashed);
+    }
+
+    /// The field read, in its order: Windows kills the worker with its session
+    /// (0x40010004), the host spawns another, and only then hears of the restart.
+    /// That worker either stops cleanly or dies with the session too, and the next
+    /// boot's worker finds it. Two restarts took 0.4.197 to `crash_count=3`.
+    #[test]
+    fn restarts_after_an_update_never_reach_a_rollback() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        let mut tick = |cfg: &mut AgentConfig, boot: &str, host_word: bool| {
+            now += 20;
+            start_a_run(cfg, Some(boot), host_word, now);
+            assert_eq!(cfg.crash_count, 0, "nothing crashed");
+            assert!(!should_rollback(cfg, "0.4.197", now));
+        };
+        // The update's own worker.
+        tick(&mut cfg, "7", false);
+        // Restart 1: its session is torn down, the host's next worker stops cleanly.
+        tick(&mut cfg, "7", true);
+        mark_clean_shutdown(&mut cfg);
+        tick(&mut cfg, "8", false);
+        // Restart 2: the host's next worker dies with the session as well.
+        tick(&mut cfg, "8", true);
+        tick(&mut cfg, "9", false);
+        // Restart 3: no worker in between, the host never saw it end.
+        tick(&mut cfg, "10", false);
+    }
+
+    /// The other side of the same table: a worker that keeps dying on its own, with
+    /// the OS up and no word from a host, reaches the rollback on the third start.
+    #[test]
+    fn a_real_crash_loop_still_reaches_the_rollback() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, now);
+        for expected in 1..=3u32 {
+            assert!(!should_rollback(&cfg, "0.4.197", now));
+            now += 20;
+            start_a_run(&mut cfg, Some("7"), false, now);
+            assert_eq!(cfg.crash_count, expected);
+        }
+        assert!(should_rollback(&cfg, "0.4.197", now));
+    }
+
+    /// A restart in the middle of a crash loop neither counts nor wipes the count:
+    /// the two crashes before it are still crashes of this version.
+    #[test]
+    fn a_restart_during_a_crash_loop_keeps_the_count() {
+        let mut cfg = just_updated();
+        let mut now = 1_000_000;
+        start_a_run(&mut cfg, Some("7"), false, now);
+        for _ in 0..2 {
+            now += 20;
+            start_a_run(&mut cfg, Some("7"), false, now);
+        }
+        assert_eq!(cfg.crash_count, 2);
+        now += 60;
+        start_a_run(&mut cfg, Some("8"), false, now);
+        assert_eq!(cfg.crash_count, 2);
+        assert!(!should_rollback(&cfg, "0.4.197", now));
+        now += 20;
+        start_a_run(&mut cfg, Some("8"), false, now);
+        assert_eq!(cfg.crash_count, 3);
+        assert!(should_rollback(&cfg, "0.4.197", now));
+    }
+
+    #[test]
+    fn a_config_from_before_the_boot_key_loads_without_it() {
+        let mut cfg = fixture();
+        cfg.last_run_boot = Some("7".into());
+        let text = toml::to_string(&cfg).unwrap();
+        assert!(text.contains("last_run_boot = \"7\""));
+        let old: String = text
+            .lines()
+            .filter(|l| !l.starts_with("last_run_boot"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: AgentConfig = toml::from_str(&old).unwrap();
+        assert_eq!(back.last_run_boot, None);
+    }
+
     // ---- Migration tests (rc.18 P4) ---------------------------------
 
     #[test]
@@ -6283,6 +6931,121 @@ tenant_id = "tid2"
         assert!(!path.exists());
     }
 
+    /// FR-43 P3a — a GUI worker's view holds no enrollment and no host role,
+    /// because the root holds them and a second one on the machine would be a
+    /// defect, and it keeps the person's session knobs, which are why it reads
+    /// the file at all.
+    #[test]
+    fn a_workers_view_drops_every_enrollment_and_keeps_the_persons_knobs() {
+        let mut file = test_fixture();
+        file.ephemeral = true;
+        file.orgs = vec![OrgEntry {
+            label: "acme".into(),
+            server_url: "https://b.invalid".into(),
+            ws_url: None,
+            agent_token: "tok-acme".into(),
+            agent_id: "aid-acme".into(),
+            tenant_id: "t-acme".into(),
+            enabled: true,
+            overlay_mode: OrgOverlayMode::Off,
+            overlay_wg_secret_key: None,
+            overlay_wg_key_epoch: 0,
+            overlay_advertised_routes: Vec::new(),
+            overlay_exit_node_enabled: false,
+            advertise_routes: Vec::new(),
+            netstack_socks_port: None,
+        }];
+        file.overlay_enabled = true;
+        file.overlay_wg_secret_key = Some("WG".into());
+        file.ssh_enabled = true;
+        file.exec_enabled = true;
+        file.remote_config_enabled = true;
+        file.external_access_enabled = true;
+        file.auto_update = Some(true);
+        file.crash_count = 3;
+        file.rollback_attempted = true;
+        file.auto_grant_session = false;
+        file.keep_busy_enabled = true;
+        file.record_remote_enabled = true;
+        file.rc_clipboard = roomler_ai_remote_control::models::FeaturePolicy::Off;
+
+        let view =
+            file.for_unenrolled_worker("http://127.0.0.1:1", "ws://127.0.0.1:1/ws", "SECRET");
+
+        // Its signalling loop dials the stand-in, with the stand-in's secret.
+        assert_eq!(view.server_url, "http://127.0.0.1:1");
+        assert_eq!(view.ws_url.as_deref(), Some("ws://127.0.0.1:1/ws"));
+        assert_eq!(view.agent_token, "SECRET");
+        // No enrollment of any kind.
+        assert!(view.agent_id.is_empty());
+        assert!(view.tenant_id.is_empty());
+        assert!(!view.ephemeral);
+        assert!(view.orgs.is_empty());
+        assert!(!view.has_primary_enrollment());
+        // No host role, and no updater: the root owns the package.
+        assert!(!view.overlay_enabled);
+        assert_eq!(view.overlay_wg_secret_key, None);
+        assert!(!view.ssh_enabled);
+        assert!(!view.exec_enabled);
+        assert!(!view.remote_config_enabled);
+        assert!(!view.external_access_enabled);
+        assert_eq!(view.auto_update, Some(false));
+        assert_eq!(view.crash_count, 0);
+        assert!(!view.rollback_attempted);
+        // The person's own.
+        assert!(!view.auto_grant_session);
+        assert!(view.keep_busy_enabled);
+        assert!(view.record_remote_enabled);
+        assert_eq!(view.rc_clipboard, file.rc_clipboard);
+        assert_eq!(view.machine_name, file.machine_name);
+    }
+
+    /// FR-43 P3a — the file a person with no enrollment gets: it loads, in a
+    /// directory that wasn't there, reads as not enrolled, and holds a setting.
+    #[test]
+    fn a_blank_persons_file_loads_and_reads_as_no_enrollment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("first-run").join("config.toml");
+        let mut blank = AgentConfig::for_person_with_no_enrollment("mac").expect("blank");
+        blank.keep_busy_enabled = true;
+        save(&path, &blank).expect("save");
+
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded.machine_name, "mac");
+        assert!(loaded.keep_busy_enabled);
+        assert!(!loaded.has_primary_enrollment());
+        assert!(
+            test_fixture().has_primary_enrollment(),
+            "control: an enrolled file reads as one"
+        );
+    }
+
+    /// FR-43 P3a — a worker's startup saves leave the person's file as it was,
+    /// so their token survives for the switch's off. The control is the ordinary
+    /// startup save, which would have put the view over it.
+    #[test]
+    fn a_read_only_startup_save_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut file = test_fixture();
+        file.agent_token = "THE-PERSONS".into();
+        save(&path, &file).expect("save");
+        let on_disk = std::fs::read(&path).unwrap();
+        let view = load(&path).unwrap().for_unenrolled_worker(
+            "http://127.0.0.1:1",
+            "ws://127.0.0.1:1/ws",
+            "SECRET",
+        );
+
+        let mut writes = StartupWrites::read_only(&path);
+        writes.save(&view).expect("a save that writes nothing");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        let mut writes = StartupWrites::after_load(&path);
+        writes.save(&view).expect("the ordinary save");
+        assert_eq!(load(&path).unwrap().agent_token, "SECRET", "control");
+    }
+
     /// #3073 — ownership and the grant come before anything that can remove
     /// access: once `/inheritance:r` has run, SYSTEM keeps the directory by
     /// owning it, and a child it does not own only through an ACE the
@@ -6462,5 +7225,247 @@ tenant_id = "tid2"
                 assert!(dacl.contains(&ace), "{}: {ace} in {dacl}", child.display());
             }
         }
+    }
+
+    /// #3291 — the directory as the steps leave it, read on a SystemContext
+    /// host on 0.4.198: `O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`.
+    fn hardened_dir_acl() -> DirAcl {
+        let grant = |sid: &str| AclEntry {
+            kind: ACE_ALLOW,
+            flags: 0x3,
+            mask: 0x001F_01FF,
+            sid: sid.into(),
+        };
+        DirAcl {
+            owner: "S-1-5-32-544".into(),
+            protected: true,
+            dacl: Some(vec![grant("S-1-5-18"), grant("S-1-5-32-544")]),
+        }
+    }
+
+    /// #3291 — the steps are skipped for exactly that state, its two ACEs in
+    /// either order.
+    #[test]
+    fn harden_skips_only_the_exact_hardened_state() {
+        assert_eq!(hardened(&hardened_dir_acl()), Ok(()));
+        let mut swapped = hardened_dir_acl();
+        swapped.dacl.as_mut().unwrap().reverse();
+        assert_eq!(hardened(&swapped), Ok(()));
+    }
+
+    /// #3291 — and run for every way a directory can differ from it: whoever
+    /// owns it, whether it inherits, a DACL that is missing, empty or short,
+    /// any ACE beyond the two, a deny or a kind the read does not parse, and
+    /// either grant with a different mask or different flags.
+    #[test]
+    fn harden_runs_on_every_deviation() {
+        let ace = |kind: u8, flags: u8, mask: u32, sid: &str| AclEntry {
+            kind,
+            flags,
+            mask,
+            sid: sid.into(),
+        };
+        let with = |change: &dyn Fn(&mut DirAcl)| {
+            let mut acl = hardened_dir_acl();
+            change(&mut acl);
+            acl
+        };
+        let added = |extra: AclEntry| with(&|a| a.dacl.as_mut().unwrap().push(extra.clone()));
+        let system_grant = |change: &dyn Fn(&mut AclEntry)| {
+            with(&|a: &mut DirAcl| change(&mut a.dacl.as_mut().unwrap()[0]))
+        };
+        let cases: Vec<(&str, DirAcl)> = vec![
+            ("owned by SYSTEM", with(&|a| a.owner = "S-1-5-18".into())),
+            (
+                "owned by a user",
+                with(&|a| a.owner = "S-1-5-21-1-2-3-1001".into()),
+            ),
+            ("inheriting", with(&|a| a.protected = false)),
+            ("a NULL DACL", with(&|a| a.dacl = None)),
+            ("an empty DACL", with(&|a| a.dacl = Some(Vec::new()))),
+            (
+                "SYSTEM's grant alone",
+                with(&|a| {
+                    a.dacl.as_mut().unwrap().remove(1);
+                }),
+            ),
+            (
+                "SYSTEM's grant twice",
+                with(&|a| a.dacl.as_mut().unwrap()[1].sid = "S-1-5-18".into()),
+            ),
+            (
+                "Users may read",
+                added(ace(ACE_ALLOW, 0x3, 0x0012_00a9, "S-1-5-32-545")),
+            ),
+            (
+                "Authenticated Users may stat",
+                added(ace(ACE_ALLOW, 0, 0x0010_0080, "S-1-5-11")),
+            ),
+            (
+                "Everyone has full control",
+                added(ace(ACE_ALLOW, 0x3, 0x001F_01FF, "S-1-1-0")),
+            ),
+            (
+                "a user's own grant",
+                added(ace(ACE_ALLOW, 0x3, 0x001F_01FF, "S-1-5-21-1-2-3-1001")),
+            ),
+            (
+                "a deny",
+                added(ace(ACE_DENY, 0x3, 0x001F_01FF, "S-1-5-32-545")),
+            ),
+            ("an object ACE", added(ace(5, 0x3, 0, ""))),
+            (
+                "SYSTEM's grant as a deny",
+                system_grant(&|g| g.kind = ACE_DENY),
+            ),
+            ("SYSTEM reads only", system_grant(&|g| g.mask = 0x0012_00a9)),
+            (
+                "SYSTEM's grant as GENERIC_ALL",
+                system_grant(&|g| g.mask = 0x1000_0000),
+            ),
+            (
+                "SYSTEM's grant without (CI)",
+                system_grant(&|g| g.flags = 0x1),
+            ),
+            (
+                "SYSTEM's grant without (OI)",
+                system_grant(&|g| g.flags = 0x2),
+            ),
+            (
+                "SYSTEM's grant inherit-only",
+                system_grant(&|g| g.flags = 0x3 | 0x8),
+            ),
+            (
+                "SYSTEM's grant not propagated",
+                system_grant(&|g| g.flags = 0x3 | 0x4),
+            ),
+            (
+                "SYSTEM's grant inherited",
+                system_grant(&|g| g.flags = 0x3 | 0x10),
+            ),
+        ];
+        for (case, acl) in cases {
+            assert!(
+                hardened(&acl).is_err(),
+                "{case} must run the steps: {acl:?}"
+            );
+        }
+    }
+
+    /// #3291 — a read that fails runs the steps: a directory that is not there
+    /// has no ACL to read.
+    #[cfg(windows)]
+    #[test]
+    fn harden_runs_when_the_acl_cannot_be_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-there");
+        assert!(dir_acl(&missing).is_err());
+        assert!(!already_hardened(&missing));
+    }
+
+    /// #3291 — a directory to harden as the field has one: below another,
+    /// holding no ACE of its own and inheriting all it holds, as a directory
+    /// under ProgramData does. A fresh temp directory is not that everywhere:
+    /// on CI's runner one came with a full-control `(OI)(CI)` ACE of its own
+    /// for the runner's account. No step removes such an ACE, so the steps
+    /// could never leave that directory hardened, and the check rightly kept
+    /// running them. `/reset` drops whatever ACE the new directory was given
+    /// and leaves what its parent hands down.
+    #[cfg(windows)]
+    fn inheriting_dir(parent: &std::path::Path) -> std::path::PathBuf {
+        let dir = parent.join("roomler");
+        std::fs::create_dir(&dir).expect("a directory below the temp one");
+        let reset = std::process::Command::new("icacls")
+            .arg(&dir)
+            .arg("/reset")
+            .output()
+            .expect("icacls runs");
+        assert!(reset.status.success(), "{reset:?}");
+        let acl = dir_acl(&dir).expect("the owner reads its own directory");
+        // INHERITED_ACE.
+        let own = |ace: &AclEntry| ace.flags & 0x10 == 0;
+        assert!(
+            !acl.protected && !acl.dacl.iter().flatten().any(own),
+            "the directory inherits all it holds: {acl:?}"
+        );
+        dir
+    }
+
+    /// #3291 — the in-process read sees a DACL as `icacls` writes it. This
+    /// token owns the directory and keeps WRITE_DAC as its owner, so it needs
+    /// no elevation; an unelevated one cannot make Administrators the owner,
+    /// and the directory then counts as hardened only when it can.
+    #[cfg(windows)]
+    #[test]
+    fn harden_reads_the_dacl_icacls_writes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = inheriting_dir(temp.path());
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("icacls runs");
+            assert!(out.status.success(), "icacls {args:?}: {out:?}");
+        };
+        icacls(HARDEN_STEPS[1]);
+        icacls(HARDEN_STEPS[2]);
+        let acl = dir_acl(&dir).expect("the owner reads its own directory");
+        // Back to what it inherits, so the temp dir can be removed.
+        icacls(&["/reset"]);
+        assert!(acl.protected, "{acl:?}");
+        let mut aces = acl.dacl.clone().expect("a DACL");
+        aces.sort_by(|a, b| a.sid.cmp(&b.sid));
+        let grant = |sid: &str| AclEntry {
+            kind: ACE_ALLOW,
+            flags: 0x3,
+            mask: 0x001F_01FF,
+            sid: sid.into(),
+        };
+        assert_eq!(aces, vec![grant("S-1-5-18"), grant("S-1-5-32-544")]);
+        assert_eq!(
+            hardened(&acl).is_ok(),
+            acl.owner == "S-1-5-32-544",
+            "{acl:?}"
+        );
+    }
+
+    /// #3291 — on a directory that inherits all it holds, as the field's does,
+    /// the steps leave exactly the state the check skips on, so from the next
+    /// save on a hardened directory is left alone; and one that drifted (an
+    /// administrator granted Users) is hardened again. Taking the directory for
+    /// Administrators takes an elevated token, as #3073's case.
+    #[cfg(windows)]
+    #[test]
+    fn harden_once_then_skip_until_the_directory_drifts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = inheriting_dir(temp.path());
+        std::fs::write(dir.join("config.toml"), "x").unwrap();
+        assert!(!already_hardened(&dir), "a fresh directory inherits");
+        harden_machine_global_dir(&dir);
+        if !already_hardened(&dir) {
+            assert!(
+                std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
+                "this lane must run elevated for #3291's case: {:?}",
+                dir_acl(&dir)
+            );
+            eprintln!(
+                "skipped: this token cannot make Administrators the owner; run elevated to cover #3291"
+            );
+            return;
+        }
+        let granted = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)RX"])
+            .output()
+            .expect("icacls runs");
+        assert!(granted.status.success(), "{granted:?}");
+        assert!(!already_hardened(&dir), "a Users grant is a drift");
+        harden_machine_global_dir(&dir);
+        assert!(
+            already_hardened(&dir),
+            "the steps took the grant away again: {:?}",
+            dir_acl(&dir)
+        );
     }
 }

@@ -72,7 +72,7 @@ longer installed.
 The sentinel cannot tell those apart, because it does not record which version
 failed. `AttentionInfo` (`notify.rs:45`) is `{ path, message, reason }`, and the
 version exists only inside the free-text `message` written by
-`rollback_attention_msg` (`agents/roomlerd/src/app.rs:3211`).
+`rollback_attention_msg` (`agents/roomlerd/src/app.rs:2505`).
 
 ## Key design
 
@@ -117,16 +117,34 @@ from *never* to *not while the accused version is the one running*.
 
 ## Acceptance criteria
 
-- [ ] a `rollback_failed` sentinel naming version X is CLEARED on a healthy
+- [~] a `rollback_failed` sentinel naming version X is CLEARED on a healthy
       connect from a version that is not X
-- [ ] a `rollback_failed` sentinel naming version X is KEPT on a healthy connect
+      *Unit-locked: `a_rollback_sentinel_is_stale_once_a_different_build_connects`
+      (`crates/agent-core/src/notify.rs`). Never watched: the one field case below
+      was a legacy sentinel, with no `Failed-version:` line.*
+- [~] a `rollback_failed` sentinel naming version X is KEPT on a healthy connect
       from version X (the case the exemption exists for)
-- [ ] a legacy `rollback_failed` sentinel with no `Failed-version:` line is
+      *Unit-locked: `a_rollback_sentinel_is_kept_when_the_accused_build_is_the_one_running`.
+      Never watched.*
+- [x] a legacy `rollback_failed` sentinel with no `Failed-version:` line is
       cleared on a healthy connect
-- [ ] every other reason still clears exactly as before, and a sentinel with no
+      *`a_legacy_rollback_sentinel_with_no_version_is_stale`, and the field case below:
+      the sentinel on that Mac predates the line ("every `rollback_failed` sentinel in
+      the field today", above).*
+- [~] every other reason still clears exactly as before, and a sentinel with no
       `Reason:` line still clears
-- [ ] the companion's Attention panel goes away on the device that showed it,
+      *Unit-locked: `every_other_reason_still_clears_on_a_healthy_connect`,
+      `healthy_clear_spares_only_rollback`, `legacy_sentinel_parses_with_no_reason`. The
+      lock is falsifiable: restoring the old `return false` fails it (field log). Never
+      watched on a device.*
+- [x] the companion's Attention panel goes away on the device that showed it,
       without anyone deleting a file by hand
+      *Field, 2026-09-01, `macbook-pro` on 0.4.46: `needs-attention.txt` is gone,
+      shown by `ls` — not by the one-liner echo, which was a false positive
+      ([#1123 — P2](https://github.com/gjovanov/roomler-ai/issues/1123#issuecomment-5500523381)).*
+
+*Two ticked and three marked partial 2026-11-02. The partial ones need a sentinel
+planted on a device: no release since has raised one.*
 
 ## Out of scope
 

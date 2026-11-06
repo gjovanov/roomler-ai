@@ -26,6 +26,11 @@ flowchart TB
     BIN -.->|"Ed25519 tickets"| DERP
 ```
 
+**The blog is not on this path.** The edge sends `/blog/` and `/sitemap-blog.xml` to `roomler-blog`,
+nginx ×2 in the same namespace, fed from a MinIO bucket by a private publisher (FR-91). Rolling it
+touches no long-lived socket, and publishing a post never rolls `roomler2`:
+[public-site.md §11](public-site.md).
+
 ## The server image
 
 One multi-stage `Dockerfile`:
@@ -186,7 +191,7 @@ flowchart LR
 | Both image lanes | `hosted-image.yml:128`, `publish-selfhost-image.yml:151` | Run the fetch before `docker build`, into the build context, as a step with `continue-on-error` and an 8-minute timeout, so nothing in it can fail a build. Nothing in the Dockerfile downloads, so the layer is keyed by the file's content and a failed fetch can never be cached as an empty layer |
 | Bake + default | `Dockerfile:149` (`COPY`), `Dockerfile:155` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
-| Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:259` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
+| Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
 | Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
 | Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
 
@@ -232,10 +237,10 @@ docker compose up -d
 
 | Service | Port | Purpose |
 |---|---|---|
-| `mongo:7` | 27019→27017 | database (dev credentials in the compose file) |
-| `redis:7-alpine` | 6379 | pub/sub + presence |
+| `mongo:7.0.45`, pinned by digest | 27019→27017 | database (dev credentials in the compose file) |
+| `redis:7.4.12-alpine`, pinned by digest | 6379 | pub/sub + presence |
 | `ghcr.io/gjovanov/minio` | 9000 (API) / 9001 (console) | S3-compatible file storage: Chainguard's MinIO build, mirrored and pinned by digest, since `minio/minio` is gone from Docker Hub (#2034) |
-| `coturn/coturn` | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
+| `coturn/coturn:4.18.0-r0`, pinned by digest | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
 
 Then `cargo run --bin roomler-ai-api` (API :3000) and `cd ui && bun run dev`
 (SPA :5000, proxying `/api` + `/ws` to :5001).

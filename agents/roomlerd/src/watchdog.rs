@@ -5,9 +5,10 @@
 //! Each pump (signaling, encoder, capture) ticks the watchdog after
 //! every iteration. A background tokio task scans for stalls and
 //! force-exits the process via `std::process::exit(2)` when one is
-//! detected — relying on the OS supervisor (Scheduled Task on
-//! Windows with `RestartOnFailure`, `Restart=on-failure` on systemd,
-//! `KeepAlive` on macOS) to relaunch a healthy copy.
+//! detected — relying on the OS supervisor (the service's on Windows,
+//! `Restart=on-failure` on systemd, `KeepAlive` on macOS) to relaunch a
+//! healthy copy. The per-user Scheduled Task relaunches no exit, so that one
+//! stays down until the next sign-in (#3295).
 //!
 //! Why force-exit instead of panic? A panic on the watchdog task
 //! doesn't unwind the application — `tokio::spawn` swallows it, the
@@ -142,15 +143,12 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 /// ⚠️ **Windows side-effect, accepted deliberately.** Nothing distinguishes
 /// a supervisor-spawned worker from a directly launched one — both run
 /// `Command::Run` — so the perUser *Scheduled Task* flavour now also exits
-/// non-zero when it loses the lock, which trips its `<RestartOnFailure>`
-/// (10 attempts, 1 min apart, then it stops for good). That is bounded and
-/// self-terminating, unlike the supervisor loop this fixes, and it is
-/// arguably the better signal: exiting 0 left the task reporting SUCCESS
-/// while doing nothing, so an operator who had installed two conflicting
-/// flavours got no indication at all. A "last run failed" task is a
-/// visible, actionable state. If the 10 launches ever matter, the fix is a
-/// supervised-worker marker on the spawn — not reverting to 0, which is
-/// ambiguous with a self-update.
+/// non-zero when it loses the lock. Its `<RestartOnFailure>` restarts no exit
+/// (measured, #3292), so nothing loops, and it is arguably the better signal:
+/// exiting 0 left the task reporting SUCCESS while doing nothing, so an
+/// operator who had installed two conflicting flavours got no indication at
+/// all. A "last run failed" task is a visible, actionable state. Do not revert
+/// to 0, which is ambiguous with a self-update.
 ///
 /// Emitted by the `AcquireOutcome::AlreadyRunning` arm in `main.rs`.
 /// ⚠️ Three places must agree, in three different files, with nothing
@@ -185,7 +183,7 @@ pub const ALREADY_RUNNING_EXIT_CODE: i32 = 8;
 ///   * **the FR-43 macOS supervisor** respawns any exit after ≥ 1 s.
 ///   * **the Windows Scheduled Task**: the caller runs `roomlerd service
 ///     start` once the old process is gone (`restart_by: caller`); the
-///     task's own `<RestartOnFailure>` is at most a floor a minute later.
+///     task restarts no exit by itself (#3292).
 ///   * **the Windows SCM supervisor** does NOT see it: an SCM worker exits
 ///     **0**, which `decide_exit_reaction` already maps to an immediate
 ///     `Respawn` (and which an SCM host older than D3 respawns too). The
@@ -608,8 +606,9 @@ fn force_exit_on_runtime_stall(wd: &Watchdog, stuck_for: Duration) {
     // P5/A2 — this exit bypasses RAII; drop any exit-node split-default
     // first so a stalled host doesn't stay blackholed until the supervisor's
     // restart reconciles it. First of all (#3018): the evidence below may
-    // take its whole budget.
-    crate::purge_exit_routes();
+    // take its whole budget. #3440 — bounded: the supervisor's restart is
+    // what this exit is for, and a slow DNS purge goes on in the replacement.
+    crate::purge_exit_routes_before_restart();
     let pumps = wd
         .pump_ages_now(Instant::now())
         .unwrap_or_else(|| "unknown, their lock is held".to_string());
@@ -700,8 +699,9 @@ pub fn force_exit_on_stall(stalled: &[(&'static str, Duration)]) -> bool {
 
     // P5/A2 — bypasses RAII; drop any exit-node split-default so the stall
     // doesn't leave the host blackholed until the supervisor restarts it.
-    // Before the evidence (#3018), which may take its whole budget.
-    crate::purge_exit_routes();
+    // Before the evidence (#3018), which may take its whole budget. #3440 —
+    // bounded, as the watchdog-of-watchdog's is.
+    crate::purge_exit_routes_before_restart();
 
     // Phase 1B (Task 9): emit a crash sidecar BEFORE process-exit
     // so the next agent startup can upload it to roomler.ai. Worker

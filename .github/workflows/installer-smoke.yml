@@ -40,6 +40,8 @@ on:
     branches: [master]
     paths:
       - 'agents/roomlerd/**'
+      - 'agents/roomlerdw/**'
+      - 'agents/roomler-msi-ca/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   # Also on PRs — but only those touching the INSTALLER surface, not the whole
@@ -62,6 +64,10 @@ on:
     paths:
       - 'agents/roomlerd/wix/**'
       - 'agents/roomlerd/wix-perMachine/**'
+      # #3292 — what the per-user MSI's task, custom actions and shortcut run,
+      # and what the registration writes.
+      - 'agents/roomlerdw/**'
+      - 'agents/roomlerd/src/service.rs'
       - 'agents/roomlerd/packaging/windows/**'
       # The macOS packaging was missing here, so the postinstall — the script
       # that decides whether the root daemon lives or is DELETED — could change
@@ -80,6 +86,9 @@ on:
       # code that shares the file changes far more often than the installer.
       - 'agents/roomlerd/src/win_service/lifecycle.rs'
       - 'agents/roomlerd/src/win_service/environment.rs'
+      # #3375 — the custom-action DLL the per-Machine MSI loads on every
+      # upgrade: a change to it changes what an update keeps.
+      - 'agents/roomler-msi-ca/**'
       - '.github/workflows/installer-smoke.yml'
       - 'scripts/macos-productbuild-gated.sh'
   workflow_dispatch: {}
@@ -182,6 +191,31 @@ jobs:
           }
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
+          # #3292: the windowless launcher the per-user Scheduled Task runs.
+          cargo build -p roomlerdw --release
+          if (-not (Test-Path target\release\roomlerdw.exe)) {
+            Write-Host "::error::roomlerdw.exe not produced — LauncherExe harvest would fail (LGHT0103)"
+            exit 1
+          }
+
+      # #3375: the per-Machine MSI's custom-action DLL (agents/roomler-msi-ca),
+      # built as release-agent.yml builds it: the CRT linked in, in a target
+      # dir of its own so the flag never reaches another crate. msiexec loads
+      # it from the MSI's Binary table, alone in a temp folder, on machines
+      # that may have no VC++ redistributable. A plain build of the same crate
+      # is kept aside for the import audit's negative control below. Before
+      # the payload signing, which it joins.
+      - name: "Build the per-Machine MSI's custom-action DLL (#3375)"
+        shell: pwsh
+        run: |
+          cargo build -p roomler-msi-ca --release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\msi-ca" -Force | Out-Null
+          Copy-Item target\release\roomler_msi_ca.dll "$env:RUNNER_TEMP\msi-ca\plain-crt.dll" -Force
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo build -p roomler-msi-ca --release --target-dir target\msi-ca
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item target\msi-ca\release\roomler_msi_ca.dll target\release\roomler_msi_ca.dll -Force
 
       # Mirrors release-agent.yml's payload-signing placement exactly: after
       # the binaries are built, BEFORE the third-party DLLs (wintun, VC-CRT)
@@ -198,6 +232,8 @@ jobs:
           files: |
             target\release\roomlerd.exe
             target\release\roomler-shim.exe
+            target\release\roomlerdw.exe
+            target\release\roomler_msi_ca.dll
           mode:               local
           require:            'true'
           # The action imports the self-signed cert into the runner's Root +
@@ -275,6 +311,43 @@ jobs:
           if (-not $msi) { throw 'MSI not produced by cargo-wix' }
           'MSI_PATH=' + $msi.FullName | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "MSI ready: $($msi.FullName) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
+
+      # #3292: a rollback plays the script backwards, so a failed upgrade restores
+      # the task and the daemon only from ahead of RemoveExistingProducts, once the
+      # old files are back, and the task must come back before the start. Anything
+      # spooled ahead of that action fails every upgrade with Error 2613, so an
+      # InstallExecute has to flush them right before it. WiX orders actions that share
+      # a parent by itself, so this reads what it built.
+      - name: "Assert the rollback actions' order in the built MSI (#3292)"
+        shell: pwsh
+        run: |
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($env:MSI_PATH, 0))
+          function Get-Seq([string]$action) {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Sequence FROM InstallExecuteSequence WHERE Action='$action'"))
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $row) { throw "$action is not in InstallExecuteSequence" }
+            [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          }
+          $seq = @('InstallInitialize', 'DaemonBackOnRollback', 'AutostartBackOnRollback', 'InstallExecute', 'RemoveExistingProducts', 'InstallFiles') | ForEach-Object { Get-Seq $_ }
+          Write-Host "InstallInitialize, DaemonBackOnRollback, AutostartBackOnRollback, InstallExecute, RemoveExistingProducts, InstallFiles: $($seq -join ', ')"
+          for ($i = 1; $i -lt $seq.Count; $i++) {
+            if ($seq[$i - 1] -ge $seq[$i]) { throw "out of order: $($seq -join ', ')" }
+          }
+          # Immediately ahead: anything between InstallExecute and the removal is spooled
+          # ahead of it again.
+          $between = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Action FROM InstallExecuteSequence WHERE Sequence > $($seq[3]) AND Sequence < $($seq[4])"))
+          [void]$between.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $between, $null)
+          if ($null -ne $between.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $between, $null)) { throw 'an action sits between InstallExecute and RemoveExistingProducts' }
+          # A rollback leaves a registration the next release cannot remove, and only
+          # this attribute lets that release go on (docs/installation.md).
+          $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @("SELECT Attributes FROM Upgrade WHERE ActionProperty='WIX_UPGRADE_DETECTED'"))
+          [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+          $row = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          $attributes = [int]$row.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          Write-Host "Upgrade.Attributes: $attributes"
+          if (($attributes -band 4) -eq 0) { throw 'msidbUpgradeAttributesIgnoreRemoveFailure is not set' }
 
       - name: Install the MSI (quiet, per-User)
         shell: pwsh
@@ -410,7 +483,7 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
           # msvcp140/vcruntime140* lock the app-local VcRedistCrt component
           # (fresh machines without the VC++ redist -- 2026-07-28 fix).
-          $mustExist = @('roomlerd.exe', 'roomler.exe', 'wintun.dll',
+          $mustExist = @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe', 'wintun.dll',
                          'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
           $missing = @()
           foreach ($f in $mustExist) {
@@ -477,7 +550,7 @@ jobs:
             param([switch]$Quiet)
             $found    = @()
             $appLocal = @()
-            foreach ($exe in @('roomlerd.exe', 'roomler.exe')) {
+            foreach ($exe in @('roomlerd.exe', 'roomler.exe', 'roomlerdw.exe')) {
               $path = Join-Path $installDir $exe
               if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
               $imports = & $dumpbin /dependents $path |
@@ -539,6 +612,41 @@ jobs:
             Move-Item $stash $victim
           }
 
+      # #3292 — Restart Manager stops nothing once the daemon runs through the
+      # windowless launcher, so the MSI's StopDaemon custom action is what ends
+      # it. Without that action `msiexec /x` still exits 0, and the daemon runs on
+      # with its files gone. The launcher is started by hand here, so no task
+      # instance exists for the action's `schtasks /End` fallback to reach: only
+      # the daemon's stop event can pass the assert below.
+      - name: "Start a daemon for the uninstall to stop (#3292)"
+        shell: pwsh
+        run: |
+          $cfgDir = Join-Path $env:APPDATA 'roomler\roomler\config'
+          New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+          # Nothing answers on this port, so the daemon retries and stays up.
+          @(
+            'server_url = "http://127.0.0.1:9"',
+            'agent_token = "smoke"',
+            'agent_id = "000000000000000000000000"',
+            'tenant_id = "000000000000000000000000"',
+            'machine_id = "smoke"',
+            'machine_name = "smoke"'
+          ) | Set-Content -Encoding ascii -Path (Join-Path $cfgDir 'config.toml')
+          $env:ROOMLERD_AUTO_UPDATE = '0'
+          $launcher = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerdw.exe'
+          Start-Process -FilePath $launcher -ArgumentList 'run', '--supervisor', 'task'
+          # Long enough to reach the wait on its stop event; a start on a slow
+          # guest had its row online in under 20 s. An action that runs before
+          # that finds no event, so a shorter sleep here reads as a false failure.
+          Start-Sleep -Seconds 45
+          $up = Get-Process roomlerd -ErrorAction SilentlyContinue
+          if (-not $up) {
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime | Select-Object -Last 1 | ForEach-Object { Get-Content -LiteralPath $_.FullName -Tail 40 }
+            throw 'the daemon did not stay up on a config with no server, so this lane proves nothing'
+          }
+          Write-Host "Daemon up under the launcher: pid $($up.Id)"
+
       - name: Uninstall the MSI (quiet)
         shell: pwsh
         run: |
@@ -553,6 +661,29 @@ jobs:
             throw "msiexec /x failed with exit $($proc.ExitCode)"
           }
           Write-Host 'Uninstall succeeded (exit 0)'
+
+      - name: "Assert the uninstall stopped the daemon (#3292)"
+        shell: pwsh
+        run: |
+          $left = Get-Process roomlerd, roomlerdw -ErrorAction SilentlyContinue
+          if ($left) {
+            $left | ForEach-Object { Write-Host "still running: $($_.Name) pid $($_.Id)" }
+            $left | Stop-Process -Force
+            throw 'msiexec /x exited 0 and the daemon runs on: is StopDaemon still in the MSI, before UnregisterAutostart?'
+          }
+          $logFile = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          # A daemon that died by itself between the two steps must not pass.
+          $asked = Select-String -LiteralPath $logFile.FullName -SimpleMatch 'asked this per-user daemon to stop'
+          if (-not $asked) {
+            Get-Content -LiteralPath $logFile.FullName -Tail 40
+            throw 'the daemon is gone, and its log does not say it was asked to stop'
+          }
+          Write-Host 'The uninstall asked the daemon to stop, and it left'
+          # The later steps start from a host with no config.
+          foreach ($root in $env:APPDATA, $env:LOCALAPPDATA) {
+            Remove-Item -Recurse -Force (Join-Path $root 'roomler') -ErrorAction SilentlyContinue
+          }
 
       - name: Assert cleanup — registry + install dir gone
         shell: pwsh
@@ -589,7 +720,7 @@ jobs:
           # must have been removed (Environment Part='last' +
           # implicit Permanent='no').
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
-          foreach ($f in @('roomlerd.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
+          foreach ($f in @('roomlerd.exe', 'roomlerdw.exe', 'roomler-agent.exe', 'roomler.exe', 'wintun.dll', 'msvcp140.dll', 'vcruntime140_1.dll')) {
             $p = Join-Path $installDir $f
             if (Test-Path $p) {
               throw "$f still at $p after uninstall — MSI uninstaller is broken"
@@ -637,7 +768,106 @@ jobs:
           if (-not $msi) { throw 'per-Machine MSI not produced by cargo-wix' }
           Write-Host "per-Machine MSI compiles clean: $($msi.Name) ($([math]::Round($msi.Length / 1MB, 2)) MiB)"
 
-      - name: "A hand-run per-Machine upgrade or reinstall keeps the service and the SystemContext mode (#1727, #3115)"
+      - name: "The per-Machine MSI carries the service's Environment: its tables and its DLL (#3375)"
+        # Read from the BUILT MSI, not the wxs: the order the carry depends on,
+        # that neither action can fail an upgrade, that the values stay out of
+        # the MSI's log, and the DLL itself, taken out of the Binary table.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem 'target/wix/*.msi' | Select-Object -First 1).FullName
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
+          function Get-Row([string]$sql) {
+            $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($sql))
+            [void]$view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null)
+            $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+          }
+          function Get-Field($row, [string]$kind) {
+            $row.GetType().InvokeMember($kind, 'GetProperty', $null, $row, ([object[]]@([int32]1)))
+          }
+          function Get-Seq([string]$action) {
+            $row = Get-Row "SELECT Sequence FROM InstallExecuteSequence WHERE Action='$action'"
+            if ($null -eq $row) { throw "$action is not in InstallExecuteSequence" }
+            [int](Get-Field $row 'IntegerData')
+          }
+          # The capture before the old product's removal (afterInstallInitialize),
+          # the restore once the new entry exists, and every SystemContext action
+          # after it: each restarts the service and decides the switch.
+          $order = @('CaptureServiceEnvironment', 'InstallInitialize', 'RemoveExistingProducts', 'InstallFiles',
+                     'RegisterService', 'SetRestoreServiceEnvironment', 'RestoreServiceEnvironment',
+                     'RollbackSystemContext', 'EnableSystemContext')
+          $seq = @($order | ForEach-Object { Get-Seq $_ })
+          Write-Host "$($order -join ', '): $($seq -join ', ')"
+          for ($i = 1; $i -lt $seq.Count; $i++) {
+            if ($seq[$i - 1] -ge $seq[$i]) { throw "out of order: $($seq -join ', ')" }
+          }
+          foreach ($a in 'DisableSystemContext', 'KeepSystemContext') {
+            if ((Get-Seq $a) -le (Get-Seq 'RestoreServiceEnvironment')) { throw "$a runs before RestoreServiceEnvironment" }
+          }
+          # msidbCustomActionTypeContinue (0x40): neither can fail an upgrade.
+          foreach ($a in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+            $type = [int](Get-Field (Get-Row "SELECT Type FROM CustomAction WHERE Action='$a'") 'IntegerData')
+            Write-Host "$a Type: $type"
+            if (($type -band 0x40) -eq 0) { throw "$a can fail the install: its Return is not 'ignore'" }
+          }
+          # CustomActionData is logged under the restore's own name.
+          $hidden = Get-Field (Get-Row "SELECT Value FROM Property WHERE Property='MsiHiddenProperties'") 'StringData'
+          Write-Host "MsiHiddenProperties: $hidden"
+          foreach ($p in 'RoomlerServiceEnvironment', 'RestoreServiceEnvironment') {
+            if (@($hidden -split ';') -notcontains $p) { throw "$p is not hidden from the MSI's log" }
+          }
+          $db = $null
+          [GC]::Collect()
+
+          # The DLL as the MSI carries it. msiexec loads it alone in a temp
+          # folder, so every import must ship with Windows. The runner HAS the
+          # VC++ redistributable, so a redistributable found in System32 here
+          # proves nothing: those are refused by name.
+          $out = Join-Path $env:RUNNER_TEMP 'msi-ca\dark'
+          dark.exe -nologo -x $out $msi (Join-Path $out 'per-machine.wxs') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dark.exe failed: $LASTEXITCODE" }
+          $dll = Join-Path $out 'Binary\RoomlerMsiCa'
+          if (-not (Test-Path $dll)) { throw "the MSI's Binary table has no RoomlerMsiCa" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+          function Get-Problems([string]$path) {
+            $imports = & $dumpbin /dependents $path |
+              Select-String -Pattern '^\s{4}(\S+\.dll)$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+            if (-not $imports) { return @('dumpbin listed no imports (parse broke?)') }
+            Write-Host "  $(Split-Path -Leaf $path) imports: $($imports -join ', ')"
+            @($imports | ForEach-Object {
+              if ($_ -match '^(msvcp|vcruntime|concrt|mfc|vcomp|msvcr)') { "$_ is a redistributable" }
+              elseif ($_ -match '^(api-ms-win-|ext-ms-win-)') { }
+              elseif (-not (Test-Path (Join-Path $env:SystemRoot 'System32' $_))) { "$_ does not ship with Windows" }
+            })
+          }
+          $problems = @(Get-Problems $dll)
+          if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host "::error::roomler_msi_ca.dll: $_" }
+            throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
+          }
+          $exports = (& $dumpbin /exports $dll) -join "`n"
+          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+            if ($exports -notmatch "\b$e\b") { throw "the DLL does not export $e" }
+          }
+          Write-Host 'OK: the DLL imports only what Windows ships, and exports both entry points'
+          # Negative control: the same crate built WITHOUT +crt-static imports the
+          # VC++ runtime, and the audit has to say so.
+          $neg = @(Get-Problems "$env:RUNNER_TEMP\msi-ca\plain-crt.dll")
+          if ($neg.Count -eq 0) { throw 'NEGATIVE CONTROL FAILED: the plain-CRT build passed the audit' }
+          Write-Host "OK: the plain-CRT build is refused: $($neg[0])"
+          if ($env:WIN_TEST_PFX_BASE64) {
+            $sig = Get-AuthenticodeSignature $dll
+            Write-Host "signature: $($sig.Status)"
+            if ($sig.Status -ne 'Valid') { throw "the DLL in the MSI is not signed: $($sig.Status)" }
+          }
+
+      - name: "A hand-run per-Machine upgrade or reinstall keeps the service, the SystemContext mode and the operator's entries (#1727, #3115, #3375)"
         # The per-Machine MSI's first INSTALL coverage. A person running
         # `msiexec /i` with no ENABLE_SYSTEM_CONTEXT used to switch
         # SystemContext OFF: the property defaulted to "0", and every install
@@ -667,6 +897,16 @@ jobs:
         # no hook in the product: the host's supervisor thread is held suspended.
         # Negative control: before #3115 that cell exits 1603 and leaves the
         # runner with no Roomler service.
+        #
+        # #3375 — and every other entry `roomlerd set-service-env-var` wrote:
+        # the kill switch ROOMLERD_SFTP_AS_USER=0, and one whose value holds
+        # every character the carry escapes. Each upgrade's removal of the old
+        # product deletes the service, and the MSI's two custom actions carry
+        # the entries across it. Asserted after every step. Then each action
+        # is made to fail on purpose (ROOMLER_TEST_CA_FAIL), and the upgrade
+        # must still complete, with only the entries lost. Then a repair (/fa)
+        # and the uninstall. No MSI log may hold a carried value.
+        # Negative control: on master the v2 cell fails (the entries are gone).
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -679,7 +919,7 @@ jobs:
           Copy-Item "$wixDir\main.wxs" "$wixDir\main.wxs.bak" -Force
           Copy-Item "agents\roomlerd\wix-perMachine\main.wxs" "$wixDir\main.wxs" -Force
           try {
-            foreach ($n in 1..4) {
+            foreach ($n in 1..6) {
               cargo wix -p roomlerd --nocapture --no-build --install-version "0.0.$n-smoke.1"
               if ($LASTEXITCODE -ne 0) { throw "cargo wix failed for v$n" }
               $msi = Get-ChildItem 'target/wix/*.msi' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -718,6 +958,32 @@ jobs:
             if ($products.Count -ne 1 -or $products[0].DisplayVersion -ne $version) {
               throw "${label}: want exactly one per-Machine product at $version, found: $(($products | ForEach-Object { $_.DisplayVersion }) -join ',')"
             }
+          }
+
+          # #3375 — what an operator set with `roomlerd set-service-env-var`: the
+          # kill switch, and a value with every character the carry escapes and a
+          # token that no MSI log may hold.
+          $token = 'smoke-carry-3375'
+          $entries = [ordered]@{
+            'ROOMLERD_SFTP_AS_USER' = '0'
+            'ROOMLERD_SMOKE_CARRY'  = "$token|100%[a]{b}"
+          }
+          function Set-Entries {
+            foreach ($name in $entries.Keys) {
+              & "$env:ProgramFiles\Roomler\roomlerd.exe" set-service-env-var --name $name --value $entries[$name]
+              if ($LASTEXITCODE -ne 0) { throw "set-service-env-var $name exited $LASTEXITCODE" }
+            }
+          }
+          function Assert-Carried([string]$label, [bool]$want) {
+            $block = @((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler' -Name Environment -ErrorAction SilentlyContinue).Environment)
+            Write-Host ("{0}: Environment names: {1}" -f $label, (($block | ForEach-Object { ($_ -split '=', 2)[0] }) -join ' '))
+            foreach ($name in $entries.Keys) {
+              $have = $block -ccontains "$name=$($entries[$name])"
+              if ($have -ne $want) { throw "${label}: $name is $(if ($have) { 'there' } else { 'gone' }), want $(if ($want) { 'there' } else { 'gone' })" }
+            }
+          }
+          function Assert-Logged([string]$log, [string]$line) {
+            if (-not (Select-String -Path (Join-Path $logDir $log) -SimpleMatch "roomler_msi_ca: $line")) { throw "${log}: no '$line' from the custom actions" }
           }
 
           # #3115 — a stop slower than the 5 s RegisterService used to wait,
@@ -833,6 +1099,8 @@ jobs:
           try {
             Invoke-Msi '/i' (Join-Path $out 'pm-1.msi') (Join-Path $logDir 'pm-1.log') 'ENABLE_SYSTEM_CONTEXT=1'
             Assert-Mode 'v1, installed with =1' $true '0.0.1.1'
+            Set-Entries
+            Assert-Carried 'v1, set by set-service-env-var' $true
             # #3115 — THE regression cell for the field case: a reinstall of the
             # SAME MSI (a maintenance run) over a running SystemContext service
             # whose stop takes the field's 7.8 s. Up to 0.4.189 RegisterService
@@ -852,21 +1120,54 @@ jobs:
             if (-not $hold.Engaged) { throw 'slow stop: the service never went STOP_PENDING while its supervisor was held' }
             Write-Host "slow stop: the host stayed STOP_PENDING for $($hold.HeldMs) ms, then was let go"
             Assert-Mode 'v1, reinstalled over a running service that took 7.8 s to stop' $true '0.0.1.1'
-            # THE regression cell: a person upgrading by hand, no property.
+            Assert-Carried 'v1, reinstalled in place' $true
+            # THE regression cell: a person upgrading by hand, no property. #3375:
+            # the old product's removal deletes the service; the entries come across.
             Invoke-Msi '/i' (Join-Path $out 'pm-2.msi') (Join-Path $logDir 'pm-2.log') ''
             Assert-Mode 'v2, hand-run upgrade with no property' $true '0.0.2.1'
+            Assert-Carried 'v2, hand-run upgrade' $true
+            Assert-Logged 'pm-2.log' 'capture: carrying 3 entries'
+            Assert-Logged 'pm-2.log' 'restore: put back 2 entries'
             Invoke-Msi '/i' (Join-Path $out 'pm-3.msi') (Join-Path $logDir 'pm-3.log') 'ENABLE_SYSTEM_CONTEXT=0'
             Assert-Mode 'v3, upgrade with an explicit =0' $false '0.0.3.1'
-            Invoke-Msi '/i' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-4.log') ''
-            Assert-Mode 'v4, hand-run upgrade with no property' $false '0.0.4.1'
+            Assert-Carried 'v3, the switch is the installer''s, the rest comes across' $true
+            # #3375 — a failing action never fails the upgrade: only the entries
+            # are lost. The restore first, then the capture.
+            Invoke-Msi '/i' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-4.log') 'ROOMLER_TEST_CA_FAIL=restore'
+            Assert-Mode 'v4, the restore failing on purpose' $false '0.0.4.1'
+            Assert-Carried 'v4, the restore failing on purpose' $false
+            Assert-Logged 'pm-4.log' 'restore: failing on purpose'
+            Set-Entries
+            Invoke-Msi '/i' (Join-Path $out 'pm-5.msi') (Join-Path $logDir 'pm-5.log') 'ROOMLER_TEST_CA_FAIL=capture'
+            Assert-Mode 'v5, the capture failing on purpose' $false '0.0.5.1'
+            Assert-Carried 'v5, the capture failing on purpose' $false
+            Assert-Logged 'pm-5.log' 'capture: failing on purpose'
+            Set-Entries
+            Invoke-Msi '/i' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-6.log') ''
+            Assert-Mode 'v6, hand-run upgrade with no property' $false '0.0.6.1'
+            Assert-Carried 'v6, after the two failures' $true
+            # A repair reconfigures the entry in place (#3115): nothing to carry.
+            Invoke-Msi '/fa' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-6-repair.log') ''
+            Assert-Mode 'v6, repaired' $false '0.0.6.1'
+            Assert-Carried 'v6, repaired' $true
           } finally {
             Copy-Item "$env:ProgramData\roomler\roomler\service-logs" (Join-Path $logDir 'service-logs') -Recurse -Force -ErrorAction SilentlyContinue
             Copy-Item "$env:ProgramData\roomler\last-system-context-attempt.json" $logDir -Force -ErrorAction SilentlyContinue
           }
 
-          Invoke-Msi '/x' (Join-Path $out 'pm-4.msi') (Join-Path $logDir 'pm-uninstall.log') ''
+          # The custom actions log names; no MSI log may hold a carried value.
+          $leak = Select-String -Path (Join-Path $logDir '*.log') -SimpleMatch $token | Select-Object -First 3
+          if ($leak) {
+            $leak | ForEach-Object { Write-Host "::error::$($_.Filename):$($_.LineNumber) holds a carried value" }
+            throw 'an MSI log holds a carried value'
+          }
+          Write-Host 'OK: no MSI log holds a carried value'
+
+          Invoke-Msi '/x' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-uninstall.log') ''
           if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived the uninstall' }
-          Write-Host 'per-Machine uninstall removed the service'
+          # #3375 — and every entry with it: an uninstall carries nothing.
+          if (Test-Path 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler') { throw 'the service key, and its Environment, survived the uninstall' }
+          Write-Host 'per-Machine uninstall removed the service and its Environment'
 
       - name: An upgrade from the released MSIs leaves ONE entry, under the new name (FR-133 P1)
         # FR-133 P1 renamed what Apps & Features lists: "Roomler" and
@@ -1024,7 +1325,7 @@ jobs:
           Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
           $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
           # The Start-menu entry follows the name, and the old one leaves with
-          # the old product (MajorUpgrade runs afterInstallInitialize).
+          # the old product, whose removal runs ahead of this product's files.
           $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Roomler'
           if (-not (Test-Path -LiteralPath (Join-Path $menu "$($new.pu).lnk"))) { throw "no $($new.pu).lnk in $menu after the upgrade" }
           if (Test-Path -LiteralPath (Join-Path $menu "$($old.pu).lnk")) { throw "the pre-P1 shortcut survived the upgrade in $menu" }

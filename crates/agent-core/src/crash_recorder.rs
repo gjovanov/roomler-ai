@@ -59,7 +59,7 @@
 //! credential shape that needs adding to the scrub set).
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -196,9 +196,10 @@ pub fn record_with_log_tail(
         Err(_) => {
             // The closure panicked. Avoid touching tracing here (its
             // backing subscriber may also be in a poisoned state mid
-            // crash) — `eprintln!` goes to the SCM service's stderr
-            // capture or the terminal, which is sufficient.
-            eprintln!("crash_recorder:RECURSIVE_PANIC during record()");
+            // crash) — stderr goes to the SCM service's capture, the
+            // terminal or the rolling log (#3292), which is sufficient.
+            // Never `eprintln!`: on a failing stderr it panics (#1538).
+            crate::logging::say_on_stderr("crash_recorder:RECURSIVE_PANIC during record()");
         }
     }
 }
@@ -856,22 +857,46 @@ fn detect_hostname() -> String {
     }
 }
 
+/// How much of the rolling log's end a crash sidecar reads. Its callers run in a
+/// dying process, and a per-user Windows daemon's stderr reaches this file, up to
+/// 256 MiB a day (`logging::send_stderr_to_the_log`, #3292).
+const LOG_TAIL_MAX_BYTES: u64 = 256 * 1024;
+
 fn read_log_tail(n: usize) -> String {
     let Some(log_path) = crate::logging::active_log_path() else {
         return String::new();
     };
-    let Ok(file) = fs::File::open(&log_path) else {
+    read_tail_of(&log_path, n)
+}
+
+/// The last `n` lines within [`LOG_TAIL_MAX_BYTES`] of the end. Lossy, because raw
+/// stderr need not be UTF-8 (a driver's localized text), and one such byte must not
+/// hide what came after it.
+fn read_tail_of(path: &Path, n: usize) -> String {
+    let Ok(mut file) = fs::File::open(path) else {
         return String::new();
     };
-    // Read the whole file and tail-slice. The rolling log is bounded
-    // by the file logger's daily rotation; in practice this is < 5
-    // MiB which is cheap to read at crash time. If memory pressure
-    // becomes a concern, swap for a reverse-line-reader.
-    let reader = BufReader::new(file);
-    let mut lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-    let from = lines.len().saturating_sub(n);
-    lines.drain(..from);
-    lines.join("\n")
+    let from = file
+        .metadata()
+        .map_or(0, |m| m.len().saturating_sub(LOG_TAIL_MAX_BYTES));
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(from)).is_err()
+        || file
+            .take(LOG_TAIL_MAX_BYTES)
+            .read_to_end(&mut bytes)
+            .is_err()
+    {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Starting past the top of the file, the first line is a fragment.
+    let whole = if from > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
+    };
+    let lines: Vec<&str> = whole.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 #[cfg(test)]
@@ -890,6 +915,34 @@ mod tests {
             pid: 42,
             suppressed_since_last: 0,
         }
+    }
+
+    // ─── log tail ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_log_tail_is_bounded_and_survives_a_byte_that_is_not_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("roomlerd.log.2026-01-01");
+
+        // Past the bound, with a fragment at its edge: the tail starts on a whole line.
+        let mut big = vec![b'x'; 2 * LOG_TAIL_MAX_BYTES as usize];
+        big.extend_from_slice(b"\nstderr: caf\xe9 line\nlast line\n");
+        fs::write(&log, &big).unwrap();
+        assert_eq!(
+            read_tail_of(&log, 200),
+            "stderr: caf\u{fffd} line\nlast line"
+        );
+
+        // Inside the bound: the top line is whole, and `n` still holds.
+        fs::write(&log, b"one\ntwo\nthree\n").unwrap();
+        assert_eq!(read_tail_of(&log, 200), "one\ntwo\nthree");
+        assert_eq!(read_tail_of(&log, 2), "two\nthree");
+
+        // A file with no newline inside the bound gives nothing, not a fragment.
+        fs::write(&log, vec![b'x'; 2 * LOG_TAIL_MAX_BYTES as usize]).unwrap();
+        assert_eq!(read_tail_of(&log, 200), "");
+
+        assert_eq!(read_tail_of(&dir.path().join("absent"), 200), "");
     }
 
     // ─── scrub: Bearer ─────────────────────────────────────────────────────
@@ -1115,16 +1168,13 @@ mod tests {
 
     // ─── Crash-loop suppression (2026-05-17 a third field-test host storm fix) ─────────────
 
-    fn tempdir_for_test() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "crash_recorder_supp_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create_dir_all");
-        dir
+    /// A directory only this test sees, removed when the guard drops, a
+    /// failed assertion included (#3090). It used to be named after the
+    /// clock: two tests that read it in the same tick shared one directory
+    /// and saw each other's sidecars, and the first to finish deleted it
+    /// under the other.
+    fn tempdir_for_test() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
     }
 
     /// Drop a fake sidecar named `{ts}-{pid}.json` in `dir`. Used by
@@ -1138,31 +1188,28 @@ mod tests {
     #[test]
     fn should_suppress_returns_none_for_empty_dir() {
         let dir = tempdir_for_test();
-        assert!(should_suppress(&dir, 1_700_000_000).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(should_suppress(dir.path(), 1_700_000_000).is_none());
     }
 
     #[test]
     fn should_suppress_rate_limits_when_recent_sidecar_exists() {
         let dir = tempdir_for_test();
         // Sidecar 5 seconds ago — within the 30s MIN_INTERVAL.
-        touch_sidecar(&dir, 1_700_000_000 - 5, 12345);
+        touch_sidecar(dir.path(), 1_700_000_000 - 5, 12345);
         let now = 1_700_000_000_i64;
         assert_eq!(
-            should_suppress(&dir, now),
+            should_suppress(dir.path(), now),
             Some(SuppressReason::RecentSidecar)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn should_suppress_allows_write_after_min_interval_elapsed() {
         let dir = tempdir_for_test();
         // Sidecar 31 seconds ago — past the 30s MIN_INTERVAL.
-        touch_sidecar(&dir, 1_700_000_000 - (MIN_INTERVAL_SECS + 1), 12345);
+        touch_sidecar(dir.path(), 1_700_000_000 - (MIN_INTERVAL_SECS + 1), 12345);
         let now = 1_700_000_000_i64;
-        assert!(should_suppress(&dir, now).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(should_suppress(dir.path(), now).is_none());
     }
 
     #[test]
@@ -1172,15 +1219,14 @@ mod tests {
         // Each gets a unique ts so filenames don't collide.
         let stale_base = 1_700_000_000_i64 - 3600;
         for i in 0..HARD_CAP {
-            touch_sidecar(&dir, stale_base + i as i64, 12345);
+            touch_sidecar(dir.path(), stale_base + i as i64, 12345);
         }
         let now = 1_700_000_000_i64;
         assert_eq!(
-            should_suppress(&dir, now),
+            should_suppress(dir.path(), now),
             Some(SuppressReason::HardCapReached),
             "hard cap must trip even when all sidecars are old"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1188,9 +1234,8 @@ mod tests {
         let dir = tempdir_for_test();
         // A *.tmp file (in-progress write) doesn't count toward the
         // cap and doesn't trigger the rate-limit.
-        std::fs::write(dir.join("1700000000-12345.json.tmp"), b"{}").unwrap();
-        assert!(should_suppress(&dir, 1_700_000_000).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::write(dir.path().join("1700000000-12345.json.tmp"), b"{}").unwrap();
+        assert!(should_suppress(dir.path(), 1_700_000_000).is_none());
     }
 
     #[test]
@@ -1224,11 +1269,6 @@ mod tests {
         // verbatim — modulo the scrub pipeline. The local rolling-log
         // read path (`read_log_tail`) is bypassed entirely so the
         // override is the authoritative source.
-        let dir = tempdir_for_test();
-        // Drive record_inner directly so we can control the dir
-        // without going through `logging::log_dir()`. Override the
-        // crashes_dir resolution: write to `dir` and verify the JSON
-        // contents.
         let now_unix = 1_700_000_000_i64;
         let mut payload = AgentCrashPayload {
             crashed_at_unix: now_unix,
@@ -1246,7 +1286,6 @@ mod tests {
         fit_to_envelope(&mut payload, MAX_PAYLOAD_BYTES);
         assert!(payload.log_tail.contains("WORKER's real log content"));
         assert!(!payload.log_tail.contains("[…log truncated"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1334,7 +1373,8 @@ mod tests {
     /// finds nothing left to move or warn about.
     #[test]
     fn a_torn_sidecar_is_moved_aside_once() {
-        let dir = tempdir_for_test();
+        let tmp = tempdir_for_test();
+        let dir = tmp.path().to_path_buf();
         write_valid_sidecar(&dir, 1_700_000_000, 1);
         let torn = write_torn_sidecar(&dir, 1_700_000_100, 2);
 
@@ -1348,20 +1388,19 @@ mod tests {
         let second = scan_dir(&dir);
         assert_eq!(second.len(), 1);
         assert!(moved.exists(), "a second scan leaves it where it is");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #2955 — when the move fails, the sidecar stays where it was, as before
     /// the quarantine existed: skipped, never lost.
     #[test]
     fn a_torn_sidecar_that_cannot_move_stays_put() {
-        let dir = tempdir_for_test();
+        let tmp = tempdir_for_test();
+        let dir = tmp.path().to_path_buf();
         // A FILE where the quarantine directory would go: create_dir_all fails.
         std::fs::write(dir.join(MALFORMED_DIR), b"not a directory").unwrap();
         let torn = write_torn_sidecar(&dir, 1_700_000_100, 2);
 
         assert!(scan_dir(&dir).is_empty());
         assert!(torn.exists(), "the sidecar was not lost");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

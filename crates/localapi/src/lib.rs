@@ -23,10 +23,6 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-// FR-90 P1j — the adopt socket's protocol: a separate socket, open to every
-// account, whose peer the daemon identifies by the kernel's word alone.
-pub mod hive_adopt;
-
 // FR-84 D5b — the device's own view of its org (the Devices page's grid and
 // mesh), in its own file so the verbs' types don't sprawl through this one.
 mod devices;
@@ -455,6 +451,41 @@ pub struct NodeStatus {
     /// with no GUI session (a Mac's root half), and from an older daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos_grants: Option<MacosGrants>,
+    /// FR-67 P3 — what the most recent install attempt came to, as the
+    /// post-install watcher left it in `<log_dir>/last-install.json`
+    /// ([`LastInstallStatus`]). Read from disk on every answer, so a verdict
+    /// written after this daemon started (Windows: the new service starts
+    /// while the watcher still waits on msiexec) shows up without a restart.
+    ///
+    /// ⚠️ Three states must stay apart, and they do by construction: `None`
+    /// is a daemon that predates the field and cannot say; `Some` with
+    /// [`LastInstallStatus::ABSENT`] is a daemon with no record (its updater
+    /// has installed nothing); `Some` with [`LastInstallStatus::IN_PROGRESS`]
+    /// is a record whose verdict never came — the bug FR-67 exists for.
+    /// Collapsing any two of them recreates that bug one layer up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_install: Option<LastInstallStatus>,
+    /// FR-43 P3c — the GUI worker a Mac's root daemon supervises, as the
+    /// delegation channel sees it. What `roomlerd one-row` verifies after its
+    /// restart. `None` off macOS, from the worker itself, and from an older
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_worker: Option<GuiWorkerStatus>,
+}
+
+/// FR-43 P3c — what [`NodeStatus::gui_worker`] reports.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GuiWorkerStatus {
+    /// A worker holds the delegation channel.
+    pub attached: bool,
+    /// The permission words it announced (`screen-capture`, `input`), which
+    /// are the ones the device's row advertises (FR-43 P2c). `None` until it
+    /// has sent its caps, and again once it detaches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<String>>,
+    /// The daemon runs with `macos_one_row`: its worker holds no enrollment.
+    #[serde(default)]
+    pub one_row: bool,
 }
 
 /// #3164 — what [`NodeStatus::macos_grants`] reports.
@@ -467,6 +498,92 @@ pub struct MacosGrants {
     /// Accessibility, read live: a grant shows here at once, and input works
     /// from the next event without a restart.
     pub accessibility: bool,
+}
+
+/// FR-67 P3 — the post-install watcher's record of the most recent install
+/// attempt (`<log_dir>/last-install.json`), as the daemon reads it back.
+///
+/// The watcher (`roomlerd post-install-watch`, spawned by the updater beside
+/// the installer) writes the record; until P3 nothing read it, on any
+/// platform. `status` is one of the words below, spelled exactly as the file
+/// and the watcher's own `post-install verdict:` log line spell them, so one
+/// grep finds all three surfaces:
+///
+/// | word | meaning |
+/// |---|---|
+/// | `Absent` | no record: this daemon's updater has installed nothing yet, or the record sits in another process role's log dir — `path` says where this one looked |
+/// | `InProgress` | the watcher wrote its opening line and no verdict. Younger than [`Self::STALE_AFTER_SECS`], a watcher still at work (on Windows the new service starts while it still waits on msiexec). Older, an install that never reported: the watcher was killed first |
+/// | `SucceededVerified` | the installer exited 0 and the new binary's `--version` answered `expected_version` |
+/// | `SucceededUnverified` | the installer exited 0 but the version probe did not confirm it; `note` says what it saw |
+/// | `InstallerFailed` | the installer exited non-zero (`installer_exit_code`) |
+/// | `Timeout` | the installer did not exit within the watcher's budget (on Windows, not after the kill-and-retry either) |
+/// | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) |
+/// | `Unreadable` | a file is there and does not parse; `note` carries the error |
+///
+/// Additive everywhere: a daemon that predates it sends no key, an older
+/// client ignores it. A word this client does not know is a newer daemon's
+/// and is shown as it is, never an error.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LastInstallStatus {
+    pub status: String,
+    /// The release the install was for (`agent-v0.4.172`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<String>,
+    /// What the new binary's `--version` printed, when the probe ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_binary_version: Option<String>,
+    /// When the watcher started, unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix: Option<u64>,
+    /// When it wrote its verdict, unix seconds; unset while `InProgress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installer_exit_code: Option<i32>,
+    /// The watcher's own note on the verdict; for `Unreadable`, the error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The file this answer was read from, or looked for. `None` when the
+    /// daemon resolved no log dir at all (a checkout run with no home).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl LastInstallStatus {
+    pub const ABSENT: &'static str = "Absent";
+    pub const IN_PROGRESS: &'static str = "InProgress";
+    pub const SUCCEEDED_VERIFIED: &'static str = "SucceededVerified";
+    pub const SUCCEEDED_UNVERIFIED: &'static str = "SucceededUnverified";
+    pub const INSTALLER_FAILED: &'static str = "InstallerFailed";
+    pub const TIMEOUT: &'static str = "Timeout";
+    pub const WATCHER_STOPPED: &'static str = "WatcherStopped";
+    pub const UNREADABLE: &'static str = "Unreadable";
+
+    /// An `InProgress` record older than this never got its verdict. The
+    /// watcher's whole life is bounded: 10 min on the installer (twice on a
+    /// Windows wedge retry), 2 min settling the Windows service. Nothing is
+    /// still writing a record this old.
+    pub const STALE_AFTER_SECS: u64 = 25 * 60;
+
+    /// A record with no verdict yet — fresh or stale alike.
+    pub fn in_progress(&self) -> bool {
+        self.status == Self::IN_PROGRESS
+    }
+
+    /// `InProgress`, and old enough that no watcher can still be at work on
+    /// it: the install never reported. A record with no start time cannot be
+    /// fresh, so it counts as never reported too.
+    pub fn never_reported(&self, now_unix: u64) -> bool {
+        self.in_progress()
+            && self
+                .started_unix
+                .is_none_or(|s| now_unix.saturating_sub(s) >= Self::STALE_AFTER_SECS)
+    }
+
+    /// The one outcome nobody needs to look at.
+    pub fn is_verified_success(&self) -> bool {
+        self.status == Self::SUCCEEDED_VERIFIED
+    }
 }
 
 /// FR-19 — the org-relay probe responder's live state (see
@@ -1583,78 +1700,6 @@ pub enum Request {
     /// answer is `not_probed`; a build without encoders answers
     /// `unsupported`. Returns [`Response::EncoderCaps`].
     EncoderCaps,
-    /// FR-90 P1h-2 (AC7 on macOS) — the root update helper asks this daemon
-    /// to hold for its running agent turns before `installer(8)` restarts it
-    /// and, with it, every session's harness: what the in-process updater
-    /// does on Linux (P1d-1). Answered [`Response::HiveUpdateHeld`] once no
-    /// turn runs, or once the device's `hive_update_wait_secs` is spent; from
-    /// then on new prompts and starts are refused until THIS CONNECTION
-    /// closes. A successful install has restarted the daemon by then; a
-    /// failed one takes prompts and starts again. Root only. A daemon older
-    /// than the verb answers `Error("bad request: …")`, and the helper
-    /// installs without a hold, as before.
-    HiveUpdateHold,
-    /// FR-90 P3-9-2b — `roomler connect`: a local endpoint that signs in to a
-    /// secret's upstream as the secret's user, the value held by the daemon.
-    /// Its leases are asked for the device's OWNER (decision 23) and renewed
-    /// while it is held (decision 25), and it serves the account that asked,
-    /// as the listener read it from the OS ([`ClientPeer::asker`]). Answered
-    /// [`Response::Connected`]. It closes when THIS CONNECTION does. Only
-    /// root or SYSTEM, an elevated administrator, or the daemon's own account
-    /// may ask ([`peer_may_connect`]); never on the person socket. A daemon
-    /// older than the verb answers `Error("bad request: …")`.
-    Connect { args: ConnectArgs },
-    /// FR-90 P3-9-2b — where endpoint `id`, opened by a [`Request::Connect`]
-    /// on this same connection, stands: [`Response::ConnectState`]. Any other
-    /// id is refused.
-    ConnectStatus { id: u64 },
-}
-
-/// FR-90 P3-9-2b — what `roomler connect` asks for: the arguments a
-/// session's `vault_connect` takes, by the same names, and checked by the
-/// daemon as it checks a session's (`docs/vault.md` §19).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConnectArgs {
-    /// A structured secret, by its path or this organization's RRN, with no
-    /// `#field`.
-    pub handle: String,
-    /// `postgres`, `mongodb`, `http`, `kubernetes` or `ssh`.
-    pub engine: String,
-    /// The upstream, exactly as the secret's `audiences` names it.
-    pub upstream: String,
-    /// `http` and `kubernetes`: `basic`, `bearer` or `client-cert`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<String>,
-    /// A database's, named in the connection string.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub database: Option<String>,
-    /// A secret whose value is the upstream's CA (PEM).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ca: Option<String>,
-    /// MongoDB's: the database the secret's user is defined in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_source: Option<String>,
-    /// How long each lease is asked for, in seconds (30 to 900, default
-    /// 300); renewed before it ends.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_s: Option<u32>,
-}
-
-/// FR-90 P3-9-2b — where a person's endpoint stands
-/// ([`Request::ConnectStatus`]).
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-pub struct EndpointState {
-    /// How long its leases have left, in seconds, as the daemon holds them.
-    pub left_s: u64,
-    /// How many times its leases were renewed.
-    pub renewals: u32,
-    /// The vault refused a renewal, saying this: the endpoint serves to its
-    /// leases' end, then closes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub refused: Option<String>,
-    /// Why it closed, once it has.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed: Option<String>,
 }
 
 /// FR-84 D4 — what this device can encode, as [`Request::EncoderCaps`]
@@ -1958,25 +2003,6 @@ pub enum Response {
     Devices(Box<DevicesPage>),
     /// FR-84 D5b — the mesh graph ([`Request::Mesh`]).
     Mesh(Box<MeshView>),
-    /// FR-90 P1h-2 — the daemon holds for the update ([`Request::HiveUpdateHold`]):
-    /// install now. It waited `waited_secs` for agent turns; `cut` turns were
-    /// still running when the device's `hive_update_wait_secs` ran out, and the
-    /// install cuts them. New prompts and starts are refused until the
-    /// connection that asked closes.
-    HiveUpdateHeld {
-        waited_secs: u64,
-        cut: u32,
-    },
-    /// FR-90 P3-9-2b — the endpoint a [`Request::Connect`] opened: what a
-    /// session's `vault_connect` answers (where it is, a connection string
-    /// that holds no credential, what to set, how long its leases have), and
-    /// its `id` for [`Request::ConnectStatus`] on the same connection.
-    Connected {
-        id: u64,
-        endpoint: serde_json::Value,
-    },
-    /// FR-90 P3-9-2b — [`Request::ConnectStatus`]'s answer.
-    ConnectState(EndpointState),
     /// FR-84 D5b — the daemon answered FOR THE SERVER and the server did not
     /// give it the list. `code` names the cause so a client can choose what
     /// to show without reading prose: `server_unreachable` (connect / TLS /
@@ -2282,13 +2308,6 @@ impl ClientPeer {
         peer_is_console_user(self, console_session_id(), own_uid())
     }
 
-    /// FR-90 P1h-2 — is this peer root (Unix)? What may hold the daemon for
-    /// an update: a hold refuses every new agent prompt and start until it
-    /// ends, so no other local account may place one. Unknown is not root.
-    pub fn is_root(&self) -> bool {
-        self.uid == Some(0)
-    }
-
     /// FR-92 P10 — may this peer turn keep busy ON? Only the person at the
     /// console, on `scope`'s endpoint ([`peer_may_start_keep_busy`]).
     pub fn may_start_keep_busy(&self, scope: Scope) -> bool {
@@ -2300,64 +2319,6 @@ impl ClientPeer {
     pub fn may_record(&self, scope: Scope) -> bool {
         peer_may_record(self, scope, console_session_id(), own_uid())
     }
-
-    /// FR-90 P3-9-2b — may this peer run `roomler connect` here (decision
-    /// 26)? [`peer_may_connect`].
-    pub fn may_connect(&self) -> bool {
-        peer_may_connect(self, own_uid(), own_sid())
-    }
-
-    /// FR-90 P3-9-2b — the account a [`Request::Connect`] from this peer
-    /// serves its endpoint to: its own, as the OS said at accept time. `None`
-    /// when the OS did not say.
-    pub fn asker(&self) -> Option<Asker> {
-        match (self.uid, self.gid, &self.sid) {
-            (Some(uid), Some(gid), _) => Some(Asker::Unix { uid, gid }),
-            (None, _, Some(sid)) => Some(Asker::Windows { sid: sid.clone() }),
-            _ => None,
-        }
-    }
-}
-
-/// FR-90 P3-9-2b — the account a person's endpoint ([`Request::Connect`])
-/// is served to: the one that asked, read by the listener from the OS before
-/// a byte of the request, never from anything the client says.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Asker {
-    /// Its uid and gid.
-    Unix { uid: u32, gid: u32 },
-    /// Its account, by SID (`S-1-5-…`).
-    Windows { sid: String },
-}
-
-/// FR-90 P3-9-2b — the pure decision behind [`ClientPeer::may_connect`]
-/// (decision 26, its recommendation, pending the operator's word).
-///
-/// `roomler connect` lends the device's OWNER's vault grants (decision 23),
-/// whoever runs it, so it is held to who may already act for the whole
-/// device:
-/// - **Unix**: root, or the daemon's own uid. On a system install the daemon's
-///   socket is root's anyway, and the person socket refuses the verb
-///   ([`person_may`]).
-/// - **Windows**: SYSTEM (and the other service accounts, as
-///   [`ClientPeer::system_account`] reads them), an elevated administrator,
-///   or the account the daemon itself runs as (an attended install's
-///   person). ⚠️ The pipe's ACL is wider than that: it admits every
-///   interactive user, an RDP session's included (`LOCALAPI_SDDL`'s `IU`), so
-///   without this gate anyone signed in would reach the owner's grants.
-/// - Anything unknown: no.
-///
-/// The endpoint serves the account that asked ([`ClientPeer::asker`]), read
-/// from the same token this decides on, so the account that passes is the
-/// account that is served.
-pub fn peer_may_connect(peer: &ClientPeer, own_uid: Option<u32>, own_sid: Option<&str>) -> bool {
-    if let Some(uid) = peer.uid {
-        return uid == 0 || Some(uid) == own_uid;
-    }
-    if peer.system_account == Some(true) || peer.elevated == Some(true) {
-        return true;
-    }
-    matches!((peer.sid.as_deref(), own_sid), (Some(p), Some(o)) if p == o)
 }
 
 /// FR-92 P10 — the pure decision behind [`ClientPeer::may_start_keep_busy`].
@@ -2519,35 +2480,6 @@ struct TokenFacts {
     /// FR-90 P3-9-2b — whether it is elevated; `None` when that could not be
     /// read.
     elevated: Option<bool>,
-}
-
-/// FR-90 P3-9-2b — the account this process runs as, by SID (Windows), read
-/// once; `None` elsewhere, or when it could not be read.
-fn own_sid() -> Option<&'static str> {
-    #[cfg(windows)]
-    {
-        static OWN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        OWN.get_or_init(|| {
-            use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::Security::TOKEN_QUERY;
-            use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-            let mut token = std::ptr::null_mut();
-            // SAFETY: our own process's pseudo-handle; `token` is a valid
-            // out-param, closed below once.
-            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-                return None;
-            }
-            let facts = token_facts(token);
-            // SAFETY: closes the token opened above, exactly once.
-            unsafe { CloseHandle(token) };
-            facts.and_then(|f| f.sid)
-        })
-        .as_deref()
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
 }
 
 /// The session process `pid` runs in.
@@ -3010,42 +2942,6 @@ pub trait LocalApiState: Send + Sync {
     /// connection die before it learns the restart was accepted. Default:
     /// no-op.
     fn restart_commit(&self) {}
-    /// FR-90 P1h-2 — hold this daemon for an update the root helper is about
-    /// to install: wait for running agent turns (at most the device's
-    /// `hive_update_wait_secs`), refuse new prompts and starts, and answer
-    /// [`Response::HiveUpdateHeld`]. The hold lasts until the asking
-    /// connection closes ([`Self::hive_update_release`]). Default: this node
-    /// runs no agent sessions, so there is nothing to hold for.
-    async fn hive_update_hold(&self) -> Response {
-        Response::Error {
-            message: "this node runs no agent sessions".into(),
-        }
-    }
-    /// FR-90 P1h-2 — the connection that held the daemon closed. An install
-    /// that worked restarted the daemon long before, so this is one that did
-    /// not: take prompts and starts again. Default: no-op.
-    fn hive_update_release(&self) {}
-    /// FR-90 P3-9-2b — open a person's endpoint (`roomler connect`) served to
-    /// `asker`, the account that asked, and answer [`Response::Connected`].
-    /// The peer has passed [`peer_may_connect`] by now. Default: a daemon
-    /// built without the vault lends nothing.
-    async fn connect(&self, _asker: &Asker, _args: &ConnectArgs) -> Response {
-        Response::Error {
-            message: "this device's daemon was built without the vault, so it opens no \
-                      endpoint"
-                .into(),
-        }
-    }
-    /// FR-90 P3-9-2b — where endpoint `id` stands: [`Response::ConnectState`].
-    /// Asked only for an id this connection opened.
-    fn connect_status(&self, _id: u64) -> Response {
-        Response::Error {
-            message: "this daemon holds no endpoint".into(),
-        }
-    }
-    /// FR-90 P3-9-2b — the connection that opened endpoint `id` closed: close
-    /// it, with its connections, and let its leases go. Default: no-op.
-    fn connect_release(&self, _id: u64) {}
     /// FR-84 D4 — what this device can encode, from the probe's CACHED
     /// result only (never a probe). `None` = this node does not report
     /// encoder capabilities at all (mocks, non-daemon impls); the daemon
@@ -3082,22 +2978,6 @@ fn not_the_person_for_keep_busy() -> Response {
                   not root or SYSTEM, not a background service, not another session \
                   (anyone may stop it)"
             .into(),
-    }
-}
-
-/// FR-90 P3-9-2b (decision 26) — the answer to a `roomler connect` from
-/// anyone [`peer_may_connect`] refuses.
-fn not_one_who_may_connect() -> Response {
-    Response::Error {
-        message: if cfg!(windows) {
-            "roomler connect lends this device's owner's vault grants, so here only SYSTEM, an \
-             elevated administrator, or the account Roomler's service runs as may run it: run \
-             it from an elevated prompt"
-        } else {
-            "roomler connect lends this device's owner's vault grants, so here only root, or \
-             the account the daemon runs as, may run it: `sudo roomler connect …`"
-        }
-        .into(),
     }
 }
 
@@ -3191,12 +3071,7 @@ pub fn person_may(req: &Request) -> bool {
         | Request::ExecRemote { .. }
         | Request::SshSession { .. }
         | Request::RestartDaemon { .. }
-        | Request::EncoderCaps
-        | Request::HiveUpdateHold
-        // FR-90 P3-9-2b — `roomler connect` lends the device OWNER's vault
-        // grants: whoever sits at the screen need not be the owner.
-        | Request::Connect { .. }
-        | Request::ConnectStatus { .. } => false,
+        | Request::EncoderCaps => false,
     }
 }
 
@@ -3292,10 +3167,7 @@ pub fn handle(req: &Request, state: &dyn LocalApiState) -> Response {
         | Request::RecordingDelete { .. }
         | Request::Devices { .. }
         | Request::Mesh { .. }
-        | Request::RestartDaemon { .. }
-        | Request::HiveUpdateHold
-        | Request::Connect { .. }
-        | Request::ConnectStatus { .. } => Response::Error {
+        | Request::RestartDaemon { .. } => Response::Error {
             message: "this verb must be served on the async path".into(),
         },
     }
@@ -3345,12 +3217,6 @@ where
 {
     let (rd, mut wr) = tokio::io::split(stream);
     let mut lines = tokio::io::BufReader::new(rd).lines();
-    // FR-90 P1h-2 — a hold this connection placed ends with it, however it
-    // ends: EOF, a read error, a write error.
-    let mut held = false;
-    // FR-90 P3-9-2b — and so does every endpoint it opened (decision 25:
-    // `roomler connect` in the foreground).
-    let mut opened: Vec<u64> = Vec::new();
     let served: std::io::Result<()> = async {
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
@@ -3585,31 +3451,6 @@ where
                 // FR-84 D3 — the daemon decides (and records) here; it leaves only
                 // after the answer below is on the wire.
                 Ok(Request::RestartDaemon { reason }) => state.restart_daemon(&reason).await,
-                // FR-90 P1h-2 — root alone holds the daemon for an update: the
-                // hold refuses every new agent prompt and start until it ends.
-                Ok(Request::HiveUpdateHold) if !peer.is_root() => Response::Error {
-                    message: "only root may hold this daemon for an update".into(),
-                },
-                Ok(Request::HiveUpdateHold) => state.hive_update_hold().await,
-                // FR-90 P3-9-2b (decision 26) — `roomler connect` lends the
-                // device owner's grants: root or SYSTEM, an elevated
-                // administrator, or the daemon's own account. The endpoint
-                // serves the account that asked, as the OS read it.
-                Ok(Request::Connect { .. }) if !peer.may_connect() => not_one_who_may_connect(),
-                Ok(Request::Connect { args }) => match peer.asker() {
-                    Some(asker) => state.connect(&asker, &args).await,
-                    None => Response::Error {
-                        message: "this device could not read which account asked, so it \
-                                  serves none"
-                            .into(),
-                    },
-                },
-                // Only an endpoint this connection opened: another
-                // connection's may be another account's.
-                Ok(Request::ConnectStatus { id }) if !opened.contains(&id) => Response::Error {
-                    message: format!("no endpoint {id} was opened on this connection"),
-                },
-                Ok(Request::ConnectStatus { id }) => state.connect_status(id),
                 Ok(req) => handle(&req, state),
                 Err(e) => Response::Error {
                     message: format!("bad request: {e}"),
@@ -3623,12 +3464,6 @@ where
                 resp
             };
             let restart_accepted = matches!(resp, Response::DaemonRestarting { .. });
-            held |= matches!(resp, Response::HiveUpdateHeld { .. });
-            // Kept before the answer is written: a client gone by then still
-            // has its endpoint closed below.
-            if let Response::Connected { id, .. } = &resp {
-                opened.push(*id);
-            }
             // A Response always serialises; fall back to an Error line if a
             // custom serializer ever failed, so we never break the frame.
             let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
@@ -3654,12 +3489,6 @@ where
         Ok(())
     }
     .await;
-    if held {
-        state.hive_update_release();
-    }
-    for id in opened {
-        state.connect_release(id);
-    }
     served
 }
 
@@ -4076,8 +3905,7 @@ pub(crate) fn user_socket_path() -> std::path::PathBuf {
         .join(LOCALAPI_SOCKET_NAME)
 }
 
-/// The SYSTEM socket path, used by a daemon privileged enough to bind it,
-/// and by the root update helper (FR-90 P1h-2), which holds THAT daemon.
+/// The SYSTEM socket path, used by a daemon privileged enough to bind it.
 #[cfg(unix)]
 pub fn system_socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(LOCALAPI_SYSTEM_DIR).join(LOCALAPI_SOCKET_NAME)
@@ -4768,7 +4596,7 @@ pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Clien
 }
 
 /// Unix-socket connect, parameterised on the path so tests can target a private
-/// one, and the root update helper the system daemon (FR-90 P1h-2).
+/// one.
 #[cfg(unix)]
 pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
     let stream = tokio::net::UnixStream::connect(path).await?;
@@ -5766,11 +5594,13 @@ mod tests {
                 legacy_env_uses: Some(Vec::new()),
                 retired_env_present: Some(Vec::new()),
                 files_dir: None,
+                last_install: None,
                 derp_inbound_drops: None,
                 netcheck: None,
                 pid: None,
                 started_at_ms: None,
                 macos_grants: None,
+                gui_worker: None,
             }
         }
         fn peers(&self) -> Vec<PeerInfo> {
@@ -6834,6 +6664,94 @@ mod tests {
         assert_eq!(back.macos_grants, st.macos_grants);
     }
 
+    /// FR-67 P3 — `NodeStatus.last_install` is additive, and the three states
+    /// it must keep apart survive the wire: no key (a daemon that predates it)
+    /// parses to `None`; `Absent` and `InProgress` are two different words
+    /// that round-trip as themselves.
+    #[test]
+    fn node_status_last_install_is_additive_and_keeps_absent_from_in_progress() {
+        let mut st = Mock.status();
+        let without = serde_json::to_string(&st).unwrap();
+        assert!(!without.contains("last_install"), "{without}");
+        let back: NodeStatus = serde_json::from_str(&without).unwrap();
+        assert_eq!(back.last_install, None, "no key = a daemon that cannot say");
+
+        let absent = LastInstallStatus {
+            status: LastInstallStatus::ABSENT.into(),
+            expected_version: None,
+            new_binary_version: None,
+            started_unix: None,
+            finished_unix: None,
+            installer_exit_code: None,
+            note: None,
+            path: Some("/root/.local/share/roomler/logs/last-install.json".into()),
+        };
+        st.last_install = Some(absent.clone());
+        let with = serde_json::to_string(&st).unwrap();
+        assert!(
+            with.contains(r#""last_install":{"status":"Absent""#),
+            "{with}"
+        );
+        let back: NodeStatus = serde_json::from_str(&with).unwrap();
+        assert_eq!(back.last_install.as_ref(), Some(&absent));
+        assert!(!absent.in_progress());
+        assert!(
+            !absent.never_reported(u64::MAX),
+            "absent is not a record that never reported"
+        );
+
+        let frozen = LastInstallStatus {
+            status: LastInstallStatus::IN_PROGRESS.into(),
+            expected_version: Some("agent-v0.4.16".into()),
+            started_unix: Some(1_756_475_398),
+            ..absent.clone()
+        };
+        let back: LastInstallStatus =
+            serde_json::from_str(&serde_json::to_string(&frozen).unwrap()).unwrap();
+        assert_eq!(back, frozen);
+        assert_ne!(back.status, absent.status, "the two words never collapse");
+    }
+
+    /// FR-67 P3 — `InProgress` is a verdict still being written only while
+    /// the watcher can still be alive; past its whole budget it is an install
+    /// that never reported, and a record with no start time cannot be fresh.
+    #[test]
+    fn last_install_in_progress_is_never_reported_only_once_stale() {
+        let started = 1_792_967_937u64;
+        let mut li = LastInstallStatus {
+            status: LastInstallStatus::IN_PROGRESS.into(),
+            expected_version: Some("agent-v0.4.172".into()),
+            new_binary_version: None,
+            started_unix: Some(started),
+            finished_unix: None,
+            installer_exit_code: None,
+            note: None,
+            path: None,
+        };
+        assert!(li.in_progress());
+        assert!(
+            !li.never_reported(started + 17),
+            "17 s in, the Windows watcher is still waiting on msiexec"
+        );
+        assert!(
+            !li.never_reported(started + LastInstallStatus::STALE_AFTER_SECS - 1),
+            "inside the budget it is still a watcher at work"
+        );
+        assert!(li.never_reported(started + LastInstallStatus::STALE_AFTER_SECS));
+        assert!(li.never_reported(started + 86_400 * 7));
+        li.started_unix = None;
+        assert!(
+            li.never_reported(started),
+            "no start time = no claim to freshness"
+        );
+        li.status = LastInstallStatus::SUCCEEDED_VERIFIED.into();
+        assert!(
+            !li.never_reported(u64::MAX),
+            "a verdict is never 'never reported'"
+        );
+        assert!(li.is_verified_success());
+    }
+
     #[tokio::test]
     async fn route_verbs_dispatch_and_lock_wire_shape() {
         let s = Mock;
@@ -7556,19 +7474,12 @@ mod tests {
             Some(false),
             "a person's token, read: {peer:?}"
         );
-        // FR-90 P3-9-2b — and its account, by SID, from the same token: this
-        // process's own, so the daemon's own account may connect.
+        // FR-90 P3-9-2b — and its account, by SID, from the same token.
         assert!(
             peer.sid.as_deref().is_some_and(|s| s.starts_with("S-1-5-")),
             "{peer:?}"
         );
-        assert_eq!(peer.sid.as_deref(), own_sid(), "the client is this process");
         assert!(peer.elevated.is_some(), "its elevation, read: {peer:?}");
-        assert!(peer.may_connect(), "{peer:?}");
-        assert_eq!(
-            peer.asker(),
-            peer.sid.clone().map(|sid| Asker::Windows { sid })
-        );
     }
 
     #[test]
@@ -7713,15 +7624,9 @@ mod tests {
             },
             Request::ConfigCleanupStale,
             Request::EncoderCaps,
-            Request::HiveUpdateHold,
             Request::KillFlow { id: "f".into() },
             Request::RouteRemove { id: "r".into() },
             Request::SetDeviceName { name: "x".into() },
-            // FR-90 P3-9-2b — the owner's grants, never the seat's.
-            Request::Connect {
-                args: ConnectArgs::default(),
-            },
-            Request::ConnectStatus { id: 1 },
         ];
         for req in refused {
             assert!(!person_may(&req), "the person socket must refuse {req:?}");
@@ -8089,404 +7994,6 @@ mod tests {
             assert!(!std::path::Path::new("/roomler-p11-never.sock").exists());
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// FR-90 P1h-2 — a daemon that holds at once, counting holds and releases.
-    #[derive(Default)]
-    struct HoldMock {
-        holds: std::sync::atomic::AtomicUsize,
-        releases: std::sync::atomic::AtomicUsize,
-    }
-    #[async_trait]
-    impl LocalApiState for HoldMock {
-        fn status(&self) -> NodeStatus {
-            Mock.status()
-        }
-        fn peers(&self) -> Vec<PeerInfo> {
-            Mock.peers()
-        }
-        fn flows(&self) -> Vec<FlowInfo> {
-            Mock.flows()
-        }
-        async fn hive_update_hold(&self) -> Response {
-            self.holds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Response::HiveUpdateHeld {
-                waited_secs: 7,
-                cut: 0,
-            }
-        }
-        fn hive_update_release(&self) {
-            self.releases
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// FR-90 P1h-2 — root alone holds the daemon for an update (a hold
-    /// refuses every new agent prompt and start), and the hold ends with the
-    /// connection that placed it; a refusal places none. The wire is pinned:
-    /// the helper and the daemon are different processes, often of different
-    /// builds.
-    #[tokio::test]
-    async fn only_root_holds_the_daemon_and_the_hold_ends_with_its_connection() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let root = ClientPeer {
-            session_id: None,
-            uid: Some(0),
-            system_account: None,
-            ..ClientPeer::UNKNOWN
-        };
-        let someone = ClientPeer {
-            session_id: None,
-            uid: Some(1000),
-            system_account: None,
-            ..ClientPeer::UNKNOWN
-        };
-        for (peer, holds) in [(root, true), (someone, false), (ClientPeer::UNKNOWN, false)] {
-            let state = std::sync::Arc::new(HoldMock::default());
-            let (client, server) = tokio::io::duplex(4096);
-            let st = std::sync::Arc::clone(&state);
-            let served = peer.clone();
-            let srv = tokio::spawn(async move { serve_connection_as(server, &*st, served).await });
-            let (crd, mut cwr) = tokio::io::split(client);
-            let mut clines = tokio::io::BufReader::new(crd).lines();
-            cwr.write_all(b"{\"t\":\"hive_update_hold\"}\n")
-                .await
-                .unwrap();
-            let line = clines.next_line().await.unwrap().unwrap();
-            if holds {
-                assert_eq!(
-                    line,
-                    r#"{"t":"hive_update_held","d":{"waited_secs":7,"cut":0}}"#
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                assert_eq!(
-                    state.releases.load(SeqCst),
-                    0,
-                    "held while the helper installs"
-                );
-            } else {
-                let r: Response = serde_json::from_str(&line).unwrap();
-                assert!(
-                    matches!(&r, Response::Error { message } if message.contains("only root")),
-                    "{peer:?} → {r:?}"
-                );
-            }
-            drop(cwr);
-            drop(clines);
-            srv.await.unwrap().unwrap();
-            assert_eq!(state.holds.load(SeqCst), usize::from(holds), "{peer:?}");
-            assert_eq!(
-                state.releases.load(SeqCst),
-                usize::from(holds),
-                "released once its connection closed: {peer:?}"
-            );
-        }
-    }
-
-    /// FR-90 P3-9-2b — a daemon whose `connect` opens at once, keeping whom
-    /// it served and which endpoints were let go.
-    #[derive(Default)]
-    struct ConnectMock {
-        asked: std::sync::Mutex<Vec<Asker>>,
-        released: std::sync::Mutex<Vec<u64>>,
-        opened: std::sync::atomic::AtomicU64,
-    }
-    #[async_trait]
-    impl LocalApiState for ConnectMock {
-        fn status(&self) -> NodeStatus {
-            Mock.status()
-        }
-        fn peers(&self) -> Vec<PeerInfo> {
-            Mock.peers()
-        }
-        fn flows(&self) -> Vec<FlowInfo> {
-            Mock.flows()
-        }
-        async fn connect(&self, asker: &Asker, args: &ConnectArgs) -> Response {
-            self.asked.lock().unwrap().push(asker.clone());
-            let id = self
-                .opened
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            Response::Connected {
-                id,
-                endpoint: serde_json::json!({ "upstream": args.upstream }),
-            }
-        }
-        fn connect_status(&self, id: u64) -> Response {
-            Response::ConnectState(EndpointState {
-                left_s: 100 + id,
-                ..EndpointState::default()
-            })
-        }
-        fn connect_release(&self, id: u64) {
-            self.released.lock().unwrap().push(id);
-        }
-    }
-
-    /// One connection's conversation with a [`ConnectMock`]: each line sent
-    /// and its answer, then the connection closed and served to its end.
-    async fn converse(
-        state: &std::sync::Arc<ConnectMock>,
-        peer: ClientPeer,
-        scope: Scope,
-        lines: &[&str],
-    ) -> Vec<Response> {
-        let (client, server) = tokio::io::duplex(4096);
-        let st = std::sync::Arc::clone(state);
-        let srv =
-            tokio::spawn(async move { serve_connection_scoped(server, &*st, peer, scope).await });
-        let (crd, mut cwr) = tokio::io::split(client);
-        let mut clines = tokio::io::BufReader::new(crd).lines();
-        let mut answers = Vec::new();
-        for line in lines {
-            cwr.write_all(format!("{line}\n").as_bytes()).await.unwrap();
-            let answer = clines.next_line().await.unwrap().unwrap();
-            answers.push(serde_json::from_str(&answer).unwrap());
-        }
-        drop(cwr);
-        drop(clines);
-        srv.await.unwrap().unwrap();
-        answers
-    }
-
-    const CONNECT: &str = r#"{"t":"connect","d":{"args":{"handle":"db/orders","engine":"postgres","upstream":"db.internal:5432"}}}"#;
-
-    /// FR-90 P3-9-2b — an endpoint lives as long as the connection that
-    /// opened it (decision 25: `roomler connect` in the foreground): it is
-    /// served to the account that asked, read by the listener, and its state
-    /// is that connection's to read, no other's.
-    #[tokio::test]
-    async fn an_endpoint_serves_the_account_that_asked_and_ends_with_its_connection() {
-        let state = std::sync::Arc::new(ConnectMock::default());
-        let root = ClientPeer {
-            uid: Some(0),
-            gid: Some(0),
-            ..ClientPeer::UNKNOWN
-        };
-        let answers = converse(
-            &state,
-            root,
-            Scope::Full,
-            &[
-                CONNECT,
-                r#"{"t":"connect_status","d":{"id":1}}"#,
-                // Not this connection's: refused, and its state never read.
-                r#"{"t":"connect_status","d":{"id":2}}"#,
-            ],
-        )
-        .await;
-        assert_eq!(
-            answers[0],
-            Response::Connected {
-                id: 1,
-                endpoint: serde_json::json!({ "upstream": "db.internal:5432" }),
-            }
-        );
-        assert_eq!(
-            answers[1],
-            Response::ConnectState(EndpointState {
-                left_s: 101,
-                ..EndpointState::default()
-            })
-        );
-        assert!(
-            matches!(&answers[2], Response::Error { message } if message.contains("no endpoint 2")),
-            "{:?}",
-            answers[2]
-        );
-        assert_eq!(
-            *state.asked.lock().unwrap(),
-            [Asker::Unix { uid: 0, gid: 0 }],
-            "served to the account the listener read"
-        );
-        assert_eq!(
-            *state.released.lock().unwrap(),
-            [1],
-            "let go once its connection closed"
-        );
-    }
-
-    /// FR-90 P3-9-2b (decision 26) — `roomler connect` lends the device
-    /// owner's grants: anyone the gate refuses, a peer whose account the OS
-    /// did not name, and the person socket all get a refusal, and the daemon
-    /// is never asked.
-    #[tokio::test]
-    async fn a_connect_is_refused_before_the_daemon_is_asked() {
-        // A uid no runner signs in as, and not root.
-        let someone = ClientPeer {
-            uid: Some(4_000_000_001),
-            gid: Some(4_000_000_001),
-            ..ClientPeer::UNKNOWN
-        };
-        // SYSTEM, whose SID could not be read: the gate passes, and still no
-        // account is served.
-        let unnamed = ClientPeer {
-            session_id: Some(1),
-            system_account: Some(true),
-            elevated: Some(true),
-            ..ClientPeer::UNKNOWN
-        };
-        let root = ClientPeer {
-            uid: Some(0),
-            gid: Some(0),
-            ..ClientPeer::UNKNOWN
-        };
-        for (peer, scope, says) in [
-            (someone, Scope::Full, "owner's vault grants"),
-            (ClientPeer::UNKNOWN, Scope::Full, "owner's vault grants"),
-            (unnamed, Scope::Full, "could not read which account asked"),
-            (root, Scope::Person, "person-at-the-device socket"),
-        ] {
-            let state = std::sync::Arc::new(ConnectMock::default());
-            let answers = converse(&state, peer.clone(), scope, &[CONNECT]).await;
-            assert!(
-                matches!(&answers[0], Response::Error { message } if message.contains(says)),
-                "{peer:?} on {scope:?} → {:?}",
-                answers[0]
-            );
-            assert!(state.asked.lock().unwrap().is_empty(), "{peer:?}");
-            assert!(state.released.lock().unwrap().is_empty(), "{peer:?}");
-        }
-    }
-
-    /// FR-90 P3-9-2b (decision 26) — who may run `roomler connect`: root or
-    /// the daemon's own uid on Unix; SYSTEM, an elevated administrator or the
-    /// daemon's own account on Windows. Never another interactive user (the
-    /// pipe admits them all), and never a peer nothing is known about.
-    #[test]
-    fn only_root_system_an_elevated_administrator_or_the_daemons_own_account_may_connect() {
-        let unix = |uid| ClientPeer {
-            uid: Some(uid),
-            gid: Some(uid),
-            ..ClientPeer::UNKNOWN
-        };
-        assert!(peer_may_connect(&unix(0), Some(1000), None), "root");
-        assert!(
-            peer_may_connect(&unix(1000), Some(1000), None),
-            "the daemon's own uid"
-        );
-        assert!(
-            !peer_may_connect(&unix(1001), Some(1000), None),
-            "another uid"
-        );
-        assert!(
-            !peer_may_connect(&unix(1001), None, None),
-            "no own uid read"
-        );
-        let me = "S-1-5-21-10-20-30-1001";
-        let win = |sid: &str, system: bool, elevated: Option<bool>| ClientPeer {
-            session_id: Some(2),
-            system_account: Some(system),
-            sid: Some(sid.into()),
-            elevated,
-            ..ClientPeer::UNKNOWN
-        };
-        assert!(
-            peer_may_connect(&win("S-1-5-18", true, Some(true)), None, Some(me)),
-            "SYSTEM"
-        );
-        assert!(
-            peer_may_connect(
-                &win("S-1-5-21-10-20-30-500", false, Some(true)),
-                None,
-                Some(me)
-            ),
-            "an elevated administrator"
-        );
-        assert!(
-            peer_may_connect(&win(me, false, Some(false)), None, Some(me)),
-            "the daemon's own account, not elevated"
-        );
-        let guest = win("S-1-5-21-10-20-30-1002", false, Some(false));
-        assert!(
-            !peer_may_connect(&guest, None, Some(me)),
-            "another interactive user, an RDP guest"
-        );
-        assert!(!peer_may_connect(&guest, None, None), "no own account read");
-        assert!(
-            !peer_may_connect(&win("S-1-5-21-10-20-30-1002", false, None), None, Some(me)),
-            "an elevation that could not be read is no elevation"
-        );
-        assert!(
-            !peer_may_connect(&ClientPeer::UNKNOWN, Some(0), Some(me)),
-            "a peer nothing is known about"
-        );
-    }
-
-    /// FR-90 P3-9-2b — the account an endpoint is served to is the one the
-    /// OS named, whole: a uid with its gid, or a SID; else none.
-    #[test]
-    fn the_account_served_is_the_one_the_os_named() {
-        let unix = ClientPeer {
-            uid: Some(1000),
-            gid: Some(100),
-            ..ClientPeer::UNKNOWN
-        };
-        assert_eq!(
-            unix.asker(),
-            Some(Asker::Unix {
-                uid: 1000,
-                gid: 100
-            })
-        );
-        let win = ClientPeer {
-            session_id: Some(2),
-            sid: Some("S-1-5-18".into()),
-            ..ClientPeer::UNKNOWN
-        };
-        assert_eq!(
-            win.asker(),
-            Some(Asker::Windows {
-                sid: "S-1-5-18".into()
-            })
-        );
-        assert_eq!(ClientPeer::UNKNOWN.asker(), None);
-        let half = ClientPeer {
-            uid: Some(1000),
-            ..ClientPeer::UNKNOWN
-        };
-        assert_eq!(half.asker(), None, "a uid without its gid");
-    }
-
-    /// FR-90 P3-9-2b — the connect verbs on the wire: the CLI and the daemon
-    /// are often different builds.
-    #[test]
-    fn the_connect_verbs_wire_is_locked() {
-        let req = Request::Connect {
-            args: ConnectArgs {
-                handle: "db/orders".into(),
-                engine: "postgres".into(),
-                upstream: "db.internal:5432".into(),
-                ttl_s: Some(120),
-                ..ConnectArgs::default()
-            },
-        };
-        let wire = r#"{"t":"connect","d":{"args":{"handle":"db/orders","engine":"postgres","upstream":"db.internal:5432","ttl_s":120}}}"#;
-        assert_eq!(serde_json::to_string(&req).unwrap(), wire);
-        assert_eq!(serde_json::from_str::<Request>(wire).unwrap(), req);
-        assert_eq!(
-            serde_json::to_string(&Request::ConnectStatus { id: 7 }).unwrap(),
-            r#"{"t":"connect_status","d":{"id":7}}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Response::Connected {
-                id: 7,
-                endpoint: serde_json::json!({ "uri": "postgresql:///" }),
-            })
-            .unwrap(),
-            r#"{"t":"connected","d":{"id":7,"endpoint":{"uri":"postgresql:///"}}}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Response::ConnectState(EndpointState {
-                left_s: 200,
-                renewals: 1,
-                refused: None,
-                closed: None,
-            }))
-            .unwrap(),
-            r#"{"t":"connect_state","d":{"left_s":200,"renewals":1}}"#
-        );
     }
 
     #[tokio::test]
