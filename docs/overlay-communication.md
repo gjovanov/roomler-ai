@@ -750,7 +750,7 @@ socket's `tb` as twice `applied`. All three OSes read that way on the fleet on
 0.4.191 ([FR-18's field log](fr/FR-18-carrier-queue-discipline.md#field-log)).
 
 ⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
-answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)
+answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:299`)
 so that a transient overflow never latches the carrier dead. FR-18's design
 also named a `dropped_full` counter, and it was never built.
 
