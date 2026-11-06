@@ -37,7 +37,7 @@ That is the whole asymmetry.
 
 **What is NOT forced is two enrollments.** That comes from us: the hub keys a device's
 control WS on `agent_id` and a second connection displaces the first
-(`crates/modules/fleet/src/hub.rs:109`), so we gave each half its own identity and the
+(`crates/modules/fleet/src/hub.rs:110`), so we gave each half its own identity and the
 Mac became two rows. Cost, paid daily: every `roomler exec` / `roomler ssh` must target
 the *right* row (the GUI row cannot reach root, the root row cannot see the screen), the
 install needs two tokens, and Devices shows one machine twice.
@@ -101,9 +101,9 @@ the session has to reach the worker some other way.
 ### Why not "let the worker open its own WS for the session"
 
 Tempting, and it would remove the IPC entirely. It cannot work as-is: `Hub::register_agent`
-(`crates/modules/fleet/src/hub.rs:406`) is keyed on `agent_id`, and a second connection
+(`crates/modules/fleet/src/hub.rs:492`) is keyed on `agent_id`, and a second connection
 **displaces** the first — the displaced socket is cancelled within milliseconds by design
-(`hub.rs:109-114`). A worker dialling in as the same device would knock the daemon's control
+(`hub.rs:110-115`). A worker dialling in as the same device would knock the daemon's control
 WS off the air, which is precisely the login/displace/relaunch loop P1's stand-down exists
 to prevent. Making it work would mean teaching the server about session-scoped secondary
 connections: a server change, a new authenticated surface, and a new way for a compromised
@@ -260,7 +260,7 @@ the feature works and looks broken, which is close to not working.
 ### The constraint that shapes everything: caps are announced ONCE
 
 The server takes caps from `rc:agent.hello` and nowhere else
-(`crates/modules/fleet/src/socket.rs:60`). `AgentHeartbeat` carries `rss_mb`,
+(`crates/modules/fleet/src/socket.rs:61`). `AgentHeartbeat` carries `rss_mb`,
 `cpu_pct`, `active_sessions` and `sys` — **no caps**
 (`crates/remote_control/src/signaling.rs:623`). There is no post-hello refresh
 path at all.
@@ -646,7 +646,7 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
 | Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:641-700`). The migration touches no bundle, which is what AC5 reads |
-| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:828`) | The worker no longer dials a server, so it can displace nothing |
+| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:914`) | The worker no longer dials a server, so it can displace nothing |
 | The delegation channel's two gates (`delegate.rs:764-785`) | Unchanged |
 | The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
 

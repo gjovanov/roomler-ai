@@ -8378,6 +8378,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tracing",
+ "tungstenite 0.29.0",
  "uuid",
 ]
 

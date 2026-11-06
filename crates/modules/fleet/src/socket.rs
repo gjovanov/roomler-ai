@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 
 use crate::FleetState;
 use crate::hub::DispatchCtx;
+use crate::socket_end::SocketEnd;
 use axum::{extract::WebSocketUpgrade, response::Response};
 use roomler_core::ws::upgrade::{MAX_WS_MESSAGE_BYTES, send_goodbye_and_close, tid_matches_claim};
 
@@ -57,7 +58,7 @@ pub async fn handle_agent_socket(
 
     // Wait for the agent's hello message — it announces OS + capabilities.
     let hello = match read_next_rc(&mut socket_rx).await {
-        Some(ClientMsg::AgentHello {
+        Ok(ClientMsg::AgentHello {
             machine_name,
             os,
             arch,
@@ -80,8 +81,23 @@ pub async fn handle_agent_socket(
             supports_relay_regions,
             (ssh_host_pubkey, peer_auth_key),
         ),
-        other => {
-            warn!(?other, "agent opened WS without rc:agent.hello — closing");
+        Ok(other) => {
+            warn!(%agent_id, ?other, "agent opened WS without rc:agent.hello — closing");
+            return;
+        }
+        // #3517 — the socket ended before its hello. Nothing registered, so
+        // the disconnect line below never prints for this connection: this
+        // line says how it ended instead, with the same fields.
+        Err(end) => {
+            warn!(
+                %agent_id,
+                cause = %end.cause(),
+                code = end.code(),
+                reason = end.reason(),
+                kind = end.kind().map(tracing::field::display),
+                error = end.error(),
+                "agent opened WS without rc:agent.hello — closing"
+            );
             return;
         }
     };
@@ -146,9 +162,10 @@ pub async fn handle_agent_socket(
     //   * `tx` is captured for the eventual `unregister_agent` call so
     //     a displaced-handler late unregister doesn't evict a newer
     //     connection's entry (critique #4 race fix).
-    //   * `cancel` is an `Arc<Notify>` the read-loop `select!`s on,
+    //   * `cancel` is an `Arc<AgentCancel>` the read-loop `select!`s on,
     //     so a displacement triggers an immediate read-loop exit
-    //     instead of waiting up to one 25 s keepalive interval.
+    //     instead of waiting up to one 25 s keepalive interval (#3517:
+    //     and it says which of the Hub's triggers fired it).
     //   * `rx` feeds the pump task as before.
     let max_sessions = caps.max_simultaneous_sessions.max(1);
     // P6 — an arbiter-capable agent serializes + fences concurrent input
@@ -458,7 +475,11 @@ pub async fn handle_agent_socket(
     // displacement-cancel notify exits this loop within milliseconds
     // — without the cancel arm, a displaced socket would linger up
     // to one 25 s keepalive interval (auto-fail #3 in v2 plan).
-    loop {
+    //
+    // #3517 — every exit breaks with how the socket ended, and the
+    // disconnect line at the end of the teardown carries it. A bare
+    // `break` does not compile here, so a new exit has to name its cause.
+    let end = loop {
         tokio::select! {
             // `biased` so cancel fires deterministically when both
             // arms are ready in the same poll cycle. Without this,
@@ -466,19 +487,26 @@ pub async fn handle_agent_socket(
             // for several iterations in a hot read loop.
             biased;
             _ = cancel.notified() => {
-                info!(%agent_id, "agent connection cancelled by Hub (replaced by newer); exiting read-loop");
-                break;
+                let end = SocketEnd::Cancelled(cancel.reason());
+                info!(
+                    %agent_id,
+                    by = end.by().map(tracing::field::display),
+                    "agent connection cancelled by Hub; exiting read-loop"
+                );
+                break end;
             }
             _ = liveness.tick() => {
-                if last_rx.elapsed() > rx_deadline {
-                    warn!(%agent_id, elapsed_s = last_rx.elapsed().as_secs(),
+                let elapsed = last_rx.elapsed();
+                if elapsed > rx_deadline {
+                    let elapsed_s = elapsed.as_secs();
+                    warn!(%agent_id, elapsed_s,
                         "agent WS receive-liveness deadline exceeded — reaping half-open socket");
-                    break;
+                    break SocketEnd::LivenessDeadline { elapsed_s };
                 }
                 continue;
             }
             maybe_msg = socket_rx.next() => {
-                let Some(msg) = maybe_msg else { break };
+                let Some(msg) = maybe_msg else { break SocketEnd::StreamEnd };
                 // EVERY inbound frame proves the leg alive — including
                 // Pings/Pongs/Binary (the catch-all below).
                 last_rx = std::time::Instant::now();
@@ -651,7 +679,7 @@ pub async fn handle_agent_socket(
                                         ),
                                         Err(e) => warn!(%agent_id, %e, "agent record_sleep failed"),
                                     }
-                                    break;
+                                    break SocketEnd::Sleep;
                                 }
                                 other => other,
                             };
@@ -908,12 +936,13 @@ pub async fn handle_agent_socket(
                         let mut guard = socket_tx.lock().await;
                         let _ = guard.send(Message::Pong(data)).await;
                     }
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Close(frame)) => break SocketEnd::of_close(frame),
+                    Err(e) => break SocketEnd::of_error(&e),
                     _ => {}
                 }
             }
         }
-    }
+    };
 
     // Teardown: unregister + mark offline. rc.53: thread `registered_tx`
     // into unregister_agent so a displaced-handler late unregister
@@ -999,7 +1028,19 @@ pub async fn handle_agent_socket(
     } else {
         debug!(%agent_id, "teardown skipped Offline+presence (newer connection owns the slot)");
     }
-    info!(%agent_id, "remote-control agent WS disconnected");
+    // #3517 — how the socket ended (`socket_end`). A field that does not
+    // apply to this end is left off the line.
+    info!(
+        %agent_id,
+        cause = %end.cause(),
+        code = end.code(),
+        reason = end.reason(),
+        kind = end.kind().map(tracing::field::display),
+        error = end.error(),
+        elapsed_s = end.elapsed_s(),
+        by = end.by().map(tracing::field::display),
+        "remote-control agent WS disconnected"
+    );
 }
 
 /// Fleet RPC — a device asked to run a command on another device
@@ -1198,21 +1239,23 @@ pub fn prefs_from_rtt(results: &[RelayRegionRtt]) -> Vec<String> {
 }
 
 /// Parse the next inbound WS text frame as [`ClientMsg`]. Skips non-text frames.
+/// #3517 — a socket that ends first says how, as the read loop's ends do.
 async fn read_next_rc(
     socket_rx: &mut futures::stream::SplitStream<WebSocket>,
-) -> Option<ClientMsg> {
+) -> Result<ClientMsg, SocketEnd> {
     while let Some(msg) = socket_rx.next().await {
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(parsed) = serde_json::from_str::<ClientMsg>(&text) {
-                    return Some(parsed);
+                    return Ok(parsed);
                 }
             }
-            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(Message::Close(frame)) => return Err(SocketEnd::of_close(frame)),
+            Err(e) => return Err(SocketEnd::of_error(&e)),
             _ => continue,
         }
     }
-    None
+    Err(SocketEnd::StreamEnd)
 }
 
 /// Forwards [`ServerMsg`] values from a Hub-owned [`mpsc::Receiver`] to a
@@ -1396,6 +1439,126 @@ mod tests {
         assert_eq!(d.get_i64("tx").unwrap(), 512);
         assert_eq!(d.get_i64("rx").unwrap(), 0);
         assert_eq!(d.get_str("relay").unwrap(), "turn/udp");
+    }
+
+    // ─── #3517: how a socket ended, read off a real axum socket ──────
+
+    /// Serve axum WebSockets on loopback, each answering with what its first
+    /// `read_next_rc` returned. The client side is raw TCP, so a test decides
+    /// exactly what reaches the server: a close frame with or without a
+    /// status, or a FIN with no frame at all.
+    async fn hello_wait_on_loopback() -> (
+        std::net::SocketAddr,
+        mpsc::UnboundedReceiver<Result<ClientMsg, SocketEnd>>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/ws",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let tx = tx.clone();
+                async move {
+                    ws.on_upgrade(move |socket| async move {
+                        let (_sink, mut stream) = socket.split();
+                        let _ = tx.send(read_next_rc(&mut stream).await);
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, rx)
+    }
+
+    /// Upgrade a raw TCP connection by hand, reading the 101's head and
+    /// nothing past it.
+    async fn raw_upgrade(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n\
+              Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+              Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tcp.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(
+            head.starts_with(b"HTTP/1.1 101"),
+            "{}",
+            String::from_utf8_lossy(&head)
+        );
+        tcp
+    }
+
+    /// A client's close frame: FIN + opcode 8, masked (a server refuses an
+    /// unmasked client frame) with an all-zero key, so the payload goes as is.
+    fn close_frame(payload: &[u8]) -> Vec<u8> {
+        assert!(
+            payload.len() < 126,
+            "a control frame's payload fits in 7 bits"
+        );
+        let mut frame = vec![0x88, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    async fn next_end(
+        ends: &mut mpsc::UnboundedReceiver<Result<ClientMsg, SocketEnd>>,
+    ) -> SocketEnd {
+        tokio::time::timeout(std::time::Duration::from_secs(5), ends.recv())
+            .await
+            .expect("the server read nothing within 5 s")
+            .expect("the server task is gone")
+            .expect_err("no hello was sent, so the socket must end")
+    }
+
+    /// The daemon's clean stop: a close frame with no status code.
+    #[tokio::test]
+    async fn a_close_with_no_status_reads_close_no_frame() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, mut ends) = hello_wait_on_loopback().await;
+        let mut tcp = raw_upgrade(addr).await;
+        tcp.write_all(&close_frame(&[])).await.unwrap();
+        assert_eq!(next_end(&mut ends).await, SocketEnd::CloseNoFrame);
+    }
+
+    #[tokio::test]
+    async fn a_close_frame_reads_its_code_and_reason() {
+        use tokio::io::AsyncWriteExt;
+        let (addr, mut ends) = hello_wait_on_loopback().await;
+        let mut tcp = raw_upgrade(addr).await;
+        let mut payload = 1001u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"going away");
+        tcp.write_all(&close_frame(&payload)).await.unwrap();
+        assert_eq!(
+            next_end(&mut ends).await,
+            SocketEnd::Close {
+                code: 1001,
+                reason: "going away".into(),
+            }
+        );
+    }
+
+    /// A process that exits, or a hop that closes its side, ends the TCP leg
+    /// with a FIN and no close frame. ⚠️ This is also the guard on
+    /// `socket_end::error_kind`'s downcast: if axum moves to a tungstenite
+    /// other than the one fleet's `Cargo.toml` pins, this reads `other`.
+    #[tokio::test]
+    async fn a_dropped_tcp_leg_reads_eof() {
+        let (addr, mut ends) = hello_wait_on_loopback().await;
+        drop(raw_upgrade(addr).await);
+        match next_end(&mut ends).await {
+            SocketEnd::Error { kind, detail } => {
+                assert_eq!(kind, "eof", "{detail}");
+            }
+            other => panic!("a FIN with no close frame read {other:?}"),
+        }
     }
 }
 

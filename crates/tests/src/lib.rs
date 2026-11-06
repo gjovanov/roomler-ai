@@ -62,6 +62,9 @@ mod agent_removal_tests;
 /// org is exactly its netmap ∪ itself (the negative control lives here).
 #[cfg(test)]
 mod agent_self_tests;
+/// #3517 — the agent socket's disconnect line says how the socket ended.
+#[cfg(test)]
+mod agent_socket_end_tests;
 #[cfg(test)]
 mod agent_tests;
 /// FR-88 P1a — sign-up attribution: stored once at creation, absent from
