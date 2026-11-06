@@ -24,6 +24,26 @@ two decoy `roomlerd.log*` files (the SCM supervisor's and the updater's).
 Path archaeology has produced a false "the agent's logging is dead" verdict
 twice (2026-08-07 and 2026-08-09); the verb existed both times.
 
+**What reaches that log.** The daemon keeps lines by `RUST_LOG` when its environment
+sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
+everything else at WARN (`crates/agent-core/src/logging.rs:352`). Either way it then
+keeps INFO from two targets that no shipped unit names
+(`crates/agent-core/src/logging.rs:435`, #1928):
+
+| Target | Its INFO lines |
+|---|---|
+| `roomler_localapi` | The LocalAPI listeners coming up and going down, and the person socket's up and down (FR-27 P11). Its per-connection lines are DEBUG and stay off. |
+| `roomler_node_core::logging` | One: #3438's "this console has no window", at a worker's start. |
+
+A `RUST_LOG` that already decides about a target is used as written: it has a
+directive for the target, for a module under it or for any prefix of its name
+(`EnvFilter` matches targets by prefix), or a bare level of `info` or finer. So
+`RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
+silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
+logs ERROR from every target. Two directives are added whatever the spec says:
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:390`) and
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:401`).
+
 ## Transport
 
 Commands ride the agent's **existing control WebSocket**, not the overlay.
