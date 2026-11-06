@@ -1483,12 +1483,18 @@ Measured with the sweep described below (20 rate changes 6 M → 200 k → 6 M a
 | `hevc_amf` (Radeon 610M) | rebuild | **20/20** | **41–55 ms** | **0.4.187, 2026-10-29** — the 0.4.187 harness filed every one as periodic (below); the corrected harness reads `total_rate_idr: 20`, `pass: false` |
 | `hevc_d3d12va`, `hevc_vulkan` (the dev box) | rebuild | 20/20 | 42–77 ms | FR-78 P2 |
 | `*_vaapi` | rebuild, by construction | — | unmeasured | — |
-| `hevc_videotoolbox` | rebuild | unmeasured | unmeasured | A3's open decision: patch 0002, or a rebuild at settle |
+| `hevc_videotoolbox` (Apple M5 Pro) | rebuild | **20/20** | **8–12 ms** | **0.4.201, 2026-11-05**; patch 0002 would remove the IDR (A3's open decision) |
 
 So the two rebuild families are not one: QSV's rebuild is a multi-second stall at
-the rates a slow link runs, while AMF, D3D12 and Vulkan rebuild in 40–80 ms and pay
-only the IDR. The rationing a backend needs follows from its row, which is why A4
+the rates a slow link runs, while VideoToolbox (8–12 ms), AMF, D3D12 and Vulkan
+(40–80 ms) rebuild fast and pay only the IDR. The rationing a backend needs follows from its row, which is why A4
 retires heuristics per backend rather than deleting them.
+
+In the field `av1_nvenc` moves the same way. A relayed CORPLAP-2 session on 0.4.201
+crossed 13 rungs in place, down to 550 k and back up to 3 M, with `rebuilds=0`, and
+none of the moves brought an IDR of its own (FR-62 AC2/AC3, 2026-11-05). Patch 0001
+is in `nvenc.c`'s `reconfig_encoder`, which `h264_nvenc`, `hevc_nvenc` and
+`av1_nvenc` share.
 
 ⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
 direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
@@ -1513,6 +1519,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
 roomlerd encoder-smoke --reconfigure-sweep --name hevc_amf --codec hevc --json   # a backend the cascade outranks
+roomlerd encoder-smoke --reconfigure-sweep --name hevc_videotoolbox --codec hevc --json   # a Mac, as root
 ```
 
 Per rung it prints `set_ms`, `rate_idr`, `periodic_idr`, `mean_bytes`, the

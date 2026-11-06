@@ -1,6 +1,6 @@
 # FR-137: Hive leaves master — FR-90 parked on a branch, the fleet kept whole
 
-**Issue:** [#3458](https://github.com/gjovanov/roomler-ai/issues/3458) · **Status:** **claimed** 2026-11-04; D1–D11 confirmed the same day; P1 merged and promoted, P2 merged, P3 in review ·
+**Issue:** [#3458](https://github.com/gjovanov/roomler-ai/issues/3458) · **Status:** **claimed** 2026-11-04; D1–D11 confirmed the same day; P1, P2 and P3 merged and promoted, P2 released in agent 0.4.201, every criterion met 2026-11-05 ·
 **Anchors:** master `8f7533e96` (2026-11-04) unless a row says otherwise ·
 **Parks:** [FR-90](https://github.com/gjovanov/roomler-ai/blob/park/hive-fr90/docs/fr/FR-90-hive-agent-sessions.md)
 ([#1827](https://github.com/gjovanov/roomler-ai/issues/1827)), parked on
@@ -44,11 +44,22 @@ the Hive-only directories.
 | P2 (PR-B): device + wire + shared | `crates/hive-node`, roomlerd's `hive/` and `vault_proxy/`, 14 single files | ≈ 113.7k | ~70 cited by line: 214 rows cut, 23 stubbed, 9 kept as generic |
 | P3 (PR-C): docs | 5 docs and FR-90's spec | 18,312 | 28: ~910 lines cut, ~45 rewritten |
 
-Three classes of match are **not** Hive, and the inventories mark them false positives:
+Five classes of match are **not** Hive. The inventories mark the first three false positives, and AC1's
+read after P3 (§8) found the last two:
 
 - "archive";
 - the Windows **registry hive** (`crates/agent-core/src/companion_autostart.rs`, `scripts/install.ps1`);
-- FR-52's `connect_code`.
+- FR-52's `connect_code`;
+- **"split-brain"**: the `\bbrain\b` alternative matches it, because a hyphen is a word boundary. On master
+  `a19e4573f` that is 16 lines in 8 files: `agents/roomler-desktop/src/commands.rs` 5,
+  `crates/modules/network/src/derp.rs` 4, `crates/modules/conference/src/media_cluster.rs` 2, and one each
+  in `crates/agent-core/src/appdirs.rs`, `crates/core/src/cluster/directory.rs`,
+  `crates/core/src/cluster/metrics.rs`, `crates/modules/network/src/lib.rs` and
+  `crates/modules/network/src/overlay.rs`;
+- **history notes**: a comment that records when FR-90 changed something else. There is one,
+  `.github/workflows/release-agent.yml:2321` (on `a19e4573f`), in the MSI size-history comment: it dates the
+  0.4.124 MSI step to FR-90's `hive` entering the Windows build (#1915). It stays as written, because it is
+  the history the size baseline was measured from.
 
 FR-90 also left code that never says hive:
 
@@ -177,6 +188,14 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 | **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4562` | Every host carries them (§2.2). | — (D11) |
 | **S-B8**: FR-90's refactors of shipped code: SOCKS5 `negotiate()`, `flow_listener::bind()`, `TempDir::named`, `within_ngroups_max`, the Windows Job Object code, shared `windows-sys` features and deps | `inventory-B.md` §B1 | Shipped paths now run on them. | Never. |
 
+Two decisions also keep lines that name Hive. They are not stubs, and AC1's read classes them here
+(anchors on `a19e4573f`):
+
+| Kept line | Where | Why | It may go when |
+|---|---|---|---|
+| **The parked rows' binding**: the doc comment and the shape test that spell `{module: "hive", ref: …}`, and the SPA's note that such a room opens as a plain Secret room | `crates/db/src/models/binding.rs:8-9`, `:42`, `:45`; `ui/src/stores/rooms.ts:37` | D2 keeps the rooms bound to `hive` (73 on production), and D9 opens them as plain Secret rooms. The comment says which rows carry the binding and why chat never reads it. | Those rows are dropped (out of scope, §7), or Hive returns and owns them again. |
+| **D3's retired-switch test**: `a_retired_module_switch_loads_and_switches_nothing` | `crates/config/src/settings.rs:1786`, its two `toml::from_str` lines at `:1788` and `:1792` | A config that still sets `hive`, `vault` or `knowhow` under `[modules]` must load and switch nothing. D3 removed production's Hive env on 2026-11-05 (AC8), but an older deploy or a self-host config can still carry a switch. | No supported config can carry a retired switch, or never: the test costs nothing. |
+
 LocalAPI needs no verb stubs. An unknown verb answers `Error("bad request: …")` and the connection lives on
 (`crates/localapi/src/lib.rs:3788`). The 0.4.199 macOS update helper therefore installs without a Hive hold,
 failing open by design (`agents/roomlerd/src/updater.rs:3861`). Remote config needs nothing either:
@@ -227,11 +246,12 @@ device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).
      untouched on disk.
    - Its Hive frames meet P1's stub, or `debug!` after P2's server roll.
 5. **A 0.4.199 agent against P2's server.**
-   - A retired frame fails the parse and lands at `debug!` (`crates/modules/fleet/src/socket.rs:1012`),
-     with no disconnect.
+   - A retired frame fails the parse and lands at `debug!` (`crates/modules/fleet/src/socket.rs:904` on
+     master `a19e4573f`, after P2), with no disconnect. P2's server GREEN saw exactly that on production
+     (§8).
    - The hello still parses: `vault_key` is an ignored field and the verbs are strings. A frozen-hello test
      pins this, because `read_next_rc` drops an unparseable hello without a word
-     (`crates/modules/fleet/src/socket.rs:1309`).
+     (`crates/modules/fleet/src/socket.rs:1201` on `a19e4573f`).
    - A ticket or grant is still refused (S-B3).
    - DERP traffic is opaque to the relay.
 6. **P2's agent against P1's server.** Nothing Hive flows either way, and `one_command` is always `false`.
@@ -271,8 +291,8 @@ Each field check is run **RED first** on the current deploy, then GREEN.
 |---|---|---|---|
 | **P0** | this spec, the claim, the inventories (`inventory-{A,B,C}.md`), the compatibility facts (`compat.md`) and the anchor check | 627 inventory anchors + 2 in range, and every spec anchor, checked on master `8f7533e96` | drafted 2026-11-04 |
 | **P1** | PR-A (`inventory-A.md`): the server and the UI, stubs S-A1…S-A8 | §4.1 | merged 2026-11-04 as `97dea2554` and promoted as `hosted-20261104-97dea25`; GREEN 2026-11-04 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6636996599)) |
-| **P2** | PR-B (`inventory-B.md`): the device, the wire and the shared crates, stubs S-B1…S-B8, the compatibility tests | §4.2 | merged 2026-11-04 as `9da76c4e6` (#3475); it rides 0.4.201, not cut yet |
-| **P3** | PR-C (`inventory-C.md`): the six docs leave, 28 files cleaned, FR-90's row parked, and this FR's docs: the reserved surfaces, each in its home doc, a checklist section with a mermaid diagram of where each retired surface lands, linked from `docs/README.md` | §4.3 | RED read 2026-11-04 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6635837269)); PR-C (#3490) in review |
+| **P2** | PR-B (`inventory-B.md`): the device, the wire and the shared crates, stubs S-B1…S-B8, the compatibility tests | §4.2 | merged 2026-11-04 as `9da76c4e6` (#3475), promoted as `hosted-20261104-9da76c4` on 2026-11-05 and released in agent 0.4.201 the same day; server GREEN ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6647220111)), fleet GREEN ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6663046866)) |
+| **P3** | PR-C (`inventory-C.md`): the six docs leave, 28 files cleaned, FR-90's row parked, and this FR's docs: the reserved surfaces, each in its home doc, a checklist section with a mermaid diagram of where each retired surface lands, linked from `docs/README.md` | §4.3 | RED read 2026-11-04 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6635837269)); merged 2026-11-05 as `225de0828` (#3490) and promoted as `hosted-20261105-225de08`; GREEN ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6649560305)) |
 
 ### 4.1 P1: what proves it
 
@@ -314,8 +334,12 @@ Each field check is run **RED first** on the current deploy, then GREEN.
   platforms (B-I1).
 - **RED on today's fleet:** a current device's stored `capabilities.rpc` lists the Hive verbs its build
   advertises (most are build-gated; a few also need a config switch or a unix host) and `ssh-one-command`.
-- **GREEN, server:** after the promote, §4.1's GREEN list again, plus the DERP relay's health. The relay
-  rides the same image (`Dockerfile:75`) and names no Hive item.
+- **GREEN, server:** after the promote, §4.1's GREEN list again, plus the DERP relay's health. Only the
+  build shares the image: `Dockerfile:78` builds `derp-relay` and `:131` copies it in, but no deployed
+  relay runs the promoted image. The regional PoPs run a binary staged on each relay host, and the
+  in-cluster relay is a `stats` sidecar pinned to its own image. The DERP a promote rolls is the app pods'
+  in-process `/derp`, so that is the one this read checks, with the PoPs' `/healthz` read beside it.
+  `crates/derp-relay` names no Hive item.
 - **GREEN, canary:** before publishing, one device per OS on the rehearsal's build with auto-update off:
   - the version;
   - an RC session;
@@ -341,29 +365,29 @@ Each field check is run **RED first** on the current deploy, then GREEN.
 
 ## 5. Acceptance criteria
 
-- [ ] **AC1, master carries no Hive.** After P3, `cargo metadata` lists no `roomler-ai-mod-hive`,
+- [x] **AC1, master carries no Hive.** After P3, `cargo metadata` lists no `roomler-ai-mod-hive`,
   `roomler-ai-mod-vault`, `roomler-ai-mod-knowhow` or `roomler-hive-node`. No CI lane or release list names
   a `hive` or `vault` feature. And §2.1's regex over `crates agents ui .github scripts Cargo.toml
   Dockerfile* docker-compose*` returns only §3.3's stubs and §2.1's false-positive classes, with the list
-  recorded in §8.
+  recorded in §8. *(Read on master `225de0828` after P3 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6646280609)), and again on `a19e4573f` for this commit, which adds the classes the first read found unlisted: §2.1's "split-brain" and history notes, and §3.3's kept decision lines. §8 has the per-class totals.)*
 - [x] **AC2, P1 is promoted and production holds.** §4.1's RED reading before, and every GREEN item after. *(GREEN 2026-11-04: [#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6636996599).)*
-- [ ] **AC3, P2 is promoted and released, and the fleet holds.** §4.2's rehearsal, server, canary and fleet
+- [x] **AC3, P2 is promoted and released, and the fleet holds.** §4.2's rehearsal, server, canary and fleet
   readings. The first release after P2 builds from its tag on all four platforms and re-pins the MSI size
-  baseline (D10).
-- [ ] **AC4, the compatibility tests are in CI and green.** §4.2's list runs in the default lanes.
-- [ ] **AC5, no data is dropped.** Read-only and bounded (`estimatedDocumentCount()` and `getIndexes()`,
+  baseline (D10). *(GREEN 2026-11-05: the [fleet read](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6663046866), after the [server GREEN](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6647220111) and the canary ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6632461736)); agent-v0.4.201 built from its tag on all four platforms ([run 42042701635](https://github.com/gjovanov/roomler-ai/actions/runs/42042701635)), and #3510 (`fa868aae6`) re-pinned the MSI size baseline.)*
+- [x] **AC4, the compatibility tests are in CI and green.** §4.2's list runs in the default lanes. *(GREEN 2026-11-05: each ran `ok` by name on master's push runs for `9da76c4e6`, [CI 41935772637](https://github.com/gjovanov/roomler-ai/actions/runs/41935772637) and [integration 41935772710](https://github.com/gjovanov/roomler-ai/actions/runs/41935772710); listed in the [fleet read](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6663046866).)*
+- [x] **AC5, no data is dropped.** Read-only and bounded (`estimatedDocumentCount()` and `getIndexes()`,
   never a scan), FR-90's collections and their indexes are all present before P1 and after P3 (production
   holds 13 collections and 48 indexes; the plan names 21, and the vault's eight never existed), and D2's
-  TTL decision is applied as decided.
-- [ ] **AC6, nothing is reused.** `RETIRED_RPC_VERBS` and its test are on master. Role bits 32-34 are
-  named RESERVED with a test. The `SshDenyReason` variants are kept per D7.
-- [ ] **AC7, docs (the docs criterion).** The six docs are off master. FR-90's row reads parked with the
+  TTL decision is applied as decided. *(GREEN 2026-11-05, after P3: the same 13 collections and 48 indexes, each list identical, the six TTLs unchanged ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6646318716)).)*
+- [x] **AC6, nothing is reused.** `RETIRED_RPC_VERBS` and its test are on master. Role bits 32-34 are
+  named RESERVED with a test. The `SshDenyReason` variants are kept per D7. *(GREEN 2026-11-05: `retired_rpc_verbs_are_never_reused`, `retired_wire_families_and_module_ids_are_never_reused` and `the_reserved_bits_stay_named_and_seeded_by_no_row_below_the_owner` ran `ok` in master [run 42025637832](https://github.com/gjovanov/roomler-ai/actions/runs/42025637832) on `4df9cbe74`.)*
+- [x] **AC7, docs (the docs criterion).** The six docs are off master. FR-90's row reads parked with the
   branch URL. No link dangles. The four doc gates pass. Each reserved surface is documented in its home
   doc (`docs/permissions.md`, `docs/data-model.md`, `docs/real-time.md`, `docs/overlay-nat-traversal.md`,
   `docs/roomler-ssh.md`, `docs/tunnels.md`, the public configuration reference). A checklist section in
   `docs/retired-names.md` links them, with a mermaid diagram of where each retired surface lands, and is
-  named in its `docs/README.md` row (`docs/README.md:182`).
-- [ ] **AC8, the operator's follow-ups.** D3 (the deploy env) and D5 (the GHCR image) are done as decided.
+  named in its `docs/README.md` row (`docs/README.md:182` on `8f7533e96`, `:163` on `a19e4573f`). *(GREEN 2026-11-05: PR-C #3490 merged as `225de0828`, its image promoted, the live configuration reference read ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6649560305)).)*
+- [x] **AC8, the operator's follow-ups.** D3 (the deploy env) and D5 (the GHCR image) are done as decided. *(GREEN 2026-11-05 ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6663438989)).)*
 
 ## 6. Open decisions
 
@@ -448,3 +472,14 @@ record, the confirmed one first.
 | 2026-11-04 16:19–16:20Z | P3 RED, on master `14c8937c9` and the live site, before PR-C | the six docs present (18,312 lines); FR-90's row linked its spec by relative path; 40 links on 34 lines of 9 surviving docs pointed into the six; the public configuration reference listed 13 `hive_*` rows ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6635837269)) |
 | 2026-11-04 23:41Z | P2 merged as `9da76c4e6` (#3475), after 0.4.200 was published (22:14Z) | its squash tree equals PR-B's tested head `fb3577c05` (tree `a9eb97648`); P2 rides 0.4.201 |
 | 2026-11-04 | P3 on PR-C's head (#3490), static | `fr-registry`, `anchor-ranges` and `mermaid-sequences` report 0 faults, and the docs-site build passes (98 pages, its link and anchor checks included); 0 links into the six docs; FR-90's row links the branch by full URL; `CLAUDE.md` and the modular-monolith rule hold no Hive text, and `docs/README.md` only its retired-names row's pointer to the checklist |
+| 2026-11-05 00:13Z | P2 promoted as `hosted-20261104-9da76c4` ([run 41939707249](https://github.com/gjovanov/roomler-ai/actions/runs/41939707249)) | both pods started at 00:13:36Z and 00:13:53Z |
+| 2026-11-05 00:17–01:35Z | P2 GREEN, server, on production after the promote | every §4.1 item GREEN. The DERP a promote rolls is the pods' in-process `/derp` (registrations 19 before, 20 after); the four regional PoPs answer `/healthz` and were not touched, which corrected §4.2's "the relay rides the same image". 19 `rc:hive.manifest` frames from 0.4.199/0.4.200 devices were dropped at DEBUG and no socket closed on one (§3.4 case 5); in an hour of pod logs, 0 `unexpected msg for role` and 0 `rc:* dispatch failed (agent)` ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6647220111)) |
+| 2026-11-05 00:32Z | P3 merged as `225de0828` (#3490) | its squash tree equals PR-C's tested head `0a6af0c49` merged onto that master |
+| 2026-11-05 00:37–00:43Z | AC1 and AC5 after P3, on master `225de0828` and production | AC1: `cargo metadata` lists 26 packages, none of them Hive; 0 CI or release lines name a Hive feature; the regex gives 312 lines in 61 files, every one classed, 24 of them in classes §2.1 and §3.3 did not list yet ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6646280609)). AC5, bounded: the same 13 collections, 48 indexes with identical lists, and the six TTLs unchanged. `hive_session_memory` aged 2 → 0 on its own TTL, and two knowhow counts rose before P1's roll, dated by one `_id`-sorted `limit(1)` read each ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6646318716)) |
+| 2026-11-05 01:35Z, 04:16Z | P3 promoted as `hosted-20261105-225de08` ([run 41949562673](https://github.com/gjovanov/roomler-ai/actions/runs/41949562673)); AC7's live read | the public configuration reference shows 0 `hive_*` rows (13 at the RED) and the parked-keys sentence; 0 links into the six docs over all 334 tracked `.md` files on `944319385` ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6649560305)) |
+| 2026-11-05 | The 0.4.201 canary: one device per OS on the release tree's rehearsal build ([run 42021537746](https://github.com/gjovanov/roomler-ai/actions/runs/42021537746)), auto-update off | GREEN on Linux, macOS and Windows. Each advertised RPC set lost exactly the retired verbs (33 → 18, 32 → 17, 31 → 18); RC painted and took input; overlay pairs as before, with no `Unrouted`; tunnels over `quic-v1`; `roomler ssh` returned 0; the retired keys survived saves. One installer finding, not P2's (#1683) ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6632461736)) |
+| 2026-11-05 14:17:45Z | agent-v0.4.201 published, built from its tag on all four platforms ([run 42042701635](https://github.com/gjovanov/roomler-ai/actions/runs/42042701635)) | D10: the MSIs measured 19.15 MiB (per-user) and 19.28 MiB (per-machine); #3510 (`fa868aae6`) moved the baseline 22.00 → 19.28 MiB and the ceiling 26 → 23 MiB |
+| 2026-11-05 14:44–16:16Z | P2 GREEN, fleet, on the official 0.4.201 bytes | at 16:08Z, 20 of 22 online devices ran 0.4.201, and none of those 20 advertised a retired verb. On one device per OS: RC, the overlay with no `Unrouted`, a tunnel forward, `roomler ssh`, `hive_enabled` kept through a save, and the S-B2 hook exiting 0. One Windows PC refuses SSH grants on a 73 s clock skew, not P2's (#3511) ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6663046866)). AC3 and AC4 ticked on #3458 |
+| 2026-11-05 | AC6, on master | role bits 32–34 named `RESERVED` (`crates/db/src/models/role.rs:472`'s test) and `RETIRED_RPC_VERBS` with its two tests (`crates/remote_control/src/models.rs:7980`, `:8049`), all `ok` in master [run 42025637832](https://github.com/gjovanov/roomler-ai/actions/runs/42025637832) on `4df9cbe74` |
+| 2026-11-05 16:22–16:33Z | AC8: D3 and D5, on production | the deploy repo's change merged at 16:22:09Z and rolled both pods (Ready by 16:23:16Z) on the image already live. The ConfigMap went from 64 keys to 61, the three FR-90 keys gone; no `ROOMLER__MODULES__{HIVE,VAULT,KNOWHOW}` or `ROOMLER__VAULT__*` was set anywhere. At +10 min (16:33Z), `agents_online` read 22, as before the merge. The `hive-archive` image is kept, 1 version (D5) ([#3458](https://github.com/gjovanov/roomler-ai/issues/3458#issuecomment-6663438989)) |
+| 2026-11-05 | AC1 for the closing docs commit, static, on master `a19e4573f` | `cargo metadata`: 26 packages, none Hive, no Hive feature or dependency. 0 CI or release lines name a Hive feature. The regex: **312 lines in 61 files, all classed.** §3.3's stubs 180 (S-B4 58, S-B6/S-B7 45, S-A2/S-B3 32, S-B6 23, S-B1 13, S-B2 4, S-A6/S-B5 3, S-A8 2); §3.3's kept decision lines 7 (the binding 5, D3's test 2); §2.1's classes 125 ("archive" 54, the registry hive 54, "split-brain" 16, history notes 1, `connect_code` 0). 180 + 7 + 125 = 312. This commit adds the last three classes to §2.1 and §3.3 |

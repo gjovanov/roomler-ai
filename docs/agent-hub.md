@@ -17,7 +17,7 @@ rules that every FR worker follows are in
 The tooling is **not in this repo**: on 2026-10-30 the operator decided it stays local for now, in
 the user's Claude skills folder, with a source history of its own. Its files are cited below by
 section name (`SKILL.md §Signals`), never by line.
-*As of Claude Code 2.1.314, the hub skill of 2026-11-04, `hub-view` 0.4.0 and `hub-guard` 0.4.3.*
+*As of Claude Code 2.1.314, the hub skill of 2026-11-05, `hub-view` 0.4.1 and `hub-guard` 0.4.3.*
 
 ## 1. What it is, and why sessions
 
@@ -245,7 +245,10 @@ stands alone and the exact commands to answer (in the hub's terminal, from the v
 the worker with `claude attach <short>`). An answer from the hub view arrives as mail headed
 `[hub mail · from the operator, in the hub view]`, or, sent to an older generation, with
 `(the operator, from the hub view)` on its second line, and the worker treats it as the operator's
-own words.
+own words. A question the worker marks `"typed": true` is the exception. It counts only when the
+operator types the answer in the worker's own session, because the permission check refuses an OK
+that anyone relays. So the hub gives only the ways in (`hubs`, `claude attach <short>`), and no view
+sends an answer to it.
 
 ## 5. Signals
 
@@ -375,7 +378,8 @@ flowchart LR
     OP(["the operator"])
     subgraph T["a terminal: hubs"]
         H1["every hub<br/>two lines each"] -- Enter --> H2["one hub's workers<br/>grouped by what they need"]
-        H2 -- "→" --> H3["one worker's details"]
+        H2 -- "→, or Enter on a stopped worker" --> H3["one worker's details"]
+        H3 -- "Enter on a stopped worker, or c" --> CV["its conversation<br/>read-only, newest last"]
         H2 -- "Enter on a running worker" --> AT["claude attach<br/>in the same window"]
         AT -- "Ctrl+Z" --> H2
     end
@@ -392,9 +396,9 @@ flowchart LR
 
 `hubs` is `~/.claude/skills/hub/hubs.mjs`, a Node script with no dependencies, started by a launcher
 on the `PATH` (`hubs.cmd` on Windows, `~/bin/hubs` in Git Bash). It reads `hub.mjs status <dir>
---json --peek` for every hub folder, `hub.mjs convo` for a worker's last lines, and hub-guard's task
-records. It changes nothing until a key asks it to. Drawn from a made-up fixture with `--snapshot`,
-the top level and one hub look like this:
+--json --peek` for every hub folder, `hub.mjs convo` for a worker's last lines and, a page at a time,
+its whole conversation, and hub-guard's task records. It changes nothing until a key asks it to.
+Drawn from a made-up fixture with `--snapshot`, the top level and one hub look like this:
 
 ```text
  Hubs
@@ -423,25 +427,27 @@ the top level and one hub look like this:
   W-5 g0     Throwaway E                           ◌ queued    ctx 30%
  Done · 1 (d shows them)
 ────────────────────────────────────────────────────────────────────────────────────────────────
- ↑↓ j k move  Enter attach (running)  → details  ← back  / filter  d show done  q quit
+ ↑↓ j k move  Enter attach (running)  → details  c conversation  ← back  / filter  d show done  q quit
 ```
 
 A hub's workers come in six groups: **Needs you** (a question for the operator), **Running**,
 **Paused or stopped**, **Parked**, **Queued**, and **Done**, which stays folded until `d`. A `?`
 marks a question for the hub, `⚙ 0.4c 120M` what a worker's processes cost (from 110 columns; a
 narrower window drops it, then the cache, then the context), and `⚠ N left` what an ended generation
-left running.
+left running. On the top level, a hub's `● N running` counts its workers with a live session, the way
+their rows do, not the workers its own state says it runs.
 
 | Key | Does |
 |---|---|
-| `↑` `↓` `j` `k` · PgUp PgDn Home End | moves |
-| **Enter** | goes in. On a running worker it attaches in this window, and Ctrl+Z comes back to the navigator where it was. |
-| `→` or `i` · `←` or Backspace | a worker's details: its question with the options, tasks, processes, background tasks, links and last lines · back |
+| `↑` `↓` `j` `k` · PgUp PgDn Home End | moves; in a conversation they scroll it |
+| **Enter** | goes in. On a running worker it attaches in this window, and Ctrl+Z comes back to the navigator where it was. On a stopped one it shows the details first, and Enter again opens its conversation. |
+| `→` or `i` · `←` or Backspace | a worker's details: its question with the options, tasks, processes, background tasks, links and last lines · back, and from a conversation back to where it was opened |
+| `c` | a worker's conversation, running or stopped, read-only and newest last, up to 150 entries a page through `hub.mjs convo`. ↑, PgUp or Home at its top reads the page before, `r` reloads it, and Enter in it attaches a running worker. |
 | `t` | attaches in a new tab of this window |
 | `R` | restarts a stopped worker and attaches; twice when its hub stopped it, and never while the host holds new sessions. Enter never restarts one. |
 | `/` | filters every hub and worker by id, title, PR or issue; Esc clears it |
 | `d` · `r` · `q` | shows or hides finished workers · refreshes (it also refreshes every 30 s) · quits |
-| in a worker: `a` · `u` · `w` · `p` · `o` | answers its question, into its mailbox · cleans up what earlier generations left (`hub.mjs reap`) · opens the worktree · the PR · the issue |
+| in a worker: `a` · `u` · `w` · `p` · `o` | answers its question, into its mailbox (a typed question gets nothing: `a` says Enter or `R` instead) · cleans up what earlier generations left (`hub.mjs reap`) · opens the worktree · the PR · the issue |
 
 **Attaching in the same window.** The navigator can't hand its own console to `claude attach`, so
 it writes the session to attach to into a file and exits. The launcher then runs `claude attach`,
@@ -449,7 +455,7 @@ and starts the navigator again where it was once Ctrl+Z gives the terminal back.
 
 `node hubs.mjs --snapshot [--at hubs|hub:<id>|worker:<id>/<W-n>] [--keys '…'] [--fixture DIR]`
 prints one screen as text after those keys, attaching, posting, reaping and opening nothing. The
-11 cases in `node --test hubs.test.mjs` are built on it.
+15 cases in `node --test hubs.test.mjs` are built on it.
 
 ### 8.2 The pane
 
@@ -504,9 +510,10 @@ phone there is no text field, and the worker view says how to answer instead.
 | **m** | the worker's current generation was spawned with a mailbox, running or not | `hub.mjs post --verb ANSWER --q q<id> --from operator --text <text>` (or `FYI`), one argv with no shell; it reads `✉ in its mailbox`, or `✉ waits` while the worker is stopped, then `✔ delivered <time>` once hub-guard moves it to `delivered/` |
 | **a** | the worker runs, and this session's permission mode equals the worker's (or either mode is unknown) | `$.session.send` straight to the worker: `ANSWER q<id>: <text>` while a question is open, else `FYI: <text>`, with `(the operator, from the hub view)` as the second line |
 | **b** | this session is the hub, and the modes differ | `W-n: <text>` goes into the hub's own prompt, and the hub relays it as `ANSWER` |
-| **c** | anything else, or the worker is not running | nothing is sent; `claude attach <short>` is copied, and the view says why |
+| **c** | anything else, or the worker is not running; and, since hub-view 0.4.1, any typed question, mailbox or not | nothing is sent; `claude attach <short>` is copied, and the view says why. A typed question's worker view says so under the question, and the Questions list marks it `(typed)`. |
 
-Routes a, b and c serve only generations spawned before the mailbox.
+Routes a and b serve only generations spawned before the mailbox, and c serves those and every
+typed question.
 **A route-a answer counts as received only once it shows in the worker's transcript.** The send's
 `isDelivered` only means *queued*. A session in another permission mode holds a cross-session
 message for a person there and lets it expire, while the sender still reads it as delivered. So

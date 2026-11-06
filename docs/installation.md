@@ -1750,6 +1750,13 @@ beside `--daemon-token`, with `--privileged-steps` or `--user-steps`, and with
 FR-129's next phase decides whether it gets one. The script a server hands out changes
 with that server's roll.
 
+Read on released 0.4.201, a fresh Mac and the script roomler.ai serves: one row at the
+first start, then, once both permissions were on and the root half had restarted as the
+notice says, a remote-desktop session that streamed and took input, and `roomler ssh`, on
+that row ([field log](fr/FR-43-macos-single-enrollment.md#2026-11-05--p3d-on-released-04201-one-token-one-row)).
+The install leaves the device's own `ssh_enabled` off, so `roomler ssh` waits until
+someone at the Mac turns it on.
+
 By hand, add `--one-row` to the root enroll above. It writes both switches with the
 enrollment, so the daemon's first start is one row, and it is refused off macOS and
 without root before the token is spent. Then the package has to run again, so that its
