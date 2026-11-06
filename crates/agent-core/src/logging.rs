@@ -345,6 +345,16 @@ fn open_log_appender<A>(
 
 /// The filter this binary's logs are kept by: [`init`]'s.
 pub fn filter() -> EnvFilter {
+    filter_for(std::env::var("RUST_LOG").ok())
+}
+
+/// The LocalAPI crate's tracing target, its lib name, which [`filter`] keeps
+/// at INFO at least.
+const LOCALAPI_TARGET: &str = "roomler_localapi";
+
+/// [`filter`] for one value of `RUST_LOG` (`None` when it is unset), so a test
+/// can read the filter a unit's value makes without setting the process's own.
+fn filter_for(rust_log: Option<String>) -> EnvFilter {
     // Default filter. `RUST_LOG` (env, or the SCM service Environment
     // block for the SystemContext service) overrides wholesale when
     // set. The fallback keeps `roomler_agent` at info + everything
@@ -362,16 +372,16 @@ pub fn filter() -> EnvFilter {
     // admin-UI log viewer, so they belong on by default. Everything
     // else in `tunnel_core` is debug/trace and stays suppressed; the
     // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
-    std::env::var("RUST_LOG")
-        .ok()
-        .map(|spec| EnvFilter::new(mirror_legacy_log_target(&spec)))
+    let spec = rust_log
+        .map(|spec| mirror_legacy_log_target(&spec))
         .unwrap_or_else(|| {
             // S1b follow-up: `roomlerd=info` — events emitted from the BIN
             // (target = the binary crate name) were silently capped at warn,
             // hiding the migration notes + DPI/timer diagnostics the code
             // clearly intended to be visible.
-            EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
-        })
+            "roomler_agent=info,roomlerd=info,tunnel_core=info,warn".to_string()
+        });
+    let filter = EnvFilter::new(&spec)
         // rc.181 — silence the `turn` crate's periodic refresh-failure warns
         // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
         // Now that the overlay re-allocates a dead relay carrier on the send-error
@@ -397,7 +407,59 @@ pub fn filter() -> EnvFilter {
             "tunnel_core::overlay::sockbuf=info"
                 .parse()
                 .expect("static EnvFilter directive is valid"),
+        );
+    // #2871 — a change the person at the device makes over the person socket
+    // is logged with their uid (`config key set by the person at the device …`),
+    // from the `roomler_localapi` target, which `roomlerd=info,warn` (the
+    // packaged Linux units, the per-user macOS plist) and the default above
+    // both drop: the line reached no log. The crate's INFO lines are few, that
+    // one per change and its listeners' up and down lines. INFO is a FLOOR
+    // here, not a directive like the two above: a directive REPLACES the one
+    // with its target, and the most specific one decides, so a plain
+    // `roomler_localapi=info` would cut `RUST_LOG=debug` (or
+    // `roomler_localapi=debug`) down to INFO and hide the crate's DEBUG lines
+    // from the person who asked for them.
+    if keeps(&spec, LOCALAPI_TARGET, tracing::Level::INFO) {
+        filter
+    } else {
+        filter.add_directive(
+            format!("{LOCALAPI_TARGET}=info")
+                .parse()
+                .expect("static EnvFilter directive is valid"),
         )
+    }
+}
+
+/// Whether `spec` already keeps a `level` event of `target`, read the way
+/// `EnvFilter` reads it. Only a spec whose every directive is plain
+/// (`target=level`, a bare level or a bare target) is read, because those
+/// `EnvFilter` and `Targets` read alike. Anything else answers `false`, and the
+/// caller adds its floor: `Targets` alone would read `=debug` as a catch-all
+/// where `EnvFilter` drops it, and the empty directive after a trailing comma
+/// as a global `error` where `EnvFilter` skips it.
+fn keeps(spec: &str, target: &str, level: tracing::Level) -> bool {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_:-".contains(c))
+    };
+    let mut read = Targets::new();
+    for directive in spec.split(',').filter(|d| !d.is_empty()) {
+        read = match directive.split_once('=') {
+            Some((t, l)) if plain(t) && plain(l) => match l.parse::<LevelFilter>() {
+                Ok(l) => read.with_target(t, l),
+                // `EnvFilter` drops a directive whose level does not parse.
+                Err(_) => read,
+            },
+            None if plain(directive) => match directive.parse::<LevelFilter>() {
+                Ok(l) => read.with_default(l),
+                Err(_) => read.with_target(directive, LevelFilter::TRACE),
+            },
+            _ => return false,
+        };
+    }
+    read.would_enable(target, &level)
 }
 
 /// Claim the consumer end of the log-upload channel. Returns `None`
@@ -1014,6 +1076,118 @@ mod tests {
             mirror_legacy_log_target("roomler_agent_core=debug,warn"),
             "roomler_agent_core=debug,warn"
         );
+    }
+
+    // ── #2871: the person socket's record line reaches the log ──
+
+    /// The target and level of each event [`filter_for`] keeps for `rust_log`,
+    /// out of one INFO and one DEBUG line of the LocalAPI crate and one INFO
+    /// line of a crate no spec below names.
+    fn kept_under(rust_log: Option<&str>) -> Vec<(&'static str, tracing::Level)> {
+        struct Kept(std::sync::Arc<Mutex<Vec<(&'static str, tracing::Level)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Kept {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let meta = event.metadata();
+                self.0.lock().unwrap().push((meta.target(), *meta.level()));
+            }
+        }
+        let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(filter_for(rust_log.map(str::to_string)))
+            .with(Kept(kept.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: LOCALAPI_TARGET, "config key set by the person at the device");
+            tracing::debug!(target: LOCALAPI_TARGET, "person-socket client ended");
+            tracing::info!(target: "webrtc_ice", "a line no spec here names");
+        });
+        kept.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn the_person_socket_record_line_is_kept_under_every_packaged_value() {
+        for rust_log in [
+            // packaging/linux/roomlerd.service, roomler.service, and the
+            // per-user macOS plist.
+            Some("roomlerd=info,warn"),
+            // The units service.rs writes.
+            Some("roomlerd=info,tunnel_core=info,warn"),
+            // A unit from before the lib rename, still on disk in the field.
+            Some("roomler_agent=info,warn"),
+            // No `RUST_LOG`: the default.
+            None,
+        ] {
+            let kept = kept_under(rust_log);
+            assert!(
+                kept.contains(&(LOCALAPI_TARGET, tracing::Level::INFO)),
+                "{rust_log:?} drops the record line: {kept:?}"
+            );
+            // The controls: the floor is INFO, not every level of the crate,
+            // and not every crate.
+            assert!(
+                !kept.contains(&(LOCALAPI_TARGET, tracing::Level::DEBUG)),
+                "{rust_log:?}: {kept:?}"
+            );
+            assert!(
+                !kept.contains(&("webrtc_ice", tracing::Level::INFO)),
+                "{rust_log:?}: {kept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn info_is_a_floor_for_the_localapi_crate_never_a_ceiling() {
+        // An `EnvFilter` directive REPLACES the one with its target, and the
+        // most specific one decides, so a plain `roomler_localapi=info` would
+        // hide the crate's DEBUG lines from the person who asked for them.
+        for rust_log in [
+            "debug",
+            "roomler_localapi=debug,warn",
+            "roomler=trace,warn",
+            // `EnvFilter` skips the empty directive; `Targets` would read it as
+            // a global `error` in place of the `debug`.
+            "debug,",
+        ] {
+            let kept = kept_under(Some(rust_log));
+            assert!(
+                kept.contains(&(LOCALAPI_TARGET, tracing::Level::DEBUG)),
+                "{rust_log}: {kept:?}"
+            );
+        }
+        // The macOS root daemon's plist: already INFO, and still INFO.
+        let kept = kept_under(Some("info"));
+        assert!(kept.contains(&(LOCALAPI_TARGET, tracing::Level::INFO)));
+        assert!(!kept.contains(&(LOCALAPI_TARGET, tracing::Level::DEBUG)));
+    }
+
+    #[test]
+    fn a_spec_the_floor_cannot_read_still_keeps_the_record_line() {
+        for rust_log in [
+            // `Targets` would read `=debug` as a catch-all and add no floor,
+            // where `EnvFilter` drops it and keeps the crate at `warn`.
+            "=debug,warn",
+            // `EnvFilter` reads ` debug` as a target that matches nothing.
+            "roomlerd=info, debug",
+            // Naming the crate `off` does not silence the record line.
+            "roomler_localapi=off,warn",
+        ] {
+            let kept = kept_under(Some(rust_log));
+            assert!(
+                kept.contains(&(LOCALAPI_TARGET, tracing::Level::INFO)),
+                "{rust_log}: {kept:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_names_the_localapi_crate() {
+        // A tracing target is its crate's lib name: a rename that left this
+        // behind would silence the record line again, with no error anywhere.
+        let path = std::any::type_name::<roomler_localapi::Request>();
+        assert!(path.starts_with(&format!("{LOCALAPI_TARGET}::")), "{path}");
     }
 
     use super::*;
