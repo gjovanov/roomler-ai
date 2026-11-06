@@ -342,7 +342,7 @@ tag is a deliberate wire break.
 | Relay / DERP | `rc:relay.regions` · `.probe_report` · `.derp_ticket_request`/`.derp_ticket` | Multi-region PoP selection + ticket auth for standalone DERP relays |
 | Fleet RPC | `rc:rpc.exec` · `.cancel` · `.result` · `.request` · `.response` | Remote command execution over the control WS (see [fleet-rpc.md](fleet-rpc.md)) — capability-gated via `AgentCaps.rpc` |
 | Overlay key rotation | `rc:agent.key_rotate` → `rc:agent.key_rotated` | An **order** to re-mint the device's overlay key, never a delivery: the order carries no key material (test-locked), the report carries public keys only and is sent on every outcome, refusals included, then re-sent on the next session (see [overlay-key-rotation.md](overlay-key-rotation.md)) — capability-gated via `AgentCaps.rpc` (`key-rotate`), never sent blind |
-| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1170`), `RETIRED_RC_TAG_FAMILIES` (`:1199`), `RETIRED_USER_WS_NAMESPACES` (`:1204`) and `RETIRED_MODULE_IDS` (`:1208`), locked by `retired_rpc_verbs_are_never_reused` (`:7980`), `retired_wire_families_and_module_ids_are_never_reused` (`:8049`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5195`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
+| Retired with FR-90 (FR-137) | `rc:hive.*` · `rc:vault.*` · `rc:knowhow.*`, and the user socket's `hive:*` | **Reserved, never reused.** A 0.4.199 agent, or a tab opened before FR-90 was parked, still sends and expects frames under them, so a new tag named into one would feed a build that means something else by it. The same holds for FR-90's 21 `RpcCap` spellings, which such an agent keeps advertising and which match by equality, and for the module ids `hive`, `vault`, `knowhow`. The lists are `RETIRED_RPC_VERBS` (`crates/remote_control/src/models.rs:1170`), `RETIRED_RC_TAG_FAMILIES` (`:1199`), `RETIRED_USER_WS_NAMESPACES` (`:1204`) and `RETIRED_MODULE_IDS` (`:1208`), locked by `retired_rpc_verbs_are_never_reused` (`:8000`), `retired_wire_families_and_module_ids_are_never_reused` (`:8069`) and a frozen 0.4.199 hello (`a_0_4_199_hello_with_the_retired_words_still_parses`, `signaling.rs:5203`). The checklist: [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137) |
 
 ### Remote-desktop session setup
 
@@ -449,3 +449,98 @@ where **both** sides are UDP-blocked:
   alive.
 - `rc:goodbye` close reasons distinguish *replaced by newer connection* (benign
   restart) from *deleted / policy-rejected* (stop retrying).
+
+### How an agent socket ended (#3517)
+
+Every end of a registered agent socket leaves one line on the pod that held it, at the
+end of its teardown (`crates/modules/fleet/src/socket.rs:1031-1043`), and its `cause`
+says how the socket ended:
+
+```
+INFO roomler_ai_mod_fleet::socket: remote-control agent WS disconnected agent_id=… cause=error kind=eof error="…"
+```
+
+Each exit of the read loop (`socket.rs:482`) breaks with a `SocketEnd`
+(`crates/modules/fleet/src/socket_end.rs:25`), so an exit added later does not compile
+until it names its cause. `cause` is always on the line. Every other field appears only
+with the cause it belongs to, so the line never carries a field that means nothing for
+its end. Before #3517 the line carried the agent id alone, and a close frame or a reset
+showed on no line at all.
+
+```mermaid
+flowchart LR
+    RL["read loop<br/>(biased select!)"]
+    RL -->|"the Hub's cancel"| C["cancelled · by"]
+    RL -->|"no frame past the deadline"| L["liveness_deadline · elapsed_s"]
+    RL -->|"rc:agent.sleeping"| S["sleep"]
+    RL -->|"a close frame"| CL["close · code · reason<br/>or close_no_frame"]
+    RL -->|"a failed read"| E["error · kind · error"]
+    RL -->|"the stream ended"| SE["stream_end"]
+    C & L & S & CL & E & SE --> T["teardown:<br/>unregister, Offline"]
+    T --> D["remote-control agent WS disconnected<br/>cause=…"]
+```
+
+| `cause` | its fields | what ended the socket |
+|---|---|---|
+| `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2107`) |
+| `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
+| `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:504`). The check runs on a tick, so `elapsed_s` reads past the deadline |
+| `cancelled` | `by` | the Hub cancelled the loop; `by` below |
+| `sleep` | — | the device said it is going to sleep (FR-55 P4). Its daemon sends a close frame next, which the loop never reads |
+| `stream_end` | — | the stream ended with neither a frame nor an error. tokio-tungstenite ends it that way only after a close or an error, and the loop leaves on both first, so this is not expected |
+
+`by`, for `cause=cancelled`. Each trigger records itself just before its notify
+(`AgentCancel`, `crates/modules/fleet/src/hub.rs:217`), with the notify call itself
+unchanged. The cancel arm's own line, `agent connection cancelled by Hub; exiting
+read-loop`, carries the same `by`.
+
+| `by` | the trigger |
+|---|---|
+| `replaced` | a newer connection for the same agent registered (`Hub::register_agent`, `hub.rs:1043`): a reconnect that beat the old socket's teardown, or two daemons on one identity |
+| `idle_nudge` | the idle nudge cycled an idle agent, so its reconnect re-hashes through the LB (`Hub::nudge_agent_if_idle`, `hub.rs:1239`) |
+| `renumber` | an overlay renumber (`Hub::cycle_agent_ws`, `hub.rs:1267`) |
+| `shutdown` | this pod's graceful shutdown (`Hub::cancel_all_agents`, `hub.rs:1282`) |
+| `unknown` | a cancel with no trigger recorded. Nothing fires one today |
+
+`kind`, for `cause=error` (`error_kind`, `socket_end.rs:138`):
+
+| `kind` | what the transport under the socket said |
+|---|---|
+| `eof` | the TCP leg ended with no close frame |
+| `reset` | the TCP leg was reset |
+| `aborted` · `timeout` · `broken_pipe` · `io` | the other I/O errors; `io` is any not named |
+| `protocol` | a frame RFC 6455 forbids, invalid UTF-8 in a text frame among them |
+| `capacity` | a frame over `MAX_WS_MESSAGE_BYTES` |
+| `other` | an error that is not tungstenite's |
+
+⚠️ **The pod sees the hop in front of it, not the device.** The binary's peer is the
+pod's nginx ([deployment.md § Topology](deployment.md#topology)), so a device whose
+process died or whose network dropped mid-stream usually reads `kind=eof` once the
+proxies close their legs, whatever the device's own TCP stack sent. `eof` means *no
+close frame*, not *a clean FIN at the device*.
+
+⚠️ **`kind=other` on every error means the tungstenite pin drifted.** `error_kind`
+downcasts axum's error to the tungstenite that `crates/modules/fleet/Cargo.toml`
+pins. If axum moves to another one, every error reads `other`, and the loopback test
+`socket::tests::a_dropped_tcp_leg_reads_eof` fails first.
+
+**Before the hello.** A socket that ends before its `rc:agent.hello` registered nothing,
+so it gets no disconnect line. The hello wait (`read_next_rc`, `socket.rs:1243`) says
+how it ended on its own warn line, `agent opened WS without rc:agent.hello — closing`,
+with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that line read
+`other=None` for every end.
+
+**The grep.** Pod logs are ANSI-coloured, so strip the codes first. Tenant affinity pins
+each socket to one pod, so read every pod:
+
+```bash
+for p in $(kubectl -n roomler-ai get pods -o name | grep roomler2-); do
+  echo "== $p"
+  kubectl -n roomler-ai logs "$p" | sed -E 's/\x1b\[[0-9;]*m//g' \
+    | grep 'remote-control agent WS disconnected' \
+    | grep -oE 'cause=[a-z_]+( kind=[a-z_]+| by=[a-z_]+)?' | sort | uniq -c | sort -rn
+done
+```
+
+For one device's history, replace the last `grep -oE …` with `grep 'agent_id=<hex>'`.

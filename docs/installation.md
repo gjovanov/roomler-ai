@@ -1058,7 +1058,7 @@ them. The worker says so once at its start: `logging: this console has no window
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:1662`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:1808`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
@@ -1464,8 +1464,11 @@ Disconnect and its consent prompt. As that user:
   pointer to `sudo roomler …`.
 
 The socket follows the person signed in at the machine's own screen (logind's `seat0`),
-so there is none over SSH or a remote desktop, or at the login screen. Turn it off with `ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service`
-drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
+so there is none over SSH or a remote desktop, or at the login screen. The daemon's log
+says when it comes up and goes down, at INFO under every shipped `RUST_LOG` (#1928):
+`localapi: person-at-the-device socket up (FR-27 P11)`, with its path and the
+person's uid, and `localapi: person-at-the-device socket down`. Turn it off with
+`ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service` drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
 [security baseline](security-baseline.md) §4.
 
 ### The companion's Device configuration on a system install (#2891, #2871)

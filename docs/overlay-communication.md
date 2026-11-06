@@ -261,7 +261,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:407`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:401`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -750,7 +750,7 @@ socket's `tb` as twice `applied`. All three OSes read that way on the fleet on
 0.4.191 ([FR-18's field log](fr/FR-18-carrier-queue-discipline.md#field-log)).
 
 ⚠️ **A full outbound queue drops the frame uncounted.** `DerpConn::send_to`
-answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:323`)
+answers `Ok` when the queue is full (`crates/tunnel-core/src/transport/derp.rs:299`)
 so that a transient overflow never latches the carrier dead. FR-18's design
 also named a `dropped_full` counter, and it was never built.
 

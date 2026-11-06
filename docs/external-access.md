@@ -180,7 +180,7 @@ A bar reads in `gates` (`extauth.rs:396`), so it holds at `start`, at `finish` a
 `session`, and a login in flight dies with the rest. ⚠️ `standing` (`extauth.rs:447`)
 opens only on an answer it has seen: a read that fails refuses.
 
-`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2403`) ends what the person
+`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2493`) ends what the person
 opened **through an external login**. A session the same account holds as a member came
 through the other door, with gates of its own, and it stands (`LiveSession.external`).
 
@@ -258,8 +258,8 @@ bar them and change the password on the device. For guessing, rotate the connect
 | What follows a session | `session_opened`, `extauth.rs:1390` |
 | The notices | `crates/modules/remote/src/extauth_notice.rs` |
 | Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `set_enabled` `:443`, `set_policy` `:496`, `audit` `:743`, `principals` `:778`, `set_principal` `:844` |
-| Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2403`, a device's `:2416`, an org's `:2422`. From another pod, `ctrl.rs`: `:122`, `:142`, `:156` |
-| The two collections | `crates/remote_control/src/models.rs:4439`, `:4514`; indexes `crates/modules/fleet/src/lib.rs:776`, `:789` |
+| Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2493`, a device's `:2506`, an org's `:2512`. From another pod, `ctrl.rs`: `:122`, `:142`, `:156` |
+| The two collections | `crates/remote_control/src/models.rs:4459`, `:4534`; indexes `crates/modules/fleet/src/lib.rs:778`, `:791` |
 | The device's half | `agents/roomlerd/src/extauth.rs`, `agents/roomlerd/src/external_logins.rs` |
 | The page | `ui/src/views/remote/ConnectView.vue`, `ui/src/composables/useExternalLogin.ts` |
 | The audit page | `ui/src/components/admin/ExternalAuditSection.vue`, `ExternalPeopleCard.vue`, `ui/src/utils/externalAudit.ts` |

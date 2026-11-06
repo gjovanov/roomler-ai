@@ -32,8 +32,8 @@ overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), w
 viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7563`,
 called at `:9168`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3810`) and
 forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:2059`). The Hub stores it
-on the session (`crates/modules/fleet/src/hub.rs:1818`) and hands the remote agent `turn:<overlay>:<port>` with the
-offer (`forward_offer`, `:2133`, the relay at `:2173`), only for an overlay address (`is_overlay_relay_ip`, `:65`) and
+on the session (`crates/modules/fleet/src/hub.rs:1908`) and hands the remote agent `turn:<overlay>:<port>` with the
+offer (`forward_offer`, `:2223`, the relay at `:2263`), only for an overlay address (`is_overlay_relay_ip`, `:66`) and
 only when the device lets remote desktop use the overlay (#1882's `rc_overlay`).
 
 ### 2.2 What it cost on the field (2026-10-24)
@@ -208,7 +208,7 @@ sequenceDiagram
 | The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3961`, `:4083`, `:4099`, `:4112`, `:8671`, `:11034` |
 | The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1958`, `:3750`; `useRemoteControl.ts:4135` |
 | The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2037`, `:2044`, `:3349`, `:5573` |
-| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:84`, `:104`, `:125`, `:1656`, `:1884`, `:2315`, `:4066`, `:4075`; `crates/remote_control/src/session.rs:63` |
+| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:85`, `:105`, `:126`, `:1746`, `:1974`, `:2405`, `:4156`, `:4165`; `crates/remote_control/src/session.rs:63` |
 
 ⚠️ **ICE keeps the path that works, not the fastest one that works.** Chrome ranks its relay candidates by the order of
 its TURN servers, the first highest, and nominates the best-ranked pair that succeeds. The browser puts the relays in

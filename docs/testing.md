@@ -798,7 +798,7 @@ corporate laptop, a real relay path, or both:
 |---|---|---|
 | round 2 | `scp` exited 1 after every *successful* transfer: the sftp subsystem never sent an exit status | #1559 — the pump waits for the child and reports it ([`ssh.rs:1084`](../agents/roomlerd/src/ssh.rs#L1084)) |
 | round 2 | a device whose stored SSH host key was unreadable published **no** key, permanently, so no caller could verify it | #1565 — an unreadable key counts as no key and is replaced ([`ssh.rs:410`](../agents/roomlerd/src/ssh.rs#L410)) |
-| round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:465`](../crates/modules/network/src/routes/agent_ssh.rs#L465)) |
+| round 3 | a caller with a faster control path than the target dialled before the target had its grant: `Permission denied (publickey)`, 0/3 on one laptop | FR-83 (#1597) — the server answers only after the device confirms the grant ([`agent_ssh.rs:468`](../crates/modules/network/src/routes/agent_ssh.rs#L468)) |
 | round 3 | `roomler proxy`'s own `--help` recipe could not work (`%h` arrives as `<name>.roomler`) | #1573 — the suffix and the MagicDNS domain are stripped ([`localclient.rs:617`](../agents/roomler-cli/src/localclient.rs#L617)) |
 
 ### Reference run — `20260924-155559`, every target on agent 0.4.101

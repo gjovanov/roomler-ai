@@ -2536,7 +2536,27 @@ pub mod ssh_limits {
     /// makes immediately after receiving it, so this only has to cover
     /// signalling latency plus a slow WireGuard handshake. A grant that
     /// lingered would be a standing key to the device.
+    ///
+    /// An agent with #3511 counts it from the grant's ARRIVAL, on its own
+    /// monotonic clock; the caller's `expires_at_ms` is mint + this.
     pub const GRANT_TTL_SECS: u64 = 60;
+    /// #3511 — added to the `expires_at_ms` the TARGET is told (`rc:ssh.grant`,
+    /// and the FR-105 `ssh_pending` row its SYSTEM service claims), and only
+    /// there.
+    ///
+    /// It exists for agents released before #3511, which judge that
+    /// timestamp against their own wall clock, `min(expires_at_ms - now,
+    /// GRANT_TTL_SECS)`, and refuse a zero window as `expired`: a device whose
+    /// clock ran a minute ahead of the server's refused every grant. With
+    /// this slack they take up to ten minutes of skew, while the
+    /// `GRANT_TTL_SECS` ceiling every released agent applies (it came with
+    /// SSH itself, #544) still caps the window at 60 s from arrival. A newer
+    /// agent reads the timestamp only for its log.
+    ///
+    /// Not a longer grant: the caller's `expires_at_ms` stays mint +
+    /// `GRANT_TTL_SECS`, and the row's `claim_by` and TTL stay on the
+    /// server's clock.
+    pub const DEVICE_EXPIRY_SLACK_SECS: u64 = 600;
     /// FR-83 — how long the server holds the CALLER while it waits for the
     /// target to confirm a grant (`rc:ssh.grant_ack`). No confirmation in
     /// time ⇒ the request is refused as unconfirmed, never answered with an

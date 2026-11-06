@@ -100,7 +100,7 @@ static FULL_LOG_AT: LazyLock<DashMap<DerpKey, Instant>> = LazyLock::new(DashMap:
 /// QUIC over this relay, and unlike the WG floor traffic the plane was
 /// sized for, a tunnel can be an elephant flow (a git clone). Per
 /// (network, src) token bucket, applied ONLY to tunnel-class payloads
-/// (non-WG/non-disco first bytes — the same classifier both mux ends use);
+/// (neither a whole WG header nor a disco frame — the same classifier both mux ends use);
 /// WG + disco frames are never shaped. ~3 Mbit/s sustained with a 1 MiB
 /// burst: the leg is a last resort whose job is "usable", not "fast", and
 /// a modest cap keeps the floor honest for every other tenant on the pod.

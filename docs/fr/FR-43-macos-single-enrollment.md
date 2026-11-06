@@ -646,7 +646,7 @@ Before it shipped, the macOS path ran under `dash` with stand-ins for `installer
 |---|---|
 | One daemon per machine | Still one. The worker stays a process of that install, and now holds less |
 | Who holds the TCC grant | The same bundle at the same path, through the same chain (`macos_supervisor.rs:641-700`). The migration touches no bundle, which is what AC5 reads |
-| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:828`) | The worker no longer dials a server, so it can displace nothing |
+| The hub keys on `agent_id` (`crates/modules/fleet/src/hub.rs:914`) | The worker no longer dials a server, so it can displace nothing |
 | The delegation channel's two gates (`delegate.rs:764-785`) | Unchanged |
 | The reap's exact match (`macos_supervisor.rs:486`, `:499`) | Matches both command lines, so a worker of either kind is found |
 

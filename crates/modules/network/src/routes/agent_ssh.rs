@@ -430,6 +430,9 @@ async fn decide(
     let grant_id = ObjectId::new().to_hex();
     let session_secs = ssh_limits::clamp_session_secs(session_secs);
     let expires_at_ms = now_ms() + ssh_limits::GRANT_TTL_SECS * 1000;
+    // #3511 — the copy the target judges on its own clock carries the slack;
+    // the caller's does not (`ssh_limits::DEVICE_EXPIRY_SLACK_SECS`).
+    let device_expires_at_ms = expires_at_ms + ssh_limits::DEVICE_EXPIRY_SLACK_SECS * 1000;
 
     // EXHAUSTIVE — the spec's fields map 1:1 onto the wire, and binding them
     // all here is what keeps a field routed into the spec from being dropped
@@ -449,7 +452,7 @@ async fn decide(
         caller: caller.display.clone(),
         account_mode: account_mode_wire(account_mode).to_string(),
         account,
-        expires_at_ms,
+        expires_at_ms: device_expires_at_ms,
         session_secs,
         consent_mode,
         via_service,
@@ -474,7 +477,8 @@ async fn decide(
             public_key: public_key.to_string(),
             caller: caller.display.clone(),
             account_mode: account_mode_wire(account_mode).to_string(),
-            expires_at_ms,
+            // What the service hands `record_grant`, so the target's copy.
+            expires_at_ms: device_expires_at_ms,
             session_secs,
             consent_mode,
             state: SshPending::PENDING.to_string(),

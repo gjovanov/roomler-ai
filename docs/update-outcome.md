@@ -51,7 +51,7 @@ reading was wrong about which mattered:
 | `note` | the watcher's own sentence: the probe's answer, the exit code, on Windows the service settle's verdict (`service Roomler: running (0 starts; seen Running)`) |
 
 `<log_dir>` is `logging::resolve_log_dir`'s
-(`crates/agent-core/src/logging.rs:824`): the process's per-user data dir plus
+(`crates/agent-core/src/logging.rs:838`): the process's per-user data dir plus
 `logs`, except a Windows process with a service role, which logs under
 `%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
 worker and `netd` (`ServiceLogRole`). The watcher never has one, so the record

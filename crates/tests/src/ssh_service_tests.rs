@@ -15,7 +15,10 @@
 //!   claim on the other pod still reaches the caller;
 //! - only the service publishes its endpoint, and re-anchoring retires it;
 //! - `ssh_audit.ran_as` records who served it; the kill switch restores the
-//!   worker path.
+//!   worker path;
+//! - #3511: on both paths the target's `expires_at_ms` (the worker's frame,
+//!   the service's claim) carries the device-leg slack, and the caller's
+//!   does not.
 
 use std::time::{Duration, Instant};
 
@@ -326,6 +329,22 @@ async fn send_ack(ws: &mut AgentWs, grant_id: &str, refused: Option<&str>) {
         .unwrap();
 }
 
+/// #3511 — the target's `expires_at_ms` is the caller's plus
+/// `DEVICE_EXPIRY_SLACK_SECS`, so an agent from before the fix tolerates that
+/// much clock skew, and the caller's copy carries none. Both come from one
+/// reading of the server's clock, so the difference is exact.
+fn assert_target_copy_carries_the_slack(body: &Value, target_expires_at_ms: u64) {
+    use roomler_ai_remote_control::models::ssh_limits;
+    let caller = body["expires_at_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the caller's expires_at_ms: {body}"));
+    assert_eq!(
+        target_expires_at_ms,
+        caller + ssh_limits::DEVICE_EXPIRY_SLACK_SECS * 1000,
+        "the target's copy, against the caller's: {body}"
+    );
+}
+
 async fn audit_rows(app: &TestApp, seeded: &SeededTenant) -> Vec<Value> {
     let audit: Value = app
         .auth_get(
@@ -377,13 +396,17 @@ async fn a_grant_goes_to_the_service_and_its_claim_confirms_it() {
         let grant: Value = claimed.json().await.unwrap();
         assert_eq!(grant["public_key"], json!(session_key()));
         assert_eq!(grant["account_mode"], json!("daemon"));
-        (grant_id, Instant::now())
+        // What the service hands `record_grant`: the worker's copy.
+        assert_eq!(grant["expires_at_ms"], frame["expires_at_ms"], "{grant}");
+        let target_expiry = grant["expires_at_ms"].as_u64().expect("expires_at_ms");
+        (grant_id, Instant::now(), target_expiry)
     };
     let caller = async {
         let body = request_session(&app, &seeded, &dev.agent_id).await;
         (body, Instant::now())
     };
-    let ((grant_id, claimed_at), (body, answered_at)) = tokio::join!(target, caller);
+    let ((grant_id, claimed_at, target_expiry), (body, answered_at)) = tokio::join!(target, caller);
+    assert_target_copy_carries_the_slack(&body, target_expiry);
 
     assert!(
         answered_at >= claimed_at,
@@ -453,10 +476,12 @@ async fn without_both_halves_the_grant_goes_to_the_worker() {
             );
             let grant_id = frame["grant_id"].as_str().unwrap().to_string();
             send_ack(&mut dev.ws, &grant_id, None).await;
+            frame["expires_at_ms"].as_u64().expect("expires_at_ms")
         };
-        let (body, ()) = tokio::join!(request_session(&app, &seeded, &agent_id), target);
+        let (body, target_expiry) = tokio::join!(request_session(&app, &seeded, &agent_id), target);
         assert_eq!(body["port"], json!(2222), "{body}");
         assert_eq!(body["host_pubkey"], json!(worker_key()), "{body}");
+        assert_target_copy_carries_the_slack(&body, target_expiry);
     }
     let rows = audit_rows(&app, &seeded).await;
     assert_eq!(

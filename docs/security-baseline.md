@@ -512,9 +512,11 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
 An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:3806`),
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
-default filter, so the daemon's filter keeps that crate at INFO at least
-(`crates/agent-core/src/logging.rs:422`). That is a floor, not a directive: a
-`RUST_LOG=debug` still keeps the crate's DEBUG lines.
+default filter, so the daemon's filter keeps that crate at INFO under any spec that would
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:435`, #3525). A
+spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
+`roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
+person at the device cannot turn the record off.
 
 The server reaches none of it (the socket is local, and `remote_config_enabled` stays
 structurally outside `DesiredConfig`). The root socket itself is unchanged. Kill switch:
