@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, filter::Directive, filter::LevelFilter, fmt};
 
 use crate::logs_upload::{LogLine, LogUploadLayer};
 
@@ -345,10 +345,16 @@ fn open_log_appender<A>(
 
 /// The filter this binary's logs are kept by: [`init`]'s.
 pub fn filter() -> EnvFilter {
+    filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// [`filter`] under the given `RUST_LOG`, or with none set.
+fn filter_for(rust_log: Option<&str>) -> EnvFilter {
     // Default filter. `RUST_LOG` (env, or the SCM service Environment
     // block for the SystemContext service) overrides wholesale when
     // set. The fallback keeps `roomler_agent` at info + everything
-    // else at warn, with ONE addition: `tunnel_core=info`.
+    // else at warn, with ONE addition: `tunnel_core=info`. Either
+    // way, [`keep_info_targets`] then adds the lifecycle targets.
     //
     // rc.74: `tunnel_core=info` surfaces the per-flow throughput
     // logger (`tunnel flow throughput (2s window) …` + the
@@ -362,16 +368,14 @@ pub fn filter() -> EnvFilter {
     // admin-UI log viewer, so they belong on by default. Everything
     // else in `tunnel_core` is debug/trace and stays suppressed; the
     // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
-    std::env::var("RUST_LOG")
-        .ok()
-        .map(|spec| EnvFilter::new(mirror_legacy_log_target(&spec)))
-        .unwrap_or_else(|| {
-            // S1b follow-up: `roomlerd=info` — events emitted from the BIN
-            // (target = the binary crate name) were silently capped at warn,
-            // hiding the migration notes + DPI/timer diagnostics the code
-            // clearly intended to be visible.
-            EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
-        })
+    let spec = rust_log.map(mirror_legacy_log_target).unwrap_or_else(|| {
+        // S1b follow-up: `roomlerd=info` — events emitted from the BIN
+        // (target = the binary crate name) were silently capped at warn,
+        // hiding the migration notes + DPI/timer diagnostics the code
+        // clearly intended to be visible.
+        "roomler_agent=info,roomlerd=info,tunnel_core=info,warn".to_string()
+    });
+    EnvFilter::new(keep_info_targets(&spec))
         // rc.181 — silence the `turn` crate's periodic refresh-failure warns
         // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
         // Now that the overlay re-allocates a dead relay carrier on the send-error
@@ -398,6 +402,78 @@ pub fn filter() -> EnvFilter {
                 .parse()
                 .expect("static EnvFilter directive is valid"),
         )
+}
+
+/// #1928, #3506 — targets whose INFO lines the daemon keeps under any spec that
+/// would leave them coarser. No shipped spec names either, so until #1928 both
+/// were dropped at the source: `ls`, not `roomler logs`, answered "is the person
+/// socket up?". Each speaks only at a lifecycle edge, so keeping them costs
+/// nothing in volume:
+/// - `roomler_localapi`: the LocalAPI's listeners coming up and going down, and
+///   the person-at-the-device socket (FR-27 P11). Its per-connection lines are
+///   DEBUG and stay off.
+/// - `roomler_node_core::logging`: what this module says about the log itself,
+///   such as #3438's "this console has no window". The rest of the crate keeps
+///   the spec's level.
+const KEPT_AT_INFO: [&str; 2] = ["roomler_localapi", "roomler_node_core::logging"];
+
+/// Add `<target>=info` to a `RUST_LOG` spec for each [`KEPT_AT_INFO`] target the
+/// spec leaves coarser than INFO, and change nothing else.
+///
+/// The spec keeps its say over a target it [`reaches`]: `roomler_localapi=debug`
+/// keeps DEBUG, and `roomler_localapi=off` keeps the crate silent. A bare level
+/// of INFO or finer already keeps the lines, and a directive added there would
+/// cap them, since a directive with a target outranks a bare level: under
+/// `debug,roomler_localapi=info` the crate logs at INFO. That is also why this
+/// edits the spec, where [`filter_for`]'s two fixed directives use
+/// `add_directive`: that replaces any directive for the same target, at whatever
+/// level the operator gave it.
+///
+/// A spec in which `EnvFilter` keeps no directive (empty, or every one invalid)
+/// is left alone as well. `EnvFilter::new` then logs ERROR from every target,
+/// and one directive added here would end that.
+fn keep_info_targets(spec: &str) -> String {
+    let directives: Vec<&str> = spec
+        .split(',')
+        .filter(|d| d.parse::<Directive>().is_ok())
+        .collect();
+    if directives.is_empty() {
+        return spec.to_string();
+    }
+    // A bare level covers every target no directive reaches, and the last one
+    // wins. With none, such a target logs nothing at all.
+    let global = directives
+        .iter()
+        .rev()
+        .find_map(|d| d.parse::<LevelFilter>().ok());
+    if global.is_some_and(|level| level >= LevelFilter::INFO) {
+        return spec.to_string();
+    }
+    let missing: Vec<String> = KEPT_AT_INFO
+        .iter()
+        .filter(|target| !directives.iter().any(|d| reaches(d, target)))
+        .map(|target| format!("{target}=info"))
+        .collect();
+    if missing.is_empty() {
+        spec.to_string()
+    } else {
+        format!("{spec},{}", missing.join(","))
+    }
+}
+
+/// Whether a `RUST_LOG` directive decides about some of `target`'s events: it
+/// names `target`, a module under it, or anything `target` starts with. A
+/// directive matches every event target that starts with its own, since
+/// `EnvFilter` compares with `starts_with`, not module by module.
+fn reaches(directive: &str, target: &str) -> bool {
+    let named = directive.split(['=', '[']).next().unwrap_or_default();
+    if named.is_empty() || named.parse::<LevelFilter>().is_ok() {
+        return false;
+    }
+    target.starts_with(named)
+        || named
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with("::"))
 }
 
 /// Claim the consumer end of the log-upload channel. Returns `None`
@@ -950,11 +1026,14 @@ mod tests {
 
     // ── FR-21 P2a: the lib rename must not blank a deployed unit's logs ──
 
+    /// A unit from before the rename, still on disk in the field.
+    const LEGACY_UNIT: &str = "roomler_agent=info,warn";
+
     #[test]
     fn legacy_log_target_is_mirrored_onto_the_new_one() {
         // Exactly what packaging/linux/roomlerd.service ships today.
         assert_eq!(
-            mirror_legacy_log_target("roomler_agent=info,warn"),
+            mirror_legacy_log_target(LEGACY_UNIT),
             "roomler_agent=info,roomlerd=info,warn"
         );
         // And what service.rs generates.
@@ -1014,6 +1093,218 @@ mod tests {
             mirror_legacy_log_target("roomler_agent_core=debug,warn"),
             "roomler_agent_core=debug,warn"
         );
+    }
+
+    // ── #1928, #3506: the lifecycle lines no shipped spec names ──
+
+    /// What `keep_info_targets` adds to a spec that leaves out both targets.
+    const BOTH: &str = "roomler_localapi=info,roomler_node_core::logging=info";
+
+    #[test]
+    fn the_specs_the_field_runs_under_gain_both_targets() {
+        for spec in [
+            // The packaged Linux units and the packaged macOS agent plist.
+            "roomlerd=info,warn",
+            // The units service.rs generates.
+            "roomlerd=info,tunnel_core=info,warn",
+            // A coarser bare level, or none at all.
+            "error",
+            "off",
+            "roomlerd=debug",
+            "[conn]=debug",
+        ] {
+            assert_eq!(
+                keep_info_targets(spec),
+                format!("{spec},{BOTH}"),
+                "spec: {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_level_of_info_or_finer_is_left_alone() {
+        // An added directive would CAP these: one with a target outranks a
+        // bare level, so under `debug` the targets would log at INFO only.
+        for spec in ["info", "debug", "trace", "INFO", "3", "roomlerd=debug,info"] {
+            assert_eq!(keep_info_targets(spec), spec, "spec: {spec}");
+        }
+    }
+
+    #[test]
+    fn the_last_bare_level_is_the_one_that_counts() {
+        assert_eq!(keep_info_targets("warn,debug"), "warn,debug");
+        assert_eq!(
+            keep_info_targets("debug,warn"),
+            format!("debug,warn,{BOTH}")
+        );
+    }
+
+    #[test]
+    fn a_spec_that_reaches_a_target_keeps_its_say_over_it() {
+        for (spec, added) in [
+            // The operator's own level, whatever it is.
+            (
+                "roomler_localapi=debug,warn",
+                "roomler_node_core::logging=info",
+            ),
+            (
+                "roomler_localapi=off,warn",
+                "roomler_node_core::logging=info",
+            ),
+            // A module under the target, and the target with no level (TRACE).
+            (
+                "roomler_localapi::conn=debug,warn",
+                "roomler_node_core::logging=info",
+            ),
+            ("roomler_localapi,warn", "roomler_node_core::logging=info"),
+            // A parent of the target.
+            ("roomler_node_core=warn,warn", "roomler_localapi=info"),
+        ] {
+            assert_eq!(
+                keep_info_targets(spec),
+                format!("{spec},{added}"),
+                "spec: {spec}"
+            );
+        }
+        // Both targets start with `roomler`, and `EnvFilter` matches a
+        // directive's target by `starts_with`, so this one reaches both.
+        assert_eq!(
+            keep_info_targets("roomler=debug,warn"),
+            "roomler=debug,warn"
+        );
+    }
+
+    #[test]
+    fn a_target_that_merely_shares_a_prefix_is_another_crate() {
+        // `roomler_localapi_x` starts with `roomler_localapi` but is not under
+        // it, and its directive matches none of the crate's events.
+        assert_eq!(
+            keep_info_targets("roomler_localapi_x=debug,warn"),
+            format!("roomler_localapi_x=debug,warn,{BOTH}")
+        );
+    }
+
+    #[test]
+    fn a_spec_envfilter_keeps_nothing_of_is_left_alone() {
+        // `EnvFilter::new` logs ERROR from every target then. One added
+        // directive would end that and drop every other target's errors.
+        for spec in ["", ",", "=", "%"] {
+            assert_eq!(keep_info_targets(spec), spec, "spec: {spec:?}");
+        }
+    }
+
+    #[test]
+    fn keeping_is_idempotent() {
+        for spec in ["roomlerd=info,warn", "warn", "roomler_localapi=debug,warn"] {
+            let once = keep_info_targets(spec);
+            assert_eq!(keep_info_targets(&once), once, "spec: {spec}");
+        }
+    }
+
+    /// Whether [`filter_for`] under `rust_log` keeps what `check` asks about,
+    /// on a dispatcher of the test's own. Making one rebuilds every callsite's
+    /// cached interest, so no other test's filter answers for this one.
+    fn kept(rust_log: Option<&str>, check: impl FnOnce() -> bool) -> bool {
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(filter_for(rust_log)));
+        tracing::dispatcher::with_default(&dispatch, check)
+    }
+
+    #[test]
+    fn the_built_filter_keeps_the_lifecycle_lines_and_nothing_chattier() {
+        use tracing::Level;
+        for rust_log in [
+            None,
+            Some("roomlerd=info,warn"),
+            Some("roomlerd=info,tunnel_core=info,warn"),
+            // A unit still on disk from before the FR-21 rename.
+            Some(LEGACY_UNIT),
+        ] {
+            let on = |check: fn() -> bool| kept(rust_log, check);
+            assert!(
+                on(|| tracing::enabled!(target: "roomler_localapi", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: "roomler_localapi::conn", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: "roomler_node_core::logging", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "roomler_localapi", Level::DEBUG)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "roomler_node_core::logging", Level::DEBUG)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "roomler_node_core::logs_upload", Level::INFO)),
+                "{rust_log:?}"
+            );
+            // What the spec and the fixed directives kept before, kept the same.
+            assert!(
+                on(|| tracing::enabled!(target: "roomlerd", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: "tunnel_core::overlay::sockbuf", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "turn::client::relay_conn", Level::WARN)),
+                "{rust_log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operators_own_choice_still_wins_in_the_built_filter() {
+        use tracing::Level;
+        // Named at DEBUG, DEBUG stays on.
+        assert!(kept(Some("roomler_localapi=debug,warn"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::DEBUG)
+        }));
+        // A bare DEBUG is not capped at INFO, as an added directive would cap it.
+        assert!(kept(Some("debug"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::DEBUG)
+        }));
+        assert!(kept(Some("debug"), || {
+            tracing::enabled!(target: "roomler_node_core::logging", Level::DEBUG)
+        }));
+        // Named off, the crate is silent.
+        assert!(!kept(Some("roomler_localapi=off,warn"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::WARN)
+        }));
+        // A parent at DEBUG reaches the logging module.
+        assert!(kept(Some("roomler_node_core=debug,warn"), || {
+            tracing::enabled!(target: "roomler_node_core::logging", Level::DEBUG)
+        }));
+        // The last bare level is the one `EnvFilter` applies.
+        assert!(!kept(Some("info,warn"), || {
+            tracing::enabled!(target: "some_crate", Level::INFO)
+        }));
+        assert!(kept(Some("info,warn"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::INFO)
+        }));
+    }
+
+    #[test]
+    fn an_empty_rust_log_keeps_envfilters_error_fallback() {
+        use tracing::Level;
+        // `RUST_LOG=` logs ERROR from every target, as it did before.
+        assert!(kept(Some(""), || {
+            tracing::enabled!(target: "roomlerd", Level::ERROR)
+        }));
+        assert!(!kept(Some(""), || {
+            tracing::enabled!(target: "roomlerd", Level::WARN)
+        }));
+        assert!(!kept(Some(""), || {
+            tracing::enabled!(target: "roomler_localapi", Level::INFO)
+        }));
     }
 
     use super::*;
