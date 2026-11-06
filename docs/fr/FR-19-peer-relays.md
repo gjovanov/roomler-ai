@@ -94,7 +94,7 @@ head-of-line-blocking layer *below* the SCTP one FR-17 is about, on top of the 5
    (`crates/tunnel-core/src/overlay/netcheck.rs:205`). Marked as such because this spec's
    own §8 rule is that absence of measurement is never evidence of absence of capability.
 3. **A high UDP port is a real risk** on the corp-managed hosts, and the codebase already
-   says so: `crates/remote_control/src/signaling.rs:3958` — *"a corp egress that whitelists
+   says so: `crates/remote_control/src/signaling.rs:3966` — *"a corp egress that whitelists
    STUN:3478 still drops the ~10-13k relay band."*
 
 **NOT established — the port choice is a hypothesis, not a finding.** ⚠️ An earlier draft
@@ -198,7 +198,7 @@ two bound `addr:port`s selected by VNI.
 
 **This is the one change that can break the fleet silently. It ships first, alone, as P0.**
 
-`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3771`) documents itself as safe
+`RelayStrategyWire` (`crates/remote_control/src/signaling.rs:3779`) documents itself as safe
 to extend — *"an unknown/absent value ⇒ the client falls back to its local computation, so
 adding a variant later is forward-compatible"* (`:3755-3757`). **The comment is wrong about
 the "unknown" half and the code does not implement it.** The enum is a plain
@@ -371,7 +371,7 @@ Verdict machinery to extend, verified against master:
 | Server verdict entry point | `crates/api/src/ws/overlay.rs:1851` `server_relay_verdict` |
 | …delegating to the pure decision | `overlay.rs:2020` `relay_verdict_core` |
 | Measured caps supersede presence | `overlay.rs:1969-1978` (in `verdict_from_nodes`, `:1948`) |
-| Wire verdict enum | `crates/remote_control/src/signaling.rs:3350` `RelayStrategyWire` |
+| Wire verdict enum | `crates/remote_control/src/signaling.rs:3358` `RelayStrategyWire` |
 | Client-side cascade consuming it | `crates/tunnel-core/src/overlay/relay_link.rs:1125` `relay_strategy` |
 
 ### 2. Gates — and an honest account of which are actually armed
@@ -719,7 +719,7 @@ Verified against `origin/master`, 2026-08-28.
 | Mint + ACL gate + rate limit | `overlay.rs:700` `handle_overlay_relay_request` (cross-tenant `:712-724`, ACL `:726-750`) — **P3c:** it now calls `crate::ws::org_relay::maybe_mint` beside the TURN grant |
 | **The mint itself (P3c)** | `crates/api/src/ws/org_relay.rs` — `maybe_mint` (gate 1 + idempotency + audit), `plan_mint` (gates 2–5, candidate ranking by probe reports), `revoke_where` + the four trigger wrappers, `reconcile_acl` (on every policy refan), `handle_relay_probe`; `OrgRelayState` holds sessions / per-relay VNI cursors / the Lamport clock / join extras / probes, pod-local |
 | Netmap shaping | `overlay.rs:2058` `shape_peer` |
-| Wire model | `crates/remote_control/src/signaling.rs:3370` `NetmapPeer`; `:3348` `RelayStrategyWire` |
+| Wire model | `crates/remote_control/src/signaling.rs:3378` `NetmapPeer`; `:3356` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
 | Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:305` `sweep_carrier_health` |
 | Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2514`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |

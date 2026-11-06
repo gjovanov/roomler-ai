@@ -2858,7 +2858,7 @@ pub enum ServerMsg {
         /// Server-minted, single-use.
         grant_id: String,
         /// OpenSSH public key the caller will authenticate with. Accepted for
-        /// exactly one session, until `expires_at_ms`.
+        /// exactly one session, inside the grant's window (see `expires_at_ms`).
         public_key: String,
         /// Display name of the acting principal — shown in the consent prompt,
         /// written to the agent's local log and carried into the audit record,
@@ -2870,8 +2870,16 @@ pub enum ServerMsg {
         /// The account for `named`. Absent otherwise.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
-        /// Unix ms after which the grant may no longer be redeemed. Short —
-        /// see [`crate::models::ssh_limits::GRANT_TTL_SECS`].
+        /// Unix ms on the SERVER's clock: mint +
+        /// [`crate::models::ssh_limits::GRANT_TTL_SECS`] +
+        /// [`crate::models::ssh_limits::DEVICE_EXPIRY_SLACK_SECS`] (#3511).
+        ///
+        /// Not a deadline the device can read off its own wall clock. An
+        /// agent with #3511 holds the grant `GRANT_TTL_SECS` from its arrival
+        /// and only logs this; an older one takes `min(expires_at_ms - now,
+        /// GRANT_TTL_SECS)`, which the slack keeps non-zero under up to ten
+        /// minutes of skew. The caller's copy (`rc:ssh.response`, the HTTP
+        /// answer) carries no slack.
         expires_at_ms: u64,
         /// Server-clamped lifetime of the session once redeemed.
         session_secs: u64,
