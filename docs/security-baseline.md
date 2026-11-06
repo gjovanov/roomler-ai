@@ -509,6 +509,13 @@ install pending a separate policy call. The dispatcher gates the peer again, thr
   `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
   widen this one, so a new key reaches the person socket only by a decision.
 
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:3806`),
+beside the daemon's own `config key updated` line, which carries the value. Its target,
+`roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
+default filter, so the daemon's filter keeps that crate at INFO at least
+(`crates/agent-core/src/logging.rs:422`). That is a floor, not a directive: a
+`RUST_LOG=debug` still keeps the crate's DEBUG lines.
+
 The server reaches none of it (the socket is local, and `remote_config_enabled` stays
 structurally outside `DesiredConfig`). The root socket itself is unchanged. Kill switch:
 `ROOMLERD_PERSON_SOCKET=0`.
