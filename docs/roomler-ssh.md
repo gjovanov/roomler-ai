@@ -1056,7 +1056,7 @@ server's. These bounds hold whatever the device's clock says:
    session (`agents/roomler-cli/src/sshcmd.rs:46`) and drops it on any refusal
    (`:59-61`), so a grant that lands late admits a key nobody holds.
 4. **A queued grant dies with its connection.** It waits on the connection's
-   own queue (`crates/modules/fleet/src/hub.rs:3014`), so a reconnect drops it,
+   own queue (`crates/modules/fleet/src/hub.rs:3104`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
    `agents/roomlerd/src/signaling.rs:63`, checked at `:2190`) reconnects. On a
    live connection a grant cannot be recorded much later than that.

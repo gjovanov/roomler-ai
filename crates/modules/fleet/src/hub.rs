@@ -17,6 +17,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -159,6 +160,89 @@ fn rc_overlay_auto_wire(
 
 // ────────────────────────────────────────────────────────────────────────────
 
+/// #3517 — which of the Hub's four triggers fired a connection's cancel. The
+/// read loop names it on the disconnect line (`by=`), because "the Hub
+/// cancelled it" is four events with four different fixes: a second install
+/// displacing the first, an idle nudge re-hashing through the LB, an overlay
+/// renumber, a pod going down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CancelReason {
+    /// A newer connection registered for the same agent
+    /// ([`Hub::register_agent`]).
+    Replaced = 1,
+    /// C-2's idle nudge, so the reconnect re-hashes through the LB
+    /// ([`Hub::nudge_agent_if_idle`]).
+    IdleNudge = 2,
+    /// Multi-org P2b's overlay renumber ([`Hub::cycle_agent_ws`]).
+    Renumber = 3,
+    /// The pod's graceful shutdown ([`Hub::cancel_all_agents`]).
+    Shutdown = 4,
+}
+
+impl CancelReason {
+    /// The `by=` value on the disconnect line.
+    pub fn label(self) -> &'static str {
+        match self {
+            CancelReason::Replaced => "replaced",
+            CancelReason::IdleNudge => "idle_nudge",
+            CancelReason::Renumber => "renumber",
+            CancelReason::Shutdown => "shutdown",
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(CancelReason::Replaced),
+            2 => Some(CancelReason::IdleNudge),
+            3 => Some(CancelReason::Renumber),
+            4 => Some(CancelReason::Shutdown),
+            _ => None,
+        }
+    }
+}
+
+/// rc.53's displacement cancel, and since #3517 why it fired. The read loop
+/// `select!`s on [`Self::notified`]. Each trigger records its
+/// [`CancelReason`] just before it notifies, and the loop reads it once the
+/// notification lands.
+///
+/// The reason is an atomic beside the `Notify` rather than a value sent
+/// through it, so every trigger keeps the notify call it had: `notify_one`
+/// latches a permit for a loop that is mid-dispatch, and `cancel_all_agents`'
+/// `notify_waiters` does not. With two triggers on one connection the later
+/// write wins. A notification with nothing recorded reads `None`
+/// (`by=unknown`), never a panic.
+#[derive(Default)]
+pub struct AgentCancel {
+    notify: Notify,
+    reason: AtomicU8,
+}
+
+impl AgentCancel {
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    pub fn notify_one(&self) {
+        self.notify.notify_one();
+    }
+
+    pub fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+
+    /// Record why the next notification fires. Called BEFORE the notify, so
+    /// the loop it wakes reads it.
+    pub fn set_reason(&self, reason: CancelReason) {
+        self.reason.store(reason as u8, Ordering::Release);
+    }
+
+    pub fn reason(&self) -> Option<CancelReason> {
+        CancelReason::from_u8(self.reason.load(Ordering::Acquire))
+    }
+}
+
 pub struct ConnectedAgent {
     pub agent_id: ObjectId,
     pub tenant_id: ObjectId,
@@ -178,8 +262,10 @@ pub struct ConnectedAgent {
     /// `select!`s on `socket_rx.next()` AND `cancel.notified()`, so
     /// the displaced socket exits cleanly within milliseconds of the
     /// displacement Goodbye landing — instead of lingering up to one
-    /// 25 s keepalive interval waiting for a ping-send to fail.
-    pub cancel: Arc<Notify>,
+    /// 25 s keepalive interval waiting for a ping-send to fail. The idle
+    /// nudge, the overlay renumber and the shutdown sweep fire it too, and
+    /// each records which it was (#3517).
+    pub cancel: Arc<AgentCancel>,
     /// The agent's nearest relay region (`relay_regions` id), used to pick the
     /// per-session TURN config. Seeded from the DB row at registration and
     /// refreshed live when a probe report lands ([`Hub::set_agent_relay_home`]);
@@ -816,7 +902,7 @@ impl Hub {
     ///     and avoid evicting a NEWER displacing connection's entry
     ///     (rc.53 race fix; the pre-rc.53 unregister unconditionally
     ///     removed by `agent_id`).
-    ///   * `cancel` — `Arc<Notify>` the WS handler `select!`s on so a
+    ///   * `cancel` — `Arc<AgentCancel>` the WS handler `select!`s on so a
     ///     displacement triggers an immediate read-loop exit, NOT a 25 s
     ///     wait for the agent's own keepalive ping to fail.
     ///   * `rx` — pump source for `pump_server_messages`.
@@ -838,9 +924,9 @@ impl Hub {
         // Fleet RPC — whether the agent's caps advertise `rpc: ["exec", …]`
         // (see [`ConnectedAgent::supports_exec`]).
         supports_exec: bool,
-    ) -> (ClientTx, Arc<Notify>, mpsc::Receiver<ServerMsg>) {
+    ) -> (ClientTx, Arc<AgentCancel>, mpsc::Receiver<ServerMsg>) {
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
-        let cancel = Arc::new(Notify::new());
+        let cancel = Arc::new(AgentCancel::default());
         let entry = ConnectedAgent {
             agent_id,
             tenant_id,
@@ -954,6 +1040,7 @@ impl Hub {
             // notify_waiters would lose the signal and the old socket
             // would linger waiting on its 25 s keepalive. notify_one's
             // permit storage closes that hole.
+            prev.cancel.set_reason(CancelReason::Replaced);
             prev.cancel.notify_one();
             drop(prev);
         }
@@ -1149,6 +1236,7 @@ impl Hub {
         // write) still fires on the next `cancel.notified()`. The old
         // notify_waiters here silently LOST exactly those nudges while
         // still reporting success to the requesting pod.
+        agent.cancel.set_reason(CancelReason::IdleNudge);
         agent.cancel.notify_one();
         NudgeOutcome::Nudged
     }
@@ -1176,6 +1264,7 @@ impl Hub {
         // notify_one, not notify_waiters — same latching rationale as the
         // nudge path: a cycle landing while the read loop is mid-dispatch
         // must still fire on the next `cancel.notified()`.
+        agent.cancel.set_reason(CancelReason::Renumber);
         agent.cancel.notify_one();
         true
     }
@@ -1190,6 +1279,7 @@ impl Hub {
     pub fn cancel_all_agents(&self) -> Vec<ObjectId> {
         let ids: Vec<ObjectId> = self.inner.agents.iter().map(|a| *a.key()).collect();
         for entry in self.inner.agents.iter() {
+            entry.value().cancel.set_reason(CancelReason::Shutdown);
             entry.value().cancel.notify_waiters();
         }
         ids
@@ -7175,6 +7265,56 @@ mod tests {
                 "displacement must store a notify permit so the displaced read-loop \
                  exits within milliseconds (rc.53 auto-fail #5 mitigation)",
             );
+    }
+
+    /// #3517 — each of the four triggers records which it was before it
+    /// notifies, and the read loop's classification carries it to the
+    /// disconnect line as `by=`. The loop builds its end exactly this way:
+    /// `SocketEnd::Cancelled(cancel.reason())`.
+    #[tokio::test]
+    async fn each_cancel_trigger_reaches_the_disconnect_line() {
+        use crate::socket_end::SocketEnd;
+        let by = |cancel: &Arc<AgentCancel>| SocketEnd::Cancelled(cancel.reason()).by();
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                ObjectId::new(),
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            )
+        };
+
+        let (_tx1, cancel1, _rx1) = register();
+        assert_eq!(by(&cancel1), Some("unknown"), "nothing has fired yet");
+        let (_tx2, cancel2, _rx2) = register();
+        assert_eq!(by(&cancel1), Some("replaced"));
+        assert_eq!(by(&cancel2), Some("unknown"), "the newer connection stays");
+
+        assert_eq!(
+            hub.nudge_agent_if_idle(agent_id, false),
+            NudgeOutcome::Nudged
+        );
+        assert_eq!(by(&cancel2), Some("idle_nudge"));
+        // The nudge still latches its permit, as before.
+        tokio::time::timeout(Duration::from_millis(50), cancel2.notified())
+            .await
+            .expect("the nudge's notify_one latches");
+
+        let (_tx3, cancel3, _rx3) = register();
+        assert!(hub.cycle_agent_ws(agent_id));
+        assert_eq!(by(&cancel3), Some("renumber"));
+        tokio::time::timeout(Duration::from_millis(50), cancel3.notified())
+            .await
+            .expect("the renumber's notify_one latches");
+
+        let (_tx4, cancel4, _rx4) = register();
+        assert_eq!(hub.cancel_all_agents(), vec![agent_id]);
+        assert_eq!(by(&cancel4), Some("shutdown"));
     }
 
     #[tokio::test]
