@@ -650,7 +650,7 @@ mod tests {
         let carrier: Arc<DerpConn> = Arc::new(mux.conn_for(pk(0x02)));
         let survivor = Arc::clone(&carrier);
 
-        // A WG frame (first byte 1..=4 ⇒ the WG/disco consumer).
+        // A WG frame (its whole header [1, 0, 0, 0] ⇒ the WG/disco consumer).
         let mut frame = pk(0x02).to_vec();
         frame.extend_from_slice(&[1, 0, 0, 0]);
         mux.deliver(&frame);
@@ -731,9 +731,9 @@ mod tests {
         assert_eq!(DISCO_MAGIC, crate::overlay::disco::MAGIC);
     }
 
-    /// R4 — per-frame demux: WG (first byte 1..=4) and disco (8-byte magic)
-    /// reach the WG consumer; QUIC-shaped payloads (short header 0x40+, long
-    /// header 0xC0+) reach the TUNNEL consumer when registered. A QUIC short
+    /// R4 — per-frame demux: WG (its whole 4-byte header, `[1..=4, 0, 0, 0]`,
+    /// #2002) and disco (8-byte magic) reach the WG consumer; every other
+    /// payload, QUIC, reaches the TUNNEL consumer when registered. A QUIC short
     /// header may start with 0x52 ('R'), so the disco test is the full magic.
     #[tokio::test]
     async fn deliver_splits_wg_disco_and_tunnel_per_frame() {
