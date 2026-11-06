@@ -81,9 +81,9 @@ it. Do not shift these anchors with code that moved later.*
 
 | Surface | Where | What it does today |
 |---|---|---|
-| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:391` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:119-129`); FR-104 `anchor` from an optional body (`:52-88`) |
+| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:389` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:117-127`); FR-104 `anchor` from an optional body (`:52-88`) |
 | token claims | `crates/services/src/auth/mod.rs:82-96`, `:530-563` | `EnrollmentClaims { sub = issuing admin, tenant_id, jti, anchor }`; ten audiences in `TokenType` (`:37-78`) |
-| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:482-483`, `:569` | public `POST /api/agent/enroll`: archived org refused (`:197-212`), plan device cap before the single-use claim (`:227-247`), the claim fails closed (`:249-265`) |
+| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:480-481`, `:567` | public `POST /api/agent/enroll`: archived org refused (`:195-210`), plan device cap before the single-use claim (`:225-245`), the claim fails closed (`:247-263`) |
 | tunnel token | `crates/modules/network/src/routes/tunnel.rs:53-75`; mint `crates/services/src/auth/mod.rs:731` | any member (`is_member`) mints a `TunnelEnrollment` token |
 | registration | `crates/api/src/routes/auth.rs:167-325` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:250-255`); production returns no session (`:311-324`) |
 | login gate | `crates/api/src/routes/auth.rs:366-370` | an unactivated account is refused |

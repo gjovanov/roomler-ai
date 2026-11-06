@@ -2922,13 +2922,16 @@ pub struct Grant {
     pub consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
     /// Server-clamped session lifetime once redeemed.
     pub session_secs: u64,
-    /// LOCAL deadline after which this grant is dead.
+    /// LOCAL deadline after which this grant is dead: its arrival plus
+    /// `ssh_limits::GRANT_TTL_SECS`, on this machine's monotonic clock.
     ///
-    /// Deliberately an `Instant` derived from arrival rather than the server's
-    /// wall-clock `expires_at_ms`: the two machines' clocks can differ by
-    /// minutes, and a skewed or malformed timestamp must not be able to
-    /// produce a grant that never expires. The server's value only ever
-    /// SHORTENS the local ceiling.
+    /// Never derived from the server's wall-clock `expires_at_ms` (#3511).
+    /// The two machines' clocks can differ by minutes, so comparing the
+    /// timestamp with this clock measured their skew, not the grant's age: a
+    /// device a minute ahead of the server refused every grant, and one
+    /// behind it took a late grant for the full window. So a skewed or
+    /// malformed timestamp can neither shorten this nor stretch it, and no
+    /// grant outlives the TTL from its arrival.
     deadline: std::time::Instant,
 }
 
@@ -2954,15 +2957,16 @@ const MAX_PENDING_GRANTS: usize = 16;
 /// `rc:ssh.grant_ack`, and the person who asked for the session is told which
 /// one it was instead of meeting `Permission denied (publickey)`. The text a
 /// log line prints is unchanged.
+///
+/// #3511 — there is no "expired on arrival" any more: a grant's window starts
+/// when it arrives (`Grant::deadline`). The wire keeps
+/// `SshGrantRefusal::Expired`, because agents released before the fix still
+/// send it.
 #[cfg(feature = "ssh-server")]
 #[derive(Debug)]
 pub enum GrantRejected {
     /// The key the server validated does not parse here.
     UnparseableKey(String),
-    /// Nothing is left of the window between arrival and the server's
-    /// deadline: this clock is ahead of the server's, or the grant spent its
-    /// whole life in transit.
-    ExpiredOnArrival,
 }
 
 #[cfg(feature = "ssh-server")]
@@ -2972,7 +2976,6 @@ impl GrantRejected {
         use roomler_ai_remote_control::models::SshGrantRefusal;
         match self {
             Self::UnparseableKey(_) => SshGrantRefusal::Invalid,
-            Self::ExpiredOnArrival => SshGrantRefusal::Expired,
         }
     }
 }
@@ -2982,9 +2985,6 @@ impl std::fmt::Display for GrantRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnparseableKey(e) => write!(f, "grant carries an unparseable public key: {e}"),
-            Self::ExpiredOnArrival => {
-                f.write_str("grant is already expired on arrival (clock skew?)")
-            }
         }
     }
 }
@@ -2995,6 +2995,10 @@ impl std::fmt::Display for GrantRejected {
 /// connection authenticating with its key succeeds from this moment. That is
 /// what the caller's `rc:ssh.grant_ack` promises the server (FR-83), which is
 /// why the ack is sent only after this returns.
+///
+/// `expires_at_ms` is the server's wall clock, and it is only logged: the
+/// grant lives `ssh_limits::GRANT_TTL_SECS` from now, whatever it says
+/// (#3511, `Grant::deadline`).
 #[cfg(feature = "ssh-server")]
 #[allow(clippy::too_many_arguments)]
 pub fn record_grant(
@@ -3016,17 +3020,29 @@ pub fn record_grant(
     russh::keys::ssh_key::PublicKey::from_openssh(&public_key)
         .map_err(|e| GrantRejected::UnparseableKey(e.to_string()))?;
 
-    // Re-clamp the lifetime against our own clock. The server's timestamp can
-    // only make the window SMALLER than the local ceiling, never larger.
-    let ceiling = Duration::from_secs(ssh_limits::GRANT_TTL_SECS);
+    // #3511 — the window starts at ARRIVAL, on this machine's monotonic
+    // clock, and is the TTL whatever the server's timestamp says. Lateness is
+    // bounded on the server's clock instead: the caller is told where to dial
+    // only once this function's ack is back inside
+    // `GRANT_ACK_TIMEOUT_SECS` (FR-83), and a via-service grant can be
+    // claimed only inside that bound (FR-105).
+    let window = Duration::from_secs(ssh_limits::GRANT_TTL_SECS);
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let server_window = Duration::from_millis(expires_at_ms.saturating_sub(now_ms));
-    let window = server_window.min(ceiling);
-    if window.is_zero() {
-        return Err(GrantRejected::ExpiredOnArrival);
+    // What the timestamp leaves by THIS clock, for the log and never for a
+    // decision; negative = already past here.
+    let server_expiry_in_ms = (i128::from(expires_at_ms) - i128::from(now_ms))
+        .clamp(i64::MIN.into(), i64::MAX.into()) as i64;
+    if server_expiry_in_ms <= 0 {
+        // What an agent before #3511 refused as `expired`. Still worth a
+        // line: this clock is likely ahead of the server's.
+        tracing::warn!(
+            %grant_id, server_expiry_in_ms,
+            "ssh: the server's expiry for this grant is already past by this device's clock \
+             (is the clock ahead?); holding it the full window from arrival"
+        );
     }
 
     let grant = Grant {
@@ -3052,6 +3068,7 @@ pub fn record_grant(
     tracing::info!(
         grant_id = %grant.grant_id, caller = %grant.caller,
         account_mode = %grant.account_mode, ttl_secs = window.as_secs(),
+        server_expiry_in_ms,
         "ssh: grant recorded"
     );
     grants.push(grant);
@@ -3900,56 +3917,19 @@ mod tests {
         assert!(!res.success(), "a redeemed grant must not be replayable");
     }
 
-    /// An expired grant is not a grant. The deadline is derived from arrival,
-    /// so this does not depend on the two clocks agreeing.
+    /// An expired grant is not a grant. The deadline is LOCAL, arrival plus
+    /// the TTL (#3511), so this puts it in the past rather than waiting the
+    /// TTL out, and nothing here depends on the two clocks agreeing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_expired_grant_admits_nobody() {
         let _lock = grant_test().await;
         let (key, line) = client_key(11);
         let addr = serve_one(&cfg_with(Vec::new())).await;
 
-        // Arrives already past its expiry — rejected outright rather than
-        // stored as a live credential.
-        assert!(grant_for(&line, 0).is_err());
-        assert_eq!(super::pending_grants(), 0);
-
-        // FR-83 — and the refusal that reaches the caller says WHICH: expiry
-        // means "the clocks disagree", which someone can fix, where an
-        // unusable key means "report a bug". Both paths reject before
-        // anything is stored, so this needs no table state of its own.
-        use roomler_ai_remote_control::models::SshGrantRefusal;
-        let (_, other_line) = client_key(12);
-        let expired = super::record_grant(
-            "g-expired".into(),
-            other_line,
-            "alice@example.com".into(),
-            "daemon".into(),
-            None,
-            None,
-            0,
-            0,
-        )
-        .unwrap_err();
-        assert!(matches!(expired, super::GrantRejected::ExpiredOnArrival));
-        assert_eq!(expired.refusal(), SshGrantRefusal::Expired);
-        assert_eq!(
-            expired.to_string(),
-            "grant is already expired on arrival (clock skew?)",
-            "the device's log line must not change with the type"
-        );
-        let garbage = super::record_grant(
-            "g-garbage".into(),
-            "not a key".into(),
-            "alice@example.com".into(),
-            "daemon".into(),
-            None,
-            None,
-            now_ms() + 30_000,
-            0,
-        )
-        .unwrap_err();
-        assert_eq!(garbage.refusal(), SshGrantRefusal::Invalid);
-        assert_eq!(super::pending_grants(), 0);
+        grant_for(&line, 30_000).unwrap();
+        for grant in super::GRANTS.lock().unwrap().iter_mut() {
+            grant.deadline = std::time::Instant::now();
+        }
 
         let config = Arc::new(russh::client::Config::default());
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -3964,12 +3944,91 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!res.success());
+        assert!(!res.success(), "a grant past its deadline admits nobody");
+        assert_eq!(super::pending_grants(), 0, "and it is gone from the table");
+
+        // FR-83 — a refusal reaches the caller and says WHICH. An unusable
+        // key means "report a bug", and it is refused before anything is
+        // stored.
+        use roomler_ai_remote_control::models::SshGrantRefusal;
+        let garbage = super::record_grant(
+            "g-garbage".into(),
+            "not a key".into(),
+            "alice@example.com".into(),
+            "daemon".into(),
+            None,
+            None,
+            now_ms() + 30_000,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(garbage.refusal(), SshGrantRefusal::Invalid);
+        assert_eq!(super::pending_grants(), 0);
     }
 
-    /// The server can only ever SHORTEN the local window. A grant claiming a
-    /// year of validity — a skewed clock, or a compromised control plane —
-    /// still dies at the local ceiling.
+    /// #3511 — the window is the TTL from ARRIVAL, whatever the two clocks
+    /// say. Each case is a grant minted now by a server whose clock differs
+    /// from this one by the skew (positive = this device AHEAD), with the
+    /// timestamp both kinds of server write: mint + TTL (before #3511) and
+    /// mint + TTL + the device-leg slack. Before the fix +73 s (the field
+    /// case) and +120 s were refused as expired, +30 s got half a window, and
+    /// a timestamp of 0 was refused.
+    #[tokio::test]
+    async fn the_window_is_the_ttl_from_arrival_whatever_the_clocks_say() {
+        use roomler_ai_remote_control::models::ssh_limits;
+        use std::time::{Duration, Instant};
+
+        let _lock = grant_test().await;
+        let ttl = Duration::from_secs(ssh_limits::GRANT_TTL_SECS);
+        let ttl_ms = ssh_limits::GRANT_TTL_SECS * 1000;
+        let slack_ms = ssh_limits::DEVICE_EXPIRY_SLACK_SECS * 1000;
+        let mut cases: Vec<(String, u64)> = Vec::new();
+        for skew_secs in [-120i64, -30, 0, 30, 73, 120] {
+            let server_now_ms = now_ms().checked_add_signed(-skew_secs * 1000).unwrap();
+            cases.push((
+                format!("{skew_secs:+} s, old server"),
+                server_now_ms + ttl_ms,
+            ));
+            cases.push((
+                format!("{skew_secs:+} s, slacked server"),
+                server_now_ms + ttl_ms + slack_ms,
+            ));
+        }
+        cases.push(("a zero timestamp".into(), 0));
+        cases.push(("a huge timestamp".into(), u64::MAX));
+        cases.push(("a year ahead".into(), now_ms() + 365 * 24 * 3600 * 1000));
+
+        for (i, (case, expires_at_ms)) in cases.iter().enumerate() {
+            super::clear_grants();
+            let (_key, line) = client_key(200u8.wrapping_add(i as u8));
+            super::record_grant(
+                format!("g-skew-{i}"),
+                line,
+                "alice@example.com".into(),
+                "daemon".into(),
+                None,
+                None,
+                *expires_at_ms,
+                0,
+            )
+            .unwrap_or_else(|e| panic!("{case}: refused: {e}"));
+            let left = super::GRANTS.lock().unwrap()[0]
+                .deadline
+                .saturating_duration_since(Instant::now());
+            assert!(
+                left <= ttl,
+                "{case}: no grant outlives the TTL from its arrival; got {left:?}"
+            );
+            assert!(
+                left > ttl - Duration::from_secs(5),
+                "{case}: the whole window, not what the clocks leave of it; got {left:?}"
+            );
+        }
+    }
+
+    /// The server's timestamp can never LENGTHEN the local window. A grant
+    /// claiming a year of validity — a skewed clock, or a compromised control
+    /// plane — still dies at the local ceiling.
     #[tokio::test]
     async fn a_far_future_expiry_is_clamped_to_the_local_ceiling() {
         use roomler_ai_remote_control::models::ssh_limits;

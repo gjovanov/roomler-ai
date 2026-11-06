@@ -352,7 +352,7 @@ again in 6.6 to 7.6 s, and the viewer rejoined without a click.
 
 **The switch's reach, for P3.** The deny sat undelivered on an online device for 71 minutes and would have sat longer.
 Reconcile-on-connect is the only delivery path, deliberately
-(`crates/modules/fleet/src/socket.rs:427`), and no server message restarts a daemon
+(`crates/modules/fleet/src/socket.rs:410`), and no server message restarts a daemon
 ([`remote-config.md`](../remote-config.md) §7b). So a cell that goes bad stays open on an online host until that host
 has reconnected and then restarted, which across a fleet means a pod roll followed by a release's push. With someone
 at the device, two `roomler restart`s do it in about a minute. A canary week should be planned on that reach.

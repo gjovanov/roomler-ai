@@ -240,7 +240,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | How the overlay gets in | Filter (off) | Where |
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:393` |
-| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:416`, `crates/modules/fleet/src/hub.rs:1781` |
+| An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:416`, `crates/modules/fleet/src/hub.rs:2274` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1529`, `peer.rs:1571`, `peer.rs:1497` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
@@ -292,7 +292,7 @@ flowchart TD
 |---|---|
 | that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1082`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:4630`). The Hub sends `auto` to no other agent |
 | that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:2473`) |
-| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:3662`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:145`) |
+| the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:3670`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:145`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: the last netcheck (`stun_udp`, since P2b alone) of the target and of the browser's best device, read by the server (below). The target folds its own netcheck in at the offer (D8, `own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). `None` = not measured, read as usable |
 | the carriers | `mesh_carriers_of` (`agents/roomlerd/src/rc_overlay.rs:310`), one LocalAPI `peers` call for every viewer device: `Direct` direct, `Relay`/`Tunnel` relayed, anything else unknown. The best of them decides |
 | the rule | `auto_allows` (`rc_overlay.rs:292`) |
@@ -3191,7 +3191,7 @@ flowchart LR
 | `session_created` | **one server hop**: the request reached a live hub | `rc:session.created` | `remote_audit` `consent_prompted` | ✅ |
 | `ready` | a human, on a Prompt-mode device | `rc:ready` | `remote_audit` `consent_granted` | ✅ |
 | `offer_sent` | the browser building its offer | after `setLocalDescription` | — | ✅ |
-| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:1875`, `crates/remote_control/src/audit.rs:152`) | ✅ |
+| `answer` | the agent receiving the offer and answering | `rc:sdp.answer` | `remote_audit` `session_started` (`crates/modules/fleet/src/hub.rs:2373`, `crates/remote_control/src/audit.rs:155`) | ✅ |
 | `pc_connected` | ICE + DTLS | `RTCPeerConnection` `connected` | — | ✅ |
 | `dc_open` | SCTP — the `video-bytes` DataChannel | DC `open` | — | ✅ |
 | `first_frame` | the decode worker's first output frame | worker `first-frame` | — | ✅ |
@@ -3247,7 +3247,7 @@ sequenceDiagram
     participant R as Redis presence
     participant O as Owner pod
     V->>P: rc:session.request
-    P->>P: Hub::create_session (hub.rs:749)
+    P->>P: Hub::create_session (hub.rs:1399)
     alt the agent is registered on this pod
         P-->>V: rc:session.created
     else AgentOffline here

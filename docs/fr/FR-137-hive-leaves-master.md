@@ -95,7 +95,7 @@ the design:
 |---|---|---|---|
 | 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4328`) and `merge_unknown_keys` (`:4457`), locked by `:4994` | Removing the 23 keys strands nothing, and a rollback finds them again. |
 | 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1839`, deserialized at `:1959`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
-| 3 | While the wire is unchanged, a 0.4.199 Hive frame still parses on a server with no Hive module. | owner routing at `crates/modules/fleet/src/socket.rs:633`; no handler (`:640`); then `warn!("unexpected msg for role {role:?}: {:?}", msg)` (`crates/modules/fleet/src/hub.rs:4501`) and `crates/modules/fleet/src/socket.rs:829` | Without a stub, P1 would log **two WARNs per frame with the frame dumped**, which includes a device's account map. Hence S-A1. |
+| 3 | While the wire is unchanged, a 0.4.199 Hive frame still parses on a server with no Hive module. | owner routing at `crates/modules/fleet/src/socket.rs:605`; no handler (`:612`); then `warn!("unexpected msg for role {role:?}: {:?}", msg)` (`crates/modules/fleet/src/hub.rs:4411`) and `crates/modules/fleet/src/socket.rs:801` | Without a stub, P1 would log **two WARNs per frame with the frame dumped**, which includes a device's account map. Hence S-A1. |
 | 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:3100`, `:3105`, "Deliberately not fatal" (`:3097`) | The agent needs no stub variant. |
 | 5 | `ClientMsg` ignores unknown fields. | `crates/remote_control/src/signaling.rs:523-525` | If P2 dropped `ssh_ticket` or `net_grant`, an old agent's ticketed request would parse as **the owner's own**. Hence S-B3. |
 | 6 | Role reconcile only adds bits. | `let reconciled = stored \| def.permissions;` (`crates/services/src/dao/tenant.rs:427`) | Bits 32-34 stay in stored masks for good. A deleted name would let a future bit pass both bit tests (`crates/db/src/models/role.rs:529`, `:544`) and reach every member. Hence S-A5. |
@@ -109,7 +109,7 @@ the design:
 Three of the brief's starting assumptions were wrong. Each is corrected in `compat.md`:
 
 - The server does *not* simply ignore old Hive frames until P2; fact 3 above shows what it does.
-- The Hive cap gate is at `crates/modules/fleet/src/socket.rs:208` and `:324`, not where it was first
+- The Hive cap gate is at `crates/modules/fleet/src/socket.rs:191` and `:307`, not where it was first
   cited.
 - The DERP demux needs a stub. It cannot simply go.
 
@@ -161,7 +161,7 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 | A-I2 | P1 leaves the wire unchanged: the baseline's `wire` and `namespaces` stay identical. | The wire lives in `remote_control` (A-I1). |
 | A-I3 | P1 keeps `hive`, `vault` and `knowhow` in `graph::MODULES` (`crates/core/src/graph.rs:17-19`) and `HOOK_ORDER` (`crates/core/src/hooks.rs:52`). | Fact 9 |
 | A-I4 | No PR drops a collection or an index. | D2 |
-| B-I6 | No removal changes how an old agent's frame parses on the server, except as intended: a retired variant fails the parse (`debug!`), and `ssh_ticket` / `net_grant` stay so they can be refused. | Fact 5. A hello that failed to parse would leave the device unregistered without a word (`crates/modules/fleet/src/socket.rs:1352`). |
+| B-I6 | No removal changes how an old agent's frame parses on the server, except as intended: a retired variant fails the parse (`debug!`), and `ssh_ticket` / `net_grant` stay so they can be refused. | Fact 5. A hello that failed to parse would leave the device unregistered without a word (`crates/modules/fleet/src/socket.rs:1309`). |
 | B-I1 | In P2, one commit drops `hive`, `vault` and `hive-test-launcher` from the crate and `hive,` from all four release lists. | Fact 10 |
 | B-I2 | `ssh-one-command` stops being advertised (`agents/roomlerd/src/encode/caps.rs:4465`) in the same PR that removes the agent's enforcement of it. | A build that advertised the verb and ignored the field would serve an agent session's key a full session on a pre-P1 server. Not advertising is fail-closed: the old server refuses `TargetTooOld` (`crates/modules/network/src/routes/agent_ssh.rs:509`). |
 | B-I3 | Each `cfg(hive_host)` and `cfg(worker_calls)` leaves together with its `rustc-check-cfg` line. | `unexpected_cfgs` fails `clippy -D warnings`. |
@@ -172,9 +172,9 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 
 | Stub | Where | Why | It may go when |
 |---|---|---|---|
-| **S-A1**: a `debug!` + `continue` arm for `Owner::{Hive,Vault,Knowhow}` | after `Owner::Fleet => parsed,` (`crates/modules/fleet/src/socket.rs:634`) | fact 3 | P2 removes it with the variants. |
+| **S-A1**: a `debug!` + `continue` arm for `Owner::{Hive,Vault,Knowhow}` | after `Owner::Fleet => parsed,` (`crates/modules/fleet/src/socket.rs:606`) | fact 3 | P2 removes it with the variants. |
 | **S-A2**: refuse a request that carries `ssh_ticket` (`TicketRefused`, audited) or `net_grant` (`NET_GRANT_REFUSED`), never falling back to the owner's or the device's principal | `crates/modules/network/src/agent_arms.rs:193`; `crates/modules/network/src/tunnel.rs:820` | fact 5 | It becomes S-B3. |
-| **S-A3**: the hello's `vault_key` bound as `_`; `Agent{}` literals keep `vault_key: String::new()` | `crates/modules/fleet/src/socket.rs:72` | These are wire and model fields (A-I1). | P2 |
+| **S-A3**: the hello's `vault_key` bound as `_`; `Agent{}` literals keep `vault_key: String::new()` | `crates/modules/fleet/src/socket.rs:71` | These are wire and model fields (A-I1). | P2 |
 | **S-A4**: echo and model fields written neutral (`None` / `false`) | network and fleet | A-I1 | P2 |
 | **S-A5**: role bits 32-34 kept as consts and names marked RESERVED; `ALL` unchanged; dropped from `DEFAULT_MEMBER` and `DEFAULT_ADMIN`; hidden in the UI catalog | `crates/db/src/models/role.rs:112`, `:125`, `:231` | fact 6 | Never (D1). |
 | **S-A6 / S-B5**: `SshDenyReason::{TicketRefused,SessionNotAllowed,TargetTooOld}` | `crates/remote_control/src/models.rs:5253` | fact 7 | 90 days after P1's roll, or never with `#[serde(other)]` (D7). |
@@ -226,7 +226,7 @@ device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).
      (`crates/api/src/ws/handler.rs:414`).
 2. **P2's agent against a pre-P1 server** (P1 rolled back).
    - The agent advertises no Hive verb and no `ssh-one-command`, and sends no vault key. So every Hive push
-     stays gated off (`crates/modules/fleet/src/hub.rs:3095`), and a session SSH grant is refused
+     stays gated off (`crates/modules/fleet/src/hub.rs:3005`), and a session SSH grant is refused
      `TargetTooOld`.
    - Vault and knowhow push nothing either, because their pushes read the stored caps. One edge: a
      failed hello update can leave the old caps on the row for one connection, and that costs one WARN on
@@ -246,12 +246,12 @@ device's own value alone (`agents/roomlerd/src/remote_config.rs:396`).
      untouched on disk.
    - Its Hive frames meet P1's stub, or `debug!` after P2's server roll.
 5. **A 0.4.199 agent against P2's server.**
-   - A retired frame fails the parse and lands at `debug!` (`crates/modules/fleet/src/socket.rs:932` on
+   - A retired frame fails the parse and lands at `debug!` (`crates/modules/fleet/src/socket.rs:904` on
      master `a19e4573f`, after P2), with no disconnect. P2's server GREEN saw exactly that on production
      (§8).
    - The hello still parses: `vault_key` is an ignored field and the verbs are strings. A frozen-hello test
      pins this, because `read_next_rc` drops an unparseable hello without a word
-     (`crates/modules/fleet/src/socket.rs:1243` on `a19e4573f`).
+     (`crates/modules/fleet/src/socket.rs:1201` on `a19e4573f`).
    - A ticket or grant is still refused (S-B3).
    - DERP traffic is opaque to the relay.
 6. **P2's agent against P1's server.** Nothing Hive flows either way, and `one_command` is always `false`.
