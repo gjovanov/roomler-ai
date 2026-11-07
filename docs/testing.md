@@ -33,6 +33,7 @@ flowchart TB
 | A call over the self-host relay | `cd ui && E2E_EXPECT_TURN_RELAY=1 bun x playwright test e2e/selfhost-turn-relay.spec.ts` | a compose stack started with `ROOMLER__TURN__FORCE_RELAY=true` and an announced address outside its deny list, with the browser on the same machine as the server. Fails unless every connected peer connection selected a `relay` pair and both sides decode advancing remote frames |
 | Phone-width smoke | `cd ui && bun run test:phone` | nothing — the built SPA with every `/api` call mocked (`ui/e2e-phone/`) |
 | Soft-keyboard harness | `cd ui && bun run test:harness` | nothing — one harness page on the Vite dev server, in a real Chromium (`ui/e2e-harness/`, #2888) |
+| Data-channel worker harness | the same run (`e2e-harness/dcworker.spec.ts`, FR-135 R3) | nothing — two peer connections looped in one page, `VideoEncoder` on one side and the real decode worker on the other, on both arms of `roomler-rc-dc-worker` ([below](#the-data-channel-worker-harness-fr-135-r3)) |
 | Capture smoke | `./scripts/dev-xvfb.sh` | Xvfb — paints an xterm, runs the scrap-capture path headless |
 | Encoder smoke | `roomlerd encoder-smoke --encoder hardware [--codec hevc]` | the host's GPU — 10 synthetic frames, prints the cascade's decisions |
 
@@ -57,6 +58,17 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   the `rc:*` channel — notifications, conference, tenants, files, agents…),
   composables (`useRemoteControl` HID + button-mapping locks, validation,
   markdown, snackbar), API client, plugins.
+- **The data-channel worker, black-box** (`ui/src/__tests__/workers/`, FR-135 R3):
+  `rcDcWorker`, `rcMediaWindow`, `rcDecodeRecovery` and `rcDecodeWorkersColorSpace`
+  drive the real `rc-dc-worker.ts` through the messages the page sends it, with
+  WebCodecs, the canvas and the clock faked, once for each of the six codec strings
+  the page names (`dcCodecs.ts`, which `useRemoteControl.spec.ts` checks against the
+  composable's constants). One worker serves every codec, so a branch on the codec
+  string shows up as the one codec whose cases fail. `rcDcWorker` also locks the
+  `stats` message's keys and the crop handling on every codec, and reads a channel
+  moved into the worker (its open, close, gap and messages, with no page hop) and the
+  queue read at arrival beside the old one read at paint. `rcVideoChannel` covers the
+  page's half: a transfer taken, a transfer refused, the delivery-gap clock.
 - **The setup wizard's page** (`ui/src/__tests__/setupWizardPage.spec.ts`, FR-129 C): the
   real `index.html` and `app.js` of `agents/roomler-setup` in jsdom, with Tauri's `invoke`
   mocked. What is preselected, when Continue opens and which cards show are the product there,
@@ -66,7 +78,9 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   websocket + connection status, billing, invite, oauth, email flows,
   notifications, observability, profile, responsive, 404 — plus the
   remote-control lane: `remote-session-smoke`, `remote-file-upload-smoke`,
-  `rc-vp9-444` (needs an agent built with the feature),
+  `rc-vp9-444` (the data-channel worker behind two peers looped in one page; no
+  agent, but it loads the worker from the Vite dev path, so it runs against
+  `bun run dev` only: `scripts/e2e-expected-failures.txt`),
   `remote-recording-refused` and `remote-recording-smoke` (FR-85; the second
   needs an agent that advertises `record`), and a field-host upload spec. Chromium runs with fake media devices for WebRTC.
 - **The phone-width smoke** (`ui/e2e-phone/`, FR-116 D6): the BUILT SPA served
@@ -105,7 +119,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14949`,
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14769`,
   `:15039`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
@@ -148,6 +162,38 @@ other pod) · cluster · stats · relay-region · remote-control · agent
       M --> R
       R --> A{"one owner<br/>per key?"}
   ```
+
+## The data-channel worker harness (FR-135 R3)
+
+`ui/e2e-harness/dcworker.spec.ts` runs the real `rc-dc-worker.ts` in a real Chromium on both arms of
+`roomler-rc-dc-worker` ([remote-control.md §11.14.1](remote-control.md#11141-the-channel-in-the-worker-roomler-rc-dc-worker)).
+jsdom has no `RTCPeerConnection`, no transferable channel and no WebCodecs, so only a browser can say whether it
+takes the transfer, whether the moved channel's events reach the worker, and whether frames still decode once the
+main thread is out of the path. `dcworker.ts` loops two peer connections in one page: the "viewer" side opens
+`video-bytes` and moves it through the real `moveVideoChannelToWorker`, as `startDcPath` does, and the "agent"
+side encodes a moving 320×180 picture with `VideoEncoder` (VP9 profile 0, else H.264, else AV1) and sends it framed
+as the agent frames it, 13-byte header and 16 KiB messages. It needs no agent and no server. It runs with
+`bun run test:harness`, beside the soft-keyboard harness, on the Vite dev server, and CI runs it with that job on
+any PR that touches `ui/`.
+
+| Case | Asserts |
+|---|---|
+| the relay | every frame decodes, the page's channel is not a husk, `fwd` counts the page's hop, and the far end's close reaches the page |
+| the channel in the worker | the transfer is taken and the page is left a closed husk, every frame decodes off the moved channel, `fwd` counts nothing while `arr_gap` counts every arrival, `queueArrMs` is read, and the far end's close reaches the worker |
+| a refused transfer | `DataCloneError` leaves the channel on the page, whole, and the relay carries every frame |
+| every case | the size the worker paints is the picture's, 320×180. Chromium's software VP9 decoder reports a coded width 64 px wider, and with `classifyCrop` acting on VP9 this read 384×180 ([remote-control.md §11.14](remote-control.md#1114-one-data-channel-worker-fr-135-r3)) |
+
+```mermaid
+flowchart LR
+  D["vite dev :4174<br/>e2e-harness/dcworker.html"] --> PW["Playwright Chromium"]
+  PW --> E["VideoEncoder<br/>agent side"] -->|"video-bytes, 16 KiB"| V["viewer side"]
+  V -->|"relay or transfer"| W["rc-dc-worker"]
+  W --> R{"every frame decoded?<br/>fwd · arr_gap · close"}
+```
+
+⚠️ It proves the mechanism and not the gain: two peers on one loopback say nothing about a main thread under a
+real page's load at 60 Mbit/s. That is S11's read, on a real session (FR-135 §8.2). Only Chromium runs here, so
+Firefox's and Safari's transfers are unread.
 
 ## In-crate Rust unit tests
 

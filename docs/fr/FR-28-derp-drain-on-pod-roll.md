@@ -395,7 +395,8 @@ The operator's decision of 2026-11-02 changed the first two. AC3 to AC6 keep the
 | Docs | Written for what is built | Ticked with the field numbers in them |
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
-only above 1500 ms (`ui/src/composables/useRemoteControl.ts:8196-8199`).
+only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:18`, warned at
+`ui/src/composables/useRemoteControl.ts:8226`).
 
 ## Out of scope
 

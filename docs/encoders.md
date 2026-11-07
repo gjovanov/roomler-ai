@@ -174,7 +174,7 @@ every other device, and a per-device override outlives an agent losing a cell. T
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
 and telling nobody (`agents/roomlerd/src/signaling.rs:3851`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:10083`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:9905`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
@@ -1834,8 +1834,9 @@ run `cargo clippy … --all-targets -- -D warnings` under WSL before pushing it.
 
 The browser probes per-codec **software and hardware** decode support and exposes
 the render paths documented in [ui.md](ui.md#the-remote-desktop-viewer-useremotecontrolts):
-classic `<video>`, WebCodecs-over-RTP (`RTCRtpScriptTransform`), and the DC worker
-paths (`rc-webcodecs-worker`, `rc-hevc-worker`, `rc-vp9-444-worker`). Per-hop
+classic `<video>`, WebCodecs-over-RTP (`RTCRtpScriptTransform`, decoded in
+`rc-webcodecs-worker`), and the data-channel path, one worker for every codec there
+(`rc-dc-worker`; `rc-hevc-worker` and `rc-vp9-444-worker` until FR-135 R3). Per-hop
 timings (forward / decode / paint) are instrumented by `rc-hop-stats` and shown in
 the opt-in diagnostics HUD. Decoder stats flow back to the agent and close the
 rate-control loop.

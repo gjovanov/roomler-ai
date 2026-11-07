@@ -6,9 +6,10 @@
  *
  * Before this, how long a frame took to decode and paint, and whether the
  * picture froze, stopped at the HUD: `rc-hop-stats.ts` kept means for the
- * diagnostics overlay and nothing reached a session's record. The two
- * data-channel workers now keep this window beside those means, and fold it
- * into their 1 s `stats` message, which the page carries to the agent on
+ * diagnostics overlay and nothing reached a session's record. The
+ * data-channel worker (`rc-dc-worker.ts`, two workers until FR-135 R3) now
+ * keeps this window beside those means, and folds it into its 1 s `stats`
+ * message, which the page carries to the agent on
  * `rc:decodestat` (`decodeStatWireMessage`). No new message, no new cadence.
  *
  * | Wire field | Instrument | What it counts |
