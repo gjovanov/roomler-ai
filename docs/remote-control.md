@@ -243,13 +243,13 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:416`, `crates/modules/fleet/src/hub.rs:2274` |
 | A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1529`, `peer.rs:1571`, `peer.rs:1497` |
 
-"Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2148`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
+"Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2156`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
 > ⚠️ **Never the whole `100.64.0.0/10`.** That is real CGNAT space: an LTE modem, a cloud VPC's secondary range and Tailscale all hand out addresses in it, and a CIDR rule would silently strip their candidates. The footprint registry only ever grows, so a WS reconnect or runtime restart never opens a window in which an overlay address reads as foreign.
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3599`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:232`).
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3662`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:232`).
 > - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1319`, `delegate.rs:1361`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4723`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
@@ -298,7 +298,7 @@ flowchart TD
 | the rule | `auto_allows` (`rc_overlay.rs:292`) |
 
 Notes on the implementation:
-- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4360`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
+- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4423`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
 - **A viewer device on a worse link stays off** (`exclude`, `rc_overlay.rs:57`). One computer can run several agents, each with its own relay: Windows and WSL, where the Windows agent is direct to its peers and the WSL one rides DERP (FR-121 P3b). A session that rides the mesh through the best one keeps every other one out of its ICE servers, its remote candidates and the offer's SDP. Otherwise ICE, which ranks relays by the order of their TURN servers, could pick the relay behind DERP.
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn` (the server's hint), `own_far_turn` (D8), `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
@@ -633,7 +633,7 @@ is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
-| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3657`](../agents/roomlerd/src/signaling.rs#L3657)); `no-backend` | the receive-audio toggle is off, with the device's reason |
+| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3720`](../agents/roomlerd/src/signaling.rs#L3720)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:2812`](../agents/roomlerd/src/encode/caps.rs#L2812)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
@@ -881,7 +881,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:6607`](../agents/roomlerd/src/signaling.rs#L6607)),
+  announcement ([`signaling.rs:6670`](../agents/roomlerd/src/signaling.rs#L6670)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -2536,7 +2536,7 @@ session goes without it, with a reason:
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
   the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:147`](../agents/roomlerd/src/session_policy.rs#L147),
-  applied at [`signaling.rs:3861`](../agents/roomlerd/src/signaling.rs#L3861)) the moment the consent
+  applied at [`signaling.rs:3924`](../agents/roomlerd/src/signaling.rs#L3924)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
@@ -2896,7 +2896,7 @@ sequenceDiagram
 | | |
 |---|---|
 | Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14003`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:13981`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4374`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14012`) |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4437`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14012`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:674`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:342`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:805`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:434`, #2326) |
@@ -2959,8 +2959,8 @@ own `rc:terminate`), not on the controller-ended one, where `ended_at` is alread
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
 P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:951`)
-and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2659`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6493`) queues the sample on
+and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2722`), by the
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6556`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:288`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -4426,33 +4426,35 @@ instead of declaring a stall. **Watchdog-of-watchdog** runs on a
 dedicated `std::thread`, outside the runtime it watches,
 wakes every 30s, force-exits if the async watchdog hasn't bumped
 its `AtomicU64` heartbeat in 60s — catches a fully-deadlocked
-tokio runtime.
+tokio runtime. (A close-lid gap reaches `Instant` on Windows only;
+since #3530 the thread measures its own sleep too. See **Across a
+freeze or a suspend** below.)
 
 **Where a stall froze** (#2551). A tick says a pump is alive, not
 where it is. The signaling loop awaits inside its `select!` arms,
 so a stall is one arm whose await never returned, and the INFO log
 is silent while it waits.
 - Every arm therefore enters a named stage first
-  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:432`):
+  (`watchdog::enter`, `agents/roomlerd/src/watchdog.rs:461`):
   `shutdown`, `keepalive`, `netchange`, `heartbeat`, `outbound`,
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
   `ws.close` / `ws.error` / `ws.other`
-  (`agents/roomlerd/src/signaling.rs:2099` onwards).
+  (`agents/roomlerd/src/signaling.rs:2137` onwards).
 - The connection's setup awaits too, with the pump already counting.
   It reads `setup`, and `setup.overlay` while the overlay runtime
-  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1699`).
+  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1733`).
   Only the loop waiting for its next event reads `select`.
 - A `ws.text` arm is refined to the message it is handling, read
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
-  `agents/roomlerd/src/signaling.rs:6191`). The dispatch awaits per
+  `agents/roomlerd/src/signaling.rs:6254`). The dispatch awaits per
   message, so that is where a stall inside it shows.
-- The `StageGuard` (`watchdog.rs:446`) puts the pump back to
+- The `StageGuard` (`watchdog.rs:475`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
   leaves early cannot leave its name behind for a later stall to be
   blamed on.
 - The stall report then reads `signaling=93s@ws.text:rc:ssh.response`
-  (`stall_summary`, `watchdog.rs:462`). The `name=Ns` prefix is
+  (`stall_summary`, `watchdog.rs:491`). The `name=Ns` prefix is
   unchanged, so a parser of the old line still finds the pump.
 - ⚠️ Read it from the crash record, not only the log. The summary
   also goes into the crash sidecar that the next worker uploads
@@ -4492,7 +4494,7 @@ table), on a host whose adapters and routes churn.
   `max - min` per bucket, so a zero would read as a since-boot spike.
 - The arm is staged step by step: `heartbeat.flows`, `heartbeat.sys`,
   `heartbeat.caps`, `heartbeat.send`, `heartbeat.stats`
-  (`agents/roomlerd/src/signaling.rs:2399` onwards).
+  (`agents/roomlerd/src/signaling.rs:2462` onwards).
 - The encoder capability probe never runs in the heartbeat.
   `caps::detect()` is memoized per process, so only its first call
   probes.
@@ -4504,7 +4506,7 @@ table), on a host whose adapters and routes churn.
     with the device offline.
   - It is now warmed at the top of `run`, while the pump is gated off, and
     since #3439 the connect waits for its first answer `FIRST_ANSWER_WAIT`
-    at most (`agents/roomlerd/src/signaling.rs:939`).
+    at most (`agents/roomlerd/src/signaling.rs:964`).
 
 **What a stall leaves behind** (#3018). Until #3018 the
 watchdog-of-watchdog wrote one stderr line and exited. On 2026-10-26
@@ -4531,10 +4533,10 @@ sequenceDiagram
 
 | what | where |
 |---|---|
-| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:598` |
-| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:688` |
-| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:637`, `within` `:674` |
-| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:365` |
+| The runtime-stall exit. The exit-node routes are dropped first, because the evidence may take its whole budget | `force_exit_on_runtime_stall`, `agents/roomlerd/src/watchdog.rs:687` |
+| The pump-stall exit records the same evidence, and now also drops its routes first | `force_exit_on_stall`, `watchdog.rs:777` |
+| The evidence runs on a thread of its own, for at most 10 s. Whatever the stuck threads hold (the pump lock, the log writer, a filesystem) can delay the exit by that much, never stop it | `leave_stall_evidence` `:725`, `within` `:762` |
+| Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:392` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
 | Condensed per thread to the leaf end of its heaviest path, 16 frames, with identical stacks folded and a 24 KiB cap | `condense_sample` `:191`, `condense_procfs` `:412` |
 | Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:124` |
@@ -4547,7 +4549,7 @@ sequenceDiagram
 - As root, `sample` reads the hardened-runtime daemon: measured on a
   MacBook on 0.4.181, 43 threads with symbolized Rust frames in 1.6 s.
   On macOS the stacks are read **only as root**
-  (`may_read_own_stacks`, `watchdog.rs:655`). The FR-43 GUI worker runs
+  (`may_read_own_stacks`, `watchdog.rs:744`). The FR-43 GUI worker runs
   as the signed-in person, where a request to read the hardened binary
   would be refused, and a refused debugger-style request has no business
   on someone's desktop. Its record names the stall without the stacks.
@@ -4558,6 +4560,112 @@ sequenceDiagram
   `sample -file` writes as root, and a predictable name in a
   world-writable directory lets any local account plant a symlink
   there and have root overwrite the file it points to.
+
+**Across a freeze or a suspend** (#3530). Both watchdogs judge time
+with `Instant`. After a pause they wake to a gap that a naive scan
+reads as a stall, and what makes the gap depends on the OS:
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| `Instant` (std 1.95, `Instant::now` in [`sys/time/windows.rs`](https://github.com/rust-lang/rust/blob/1.95.0/library/std/src/sys/time/windows.rs) and [`sys/time/unix.rs`](https://github.com/rust-lang/rust/blob/1.95.0/library/std/src/sys/time/unix.rs)) | `QueryPerformanceCounter` | `CLOCK_MONOTONIC` | `CLOCK_UPTIME_RAW` |
+| across a host sleep | **counts it**: "including the time when the machine was in a sleep state such as standby, hibernate, or connected standby" ([Acquiring high-resolution time stamps](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)) | stops: "does not count time that the system is suspended" ([`clock_gettime(2)`](https://man7.org/linux/man-pages/man2/clock_gettime.2.html)) | stops: "does not increment while the system is asleep" (the man page std's source quotes) |
+| a timeout across a host sleep | stops since Windows 8: "does not include time spent in low-power states" ([`WaitForSingleObject`](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)) | stops: "Linux measures the time using the CLOCK_MONOTONIC clock" ([`nanosleep(2)`](https://man7.org/linux/man-pages/man2/nanosleep.2.html)) | stops: the kernel's timeouts run on `mach_absolute_time`, which `CLOCK_UPTIME_RAW` is (std's source) |
+| across a freeze (SIGSTOP, a cgroup freeze such as `systemctl freeze` or `docker pause`, a debugger, a VM pause) | counts it | counts it | counts it |
+
+So a freeze looks the same on every OS, and a host sleep looks like a
+freeze on Windows only. The wall-vs-monotonic checks (the control WS's
+`RESUME_SKEW_MIN`, `agents/roomlerd/src/signaling.rs:513`, the `/derp`
+WS's, the overlay's `resumed_from_suspend`,
+`crates/tunnel-core/src/overlay/runtime.rs:571`) catch a Linux or macOS
+sleep. They never catch a freeze or a Windows sleep, because there both
+clocks moved. What each watchdog does with the gap:
+
+| | the async watchdog | the watchdog-of-watchdog |
+|---|---|---|
+| its sleep | 5 s on a tokio timer (`SCAN_INTERVAL`, `agents/roomlerd/src/watchdog.rs:92`) | 30 s of `std::thread::sleep` (`THREAD_WATCHDOG_CHECK_EVERY`, `:214`) |
+| a sleep that came back late | more than 60 s past it (`SUSPEND_TOLERANCE`, `:98`): pump heartbeats reset, no scan (`:561`), line `watchdog detected wall-clock jump (suspend/resume) … lag_secs=N` | more than 10 s late (`THREAD_WATCHDOG_LATE_AFTER`, `:237`): a new baseline instead of a verdict (`:624`), line `watchdog-of-watchdog: its sleep came back Ns late, so this whole process did not run … heartbeat_moved=…` |
+| a runtime that is really stuck | exits at its pump's threshold | exits 60–90 s in, and after a late sleep one check later at most |
+
+Until #3530 the watchdog-of-watchdog had no guard, and one freeze in
+the wrong place forced an exit:
+
+```mermaid
+sequenceDiagram
+    participant T as watchdog-of-watchdog (30 s)
+    participant A as async watchdog (5 s)
+    participant F as the freeze
+    T->>T: check: heartbeat n, the baseline
+    F->>F: freeze begins, before A's next tick
+    Note over T,A: frozen 70 s, and Instant runs on
+    F->>F: thaw: both sleeps long expired
+    T->>T: wakes first: heartbeat still n, stuck_for 70 s
+    Note over T: before #3530: past 60 s, so exit(2)<br/>since: its sleep came back 40 s late, a new baseline
+    A->>A: wakes microseconds later: tick, lag_secs=70, pumps reset
+```
+
+- **Why 10 s, and not the issue's 60 s.** The baseline is the check the
+  sleep began at. A freeze of F s that begins φ s into a sleep brings
+  it back φ + F − 30 s late, with `stuck_for` = φ + F, so every freeze
+  that would read as a stall (`stuck_for` > 60 s) comes back more than
+  30 s late. Any bound under `STUCK_AFTER − CHECK_EVERY` catches all of
+  them. `SUSPEND_TOLERANCE` as the bound catches none of the 70 s
+  freezes that begin in the first 5 s of a sleep: they come back 40–45 s
+  late. 10 s leaves 20 s of margin and is still far above any
+  scheduler's lateness. The test
+  `the_late_bound_catches_every_freeze_that_would_read_as_a_stall`
+  (`watchdog.rs:1772`) walks every φ and F.
+- **What it costs.** The new baseline throws away at most one interval
+  of evidence, so a stuck runtime is caught one check later at most
+  (`a_late_sleep_then_a_real_stall_exits_within_one_extra_check`,
+  `:1740`). A host so starved that a sleeping thread wakes 10 s late at
+  every check would put the exit off indefinitely, and it would not
+  run a restarted daemon either.
+- **The line goes out on a thread of its own** (`say_the_process_did_not_run`,
+  `:655`). `tracing`'s stdout layer waits for whatever reads stdout
+  (journald, a console nobody reads, #3438), and the
+  watchdog-of-watchdog must never wait. One line is in flight at a
+  time (`PAUSE_LINE_IN_FLIGHT`, `:645`), so a sink that never answers
+  holds one thread. `heartbeat_moved=false` marks the pause that was an
+  exit before #3530.
+- **Why a lab loop rarely trips the old code.** The exit needs a freeze
+  that begins after a check of the thread's and before the async
+  watchdog's next tick. On a daemon that has run for hours without a
+  pause, that window is 0–5 s wide, about one freeze in twelve. But a
+  thaw re-phases both loops: their sleeps expired together, the thread
+  wakes first, and the async watchdog then falls about 0.6 ms further
+  behind per tick (tokio rounds a sleep up to the next millisecond).
+  After a resume the window is a few milliseconds wide, so random
+  freezes almost never hit it. The field read (2026-11-07, a root
+  system daemon on an Ubuntu 24.04 lab guest) froze 70 s at 1–8 ms after the
+  thread's fourth check since the previous thaw. The release, 0.4.203,
+  exited on the first such round with `stuck_for` 70.0016 s.
+
+**The lines a resume writes** (#3530). After the same freeze the agent
+blamed the network for a silence it had made itself: `half-open socket
+(middlebox still ACKs our pings)`, `signaling connect failed` with no
+connect tried, `half-open /derp WS`, and a relay `not delivering the
+peer's frames`. A loop that convicts a carrier of silence now first
+asks its own late tick (`tunnel_core::frozen::did_not_run_for`,
+`crates/tunnel-core/src/frozen.rs:40`). When the tick that found the
+silence came late by about as long, the line says the agent did not
+run. This is wording only: every verdict and every reconnect stays
+what it was.
+
+| line | the lateness it reads | slack | after a freeze it reads |
+|---|---|---|---|
+| control WS RX deadline (`signaling.rs:2233`) | the keepalive's own due instant, which `tick()` returns (`:2178`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
+| the reconnect after it (`signaling.rs:1428`) | the session's reason, `AgentDidNotRun` (`:80`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
+| `/derp` RX deadline (`agents/roomlerd/src/derp.rs:437`) | the keepalive's due instant (`:424`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
+| relay carrier rx-stale (`crates/tunnel-core/src/overlay/runtime/establish.rs:734`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3082`, `tick_late_ms`) | 25 s + 2 ticks | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended) …` |
+
+- ⚠️ The slack is what "about as long" means: how quiet the carrier gets
+  while the loop runs. A carrier that had gone quiet before the agent
+  stopped keeps today's sentence, and so does a stale lateness, which
+  the overlay's net-change sweep reads from the last tick.
+- `~N` is the tick's lateness, the least the agent was stopped for. The
+  pause itself was longer by up to one keepalive period.
+- On Windows a host sleep reaches these lines as a freeze does, so
+  after a sleep the line names the pause instead of a middlebox.
 
 **What the second named stall found** (#2551). A second Windows device
 stalled on 2026-10-27, under 0.4.177, and read
@@ -4575,7 +4683,7 @@ ruled out by the rule above. The lock behind that borrow is what held it.
   finished, so every field's guard was still held when the next field
   borrowed: ten nested read locks on one lock.
 - The view's one writer is the overlay runtime's `publish_view`
-  (`send_replace`, `crates/tunnel-core/src/overlay/runtime.rs:1973`), on
+  (`send_replace`, `crates/tunnel-core/src/overlay/runtime.rs:1981`), on
   every 5 s sweep and on carrier events. A publish that landed between
   two of `status()`'s borrows left nothing able to move:
 

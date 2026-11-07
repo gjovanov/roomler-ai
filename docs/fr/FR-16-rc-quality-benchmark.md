@@ -331,7 +331,7 @@ Linux runs were `nice -n 10`, and their `clock=` reads `clamped`. The Windows ru
   `codecs`, yet `rtp:av1` opened `noop`. FFmpeg's AV1 probe adds the codec
   (`agents/roomlerd/src/encode/caps.rs:4207`), the RTP path tries only Media Foundation
   (`agents/roomlerd/src/encode/mod.rs:1645`), and `pick_best_codec` ranks AV1 first with no
-  per-path filter (`agents/roomlerd/src/signaling.rs:3676`,
+  per-path filter (`agents/roomlerd/src/signaling.rs:3739`,
   `agents/roomlerd/src/encode/caps.rs:4836`). The code logs `Session will have no video until
   reconnect` there. `agent_logs` holds that line 14 times in the org in 7 days, all on
   CORPLAP-3, whose hello has the same shape, the last on 2026-10-30. None of those batches

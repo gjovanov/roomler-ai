@@ -58,6 +58,11 @@ const DERP_KEEPALIVE: Duration = Duration::from_secs(25);
 /// ACKing our pings after its upstream leg died, so send-success proves
 /// nothing — reconnect must key on frames RECEIVED.
 const DERP_RX_DEADLINE: Duration = Duration::from_secs(80);
+/// #3530 — how quiet the `/derp` WS gets while the loop runs: a keepalive whose
+/// pong was not read yet, and the period before it. A silence past the RX
+/// deadline that a late keepalive tick covers but for this slack is the
+/// agent's own pause ([`tunnel_core::frozen::did_not_run_for`]).
+const DERP_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(2 * DERP_KEEPALIVE.as_secs());
 
 /// FR-18 — request the [`DERP_SNDBUF_BYTES`] ceiling on the socket under the
 /// (possibly TLS-wrapped) WebSocket. Best-effort by design: an OS may clamp or
@@ -403,15 +408,20 @@ async fn run(
                 keepalive.tick().await; // swallow the immediate first tick
                 let mut last_rx = std::time::Instant::now();
                 // A5 — resume detection (see signaling.rs RESUME_SKEW_MIN):
-                // monotonic timers exclude suspend, so a nap leaves a dead
-                // socket trusted for up to another RX-deadline window.
+                // monotonic timers exclude suspend on Linux and macOS, so a nap
+                // leaves a dead socket trusted for up to another RX-deadline
+                // window. On Windows QPC counts the sleep, so the RX deadline
+                // trips at once instead, as after a freeze (#3530).
                 let mut skew_wall = std::time::SystemTime::now();
                 let mut skew_mono = std::time::Instant::now();
 
                 // Pump until either half dies (or the mux is torn down).
                 loop {
                     tokio::select! {
-                        _ = keepalive.tick() => {
+                        due = keepalive.tick() => {
+                            // #3530 — how late this tick came: for at least that
+                            // long the loop read nothing, whatever the relay did.
+                            let late = due.elapsed();
                             let wall_gap = skew_wall.elapsed().unwrap_or_default();
                             let mono_gap = skew_mono.elapsed();
                             skew_wall = std::time::SystemTime::now();
@@ -425,11 +435,27 @@ async fn run(
                                 break;
                             }
                             if last_rx.elapsed() > DERP_RX_DEADLINE {
-                                warn!(
-                                    %relay,
-                                    silent_s = last_rx.elapsed().as_secs(),
-                                    "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
-                                );
+                                let silent = last_rx.elapsed();
+                                match tunnel_core::frozen::did_not_run_for(
+                                    silent,
+                                    late,
+                                    DERP_QUIET_WHILE_RUNNING,
+                                ) {
+                                    Some(paused) => warn!(
+                                        %relay,
+                                        silent_s = silent.as_secs(),
+                                        paused_s = paused.as_secs(),
+                                        "overlay derp: no inbound frames within the RX deadline, but this \
+                                         agent did not run for ~{} s of it (frozen or suspended): the \
+                                         silence is its own, not the relay's; reconnecting",
+                                        paused.as_secs()
+                                    ),
+                                    None => warn!(
+                                        %relay,
+                                        silent_s = silent.as_secs(),
+                                        "overlay derp: no inbound frames within the RX deadline — half-open /derp WS; reconnecting"
+                                    ),
+                                }
                                 break;
                             }
                             // FR-18 — report the shed count on the keepalive

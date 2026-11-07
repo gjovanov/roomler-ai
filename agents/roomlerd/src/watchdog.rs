@@ -15,14 +15,24 @@
 //! agent continues with its hung pump. Hard exit is the only signal
 //! that propagates to the supervisor's restart counter.
 //!
-//! ## Suspend / resume
+//! ## A freeze, a suspend (#3530)
 //!
-//! On a laptop close-lid → resume cycle, `Instant` is monotonic-but-
-//! paused, so a 4-hour suspend looks like a 4-hour stall to a naive
-//! scanner. The watchdog's `run` loop compares the actual sleep
-//! duration to the expected scan interval; a delta beyond
-//! [`SUSPEND_TOLERANCE`] is treated as a wall-clock jump and the
-//! pump heartbeats are reset instead of triggering a stall exit.
+//! Every clock here is `Instant`. It runs on while the process does not
+//! run: a SIGSTOP, a cgroup freeze (`systemctl freeze`, `docker pause`), a
+//! VM pause. On Windows it is QPC, which also counts the time the host
+//! sleeps. On Linux (`CLOCK_MONOTONIC`) and macOS (`CLOCK_UPTIME_RAW`) it
+//! stops while the host sleeps, and the watchdog's own sleeps stop with it.
+//! A naive scanner reads the gap it wakes to as a stall, so both loops
+//! measure their own sleep, and a sleep that came back late is the signal,
+//! whatever made it late:
+//!
+//! - the async `run` loop: a sleep more than [`SUSPEND_TOLERANCE`] past
+//!   [`SCAN_INTERVAL`] resets the pump heartbeats instead of judging them;
+//! - the watchdog-of-watchdog: a sleep more than
+//!   [`THREAD_WATCHDOG_LATE_AFTER`] late takes a new baseline.
+//!
+//! `docs/remote-control.md` §19.1 has the per-OS table and the bound's
+//! derivation.
 //!
 //! ## Watchdog-of-watchdog
 //!
@@ -30,7 +40,8 @@
 //! task) that wakes every 30 s and force-exits if the async
 //! watchdog's own heartbeat counter hasn't moved in 60 s. This is
 //! the absolute last resort against a fully-deadlocked tokio
-//! runtime.
+//! runtime. A sleep of its own that came back late is the whole process
+//! not running, not the runtime, so it takes a new baseline (#3530).
 //!
 //! ## What a stall leaves behind (#3018)
 //!
@@ -71,7 +82,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -206,6 +217,24 @@ pub const THREAD_WATCHDOG_CHECK_EVERY: Duration = Duration::from_secs(30);
 /// watchdog-of-watchdog declares the runtime stuck. With
 /// [`THREAD_WATCHDOG_CHECK_EVERY`], it fires 60–90 s into a stall.
 pub const THREAD_WATCHDOG_STUCK_AFTER: Duration = Duration::from_secs(60);
+
+/// #3530 — a sleep of the watchdog-of-watchdog that comes back later than
+/// this past its [`THREAD_WATCHDOG_CHECK_EVERY`] means the whole process did
+/// not run: a SIGSTOP, a cgroup freeze (`systemctl freeze`, `docker pause`),
+/// a VM pause, a host sleep that `Instant` counts. The async watchdog stood
+/// still for the same reason, so the thread takes a new baseline instead of
+/// reading the gap as a runtime stall.
+///
+/// It must stay under [`THREAD_WATCHDOG_STUCK_AFTER`] −
+/// [`THREAD_WATCHDOG_CHECK_EVERY`] (30 s). The baseline is the check the
+/// sleep began at, so a freeze of F s that begins φ s into a sleep brings it
+/// back φ + F − 30 s late with `stuck_for` = φ + F. A false exit needs
+/// `stuck_for` > 60 s, so it always comes back more than 30 s late. The
+/// async watchdog's [`SUSPEND_TOLERANCE`] (60 s) would miss it: a 70 s
+/// freeze that begins in the first 5 s of a sleep, before the async
+/// watchdog has ticked again, comes back 40–45 s late with `stuck_for` past
+/// 60 s (#3530's freeze loop).
+pub const THREAD_WATCHDOG_LATE_AFTER: Duration = Duration::from_secs(10);
 
 /// #3018 — how long a stall's exit waits for its evidence: a crash sidecar
 /// with every thread's stack. `sample` takes ~1.6 s on a Mac. The rest is
@@ -556,29 +585,48 @@ pub fn spawn_thread_watchdog(wd: Arc<Watchdog>) {
         wd,
         THREAD_WATCHDOG_CHECK_EVERY,
         THREAD_WATCHDOG_STUCK_AFTER,
+        Instant::now,
+        std::thread::sleep,
         force_exit_on_runtime_stall,
     );
 }
 
-/// [`spawn_thread_watchdog`] with its cadence and its action injected, so a
-/// test can stop a runtime and watch it fire without the process exiting.
-/// `on_stuck` gets how long the heartbeat stood still. The thread ends after
-/// it, in the one case where it returns at all.
+/// [`spawn_thread_watchdog`] with its cadence, its clock, its sleep and its
+/// action injected, so a test can stop a runtime and watch it fire without
+/// the process exiting, or make one sleep come back late (#3530). `on_stuck`
+/// gets how long the heartbeat stood still. The thread ends after it, in the
+/// one case where it returns at all.
 pub(crate) fn spawn_thread_watchdog_with(
     wd: Arc<Watchdog>,
     check_every: Duration,
     stuck_after: Duration,
+    clock: impl Fn() -> Instant + Send + 'static,
+    mut sleep: impl FnMut(Duration) + Send + 'static,
     on_stuck: impl FnOnce(&Watchdog, Duration) + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("roomlerd-watchdog-of-watchdog".into())
         .spawn(move || {
             let mut prev_count = wd.own_heartbeat();
-            let mut prev_at = Instant::now();
+            let mut prev_at = clock();
             loop {
-                std::thread::sleep(check_every);
+                let slept_from = clock();
+                sleep(check_every);
                 let now_count = wd.own_heartbeat();
-                let now_at = Instant::now();
+                let now_at = clock();
+                // #3530 — a sleep that came back this late is the whole process
+                // not running, and the async watchdog stood still for the same
+                // reason: the gap is no evidence. A new baseline, and a runtime
+                // that is really stuck is still caught, one check later at most.
+                let late = now_at
+                    .saturating_duration_since(slept_from)
+                    .saturating_sub(check_every);
+                if late > THREAD_WATCHDOG_LATE_AFTER {
+                    say_the_process_did_not_run(late, now_count != prev_count);
+                    prev_count = now_count;
+                    prev_at = now_at;
+                    continue;
+                }
                 if now_count != prev_count {
                     prev_count = now_count;
                     prev_at = now_at;
@@ -591,6 +639,47 @@ pub(crate) fn spawn_thread_watchdog_with(
                 }
             }
         })
+}
+
+/// #3530 — whether a line about a new baseline is being written.
+static PAUSE_LINE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// #3530 — log that the watchdog-of-watchdog took a new baseline, from a
+/// thread of its own. `tracing`'s stdout layer waits for whatever reads stdout
+/// (journald, a supervisor's pipe, a console nobody reads, #3438), and the
+/// watchdog-of-watchdog must never wait on anything. One line at a time, so a
+/// sink that never answers holds one thread, not one per pause.
+///
+/// `heartbeat_moved: false` marks the pause that would have been an exit
+/// before #3530: the async watchdog had not ticked since the check before it.
+fn say_the_process_did_not_run(late: Duration, heartbeat_moved: bool) {
+    if PAUSE_LINE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-watchdog-pause-line".into())
+        .spawn(move || {
+            let _done = PauseLineDone;
+            tracing::warn!(
+                late_secs = late.as_secs(),
+                heartbeat_moved,
+                "watchdog-of-watchdog: its sleep came back {}s late, so this whole process did not \
+                 run (frozen or suspended); a new baseline, not a runtime stall",
+                late.as_secs()
+            );
+        });
+    if spawned.is_err() {
+        PAUSE_LINE_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// Clears [`PAUSE_LINE_IN_FLIGHT`] however the line's thread ends.
+struct PauseLineDone;
+
+impl Drop for PauseLineDone {
+    fn drop(&mut self) {
+        PAUSE_LINE_IN_FLIGHT.store(false, Ordering::Release);
+    }
 }
 
 /// The watchdog-of-watchdog's action: the whole runtime has stood still for
@@ -1450,6 +1539,8 @@ mod tests {
             Arc::clone(&wd),
             Duration::from_millis(25),
             Duration::from_millis(200),
+            Instant::now,
+            std::thread::sleep,
             move |_, stuck_for| {
                 let _ = fired_tx.send(stuck_for);
             },
@@ -1472,6 +1563,8 @@ mod tests {
             wd,
             Duration::from_millis(25),
             Duration::from_millis(200),
+            Instant::now,
+            std::thread::sleep,
             move |_, stuck_for| {
                 let _ = fired_tx.send(stuck_for);
             },
@@ -1479,6 +1572,228 @@ mod tests {
         .unwrap();
         assert!(fired_rx.recv_timeout(Duration::from_millis(800)).is_err());
         rt.shutdown_background();
+    }
+
+    // ─── #3530: the watchdog-of-watchdog across a freeze ────────────────────
+
+    /// How a scripted watchdog-of-watchdog ended.
+    #[derive(Debug, PartialEq)]
+    enum Ended {
+        /// `on_stuck` ran at this check (counted from 1), with this `stuck_for`.
+        Fired(usize, Duration),
+        /// Every sleep of the script came back and nothing fired.
+        RanOut,
+    }
+
+    /// A real sleep comes back a little late, so a heartbeat that stands
+    /// still for two checks reads just past 60 s, as it does in production.
+    const OVERSHOOT: Duration = Duration::from_millis(1);
+
+    /// A sleep of the script that comes back on time. `ticked`: whether the
+    /// async watchdog ticked while it slept.
+    fn on_time(ticked: bool) -> (Duration, bool) {
+        (OVERSHOOT, ticked)
+    }
+
+    /// A sleep of the script that comes back `late` past the check interval.
+    fn late_by(late: Duration, ticked: bool) -> (Duration, bool) {
+        (late, ticked)
+    }
+
+    /// #3530 — run the watchdog-of-watchdog with its production cadence and
+    /// bound on a clock the script turns. Each sleep returns at once, after
+    /// moving the clock by the check interval plus the step's lateness, and
+    /// bumps the heartbeat when the step says the async watchdog ticked. When
+    /// the script runs out, the thread parks for good and the run reports
+    /// `RanOut`.
+    fn drive_thread_watchdog(script: Vec<(Duration, bool)>) -> Ended {
+        use std::sync::atomic::AtomicUsize;
+        let wd = Watchdog::new();
+        let base = Instant::now();
+        let elapsed = Arc::new(Mutex::new(Duration::ZERO));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std::sync::mpsc::channel::<Ended>();
+        let clock = {
+            let elapsed = Arc::clone(&elapsed);
+            move || base + *elapsed.lock().unwrap()
+        };
+        let sleep = {
+            let (elapsed, checks, wd, tx) = (
+                Arc::clone(&elapsed),
+                Arc::clone(&checks),
+                Arc::clone(&wd),
+                tx.clone(),
+            );
+            let mut steps = script.into_iter();
+            move |asked: Duration| match steps.next() {
+                Some((late, ticked)) => {
+                    *elapsed.lock().unwrap() += asked + late;
+                    if ticked {
+                        wd.own_heartbeat.fetch_add(1, Ordering::Release);
+                    }
+                    checks.fetch_add(1, Ordering::SeqCst);
+                }
+                None => {
+                    let _ = tx.send(Ended::RanOut);
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            }
+        };
+        spawn_thread_watchdog_with(
+            wd,
+            THREAD_WATCHDOG_CHECK_EVERY,
+            THREAD_WATCHDOG_STUCK_AFTER,
+            clock,
+            sleep,
+            move |_, stuck_for| {
+                let _ = tx.send(Ended::Fired(checks.load(Ordering::SeqCst), stuck_for));
+            },
+        )
+        .unwrap();
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the scripted watchdog-of-watchdog ended")
+    }
+
+    /// #3530 (a) — one sleep comes back 150 s late, and the heartbeat has not
+    /// moved since the check before it: the freeze began before the async
+    /// watchdog ticked again, as on the lab guest's 152 s SIGSTOP. The gap is
+    /// 180 s, three times `STUCK_AFTER`, which was an exit. It is a new
+    /// baseline now, and the runtime that ticks after the thaw keeps it quiet.
+    #[test]
+    fn a_sleep_150s_late_with_a_still_heartbeat_is_no_exit() {
+        let ended = drive_thread_watchdog(vec![
+            on_time(true),
+            late_by(Duration::from_secs(150), false),
+            on_time(false),
+            on_time(true),
+            on_time(true),
+        ]);
+        assert_eq!(ended, Ended::RanOut);
+    }
+
+    /// #3530 — the issue's freeze loop (70 s) at its worst phase: the freeze
+    /// begins in the first 5 s after a check, so the sleep comes back only
+    /// 40–45 s late and the gap is 70–75 s. A bound of `SUSPEND_TOLERANCE`
+    /// (60 s) would still exit here.
+    #[test]
+    fn the_70s_freeze_at_its_worst_phase_is_no_exit() {
+        for phase in [
+            Duration::from_millis(1),
+            Duration::from_secs(2),
+            Duration::from_millis(4_900),
+        ] {
+            let ended = drive_thread_watchdog(vec![
+                on_time(true),
+                late_by(Duration::from_secs(40) + phase, false),
+                on_time(true),
+            ]);
+            assert_eq!(ended, Ended::RanOut, "phase {phase:?}");
+        }
+    }
+
+    /// #3530 (b) — the heartbeat stands still past `STUCK_AFTER` across sleeps
+    /// that come back on time: a runtime that is really stuck. The thread
+    /// exits as it always did, at the second still check.
+    #[test]
+    fn a_still_heartbeat_across_on_time_sleeps_exits() {
+        let ended = drive_thread_watchdog(vec![
+            on_time(true),
+            on_time(false),
+            on_time(false),
+            on_time(false),
+        ]);
+        let Ended::Fired(check, stuck_for) = ended else {
+            panic!("{ended:?}");
+        };
+        assert_eq!(check, 3);
+        assert!(stuck_for > THREAD_WATCHDOG_STUCK_AFTER, "{stuck_for:?}");
+        assert!(
+            stuck_for <= THREAD_WATCHDOG_STUCK_AFTER + THREAD_WATCHDOG_CHECK_EVERY,
+            "{stuck_for:?}"
+        );
+    }
+
+    /// #3530 — a sleep that comes back late but within the bound (a busy
+    /// host) is judged as before, so a still heartbeat still exits.
+    #[test]
+    fn sleeps_late_within_the_bound_still_exit_on_a_still_heartbeat() {
+        let late = THREAD_WATCHDOG_LATE_AFTER;
+        let ended = drive_thread_watchdog(vec![
+            on_time(true),
+            late_by(late, false),
+            late_by(late, false),
+            late_by(late, false),
+        ]);
+        let Ended::Fired(check, stuck_for) = ended else {
+            panic!("{ended:?}");
+        };
+        assert_eq!(check, 3);
+        assert!(stuck_for > THREAD_WATCHDOG_STUCK_AFTER, "{stuck_for:?}");
+    }
+
+    /// #3530 (c) — a late sleep, then a runtime that never ticks again. The new
+    /// baseline costs one check at most: the same stall without the freeze
+    /// exits at the third check, and with it at the fourth.
+    #[test]
+    fn a_late_sleep_then_a_real_stall_exits_within_one_extra_check() {
+        let stall = |second: (Duration, bool)| {
+            drive_thread_watchdog(vec![
+                on_time(true),
+                second,
+                on_time(false),
+                on_time(false),
+                on_time(false),
+            ])
+        };
+        let Ended::Fired(without, _) = stall(on_time(false)) else {
+            panic!("the stall without a freeze must exit");
+        };
+        let ended = stall(late_by(Duration::from_secs(150), false));
+        let Ended::Fired(with, stuck_for) = ended else {
+            panic!("{ended:?}");
+        };
+        assert_eq!(without, 3);
+        assert_eq!(with, without + 1);
+        assert!(stuck_for > THREAD_WATCHDOG_STUCK_AFTER, "{stuck_for:?}");
+        assert!(
+            stuck_for <= THREAD_WATCHDOG_STUCK_AFTER + THREAD_WATCHDOG_CHECK_EVERY,
+            "{stuck_for:?}"
+        );
+    }
+
+    /// #3530 — the bound's derivation, over every freeze: one of F s that
+    /// begins φ s into a sleep brings it back φ + F − CHECK_EVERY late with
+    /// `stuck_for` = φ + F. Every freeze that would read as a stall
+    /// (`stuck_for` > STUCK_AFTER) comes back more than LATE_AFTER late, and
+    /// `SUSPEND_TOLERANCE` as the bound would let some of them through.
+    #[test]
+    fn the_late_bound_catches_every_freeze_that_would_read_as_a_stall() {
+        assert!(
+            THREAD_WATCHDOG_LATE_AFTER + THREAD_WATCHDOG_CHECK_EVERY < THREAD_WATCHDOG_STUCK_AFTER
+        );
+        let check = THREAD_WATCHDOG_CHECK_EVERY.as_millis() as u64;
+        let mut missed_at_suspend_tolerance = 0;
+        for phi in (0..check).step_by(250) {
+            for freeze in (0..=600_000u64).step_by(500) {
+                let gap = phi + freeze;
+                if gap <= check {
+                    continue; // the freeze ended before the sleep did
+                }
+                let late = Duration::from_millis(gap - check);
+                if Duration::from_millis(gap) > THREAD_WATCHDOG_STUCK_AFTER {
+                    assert!(
+                        late > THREAD_WATCHDOG_LATE_AFTER,
+                        "phi={phi} ms, freeze={freeze} ms"
+                    );
+                    if late <= SUSPEND_TOLERANCE {
+                        missed_at_suspend_tolerance += 1;
+                    }
+                }
+            }
+        }
+        assert!(missed_at_suspend_tolerance > 0);
     }
 
     /// #3018 — the evidence gives way to the exit: evidence that hangs costs

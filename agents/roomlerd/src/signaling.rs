@@ -62,6 +62,31 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// frames RECEIVED, not frames sent.
 pub(crate) const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 
+/// The control WS's keepalive Ping period: nginx and K8s ingress commonly
+/// idle-close a WS after 60-120 s of silence.
+const WS_KEEPALIVE_EVERY: Duration = Duration::from_secs(25);
+
+/// #3530 — how quiet the control WS gets while the loop runs: a keepalive
+/// whose pong was not read yet, and the period before it. A silence past the
+/// RX deadline that a late keepalive tick covers but for this slack is the
+/// agent's own pause ([`tunnel_core::frozen::did_not_run_for`]).
+const WS_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(2 * WS_KEEPALIVE_EVERY.as_secs());
+
+/// #3530 — the session ended because this agent did not run: frozen (SIGSTOP,
+/// a cgroup freeze, a VM pause) for most of the silence that tripped
+/// [`WS_RX_DEADLINE`], or asleep (the keepalive's wall-vs-monotonic check).
+/// No connect was tried and none failed, so the reconnect line says so.
+#[derive(Debug)]
+struct AgentDidNotRun(String);
+
+impl std::fmt::Display for AgentDidNotRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AgentDidNotRun {}
+
 /// Hard bound on a single WS frame WRITE on the established connection.
 /// Every select arm awaits its sends inline, so one wedged `ws.send`
 /// freezes the whole loop: no arm runs, no `watchdog::tick`, and at 90 s
@@ -1398,8 +1423,17 @@ pub async fn run(
                 // repro 2026-05-24: a flaky WSS handshake produced
                 // identical-looking `error=ws connect` lines for
                 // every failure mode, blocking root-cause analysis.
-                let cause = error_chain(e.as_ref());
-                warn!(error = %e, %cause, "signaling connect failed; backing off");
+                // #3530 — a session that ended because this agent did not run
+                // (frozen, or asleep) tried no connect, and none failed.
+                if e.downcast_ref::<AgentDidNotRun>().is_some() {
+                    warn!(
+                        why = %e,
+                        "signaling: the session ended while this agent did not run; reconnecting"
+                    );
+                } else {
+                    let cause = error_chain(e.as_ref());
+                    warn!(error = %e, %cause, "signaling connect failed; backing off");
+                }
                 // FR-28 — the load balancer answered 502: this tenant's pod is
                 // rolling. A flat wait, and the ladder stays where it is.
                 let flat_wait = flat_redial.step(
@@ -2018,7 +2052,7 @@ async fn connect_once(
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
     // survives quiet periods between sessions.
-    let mut keepalive = tokio::time::interval(Duration::from_secs(25));
+    let mut keepalive = tokio::time::interval(WS_KEEPALIVE_EVERY);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // Swallow the immediate first tick.
 
@@ -2056,12 +2090,16 @@ async fn connect_once(
     let mut outstanding_ping: Option<std::time::Instant> = None;
 
     // A5 — resume detection. Every timer here runs on the MONOTONIC clock,
-    // which excludes suspend on Windows/Linux — so after a sleep the RX
-    // deadline picks up where it left off and a socket that died during
-    // the nap stays trusted for up to ~80 more seconds. Wall-vs-monotonic
-    // skew at the keepalive tick catches the nap (the overlay runtime and
-    // the watchdog use the same trick) and cycles the WS immediately: a
-    // fresh connect is cheap, a post-resume zombie socket is not.
+    // which excludes suspend on Linux and macOS (`CLOCK_MONOTONIC`,
+    // `CLOCK_UPTIME_RAW`) — so after a sleep the RX deadline picks up where
+    // it left off and a socket that died during the nap stays trusted for up
+    // to ~80 more seconds. Wall-vs-monotonic skew at the keepalive tick
+    // catches the nap (the overlay runtime uses the same trick) and cycles
+    // the WS immediately: a fresh connect is cheap, a post-resume zombie
+    // socket is not. #3530: Windows' QPC counts the sleep, so there this
+    // check stays quiet and the RX deadline trips at once instead, as it does
+    // after a freeze on any OS (SIGSTOP, a cgroup freeze). The late keepalive
+    // tick then words that line.
     let mut skew_wall = std::time::SystemTime::now();
     let mut skew_mono = std::time::Instant::now();
 
@@ -2134,7 +2172,10 @@ async fn connect_once(
                 let _ = send_frame(&mut ws, Message::Close(None)).await;
                 return Ok(());
             }
-            _ = keepalive.tick() => {
+            due = keepalive.tick() => {
+                // #3530 — how late this tick came: for at least that long the
+                // loop read nothing, whatever the network did.
+                let late = due.elapsed();
                 let _stage = watchdog::enter(ctx.pump, "keepalive");
                 // W4(a) — TUN-death self-heal. The overlay runtime EXITS when
                 // its TUN dies (a contract the runtime tests pin), and before
@@ -2182,24 +2223,46 @@ async fn connect_once(
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(anyhow::anyhow!(
-                        "resume-from-suspend (napped ~{} s)",
-                        (wall_gap - mono_gap).as_secs()
-                    )));
+                    return Err(ConnectError::Transient(anyhow::Error::new(AgentDidNotRun(
+                        format!(
+                            "resume-from-suspend (napped ~{} s)",
+                            (wall_gap - mono_gap).as_secs()
+                        ),
+                    ))));
                 }
                 if last_rx.elapsed() > WS_RX_DEADLINE {
-                    warn!(
-                        silent_s = last_rx.elapsed().as_secs(),
-                        "no inbound WS frames within the RX deadline — half-open socket \
-                         (middlebox still ACKs our pings); reconnecting"
-                    );
+                    let silent = last_rx.elapsed();
+                    // #3530 — after a freeze the silence is the agent's own,
+                    // and blaming a middlebox sends whoever reads it hunting
+                    // for a TLS-inspecting proxy that is not there.
+                    let paused =
+                        tunnel_core::frozen::did_not_run_for(silent, late, WS_QUIET_WHILE_RUNNING);
+                    match paused {
+                        Some(paused) => warn!(
+                            silent_s = silent.as_secs(),
+                            paused_s = paused.as_secs(),
+                            "no inbound WS frames within the RX deadline, but this agent did not \
+                             run for ~{} s of it (frozen or suspended): the silence is its own, \
+                             not the network's; reconnecting",
+                            paused.as_secs()
+                        ),
+                        None => warn!(
+                            silent_s = silent.as_secs(),
+                            "no inbound WS frames within the RX deadline — half-open socket \
+                             (middlebox still ACKs our pings); reconnecting"
+                        ),
+                    }
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(anyhow::anyhow!(
-                        "ws rx deadline: no inbound frames for {} s",
-                        last_rx.elapsed().as_secs()
-                    )));
+                    let why = format!("ws rx deadline: no inbound frames for {} s", silent.as_secs());
+                    return Err(ConnectError::Transient(match paused {
+                        Some(paused) => anyhow::Error::new(AgentDidNotRun(format!(
+                            "{why}: this agent did not run for ~{} s of it (frozen or suspended)",
+                            paused.as_secs()
+                        ))),
+                        None => anyhow::anyhow!(why),
+                    }));
                 }
                 // netstate PR-2 — the net-change probe verdict. Answered =
                 // its pong cleared `outstanding_ping`, or ANY frame arrived

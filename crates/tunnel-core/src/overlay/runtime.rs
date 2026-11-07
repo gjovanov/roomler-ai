@@ -1336,6 +1336,12 @@ pub struct OverlayRuntime {
     /// attach it to the peer view. Measurement only: nothing in the selector
     /// reads this.
     disco_paths: std::sync::Mutex<Vec<super::disco::PathSample>>,
+    /// #3530 — how late the last sweep tick came past [`FALLBACK_TICK`], in
+    /// ms: for that long the whole process did not run (a freeze, a host sleep
+    /// `Instant` counts). Stored by the tick, read by `sweep_carrier_health`
+    /// only to word a relay carrier's rx-stale line.
+    /// ⚠️ Log only: no verdict and no carrier action reads it.
+    tick_late_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1547,6 +1553,7 @@ impl OverlayRuntime {
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
             disco_paths: std::sync::Mutex::new(Vec::new()),
+            tick_late_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1582,6 +1589,7 @@ impl OverlayRuntime {
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
             disco_paths: std::sync::Mutex::new(Vec::new()),
+            tick_late_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -3069,6 +3077,13 @@ impl OverlayRuntime {
                         .duration_since(prev_wall)
                         .unwrap_or_default();
                     let mono_elapsed = prev_mono.elapsed();
+                    // #3530 — log only: how late this tick came, for the relay
+                    // carrier's rx-stale line in the sweep below.
+                    self.tick_late_ms.store(
+                        u64::try_from(mono_elapsed.saturating_sub(FALLBACK_TICK).as_millis())
+                            .unwrap_or(u64::MAX),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     resume_probe = (Instant::now(), SystemTime::now());
                     if resumed_from_suspend(mono_elapsed, wall_elapsed) {
                         warn!(

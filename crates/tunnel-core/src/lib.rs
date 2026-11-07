@@ -50,6 +50,9 @@ pub mod evidence;
 /// connections (bounded) while none is.
 pub mod flow_listener;
 pub mod forward;
+/// #3530 — whether a carrier's silence is this agent's own pause (a freeze, a
+/// host sleep): wording for the lines that convict a carrier, never a verdict.
+pub mod frozen;
 /// LocalAPI — the daemon's local control surface (P1: read-only protocol).
 ///
 /// P3e lever E moved the module OUT to the leaf crate `roomler-localapi` and
