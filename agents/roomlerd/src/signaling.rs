@@ -74,7 +74,8 @@ const WS_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(2 * WS_KEEPALIVE_EV
 
 /// #3530 — the session ended because this agent did not run: frozen (SIGSTOP,
 /// a cgroup freeze, a VM pause) for most of the silence that tripped
-/// [`WS_RX_DEADLINE`], or asleep (the keepalive's wall-vs-monotonic check).
+/// [`WS_RX_DEADLINE`] or before a send or read that failed
+/// ([`session_ended`]), or asleep (the keepalive's wall-vs-monotonic check).
 /// No connect was tried and none failed, so the reconnect line says so.
 #[derive(Debug)]
 struct AgentDidNotRun(String);
@@ -86,6 +87,86 @@ impl std::fmt::Display for AgentDidNotRun {
 }
 
 impl std::error::Error for AgentDidNotRun {}
+
+/// #3530 — the shortest pause a failed send or read is put down to. The
+/// RX-deadline line cannot name a shorter one (its deadline less a running
+/// loop's quiet), and this floor keeps the three exits on the same terms. A
+/// loop that ran but sat in one arm stays under it, such as a send that
+/// wedged for [`WS_SEND_TIMEOUT`] when a corp VPN captured the route, and
+/// keeps today's line.
+const WS_PAUSE_MIN: Duration =
+    Duration::from_secs(WS_RX_DEADLINE.as_secs() - WS_QUIET_WHILE_RUNNING.as_secs());
+
+/// #3530 — the error that ends a session on a failed send or read (`ctx`),
+/// put down to this agent's own pause when the loop's lateness explains it.
+/// After a long freeze the far end has reset the socket, and whichever arm
+/// `select!` runs first at the thaw can hit the reset before the keepalive's
+/// RX deadline does. On a lab guest after a 152 s SIGSTOP that was
+/// `Broken pipe` on the heartbeat, and `Connection reset without closing
+/// handshake` on the read. The reconnect then logged "connect failed",
+/// though no connect was tried.
+///
+/// `silent` is the time since the last frame read, and `since_keepalive` the
+/// time since the keepalive arm last ran, both read as the arm starts. The
+/// part of `since_keepalive` past [`WS_KEEPALIVE_EVERY`] is the lateness the
+/// keepalive tick would report if it ran now. If the keepalive arm already
+/// ran at the thaw, its tick reported that lateness itself, and `pause` kept
+/// it ([`RememberedPause`]). The larger of the two is the loop's lateness. A
+/// running loop has neither, so the error keeps `ctx` alone, as before.
+///
+/// ⚠️ Wording only: the error keeps its own type under the new context, so
+/// the reconnect reads it as before (FR-28's 502 check downcasts it).
+fn session_ended(
+    ctx: &'static str,
+    e: anyhow::Error,
+    silent: Duration,
+    since_keepalive: Duration,
+    pause: RememberedPause,
+) -> anyhow::Error {
+    let late = since_keepalive
+        .saturating_sub(WS_KEEPALIVE_EVERY)
+        .max(pause.late());
+    match tunnel_core::frozen::did_not_run_for(silent, late, WS_QUIET_WHILE_RUNNING)
+        .filter(|paused| *paused >= WS_PAUSE_MIN)
+    {
+        Some(paused) => {
+            let why = format!(
+                "{ctx}: {}: this agent did not run for ~{} s before it (frozen or suspended)",
+                error_chain(e.as_ref()),
+                paused.as_secs()
+            );
+            e.context(AgentDidNotRun(why))
+        }
+        None => e.context(ctx),
+    }
+}
+
+/// #3530 — the keepalive tick's lateness, kept while it reads as a pause (at
+/// least [`WS_PAUSE_MIN`]) until a tick comes on time again. With
+/// `MissedTickBehavior::Delay` that is the next one, about 25 s later.
+///
+/// It is for a send or read that fails after the keepalive arm ran at a
+/// thaw. The far end closed the socket during the freeze, but the frames it
+/// sent before its close sit ahead of the error. Each read of one refreshes
+/// `last_rx`, so the RX deadline does not trip, and gives the keepalive arm
+/// another turn, which restarts `skew_mono`. On a lab guest thawed from a
+/// 152 s SIGSTOP, the read failed 2.6 ms later and logged "connect failed".
+///
+/// One per session, beside `skew_mono`: a new session starts with none.
+#[derive(Debug, Default, Clone, Copy)]
+struct RememberedPause(Option<Duration>);
+
+impl RememberedPause {
+    /// One keepalive tick, `late` past its due instant. A pause is kept, and
+    /// a tick under [`WS_PAUSE_MIN`] clears it.
+    fn tick(&mut self, late: Duration) {
+        self.0 = (late >= WS_PAUSE_MIN).then_some(late);
+    }
+
+    fn late(self) -> Duration {
+        self.0.unwrap_or_default()
+    }
+}
 
 /// Hard bound on a single WS frame WRITE on the established connection.
 /// Every select arm awaits its sends inline, so one wedged `ws.send`
@@ -2106,6 +2187,9 @@ async fn connect_once(
     // tick then words that line.
     let mut skew_wall = std::time::SystemTime::now();
     let mut skew_mono = std::time::Instant::now();
+    // #3530 — the keepalive tick's pause, for a send or read that fails after
+    // that tick ran at a thaw, which restarts `skew_mono`. Per session.
+    let mut pause = RememberedPause::default();
 
     // netstate PR-2 — probe-then-cycle on Major network changes. `Some` =
     // a probe ping is out: (window start, missed windows so far); verdict
@@ -2180,6 +2264,7 @@ async fn connect_once(
                 // #3530 — how late this tick came: for at least that long the
                 // loop read nothing, whatever the network did.
                 let late = due.elapsed();
+                pause.tick(late);
                 let _stage = watchdog::enter(ctx.pump, "keepalive");
                 // W4(a) — TUN-death self-heal. The overlay runtime EXITS when
                 // its TUN dies (a contract the runtime tests pin), and before
@@ -2633,12 +2718,21 @@ async fn connect_once(
                     power: crate::power::brief(),
                 };
                 watchdog::stage(ctx.pump, "heartbeat.send");
+                // #3530 — read before the send, which can wedge for
+                // `WS_SEND_TIMEOUT`: the lateness is the loop's, not the send's.
+                let (silent, since_keepalive) = (last_rx.elapsed(), skew_mono.elapsed());
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(e.context("heartbeat send")));
+                    return Err(ConnectError::Transient(session_ended(
+                        "heartbeat send",
+                        e,
+                        silent,
+                        since_keepalive,
+                        pause,
+                    )));
                 }
                 // Wave 2 — one `rc:session.stats` per LIVE session, on the
                 // heartbeat's own 30 s tick (no extra timer, and it stops
@@ -3228,11 +3322,19 @@ async fn connect_once(
                     return Ok(());
                 }
                 Some(Err(e)) => {
+                    // #3530 — read before the closes below await.
+                    let (silent, since_keepalive) = (last_rx.elapsed(), skew_mono.elapsed());
                     let _stage = watchdog::enter(ctx.pump, "ws.error");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
+                    return Err(ConnectError::Transient(session_ended(
+                        "ws read",
+                        anyhow::Error::new(e),
+                        silent,
+                        since_keepalive,
+                        pause,
+                    )));
                 }
                 Some(Ok(Message::Pong(payload))) => {
                     let _stage = watchdog::enter(ctx.pump, "ws.pong");
@@ -7830,6 +7932,173 @@ mod tests {
         let bare = std::io::Error::other("simple");
         let chain = error_chain(&bare);
         assert_eq!(chain, "simple");
+    }
+
+    /// #3530 — the lab guest's 152 s SIGSTOP. The far end reset the control WS
+    /// meanwhile, and the first arm to run at the thaw hit the reset: a read
+    /// in one round, the heartbeat's send in the other. The keepalive arm last
+    /// ran 160 s before (135 s overdue) and the last frame came 170 s before.
+    /// The session ended while the agent did not run, and the reconnect says
+    /// so, with the cause.
+    #[test]
+    fn a_session_reset_during_a_freeze_names_the_pause() {
+        use tokio_tungstenite::tungstenite::{self, error::ProtocolError};
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        let reset = tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake);
+        let e = session_ended("ws read", anyhow::Error::new(reset), s(170), s(160), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        assert_eq!(
+            e.to_string(),
+            "ws read: WebSocket protocol error: Connection reset without closing handshake: \
+             Connection reset without closing handshake: this agent did not run for ~135 s \
+             before it (frozen or suspended)"
+        );
+        // Wording only: the reconnect still downcasts the error it got.
+        assert!(matches!(
+            e.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake
+            ))
+        ));
+        let pipe = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("ws send");
+        let e = session_ended("heartbeat send", pipe, s(170), s(160), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let line = e.to_string();
+        assert!(line.starts_with("heartbeat send: ws send: "), "{line}");
+        assert!(line.ends_with("did not run for ~135 s before it (frozen or suspended)"));
+    }
+
+    /// #3530 — a lab guest thawed from a 152 s SIGSTOP: a read failed 2.6 ms
+    /// later and logged "connect failed", with no RX-deadline line before it.
+    /// So a frame the far end sent before its close had been read first and
+    /// refreshed `last_rx`, and the keepalive arm then ran, late by most of
+    /// the freeze, without tripping it, and restarted `skew_mono`. The read
+    /// that met the close found no lateness in either. The tick's remembered
+    /// pause names it.
+    #[test]
+    fn a_reset_after_the_thaw_tick_names_the_remembered_pause() {
+        use tokio_tungstenite::tungstenite::{self, error::ProtocolError};
+        let ms = Duration::from_millis;
+        let mut pause = RememberedPause::default();
+        pause.tick(Duration::from_secs(145));
+        let reset = tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake);
+        let e = session_ended("ws read", anyhow::Error::new(reset), ms(1), ms(2), pause);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let line = e.to_string();
+        assert!(
+            line.starts_with("ws read: WebSocket protocol error: "),
+            "{line}"
+        );
+        assert!(line.ends_with("did not run for ~145 s before it (frozen or suspended)"));
+        assert!(e.downcast_ref::<tungstenite::Error>().is_some());
+        // The heartbeat's send, after the same tick, the same way.
+        let e = session_ended(
+            "heartbeat send",
+            anyhow::anyhow!("ws send"),
+            ms(1),
+            ms(2),
+            pause,
+        );
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        // The larger lateness wins: a smaller pause kept from an earlier tick
+        // does not shorten a freeze the keepalive arm has not run since.
+        let s = Duration::from_secs;
+        let mut earlier = RememberedPause::default();
+        earlier.tick(s(40));
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(170), s(160), earlier);
+        assert!(e.to_string().contains("~135 s"), "{e}");
+    }
+
+    /// The same read with no pause remembered: the loop ran, and the line is
+    /// today's.
+    #[test]
+    fn a_reset_with_no_remembered_pause_keeps_its_error() {
+        let ms = Duration::from_millis;
+        let none = RememberedPause::default();
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), ms(1), ms(2), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        assert_eq!(e.to_string(), "ws read");
+        assert_eq!(error_chain(e.as_ref()), "ws read: reset");
+    }
+
+    /// A tick on time forgets the pause, about 25 s after the thaw's tick,
+    /// and an error after it keeps today's line. Only a tick at the floor or
+    /// later is kept at all, so a loop held by one wedged send keeps none.
+    #[test]
+    fn an_on_time_tick_forgets_the_pause() {
+        let ms = Duration::from_millis;
+        let mut pause = RememberedPause::default();
+        pause.tick(Duration::from_secs(145));
+        assert_eq!(pause.late(), Duration::from_secs(145));
+        pause.tick(ms(3));
+        assert_eq!(pause.late(), Duration::ZERO);
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), ms(1), ms(2), pause);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        assert_eq!(e.to_string(), "ws read");
+        pause.tick(WS_PAUSE_MIN - ms(1));
+        assert_eq!(pause.late(), Duration::ZERO);
+        pause.tick(WS_SEND_TIMEOUT);
+        assert_eq!(pause.late(), Duration::ZERO);
+        pause.tick(WS_PAUSE_MIN);
+        assert_eq!(pause.late(), WS_PAUSE_MIN);
+    }
+
+    /// Each session starts with no pause remembered, so a reset early in a
+    /// new session, after the reconnect, keeps today's line.
+    #[test]
+    fn a_session_starts_with_no_remembered_pause() {
+        let start = RememberedPause::default();
+        assert_eq!(start.late(), Duration::ZERO);
+        let s = Duration::from_secs;
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(1), s(1), start);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+    }
+
+    /// A send or read that fails while the loop runs keeps today's error, so
+    /// the reconnect still logs "connect failed" with its cause.
+    #[test]
+    fn a_session_reset_while_running_keeps_its_error() {
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        // The keepalive ran 20 s ago: no lateness at all.
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(20), s(20), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        assert_eq!(e.to_string(), "ws read");
+        assert_eq!(error_chain(e.as_ref()), "ws read: reset");
+        // A loop that ran but sat on one send until it wedged (a corp VPN took
+        // the route) holds the keepalive back by up to `WS_SEND_TIMEOUT`.
+        let held = WS_KEEPALIVE_EVERY + WS_SEND_TIMEOUT;
+        let e = session_ended(
+            "heartbeat send",
+            anyhow::anyhow!("ws send"),
+            held,
+            held,
+            none,
+        );
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        // A silence that began long before a pause is not the pause's.
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(300), s(100), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+    }
+
+    /// The floor sits where the RX-deadline line's own does, above a wedged
+    /// send, so all three exits name a pause on the same terms.
+    #[test]
+    fn the_pause_floor_matches_the_rx_deadline_line() {
+        assert_eq!(WS_PAUSE_MIN, WS_RX_DEADLINE - WS_QUIET_WHILE_RUNNING);
+        assert!(WS_PAUSE_MIN > WS_SEND_TIMEOUT);
+        assert!(WS_PAUSE_MIN >= tunnel_core::frozen::LATE_MIN);
+        // Right at the floor it names the pause; just under, it does not.
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        let at = WS_KEEPALIVE_EVERY + WS_PAUSE_MIN;
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(60), at, none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let under = at - Duration::from_millis(1);
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(60), under, none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
     }
 
     // #2815 — the exec prompt said "On behalf of primary": its own copy of
