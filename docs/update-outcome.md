@@ -256,7 +256,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:6696`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:6760`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries
