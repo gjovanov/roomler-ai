@@ -74,8 +74,11 @@ forced push, so there is nothing operational to disable.
 - [x] Unparseable pin or agent version → guard stays out of the way
 - [x] Ordering locked against the updater's semantics (rc < final; finals by
       patch) in unit tests
-- [ ] Field: a stale pin against a live 0.4.x agent answers 409 in prod; a
-      current pin still delivers
+- [x] Field: a stale pin against a live 0.4.x agent answers 409 in prod; a
+      current pin still delivers. **Met 2026-08-27** (the log below): a stale pin against
+      CORPLAP-2, online on 0.4.4, answered 409 with no device side effect. The box was
+      left open when the issue closed. Read again 2026-11-03: the guard is on master at
+      both entry points (`crates/modules/fleet/src/agent.rs:1488`, `:1614`).
 
 ## Open decisions
 
