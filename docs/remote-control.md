@@ -4599,7 +4599,7 @@ sequenceDiagram
     Note over T,A: frozen 70 s, and Instant runs on
     F->>F: thaw: both sleeps long expired
     T->>T: wakes first: heartbeat still n, stuck_for 70 s
-    Note over T: before #3530: past 60 s, so exit(2)<br/>since: its sleep came back 40 s late, a new baseline
+    Note over T: before the fix: past 60 s, so exit(2)<br/>with it: its sleep came back 40 s late, a new baseline
     A->>A: wakes microseconds later: tick, lag_secs=70, pumps reset
 ```
 
