@@ -60,7 +60,7 @@
     | 18:58:49 | +1 | our `rc:keyframe` at 18:58:48.3, the positive control; a move 1.5 M → 1 M shares the window and adds nothing |
     | 18:59:01 | +1 | the resize to 1600×900, `dims_swaps` +1, the positive control |
     | 18:59:15 | +1 | the resize back, `dims_swaps` +1 |
-    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11211`) |
+    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11419`) |
 
     The other 12 moves sit in windows where `idr_count` did not move: 216 windows judged, none
     unexplained. The inequality holds as written: 4 ≤ 2 dims changes + 2 keyframe requests.
@@ -108,15 +108,15 @@
   - 🔑 **The carrier line is not a source.** Each of the three came 1–3 s after an agent line
     `overlay carrier under the nominated pair is not direct`. The code read here is master's,
     and none of these paths has changed since 0.4.199, the build that ran. The line comes from
-    `overlay_remote_is_relay_tier` (`peer.rs:2286`), a LocalAPI read that changes nothing. The
+    `overlay_remote_is_relay_tier` (`peer.rs:2287`), a LocalAPI read that changes nothing. The
     FFmpeg DC pump calls it on its transport recheck, every 5 s (`TRANSPORT_RECHECK_INTERVAL`,
-    `peer.rs:2171`; the recheck at `:7691`). The answer goes two places:
+    `peer.rs:2172`; the recheck at `:7798`). The answer goes two places:
     - into `constrained`, which sets the rate ceiling and, on a flip, re-sends `rc:video-info`
       (`:7672`);
     - into `FlipTracker` (`encode/rate_profile.rs:81`). It rebuilds the encoder only after two
       consecutive checks disagree with the state the pump was built for, at least 60 s after
       the last rebuild, and only when the frame rate changes. That rebuild logs its own line
-      (`peer.rs:7723`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
+      (`peer.rs:7830`), re-opens the encoder and restarts the counters. Of the four `send_epoch`
       bumps, only the inline open's (`:9010`) can follow from this path, through that rebuild.
       The others are a dims swap (`:7506`), a rate swap (`:7584`) and a deferred rebuild
       (`:9571`).
@@ -129,7 +129,7 @@
     WireGuard rekey timeouts and the failed make-before-break probe beside it belong to the
     overlay. The pump sees the overlay only through the carrier this recheck asks for.
   - 🔑 **On this cell the encoder never picks an IDR by itself, so each of the three was
-    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2388`).
+    forced.** `idr_count` counts every key-flagged packet (`encode/ffmpeg/encoder.rs:2392`).
     NVENC opens with a 64,800-frame GOP (`:51`, set at `:1905`), over half an hour at this
     session's 31 fps, and with `rc-lookahead=0` and `bf=0` (`:366`–`:367`). Its scene-cut
     I-frames need the lookahead, so they are off. A key frame therefore comes from a force
@@ -177,7 +177,7 @@
   - **Bytes per frame ran at p50 0.063, max 0.491, of the cap.** An idle desktop, no overshoot.
   - 🔑 **The encoder's maxrate is not always the rung.** It held the 3,677,739 it opened with:
     `set_bitrate` compares the two values' rungs and returns when they match
-    (`encode/ffmpeg/encoder.rs:3013`), so the opening value stands until the first rung crossing.
+    (`encode/ffmpeg/encoder.rs:3018`), so the opening value stands until the first rung crossing.
     The read's denominator follows it.
   - **Not run:** the positive controls and the motion. A scripted timeline (one keyframe request,
     one resize and back, a window drag, dial moves) was refused by the automation's permission
@@ -195,7 +195,7 @@
     no config change to be read for AC2/AC3, and flipping the flag off does not produce
     a RED (no IDR per rate step). The read's RED is a **positive control**: a viewer
     resize that moves `dims_swaps` by one must move `idr_count` by exactly one. That
-    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7507`), which
+    holds because a dims swap adopts through `adopt_rebuilt` (`peer.rs:7614`), which
     keeps the encoder's counters. A read that cannot see that IDR cannot vouch for the
     absence of the others.
   - 🔑 **AC3's read, as written, could fail with no rate-caused IDR at all.** Its
@@ -220,18 +220,18 @@
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9081`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9200`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**
     - `target_bps` is `governor.applied_bps()`, the raw target. The encoder runs at the maxrate
       it opened with until the first rung crossing, then at that target's nearest rung
-      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3012`).
+      (`coarsen_bitrate`, `encode/aimd.rs:317`, applied in `set_bitrate`, `encoder.rs:3017`).
       So the read is against that maxrate ÷ `target_fps` ÷ 8. Against the raw target a
       perfect encoder reads off by the rung's distance.
     - `DC pump set_bitrate (AIMD)` prints every target change, and most stay on a rung
       and move nothing. Δ`rate_moves` marks a real move. The read judges the first
-      complete 2 s heartbeat window (`peer.rs:7021`) after a Δ`rate_moves`, on
+      complete 2 s heartbeat window (`peer.rs:7119`) after a Δ`rate_moves`, on
       Δ`bytes_written` ÷ Δ`frames_encoded`. A window that starts at most 2 s after the
       move and holds the ratio shows the encoder had tracked by then.
     - ≈ 1.0 is a CBR's contract. NVENC is quality-capped VBR and sits under its cap on

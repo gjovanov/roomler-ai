@@ -148,10 +148,13 @@ pub struct Rules {
 }
 
 impl Rules {
-    /// This build: R2's plan has new code, on by default.
+    /// This build: R2's plan and R0's instruments have new code, both on by
+    /// default. `stats` is instruments and nothing else (FR-135 §7.1: R0's
+    /// fields only add to what the reads parse), so it is on from its first
+    /// release, with `rc_media_legacy=stats` as its switch.
     pub const THIS_BUILD: Rules = Rules {
-        built: MediaPlan.bit(),
-        new_by_default: MediaPlan.bit(),
+        built: Stats.bit() | MediaPlan.bit(),
+        new_by_default: Stats.bit() | MediaPlan.bit(),
     };
 }
 
