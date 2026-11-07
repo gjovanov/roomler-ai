@@ -140,7 +140,7 @@ existing self-spawn precedent (`roomlerd caps-probe`,
 ### The seam is unchanged
 
 `ScreenCapture` (`capture/mod.rs:350`), chosen in `open_default`
-(`capture/mod.rs:569`); backends at `:16` scrap, `:22` x11_damage, `:25` wgc,
+(`capture/mod.rs:573`); backends at `:16` scrap, `:22` x11_damage, `:25` wgc,
 `:34` synthetic. DRM is a fifth — no pump changes.
 
 ## Host readiness — measured on `scw-m2-asahi`, 2026-08-29

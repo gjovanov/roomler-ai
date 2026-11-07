@@ -20,6 +20,7 @@
 //! 3. Then [`super::desktop_rebind::try_change_desktop`] binds the
 //!    thread to whichever desktop currently receives input — usually
 //!    `Default` at startup, may flip to `Winlogon` after a `Win+L`.
+//!    Bound, it reads the display's refresh rate, once (FR-119 P2b-3).
 //! 4. Builds a [`DxgiDupBackend`] against the primary monitor.
 //! 5. Loops on capture commands from the async side (via
 //!    `oneshot::Sender<CaptureReply>`) until the channel is dropped.
@@ -278,7 +279,15 @@ pub struct SystemContextCapture {
     /// worker only through a paced request: FR-119's grants call the setter on
     /// the DC pumps too, and those must keep running at the display's rate.
     target_fps: u32,
+    /// FR-119 P2b-3 — the display's refresh rate, read by the worker at the
+    /// open and carried back in its ready ack.
+    refresh_hz: Option<u16>,
 }
+
+/// What the worker acks once, when its backend is up or has failed to come
+/// up: the captured width and height, and (FR-119 P2b-3) the display's
+/// refresh rate.
+type WorkerReady = Result<(u32, u32, Option<u16>)>;
 
 impl SystemContextCapture {
     /// Spawn the worker thread + initialise DXGI (or GDI fallback).
@@ -287,7 +296,7 @@ impl SystemContextCapture {
     /// degrade (typically falls back to `NoopCapture`). `paced`: see the
     /// module's "Pace".
     pub fn primary(target_fps: u32, _downscale: DownscalePolicy, paced: bool) -> Result<Self> {
-        let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(u32, u32)>>();
+        let (ready_tx, ready_rx) = std_mpsc::channel::<WorkerReady>();
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<CaptureCmd>();
         let readback = Arc::new(ReadbackTotals::default());
         let worker_readback = Arc::clone(&readback);
@@ -299,7 +308,7 @@ impl SystemContextCapture {
             })
             .map_err(|e| anyhow!("spawning system-context capture thread: {e}"))?;
 
-        let (width, height) = ready_rx
+        let (width, height, refresh_hz) = ready_rx
             .recv()
             .map_err(|_| anyhow!("system-context capture worker never acked"))??;
 
@@ -311,6 +320,7 @@ impl SystemContextCapture {
             readback,
             paced,
             target_fps,
+            refresh_hz,
         })
     }
 
@@ -362,6 +372,12 @@ impl ScreenCapture for SystemContextCapture {
         "system-context"
     }
 
+    /// FR-119 P2b-3 — the primary display's, read once at the open, on the
+    /// capture thread (`worker_main`).
+    fn refresh_hz(&self) -> Option<u16> {
+        self.refresh_hz
+    }
+
     /// FR-118 P0 — timed on the capture thread, like WGC's. Unlike WGC's, the
     /// pump waits for this one, so it is also a part of `avg_capture_ms`.
     fn readback_totals(&self) -> Option<(u64, u64)> {
@@ -379,7 +395,7 @@ impl ScreenCapture for SystemContextCapture {
 /// Worker thread main. Owns the `!Send` capture backend; receives
 /// oneshot-wrapped capture commands from the async side.
 fn worker_main(
-    ready_tx: std_mpsc::Sender<Result<(u32, u32)>>,
+    ready_tx: std_mpsc::Sender<WorkerReady>,
     cmd_rx: std_mpsc::Receiver<CaptureCmd>,
     readback: Arc<ReadbackTotals>,
     paced: bool,
@@ -411,6 +427,21 @@ fn worker_main(
         }
     }
 
+    // FR-119 P2b-3 — the display's refresh rate, read once, here: on the
+    // thread that captures, once it is on WinSta0 and bound to the input
+    // desktop (steps 1-2), so it reads the display the DXGI and GDI calls
+    // below see. Before step 1 the worker sits on the SCM's noninteractive
+    // window station (`desktop_rebind`). The worker runs as
+    // `NT AUTHORITY\SYSTEM` in the active user session, not in session 0 (read
+    // on the Windows dev box, 2026-11-07: session 1, "Console"), so
+    // `EnumDisplaySettingsW` reads the real panel. This arm captures the
+    // primary monitor only (`monitor_count`), the display `of_primary` reads.
+    let refresh_hz = crate::capture::refresh::of_primary();
+    tracing::info!(
+        ?refresh_hz,
+        "system-context capture: the display's refresh rate"
+    );
+
     // rc.105 Phase 0 — log the DXGI adapter/output layout BEFORE picking
     // a backend, so a single rc:logs-fetch shows which adapter owns the
     // primary output and whether a render-only dGPU exposes zero outputs
@@ -429,8 +460,8 @@ fn worker_main(
         }
     };
 
-    let dims = backend_dimensions(&backend);
-    if ready_tx.send(Ok(dims)).is_err() {
+    let (width, height) = backend_dimensions(&backend);
+    if ready_tx.send(Ok((width, height, refresh_hz))).is_err() {
         // Caller dropped the ready channel — async side already gave
         // up. Nothing to do but exit.
         return;
@@ -1529,6 +1560,21 @@ mod tests {
         // against the real ScreenCapture surface.
         fn assert_impl<T: ScreenCapture>() {}
         assert_impl::<SystemContextCapture>();
+    }
+
+    /// FR-119 P2b-3 — an open reports the refresh rate its display reads: the
+    /// worker reads it on the capture thread and the ready ack carries it to
+    /// the handle the pump asks. Without it the arm answered `None` on every
+    /// host, and FR-119 granted a 120 on a 60 Hz panel (FR-135 §13,
+    /// 2026-11-07). A runner with no desktop to open, or a display that names
+    /// no rate, proves nothing here.
+    #[test]
+    fn an_open_reports_the_refresh_rate_its_display_reads() {
+        let Ok(capture) = SystemContextCapture::primary(30, DownscalePolicy::default(), false)
+        else {
+            return;
+        };
+        assert_eq!(capture.refresh_hz(), crate::capture::refresh::of_primary());
     }
 
     #[cfg(feature = "scrap-capture")]
