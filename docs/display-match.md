@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:10880`](../agents/roomlerd/src/peer.rs#L10880)).
+control-channel arm sends the answer ([`peer.rs:10918`](../agents/roomlerd/src/peer.rs#L10918)).
 
 ### The answers
 
@@ -103,7 +103,7 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3220`](../crates/localapi/src/lib.rs#L3220), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:9443`](../crates/remote_control/src/models.rs#L9443)). A server that could set it could
+  push it ([`models.rs:9495`](../crates/remote_control/src/models.rs#L9495)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
   `set_device_policy`).
@@ -150,7 +150,7 @@ An unattended office PC is usually locked, so this is the main path, not an edge
 
 At the session's unlock the device decides again
 ([`display_match.rs:1601`](../agents/roomlerd/src/display_match.rs#L1601) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1425`](../agents/roomlerd/src/peer.rs#L1425)):
+session's lock watcher, [`peer.rs:1428`](../agents/roomlerd/src/peer.rs#L1428)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -165,7 +165,7 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1523`](../agents/roomlerd/src/peer.rs#L1523), wherever display match runs). It hands the screen
+([`peer.rs:1526`](../agents/roomlerd/src/peer.rs#L1526), wherever display match runs). It hands the screen
 back at once and tells the viewer ([`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651)
 `on_tick`):
 
@@ -216,7 +216,7 @@ sequenceDiagram
 |---|---|---|
 | a recorder is about to launch: the person's `RecordStart`, or a remote controller's start | the hold is taken after the one-at-a-time check and before the launch. A mode a session switched goes back first, logged `the screen is handed back … why="recording"`, and that session's request then waits for the recording's end | [`manager.rs:575`](../agents/roomlerd/src/recording/manager.rs#L575) (in `start_inner`), [`display_match.rs:1491`](../agents/roomlerd/src/display_match.rs#L1491) `hold_for_recording` |
 | a request while the recording runs: a viewer that connects, a second viewer, an unlock | `refused: recording`, and the request waits | [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch`, [`display_match.rs:1389`](../agents/roomlerd/src/display_match.rs#L1389) `waits_for` |
-| the session whose mode went back | its watcher tells its viewer once, within a quarter second | [`display_match.rs:1581`](../agents/roomlerd/src/display_match.rs#L1581) `recording_turn`, [`peer.rs:1527`](../agents/roomlerd/src/peer.rs#L1527) |
+| the session whose mode went back | its watcher tells its viewer once, within a quarter second | [`display_match.rs:1581`](../agents/roomlerd/src/display_match.rs#L1581) `recording_turn`, [`peer.rs:1530`](../agents/roomlerd/src/peer.rs#L1530) |
 | the recorder stopped: it reported `stopped`, `refused` or `error`, or its output closed | the hold is let go, and each waiting request is decided again within a quarter second through the whole guard, so an attended screen still refuses | [`manager.rs:687`](../agents/roomlerd/src/recording/manager.rs#L687), [`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651) `on_tick` |
 | a session that ends during the recording | what it waited for is dropped, and its close restores nothing, since the mode went back already | [`display_match.rs:1677`](../agents/roomlerd/src/display_match.rs#L1677) `forget` |
 | the viewer turns display match off | what it waited for is dropped. Before this a `locked` wait survived it, and the unlock switched a screen whose viewer had turned the match off | [`display_match.rs:1685`](../agents/roomlerd/src/display_match.rs#L1685) `turn_off` |
@@ -330,8 +330,8 @@ sequenceDiagram
 | The modes | the display's own list | the one active output's list in `xrandr --current`; none is added, this is someone's monitor ([`display_match.rs:370`](../agents/roomlerd/src/display_match.rs#L370) `parse_xrandr_outputs`) |
 | Several displays | the primary only | more than one active output answers `unsupported` |
 | After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:425`](../agents/roomlerd/src/display_match.rs#L425) `guard_undoes`, [`display_match.rs:605`](../agents/roomlerd/src/display_match.rs#L605) `recover`) |
-| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1470`](../agents/roomlerd/src/peer.rs#L1470)) |
-| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1510`](../agents/roomlerd/src/peer.rs#L1510)) |
+| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1473`](../agents/roomlerd/src/peer.rs#L1473)) |
+| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1513`](../agents/roomlerd/src/peer.rs#L1513)) |
 | Kill switch | `display_match = never` | `ROOMLERD_X11_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - ⚠️ **The X server says how long ago, not when.** "Now minus the idle time" moves by each read's latency,

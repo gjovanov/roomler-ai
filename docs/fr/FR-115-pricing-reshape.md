@@ -59,7 +59,7 @@ Only `max_devices` and `max_tunnel_clients` are **established** — enforced wha
 an org created after 2026-08-30, by standing decision (`crates/db/src/models/tenant.rs:58`), so
 for a new signup MagicDNS and exit nodes already pass. The advertised "1 concurrent session"
 (Free) and "5" (Pro) are enforced **nowhere**: FR-32 withheld the gate because nothing wrote
-`remote_sessions` (`crates/services/src/dao/remote_session.rs:52`). That table is written now —
+`remote_sessions` (`crates/services/src/dao/remote_session.rs:53`). That table is written now —
 projected from the audit stream (`crates/remote_control/src/audit.rs:3`) — but it is
 best-effort: three rows have shown "open" for up to 25 days. **A gate must not count it.**
 
