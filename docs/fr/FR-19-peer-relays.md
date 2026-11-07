@@ -636,10 +636,10 @@ A new tier would additionally have required navigating four hazards, three of th
 
 | hazard | anchor | why it fails silently |
 |---|---|---|
-| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2827` makes **both ends initiate** the WG handshake, `:2793` books a direct-tier failure on demote-follow |
+| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2851` makes **both ends initiate** the WG handshake, `:2817` books a direct-tier failure on demote-follow |
 | `is_sticky` `_ =>` catch-all | `path.rs:825` | silently inherits LAN/public's 2-strike escalation |
 | `suppression_half_life` `_ =>` catch-all | `path.rs:285` | same |
-| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1454`, `:1542`, `:1614`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
+| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1478`, `:1566`, `:1638`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
@@ -666,7 +666,7 @@ evidence that justifies it.
   `relay_max_bitrate_per_session`; the relay's own carriers are exempt from its forwarding
   budget. An org must not be able to cost its HQ box its own remote access.
 - **Failure is a downgrade, never a black hole**, convicted by `sweep_carrier_health`
-  (`runtime/establish.rs:312`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
+  (`runtime/establish.rs:315`). ⚠️ FR-9's lesson: the dangerous bug was never "the carrier
   failed", it was *"both ends held a hold-down and went mutually deaf"* (#746).
 - **Revocation is a push, not an expiry.** ⚠️ The first draft had no unmint at all, so
   flipping `peer_relay_mode` to `off` would have left live sessions forwarding indefinitely
@@ -721,7 +721,7 @@ Verified against `origin/master`, 2026-08-28.
 | Netmap shaping | `overlay.rs:2058` `shape_peer` |
 | Wire model | `crates/remote_control/src/signaling.rs:3378` `NetmapPeer`; `:3356` `RelayStrategyWire` |
 | Reachability report | new `rc:overlay.relay_probe`; **not** `CapVector` (`netcheck.rs:60`) |
-| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:312` `sweep_carrier_health` |
+| Carrier health / demotion | `crates/tunnel-core/src/overlay/runtime/establish.rs:315` `sweep_carrier_health` |
 | Shape disjointness standard | `overlay/disco.rs:45-52`; `is_wg_shaped` `wg.rs:2514`; fix `payload_is_wg_or_disco` `remote_control/src/derp_frame.rs:39` |
 | Anti-amplification standard | `overlay/disco.rs:69-70` (`FRAME_LEN = 85`) |
 | Per-source limiter model | `overlay/carrier_plane.rs:705` `unknown_init_fresh`; `wg.rs:725-726` |
