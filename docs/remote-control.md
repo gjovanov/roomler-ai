@@ -241,7 +241,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 |---|---|---|
 | A **host** candidate on the overlay interface. On macOS that is a kernel-named `utunN`, which the name rule cannot see | `SettingEngine` IP filter: `RcOverlay::keeps_local` | `agents/roomlerd/src/peer.rs:396` |
 | An **ICE server** on a mesh address: the loopback-TURN relay the Hub appends for a corp controller | Dropped from the session's servers (`RcOverlay::ice_servers`); the Hub also withholds it | `peer.rs:419`, `crates/modules/fleet/src/hub.rs:2274` |
-| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1532`, `peer.rs:1574`, `peer.rs:1500` |
+| A **remote** candidate on a mesh address. The agent's srflx and relay sockets are bound to `0.0.0.0`, so a check to it routes into the TUN even though the agent offered no overlay candidate | Dropped when trickled, again after an mDNS name resolves, and from the offer SDP | `peer.rs:1536`, `peer.rs:1578`, `peer.rs:1504` |
 
 "Overlay address" is **exact**: every v4 block this daemon's overlay routes (each org's `cidrs`, learned as each runtime brings its TUN up: `crates/tunnel-core/src/overlay_footprint.rs`, fed at `runtime.rs:2156`), plus the derived-v6 ULA `fd72:6f6f:6d6c::/96`.
 
@@ -249,8 +249,8 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3764`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:232`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1319`, `delegate.rs:1361`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4723`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3772`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:232`).
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1328`, `delegate.rs:1370`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4723`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -298,7 +298,7 @@ flowchart TD
 | the rule | `auto_allows` (`rc_overlay.rs:292`) |
 
 Notes on the implementation:
-- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4525`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
+- **It runs where the peer is built.** `RcOverlay::decide` (`rc_overlay.rs:112`) is called by the offer handler (`agents/roomlerd/src/signaling.rs:4541`), which a delegated macOS GUI worker runs too. The inputs cross to the worker inside `RcOverlay`.
 - **A viewer device on a worse link stays off** (`exclude`, `rc_overlay.rs:57`). One computer can run several agents, each with its own relay: Windows and WSL, where the Windows agent is direct to its peers and the WSL one rides DERP (FR-121 P3b). A session that rides the mesh through the best one keeps every other one out of its ICE servers, its remote candidates and the offer's SDP. Otherwise ICE, which ranks relays by the order of their TURN servers, could pick the relay behind DERP.
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn` (the server's hint), `own_far_turn` (D8), `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
@@ -488,7 +488,7 @@ capture of its own.
 
 | Who | How it is told | Where |
 |---|---|---|
-| the owner's own viewer | `spawn_capture_unavailable_notice`, as before | `agents/roomlerd/src/peer.rs:6746` |
+| the owner's own viewer | `spawn_capture_unavailable_notice`, as before | `agents/roomlerd/src/peer.rs:6753` |
 | the followers already on the pipeline | the owner calls `Pipeline::tell_unavailable`, which also keeps the reason | `agents/roomlerd/src/media_share.rs:620` |
 | a viewer that joins later | `try_join` reads the kept reason under the same lock as the join, so a follower is told once either way | `agents/roomlerd/src/media_share.rs:839` |
 
@@ -499,9 +499,9 @@ it has any control channel.
 ⚠️ The two pumps tell the pipeline at different points, because they register
 it at different points. The FFmpeg pump registers before it opens the capture,
 so a viewer can join during a slow open. It tells the pipeline beside the
-owner's own notice (`agents/roomlerd/src/peer.rs:6749`). The VP9 pump registers
+owner's own notice (`agents/roomlerd/src/peer.rs:6756`). The VP9 pump registers
 after the open, so it tells the pipeline right after the registration
-(`agents/roomlerd/src/peer.rs:4137`). `tell_unavailable` is a method on the
+(`agents/roomlerd/src/peer.rs:4144`). `tell_unavailable` is a method on the
 pipeline, so neither call can move above the registration.
 
 ⚠️ **A wait reaches them the same way** (#3423). A capture that waits on its
@@ -516,7 +516,7 @@ wait differs from a reason twice: it ends, and it has a deadline.
 
 | | a reason (#3260) | a wait (#3423) |
 |---|---|---|
-| the owner tells the pipeline | when its open returns no capture (above) | when `CaptureWait::hold` tells the owner's own viewer, in the owner's loop (`agents/roomlerd/src/peer.rs:5986`), or from the wait hook of an open that runs after the registration (`shared_media_waiting_hook`, `agents/roomlerd/src/peer.rs:6058`) |
+| the owner tells the pipeline | when its open returns no capture (above) | when `CaptureWait::hold` tells the owner's own viewer, in the owner's loop (`agents/roomlerd/src/peer.rs:5993`), or from the wait hook of an open that runs after the registration (`shared_media_waiting_hook`, `agents/roomlerd/src/peer.rs:6065`) |
 | the followers are told by | `Pipeline::tell_unavailable` | `Pipeline::tell_waiting` (`agents/roomlerd/src/media_share.rs:641`), through the same retrying sender as the owner's own notice |
 | it is kept | until the owner's next frame, unless a wait replaces it | until the owner's next frame (`Pipeline::on_frame`, `agents/roomlerd/src/media_share.rs:662`), unless a reason replaces it |
 | a later joiner hears | the reason | the time the wait has left, not the owner's whole wait, and nothing once that has run out (`try_join`, `agents/roomlerd/src/media_share.rs:839`) |
@@ -633,7 +633,7 @@ is tested on every OS.
 
 | Feature | When | What the hello says | What the viewer does |
 |---|---|---|---|
-| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3822`](../agents/roomlerd/src/signaling.rs#L3822)); `no-backend` | the receive-audio toggle is off, with the device's reason |
+| `audio` | the `audio` feature is built and the OS has no capture backend (macOS, until FR-97 P2a) | `audio` empty, so the daemon's session gate never adds a track ([`signaling.rs:3830`](../agents/roomlerd/src/signaling.rs#L3830)); `no-backend` | the receive-audio toggle is off, with the device's reason |
 | `audio` | Linux with no way to the computer's sound (FR-97 P3c, §5.1c) | `audio` empty; `no-sound-server` (no Pulse client library), `no-session` (a root build without the session helper), or `no-monitor` (`ROOMLERD_AUDIO_SESSION=0` with nothing named) | the same |
 | `clipboard` | a root Linux daemon with neither `DISPLAY` nor `WAYLAND_DISPLAY` ([`caps.rs:2812`](../agents/roomlerd/src/encode/caps.rs#L2812)) | `supports_clipboard: false`, no clipboard words; `no-session` | send, get and auto-sync are greyed, with the reason |
 | `clipboard-image-events` | everywhere but Windows and (FR-97 P3e-3a) a Linux X11 session, whose watchers report copied images | the words stay: text syncs, and an image moves on request; `not-watched` | the auto-sync tooltip stops promising host images |
@@ -770,10 +770,10 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:13644`](../agents/roomlerd/src/peer.rs#L13644)) sends it
+The pump ([`peer.rs:13651`](../agents/roomlerd/src/peer.rs#L13651)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
-[`peer.rs:5690`](../agents/roomlerd/src/peer.rs#L5690); the viewer parses it
+[`peer.rs:5697`](../agents/roomlerd/src/peer.rs#L5697); the viewer parses it
 at [`useRemoteControl.ts:1690`](../ui/src/composables/useRemoteControl.ts#L1690)
 and puts it on the toggle's title
 ([`RemoteControl.vue:3753`](../ui/src/views/remote/RemoteControl.vue#L3753)).
@@ -810,7 +810,7 @@ machine awake while a session is live, per OS:
 |---|---|---|---|
 | The lock signal | the input desktop moves to `winsta0\Winlogon` (`lock_state`) | logind's `LockedHint` for seat0's active session, polled every 2 s ([`lock_state.rs:347`](../agents/roomlerd/src/lock_state.rs#L347)); GNOME, KDE and light-locker set it | the session dictionary's `CGSSessionScreenIsLocked`, or another user on the console, polled every 2 s ([`lock_state.rs:357`](../agents/roomlerd/src/lock_state.rs#L357)); only the GUI session's half can ask, so the root half says nothing |
 | What the session does | paints the "Host locked" overlay and suppresses input: the worker can neither capture nor inject there | **nothing**: the lock screen is captured like any other screen, and input reaches it | **nothing**: no overlay, and input is not suppressed |
-| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10565`](../agents/roomlerd/src/peer.rs#L10565)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
+| `rc:host_locked` | `{locked}` | `{locked, input: "passes"}` ([`peer.rs:10572`](../agents/roomlerd/src/peer.rs#L10572)), retried until the control DC carries it | `{locked, input: "unknown"}`, the same way: whether the lock screen's password field takes injected keys is not measured |
 | The viewer's chip | "input is suppressed" | "Your input reaches it, so you can type the password to unlock" | "The remote host is on its lock screen.", claiming neither way ([`useRemoteControl.ts:1540`](../ui/src/composables/useRemoteControl.ts#L1540) `hostLockedChipTitle`) |
 | A request that waits for consent | `rc:consent.pending{host_locked}` (FR-34, §11.2) | not yet: the read is a `loginctl` run, which does not belong on the signalling loop | `rc:consent.pending{host_locked}`, from the same session dictionary ([`lock_state.rs:301-320`](../agents/roomlerd/src/lock_state.rs#L301-L320)) |
 | Holding the machine awake while a session is live (FR-55) | `PowerCreateRequest` | a logind **block** inhibitor ([`power.rs:758`](../agents/roomlerd/src/power.rs#L758)): `sleep:idle` for a root daemon, `idle` only for a per-user one | `IOPMAssertion` |
@@ -881,7 +881,7 @@ sequenceDiagram
 - **The decision is one pure function**
   ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
-  announcement ([`signaling.rs:6775`](../agents/roomlerd/src/signaling.rs#L6775)),
+  announcement ([`signaling.rs:6798`](../agents/roomlerd/src/signaling.rs#L6798)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
   GPO refresh changes reaches the server within a beat. Where it says no, the
   `keys-only` entry stays and its reason names the half that is missing.
@@ -1247,6 +1247,8 @@ that reports the same input form costs nothing.
 | `fps` | the grant, when the answer moves | `granted`, plus `asked` and `reason` when an ask was refused |
 | `ladder` | every step down | `{from, to, why, at_ms}`. A cell that lost to the next, GPU form to CPU form, asked to granted. At most 24, and `stopped` still says how it ended |
 | `stopped` | the pump, on its way out | `no_encoder` or `encoder_fault`, and the backend's own words, one line of at most 160 characters |
+| `legacy` | session start | FR-135 §7.1 — the media paths this session runs on their OLD code because `rc_media_legacy` says so, listed or implied by a path they stand on. Absent when no key sent one back |
+| `refused` | session start | FR-135 §7.1 — `rc_media_canary` entries this session did not honour, as `path:why` (`legacy`, `not_built`, `requires:<path>`). Absent when none |
 
 ⚠️ **Three of those arrows are written by one pump.** The FFmpeg data-channel pump is
 the only one instrumented. An RTP or VP9 session carries the plan's start and nothing
@@ -1309,11 +1311,44 @@ Both directions are additive, and each is read by the other side's verb or by no
 | With `media-plan` | Older | Its parser drops an unknown `t`. It never sends `rc:viewer-hz`, so `viewer_hz()` stays `None` |
 | Older | Knows it | No plan arrives, so the page reads as it did. No `rc:viewer-hz` is sent, because the verb is absent |
 
-Kill switch: `ROOMLERD_MEDIA_PLAN=0` registers no plan, so every writer does nothing,
-and the agent stops advertising `media-plan`. R0 folds it into `rc_media_legacy` as
-`media_plan`, and the cap into R0's keys. Neither touches the server wire or the
-composition baseline: both messages are peer-to-peer control-channel JSON, and the
-baseline holds no verbs.
+Kill switch: a `media_plan` entry in `rc_media_legacy` (FR-135 §7.1, below) registers
+no plan for the sessions that open after it, so every writer does nothing. It is
+pushable with `MANAGE_AGENTS` and live, with no restart
+([`remote-config.md`](remote-config.md) §6, "A fifth"). `ROOMLERD_MEDIA_PLAN=0` still
+works, read as that entry, and it alone also stops the agent advertising `media-plan`:
+a hello is not re-sent for a push, and a viewer reads no fault into a missing plan. The
+cap is not in R0's keys yet; it stays on its own env switch until its flip. Neither
+message touches the server wire or the composition baseline: both are peer-to-peer
+control-channel JSON, and the baseline holds no verbs.
+
+**The media paths (FR-135 §7.1).** Each FR-135 phase adds a media path's new code beside
+the old, and two temporary keys choose between them per session:
+`rc_media_legacy` sends a session back to old code, and `rc_media_canary`, local only,
+turns new code on before its default does. Precedence is legacy, then canary, then the
+built-in default. Entries match whole names. The one read is each session's open
+(`RemoteConfigServices::media_paths`), and the session keeps what it read until it ends.
+
+```mermaid
+flowchart LR
+  L["rc_media_legacy<br/>pushable, live"] --> R{"resolve, per path,<br/>in dependency order"}
+  C["rc_media_canary<br/>this device only"] --> R
+  D["built-in default"] --> R
+  R -->|old| O["the path's old code"]
+  R -->|new| N["the path's new code"]
+  R --> P["rc:media-plan names<br/>legacy and refused"]
+```
+
+| Path | Phase | New code in this build | Default |
+|---|---|---|---|
+| `stats` | R0 | not yet | old |
+| `media_plan` | R2 | yes | new |
+| `capture_wait`, `capture_stage`, `zero_copy_shared`, `dc_sink`, `sctp_rto`, `encode_stage`, `cell_table`, `rtp_sink`, `recording_door`, `high_refresh` | R4a to R12 | not yet | old |
+
+Some paths stand on others (`capture_wait` under `capture_stage`, both and `dc_sink`
+under `encode_stage` and `high_refresh`, `encode_stage` under `rtp_sink`), so an old
+path forces what stands on it onto the old path, and a canary entry whose requirement
+is old is refused. `media_paths::tests::every_combination_keeps_the_rules` walks about
+57,000 combinations of the two keys against those rules.
 
 ### 5.2 Encoder selection
 
@@ -1352,12 +1387,12 @@ Without them the viewer never offers above 60 and never sends `rc:fps`.
 | Message | Direction | Fields |
 |---|---|---|
 | `rc:fps` | viewer → agent, control channel | `fps`: 60, 120 or 144 ([`frame_rate.rs:36`](../agents/roomlerd/src/encode/frame_rate.rs#L36)); anything else is dropped. `retry: true`, a literal `true` only, asks to trial a refused rate again (`fps-retry`, [`frame_rate.rs:30`](../agents/roomlerd/src/encode/frame_rate.rs#L30)) |
-| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5529`](../agents/roomlerd/src/peer.rs#L5529)) |
+| `rc:video-info` | agent → viewer | `fps`, what the stream runs at; `fps_asked` and `fps_reason` once it runs below the ask; `fps_trial` while a trial runs; `refresh_hz` when the host could read its screen's rate ([`peer.rs:5536`](../agents/roomlerd/src/peer.rs#L5536)) |
 | `rc:viewer-hz` | viewer → agent, control channel | `hz`, the viewer's screen as its decode worker measured it, 1 to 1000. Stored and logged ([§5.1h](#51h-a-session-says-what-it-got-fr-135-r2)). The grant reads it only under `ROOMLERD_VIEWER_HZ_CAP=1` |
 
 **The grant** ([`frame_rate.rs:320`](../agents/roomlerd/src/encode/frame_rate.rs#L320)).
 It runs in the FFmpeg data-channel pump
-([`peer.rs:8522`](../agents/roomlerd/src/peer.rs#L8522)) whenever the ask, the
+([`peer.rs:8529`](../agents/roomlerd/src/peer.rs#L8529)) whenever the ask, the
 base rate, the transport or the class moves, and once a second for the pipe's
 belief. Each rate is checked in the order a viewer can see and act on
 ([`frame_rate.rs:260`](../agents/roomlerd/src/encode/frame_rate.rs#L260)):
@@ -1375,7 +1410,7 @@ A refused ask **steps down one rate at a time** (P2b-18): the highest offered
 rate below the ask that nothing refuses runs instead, and the viewer is still
 told why the ask was refused, as "120 fps (144 fps not granted: …)". The pump
 checks each of those rates against its own deny entry and its own ceiling
-([`peer.rs:8591`](../agents/roomlerd/src/peer.rs#L8591)).
+([`peer.rs:8598`](../agents/roomlerd/src/peer.rs#L8598)).
 
 ```mermaid
 flowchart TD
@@ -1422,7 +1457,7 @@ from the top. A proven rate stays proven.
 every Windows session ran at about 58 fps. An NVENC session holds the GPU clock
 pin, graphics and memory, from the moment the grant wants the rate
 ([`gpu_clock.rs:506`](../agents/roomlerd/src/gpu_clock.rs#L506),
-[`peer.rs:8629`](../agents/roomlerd/src/peer.rs#L8629)). Under an encoder-only
+[`peer.rs:8636`](../agents/roomlerd/src/peer.rs#L8636)). Under an encoder-only
 load the driver otherwise drops the memory clock, and NVENC's time per frame
 doubles.
 
@@ -2536,7 +2571,7 @@ session goes without it, with a reason:
 
 - ⚠️ **The device enforces the floor itself.** The hub's strip is so the viewer can say why before
   the person clicks. The agent masks the grant ([`mask`, `session_policy.rs:147`](../agents/roomlerd/src/session_policy.rs#L147),
-  applied at [`signaling.rs:4026`](../agents/roomlerd/src/signaling.rs#L4026)) the moment the consent
+  applied at [`signaling.rs:4036`](../agents/roomlerd/src/signaling.rs#L4036)) the moment the consent
   mode resolves, before anything reads it. A request carrying `FILES` with no policy at all, as from a
   bypassed hub, is masked to no `FILES` when the floor says `off`
   (`the_device_floor_holds_when_the_server_sends_no_policy`). Field-verified on 0.4.136, with the red
@@ -2895,8 +2930,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14041`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14019`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4539`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14050`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14048`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14026`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4555`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14057`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:674`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:342`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:805`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:434`, #2326) |
@@ -2958,9 +2993,9 @@ where the server still holds the session live: on the device-ended path (sent ah
 own `rc:terminate`), not on the controller-ended one, where `ended_at` is already set when the agent
 hears the terminate and `merge_live_stats` matches nothing. So a session with no tick after the
 observation — overwhelmingly a short one — recorded none, which the freeze reads as `unknown`. Since
-P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:954`)
-and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2816`), by the
-same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6661`) queues the sample on
+P9d the observation signals the signalling loop the moment it lands (`agents/roomlerd/src/peer.rs:958`)
+and the loop sends one `rc:session.stats` at once (`agents/roomlerd/src/signaling.rs:2820`), by the
+same road the tick uses: the shared `send_one_session_stats` (`signaling.rs:6684`) queues the sample on
 **the peer's own sender**, the FR-43 seam the peer was built with (`peer.rs:288`) — the loop's outbound
 queue for its own session, flushed to the WS one hop later, or the delegation channel for a delegated
 session, so a supervised Mac's sample reaches the server under the daemon's identity, the one the
@@ -3004,8 +3039,8 @@ sequenceDiagram
 | Piece | What it does | Where |
 |---|---|---|
 | the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2518`; sent by `reportDecodeError` (`:7479`) from all three worker handlers |
-| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2493`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10649` |
-| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11178`; `viewer_decode_error`, `peer.rs:10624` |
+| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2493`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10656` |
+| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11185`; `viewer_decode_error`, `peer.rs:10631` |
 | the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:207` |
 | the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
 | the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:754` |
@@ -3075,11 +3110,11 @@ with no grep of `agent_logs`.
 
 | Piece | What it does | Where |
 |---|---|---|
-| the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:10046` |
+| the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:10053` |
 | a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:126` |
 | the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
 | the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:761` |
-| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:5883` |
+| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:5946` |
 | the row | `remote_sessions.video`, beside `stats`, so `mark_ended`'s whole-`stats` write cannot reset it | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:152` |
 
 ⚠️ **The reading cannot wait for the session's last sample.** When the viewer hangs up, the server
@@ -3553,7 +3588,7 @@ system guest, idle 60 s after each of three 2-minute DRM sessions, with gdb's
 | session 3 | 303 MB | 256 MB | 290 MB | **9.2 MB** | 32 |
 | one `malloc_trim(0)` | **89 MB** | **42 MB** | 290 MB | 9.2 MB | 32 |
 
-So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1775`) asks for a trim, and
+So `AgentPeer`'s drop (`agents/roomlerd/src/peer.rs:1782`) asks for a trim, and
 `agents/roomlerd/src/mem_trim.rs:33` runs `malloc_trim(0)` once, on a short-lived
 `mem-trim` thread, **5 s after the last session ended**. The delay lets the
 encoder thread finish freeing (`encode/thread.rs:266` joins it), and sessions
@@ -4095,7 +4130,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
   anyone but the floor holder, as keep busy's switch does
   (`agents/roomlerd/src/input/arbiter.rs:874`). Before, a view-only session
   could switch the host's layout. And the current snapshot goes out once when
-  the control DC opens (`agents/roomlerd/src/peer.rs:1275`): the emitter
+  the control DC opens (`agents/roomlerd/src/peer.rs:1279`): the emitter
   starts before the channel does, so the snapshot it starts with found no
   channel, and went out again only on the next change.
 
@@ -4104,8 +4139,8 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
 (`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
-(`agents/roomlerd/src/peer.rs:1567`) and its `rc:layout.set` arm
-(`agents/roomlerd/src/peer.rs:11271`) serve both platforms.
+(`agents/roomlerd/src/peer.rs:1571`) and its `rc:layout.set` arm
+(`agents/roomlerd/src/peer.rs:11278`) serve both platforms.
 
 ```mermaid
 sequenceDiagram
@@ -4468,14 +4503,14 @@ is silent while it waits.
   `carrier_ready`, `consent`, `device_end`, `tunnel_reap`,
   `quic_setup`, `delegated`, and `ws.text` / `ws.ping` / `ws.pong` /
   `ws.close` / `ws.error` / `ws.other`
-  (`agents/roomlerd/src/signaling.rs:2221` onwards).
+  (`agents/roomlerd/src/signaling.rs:2225` onwards).
 - The connection's setup awaits too, with the pump already counting.
   It reads `setup`, and `setup.overlay` while the overlay runtime
-  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1814`).
+  starts or re-attaches (`agents/roomlerd/src/signaling.rs:1818`).
   Only the loop waiting for its next event reads `select`.
 - A `ws.text` arm is refined to the message it is handling, read
   from the JSON's `t` (`ws.text:rc:ssh.response`; `server_msg_tag`,
-  `agents/roomlerd/src/signaling.rs:6356`). The dispatch awaits per
+  `agents/roomlerd/src/signaling.rs:6379`). The dispatch awaits per
   message, so that is where a stall inside it shows.
 - The `StageGuard` (`watchdog.rs:475`) puts the pump back to
   `select` when the arm's scope ends, however it ends. An arm that
@@ -4522,7 +4557,7 @@ table), on a host whose adapters and routes churn.
   `max - min` per bucket, so a zero would read as a since-boot spike.
 - The arm is staged step by step: `heartbeat.flows`, `heartbeat.sys`,
   `heartbeat.caps`, `heartbeat.send`, `heartbeat.stats`
-  (`agents/roomlerd/src/signaling.rs:2547` onwards).
+  (`agents/roomlerd/src/signaling.rs:2551` onwards).
 - The encoder capability probe never runs in the heartbeat.
   `caps::detect()` is memoized per process, so only its first call
   probes.
@@ -4534,7 +4569,7 @@ table), on a host whose adapters and routes churn.
     with the device offline.
   - It is now warmed at the top of `run`, while the pump is gated off, and
     since #3439 the connect waits for its first answer `FIRST_ANSWER_WAIT`
-    at most (`agents/roomlerd/src/signaling.rs:1045`).
+    at most (`agents/roomlerd/src/signaling.rs:1049`).
 
 **What a stall leaves behind** (#3018). Until #3018 the
 watchdog-of-watchdog wrote one stderr line and exited. On 2026-10-26
@@ -4602,7 +4637,7 @@ reads as a stall, and what makes the gap depends on the OS:
 
 So a freeze looks the same on every OS, and a host sleep looks like a
 freeze on Windows only. The wall-vs-monotonic checks (the control WS's
-`RESUME_SKEW_MIN`, `agents/roomlerd/src/signaling.rs:594`, the `/derp`
+`RESUME_SKEW_MIN`, `agents/roomlerd/src/signaling.rs:598`, the `/derp`
 WS's, the overlay's `resumed_from_suspend`,
 `crates/tunnel-core/src/overlay/runtime.rs:571`) catch a Linux or macOS
 sleep. They never catch a freeze or a Windows sleep, because there both
@@ -4693,9 +4728,9 @@ what it was.
 
 | line | the lateness it reads | slack | after a freeze it reads |
 |---|---|---|---|
-| control WS RX deadline (`signaling.rs:2318`) | the keepalive's own due instant, which `tick()` returns (`:2262`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
-| control WS, a failed heartbeat send (`signaling.rs:2719`) or read (`:3318`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:157`, set at `:2263`). Both are read before the send, or on a read error before the closes (`session_ended`, `:119`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:97`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
-| the reconnect after any of them (`signaling.rs:1509`) | the session's reason, `AgentDidNotRun` (`:81`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
+| control WS RX deadline (`signaling.rs:2322`) | the keepalive's own due instant, which `tick()` returns (`:2266`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
+| control WS, a failed heartbeat send (`signaling.rs:2723`) or read (`:3326`) | the larger of two: the keepalive's overdue time, which is the time since its last tick (`skew_mono`) less its 25 s period, and the remembered pause, the lateness of a tick that already ran at the thaw, kept for about 25 s, until a tick comes on time (`RememberedPause`, `:157`, set at `:2267`). Both are read before the send, or on a read error before the closes (`session_ended`, `:119`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:97`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
+| the reconnect after any of them (`signaling.rs:1513`) | the session's reason, `AgentDidNotRun` (`:81`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:437`) | the keepalive's due instant (`:424`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:675`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3082`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:757`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
@@ -4731,13 +4766,13 @@ what it was.
   it, so a loop held by one wedged send keeps none. The exits read
   the larger of it and the keepalive's overdue time, and the floor
   still applies to the result. The tests are
-  `a_session_reset_during_a_freeze_names_the_pause` (`:7908`),
-  `a_reset_after_the_thaw_tick_names_the_remembered_pause` (`:7945`),
-  `a_reset_with_no_remembered_pause_keeps_its_error` (`:7981`),
-  `an_on_time_tick_forgets_the_pause` (`:7994`),
-  `a_session_starts_with_no_remembered_pause` (`:8015`),
-  `a_session_reset_while_running_keeps_its_error` (`:8026`) and
-  `the_pause_floor_matches_the_rx_deadline_line` (`:8053`).
+  `a_session_reset_during_a_freeze_names_the_pause` (`:7933`),
+  `a_reset_after_the_thaw_tick_names_the_remembered_pause` (`:7970`),
+  `a_reset_with_no_remembered_pause_keeps_its_error` (`:8006`),
+  `an_on_time_tick_forgets_the_pause` (`:8019`),
+  `a_session_starts_with_no_remembered_pause` (`:8040`),
+  `a_session_reset_while_running_keeps_its_error` (`:8051`) and
+  `the_pause_floor_matches_the_rx_deadline_line` (`:8078`).
 - **In the field** (the same lab guest). In the 40 rounds of 70 s,
   `/derp` tripped 3 times and read "did not run" each time, while the
   control WS's 80 s and the relay's 90 s deadlines never tripped. In
@@ -5038,7 +5073,7 @@ clean, and Windows can end a worker before its service host hears of a
 restart. On released 0.4.197 two `shutdown /r` within five minutes of a
 self-update reached `crash_count=3`, and a healthy device tried to roll
 itself back. `config::previous_run`
-([`crates/agent-core/src/config.rs:2646`](../crates/agent-core/src/config.rs#L2646))
+([`crates/agent-core/src/config.rs:2667`](../crates/agent-core/src/config.rs#L2667))
 is the one table that decides, on every start:
 
 | How the last run ended | Who can say | `PreviousRun` | Counts |

@@ -488,6 +488,7 @@ mod tests {
                 rc_overlay: None,
                 idle_secs: None,
                 lock_on_end: None,
+                media_legacy: None,
             })))
             .await
             .unwrap();

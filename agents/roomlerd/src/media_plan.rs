@@ -23,8 +23,12 @@
 //! §7.5, the pumps its ratchet stops growing): their sessions carry the plan's
 //! start only. Their fault ladders arrive with their stages (R8, R11).
 //!
-//! The kill switch is `ROOMLERD_MEDIA_PLAN=0`, which R0 folds into
-//! `rc_media_legacy` as `media_plan`.
+//! The kill switch is a `media_plan` entry in `rc_media_legacy` (FR-135 §7.1,
+//! [`crate::media_paths`]), pushable and live from the next session.
+//! `ROOMLERD_MEDIA_PLAN=0` still works, read as that entry. The plan names the
+//! session's other key-chosen paths (`legacy`, `refused`), so a reader sees
+//! what the keys did; the verb follows the env switch alone, because a hello
+//! is not re-sent for a push and a viewer reads no fault into silence.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -121,6 +125,15 @@ pub struct Plan {
     pub ladder: Vec<Step>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
+    /// FR-135 §7.1 — the media paths this session runs on their OLD code
+    /// because `rc_media_legacy` says so, listed or implied by a path they
+    /// stand on. Absent when no key sent one back.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub legacy: Vec<&'static str>,
+    /// FR-135 §7.1 — `rc_media_canary` entries this session did not honour,
+    /// `path:why` (`legacy`, `not_built`, `requires:<path>`). Absent when none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused: Vec<String>,
 }
 
 /// What a backend's error text may put on a page: one line, bounded.
@@ -154,6 +167,8 @@ impl Plan {
             capture: None,
             ladder: Vec::new(),
             stopped: None,
+            legacy: Vec::new(),
+            refused: Vec::new(),
         }
     }
 
@@ -314,21 +329,26 @@ fn with(session_id: ObjectId, change: impl FnOnce(&mut Plan, u64)) {
 /// Begin this session's plan, and keep the viewer told of it until `until`.
 ///
 /// Called before the pump is spawned, when the stash of the control channel is
-/// still empty, so the first message waits in the retry below. With the switch
-/// off nothing is registered, and every writer here does nothing.
+/// still empty, so the first message waits in the retry below. With
+/// `media_plan` on the session's old path nothing is registered, and every
+/// writer here does nothing.
 pub fn start(
     session_id: ObjectId,
     transport: Option<&str>,
     chosen_codec: &str,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     until: CancellationToken,
+    paths: &crate::media_paths::MediaPaths,
 ) {
-    if !enabled() {
+    if !paths.is_new(crate::media_paths::MediaPath::MediaPlan) {
         return;
     }
+    let mut first = Plan::new(transport, chosen_codec);
+    first.legacy = paths.legacy_wire();
+    first.refused = paths.refused_wire();
     let plan = Arc::new(SessionPlan {
         started: Instant::now(),
-        plan: Mutex::new(Plan::new(transport, chosen_codec)),
+        plan: Mutex::new(first),
         changed: tokio::sync::Notify::new(),
     });
     registry().insert(session_id, plan.clone());
@@ -791,6 +811,7 @@ mod tests {
             "h264",
             Arc::new(tokio::sync::Mutex::new(None)),
             end.clone(),
+            &crate::media_paths::MediaPaths::default(),
         );
         assert!(registry().get(&id).is_some());
         fps_answer(id, 60, None);
@@ -802,5 +823,63 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         panic!("the plan outlived its session");
+    }
+
+    /// FR-135 §7.1 — `media_plan` on the session's old path registers no plan,
+    /// so no writer reaches a viewer; and a plan that does start names the
+    /// paths the keys sent back, and what they refused, with no fields at all
+    /// when no key spoke.
+    #[tokio::test]
+    async fn the_keys_switch_the_plan_off_and_are_named_in_it() {
+        use crate::media_paths::{MediaPath, parse, resolve};
+        let off = resolve(&parse(Some("media_plan")), &parse(None));
+        let id = ObjectId::new();
+        let end = CancellationToken::new();
+        let dc = Arc::new(tokio::sync::Mutex::new(None));
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            dc.clone(),
+            end.clone(),
+            &off,
+        );
+        assert!(registry().get(&id).is_none(), "no plan on the old path");
+
+        let keyed = resolve(&parse(Some("capture_stage")), &parse(Some("encode_stage")));
+        assert!(keyed.is_new(MediaPath::MediaPlan));
+        let id = ObjectId::new();
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            dc.clone(),
+            end.clone(),
+            &keyed,
+        );
+        let (_, payload) = registry().get(&id).expect("a plan").snapshot();
+        let v: serde_json::Value = serde_json::from_str(&payload.expect("a payload")).unwrap();
+        assert_eq!(
+            v["legacy"],
+            serde_json::json!(["capture_stage", "encode_stage", "rtp_sink", "high_refresh"])
+        );
+        assert_eq!(v["refused"], serde_json::json!(["encode_stage:legacy"]));
+
+        let id = ObjectId::new();
+        start(
+            id,
+            Some("data-channel-h264"),
+            "h264",
+            dc,
+            end.clone(),
+            &crate::media_paths::MediaPaths::default(),
+        );
+        let (_, payload) = registry().get(&id).expect("a plan").snapshot();
+        let v: serde_json::Value = serde_json::from_str(&payload.expect("a payload")).unwrap();
+        assert!(
+            v.get("legacy").is_none() && v.get("refused").is_none(),
+            "{v}"
+        );
+        end.cancel();
     }
 }

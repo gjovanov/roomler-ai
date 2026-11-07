@@ -322,3 +322,149 @@ async fn a_session_says_its_plan_on_the_control_channel_and_hears_the_viewers_re
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), sig).await;
 }
+
+/// FR-135 §7.1 — `rc_media_legacy`, pushed end to end, is in force from the
+/// device's NEXT session with no restart: R2's plan is the path it sends back
+/// here, because it is the one this agent, with no encoder compiled in, runs.
+///
+/// A device that opted in writes the list to its config file and reports it
+/// under `live`, never `needs_restart`, which the listing resolves into
+/// `applied`. The same process then opens a session that says no plan, where
+/// the session before the push said one.
+#[tokio::test]
+async fn a_pushed_media_plan_entry_takes_the_next_sessions_plan_away_with_no_restart() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("mediaplanoff").await;
+    let mut cfg = enrol_real(&app, &seeded, "mediaplanoff-host").await;
+    // The device's own opt-in, set where only someone at the machine can set
+    // it: in its config file.
+    cfg.remote_config_enabled = true;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    roomlerd::config::save(&path, &cfg).unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let sig = crate::agent_tests::spawn_agent_signaling_on(
+        roomlerd::signaling::OrgCtx::primary(roomlerd::token_slot::TokenSlot::new(
+            cfg.agent_token.clone(),
+        )),
+        cfg.clone(),
+        path.clone(),
+        stop_rx,
+    );
+    wait_online(&app, &seeded, &cfg).await;
+
+    // Before the push: the built-in default, a plan.
+    let mut viewer = open_viewer(&app, &seeded, &cfg).await;
+    assert!(
+        next_plan(&mut viewer, Duration::from_secs(10))
+            .await
+            .is_some(),
+        "the default session says its plan"
+    );
+    viewer.pc.close().await.ok();
+    drop(viewer);
+
+    let desired = format!(
+        "/api/tenant/{}/agent/{}/desired-config",
+        seeded.tenant_id, cfg.agent_id
+    );
+    let resp = app
+        .auth_put(&desired, &seeded.admin.access_token)
+        .json(&json!({ "rc_media_legacy": "media_plan" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "desired-config PUT");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["desired"]["rc_media_legacy"],
+        json!("media_plan"),
+        "{body}"
+    );
+    let revision = body["revision"].as_u64().expect("a revision");
+
+    // FR-132 P1b delivers a save to a connected device at once.
+    let url = format!("/api/tenant/{}/agent/{}", seeded.tenant_id, cfg.agent_id);
+    let mut row = Value::Null;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        row = app
+            .auth_get(&url, &seeded.admin.access_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if row["remote_config"]["report"]["revision"].as_u64() == Some(revision) {
+            break;
+        }
+    }
+    let rc = &row["remote_config"];
+    assert_eq!(
+        rc["report"]["revision"].as_u64(),
+        Some(revision),
+        "the device never reported on this revision: {row}"
+    );
+    assert_eq!(rc["report"]["outcome"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(rc["report"]["live"], json!(["rc_media_legacy"]), "{rc}");
+    assert!(
+        rc["report"]["needs_restart"]
+            .as_array()
+            .is_none_or(|l| l.is_empty()),
+        "read at each session's open, so nothing waits on a restart: {rc}"
+    );
+    assert_eq!(rc["state"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(
+        roomlerd::config::load(&path)
+            .unwrap()
+            .rc_media_legacy
+            .as_deref(),
+        Some("media_plan"),
+        "the device wrote the list to its own config file"
+    );
+
+    // The next session, on the same process: no plan.
+    let mut viewer = open_viewer(&app, &seeded, &cfg).await;
+    assert_eq!(
+        next_plan(&mut viewer, Duration::from_secs(3)).await,
+        None,
+        "media_plan is on this session's old path"
+    );
+
+    // What the door refuses, from the review: a spelling no device can read is
+    // a 400 (it would be written, reported applied, and read as nothing), and
+    // the key that turns new code on is the device's, a 403. Neither moves the
+    // stored revision.
+    for (body, want) in [
+        (json!({ "rc_media_legacy": "media-plan" }), 400),
+        (json!({ "rc_media_legacy": "Media_Plan" }), 400),
+        (json!({ "rc_media_legacy": "media_plan;stats" }), 400),
+        (json!({ "rc_media_canary": "media_plan" }), 403),
+    ] {
+        let resp = app
+            .auth_put(&desired, &seeded.admin.access_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), want, "{body}");
+    }
+    let row: Value = app
+        .auth_get(&url, &seeded.admin.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        row["remote_config"]["desired"]["revision"].as_u64(),
+        Some(revision),
+        "a refused body stores nothing: {row}"
+    );
+
+    viewer.pc.close().await.ok();
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), sig).await;
+}

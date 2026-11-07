@@ -26,9 +26,11 @@
 //! `record_dir` (FR-85), read when a recording starts,
 //! `local_restart_enabled` (FR-84 D3), read by the restart verb on every
 //! request, `files_dir`, which `files::set_files_dir` re-seeds on the
-//! same path and every drop re-reads (FR-84 D4), and FR-52's three
+//! same path and every drop re-reads (FR-84 D4), FR-52's three
 //! `external_*` keys, read from the FILE each time an outsider knocks and
-//! each time an external session is requested.
+//! each time an external session is requested, and FR-135's
+//! `rc_media_legacy` and `rc_media_canary`, which `adopt_local` also seeds and
+//! each session's open reads.
 //! FR-84 D2 made that per-key truth part of the registry ([`KeyMeta::live`])
 //! instead of a list each client kept by hand, and gave every key a
 //! [`Group`] and a [`Tier`] so the Settings page can be more than 150 rows.
@@ -1710,6 +1712,22 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-118 - GPU-input cells this device must not open, by the probe or by a session: comma-separated name:gpu entries (e.g. hevc_qsv:gpu). Empty or `none` = deny nothing. Env: ROOMLERD_ZERO_COPY_DENY. Pushable through remote config (FR-132). Restart required.",
     },
     KeyMeta {
+        key: "rc_media_legacy",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: true,
+        kind: "string",
+        description: "FR-135 - media paths a remote-desktop session must run on their OLD code: comma-separated names, one per FR-135 phase (e.g. media_plan). Whole names only, never a prefix; an unknown name is ignored. Empty or `none` = no entries. Beats rc_media_canary. Pushable through remote config. Applies from the next session, no restart.",
+    },
+    KeyMeta {
+        key: "rc_media_canary",
+        group: Group::VideoEncoding,
+        tier: Tier::Advanced,
+        live: true,
+        kind: "string",
+        description: "FR-135 - media paths a remote-desktop session runs on their NEW code before the built-in default does: the same names as rc_media_legacy, which beats it. A name this build has no new code for is refused, session by session. Empty or `none` = no entries. This device only: never pushable. Applies from the next session, no restart.",
+    },
+    KeyMeta {
         key: "nvenc_split",
         group: Group::VideoEncoding,
         tier: Tier::Advanced,
@@ -2128,6 +2146,8 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "zero_copy" => cfg.zero_copy.map(fmt_bool),
         "color_description" => cfg.color_description.map(fmt_bool),
         "zero_copy_deny" => cfg.zero_copy_deny.clone(),
+        "rc_media_legacy" => cfg.rc_media_legacy.clone(),
+        "rc_media_canary" => cfg.rc_media_canary.clone(),
         "nvenc_split" => cfg.nvenc_split.clone(),
         "vaapi_device" => cfg.vaapi_device.clone(),
         "d3d12_adapter" => cfg.d3d12_adapter.clone(),
@@ -2767,6 +2787,24 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
                 }
             }
         }
+        "rc_media_legacy" => {
+            cfg.rc_media_legacy = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    validate_media_path_list("rc_media_legacy", v)?;
+                    Some(v.to_string())
+                }
+            }
+        }
+        "rc_media_canary" => {
+            cfg.rc_media_canary = match value.map(str::trim).filter(|s| !s.is_empty()) {
+                None => None,
+                Some(v) => {
+                    validate_media_path_list("rc_media_canary", v)?;
+                    Some(v.to_string())
+                }
+            }
+        }
         "nvenc_split" => {
             cfg.nvenc_split = match value.map(|s| s.trim().to_ascii_lowercase()) {
                 None => None,
@@ -2907,6 +2945,15 @@ pub fn validate_fps_denylist(v: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// FR-135 §7.1 — `rc_media_legacy` and `rc_media_canary` take comma-separated
+/// path names (`media_plan`, `stats`), or `none`. Only the SHAPE is checked
+/// here: the names belong to the daemon's build, which ignores one it does not
+/// know, so a name from a newer FR-135 phase is not a typo to this crate.
+pub fn validate_media_path_list(key: &str, v: &str) -> Result<(), String> {
+    // The one check the server's door runs too, so the two never disagree.
+    roomler_ai_remote_control::models::check_media_path_list(v).map_err(|e| format!("{key}: {e}"))
 }
 
 /// FR-118 — `zero_copy_deny` entries are `name:gpu`: a plain FFmpeg encoder
@@ -3216,6 +3263,10 @@ mod tests {
             "display_match",
             // FR-100 P1c — re-seeded by `adopt_local`; every offer reads it.
             "peer_auth",
+            // FR-135 §7.1 — re-seeded by `adopt_local`; each session's open
+            // reads them.
+            "rc_media_legacy",
+            "rc_media_canary",
             // FR-52 — read at use: from the config FILE at every knock and
             // every external session request, so nothing re-seeds them.
             "external_access_enabled",
