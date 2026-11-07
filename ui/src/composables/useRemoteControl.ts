@@ -57,6 +57,7 @@ import {
   type SharpenMode,
 } from '@/workers/rc-fsr-render'
 import { colorSpaceLabel } from '@/workers/rc-decoder-config'
+import { MEDIA_BUCKETS, type ViewerMediaWindow } from '@/workers/rc-media-window'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -102,6 +103,7 @@ import {
   type BenchMode,
   type BenchPath,
   type BenchProber,
+  type RcL4Join,
   type VideoBenchSampler,
 } from './rcBench'
 import { useSnackbar } from './useSnackbar'
@@ -2437,6 +2439,7 @@ export function decodeStatWireMessage(
   probeRttMs?: number | null,
   link?: { rxBps: number; queueMs: number | null } | null,
   arrival?: { avgMs: number } | null,
+  media?: Partial<ViewerMediaWindow> | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -2485,6 +2488,44 @@ export function decodeStatWireMessage(
     // The agent packs this into an i16; clamp here so a pathological
     // window cannot wrap into its own sign.
     msg.queue_ms = Math.min(Math.max(Math.round(link.queueMs), -32768), 32767)
+  }
+  // FR-135 R0 (N9-N12, N16) — the decode worker's window of media numbers
+  // (`rc-media-window.ts`), for the agent's heartbeat and the session's
+  // summary. Each field goes only when the worker counted it, so absent is
+  // **not counted**, never zero; nothing here is read by a rate law, and the
+  // fields above are unchanged. A `_ms` field is twelve log-2 ms buckets for
+  // this window; `chunk_gaps`, `freezes` and `painted` are cumulative.
+  if (media) {
+    const hist = (v: unknown): number[] | null =>
+      Array.isArray(v) &&
+      v.length === MEDIA_BUCKETS &&
+      v.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0)
+        ? v.map((n: number) => Math.min(n, 4_294_967_295))
+        : null
+    const count = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isInteger(v) && v >= 0 ? Math.min(v, Number.MAX_SAFE_INTEGER) : null
+    const hists: [string, unknown][] = [
+      ['dec_ms', media.dec],
+      ['paint_ms', media.paint],
+      ['fwd_ms', media.fwd],
+      ['backlog_ms', media.backlog],
+      ['arr_gap_ms', media.arrGap],
+      ['gate_ms', media.gate],
+    ]
+    for (const [key, v] of hists) {
+      const h = hist(v)
+      if (h) msg[key] = h
+    }
+    const counts: [string, unknown][] = [
+      ['chunk_gaps', media.chunkGaps],
+      ['freezes', media.freezes],
+      ['painted', media.painted],
+    ]
+    for (const [key, v] of counts) {
+      const n = count(v)
+      if (n !== null) msg[key] = n
+    }
+    if (typeof media.decoderHw === 'boolean') msg.decoder_hw = media.decoderHw
   }
   // FR-132 P1 — this viewer counts its decode errors (one `rc:decode-error`
   // each, `decodeErrorWireMessage`), so the agent reports the session's count
@@ -5652,6 +5693,10 @@ export function useRemoteControl(
    *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
    *  until `rc:video-info` names the agent's real encoder. */
   const dcDecoderCodec = ref<string | null>(null)
+  /** FR-135 R0 (N2) — whether the browser says the active DataChannel decoder
+   *  is hardware (`rc-media-window.ts`), for the `rc.l4` record; `null` until
+   *  the worker knows. */
+  let dcDecoderHw: boolean | null = null
   /** P6 — the agent's InputArbiter state (participants, mode, floor
    *  holder). Null until the first `rc:control.state` broadcast; old
    *  agents never send it, so the multi-user UI self-hides. */
@@ -7184,6 +7229,25 @@ export function useRemoteControl(
     benchProber?.onPainted(seq, paintedAt, path)
   }
 
+  /** FR-135 R0 (N2) — what this session is, for the `rc.l4` record, as the
+   *  page knows it at the flush. A decode worker's renderer and decoder count
+   *  only while one paints. */
+  function benchJoin(): RcL4Join {
+    const vi = videoInfo.value
+    const video = benchSurface?.querySelector('video') as HTMLVideoElement | null
+    const dc = vp9_444Active.value || hevcActive.value
+    return {
+      targetFps: vi?.fps ?? mediaPlan.value?.fps?.granted ?? null,
+      width: mediaIntrinsicW.value || video?.videoWidth || null,
+      height: mediaIntrinsicH.value || video?.videoHeight || null,
+      codec: vi?.codec || null,
+      chroma: vi?.chroma || null,
+      carrier: vi?.transport || null,
+      render: dc ? (renderInfo.value?.mode ?? null) : null,
+      decoderHw: dc ? dcDecoderHw : null,
+    }
+  }
+
   /** FR-16 L4 — start probing: called when the input channel opens, and a
    *  no-op unless this session resolved `sessionBench`. Every sampler is
    *  armed per probe; only the one painting frames can answer. */
@@ -7210,6 +7274,7 @@ export function useRemoteControl(
           agentOrgId: lastConnectArgs?.orgId ?? null,
           agentId: lastConnectArgs?.agentId ?? null,
           sessionId: sessionId.value,
+          join: benchJoin(),
         })
       },
     })
@@ -7530,12 +7595,13 @@ export function useRemoteControl(
     probeRttMs?: number | null,
     link?: { rxBps: number; queueMs: number | null } | null,
     arrival?: { avgMs: number } | null,
+    media?: Partial<ViewerMediaWindow> | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(
-        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival)),
+        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media)),
       )
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
@@ -7561,6 +7627,8 @@ export function useRemoteControl(
     /** FR-59 P3 — ms the transit queue grew this window; `null`/absent =
      *  fewer than two frames arrived, which is no-signal, not stability. */
     queueMs?: number | null
+    /** FR-135 R0 — the worker's window for the agent (`rc-media-window.ts`). */
+    media?: Partial<ViewerMediaWindow> | null
   }) {
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
@@ -7593,6 +7661,12 @@ export function useRemoteControl(
     // FR-70 M0 — the age at arrival, present under the same conditions as
     // `age` (probe locked, frames painted).
     const arrival = age && m.arrival && m.arrival.n > 0 ? { avgMs: m.arrival.avgMs } : null
+    // FR-135 R0 — rides along as it came; `decodeStatWireMessage` keeps only
+    // what the worker counted. The decoder's form is kept for `rc.l4` (N2).
+    const media = m.media && typeof m.media === 'object' ? m.media : null
+    if (media && (typeof media.decoderHw === 'boolean' || media.decoderHw === null)) {
+      dcDecoderHw = media.decoderHw
+    }
     sendDecodeStat(
       typeof m.fps === 'number' ? m.fps : 0,
       struggleWindow.observe(bad),
@@ -7600,6 +7674,7 @@ export function useRemoteControl(
       clockBest?.rttMs ?? null,
       link,
       arrival,
+      media,
     )
   }
 
@@ -9696,6 +9771,7 @@ export function useRemoteControl(
     inputReach.value = null
     idleEndsAt.value = null
     dcDecoderCodec.value = null
+    dcDecoderHw = null
     remoteLayout.value = null
     localClipboardBridge.value = null
     localClipboardBridgePort.value = null
@@ -10914,6 +10990,10 @@ export function useRemoteControl(
           hint: parsed.hint,
         }
         mediaWaitingSinceMs = Date.now()
+        // FR-135 R0c — the pumps send nothing while capture waits, so the
+        // decode workers must not count the gap across the hold as a freeze.
+        hevcWorker?.postMessage({ type: 'media-hold' })
+        vp9_444Worker?.postMessage({ type: 'media-hold' })
         console.info(
           `[rc] the host is waiting for the person at the screen (${parsed.for}), up to ${Math.round(parsed.waitsMs / 1000)} s`,
         )

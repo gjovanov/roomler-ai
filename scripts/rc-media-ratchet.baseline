@@ -7,4 +7,4 @@ agent_env_reads=178 # r9:ENV-1: stays, a test-only fixture switch
 viewer_knobs=31
 pump_lines_rtp=1312
 pump_lines_vp9_dc=1465
-pump_lines_ffmpeg_dc=3938
+pump_lines_ffmpeg_dc=3958 # r0:VIEW-1: folds into R8's one loop

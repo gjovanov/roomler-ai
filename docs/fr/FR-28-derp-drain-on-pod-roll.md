@@ -48,7 +48,7 @@ sequenceDiagram
     A->>A: the sweep logs hard-errored and carriers rebuild
 ```
 
-The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3222-3229`)
+The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3316-3323`)
 and the Hub ends the agent's sessions when it unregisters (`crates/modules/fleet/src/hub.rs:1125-1167`).
 `docs/multi-pod-scale-out.md:182` records this; the 08-29 spec missed it.
 
@@ -70,7 +70,7 @@ under 0.4 s after its container started.
 backoff ladder (1, 2, 4, 8, 10 s; `agents/roomlerd/src/derp.rs:49`, `:571`): 3.4 s in one roll,
 7.5–7.7 s in ten, 15.2–15.8 s in two, 25.9 s in one. A replacement that listens just after a step
 waits for the next one. The control WS doubles the same way, up to 60 s
-(`agents/roomlerd/src/signaling.rs:1457`).
+(`agents/roomlerd/src/signaling.rs:1538`).
 
 A device in two orgs holds one socket per org, each pinned by its own tenant, so it can lose a
 socket in each wave. That accounts for the 6–8 hosts per roll that log two closes: on the roll of
@@ -172,7 +172,7 @@ flowchart TD
 | A major network change (only the control socket listens for one) | Restarts at 1 s | Back to 30 |
 
 The code: `FlatRedial` (`agents/roomlerd/src/ws_connect.rs:60`) with its allowance and wait (`:33`, `:38`), the
-control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1443`, `:1177`), and `/derp`'s
+control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1524`, `:1258`), and `/derp`'s
 (`agents/roomlerd/src/derp.rs:557`, `:551`). Regional relays keep their ladder
 (`agents/roomlerd/src/derp.rs:332`): no pod rolls under one.
 
@@ -215,7 +215,7 @@ this size it is a number to measure first. The flip is a staged rollout and the 
   switch on too: climbing there would slow the floor on any path whose middlebox kills young sockets, on exactly
   the hosts with no other carrier. That change needs its own read.
 - A clean close on the control socket redials with no wait at all (the `Ok(())` arm,
-  `agents/roomlerd/src/signaling.rs:1181`). A roll does not take that arm: 22 of 22 hosts on the 12:43Z roll below
+  `agents/roomlerd/src/signaling.rs:1262`). A roll does not take that arm: 22 of 22 hosts on the 12:43Z roll below
   read `Connection reset without closing handshake`.
 
 ## P3: the pre-pull
@@ -395,7 +395,7 @@ The operator's decision of 2026-11-02 changed the first two. AC3 to AC6 keep the
 | Docs | Written for what is built | Ticked with the field numbers in them |
 
 ⚠️ What moved with AC1: the reader for it does not exist either. `video DC delivery gap` is console-only and logs
-only above 1500 ms (`ui/src/composables/useRemoteControl.ts:8121-8124`).
+only above 1500 ms (`ui/src/composables/useRemoteControl.ts:8196-8199`).
 
 ## Out of scope
 

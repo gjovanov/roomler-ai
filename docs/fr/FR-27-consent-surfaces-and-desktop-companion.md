@@ -67,7 +67,7 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:5604`, `ssh.rs:2176` vs `git grep write_pending`
+   — `signaling.rs:5706`, `ssh.rs:2176` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
@@ -690,7 +690,7 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2625`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2566`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
 directive: `Prompt { timeout: host_window }` (`signaling.rs:2526`). The control

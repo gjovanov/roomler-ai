@@ -86,12 +86,18 @@ flowchart TB
   tells its decoder the agent's BT.601 limited colour space through
   `rc-decoder-config` (FR-130 P2; kill switch `roomler-rc-colorspace=off`):
   [remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2).
+  The two data-channel workers also keep `rc-media-window`: decode, paint, hop,
+  arrival and key-frame-gate times in the agent's log-2 buckets, the freeze and
+  painted counts, and whether the decoder is hardware, folded into their 1 s `stats`
+  message for the agent (FR-135 R0,
+  [remote-control.md §11.13.1](remote-control.md#11131-the-viewers-half-r0c)).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
-  its frame-skip rate control), one `rc:decode-error` per decode error, counted into
+  its frame-skip rate control, and since FR-135 R0 also carries the worker's media
+  window, which only records), one `rc:decode-error` per decode error, counted into
   the session's stats (FR-132 P1,
   [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
   a data-channel decoder that fails after its first frame replaced in place, off with
@@ -145,7 +151,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7714`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7789`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on

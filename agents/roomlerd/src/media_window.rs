@@ -32,6 +32,20 @@
 //! the session reports. With `stats` on a session's old path
 //! (`rc_media_legacy`, [`crate::media_paths`]) there is no window at all, and
 //! the heartbeat is today's.
+//!
+//! **The viewer's half** ([`ViewerReport`]) comes in on `rc:decodestat`: the
+//! decode worker's own window in the same twelve buckets
+//! (`ui/src/workers/rc-media-window.ts`), parsed here, kept in
+//! [`crate::session_telemetry`] and printed on the FFmpeg heartbeat as
+//! `viewer_*`:
+//!
+//! | Field | Instrument | Closes |
+//! |---|---|---|
+//! | `dec_ms`, `paint_ms`, `fwd_ms`, `backlog_ms`, `chunk_gaps`, `decoder_hw` | N9 | decode and paint were HUD-only |
+//! | `arr_gap_ms` | N10, the viewer's half | the cadence frames arrive at |
+//! | `freezes` | N11 | no freeze counter |
+//! | `gate_ms` | N12, the viewer's half | how long the picture waits for a key frame |
+//! | `painted` | N16 | frames painted beside frames encoded |
 
 use std::time::{Duration, Instant};
 
@@ -344,6 +358,91 @@ impl MediaWindow {
     }
 }
 
+/// FR-135 R0 — one `rc:decodestat`'s viewer numbers. Each field is `None`
+/// when the message lacks it, or carries it in a shape it should not have: an
+/// older viewer, a path that does not count it, or a viewer this agent cannot
+/// trust with it. Absent is **not counted**, never zero, and one bad field never
+/// costs the others.
+///
+/// The `_ms` histograms are the viewer's window, which a fold sums; the counts
+/// are cumulative for the viewer's session, and a fold keeps the later reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewerReport {
+    pub dec: Option<[u32; BUCKETS]>,
+    pub paint: Option<[u32; BUCKETS]>,
+    pub fwd: Option<[u32; BUCKETS]>,
+    pub backlog: Option<[u32; BUCKETS]>,
+    pub arr_gap: Option<[u32; BUCKETS]>,
+    pub gate: Option<[u32; BUCKETS]>,
+    pub chunk_gaps: Option<u32>,
+    pub freezes: Option<u32>,
+    pub painted: Option<u64>,
+    pub decoder_hw: Option<bool>,
+}
+
+impl ViewerReport {
+    /// Read the fields from an `rc:decodestat`. The viewer is the untrusted
+    /// side: a histogram must be exactly twelve whole counts, and a count must
+    /// sit inside the session row's own bounds
+    /// ([`roomler_ai_remote_control::models::SessionVideo::checked`]), so no
+    /// viewer can make this agent send a reading the server drops whole.
+    pub fn parse(val: &serde_json::Value) -> Self {
+        use roomler_ai_remote_control::models::SessionVideo;
+        let hist = |key: &str| -> Option<[u32; BUCKETS]> {
+            let arr = val.get(key)?.as_array()?;
+            if arr.len() != BUCKETS {
+                return None;
+            }
+            let mut out = [0u32; BUCKETS];
+            for (slot, v) in out.iter_mut().zip(arr) {
+                *slot = u32::try_from(v.as_u64()?).ok()?;
+            }
+            Some(out)
+        };
+        let count = |key: &str, max: u64| val.get(key)?.as_u64().filter(|n| *n <= max);
+        Self {
+            dec: hist("dec_ms"),
+            paint: hist("paint_ms"),
+            fwd: hist("fwd_ms"),
+            backlog: hist("backlog_ms"),
+            arr_gap: hist("arr_gap_ms"),
+            gate: hist("gate_ms"),
+            chunk_gaps: count("chunk_gaps", u32::MAX as u64).map(|n| n as u32),
+            freezes: count("freezes", SessionVideo::MAX_FREEZES as u64).map(|n| n as u32),
+            painted: count("painted", SessionVideo::MAX_FRAMES),
+            decoder_hw: val.get("decoder_hw").and_then(|v| v.as_bool()),
+        }
+    }
+
+    /// Whether the message carried none of it: an older viewer.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Fold a later report into this one: the histograms add, and each count
+    /// takes the later reading where it has one.
+    pub fn fold(&mut self, later: &ViewerReport) {
+        fn add(acc: &mut Option<[u32; BUCKETS]>, more: Option<[u32; BUCKETS]>) {
+            if let Some(more) = more {
+                let acc = acc.get_or_insert([0; BUCKETS]);
+                for (a, m) in acc.iter_mut().zip(more) {
+                    *a = a.saturating_add(m);
+                }
+            }
+        }
+        add(&mut self.dec, later.dec);
+        add(&mut self.paint, later.paint);
+        add(&mut self.fwd, later.fwd);
+        add(&mut self.backlog, later.backlog);
+        add(&mut self.arr_gap, later.arr_gap);
+        add(&mut self.gate, later.gate);
+        self.chunk_gaps = later.chunk_gaps.or(self.chunk_gaps);
+        self.freezes = later.freezes.or(self.freezes);
+        self.painted = later.painted.or(self.painted);
+        self.decoder_hw = later.decoder_hw.or(self.decoder_hw);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +584,105 @@ mod tests {
             .expect("due");
         assert_eq!(f.ms, MAX_FOLD.as_millis() as u64);
         assert!(!f.moving);
+    }
+
+    fn bucket_at(i: usize, n: u32) -> [u32; BUCKETS] {
+        let mut h = [0; BUCKETS];
+        h[i] = n;
+        h
+    }
+
+    /// FR-135 R0 — what a viewer's decode worker sends (`decodeStatWireMessage`
+    /// in `ui/src/composables/useRemoteControl.ts`), read whole.
+    #[test]
+    fn a_viewer_report_reads_every_field_the_viewer_sent() {
+        let h = |i: usize, n: u32| serde_json::json!(bucket_at(i, n));
+        let r = ViewerReport::parse(&serde_json::json!({
+            "t": "rc:decodestat", "fps": 60, "struggling": false, "de": 1,
+            "dec_ms": h(3, 50), "paint_ms": h(0, 60), "fwd_ms": h(0, 61),
+            "backlog_ms": h(1, 59), "arr_gap_ms": h(4, 58), "gate_ms": h(8, 1),
+            "chunk_gaps": 2, "freezes": 1, "painted": 1234, "decoder_hw": true,
+        }));
+        assert_eq!(
+            r,
+            ViewerReport {
+                dec: Some(bucket_at(3, 50)),
+                paint: Some(bucket_at(0, 60)),
+                fwd: Some(bucket_at(0, 61)),
+                backlog: Some(bucket_at(1, 59)),
+                arr_gap: Some(bucket_at(4, 58)),
+                gate: Some(bucket_at(8, 1)),
+                chunk_gaps: Some(2),
+                freezes: Some(1),
+                painted: Some(1234),
+                decoder_hw: Some(true),
+            }
+        );
+        // An older viewer's decodestat carries none of it.
+        let old = ViewerReport::parse(&serde_json::json!({
+            "t": "rc:decodestat", "fps": 60, "struggling": false, "de": 1, "queue_ms": 4,
+        }));
+        assert!(old.is_empty(), "{old:?}");
+    }
+
+    /// The viewer is the untrusted side: a field in the wrong shape, or a count
+    /// the session row would refuse, is dropped alone, so no viewer can have
+    /// the agent's own reading dropped by the server.
+    #[test]
+    fn a_viewer_field_out_of_shape_is_dropped_alone() {
+        use roomler_ai_remote_control::models::SessionVideo;
+        let r = ViewerReport::parse(&serde_json::json!({
+            "dec_ms": [1, 2, 3],
+            "paint_ms": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1],
+            "fwd_ms": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.5],
+            "backlog_ms": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, u64::from(u32::MAX) + 1],
+            "arr_gap_ms": "[0,0,0,0,0,0,0,0,0,0,0,0]",
+            "gate_ms": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+            "chunk_gaps": -1,
+            "freezes": u64::from(SessionVideo::MAX_FREEZES) + 1,
+            "painted": SessionVideo::MAX_FRAMES + 1,
+            "decoder_hw": "yes",
+        }));
+        assert_eq!(
+            r,
+            ViewerReport {
+                gate: Some(bucket_at(11, 3)),
+                ..Default::default()
+            }
+        );
+        let at_the_bounds = ViewerReport::parse(&serde_json::json!({
+            "freezes": SessionVideo::MAX_FREEZES,
+            "painted": SessionVideo::MAX_FRAMES,
+        }));
+        assert_eq!(at_the_bounds.freezes, Some(SessionVideo::MAX_FREEZES));
+        assert_eq!(at_the_bounds.painted, Some(SessionVideo::MAX_FRAMES));
+    }
+
+    /// A fold sums the windows, and a count takes the later reading where it
+    /// has one: a window that lacks one keeps the last.
+    #[test]
+    fn viewer_reports_fold_windows_and_keep_the_latest_count() {
+        let mut acc = ViewerReport::default();
+        acc.fold(&ViewerReport {
+            dec: Some(bucket_at(3, 40)),
+            gate: Some(bucket_at(8, 1)),
+            freezes: Some(1),
+            painted: Some(100),
+            decoder_hw: Some(true),
+            ..Default::default()
+        });
+        acc.fold(&ViewerReport {
+            dec: Some(bucket_at(3, u32::MAX)),
+            paint: Some(bucket_at(0, 60)),
+            painted: Some(160),
+            ..Default::default()
+        });
+        assert_eq!(acc.dec, Some(bucket_at(3, u32::MAX)), "saturating");
+        assert_eq!(acc.paint, Some(bucket_at(0, 60)));
+        assert_eq!(acc.gate, Some(bucket_at(8, 1)));
+        assert_eq!(acc.fwd, None, "never sent, never counted");
+        assert_eq!(acc.freezes, Some(1), "kept from the window that had it");
+        assert_eq!(acc.painted, Some(160), "the later reading");
+        assert_eq!(acc.decoder_hw, Some(true));
     }
 }
