@@ -421,6 +421,10 @@ impl AgentPeer {
         // peer's own sender (the seam), which for a delegated session is the
         // delegation channel to the daemon, never the worker's own WS.
         carrier_ready_tx: mpsc::Sender<bson::oid::ObjectId>,
+        // FR-135 §7.1 — which media paths this session runs, old or new,
+        // decided once by the signalling loop from `rc_media_legacy` and
+        // `rc_media_canary` (`RemoteConfigServices::media_paths`).
+        media_paths: crate::media_paths::MediaPaths,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -1628,12 +1632,15 @@ impl AgentPeer {
 
         // FR-135 R2 — say what this session is set to send, before any pump
         // runs, so a pump that cannot start still leaves the viewer knowing.
+        // §7.1 — unless `media_plan` is on this session's old path, and with
+        // the session's other key-chosen paths named in the plan.
         crate::media_plan::start(
             session_id,
             negotiated_transport.as_deref(),
             &chosen_codec,
             control_dc.clone(),
             session_end.clone(),
+            &media_paths,
         );
 
         // Start the capture→encode→track pump. The pump is self-regulating:

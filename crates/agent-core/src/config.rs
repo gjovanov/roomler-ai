@@ -1476,6 +1476,23 @@ pub struct AgentConfig {
     /// `zero_copy` itself is NOT pushable (FR-132 decision 1).
     #[serde(default)]
     pub zero_copy_deny: Option<String>,
+    /// FR-135 §7.1 — media paths a session must run on their OLD code,
+    /// comma-separated (`media_plan`, `stats`, … one name per FR-135 phase).
+    /// Unset or `none` = no entries. Entries match whole names, never a prefix;
+    /// an unknown name is ignored. LIVE: read at each session's open, so the
+    /// next session runs the new value with no restart. Pushable through remote
+    /// config, because it can only send a session back to code it already ran.
+    /// Beats `rc_media_canary`. Temporary: it is removed when FR-135's last old
+    /// path is deleted.
+    #[serde(default)]
+    pub rc_media_legacy: Option<String>,
+    /// FR-135 §7.1 — media paths a session runs on their NEW code before the
+    /// built-in default does, comma-separated, the same names as
+    /// `rc_media_legacy`. LOCAL ONLY: never pushable, because turning a path on
+    /// stays a decision made on the device or by a release. Live like
+    /// `rc_media_legacy`, which it loses to. Temporary, like it.
+    #[serde(default)]
+    pub rc_media_canary: Option<String>,
     /// FR-119 P2b-10 — how NVENC splits a frame across its engines above
     /// 60 fps: `auto` (unset; the driver picks the number of strips), `off`
     /// (never ask, as before P2b-10), or a strip count `2`–`4` (applied only
@@ -2982,6 +2999,8 @@ pub fn test_fixture() -> AgentConfig {
         zero_copy: None,
         color_description: None,
         zero_copy_deny: None,
+        rc_media_legacy: None,
+        rc_media_canary: None,
         nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,

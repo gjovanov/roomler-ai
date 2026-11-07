@@ -1247,6 +1247,8 @@ that reports the same input form costs nothing.
 | `fps` | the grant, when the answer moves | `granted`, plus `asked` and `reason` when an ask was refused |
 | `ladder` | every step down | `{from, to, why, at_ms}`. A cell that lost to the next, GPU form to CPU form, asked to granted. At most 24, and `stopped` still says how it ended |
 | `stopped` | the pump, on its way out | `no_encoder` or `encoder_fault`, and the backend's own words, one line of at most 160 characters |
+| `legacy` | session start | FR-135 §7.1 — the media paths this session runs on their OLD code because `rc_media_legacy` says so, listed or implied by a path they stand on. Absent when no key sent one back |
+| `refused` | session start | FR-135 §7.1 — `rc_media_canary` entries this session did not honour, as `path:why` (`legacy`, `not_built`, `requires:<path>`). Absent when none |
 
 ⚠️ **Three of those arrows are written by one pump.** The FFmpeg data-channel pump is
 the only one instrumented. An RTP or VP9 session carries the plan's start and nothing
@@ -1309,11 +1311,44 @@ Both directions are additive, and each is read by the other side's verb or by no
 | With `media-plan` | Older | Its parser drops an unknown `t`. It never sends `rc:viewer-hz`, so `viewer_hz()` stays `None` |
 | Older | Knows it | No plan arrives, so the page reads as it did. No `rc:viewer-hz` is sent, because the verb is absent |
 
-Kill switch: `ROOMLERD_MEDIA_PLAN=0` registers no plan, so every writer does nothing,
-and the agent stops advertising `media-plan`. R0 folds it into `rc_media_legacy` as
-`media_plan`, and the cap into R0's keys. Neither touches the server wire or the
-composition baseline: both messages are peer-to-peer control-channel JSON, and the
-baseline holds no verbs.
+Kill switch: a `media_plan` entry in `rc_media_legacy` (FR-135 §7.1, below) registers
+no plan for the sessions that open after it, so every writer does nothing. It is
+pushable with `MANAGE_AGENTS` and live, with no restart
+([`remote-config.md`](remote-config.md) §6, "A fifth"). `ROOMLERD_MEDIA_PLAN=0` still
+works, read as that entry, and it alone also stops the agent advertising `media-plan`:
+a hello is not re-sent for a push, and a viewer reads no fault into a missing plan. The
+cap is not in R0's keys yet; it stays on its own env switch until its flip. Neither
+message touches the server wire or the composition baseline: both are peer-to-peer
+control-channel JSON, and the baseline holds no verbs.
+
+**The media paths (FR-135 §7.1).** Each FR-135 phase adds a media path's new code beside
+the old, and two temporary keys choose between them per session:
+`rc_media_legacy` sends a session back to old code, and `rc_media_canary`, local only,
+turns new code on before its default does. Precedence is legacy, then canary, then the
+built-in default. Entries match whole names. The one read is each session's open
+(`RemoteConfigServices::media_paths`), and the session keeps what it read until it ends.
+
+```mermaid
+flowchart LR
+  L["rc_media_legacy<br/>pushable, live"] --> R{"resolve, per path,<br/>in dependency order"}
+  C["rc_media_canary<br/>this device only"] --> R
+  D["built-in default"] --> R
+  R -->|old| O["the path's old code"]
+  R -->|new| N["the path's new code"]
+  R --> P["rc:media-plan names<br/>legacy and refused"]
+```
+
+| Path | Phase | New code in this build | Default |
+|---|---|---|---|
+| `stats` | R0 | not yet | old |
+| `media_plan` | R2 | yes | new |
+| `capture_wait`, `capture_stage`, `zero_copy_shared`, `dc_sink`, `sctp_rto`, `encode_stage`, `cell_table`, `rtp_sink`, `recording_door`, `high_refresh` | R4a to R12 | not yet | old |
+
+Some paths stand on others (`capture_wait` under `capture_stage`, both and `dc_sink`
+under `encode_stage` and `high_refresh`, `encode_stage` under `rtp_sink`), so an old
+path forces what stands on it onto the old path, and a canary entry whose requirement
+is old is refused. `media_paths::tests::every_combination_keeps_the_rules` walks about
+57,000 combinations of the two keys against those rules.
 
 ### 5.2 Encoder selection
 

@@ -2812,6 +2812,20 @@ pub struct DesiredConfig {
     /// (`the_device_owned_refusals_are_not_pushable`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zero_copy_deny: Option<String>,
+    /// FR-135 §7.1 — the media paths a session must run on their OLD code
+    /// (`rc_media_legacy`): comma-separated path names, one per FR-135 phase
+    /// (`media_plan`, `stats`, …), or `none`. Pushable for the denylists'
+    /// reason: it only ever sends a session back to code the device already
+    /// ran, so `MANAGE_AGENTS` is enough, and the server passes it on unread,
+    /// because a device ignores a name it does not know. Blank clears the
+    /// device's key. LIVE on the device: its one read site is each session's
+    /// open, so it applies from the next session with no restart.
+    ///
+    /// ⚠️ `rc_media_canary`, the key that turns a path's new code ON early, is
+    /// ABSENT and stays absent: turning a path on is a decision made on the
+    /// device or by a release, as `zero_copy` is (FR-132 decision 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rc_media_legacy: Option<String>,
     /// Bumped on every write. The agent reports the revision it has applied,
     /// so "asked for" and "actually running" can be told apart in the UI —
     /// without it, a device that refused the config and one that never heard
@@ -2837,6 +2851,7 @@ impl DesiredConfig {
             && self.fps_deny.is_none()
             && self.color_description.is_none()
             && self.zero_copy_deny.is_none()
+            && self.rc_media_legacy.is_none()
     }
 
     /// Whether this request touches the Fleet-RPC grant. Drives the
@@ -2887,6 +2902,8 @@ impl DesiredConfig {
             color_description: _,
             // FR-132 P1 — neither: the GPU-input denylist only removes.
             zero_copy_deny: _,
+            // FR-135 — neither: it only sends a session back to old code.
+            rc_media_legacy: _,
             revision: _,
             updated_by: _,
             updated_at: _,
@@ -7673,6 +7690,7 @@ mod tests {
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
             zero_copy_deny: Some("hevc_qsv:gpu".into()),
+            rc_media_legacy: Some("media_plan".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7720,6 +7738,7 @@ mod tests {
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
             zero_copy_deny: Some("hevc_qsv:gpu".into()),
+            rc_media_legacy: Some("media_plan".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7751,6 +7770,7 @@ mod tests {
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
             zero_copy_deny: Some("hevc_qsv:gpu".into()),
+            rc_media_legacy: Some("media_plan".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7802,6 +7822,7 @@ mod tests {
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
             zero_copy_deny: Some("hevc_qsv:gpu".into()),
+            rc_media_legacy: Some("media_plan".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -7846,6 +7867,7 @@ mod tests {
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
             zero_copy_deny: Some("hevc_qsv:gpu".into()),
+            rc_media_legacy: Some("media_plan".into()),
             revision: 7,
             updated_by: None,
             updated_at: None,
@@ -9376,6 +9398,7 @@ mod tests {
             fps_deny: Some("*:144".into()),
             color_description: Some("off".into()),
             zero_copy_deny: Some("hevc_qsv:gpu".into()),
+            rc_media_legacy: Some("media_plan".into()),
             revision: 1,
             updated_by: Some(ObjectId::new()),
             updated_at: Some(DateTime::now()),
@@ -9458,6 +9481,15 @@ mod tests {
              is the device's decision, or a release's. Got keys: {keys:?}"
         );
         assert!(keys.contains(&"zero_copy_deny"), "{keys:?}");
+        // FR-135 §7.1 — the same split for the media paths: the key that sends
+        // a session back to old code is pushable, and the key that turns new
+        // code on early is not. Whole keys again, never a prefix.
+        assert!(
+            !keys.contains(&"rc_media_canary"),
+            "rc_media_canary must never be pushable by the server: turning a media path's \
+             new code on is the device's decision, or a release's. Got keys: {keys:?}"
+        );
+        assert!(keys.contains(&"rc_media_legacy"), "{keys:?}");
         assert!(
             !keys.iter().any(|k| k.contains("restart")),
             "remote configuration never restarts a daemon (docs/remote-config.md §7b): {keys:?}"

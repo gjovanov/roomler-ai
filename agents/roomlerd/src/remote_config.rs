@@ -102,6 +102,8 @@ impl RunningKeys {
         let DesiredConfig {
             // Live: `apply` puts it in force itself.
             exec_enabled: _,
+            // FR-135 — live as well: each session's open reads it.
+            rc_media_legacy: _,
             ssh_enabled,
             ssh_authorized_keys,
             ssh_account_mode,
@@ -200,6 +202,18 @@ pub struct RemoteConfigServices {
     /// until [`Self::adopt_local`] seeds the configured value; only the
     /// person at the console can change it, and never the server.
     peer_auth_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// FR-135 §7.1 — `rc_media_legacy` and `rc_media_canary` as the file holds
+    /// them. Live for `exec_enabled`'s reason: one read site, each session's
+    /// open ([`Self::media_paths`]). [`Self::adopt_local`] seeds both, and
+    /// [`Self::apply`] writes the pushable one after the durable save.
+    media_keys: Arc<std::sync::RwLock<MediaKeys>>,
+}
+
+/// FR-135 §7.1 — the two media-path keys, unparsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MediaKeys {
+    legacy: Option<String>,
+    canary: Option<String>,
 }
 
 /// FR-100 P1c — the policy in an atomic: `0` off, `1` audit.
@@ -240,7 +254,29 @@ impl RemoteConfigServices {
             peer_auth_policy: Arc::new(std::sync::atomic::AtomicU8::new(policy_bits(
                 crate::peer_auth::PeerAuthPolicy::Audit,
             ))),
+            media_keys: Arc::new(std::sync::RwLock::new(MediaKeys::default())),
         }
+    }
+
+    /// FR-135 §7.1 — what the session opening now runs, path by path. The ONE
+    /// read site of `rc_media_legacy` and `rc_media_canary`, so a session never
+    /// changes path mid-flight and a push applies from the next session.
+    ///
+    /// R2's `ROOMLERD_MEDIA_PLAN=0` folds in here as a `media_plan` entry of
+    /// the legacy list, so the switch it always was keeps working beside the
+    /// pushable one.
+    pub fn media_paths(&self) -> crate::media_paths::MediaPaths {
+        use crate::media_paths::{MediaPath, parse, resolve};
+        let keys = self
+            .media_keys
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut legacy = parse(keys.legacy.as_deref());
+        if !crate::media_plan::enabled() && !legacy.paths.contains(&MediaPath::MediaPlan) {
+            legacy.paths.push(MediaPath::MediaPlan);
+        }
+        resolve(&legacy, &parse(keys.canary.as_deref()))
     }
 
     /// FR-132 P1c — record what this process started on, from the config it
@@ -374,6 +410,11 @@ impl RemoteConfigServices {
         // FR-100 P1c — the next offer is judged under the owner's new word.
         self.peer_auth_policy
             .store(policy_bits(cfg.peer_auth), Ordering::Relaxed);
+        // FR-135 §7.1 — and the next session opens under the owner's lists.
+        *self.media_keys.write().unwrap_or_else(|p| p.into_inner()) = MediaKeys {
+            legacy: cfg.rc_media_legacy.clone(),
+            canary: cfg.rc_media_canary.clone(),
+        };
     }
 
     /// Reconcile the on-disk config against `desired`, persist, and put the
@@ -398,6 +439,7 @@ impl RemoteConfigServices {
         let path = self.path.clone();
         let desired = desired.clone();
         let exec_flag = self.exec_enabled.clone();
+        let media_keys = self.media_keys.clone();
         let running = self.running.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -497,6 +539,20 @@ impl RemoteConfigServices {
                     applied.needs_restart.push("zero_copy_deny");
                 }
             }
+            // FR-135 §7.1 — `rc_media_legacy`, LIVE: each session's open reads
+            // it, so the next session runs the pushed value and no restart is
+            // owed. Blank clears the device's key; `none` keeps it managed with
+            // no entries. A name this build does not know stays in the file,
+            // read as nothing, so a newer phase's push survives an older agent.
+            if let Some(want) = desired.rc_media_legacy.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.rc_media_legacy != next {
+                    cfg.rc_media_legacy = next;
+                    applied.live.push("rc_media_legacy");
+                }
+            }
 
             applied.wrote = !applied.live.is_empty() || !applied.needs_restart.is_empty();
             if applied.wrote {
@@ -514,6 +570,18 @@ impl RemoteConfigServices {
                 && !applied.live.contains(&"exec_enabled")
             {
                 applied.live.push("exec_enabled");
+            }
+            // FR-135 §7.1 — the same rule for the media paths: after the
+            // write, and whenever the document manages the key, so a file
+            // edited by hand to match still moves the sessions to come.
+            if desired.rc_media_legacy.is_some() {
+                let mut keys = media_keys.write().unwrap_or_else(|p| p.into_inner());
+                if keys.legacy != cfg.rc_media_legacy {
+                    keys.legacy = cfg.rc_media_legacy.clone();
+                    if !applied.live.contains(&"rc_media_legacy") {
+                        applied.live.push("rc_media_legacy");
+                    }
+                }
             }
             // FR-132 P1c — the lists above say what changed in the FILE, and
             // the report means what this process does not run yet. On a later
@@ -843,6 +911,108 @@ mod tests {
         assert_eq!(on_disk(), None);
         assert!(svc.apply(&push("")).await.unwrap().is_noop());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-135 §7.1 — a pushed `rc_media_legacy` is LIVE: written, in force for
+    /// the next session with no restart, and reported under `live`, never
+    /// `needs_restart`, even on a daemon that knows what it started on. The same
+    /// push again changes nothing, `none` keeps the key managed with no entries,
+    /// and a blank push clears it.
+    #[tokio::test]
+    async fn a_pushed_media_legacy_list_is_live_for_the_next_session_and_a_blank_clears_it() {
+        use crate::media_paths::MediaPath;
+        let dir = std::env::temp_dir().join(format!("fr135-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        )
+        .running_on(&started);
+        svc.adopt_local(&started);
+        let push = |v: &str| DesiredConfig {
+            rc_media_legacy: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().rc_media_legacy;
+        assert!(
+            svc.media_paths().is_new(MediaPath::MediaPlan),
+            "the default"
+        );
+
+        let applied = svc.apply(&push(" media_plan, later_phase ")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"]);
+        assert!(applied.needs_restart.is_empty(), "{applied:?}");
+        assert_eq!(on_disk().as_deref(), Some("media_plan, later_phase"));
+        let next = svc.media_paths();
+        assert!(
+            !next.is_new(MediaPath::MediaPlan),
+            "the next session's plan is off"
+        );
+        assert_eq!(next.legacy_wire(), vec!["media_plan"]);
+        assert!(
+            svc.apply(&push("media_plan, later_phase"))
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        let applied = svc.apply(&push("none")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"]);
+        assert_eq!(on_disk().as_deref(), Some("none"), "managed, no entries");
+        assert!(svc.media_paths().is_new(MediaPath::MediaPlan));
+
+        svc.apply(&push("media_plan")).await.unwrap();
+        let applied = svc.apply(&push("")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"]);
+        assert_eq!(on_disk(), None, "a blank push clears the device's key");
+        assert!(svc.media_paths().is_new(MediaPath::MediaPlan));
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
+
+        // A file edited to match by hand still moves the sessions to come.
+        let mut cfg = crate::config::load(&path).unwrap();
+        cfg.rc_media_legacy = Some("media_plan".into());
+        crate::config::save(&path, &cfg).unwrap();
+        assert!(
+            svc.media_paths().is_new(MediaPath::MediaPlan),
+            "not seen yet"
+        );
+        let applied = svc.apply(&push("media_plan")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"], "the holder moved");
+        assert!(!svc.media_paths().is_new(MediaPath::MediaPlan));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-135 §7.1 — the owner's own lists are in force from their save, as
+    /// `exec_enabled` is: `adopt_local` seeds both keys, the local-only canary
+    /// included, and legacy still beats it.
+    #[test]
+    fn adopt_local_puts_both_media_lists_in_force() {
+        use crate::media_paths::MediaPath;
+        let svc = RemoteConfigServices::new(
+            std::env::temp_dir().join("fr135-adopt-unused.toml"),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            false,
+        );
+        let mut cfg = crate::config::test_fixture();
+        cfg.rc_media_legacy = Some("media_plan".into());
+        cfg.rc_media_canary = Some("media_plan,encode_stage".into());
+        svc.adopt_local(&cfg);
+        let s = svc.media_paths();
+        assert!(!s.is_new(MediaPath::MediaPlan), "legacy beats canary");
+        assert_eq!(
+            s.refused_wire(),
+            vec!["media_plan:legacy", "encode_stage:not_built"]
+        );
+        cfg.rc_media_legacy = None;
+        cfg.rc_media_canary = None;
+        svc.adopt_local(&cfg);
+        assert_eq!(svc.media_paths(), crate::media_paths::MediaPaths::default());
     }
 
     /// FR-132 P1 — a pushed GPU-input denylist is written and reported as

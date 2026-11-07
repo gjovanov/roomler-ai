@@ -1012,6 +1012,10 @@ pub struct DesiredConfigView {
     /// clear the device's key. Absent = not managed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zero_copy_deny: Option<String>,
+    /// FR-135 §7.1 — the media paths sent back to their old code, as pushed;
+    /// `""` is a request to clear the device's key. Absent = not managed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rc_media_legacy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1039,6 +1043,7 @@ impl From<roomler_ai_remote_control::models::DesiredConfig> for DesiredConfigVie
             fps_deny: d.fps_deny,
             color_description: d.color_description,
             zero_copy_deny: d.zero_copy_deny,
+            rc_media_legacy: d.rc_media_legacy,
             updated_by: d.updated_by.map(|i| i.to_hex()),
             updated_at: d.updated_at.map(fmt_dt),
         }

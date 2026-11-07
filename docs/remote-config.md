@@ -357,6 +357,51 @@ only delivers the push, and it takes a second restart. The same holds for every
 Taking a deny off costs the same: `none` arrives the same way, and the deny holds
 until the restart after it ([FR-132](fr/FR-132-zero-copy-by-default.md) §8).
 
+**A fifth (FR-135 §7.1), and the first that is live.** `rc_media_legacy` sends a
+device's remote-desktop sessions back to a media path's OLD code: comma-separated
+path names, one per [FR-135](fr/FR-135-one-rc-media-pipeline.md) phase
+(`media_plan` today, `stats` and the rest as their phases land), or `none`. It is
+every FR-135 phase's kill switch. It needs `MANAGE_AGENTS` alone, because it only
+ever returns a session to code the device already ran, and the server passes it
+on unread (`crates/modules/fleet/src/remote_config.rs:290`), because a
+device ignores a name its build does not know. A newer phase's name therefore
+reaches an older agent as nothing, and still sits in its file for the release
+that knows it.
+
+It is **live**, unlike the four before it. Its one read site is each session's
+open (`RemoteConfigServices::media_paths`,
+`agents/roomlerd/src/remote_config.rs:268`), so a push applies from the
+device's next session with no restart, and the device reports it under `live`,
+never `needs_restart` (`agents/roomlerd/src/remote_config.rs:553`). A
+session never changes path mid-flight.
+
+| pushed `rc_media_legacy` | what the device's key becomes |
+|---|---|
+| absent | not managed: left as it is |
+| `""` | cleared: no entries |
+| `none` | `none`: no entries, still managed |
+| `media_plan` | that list: the next session sends no `rc:media-plan` |
+
+Entries match whole names by equality, never by prefix, and an old path forces
+the paths that stand on it onto the old path too (§7.1's second table, in
+`agents/roomlerd/src/media_paths.rs`). The session's `rc:media-plan` names both,
+in `legacy`, so a reader sees what the key did. `ROOMLERD_MEDIA_PLAN=0`, R2's
+first switch, still works and reads as a `media_plan` entry.
+
+⚠️ **`rc_media_canary`, the key that turns a path's new code on before its
+default does, is NOT pushable**, for `zero_copy`'s reason (FR-132 decision 1):
+turning new code on stays the device's decision, or a release's. It is set on the
+device (`roomler config set rc_media_canary <names>`), is live the same way, and
+loses to `rc_media_legacy`. The test that guards it compares whole keys
+(`the_device_owned_refusals_are_not_pushable`). A canary entry this build has no
+new code for, or whose requirement is on the old path, is refused and named in
+the plan's `refused`.
+
+⚠️ **The reach is the opt-in's.** A device that has not set
+`remote_config_enabled` refuses every push, this one included (§2), and most
+devices have not ([FR-135](fr/FR-135-one-rc-media-pipeline.md) §7.1 measured 4
+of 37). On those the kill switch is a person at the device or a forward release.
+
 ## 7. What this does not do
 
 - **No bootstrapping problem.** Enabling `exec_enabled` remotely does not

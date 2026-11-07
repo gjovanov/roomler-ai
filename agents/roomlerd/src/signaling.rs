@@ -4461,6 +4461,12 @@ async fn handle_server_msg(
                 return Ok(());
             }
 
+            // FR-135 §7.1 — which media paths this session runs, old or new:
+            // the ONE read of `rc_media_legacy` and `rc_media_canary`, so the
+            // session never changes path mid-flight and a push applies from the
+            // next session. One log line when either key spoke, none otherwise.
+            let media_paths = remote_cfg.media_paths();
+            media_paths.log(session_id);
             let peer = match AgentPeer::new(
                 session_id,
                 &ice_servers,
@@ -4494,6 +4500,7 @@ async fn handle_server_msg(
                 // FR-102 P9d — so this peer's carrier observation signals the
                 // loop that holds it (the clone drops with the peer).
                 carrier_ready_tx.clone(),
+                media_paths,
             )
             .await
             {
@@ -7145,6 +7152,7 @@ mod tests {
             // The carrier-ready signal: nothing reads it here, the test calls
             // the helper the arm would call.
             mpsc::channel(1).0,
+            crate::media_paths::MediaPaths::default(),
         )
         .await
         .expect("AgentPeer::new")
