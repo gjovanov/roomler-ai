@@ -77,7 +77,7 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
    stays up (`encoder.rs:3383` `convert_pool`) — byte-identical output (even-row
    cuts, chroma pairs never straddle a band boundary). Band count is
    `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2306`
-   `convert_bands`, `:2325` `band_cuts`; `mod.rs:634` `par_convert_enabled`).
+   `convert_bands`, `:2325` `band_cuts`; `mod.rs:639` `par_convert_enabled`).
 2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per

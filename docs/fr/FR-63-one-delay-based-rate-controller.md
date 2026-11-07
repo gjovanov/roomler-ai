@@ -534,7 +534,7 @@ either — which is the number B1 has to beat.
   | number | why | how firm |
   |---|---|---|
   | a gate on the spend | a bar over all clean windows has no power: B1 scores 96 %, a pinned shadow 93 % | measured, one host |
-  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:295-300`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
+  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:300-305`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
   | 0.5 Mbps constrained | the constrained floor is 200 k against a ~3 M nominal cap | **not measured**: no real constrained line was read. Check it against the fleet table first |
   | ×1.25 | a small excess can be overshoot. The result does not hang on it: B1 at ≥ 2 Mbps is 43 % over by more than this, 57 % over at all | judgement |
   | 90 %, ≥ 20 sessions | mirror the existing bar, so no new number to defend | judgement |
