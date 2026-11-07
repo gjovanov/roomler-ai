@@ -40,6 +40,9 @@ export interface HarnessResult {
    *  leaves a closed husk behind. */
   pageChannelAfterMove: string
   framesSent: number
+  /** Messages the page relayed to the worker as `chunk`: the relay's own
+   *  count, which no clock can skew (the `fwd` hop can read nothing). */
+  relayed: number
   framesDecoded: number
   /** The size the worker reported painting (`first-frame`): the picture, not
    *  a decoder's padded buffer. */
@@ -114,6 +117,7 @@ async function run(arm: HarnessArm, frames = 50, fps = 20): Promise<HarnessResul
     refused: null,
     pageChannelAfterMove: '',
     framesSent: 0,
+    relayed: 0,
     framesDecoded: 0,
     firstFrame: null,
     windows: [],
@@ -179,6 +183,7 @@ async function run(arm: HarnessArm, frames = 50, fps = 20): Promise<HarnessResul
     dc.binaryType = 'arraybuffer'
     dc.onmessage = (ev) => {
       if (!(ev.data instanceof ArrayBuffer)) return
+      result.relayed++
       worker.postMessage({ type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() }, [ev.data])
     }
     dc.onopen = () => result.channelEvents.push('open')

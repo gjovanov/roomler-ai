@@ -8,7 +8,7 @@
  * (`dcCodecs.ts`), with WebCodecs and the canvas replaced by recording fakes.
  * What R3 merged must stay as each worker had it: the codec the composable
  * names, the stats message and its keys, and the crop handling the HEVC worker
- * had, which every codec now gets.
+ * had, which HEVC keeps: every codec is classified, and only HEVC acts on it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { DC_CODECS } from './dcCodecs'

@@ -64,14 +64,18 @@ test.describe('FR-135 R3 — the data-channel worker, on both arms', () => {
     test.skip(!(await canRun(page)), 'no WebRTC, or no codec this browser both encodes and decodes')
   })
 
-  test('the relay: the page forwards each message, and the hop is timed', async ({ page }) => {
+  // The relay is asserted by its own count, not by the `fwd` hop: the page and
+  // the worker each stamp on their own `timeOrigin`, a hop shorter than the
+  // skew between them reads negative and is dropped (`LogHist.add`), so a run
+  // can time no hop at all while every message went through the page.
+  test('the relay: the page forwards each message to the worker', async ({ page }) => {
     const r = await run(page, 'page')
     expect(r.refused).toBe('off')
     expect(r.pageChannelAfterMove).not.toBe('closed')
     expect(r.framesSent).toBeGreaterThan(30)
+    expect(r.relayed, 'a relayed message per frame at least').toBeGreaterThanOrEqual(r.framesSent)
     expect(r.framesDecoded).toBe(r.framesSent)
     expect(r.windows.length).toBeGreaterThan(0)
-    expect(sum(r.windows.map((w) => w.fwd)), 'a page hop per message').toBeGreaterThan(0)
     expect(r.channelEvents).toEqual(['open', 'closed'])
   })
 
@@ -82,6 +86,7 @@ test.describe('FR-135 R3 — the data-channel worker, on both arms', () => {
     expect(r.framesSent).toBeGreaterThan(30)
     expect(r.framesDecoded).toBe(r.framesSent)
     expect(r.windows.length).toBeGreaterThan(0)
+    expect(r.relayed, 'the page relayed nothing').toBe(0)
     expect(sum(r.windows.map((w) => w.fwd)), 'no page hop').toBe(0)
     expect(sum(r.windows.map((w) => w.arrGap)), 'every arrival counted').toBeGreaterThan(20)
     expect(r.windows.some((w) => typeof w.queueArrMs === 'number'), 'the arrival reading').toBe(true)
@@ -94,8 +99,8 @@ test.describe('FR-135 R3 — the data-channel worker, on both arms', () => {
     const r = await run(page, 'refused')
     expect(r.refused).toMatch(/^DataCloneError/)
     expect(r.pageChannelAfterMove).not.toBe('closed')
+    expect(r.relayed, 'the relay carries it').toBeGreaterThanOrEqual(r.framesSent)
     expect(r.framesDecoded).toBe(r.framesSent)
-    expect(sum(r.windows.map((w) => w.fwd))).toBeGreaterThan(0)
     expect(r.channelEvents).toEqual(['open', 'closed'])
   })
 })
