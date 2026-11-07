@@ -60,7 +60,7 @@ sequenceDiagram
 [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
 unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:10925`](../agents/roomlerd/src/peer.rs#L10925)).
+control-channel arm sends the answer ([`peer.rs:11130`](../agents/roomlerd/src/peer.rs#L11130)).
 
 ### The answers
 
@@ -103,7 +103,7 @@ roomler config set display_match auto     # auto (default) | always | never
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
   ([`lib.rs:3220`](../crates/localapi/src/lib.rs#L3220), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:9564`](../crates/remote_control/src/models.rs#L9564)). A server that could set it could
+  push it ([`models.rs:9615`](../crates/remote_control/src/models.rs#L9615)). A server that could set it could
   take every screen it reaches.
 - **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
   `set_device_policy`).
