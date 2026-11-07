@@ -532,10 +532,13 @@ with the same `cause`, `code`, `reason`, `kind` and `error`. Before #3517 that l
 `other=None` for every end.
 
 **The grep.** Pod logs are ANSI-coloured, so strip the codes first. Tenant affinity pins
-each socket to one pod, so read every pod:
+each socket to one pod, so read every pod. Select the pods by their label. A name match
+such as `grep roomler2-` also catches the `roomler2-prepull-*` pods of FR-28's pre-pull
+DaemonSet (`.github/workflows/promote.yml:46`), which carry `app=roomler2-prepull` and
+run no `roomler2` container.
 
 ```bash
-for p in $(kubectl -n roomler-ai get pods -o name | grep roomler2-); do
+for p in $(kubectl -n roomler-ai get pods -l app=roomler2 -o name); do
   echo "== $p"
   kubectl -n roomler-ai logs "$p" | sed -E 's/\x1b\[[0-9;]*m//g' \
     | grep 'remote-control agent WS disconnected' \
@@ -544,3 +547,19 @@ done
 ```
 
 For one device's history, replace the last `grep -oE …` with `grep 'agent_id=<hex>'`.
+
+⚠️ **`kubectl logs` reads only the pod's current log file.** The kubelet rotates that
+file at its size cap, which under daytime traffic has been every 10 to 15 minutes, so an
+empty grep can be the file's boundary rather than the absence of a disconnect. For an
+older window, read the rotated files through the kubelet's log proxy. The newest rotated
+file is plain text and the older ones are gzipped, and each line there carries the CRI
+prefix `<ts> stdout F`:
+
+```bash
+P=roomler2-…   # the pod's name, without the pod/ prefix
+N=$(kubectl -n roomler-ai get pod "$P" -o jsonpath='{.spec.nodeName}')
+U=$(kubectl -n roomler-ai get pod "$P" -o jsonpath='{.metadata.uid}')
+D="/api/v1/nodes/$N/proxy/logs/pods/roomler-ai_${P}_${U}/roomler2"
+kubectl get --raw "$D/"                  # lists 0.log, 0.log.<ts> and the *.gz files
+kubectl get --raw "$D/0.log.<ts>" | sed -E 's/\x1b\[[0-9;]*m//g' | grep 'remote-control agent WS disconnected'
+```
