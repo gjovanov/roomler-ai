@@ -483,7 +483,7 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2194`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2229`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
 | `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:504`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |

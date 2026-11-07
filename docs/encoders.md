@@ -172,7 +172,7 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3805`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3843`), and the viewer ignores
 that track while it holds a DataChannel transport
 (`ui/src/composables/useRemoteControl.ts:10007`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
