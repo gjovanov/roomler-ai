@@ -186,7 +186,7 @@ compile.
   person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3156`;
   the device-owned gates are not among them) — and the page shows the Mac as one device:
   each row comes from, and a change goes to, the half that READS the key. The split is the
-  key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`):
+  key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`):
 
   | Owner | Groups | On a two-half Mac | Examples |
   |---|---|---|---|
@@ -744,7 +744,7 @@ registered the moment it connects, and the banner used to come up then. It said 
 while nothing was shared yet. On a desktop that centres new windows, it also sat right over the
 dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat beside the
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
-dialog is the wait (`agents/roomlerd/src/peer.rs:5781`, `AskingMark`
+dialog is the wait (`agents/roomlerd/src/peer.rs:5788`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
 `crates/localapi/src/lib.rs:1324`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes

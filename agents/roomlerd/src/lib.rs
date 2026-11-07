@@ -119,6 +119,9 @@ pub mod macos_quit;
 pub mod macos_spawn;
 pub mod macos_supervisor;
 pub mod mdns_resolve;
+/// FR-135 §7.1 — which media path a session runs, old or new, from
+/// `rc_media_legacy` and `rc_media_canary`, decided once at its open.
+pub mod media_paths;
 /// FR-135 R2 — `rc:media-plan`: what a session promised its viewer, and every
 /// step it took down from there.
 pub mod media_plan;

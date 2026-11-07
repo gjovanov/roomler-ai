@@ -603,6 +603,12 @@ export interface DesiredConfig {
    *  to clear the device's key (deny nothing). `zero_copy` itself is never
    *  pushable (FR-132 decision 1). */
   zero_copy_deny?: string
+  /** FR-135 §7.1 — the media paths a session runs on their OLD code (path
+   *  names such as `media_plan`, or `none`), every FR-135 phase's kill switch;
+   *  MANAGE_AGENTS only, live from the device's next session. `''` is a request
+   *  to clear the device's key. `rc_media_canary`, which turns new code on
+   *  early, is never pushable. */
+  rc_media_legacy?: string
   updated_by?: string
   updated_at?: string
 }
