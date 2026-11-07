@@ -3,24 +3,31 @@
 /// <reference lib="webworker" />
 
 /**
- * Phase Y.2 — VP9 4:4:4 decoder worker for the DataChannel-bypass
- * video transport. See `docs/encoders.md`.
+ * FR-135 R3 — the one decoder worker for video over the data channel. Every
+ * codec the agent sends on `video-bytes` comes here: VP9 profile 0 and 1, AV1,
+ * H.264 and HEVC (Main and Rext). The composable names the codec in
+ * `init-canvas`; the wire format, the decoder's life, the paint and the
+ * numbers are the same for all of them. It was two workers until R3:
+ * `rc-vp9-444-worker.ts` (Phase Y.2, carrying AV1 since rc.190 and H.264
+ * since P2) and its copy for HEVC, `rc-hevc-worker.ts` (rc.78). See
+ * `docs/remote-control.md` §11.14 and `docs/encoders.md`.
  *
- * Receives length-prefixed encoded VP9 frames from the main thread
- * (which forwards them off `RTCDataChannel.onmessage`), reassembles
- * them, feeds `VideoDecoder({codec:'vp09.01.10.08'})` (profile 1,
- * 8-bit 4:4:4), and paints the resulting `VideoFrame`s to an
- * `OffscreenCanvas`. No `RTCRtpScriptTransform` involvement — this
- * worker is independent of the broken-in-Chrome 131 RTP transform
- * path.
+ * Receives length-prefixed encoded frames from the main thread (which
+ * forwards them off `RTCDataChannel.onmessage`), reassembles them, feeds
+ * `VideoDecoder`, and paints the resulting `VideoFrame`s to an
+ * `OffscreenCanvas`. No `RTCRtpScriptTransform` involvement — this worker is
+ * independent of the broken-in-Chrome 131 RTP transform path.
  *
- * Wire format (matches `agents/roomlerd/src/encode/libvpx.rs`):
+ * Wire format (`frame_video_bytes`, `agents/roomlerd/src/peer.rs`):
  *
  *   struct Frame {
  *     u32  size_le;          // payload length, little-endian
  *     u8   flags;            // bit 0: keyframe
- *     u64  timestamp_us;     // monotonic capture timestamp
- *     [u8] payload;          // raw VP9 frame
+ *     u64  timestamp_us;     // the agent's process clock at framing
+ *                            // (`agent_epoch_us()`), not the capture time
+ *     [u8] payload;          // the codec's frame: VP9 or AV1 as encoded,
+ *                            // H.264 and HEVC as Annex-B access units
+ *                            // (HEVC key frames AUD → VPS → SPS → PPS → IDR)
  *   }
  *
  * Header is 13 bytes. SCTP is reliable+ordered so a single frame
@@ -90,11 +97,13 @@ type InitCanvasMessage = {
    *  `AgentCaps.video`). Absent/false keeps the pre-FR-17 bare byte
    *  stream, which is what every agent below 0.4.14 still sends. */
   chunkFraming?: boolean
-  /** Optional codec override. Production uses VP9 profile 1
-   *  (vp09.01.10.08, 4:4:4 8-bit) — the default below — but the
-   *  e2e harness lacks a 4:4:4 *encoder* in current Chromium
-   *  WebCodecs, so it overrides with VP9 profile 0 (vp09.00.10.08,
-   *  4:2:0) just to exercise the wire+DC+decoder mechanics. */
+  /** The `VideoDecoder` codec string for this session's cell. The composable
+   *  names one for every session: `vp09.01.10.08` / `vp09.00.10.08` (VP9
+   *  4:4:4 / 4:2:0), `AV1_CODEC_STRING`, the H.264 string its probe ladder
+   *  picked, `HEVC_MAIN_CODEC_STRING` or `HEVC_REXT_CODEC_STRING`. Absent, it
+   *  is VP9 profile 1 ({@link DEFAULT_CODEC}): the e2e harness, which has no
+   *  4:4:4 *encoder* in current Chromium WebCodecs, names VP9 profile 0 to
+   *  exercise the wire, the channel and the decoder. */
   codec?: string
   /** 2026-07-24 decode-stall A/B — optional `VideoDecoder.hardwareAcceleration`
    *  override from the composable (localStorage `roomler-rc-decode-pref`).
@@ -153,11 +162,11 @@ type IncomingMessage =
 
 const HEADER_BYTES = 13
 const FLAG_KEYFRAME = 0x01
-/** Default codec — VP9 profile 1 (4:4:4 8-bit). Browsers' WebCodecs
- *  decoders use libvpx and accept this without quibble. Tests can
- *  override via the `codec` field on `init-canvas`. */
-const DEFAULT_VP9_CODEC = 'vp09.01.10.08'
-let activeCodec: string = DEFAULT_VP9_CODEC
+/** The codec when `init-canvas` names none: VP9 profile 1 (4:4:4 8-bit), the
+ *  one this worker decoded when it was the VP9 worker. Browsers' WebCodecs
+ *  decoders use libvpx and accept it without quibble. */
+const DEFAULT_CODEC = 'vp09.01.10.08'
+let activeCodec: string = DEFAULT_CODEC
 
 const workerScope = self as unknown as {
   onmessage: ((ev: MessageEvent<IncomingMessage>) => void) | null
@@ -192,21 +201,28 @@ let decoder: VideoDecoder | null = null
 let configured = false
 let framesDecoded = 0
 let framesReceived = 0
-// rc.103 — leading-delta gate, mirrored from rc-hevc-worker. The
-// VideoDecoder rejects a delta as its FIRST input ("A key frame is
-// required after configure() or flush()"). The libvpx pump that feeds
-// this worker is synchronous (the first emitted packet is already the
-// IDR) so the gate normally passes immediately — but the FFmpeg vp9_qsv
-// path is async (pipeline depth) and can drain a buffered delta ahead of
-// the DC-open IDR, exactly like the HEVC failure on WINHOST-G. Drop
-// leading deltas until the first keyframe so neither feeder can wedge the
-// decode path into a permanent <video> fallback.
+// rc.103 — leading-delta gate. A VideoDecoder rejects a delta as its FIRST
+// input after configure()/flush() ("A key frame is required"). The agent's
+// FFmpeg encoders (NVENC, QSV, AMF: HEVC, AV1, H.264, vp9_qsv) are ASYNC
+// (pipeline depth): at the instant the DC reaches Open, the packet draining
+// is a buffered delta from earlier in the encoder queue — it ships ahead of
+// the freshly-forced IDR (rc.97 force-kf-on-open), so the browser's first
+// ASSEMBLED frame is sometimes a delta. Field WINHOST-G (hevc_qsv) hit
+// exactly this: "hevc DC opened" → "decode-error: A key frame is required" →
+// permanent <video> fallback. The libvpx VP9 pump is synchronous (the first
+// emitted packet is already the IDR), so the gate normally passes at once
+// there. Drop leading deltas until the first keyframe; the IDR is only a
+// handful of frames behind them in the async queue, so the wait is a few ms.
 let sawKeyframe = false
 let framesSkippedAwaitingKey = 0
 
-// rc.130 — decode-backlog shed (see the HEVC worker for the rationale). Drop
-// deltas + ask the agent for a resync IDR when the decoder's input queue
-// grows, so a sustained decode deficit can't make latency grow without bound.
+// rc.130 — decode-backlog shed. With `optimizeForLatency` the decoder keeps
+// its input queue at 0–1 when it's keeping up; a sustained queue above this
+// means it has fallen behind (slow client / 4K on a weak iGPU / throttled
+// background tab) and the stream latency is growing monotonically. When that
+// happens we drop incoming DELTAS and ask the agent for a fresh keyframe to
+// resync — never dropping a key frame (it's the resync point). Without this
+// the queue never drains and "typing appears seconds later" is permanent.
 // rc.188 — raised 2→4: the agent now caps send-fps to this viewer's reported
 // sustainable rate (`rc:decodestat`), so in steady state the queue sits at ~0.
 // The higher ceiling only matters transiently — it lets an onset burst (the
@@ -215,13 +231,16 @@ let framesSkippedAwaitingKey = 0
 // composable's `struggling` rule trips at a lower queue depth, so the cap
 // reacts before we ever reach this drop threshold.
 // P6 — init-canvas-configurable for the flow-control field-tuning round.
-// FR-119 P2b-7 — the threshold is the decode BACKLOG in ms, not a frame count
-// (mirrors rc-hevc-worker; the reasoning is on `DecodeBacklog`).
+// FR-119 P2b-7 — the threshold is the decode BACKLOG in ms, not a frame count:
+// 4 frames were 67 ms at 60 and only 33 ms at 120, where one slow keyframe
+// tripped the drop and the drop's IDR tripped it again (`DecodeBacklog`).
 let maxBacklogMs = DEFAULT_MAX_BACKLOG_MS
 let framesDroppedBacklog = 0
 let lastKeyframeReqMs = 0
 
-/** Debounced keyframe-resync request after a backlog drop. */
+/** Ask the agent (via the composable → `control` DC) to force an IDR so the
+ *  decoder can resync after a backlog drop. Debounced so a sustained deficit
+ *  can't spam keyframe requests (the largest frames) onto a congested link. */
 function requestKeyframeResync(): void {
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now()
   if (now - lastKeyframeReqMs < 250) return
@@ -237,7 +256,11 @@ function requestKeyframeResync(): void {
 // output-callback cadence: if chunks keep landing while output has been
 // silent > STALL_GAP_MS with work queued, report a one-shot `decode-stall`
 // (and `decode-stall-recovered` with the true gap once output resumes) so the
-// console pins the layer during field repros.
+// console pins the layer during field repros. `decodePref` is the
+// composable's localStorage A/B override for `hardwareAcceleration`. HEVC has
+// no software decoder in Chromium: prefer-software there fails configure()
+// and the composable's fallback takes over, so the A/B means something on
+// VP9, AV1 and H.264.
 const STALL_GAP_MS = 1500
 let decodePref: 'prefer-software' | 'prefer-hardware' | 'no-preference' = 'no-preference'
 let lastOutputMs = 0
@@ -319,14 +342,24 @@ let outGapMaxMs = 0
 // callback → submit→output latency, and (FR-119 P2b-7) the decode backlog the
 // shed rule and the struggling rule read.
 const backlog = new DecodeBacklog()
-// FR-70 M0 — the age SPLIT (mirrors rc-hevc-worker): the age at ARRIVAL of
-// the frame's last chunk (agent clock via the probe) and the local
-// arrival→paint time. The agent subtracts the rest.
+// FR-70 M0 — the age SPLIT. `ageStats` fuses sender, transit and viewer
+// latency into one number, which is how a 4903 ms relay stall on 2026-09-04
+// arrived looking like a pump problem. `arrivalStats` is the age of the
+// frame when its LAST CHUNK reached this worker (agent clock via the probe,
+// like `ageStats`), and `viewerStats` is the purely local time from that
+// arrival to the paint (decode queue + decode + paint) — no probe needed.
+// The agent subtracts: viewer = age − arrival, transit = arrival − its own
+// send-queue wait. Keyed by the wire timestamp, like the decode `backlog`.
 const arrivalStats = new HopStats()
 const viewerStats = new HopStats()
 const pendingArrivalUs = new Map<number, number>()
 
-// P7 — FSR sharpening state (mirrors rc-hevc-worker; see rc-fsr-render.ts).
+// P7 — FSR sharpening state (see rc-fsr-render.ts). The renderer is created
+// lazily on the first frame that needs it; a GL failure disposes it and the
+// next frame re-creates (bounded by MAX_FSR_REBUILDS, then the session goes
+// permanently 2D with a one-shot `render-fallback` breadcrumb). The visible
+// canvas stays 2D throughout, so every failure lands on the byte-identical
+// legacy path the same frame.
 const MAX_FSR_REBUILDS = 3
 let sharpenMode: SharpenMode = 'auto'
 let sharpness = DEFAULT_RCAS_SHARPNESS
@@ -350,7 +383,8 @@ function maybeEmitStats(): void {
   const elapsedSec = elapsed / 1000
   const bitrateBps = Math.round((statsBytesInWindow * 8) / elapsedSec)
   const fps = Math.round(statsFramesInWindow / elapsedSec)
-  // FR-119 P2b-7 — the window's decode backlog (see rc-hevc-worker).
+  // FR-119 P2b-7 — the window's decode backlog: the mean is what the
+  // composable's struggling rule reads, the max is for the HUD.
   const backlogWindow = backlog.takeWindow()
   workerScope.postMessage({
     type: 'stats',
@@ -376,7 +410,8 @@ function maybeEmitStats(): void {
     paint: paintStats.snapshotAndReset(),
     // FR-1 P7 — end-to-end frame age; null until the clock probe lands.
     age: clockOffsetUs !== null ? ageStats.snapshotAndReset() : null,
-    // FR-70 M0 — the split (see the hevc worker).
+    // FR-70 M0 — the split: age at ARRIVAL (same clock mapping as `age`)
+    // and the local arrival→paint time.
     arrival: clockOffsetUs !== null ? arrivalStats.snapshotAndReset() : null,
     viewer: viewerStats.snapshotAndReset(),
     // FR-59 P3 — window queue growth in ms (null = fewer than two frames
@@ -584,25 +619,89 @@ function initDecoder() {
         decodeStats.add(decodeMs)
         mediaWindow.onDecoded(decodeMs)
       }
-      // Snapshot dims BEFORE paintFrame — it calls frame.close() in a
-      // finally block, after which displayWidth/displayHeight return 0.
-      const w = frame.displayWidth
-      const h = frame.displayHeight
-      statsLastWidth = w
-      statsLastHeight = h
-      // FR-1 P7 — capture the wire timestamp BEFORE paintFrame closes the
-      // frame (a closed VideoFrame reports 0).
+      // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
+      // geometry for our hevc_nvenc stream (field DEVBOX, RTX 5090):
+      // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
+      // pump heartbeat: w=2560 h=1600 enc=hevc_nvenc, ~3 MB/window), but the
+      // decoded VideoFrame carries a SPURIOUS conformance window —
+      // codedWidth/Height = 2560×1600 yet visibleRect/displayWidth = 1280×720
+      // at offset (0,0). `drawImage` honours visibleRect, so we were painting
+      // only the top-left region. The coded pixels ARE the whole desktop, so
+      // re-wrap the frame with visibleRect = the full coded rect and render
+      // THAT. (rc.100 first moved to codedWidth for the reported intrinsic;
+      // rc.102 also overrides the crop drawImage honours.)
+      //
+      // A SMALL top-left crop is NOT that bug, though — it is a legitimate
+      // encoder alignment crop, and the rewrap must NOT override it. Field
+      // WINHOST-F (hevc_qsv, 1920×1080 — the first non-mod-16-height
+      // sender): QSV pads HEVC to its row alignment, coding 1920×1088 with a
+      // conformance window hiding 8 rows of pooled-surface junk that changes
+      // per frame. Rendering the coded rect painted the junk — a purple/blue
+      // band flickering on every arriving frame during window drags. Every
+      // earlier QSV host had a mod-16 panel (1200/1600/2160 → no crop), which
+      // is why qsv looked "unaffected". `classifyCrop` separates the cases.
+      //
+      // FR-135 R3 — every codec is classified (the class rides the first frame),
+      // but only HEVC acts on it. The rule reads a coded size padded by 64 px or
+      // more as the NVDEC bug, and Chromium's software VP9 decoder pads every
+      // frame that much (libvpx's buffer: 1984×1080 coded for a 1920×1080 picture,
+      // measured 2026-11-07), so re-wrapped, a VP9 session would paint the padding.
+      // Any other codec paints the picture its decoder says is visible at its
+      // natural size, as the VP9 worker did (ledger S19 stays open).
+      const vr = frame.visibleRect
+      const crop = classifyCrop(frame.codedWidth, frame.codedHeight, vr)
+      let render: VideoFrame = frame
+      let rewrapped = false
+      let renderW = frame.displayWidth
+      let renderH = frame.displayHeight
+      if (/^(?:hev1|hvc1)\./i.test(activeCodec)) {
+        renderW = frame.codedWidth || frame.displayWidth
+        renderH = frame.codedHeight || frame.displayHeight
+        if (crop === 'spurious') {
+          try {
+            render = new VideoFrame(frame, { visibleRect: { x: 0, y: 0, width: frame.codedWidth, height: frame.codedHeight } })
+            rewrapped = true
+          } catch {
+            render = frame // re-wrap rejected → fall back to the cropped frame
+          }
+        } else if (crop === 'alignment' && vr) {
+          renderW = vr.width // trust the conformance window: paint and report the visible dims
+          renderH = vr.height
+        }
+      }
+      // Capture the one-shot diagnostic BEFORE paintFrame() calls close()
+      // (a closed VideoFrame reports 0/null — rc.100 logged {0,0} this way).
+      let firstFrameMsg: Record<string, unknown> | null = null
+      // rc.187 — post dims on frame 1 AND whenever the decoded size changes
+      // (the agent's viewer-adaptive resolution downscales mid-session), so the
+      // composable's cursor mapping never divides by a stale intrinsic.
+      if (renderW !== lastPostedW || renderH !== lastPostedH) {
+        lastPostedW = renderW
+        lastPostedH = renderH
+        firstFrameMsg = {
+          type: 'first-frame',
+          width: renderW,
+          height: renderH,
+          coded: { w: frame.codedWidth, h: frame.codedHeight },
+          display: { w: frame.displayWidth, h: frame.displayHeight },
+          visible: vr ? { x: vr.x, y: vr.y, w: vr.width, h: vr.height } : null,
+          crop,
+          rewrapped,
+          // FR-130 P2 — the colour space the decoder says it produced: how the
+          // field reads, per session, what it made of the stream.
+          colorSpace: frameColorSpace(frame),
+        }
+      }
+      statsLastWidth = renderW
+      statsLastHeight = renderH
+      // FR-1 P7 — capture the wire timestamp BEFORE paint can close the
+      // frame; a closed VideoFrame reports 0 (the rc.100 lesson).
       const wireTsUs = frame.timestamp
-      // rc.187 — dims go to the composable on frame 1 and on every size
-      // change (below). FR-130 P2 — with the colour space the decoder says it
-      // produced, which, like the dims, must be read before paint closes it.
-      const dimsChanged = w !== lastPostedW || h !== lastPostedH
-      const colorSpace = dimsChanged ? frameColorSpace(frame) : null
       // FR-16 L4 — a clone for the probe read, taken before paint closes
-      // `frame`; null unless a bench probe is outstanding.
-      const benchClone = bench.take(frame)
+      // `render`; null unless a bench probe is outstanding.
+      const benchClone = bench.take(render)
       const paintT0 = performance.now()
-      const drew = paintFrame(frame, w, h)
+      const drew = paintFrame(render, renderW, renderH)
       const paintT1 = performance.now()
       paintStats.add(paintT1 - paintT0)
       // FR-135 R0 (N9, N11, N12, N16) — a frame on the canvas.
@@ -613,12 +712,14 @@ function initDecoder() {
       if (recovered) {
         workerScope.postMessage({ type: 'decode-recovered', ms: Math.round(recovered.ms), attempts: recovered.attempts })
       }
-      // Age at paint on the agent's clock (mapped via the rc:clock probe).
+      // Age at paint on the agent's clock (mapped via the rc:clock probe):
+      // framing → send queue → network → decode → paint, end to end.
       const arrivalUs = epochNowUs()
       if (clockOffsetUs !== null) {
         ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivalUs))
       }
-      // FR-70 M0 — the same age at ARRIVAL, and the local arrival→paint time.
+      // FR-70 M0 — the same age at the moment the frame ARRIVED, and the
+      // local arrival→paint time; see `arrivalStats`.
       const arrivedUs = pendingArrivalUs.get(wireTsUs)
       if (arrivedUs !== undefined) {
         pendingArrivalUs.delete(wireTsUs)
@@ -629,15 +730,10 @@ function initDecoder() {
       }
       // FR-59 P3 — unconditional: the drift needs no probe lock.
       queueDrift.add(wireTsUs, arrivalUs)
+      if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       // rc.187 — report dims on frame 1 AND on every size change (live
       // downscale), so the composable updates the cursor-mapping intrinsic.
-      // FR-130 P2 — `colorSpace` is how the field reads, per session, what the
-      // decoder made of the stream (the composable logs it).
-      if (dimsChanged) {
-        lastPostedW = w
-        lastPostedH = h
-        workerScope.postMessage({ type: 'first-frame', width: w, height: h, colorSpace })
-      }
+      if (firstFrameMsg) workerScope.postMessage(firstFrameMsg)
       if (perFrameMsg && framesDecoded > 1) {
         // P1 — legacy per-frame counter message, OFF by default (a pure
         // main-thread tax at 60 fps); the 1 s stats message carries
@@ -662,31 +758,29 @@ function initDecoder() {
       onDecoderFailure('decoder-error', err)
     },
   })
-  // Configure now; the default `vp09.01.10.08` is unconditionally
-  // supported by WebCodecs in Chromium-based browsers (libvpx ships
-  // in-tree). If a future Chrome deprecates profile 1 we'll see the
-  // rejection in the error callback. Tests may override via
-  // `init-canvas.codec`.
-  //
-  // FR-130 P2 — `rcDecoderConfig` adds the colour space the agent converted
-  // with (set S) while the session wants it, and a configure() that throws
-  // on it goes again without it (`rc-decoder-config.ts`). Every other field
-  // is the worker's own, unchanged.
+  // Configure. FR-130 P2 — `rcDecoderConfig` adds the colour space the agent
+  // converted with (set S) while the session wants it, and a configure() that
+  // throws on it goes again without it (`rc-decoder-config.ts`). Every other
+  // field is the worker's own, unchanged. A codec this browser cannot decode
+  // after all shows up in the error callback above, and before the first
+  // frame the composable bans the transport and renegotiates.
   try {
     const applied = decoderColorSpace.configure(decoder, (colorSpace) => rcDecoderConfig({
       codec: activeCodec,
       optimizeForLatency: true,
-      // Hardware-decode preference. Profile-1 (4:4:4) HW decode is
-      // rare — Intel Tiger Lake+, some AMD; NVDEC and Intel UHD 630
-      // don't expose it. `'prefer-hardware'` was tried (added in
-      // aac736b) on the theory Chromium would silently fall back to
-      // SW decode on GPUs without 4:4:4 support — but on Chrome 148
-      // it does NOT: `configure()` accepts the hint, then the first
-      // real frame hard-rejects with "Unsupported configuration",
-      // the decoder closes, and the canvas goes black (field repro
-      // 2026-05-21, RTX 5090 + UHD 630). `'no-preference'` lets
-      // Chromium pick HW decode where it genuinely exists and SW
-      // otherwise — the actual silent-fallback behaviour we want.
+      // Hardware-decode preference. `'no-preference'` lets Chromium pick
+      // hardware where it genuinely exists and software otherwise, which is
+      // the silent fallback we want. `'prefer-hardware'` was tried for VP9
+      // profile 1 (added in aac736b) on the theory Chromium would fall back
+      // to software on GPUs without 4:4:4 support (profile-1 hardware decode
+      // is rare: Intel Tiger Lake+, some AMD; NVDEC and Intel UHD 630 don't
+      // expose it), but on Chrome 148 it does NOT: `configure()` accepts the
+      // hint, then the first real frame hard-rejects with "Unsupported
+      // configuration", the decoder closes, and the canvas goes black (field
+      // repro 2026-05-21, RTX 5090 + UHD 630). HEVC has no software decoder in
+      // WebCodecs at all, so there it is hardware or nothing: the composable
+      // probes `isConfigSupported` before it starts this worker on HEVC, and
+      // a driver hiccup mid-session reaches the error callback.
       // 2026-07-24 — `decodePref` (localStorage A/B) can override to
       // prefer-software/-hardware for the decode-stall field diagnosis;
       // defaults to 'no-preference' (unchanged behaviour).
@@ -738,8 +832,8 @@ function consumeBytes(bytes: Uint8Array): void {
         const ts_hi = view.getUint32(9, true)
         const ts_us = (BigInt(ts_hi) << 32n) | BigInt(ts_lo)
         if (size === 0 || size > 16 * 1024 * 1024) {
-          // Out-of-spec; drop and resync. 16 MB cap is generous —
-          // a 4K I444 keyframe at very high bitrate is ~6 MB.
+          // Out-of-spec; drop and resync. 16 MB cap is generous: a 4K I444
+          // VP9 keyframe at very high bitrate is ~6 MB, a 4K HEVC IDR 0.5-2 MB.
           workerScope.postMessage({
             type: 'frame-rejected',
             reason: 'implausible-size',
@@ -783,14 +877,23 @@ function emitFrame(): void {
   if (!payload) return
   const isKey = (assembler.pendingFlags & FLAG_KEYFRAME) !== 0
   // rc.103 — gate on the first keyframe (see `sawKeyframe` note above).
+  // Feeding a leading delta to the decoder throws "A key frame is required"
+  // and the composable then tears the whole path down. Drop deltas until the
+  // IDR (right behind them) arrives.
   if (!shouldDecodeFrame(sawKeyframe, isKey)) {
     framesSkippedAwaitingKey++
-    // 2026-07-24 freeze fix — keep re-requesting the resync IDR while gated
-    // (mirrors the HEVC worker; see its comment for the full field story).
-    // The backlog branch fires the request once then re-arms the gate; a lost
-    // request or a far-away GOP boundary left the decoder wedged on a stale
-    // frame. Debounced + agent-clamped to ~4 req/s.
+    // 2026-07-24 freeze fix — keep re-requesting the resync IDR while gated.
+    // The backlog branch below fires the request exactly ONCE (it re-arms the
+    // gate, so it can never fire again for this wedge); if that single
+    // control-DC message was lost — or the natural GOP IDR is far away
+    // because the viewer-rate cap shed the encode rate (240-frame GOP at
+    // 12 fps = 20 s) or the screen went static (frame-counted GOP never
+    // advances) — the decoder sat wedged on a stale frame indefinitely
+    // (field: "old screen for 30+ s", DEVBOX viewing WINHOST-A). The 250 ms
+    // debounce + the agent's MIN_KF_GAP clamp bound this to ~4 req/s.
     requestKeyframeResync()
+    // One-shot + periodic diagnostic so the field log shows the gate
+    // engaged (and how many deltas it ate) without flooding.
     if (framesSkippedAwaitingKey === 1 || framesSkippedAwaitingKey % 60 === 0) {
       workerScope.postMessage({
         type: 'awaiting-keyframe',
@@ -807,10 +910,12 @@ function emitFrame(): void {
       droppedBefore: framesSkippedAwaitingKey,
     })
   }
-  // rc.130 — backlog shed. Drop this delta + re-arm the keyframe gate (so we
-  // keep dropping deltas, which would otherwise decode-error against the
-  // missing reference) until the resync IDR lands. FR-119 P2b-7 — "behind" is
-  // the backlog in ms, sampled once per arriving frame.
+  // rc.130 — backlog shed. If the decoder has fallen behind, drop this delta
+  // and re-arm the keyframe gate so we keep dropping deltas (which would
+  // otherwise decode-error against the missing reference and tear the path
+  // down) until the resync IDR lands. FR-119 P2b-7 — "behind" is the backlog
+  // in ms, sampled here once per arriving frame (the struggling rule reads the
+  // window's mean of these samples).
   const backlogMs = backlog.sample(performance.now())
   mediaWindow.onBacklog(backlogMs)
   if (!isKey && backlogShouldDrop(backlogMs, maxBacklogMs)) {
@@ -829,7 +934,7 @@ function emitFrame(): void {
     return
   }
   // EncodedVideoChunk.timestamp is a microsecond integer per spec.
-  // We pass the agent-side capture timestamp through unmodified —
+  // We pass the agent-side framing timestamp through unmodified —
   // VideoDecoder uses it for ordering / frame.timestamp passthrough.
   const ts = Number(assembler.pendingTimestampUs)
   try {
@@ -850,16 +955,18 @@ function emitFrame(): void {
   }
 }
 
-/** Draw a decoded frame; true when it reached the canvas. */
+/** Draw a decoded frame at `w`×`h`; true when it reached the canvas. */
 function paintFrame(frame: VideoFrame, w: number, h: number): boolean {
   if (!canvas || !ctx) {
     frame.close()
     return false
   }
   try {
-    // P7 — FSR sharpening upscale (mirrors rc-hevc-worker; see
-    // rc-fsr-render.ts). `blit` is the pre-P7 path, byte-identical; any GL
-    // failure falls back to it the SAME frame.
+    // P7 — FSR sharpening upscale (see rc-fsr-render.ts). The sizing policy
+    // is pure and ns-cheap, so it runs per paint: a mid-stream resolution
+    // flip (the agent rebuilds on rung changes) or a window resize just
+    // yields a different target next frame. `blit` is the pre-P7 path,
+    // byte-identical; any GL failure falls back to it the SAME frame.
     const target = computeRenderTarget(
       w,
       h,
@@ -883,6 +990,8 @@ function paintFrame(frame: VideoFrame, w: number, h: number): boolean {
           lastRenderPass = target.pass
           painted = true
         } else {
+          // Lost/failed GL — dispose so the next frame lazily re-creates a
+          // fresh context; after MAX_FSR_REBUILDS the session goes 2D.
           fsr.dispose()
           fsr = null
           fsrRebuilds++
@@ -893,7 +1002,12 @@ function paintFrame(frame: VideoFrame, w: number, h: number): boolean {
     if (!painted) {
       if (canvas.width !== w) canvas.width = w
       if (canvas.height !== h) canvas.height = h
-      ctx.drawImage(frame, 0, 0)
+      // rc.100 — pass the explicit dest rect. The bare `drawImage(frame, 0, 0)`
+      // uses the frame's `displayWidth/Height` as its natural size, which is
+      // exactly the shrunken value we're routing around on the NVDEC-bug path;
+      // an explicit dest of the render size (coded for the rewrapped spurious
+      // case, visible for a trusted alignment crop) keeps the output 1:1.
+      ctx.drawImage(frame, 0, 0, w, h)
       lastRenderPass = 'blit'
     }
     return true
@@ -919,7 +1033,8 @@ function teardown(): void {
   framesReceived = 0
   lastPostedW = 0
   lastPostedH = 0
-  // rc.103 — re-arm the leading-delta gate for the next decoder.
+  // rc.103 — re-arm the leading-delta gate so a fresh decoder (re-connect
+  // / re-negotiation) again waits for an IDR before its first decode().
   sawKeyframe = false
   framesSkippedAwaitingKey = 0
   framesDroppedBacklog = 0
@@ -937,7 +1052,8 @@ function teardown(): void {
   clockOffsetUs = null
   outGapMaxMs = 0
   mediaWindow.reset()
-  // P7 — release the GL renderer; a fresh session re-creates lazily.
+  // P7 — release the GL renderer; a fresh session re-creates lazily and
+  // gets a fresh unavailability verdict (a new tab/GPU state may differ).
   fsr?.dispose()
   fsr = null
   fsrUnavailable = false
@@ -980,9 +1096,47 @@ export function isKeyframe(flags: number): boolean {
   return (flags & FLAG_KEYFRAME) !== 0
 }
 
-/** rc.103 — leading-delta gate decision, pure for vitest. A delta is only
- *  decodable once a keyframe has been seen; a keyframe is always decodable.
- *  Mirrors rc-hevc-worker so the wire-level invariant is shared. */
+/** rc.103 — leading-delta gate decision, pure for vitest. Returns whether
+ *  a frame should be fed to `decoder.decode()`: a delta is only decodable
+ *  once a keyframe has already been seen; a keyframe is always decodable.
+ *  This is the guard that stops the decoder throwing "A key frame is
+ *  required after configure() or flush()" on a leading delta — the field
+ *  WINHOST-G hevc_qsv failure (async-encoder DC-open race). */
 export function shouldDecodeFrame(hasSeenKeyframe: boolean, isKey: boolean): boolean {
   return hasSeenKeyframe || isKey
+}
+
+/** Crop classification for a decoded frame, any codec — pure for vitest.
+ *
+ *  - `exact`: no conformance window (visibleRect == coded size), or the
+ *    frame carries no usable geometry — render as-is.
+ *  - `alignment`: a REAL encoder alignment crop — origin (0,0) and less
+ *    than one CTU (64 px) smaller than the coded size on BOTH axes. HEVC
+ *    and H.264 encoders pad the picture to their block alignment and crop
+ *    the excess: Intel QSV codes a 1920×1080 desktop as 1920×1088 with an
+ *    8-row bottom crop whose padding rows are pooled-surface junk. TRUST it —
+ *    `drawImage` honours the visibleRect natively. (Field WINHOST-F: painting
+ *    the coded rect instead showed the junk as a purple/blue band flickering
+ *    on every frame while dragging windows.)
+ *  - `spurious`: anything else — a drastically smaller visible rect or an
+ *    offset origin is the Chrome NVDEC misreported-geometry bug (field
+ *    DEVBOX: coded 2560×1600, visible 1280×720). The coded pixels
+ *    are the whole desktop → re-wrap and render the full coded rect.
+ *
+ *  An alignment pad can never reach 64: aligning to any of 8/16/32/64 pads
+ *  by at most alignment−1 px, so a ≥64 deficit means the visible picture is
+ *  genuinely smaller than the coded surface — NVDEC-bug territory. */
+export function classifyCrop(
+  codedW: number,
+  codedH: number,
+  vr: { x: number; y: number; width: number; height: number } | null | undefined,
+): 'exact' | 'alignment' | 'spurious' {
+  if (!vr || codedW <= 0 || codedH <= 0) return 'exact'
+  if (vr.width === codedW && vr.height === codedH) return 'exact'
+  const dw = codedW - vr.width
+  const dh = codedH - vr.height
+  if (vr.x === 0 && vr.y === 0 && dw >= 0 && dh >= 0 && dw < 64 && dh < 64) {
+    return 'alignment'
+  }
+  return 'spurious'
 }

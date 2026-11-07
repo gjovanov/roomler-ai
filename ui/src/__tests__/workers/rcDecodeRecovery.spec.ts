@@ -4,8 +4,9 @@
  * FR-135 R1 — the recovery decision, the worker wiring, and the gap's gate.
  *
  * The second half is black-box, in the manner of `rcDecodeWorkersColorSpace`:
- * each real DC worker is driven through the messages the composable sends it,
- * with WebCodecs replaced by a recording fake.
+ * the real DC worker is driven through the messages the composable sends it,
+ * once per codec it decodes (`dcCodecs.ts`), with WebCodecs replaced by a
+ * recording fake.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
@@ -13,6 +14,7 @@ import {
   DECODE_RECOVER_MAX_ATTEMPTS,
   DECODE_RECOVER_WINDOW_MS,
 } from '@/workers/rc-decode-recovery'
+import { DC_CODECS } from './dcCodecs'
 
 describe('FR-135 R1 — the recovery decision', () => {
   function enabled() {
@@ -217,16 +219,11 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-const DC_WORKERS = [
-  { name: 'rc-vp9-444-worker', load: () => import('@/workers/rc-vp9-444-worker') },
-  { name: 'rc-hevc-worker', load: () => import('@/workers/rc-hevc-worker') },
-] as const
-
-describe.each(DC_WORKERS)('FR-135 R1 — $name', ({ load }) => {
+describe.each(DC_CODECS)('FR-135 R1 — the data-channel worker on $name', ({ codec }) => {
   async function start(init: Record<string, unknown> = { decodeRecover: true }) {
-    await load()
+    await import('@/workers/rc-dc-worker')
     const onmessage = scope.onmessage!
-    onmessage({ data: { type: 'init-canvas', canvas: fakeCanvas(), ...init } })
+    onmessage({ data: { type: 'init-canvas', canvas: fakeCanvas(), codec, ...init } })
     return (msg: Record<string, unknown>) => onmessage({ data: msg })
   }
 

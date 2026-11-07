@@ -42,7 +42,9 @@ const EXPECT_MAX_MS = process.env.DR_EXPECT_MAX_MS ? Number(process.env.DR_EXPEC
 const EXPECT_DELTAS = process.env.DR_EXPECT_DELTAS ? Number(process.env.DR_EXPECT_DELTAS) : null
 const UI_DIST = process.env.DR_UI_DIST || ''
 const CODEC_STORAGE_PREFIX = 'roomler-rc-codec.v1:'
-const WORKER_FILE = /\/rc-(vp9-444|hevc)-worker[^/]*\.js$/
+// FR-135 R3 made the two data-channel workers one, `rc-dc-worker`; the old
+// names still match a viewer older than that, so the spec reads either.
+const WORKER_FILE = /\/rc-(dc|vp9-444|hevc)-worker[^/]*\.js$/
 
 const say = (s: string) => console.log(`[dr-spec] ${new Date().toISOString()} ${s}`)
 

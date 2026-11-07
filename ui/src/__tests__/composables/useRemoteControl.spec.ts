@@ -174,6 +174,9 @@ import {
   DEFAULT_RC_METRICS,
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
+  HEVC_MAIN_CODEC_STRING,
+  H264_DC_CODEC_CANDIDATES,
+  isHevcDecodeSupported,
   translateModifierForHost,
   translateModsForHost,
   type AutoTransportInputs,
@@ -197,8 +200,7 @@ import {
 } from '@/workers/rc-fsr-render'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { RC_DECODER_COLOR_SPACE, rcDecoderConfig } from '@/workers/rc-decoder-config'
-import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
-import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
+import { parseFrameHeader, isKeyframe, shouldDecodeFrame, classifyCrop } from '@/workers/rc-dc-worker'
 import {
   HopStats,
   StruggleWindow,
@@ -1921,7 +1923,7 @@ describe('codecFromSdp', () => {
   })
 })
 
-describe('rc-vp9-444-worker frame header', () => {
+describe('rc-dc-worker frame header', () => {
   // Lock the wire format so any change to the agent-side encoder
   // emit gets caught here. Schema: u32 size LE + u8 flags + u64 ts LE.
 
@@ -1979,10 +1981,10 @@ describe('leading-delta keyframe gate (rc.103)', () => {
   // throws "A key frame is required after configure() or flush()" on a
   // leading delta, and the FFmpeg async encoder can ship a buffered delta
   // ahead of the DC-open IDR. The worker must DROP deltas until the first
-  // keyframe, then decode everything.
+  // keyframe, then decode everything. One worker serves every codec since
+  // FR-135 R3, so one gate.
   for (const [label, gate] of [
-    ['vp9-444', shouldDecodeFrame],
-    ['hevc', shouldDecodeFrameHevc],
+    ['rc-dc-worker', shouldDecodeFrame],
   ] as const) {
     describe(label, () => {
       it('drops a leading delta before any keyframe is seen', () => {
@@ -2020,7 +2022,7 @@ describe('leading-delta keyframe gate (rc.103)', () => {
   }
 })
 
-describe('classifyCrop — HEVC conformance-window handling', () => {
+describe('classifyCrop — conformance-window handling, every codec since FR-135 R3', () => {
   // Locks the WINHOST-F fix: QSV codes a 1920×1080 desktop as
   // 1920×1088 + an 8-row bottom crop (alignment padding = per-frame junk).
   // The NVDEC-bug rewrap (rc.102) must NOT override that legit crop — doing
@@ -4408,10 +4410,44 @@ describe('per-agent codec override (2026-07-28)', () => {
 })
 
 describe('P7 — HEVC Rext 4:4:4 codec string', () => {
-  it('locks the Rext profile fields alongside the Main-profile default', () => {
-    // Same Annex-B no-description contract as the worker's default
-    // hev1.1.6.L153.B0; profile_idc 4 + the Rext compat flag + Level 5.1.
+  it('locks the Rext profile fields alongside the Main-profile string', () => {
+    // Same Annex-B no-description contract as HEVC_MAIN_CODEC_STRING
+    // (hev1.1.6.L153.B0); profile_idc 4 + the Rext compat flag + Level 5.1.
     expect(HEVC_REXT_CODEC_STRING).toBe('hev1.4.10.L153.B0')
+  })
+})
+
+describe('FR-135 R3 — the codec strings the one data-channel worker is given', () => {
+  it('names HEVC Main at Level 5.1, the HEVC worker default it replaces (rc.94)', () => {
+    expect(HEVC_MAIN_CODEC_STRING).toBe('hev1.1.6.L153.B0')
+  })
+
+  it('probes HEVC at the string the worker then configures', async () => {
+    const asked: string[] = []
+    vi.stubGlobal('VideoDecoder', {
+      isConfigSupported: async (cfg: { codec: string }) => {
+        asked.push(cfg.codec)
+        return { supported: true }
+      },
+    })
+    try {
+      expect(await isHevcDecodeSupported()).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    expect(asked).toEqual([HEVC_MAIN_CODEC_STRING])
+  })
+
+  it('agrees with the worker specs’ codec list', async () => {
+    const { DC_CODECS } = await import('../workers/dcCodecs')
+    expect(DC_CODECS.map((c) => c.codec)).toEqual([
+      'vp09.01.10.08',
+      'vp09.00.10.08',
+      AV1_CODEC_STRING,
+      H264_DC_CODEC_CANDIDATES[0],
+      HEVC_MAIN_CODEC_STRING,
+      HEVC_REXT_CODEC_STRING,
+    ])
   })
 })
 
@@ -6004,13 +6040,11 @@ describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
     })
   })
 
-  const at = (rtpBytes: number, vp9Frames = 0, hevcFrames = 0) => ({ rtpBytes, vp9Frames, hevcFrames })
+  const at = (rtpBytes: number, dcFrames = 0) => ({ rtpBytes, dcFrames })
 
   it('counts frames on a data-channel session, and RTP bytes no longer hold off the re-create', () => {
     expect(mediaAdvanced(at(0, 10), at(0, 11), true)).toBe(true)
-    expect(mediaAdvanced(at(0, 0, 10), at(0, 0, 11), true)).toBe(true)
     expect(mediaAdvanced(at(100, 10), at(200, 10), true)).toBe(false)
-    expect(mediaAdvanced(at(100, 0, 10), at(200, 0, 10), true)).toBe(false)
   })
 
   it('still counts RTP bytes before a first data-channel frame: an agent that ignores the channel sends RTP', () => {
@@ -6019,7 +6053,7 @@ describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
   })
 
   it('judges a <video> fallback on RTP again once the path is down', () => {
-    // stopVp9_444Path zeroes the counter.
+    // stopDcPath zeroes the counter.
     expect(mediaAdvanced(at(100, 10), at(200, 0), true)).toBe(true)
     expect(mediaAdvanced(at(100, 10), at(100, 0), true)).toBe(false)
   })
