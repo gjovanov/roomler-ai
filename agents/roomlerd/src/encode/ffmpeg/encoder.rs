@@ -920,6 +920,10 @@ pub struct RateStats {
     pub stage: StageTimes,
     /// FR-118 P2-2 — GPU frames or CPU frames, and why.
     pub input: super::gpu_hint::InputForm,
+    /// FR-135 R0 — the bitrate ceiling the encoder runs now (`rc_max_rate`,
+    /// moved by every rate apply). R12's red reads the 25 M cap here. 0 from a
+    /// failed read, which is `RateStats::default()`.
+    pub maxrate_bps: u32,
 }
 
 /// FR-118 P0 — where `encode_sync`'s time goes, cumulative for one encoder.
@@ -2532,6 +2536,7 @@ impl FfmpegEncoder {
             idr_count: self.idr_count,
             stage: self.stage,
             input: self.input,
+            maxrate_bps: self.current_maxrate_bps(),
         }
     }
 

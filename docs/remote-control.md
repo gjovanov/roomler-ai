@@ -1340,7 +1340,7 @@ flowchart LR
 
 | Path | Phase | New code in this build | Default |
 |---|---|---|---|
-| `stats` | R0 | not yet | old |
+| `stats` | R0 | yes | new |
 | `media_plan` | R2 | yes | new |
 | `capture_wait`, `capture_stage`, `zero_copy_shared`, `dc_sink`, `sctp_rto`, `encode_stage`, `cell_table`, `rtp_sink`, `recording_door`, `high_refresh` | R4a to R12 | not yet | old |
 
@@ -3128,6 +3128,65 @@ exists for.
 first heartbeat, a follower on a shared pipeline (its owner's row has the reading) and a pump with
 no input form each read as an absent field, so a fleet read compares only sessions that reported.
 **Record, never decide**: nothing on the agent or the server changes because of a reading.
+
+### 11.13 What a session did, and each window of it (FR-135 R0)
+
+FR-135's first week replaces its plan's weights with measured ones, which needs each session to
+say which cell it ran and how long it was in motion. Before this, those numbers came from scraping
+`agent_logs`, which keeps seven days. So both data-channel pumps keep a **window**
+(`agents/roomlerd/src/media_window.rs`), and two things are built from it: new heartbeat fields,
+and a **summary** that rides P1d's reading into `remote_sessions.video`.
+
+```mermaid
+flowchart LR
+  P["DC pump<br/>capture · encode · hand-off"] --> W["MediaWindow<br/>histograms + counts"]
+  W -->|"each heartbeat (FFmpeg)"| H["heartbeat fields"]
+  W -->|"every 2 s, own clock"| T["session_telemetry<br/>MediaTally"]
+  T --> V["rc:session.stats video"] --> R["remote_sessions.video"]
+  K["rc:keyframe handler"] -->|"asks, gapped, oldest wait"| T
+```
+
+**The summary**, every field absent until the pump has folded a window, and absent is **not
+counted**, never zero:
+
+| Field | Says |
+|---|---|
+| `chroma` | `yuv420` or `yuv444`; with `encoder`, the cell |
+| `moving_s`, `sparse_s` | seconds of 2 s windows capturing 5 or more real frames a second, and the rest (FR-135 §2.1). A window longer than 10 s (a gate, a long capture wait) counts 10 s |
+| `frames_encoded`, `frames_keepalive` | frames the encoder returned, and of them the re-encodes of an unchanged screen |
+| `followers` | the most viewers that shared the session's pipeline |
+| `first_frame_ms` | from the pump's start to its first frame in the channel's queue: the agent's half of the time to the first frame |
+
+The VP9 pump now sends P1d's reading too (`vp9_libvpx`, CPU, `no_gpu_cell`), so a VP9 session
+names its cell as an FFmpeg one does. The server checks every count against a bound (30 days, 240
+fps, 64 followers, an hour) and drops a reading with one out of range whole, as it drops a bad
+name. The struct defaults field by field, so a later agent that drops a field costs that reading
+and never the rest of the sample.
+
+⚠️ **A short session reports its first window only.** The summary rides the samples P1d sends:
+one when the reading first appears, about 2 s in, then the 30 s tick. A session the viewer ends
+before its first tick keeps that early count, because the server has set `ended_at` before the
+last sample lands (above). By FR-135 §2.1's numbers those sessions hold about 6 % of the hours.
+
+**The heartbeat fields**, on the FFmpeg data-channel pump's line, appended and never renamed. Each
+reads `None` with `stats` on the session's old path. A `_ms` list is twelve log-2 ms buckets,
+`[0,1)` up to `[1024,∞)`.
+
+| Field | Instrument | Says |
+|---|---|---|
+| `capture_backend`, `frames_keepalive`, `keepalive_bytes` | N3 | which capture arm, and what a still screen costs |
+| `window_ms` | ledger L03 | the window's real length; "≈2s" is only its floor |
+| `cap_to_handoff_ms`, `_p50_ms`, `_p95_ms` | N7 | from when the pump took a real frame to its hand-off to the channel, in the process's one clock. On a push arm (WGC, the portal) it starts when the pump takes the frame, not at capture |
+| `handoff_gap_ms` | N10, the agent's half | the cadence the channel is fed at |
+| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and every ask with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter |
+| `idr_causes` | IDR by cause | forces per window: `[asked, shared, lock, backstop, resync, settle]`. `asked` is the shared flag, which the viewer, the settle request and the channel-not-open request all set |
+| `dc_lock_ms` | §2.5 | the video channel's mutex wait, which `send_wait` does not contain |
+| `maxrate_bps` | R12's red | the bitrate ceiling the encoder runs now |
+
+The switch is `rc_media_legacy=stats` (§5.1, "The media paths"): with it, the pumps keep no window,
+the heartbeat is the line it was, and no summary is sent. The fix that rides with it: a heartbeat
+whose `rate_stats` read failed no longer reaches `rc:media-plan`, where it wrote a false "gpu →
+cpu" step and its way back.
 
 ## 12. Performance targets & budget
 

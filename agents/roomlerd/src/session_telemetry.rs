@@ -99,6 +99,40 @@ pub struct SessionCounters {
     /// reading ([`Self::note_video`]). `None` before its first heartbeat, and
     /// on a pump with no input form to name.
     video: std::sync::Mutex<Option<VideoForm>>,
+    /// FR-135 R0 (N16) — the session's media summary, folded from its pump's
+    /// windows ([`Self::note_media_fold`]). `None` until the first fold, and
+    /// with `stats` on the session's old path.
+    media: std::sync::Mutex<Option<MediaTally>>,
+    /// FR-135 R0 (N12) — the viewer's `rc:keyframe` asks, and how many of them
+    /// the 500 ms gap dropped (R1's slow recoveries pointed at that gap, and
+    /// no counter confirmed it).
+    kf_asks: AtomicU32,
+    kf_asks_gapped: AtomicU32,
+    /// When the last ask the gap let through arrived, as `kf_ask_epoch`
+    /// micros plus one; 0 = none waiting. The pump takes it when the key frame
+    /// that answers it is queued ([`Self::take_keyframe_ask`]).
+    kf_ask_at: AtomicU64,
+}
+
+/// FR-135 R0 (N16) — what a session's windows add up to, beside P1d's reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaTally {
+    /// Windows capturing 5 or more frames a second (FR-135 §2.1), and the rest.
+    pub moving_ms: u64,
+    pub sparse_ms: u64,
+    pub frames_encoded: u64,
+    pub frames_keepalive: u64,
+    /// The most followers the session's pipeline served at once.
+    pub followers: u32,
+    /// From the pump's start to the first frame in the channel's queue.
+    pub first_frame_ms: Option<u32>,
+}
+
+/// The clock the keyframe ask's arrival is kept in: microseconds since the
+/// first call, which only ever compares two readings of itself.
+fn kf_ask_epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
 }
 
 /// FR-132 P1d — one pump reading, in the names the heartbeat logs. `'static`
@@ -112,6 +146,9 @@ pub struct VideoForm {
     pub input_path: &'static str,
     /// Empty on GPU input, as `InputForm::reason` is.
     pub input_reason: &'static str,
+    /// FR-135 R0 — `yuv420` or `yuv444`: with `encoder`, the cell. Empty from a
+    /// pump that does not know, and then not sent.
+    pub chroma: &'static str,
 }
 
 impl SessionCounters {
@@ -131,15 +168,90 @@ impl SessionCounters {
         video.replace(form) != Some(form)
     }
 
-    /// FR-132 P1d — what `rc:session.stats` carries.
+    /// FR-132 P1d — what `rc:session.stats` carries. FR-135 R0 (N16) adds the
+    /// session's media summary to the same reading once the pump has folded a
+    /// window; without one those fields are absent, never zero.
     pub fn video(&self) -> Option<SessionVideo> {
         let form = (*self.video.lock().unwrap_or_else(|p| p.into_inner()))?;
+        let media = *self.media.lock().unwrap_or_else(|p| p.into_inner());
         Some(SessionVideo {
             encoder: form.encoder.to_string(),
             capture: form.capture.to_string(),
             input_path: form.input_path.to_string(),
             input_reason: (!form.input_reason.is_empty()).then(|| form.input_reason.to_string()),
+            chroma: (!form.chroma.is_empty()).then(|| form.chroma.to_string()),
+            moving_s: media.map(|m| (m.moving_ms / 1000).min(u32::MAX as u64) as u32),
+            sparse_s: media.map(|m| (m.sparse_ms / 1000).min(u32::MAX as u64) as u32),
+            frames_encoded: media.map(|m| m.frames_encoded),
+            frames_keepalive: media.map(|m| m.frames_keepalive),
+            followers: media.map(|m| m.followers),
+            first_frame_ms: media.and_then(|m| m.first_frame_ms),
         })
+    }
+
+    /// FR-135 R0 (N16) — one window of the pump's, folded into the session's
+    /// summary, with the followers its pipeline serves now.
+    pub fn note_media_fold(&self, fold: crate::media_window::FoldReport, followers: u32) {
+        let mut media = self.media.lock().unwrap_or_else(|p| p.into_inner());
+        let m = media.get_or_insert_with(MediaTally::default);
+        if fold.moving {
+            m.moving_ms = m.moving_ms.saturating_add(fold.ms);
+        } else {
+            m.sparse_ms = m.sparse_ms.saturating_add(fold.ms);
+        }
+        m.frames_encoded = m.frames_encoded.saturating_add(fold.frames_encoded);
+        m.frames_keepalive = m.frames_keepalive.saturating_add(fold.frames_keepalive);
+        m.followers = m.followers.max(followers);
+    }
+
+    /// FR-135 R0 (N16) — the session's first frame reached the channel's queue
+    /// `after` the pump started. The first call wins.
+    pub fn note_first_frame(&self, after: std::time::Duration) {
+        let mut media = self.media.lock().unwrap_or_else(|p| p.into_inner());
+        let m = media.get_or_insert_with(MediaTally::default);
+        if m.first_frame_ms.is_none() {
+            m.first_frame_ms = Some(after.as_millis().min(u32::MAX as u128) as u32);
+        }
+    }
+
+    /// FR-135 R0 (N12) — a viewer's `rc:keyframe`, let through by the gap or
+    /// dropped by it. One the gap let through starts the wait the pump reads
+    /// when the key frame that answers it is queued.
+    pub fn note_keyframe_ask(&self, allowed: bool) {
+        self.kf_asks.fetch_add(1, Ordering::Relaxed);
+        if allowed {
+            let at = kf_ask_epoch()
+                .elapsed()
+                .as_micros()
+                .min(u64::MAX as u128 - 1) as u64;
+            // Keep the OLDEST unanswered ask: the wait is the viewer's.
+            let _ =
+                self.kf_ask_at
+                    .compare_exchange(0, at + 1, Ordering::Relaxed, Ordering::Relaxed);
+        } else {
+            self.kf_asks_gapped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// FR-135 R0 (N12) — how long the oldest unanswered ask has waited, taken
+    /// so the next key frame does not answer it twice. `None` when none waits.
+    pub fn take_keyframe_ask(&self) -> Option<std::time::Duration> {
+        match self.kf_ask_at.swap(0, Ordering::Relaxed) {
+            0 => None,
+            at => {
+                let now = kf_ask_epoch().elapsed().as_micros() as u64;
+                Some(std::time::Duration::from_micros(now.saturating_sub(at - 1)))
+            }
+        }
+    }
+
+    /// FR-135 R0 (N12) — the session's asks so far, and how many the gap
+    /// dropped.
+    pub fn keyframe_asks(&self) -> (u32, u32) {
+        (
+            self.kf_asks.load(Ordering::Relaxed),
+            self.kf_asks_gapped.load(Ordering::Relaxed),
+        )
     }
 
     /// FR-101 P3 — one completed file transfer. Only a SHA-256 of `name`
@@ -415,6 +527,7 @@ mod tests {
             capture: "system-context",
             input_path: "cpu",
             input_reason: "denied",
+            chroma: "yuv420",
         });
         assert_eq!(
             counters(s).video(),
@@ -423,6 +536,8 @@ mod tests {
                 capture: "system-context".into(),
                 input_path: "cpu".into(),
                 input_reason: Some("denied".into()),
+                chroma: Some("yuv420".into()),
+                ..Default::default()
             })
         );
 
@@ -431,6 +546,7 @@ mod tests {
             capture: "wgc",
             input_path: "gpu",
             input_reason: "",
+            chroma: "yuv444",
         });
         assert_eq!(
             counters(s).video(),
@@ -439,6 +555,8 @@ mod tests {
                 capture: "wgc".into(),
                 input_path: "gpu".into(),
                 input_reason: None,
+                chroma: Some("yuv444".into()),
+                ..Default::default()
             }),
             "the newest reading"
         );
@@ -455,6 +573,7 @@ mod tests {
             capture: "wgc",
             input_path: "cpu",
             input_reason: "cpu_frames",
+            chroma: "yuv420",
         };
         let gpu = VideoForm {
             input_path: "gpu",
@@ -468,6 +587,111 @@ mod tests {
         forget(s);
     }
 
+    /// FR-135 R0 (N16) — the summary is absent until a window folds, then
+    /// rides the reading: moving and sparse by the fold's verdict, frames
+    /// summed, the most followers kept, and the first frame's time once.
+    #[test]
+    fn the_media_summary_folds_into_the_reading() {
+        use crate::media_window::FoldReport;
+        let s = ObjectId::new();
+        let form = VideoForm {
+            encoder: "hevc_qsv",
+            capture: "system-context",
+            input_path: "cpu",
+            input_reason: "switch_off",
+            chroma: "yuv420",
+        };
+        counters(s).note_video(form);
+        let v = counters(s).video().unwrap();
+        assert_eq!(v.chroma.as_deref(), Some("yuv420"));
+        assert_eq!(
+            (v.moving_s, v.sparse_s, v.frames_encoded, v.first_frame_ms),
+            (None, None, None, None),
+            "not counted before a fold, never zero"
+        );
+
+        counters(s).note_media_fold(
+            FoldReport {
+                ms: 2_000,
+                moving: true,
+                frames_encoded: 120,
+                frames_keepalive: 0,
+            },
+            0,
+        );
+        counters(s).note_media_fold(
+            FoldReport {
+                ms: 10_000,
+                moving: false,
+                frames_encoded: 10,
+                frames_keepalive: 10,
+            },
+            2,
+        );
+        counters(s).note_media_fold(
+            FoldReport {
+                ms: 2_500,
+                moving: false,
+                frames_encoded: 2,
+                frames_keepalive: 2,
+            },
+            1,
+        );
+        counters(s).note_first_frame(std::time::Duration::from_millis(640));
+        counters(s).note_first_frame(std::time::Duration::from_millis(9_999));
+        let v = counters(s).video().unwrap();
+        assert_eq!(v.moving_s, Some(2));
+        assert_eq!(
+            v.sparse_s,
+            Some(12),
+            "12.5 s of sparse windows, whole seconds"
+        );
+        assert_eq!(v.frames_encoded, Some(132));
+        assert_eq!(v.frames_keepalive, Some(12));
+        assert_eq!(v.followers, Some(2), "the most at once");
+        assert_eq!(v.first_frame_ms, Some(640), "the first call wins");
+        assert!(v.clone().checked().is_some(), "{v:?}");
+        forget(s);
+    }
+
+    /// FR-135 R0 (N12) — every ask counts, the gap's drops count apart, and the
+    /// oldest unanswered ask's wait is taken once, by the key frame that
+    /// answers it.
+    #[test]
+    fn a_keyframe_ask_waits_until_a_key_frame_takes_it() {
+        let s = ObjectId::new();
+        assert_eq!(counters(s).take_keyframe_ask(), None);
+        counters(s).note_keyframe_ask(true);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        counters(s).note_keyframe_ask(false);
+        counters(s).note_keyframe_ask(true);
+        assert_eq!(counters(s).keyframe_asks(), (3, 1));
+        let waited = counters(s).take_keyframe_ask().expect("an ask waits");
+        assert!(
+            waited >= std::time::Duration::from_millis(5),
+            "the OLDEST ask's wait: {waited:?}"
+        );
+        assert_eq!(counters(s).take_keyframe_ask(), None, "answered once");
+        assert_eq!(
+            counters(s).keyframe_asks(),
+            (3, 1),
+            "taking leaves the counts"
+        );
+        forget(s);
+    }
+
+    /// FR-132 P1d, the reviewer's nit on #3284 — the rule below rests on what a
+    /// failed read produces: `EncoderDriver::rate_stats` answers
+    /// `RateStats::default()`, whose input form must stay CPU with no reason.
+    #[cfg(feature = "ffmpeg-encoder")]
+    #[test]
+    fn a_failed_read_is_cpu_with_no_reason() {
+        let failed = crate::encode::ffmpeg::encoder::RateStats::default();
+        assert!(!failed.input.gpu);
+        assert_eq!(failed.input.reason, "");
+        assert_eq!(failed.maxrate_bps, 0);
+    }
+
     /// FR-132 P1d — a heartbeat whose `rate_stats` failed reads `InputForm`'s
     /// default, CPU with no reason. It says nothing about the session, so a
     /// reading stands through it, and no sample goes for it.
@@ -479,6 +703,7 @@ mod tests {
             capture: "wgc",
             input_path: "gpu",
             input_reason: "",
+            chroma: "yuv420",
         };
         let failed = VideoForm {
             input_path: "cpu",
