@@ -150,7 +150,7 @@ pub const AGENT_DELETED_EXIT_CODE: i32 = 7;
 /// all. A "last run failed" task is a visible, actionable state. Do not revert
 /// to 0, which is ambiguous with a self-update.
 ///
-/// Emitted by the `AcquireOutcome::AlreadyRunning` arm in `main.rs`.
+/// Emitted by the `AcquireOutcome::AlreadyRunning` arm in `app.rs`.
 /// ⚠️ Three places must agree, in three different files, with nothing
 /// coupling them: this constant, the Linux units'
 /// `RestartPreventExitStatus`, and the Windows supervisor's `Stop` arm.

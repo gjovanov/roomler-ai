@@ -3102,10 +3102,10 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
 /// builds always return false (no risk of asymmetry).
 #[cfg(all(feature = "system-context", target_os = "windows"))]
 fn enroll_user_context_warning_due() -> bool {
-    // main.rs is the bin crate; reach into the lib via its crate name
-    // — mirrors the existing call sites at :404, :476, :637, :1032, :1792.
-    // Local cargo test caught this only via the bin-tests build path
-    // because the test binary doesn't exercise the system-context feature.
+    // `roomlerd::` is this lib's own name (`extern crate self as roomlerd`,
+    // lib.rs), kept from when this file was the bin crate's `main.rs`.
+    // Only a system-context Windows build compiles this, so a default
+    // `cargo test` never sees it.
     use roomlerd::system_context::worker_role::{WorkerRole, probe_self};
     !matches!(probe_self(), Ok(WorkerRole::SystemContext))
 }

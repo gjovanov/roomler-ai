@@ -3664,8 +3664,8 @@ pub enum AutoUpdate {
     OptedOut(&'static str),
 }
 
-/// #2901 — the start-up decision, pure so the lib tests can pin it (the
-/// daemon's `main.rs` has no test lane). `setting` is the resolved
+/// #2901 — the start-up decision, pure so a test can pin it without starting a
+/// daemon. `setting` is the resolved
 /// `AUTO_UPDATE` value (config key or env); `marker` is [`opt_out_marker`].
 /// Either opt-out turns the updater off. A setting that says off is reported
 /// first, because it is the one the operator set on this daemon.
