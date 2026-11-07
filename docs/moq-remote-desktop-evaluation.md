@@ -45,7 +45,7 @@ Everything is **feature-flagged** (`--features moq-broadcast` + `ROOMLERD_MOQ=1`
 **Build (minimal):**
 - **Agent probe** (`roomlerd moq-probe`, behind the feature): reuse `capture::open_default` + `encode::open_for_codec` (`encode/mod.rs:386`); wrap each frame with the **existing** `frame_video_bytes` 13-byte header verbatim (`peer.rs:1762`); publish via the kixelated **`moq-lite`** + **`web-transport`** Rust crates (native QUIC) — map one keyframe-led GOP = one MoQ *group*, each frame = one *object*.
 - **Relay**: run kixelated **`moq-relay` as one container on an existing coturn host** (we already operate + monitor these). No new cloud account.
-- **Throwaway browser subscriber** (a static page / hidden route, *not* wired into `RemoteControl.vue`): open a `WebTransport` to the relay, subscribe, and `postMessage({type:'chunk', bytes})` to the **unmodified** `rc-vp9-444-worker.ts` / `rc-hevc-worker.ts` (the existing transport-agnostic handoff in `useRemoteControl.ts:~1850`). If frames paint, subscriber-reuse is proven.
+- **Throwaway browser subscriber** (a static page / hidden route, *not* wired into `RemoteControl.vue`): open a `WebTransport` to the relay, subscribe, and `postMessage({type:'chunk', bytes})` to the **unmodified** data-channel worker (`rc-dc-worker.ts` since FR-135 R3; `rc-vp9-444-worker.ts` / `rc-hevc-worker.ts` when this was written) (the existing transport-agnostic handoff in `useRemoteControl.ts:~1850`). If frames paint, subscriber-reuse is proven.
 
 **Measure (on the Iris-Xe and RTX-5090 field boxes):**
 1. **Glass-to-glass p50/p95**, agent→relay→browser, vs the WebRTC-P2P baseline (instrument the worker using the capture `ts_us` already in the header).
@@ -87,7 +87,7 @@ Everything is **feature-flagged** (`--features moq-broadcast` + `ROOMLERD_MOQ=1`
 - `crates/remote_control/src/signaling.rs` — new `rc:broadcast.*` `ClientMsg`/`ServerMsg` wire types (mirror `SessionRequest`/`Request` + tunnel additions).
 - `crates/tunnel-core/src/transport/mod.rs` — `MIN_MOQ_AGENT_RC` + `agent_supports_moq()` next to `agent_supports_quic`.
 - `agents/roomlerd/src/encode/caps.rs` — probe-gated `"moq-broadcast"` cap + a default-build-omits-it test.
-- `ui/src/composables/useRemoteControl.ts` — `startMoqObserverPath()` (mirror `startVp9_444Path`); reuse the worker handoff verbatim. `ui/src/workers/rc-vp9-444-worker.ts` / `rc-hevc-worker.ts` — **unchanged**.
+- `ui/src/composables/useRemoteControl.ts` — `startMoqObserverPath()` (mirror `startDcPath`, `startVp9_444Path` when this was written); reuse the worker handoff verbatim. `ui/src/workers/rc-dc-worker.ts` (`rc-vp9-444-worker.ts` / `rc-hevc-worker.ts` until FR-135 R3) — **unchanged**.
 - `crates/api/src/ws/tunnel.rs` — server-side auth-boundary + version-gate pattern to copy. `crates/remote_control/src/turn_creds.rs` — `ice_servers_for` template for handing out the relay address.
 - New deps (Phase 0): `moq-lite`, `web-transport` (Rust, kixelated/moq-dev); `moq-relay` container. New build feature `moq-broadcast`.
 

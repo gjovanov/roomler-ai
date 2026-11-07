@@ -57,6 +57,14 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   the `rc:*` channel — notifications, conference, tenants, files, agents…),
   composables (`useRemoteControl` HID + button-mapping locks, validation,
   markdown, snackbar), API client, plugins.
+- **The data-channel worker, black-box** (`ui/src/__tests__/workers/`, FR-135 R3):
+  `rcDcWorker`, `rcMediaWindow`, `rcDecodeRecovery` and `rcDecodeWorkersColorSpace`
+  drive the real `rc-dc-worker.ts` through the messages the page sends it, with
+  WebCodecs, the canvas and the clock faked, once for each of the six codec strings
+  the page names (`dcCodecs.ts`, which `useRemoteControl.spec.ts` checks against the
+  composable's constants). One worker serves every codec, so a branch on the codec
+  string shows up as the one codec whose cases fail. `rcDcWorker` also locks the
+  `stats` message's keys and the crop handling on every codec.
 - **The setup wizard's page** (`ui/src/__tests__/setupWizardPage.spec.ts`, FR-129 C): the
   real `index.html` and `app.js` of `agents/roomler-setup` in jsdom, with Tauri's `invoke`
   mocked. What is preselected, when Continue opens and which cards show are the product there,
@@ -66,7 +74,9 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   websocket + connection status, billing, invite, oauth, email flows,
   notifications, observability, profile, responsive, 404 — plus the
   remote-control lane: `remote-session-smoke`, `remote-file-upload-smoke`,
-  `rc-vp9-444` (needs an agent built with the feature),
+  `rc-vp9-444` (the data-channel worker behind two peers looped in one page; no
+  agent, but it loads the worker from the Vite dev path, so it runs against
+  `bun run dev` only: `scripts/e2e-expected-failures.txt`),
   `remote-recording-refused` and `remote-recording-smoke` (FR-85; the second
   needs an agent that advertises `record`), and a field-host upload spec. Chromium runs with fake media devices for WebRTC.
 - **The phone-width smoke** (`ui/e2e-phone/`, FR-116 D6): the BUILT SPA served
@@ -105,7 +115,7 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14949`,
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14674`,
   `:15039`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
