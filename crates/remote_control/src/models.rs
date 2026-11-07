@@ -5059,9 +5059,9 @@ pub enum SshDenyReason {
     /// lived only in the device's log, and the caller was told to dial a port
     /// that nothing intercepts when SSH is off — a bare `Connection refused`.
     AgentDisabled,
-    /// FR-83 — the grant had already expired when the device received it:
-    /// the device's clock is ahead of the server's, or its control connection
-    /// is slower than the grant's whole life.
+    /// FR-83 — the grant had already expired when the device received it. Since #3511
+    /// only an older agent sends it, from about 11 minutes ahead of the server's clock:
+    /// [`ssh_limits::GRANT_TTL_SECS`] + [`ssh_limits::DEVICE_EXPIRY_SLACK_SECS`].
     GrantExpiredOnArrival,
     /// FR-83 — the device refused the grant for a reason with no dedicated
     /// variant (an unusable key, or a reason newer than this server).
@@ -5124,8 +5124,8 @@ impl SshDenyReason {
                  setting) — only someone with access to that device can turn it on"
             }
             Self::GrantExpiredOnArrival => {
-                "the grant had already expired when the device received it — the \
-                 device's clock is probably ahead of the server's by a minute or more"
+                "the grant expired before the device got it — its clock is probably about 11 \
+                 minutes or more ahead; fix that clock, or update its agent to 0.4.202 or later"
             }
             Self::GrantRefused => {
                 "the device refused the session grant — its own log (`roomler logs \
@@ -10416,5 +10416,26 @@ mod retired_key_tests {
             );
         }
         assert_eq!(v["trigger"], "key_retired");
+    }
+}
+
+// #3511 — the expired-on-arrival refusal names, in minutes, the skew an agent
+// released before #3511 needs before it refuses a grant from a server that has
+// it: the TTL plus the slack that server adds. This keeps the text in step with
+// the two constants. It sits at the end of the file so no anchor above moves.
+#[cfg(test)]
+mod expired_on_arrival_text {
+    use super::*;
+
+    #[test]
+    fn names_the_skew_an_old_agent_needs() {
+        let secs = ssh_limits::GRANT_TTL_SECS + ssh_limits::DEVICE_EXPIRY_SLACK_SECS;
+        assert_eq!(secs % 60, 0, "the bound is a whole number of minutes");
+        let text = SshDenyReason::GrantExpiredOnArrival.message();
+        assert!(
+            text.contains(&format!("about {} minutes", secs / 60)),
+            "{text}"
+        );
+        assert!(text.contains("0.4.202"), "{text}");
     }
 }
