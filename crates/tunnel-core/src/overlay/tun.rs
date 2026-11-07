@@ -5619,8 +5619,8 @@ mod system {
         }
     }
 
-    /// Purge the PEER/SUBNET ROUTES on a persisted TUN that no crypto-router
-    /// backs, and return the ones it found (each purged best-effort).
+    /// Purge every PEER/SUBNET ROUTE on the overlay's TUN (all but its own
+    /// connected prefixes), and return the ones it found, each purged best-effort.
     ///
     /// `install_subnets` writes an OS route **and** the crypto-router entry in
     /// one call, so within a single runtime generation the two cannot diverge.

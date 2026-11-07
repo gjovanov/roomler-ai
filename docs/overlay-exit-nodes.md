@@ -249,13 +249,13 @@ into `roomlerd::purge_exit_routes()` and called:
   runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2148`):
   see [exit-client pins](#exit-client-pins-fr-97-p0e) below.
 
-The stale-route purge drops every peer/subnet route on the persisted TUN, and
+The stale-route purge drops every peer/subnet route on the overlay's TUN, and
 the end of a generation that logs it tells the two cases apart:
 
 | Line | Logged by | Means |
 |---|---|---|
 | `overlay: boot reconcile — dropped stale routes left by a previous generation …` | a start (`agents/roomlerd/src/lib.rs:387`) | the process before it never purged them: it crashed, was killed or lost power, or its purge failed |
-| `overlay: exit purge — dropped the overlay's routes from a persisted TUN …` | an exit (`agents/roomlerd/src/lib.rs:344`) | routine: an exit drops the routes it leaves, so none black-holes while no daemon runs |
+| `overlay: exit purge — dropped the overlay's routes from its TUN …` | an exit (`agents/roomlerd/src/lib.rs:344`) | routine: an exit drops the routes it leaves, so none black-holes while no daemon runs |
 
 Older agents log the boot line at both ends, so on them an update's own exit
 reads like a stale-route find.

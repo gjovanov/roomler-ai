@@ -325,11 +325,11 @@ pub fn purge_exit_routes() {
     }
 }
 
-/// An exit's purge of the peer/subnet routes on a persisted TUN
+/// An exit's purge of the peer/subnet routes on the overlay's TUN
 /// (`tunnel_core::overlay::tun::purge_stale_peer_routes`). Their crypto-router
-/// entries die with the runtime, so left behind they black-hole silently: the
-/// OS route looks right, the peer is online, and only the traffic vanishes
-/// (field case 2026-08-03).
+/// entries die with the runtime, so left behind on a persisted TUN they
+/// black-hole silently: the OS route looks right, the peer is online, and only
+/// the traffic vanishes (field case 2026-08-03).
 ///
 /// Its line is not the start's `boot reconcile` one: every exit drops the
 /// routes it leaves, so this line is routine, while routes a start finds mean
@@ -341,8 +341,8 @@ fn purge_peer_routes_at_exit() {
     if !dropped.is_empty() {
         tracing::info!(
             count = dropped.len(), routes = ?dropped,
-            "overlay: exit purge — dropped the overlay's routes from a persisted TUN, so none \
-             outlives this process to black-hole"
+            "overlay: exit purge — dropped the overlay's routes from its TUN, so none outlives \
+             this process to black-hole"
         );
     }
 }
