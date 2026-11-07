@@ -39,6 +39,7 @@ FR-37=1   # A.5 #928 no Result comment. One nightly run settles it: does the nig
 
 # ── B. deliberately not met, and the spec says so ────────────────────────────
 FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addressable by P1" (fps under sustained motion). Honest and intentional. Owed: a child FR or an in-spec waiver, so a later reader does not have to infer it.
+FR-56=2   # B.2 #1157 the spec WAIVES both, by the operator's decision of 2026-11-02. AC5, a native window listed and focused on wlroots: GNOME refuses enumeration (measured) and wlroots is unverifiable here, since no device reports one; follow-up #3311. AC9, launch with no Xwayland: refuted as written, because such a window can be neither listed nor focused. Owed: nothing until a wlroots host exists.
 
 # ── C. closed WITH field evidence on the issue: what the evidence did NOT reach ─
 # 2026-11-02: every criterion of this group was matched against its own evidence, one

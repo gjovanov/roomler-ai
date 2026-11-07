@@ -46,9 +46,10 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 /// What this test thread logged. `#[tokio::test]` runs the agent's tasks on this
 /// one thread, so a thread's default subscriber sees them, and a parallel test's
-/// agent stays out of it.
+/// agent stays out of it. The server's tasks too (#3517's
+/// `agent_socket_end_tests` reads the agent socket's disconnect line with it).
 #[derive(Clone, Default)]
-struct Logged(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct Logged(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Logged {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -68,7 +69,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logged {
 }
 
 impl Logged {
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
+    pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
         tracing::subscriber::set_default(
             tracing_subscriber::fmt()
                 .with_max_level(tracing::Level::INFO)
@@ -78,7 +79,7 @@ impl Logged {
         )
     }
 
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 }

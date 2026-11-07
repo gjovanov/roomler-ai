@@ -4,7 +4,6 @@ import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { looksSignedIn } from '@/api/session'
 import { useCapabilitiesStore } from '@/stores/capabilities'
-import { useHiveStore } from '@/stores/hive'
 import { PAIR_PATH, takePendingPair } from '@/utils/pairing'
 import type { ModuleId } from '@/modules/registry'
 
@@ -234,7 +233,13 @@ const routes: RouteRecordRaw[] = [
             path: 'room/:roomId/call',
             name: 'room-call',
             component: () => import('@/views/conference/ConferenceView.vue'),
-            meta: { module: 'conference', liveSession: true },
+            // #1637 — the app bar's Active Calls menu pushes another room's
+            // call onto this page in place, and the page runs its room in
+            // onMounted: it kept the previous room's call, chat and name
+            // under the new URL. Remounting by roomId gives every room a fresh
+            // page; leaving a call the page is in is the page's own question
+            // (onBeforeRouteUpdate). Locked by ConferenceViewRoomSwitch.spec.ts.
+            meta: { module: 'conference', liveSession: true, remountOn: 'roomId' },
           },
           {
             path: 'rooms',
@@ -284,31 +289,6 @@ const routes: RouteRecordRaw[] = [
             name: 'devices',
             component: () => import('@/views/devices/DevicesView.vue'),
             meta: { module: 'fleet' },
-          },
-          {
-            // FR-90 — your agent sessions. A session's own page is its
-            // chat room (`room/:roomId`), where the transcript is read.
-            path: 'sessions',
-            name: 'hive-sessions',
-            component: () => import('@/views/hive/HiveSessionsView.vue'),
-            meta: { module: 'hive' },
-          },
-          {
-            // FR-90 P1e — the facts people keep for the org's agent
-            // sessions (core memory).
-            path: 'memory',
-            name: 'hive-memory',
-            component: () => import('@/views/hive/HiveMemoryView.vue'),
-            meta: { module: 'hive' },
-          },
-          {
-            // FR-90 P2h-2 — where the org's agent sessions are copied, and
-            // its archive replicas. The page says so itself where the
-            // server copies none (`hive.replicaset` off).
-            path: 'copies',
-            name: 'hive-copies',
-            component: () => import('@/views/hive/HiveCopiesView.vue'),
-            meta: { module: 'hive' },
           },
           {
             // S4 pivot — the overlay/tunnel network group, promoted out
@@ -472,13 +452,6 @@ router.beforeEach(async (to) => {
   const caps = useCapabilitiesStore()
   await caps.ready()
   if (caps.has(wanted)) {
-    // FR-90 P1g — agent sessions may serve some organizations and not
-    // others: a deep link into one they do not serve goes to its dashboard.
-    const tid = to.params.tenantId
-    if (wanted === 'hive' && typeof tid === 'string' && tid !== '' && !(await useHiveStore().checkServed(tid))) {
-      console.warn(`[modules] agent sessions do not serve organization ${tid}`)
-      return { name: 'tenant-dashboard', params: { tenantId: tid } }
-    }
     return true
   }
   console.warn(

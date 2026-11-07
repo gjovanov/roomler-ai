@@ -14,7 +14,7 @@ half: a Windows peer probe that starts no process.
 
 | | |
 |---|---|
-| The watch | `agents/roomlerd/src/resource_watch.rs`, started in `run_cmd` (`agents/roomlerd/src/app.rs:4408`) |
+| The watch | `agents/roomlerd/src/resource_watch.rs`, started in `run_cmd` (`agents/roomlerd/src/app.rs:4422`) |
 | Kill switch | `ROOMLERD_RESOURCE_WATCH=0` |
 | The bar | 2,000 handles on Windows, 200 descriptors on Linux and macOS (`resource_watch.rs:38`, `:40`) |
 | A lower bar, for a field test | `ROOMLERD_RESOURCE_WATCH_MIN_RISE=<n>` |

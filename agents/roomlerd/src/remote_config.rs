@@ -183,7 +183,7 @@ pub struct RemoteConfigServices {
     /// FR-52 P3 — the device's external-login state: guess budget, in-flight
     /// logins, verified grants.
     ///
-    /// Here because this struct is built ONCE per daemon (`main.rs`) and cloned
+    /// Here because this struct is built ONCE per daemon (`app.rs`) and cloned
     /// into every org's control loop and the LocalAPI: the budget has to be the
     /// DEVICE's, and one per loop would hand an attacker a separate budget for
     /// every org the device belongs to. It is NOT a process-wide static — that

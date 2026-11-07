@@ -62,6 +62,9 @@ mod agent_removal_tests;
 /// org is exactly its netmap ∪ itself (the negative control lives here).
 #[cfg(test)]
 mod agent_self_tests;
+/// #3517 — the agent socket's disconnect line says how the socket ended.
+#[cfg(test)]
+mod agent_socket_end_tests;
 #[cfg(test)]
 mod agent_tests;
 /// FR-88 P1a — sign-up attribution: stored once at creation, absent from
@@ -160,8 +163,6 @@ mod growth_setup_diagnostics_tests;
 /// the exclusion list and the set every growth number applies (AC4).
 #[cfg(test)]
 mod growth_tests;
-#[cfg(test)]
-mod hive_tests;
 /// FR-102 P3 — the install trace: the token ledger (AC11), the fetch
 /// counters by client class with the updater never counted (AC10), and the
 /// enroll's `install` claim as the row records it.
@@ -173,80 +174,6 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
-/// FR-90 P4-6-1a — a session's connect: offered to a device with a vault
-/// client, answered with the access the entity's facts say and the paths the
-/// devices' findings measured, this device's first; a proposal places no
-/// credential; the refusals in a word.
-#[cfg(test)]
-mod knowhow_connect_tests;
-/// FR-90 P4-5-1b — a device's probe end to end: the real agent loop probes
-/// within the list its config file holds, what it measured on the map; an
-/// emptied list answers `not_allowed`. Linux, as the device's scan test is:
-/// the prober rides the `hive` feature this crate's dev-dependency turns on.
-#[cfg(all(test, target_os = "linux"))]
-mod knowhow_device_probe_tests;
-/// FR-90 P4-3b-1 — a device's scan end to end: the real agent loop scans the
-/// roots its config file lists onto the map; a root gone unread retires
-/// nothing; an emptied list answers `no_roots`. Linux: the agent's scanner
-/// rides the `hive` feature, which this crate's dev-dependency turns on there.
-#[cfg(all(test, target_os = "linux"))]
-mod knowhow_device_scan_tests;
-/// FR-90 P4-3a-2 — what a scan writes: its device's own part, shared entities
-/// made bare and linked, a later scan's archive, the device's word kept the
-/// device's, a device describing only itself, a removal's archive.
-#[cfg(test)]
-mod knowhow_intake_tests;
-/// FR-90 P4-2b — the network's word on each machine: its lease, names,
-/// carried routes, exit, SSH and tunnel routes, through a real overlay join;
-/// an evicted node's facts gone with it; a machine's room kept for the sync.
-#[cfg(test)]
-mod knowhow_network_sync_tests;
-/// FR-90 P4-5-1a — a probe asked, sent the target the entity's facts say,
-/// answered once, and recorded on the facts it measured: a proposal it found
-/// as it says confirmed, anything else recorded and changing nothing; the
-/// refusals; one at a time, 30 a minute; a hello's delivery; the sweep;
-/// expiry.
-#[cfg(test)]
-mod knowhow_probe_tests;
-/// FR-90 P4-4-2 — a session's proposals: each written `proposed` and naming
-/// its session, its why in the history; adding, never changing; never into
-/// a device's part of the map; a credential's shape refused whole; 50 a
-/// session; believed as a question is.
-#[cfg(test)]
-mod knowhow_propose_tests;
-/// FR-90 P4-3a-1 — a scan asked, delivered on the device's own connection
-/// and answered once; the refusals; no doubling; a hello's delivery and its
-/// repeat; a forged answer dropped; the sweep; expiry.
-#[cfg(test)]
-mod knowhow_scan_tests;
-/// FR-90 P4-4-1 — a session's questions about the map: the word that the map
-/// is there, given only where it is; the people's search and card, bounded;
-/// a question believed only from the session's device and fence while it is
-/// live, and only while its starter may read the map.
-#[cfg(test)]
-mod knowhow_session_tests;
-/// FR-90 P4-5-3-1 — staleness: a person's fact nothing confirmed turns
-/// stale at the sweep, a word revives it; the sync's, a scan's own and a
-/// waiting proposal never; an unserved organization and `stale_days = 0`
-/// turn nothing.
-#[cfg(test)]
-mod knowhow_stale_tests;
-/// FR-90 P4-2a — the fleet's devices mirrored onto the map: a hello's
-/// machine, the fleet's changes, the fleet's facts kept the fleet's, a
-/// removal's archive, and the reconcile that retires what is gone.
-#[cfg(test)]
-mod knowhow_sync_tests;
-/// FR-90 P4-1 — knowhow, the organization's map: off until turned on, read
-/// from `member` up and changed by `admin`, each entity named once, every
-/// change at the rev it was read, links that go with what they link, and
-/// another organization's id answered as a bogus one.
-#[cfg(test)]
-mod knowhow_tests;
-/// FR-90 P4-5-2a — a session's verify: offered to a device that probes,
-/// answered at once with the probe it asked, the probe sent to the session's
-/// own device, what it measured sent back; the refusals in a word.
-#[cfg(test)]
-mod knowhow_verify_tests;
 /// FR-115 P5 — the meeting-length cap: warned at 55, ended at 60, once.
 #[cfg(test)]
 mod meeting_cap_tests;
@@ -278,6 +205,10 @@ mod pagination_tests;
 /// one, the address and account ceilings, the kill switch, the audit trail.
 #[cfg(test)]
 mod pairing_tests;
+/// FR-137 P2 — FR-90's two parse-only wire fields are refused, never served as
+/// the owner's, and the audit rows Hive left still list.
+#[cfg(test)]
+mod parked_wire_tests;
 #[cfg(test)]
 mod pdf_export_tests;
 /// FR-100 P1a — a device's identity key as the fleet stores and shows it, and
@@ -314,6 +245,11 @@ mod relay_region_tests;
 mod remote_control_tests;
 #[cfg(test)]
 mod remote_recording_tests;
+/// FR-40 P2 — a key a device rotated away from cannot be used to rejoin:
+/// refused `key_retired` at join and DERP under the org's `enforce`, the
+/// device with the verb ordered to rotate (once), `warn` and `off` admit.
+#[cfg(test)]
+mod retired_key_tests;
 #[cfg(test)]
 mod role_reconcile_tests;
 #[cfg(test)]
@@ -356,11 +292,6 @@ mod sleep_announce_tests;
 mod ssh_grant_ack_tests;
 #[cfg(test)]
 mod ssh_service_tests;
-/// FR-90 P3-8-1b — an agent session's SSH request is the session's own: held
-/// to the vault's ticket, refused at gate 3 until decision 22, never served
-/// as the device owner's, every outcome audited as the session's.
-#[cfg(test)]
-mod ssh_session_ticket_tests;
 #[cfg(test)]
 mod stats_tests;
 #[cfg(test)]
@@ -382,11 +313,6 @@ mod tombstone_tests;
 mod touch_preset_tests;
 #[cfg(test)]
 mod transfer_activity_tests;
-/// FR-90 P3-7-2a — a session's egress, the network module's half: a grant
-/// bound at `rc:tunnel.open` only where it holds, its flows held to it and
-/// decided for the session, never its device.
-#[cfg(test)]
-mod tunnel_grant_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the
@@ -397,72 +323,5 @@ mod turn_usage_tests;
 mod tutorial_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
-/// FR-90 P3-4d-1 — what a device reports doing with its leases: kept apart
-/// from the vault's decisions, and only for leases released to that device,
-/// for that session, in the use's mode and toward its target.
-#[cfg(test)]
-mod vault_activity_tests;
-/// FR-90 P3-4e — the approval a policy may ask for: one card in the
-/// session's room, a driver's answer, and the one lease a yes allows.
-#[cfg(test)]
-mod vault_approval_tests;
-/// FR-90 P3-9-1 — a person's `roomler connect`, the vault's half:
-/// `rc:vault.connect` decided by Cedar's `secret:connect` for the device's
-/// OWNER as its row names them, lent only where `vault.people` lists the
-/// organization, never by a policy written for sessions, and taken back when
-/// the owner changes or leaves.
-#[cfg(test)]
-mod vault_connect_tests;
-/// FR-90 P3-6b-1 — dynamic secrets, the vault's half: declared with a
-/// provider and one audience, holding the issuer's fields alone, leased in
-/// `short-lived` as one bundle sealed to the device, the kind and its mode
-/// paired by guardrails.
-#[cfg(test)]
-mod vault_dynamic_tests;
-/// FR-90 P3b-1a — a session's egress allowlist: `rc:vault.egress` decided by
-/// Cedar's `net:egress`, believed as a lease is, the host decided, recorded
-/// and answered in its one spelling, nothing reached that no policy names.
-#[cfg(test)]
-mod vault_egress_tests;
-/// FR-90 P3-3a — a device's vault key as the fleet stores it: from every
-/// hello, never a malformed one, and gone with the hello that drops it.
-#[cfg(test)]
-mod vault_key_tests;
-/// FR-90 P3-3b — leases: sealed to the device's key, believed only from the
-/// session record's device at its fence, decided by Cedar with the device's
-/// facts from its row, recorded before they are sent.
-#[cfg(test)]
-mod vault_lease_tests;
-/// FR-90 P3-4b — what a session may know of the vault: a listing and a
-/// description, decided by Cedar's `secret:list`, believed as a lease is,
-/// never a value.
-#[cfg(test)]
-mod vault_meta_tests;
-/// FR-90 P3-7-1b — a session's own egress: `rc:vault.net` decided by Cedar's
-/// `net:socks` or `net:forward`, believed as a lease is, answered with a grant
-/// under its own audience that names exactly what was decided.
-#[cfg(test)]
-mod vault_net_tests;
-/// FR-90 P3b-2 — placeholder leases, the vault's half: released only where
-/// `vault.placeholder` lists the organization, toward an origin the secret
-/// names, never on Windows until decision 30.
-#[cfg(test)]
-mod vault_placeholder_tests;
-/// FR-90 P3-3c — revocation: a session's end or move, a changed, disabled
-/// or deleted secret, a new device key, a removed device; told at once on
-/// the device's pod or at its sweep, again at every hello, never expired.
-#[cfg(test)]
-mod vault_revoke_tests;
-/// FR-90 P3-8-1a — a session's command on another device: `rc:vault.ssh`
-/// decided by Cedar's `ssh:run` over the target's row and the account its
-/// SSH policy maps, never the session's own device, answered with a ticket
-/// under its own audience that names exactly what was decided.
-#[cfg(test)]
-mod vault_ssh_tests;
-/// FR-90 P3-1 — the vault's store: off until turned on, administrators
-/// only and every decision recorded, no answer carrying a value, sealed
-/// bytes that do not open where they were moved, no sealing without a KEK.
-#[cfg(test)]
-mod vault_tests;
 #[cfg(test)]
 mod ws_auth_tests;

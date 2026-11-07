@@ -68,6 +68,11 @@ to a 1 h cap over a 24 h window. It is the device's, and a server cannot refund 
 An outsider never holds `RECORD` or `PRIVACY`, at the Hub or on the device, whatever a
 ceiling says, and a frame naming a `local_relay` is refused and logged.
 
+Nor is an outsider offered break-glass. When their session ends, the viewer offers
+**Force control** to members only (`offersBreakGlass`,
+`ui/src/composables/breakGlass.ts:18`, #3258). Its reason rides `rc:session.request`,
+and an outsider's session starts from `rc:extauth.session` and never sends that frame.
+
 ## 3. What each side is told
 
 The outsider gets one coarse word. The org's log gets the reason.
@@ -175,7 +180,7 @@ A bar reads in `gates` (`extauth.rs:396`), so it holds at `start`, at `finish` a
 `session`, and a login in flight dies with the rest. ⚠️ `standing` (`extauth.rs:447`)
 opens only on an answer it has seen: a read that fails refuses.
 
-`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2552`) ends what the person
+`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2493`) ends what the person
 opened **through an external login**. A session the same account holds as a member came
 through the other door, with gates of its own, and it stands (`LiveSession.external`).
 
@@ -208,9 +213,9 @@ leaves the session running, as a failed `note_session` does. `set_enabled` and
 `set_policy` end sessions on a repeat too, for a bar's reason.
 
 **Across pods**, `set_principal` also publishes `terminate_external` on the control lane
-(`crates/modules/fleet/src/ctrl.rs:128`), and the pod holding the session applies it.
+(`crates/modules/fleet/src/ctrl.rs:122`), and the pod holding the session applies it.
 `set_enabled` publishes `terminate_external_org` and `set_policy` publishes
-`terminate_external_device` (`ctrl.rs:162`, `:148`). The scope is the event's name, so an
+`terminate_external_device` (`ctrl.rs:156`, `:142`). The scope is the event's name, so an
 envelope short a key ends nothing, and can never read as a wider one. Each names the
 tenant and the Hub checks it, so a mismatched one ends nothing. ⚠️ With Redis down that
 event never arrives: a session on the other pod keeps running, while every new login is
@@ -253,8 +258,8 @@ bar them and change the password on the device. For guessing, rotate the connect
 | What follows a session | `session_opened`, `extauth.rs:1390` |
 | The notices | `crates/modules/remote/src/extauth_notice.rs` |
 | Gates 1 and 2, the code, the log, the people | `crates/modules/fleet/src/external_access.rs`: `decide_revocation` `:138`, `set_enabled` `:443`, `set_policy` `:496`, `audit` `:743`, `principals` `:778`, `set_principal` `:844` |
-| Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2552`, a device's `:2565`, an org's `:2571`. From another pod, `ctrl.rs`: `:128`, `:148`, `:162` |
-| The two collections | `crates/remote_control/src/models.rs:4546`, `:4621`; indexes `crates/modules/fleet/src/lib.rs:776`, `:789` |
+| Ending external sessions | `crates/modules/fleet/src/hub.rs`: a person's `:2493`, a device's `:2506`, an org's `:2512`. From another pod, `ctrl.rs`: `:122`, `:142`, `:156` |
+| The two collections | `crates/remote_control/src/models.rs:4459`, `:4534`; indexes `crates/modules/fleet/src/lib.rs:778`, `:791` |
 | The device's half | `agents/roomlerd/src/extauth.rs`, `agents/roomlerd/src/external_logins.rs` |
 | The page | `ui/src/views/remote/ConnectView.vue`, `ui/src/composables/useExternalLogin.ts` |
 | The audit page | `ui/src/components/admin/ExternalAuditSection.vue`, `ExternalPeopleCard.vue`, `ui/src/utils/externalAudit.ts` |

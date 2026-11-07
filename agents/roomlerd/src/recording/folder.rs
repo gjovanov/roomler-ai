@@ -293,10 +293,16 @@ pub fn unique_recording_name(dir: &Path, now: chrono::DateTime<chrono::Local>) -
 
 /// Bytes free on the volume holding `dir` (the longest mount point that
 /// prefixes its canonical path). `None` when it cannot be told.
+///
+/// FR-85 P7 — storage only. A full refresh also reads every disk's kind and
+/// its I/O counters, which on macOS walks IOKit for each volume, and nothing
+/// here reads either.
 pub fn available_space(dir: &Path) -> Option<u64> {
     let canon = std::fs::canonicalize(dir).ok()?;
     let canon = strip_verbatim(&canon);
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let disks = sysinfo::Disks::new_with_refreshed_list_specifics(
+        sysinfo::DiskRefreshKind::nothing().with_storage(),
+    );
     disks
         .list()
         .iter()

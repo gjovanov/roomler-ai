@@ -70,7 +70,7 @@ flowchart LR
 - **One seam.** Every direct carrier socket is bound by `bind_direct_socket`
   (`crates/tunnel-core/src/overlay/direct.rs:1570`). That covers the shared carrier plane's `lan` and
   `public-dial` sockets (`carrier_plane.rs:338`, `:362`) and the per-runtime binds kept behind
-  `overlay_shared_carrier = false` (`runtime/establish.rs:856`, `:896`). Tuning right after the bind covers
+  `overlay_shared_carrier = false` (`runtime/establish.rs:879`, `:919`). Tuning right after the bind covers
   both modes, every org and every OS.
 - **The size: 7 MiB, receive and send.** That is what wireguard-go and Tailscale ask for. A burst at
   1 Gbit/s fills 208 KB in under 2 ms.
@@ -87,7 +87,7 @@ flowchart LR
   ⚠️ The packaged Linux units set `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO. The first
   candidate's buffers were in place (`ss`: `rb14680064`) while the line never reached the journal. So the
   logger appends `tunnel_core::overlay::sockbuf=info` unconditionally
-  (`crates/agent-core/src/logging.rs:278`), as it already does for the `turn` crate's refresh warnings.
+  (`crates/agent-core/src/logging.rs:399`), as it already does for the `turn` crate's refresh warnings.
 - **Kill switch:** `ROOMLERD_OVERLAY_SOCKBUF=0` skips the tuning, so the sockets keep the OS default as
   before FR-110.
 - **What it costs.** The kernel charges a socket's buffer only for datagrams actually queued, so an idle

@@ -19,6 +19,13 @@ use super::*;
 const REINIT_WINDOW: Duration = Duration::from_secs(60);
 const REINIT_PRESSURE_MIN: u32 = 5;
 
+/// #3530 — how quiet a relay carrier gets while the runtime runs: the peer's
+/// WireGuard keepalive (25 s, `wg::KEEPALIVE_SECS`) and two sweep ticks, the
+/// granularity of `last_rx_at`. An rx-stale silence that the last tick's
+/// lateness (the runtime's `tick_late_ms`) covers but for this slack is
+/// the agent's own pause ([`crate::frozen::did_not_run_for`]). Wording only.
+const RELAY_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(25 + 2 * FALLBACK_TICK.as_secs());
+
 /// #2820 — the `/derp` probe's handshake leaves this long after its nudge, so
 /// a peer that follows us onto `/derp` on hearing the nudge (its demote-follow
 /// runs on its own event loop, in milliseconds) has registered its DERP
@@ -733,10 +740,26 @@ impl OverlayRuntime {
                     } else {
                         "coturn allocation dropped?"
                     };
-                    warn!(
-                        peer = %nid, kind = ?e.relay_kind,
-                        "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — {cause}) — {rebuild}"
+                    // #3530 — after a freeze the silence is the agent's own:
+                    // the tick that found it came late by about as long. The
+                    // verdict and the rebuild stay as they are; only the
+                    // sentence changes.
+                    let silent = now.saturating_duration_since(e.last_rx_at);
+                    let late = Duration::from_millis(
+                        self.tick_late_ms.load(std::sync::atomic::Ordering::Relaxed),
                     );
+                    match crate::frozen::did_not_run_for(silent, late, RELAY_QUIET_WHILE_RUNNING) {
+                        Some(paused) => warn!(
+                            peer = %nid, kind = ?e.relay_kind,
+                            silent_s = silent.as_secs(), paused_s = paused.as_secs(),
+                            "overlay: relay carrier went silent while this agent did not run for ~{} s (frozen or suspended): the silence is its own, not the relay's — {rebuild}",
+                            paused.as_secs()
+                        ),
+                        None => warn!(
+                            peer = %nid, kind = ?e.relay_kind,
+                            "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — {cause}) — {rebuild}"
+                        ),
+                    }
                 } else {
                     // #28 — the one-way class is where the wrong sentence hurt
                     // most, because on DERP it has a completely different

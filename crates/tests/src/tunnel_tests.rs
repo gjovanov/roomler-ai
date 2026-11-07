@@ -993,7 +993,7 @@ async fn connect_agent_ws_inner(
 ///
 /// Up to 10 s: it returns the moment the row says online. ⚠️ A reconnect
 /// waits for [`wait_agent_offline`] first. Raising this from 2 s to 10 s for
-/// a `vault_revoke_tests` failure read as load (2026-10-18, run 39155622658)
+/// a test failure read as load (2026-10-18, run 39155622658)
 /// did not help: that failure was the reconnect race, and it came back on
 /// 10 s (2026-10-19, run 39306461861).
 pub(crate) async fn wait_agent_online(

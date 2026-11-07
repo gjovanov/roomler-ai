@@ -144,6 +144,30 @@ async fn gates_changed(w: &mut GateWatch) {
     std::future::pending::<()>().await
 }
 
+/// FR-43 P3b — the person's floor as it stands: their `auto_grant_session`,
+/// fixed for the process (the consent broker is built from it at start), and
+/// their live `rc_*` floor.
+fn person_floor(auto_grant_session: bool) -> crate::delegate::PersonFloor {
+    crate::delegate::PersonFloor {
+        auto_grant_session,
+        session_policy: crate::session_policy::device_policy(),
+    }
+}
+
+/// FR-43 P3b — resolves when the person's `rc_*` floor changes; never for a
+/// worker that hands no floor over (or if the sender is ever gone, which a
+/// `static` cannot be — pending beats spinning).
+async fn floor_changed(
+    w: &mut Option<tokio::sync::watch::Receiver<roomler_ai_remote_control::models::SessionPolicy>>,
+) {
+    if let Some(w) = w
+        && w.changed().await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await
+}
+
 /// Run the worker's side of the channel for the process lifetime.
 ///
 /// Returns immediately unless this process was started as `run --supervised`,
@@ -154,6 +178,15 @@ pub async fn run(
     // FR-43 P3a — this worker holds no enrollment, so this channel is all it
     // can serve, and without it the process is of no use to anyone.
     unenrolled: bool,
+    // FR-43 P3b — the person's `auto_grant_session`, from their own file. A
+    // worker with no enrollment hands it to the daemon with their `rc_*`
+    // floor ([`DelegateFrame::PersonFloor`]); every other worker's row
+    // enforces its own, and sends nothing.
+    auto_grant_session: bool,
+    // FR-43 P3a — and its own log lines, which go to the daemon over the
+    // channel because this process has no row to upload them on. `None` for
+    // every other worker, which uploads its own.
+    mut logs: Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     // FR-43 P2b-2 — the signalling loop's two ends: delegated messages go IN,
     // a delegated session's replies come OUT. `None` when this process is not
     // a worker, in which case `supervised` is false too and we return at once.
@@ -191,10 +224,20 @@ pub async fn run(
         return;
     };
 
+    let person = unenrolled.then_some(auto_grant_session);
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(&secret, &to_signaling, &mut from_signaling, &mut shutdown).await {
+        match attach_once(
+            &secret,
+            &to_signaling,
+            &mut from_signaling,
+            &mut logs,
+            person,
+            &mut shutdown,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -232,6 +275,10 @@ async fn attach_once(
     secret: &str,
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+    // FR-43 P3b — `Some(auto_grant_session)` when this worker hands the
+    // person's floor to the daemon.
+    person: Option<bool>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     // Dial the daemon's DEDICATED delegation socket, not the LocalAPI control
@@ -323,6 +370,19 @@ async fn attach_once(
         )
         .await?;
     }
+    // FR-43 P3b — and, from a worker with no enrollment, the person's floor:
+    // their row and its broker are gone, so the daemon's `Request` arm is the
+    // only consent there is. Subscribed BEFORE the first frame, so a change in
+    // between is never missed.
+    let mut floor_watch = person.map(|_| crate::session_policy::watch_device_policy());
+    if let Some(auto_grant_session) = person {
+        let floor = person_floor(auto_grant_session);
+        tracing::info!(
+            ?floor,
+            "delegation: handing the person's consent floor to the daemon"
+        );
+        write_frame(&mut wr, &DelegateFrame::PersonFloor(floor)).await?;
+    }
 
     loop {
         tokio::select! {
@@ -402,7 +462,9 @@ async fn attach_once(
                         Ok(
                             DelegateFrame::FromWorker { .. }
                             | DelegateFrame::WorkerCaps { .. }
-                            | DelegateFrame::KeepBusyTold { .. },
+                            | DelegateFrame::KeepBusyTold { .. }
+                            | DelegateFrame::WorkerLogs { .. }
+                            | DelegateFrame::PersonFloor(..),
                         ) => {
                             // Worker → daemon only. A daemon sending one is
                             // confused about which end it is.
@@ -428,6 +490,17 @@ async fn attach_once(
                     None => return Ok(()),
                 }
             }
+            // FR-43 P3a — this worker's own log lines, for the daemon to upload
+            // on its row. What is queued goes in one frame, so a burst is one
+            // write; lines logged while detached wait in the queue, which drops
+            // the newest when full, as it would for any uploader.
+            line = next_log_line(logs) => match line {
+                Some(first) => {
+                    let lines = log_batch(first, logs);
+                    write_frame(&mut wr, &DelegateFrame::WorkerLogs { lines }).await?;
+                }
+                None => *logs = None,
+            },
             _ = tokio::time::sleep(PING_EVERY) => {
                 write_frame(&mut wr, &DelegateFrame::Ping).await?;
             }
@@ -448,6 +521,15 @@ async fn attach_once(
                 )
                 .await?;
             }
+            // FR-43 P3b — the person changed their `rc_*` floor (a `config
+            // set`): the daemon holds the new one before the next session asks.
+            () = floor_changed(&mut floor_watch) => {
+                if let Some(auto_grant_session) = person {
+                    let floor = person_floor(auto_grant_session);
+                    tracing::info!(?floor, "delegation: the person's consent floor changed");
+                    write_frame(&mut wr, &DelegateFrame::PersonFloor(floor)).await?;
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     return Ok(());
@@ -455,6 +537,38 @@ async fn attach_once(
             }
         }
     }
+}
+
+/// FR-43 P3a — the next of this worker's log lines, or never when it forwards
+/// none. `None` when the layer's sender has gone.
+async fn next_log_line(
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Option<crate::logs_upload::LogLine> {
+    match logs {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// FR-43 P3a — `first` and whatever else is queued behind it, up to one frame's
+/// worth, each trimmed to what a frame carries.
+fn log_batch(
+    first: crate::logs_upload::LogLine,
+    logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
+) -> Vec<crate::logs_upload::LogLine> {
+    let mut lines = vec![first];
+    if let Some(rx) = logs.as_mut() {
+        while lines.len() < crate::delegate::WORKER_LOG_LINES_PER_FRAME {
+            match rx.try_recv() {
+                Ok(line) => lines.push(line),
+                Err(_) => break,
+            }
+        }
+    }
+    for line in &mut lines {
+        crate::delegate::trim_worker_line(line);
+    }
+    lines
 }
 
 /// Start the thread that owns stdin (#2987). It reads the attach secret, then
@@ -538,5 +652,79 @@ async fn read_secret(secret: tokio::sync::oneshot::Receiver<Option<String>>) -> 
             tracing::warn!("delegation: timed out waiting for the secret on stdin");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delegate::{WORKER_LOG_LINES_PER_FRAME, WORKER_LOG_MSG_MAX};
+
+    fn line(msg: String) -> crate::logs_upload::LogLine {
+        crate::logs_upload::LogLine {
+            ts: bson::DateTime::now(),
+            level: crate::logs_upload::LogLevel::Info,
+            target: "roomlerd".into(),
+            msg,
+            fields: bson::Document::new(),
+        }
+    }
+
+    /// FR-43 P3a — a burst of the worker's log lines leaves in frames of at most
+    /// one frame's worth, in order, none lost between frames, and a message too
+    /// long for a frame is cut.
+    #[tokio::test]
+    async fn queued_log_lines_leave_in_bounded_trimmed_frames() {
+        let total = WORKER_LOG_LINES_PER_FRAME * 2 + 7;
+        let (tx, rx) = tokio::sync::mpsc::channel(total + 1);
+        for i in 0..total {
+            tx.try_send(line(i.to_string())).unwrap();
+        }
+        tx.try_send(line("x".repeat(WORKER_LOG_MSG_MAX + 100)))
+            .unwrap();
+        drop(tx);
+
+        let mut logs = Some(rx);
+        let mut seen = Vec::new();
+        let mut frames = 0;
+        while let Some(first) = next_log_line(&mut logs).await {
+            let batch = log_batch(first, &mut logs);
+            assert!(batch.len() <= WORKER_LOG_LINES_PER_FRAME);
+            seen.extend(batch);
+            frames += 1;
+        }
+        assert_eq!(frames, 3);
+        assert_eq!(seen.len(), total + 1);
+        for (i, l) in seen.iter().take(total).enumerate() {
+            assert_eq!(l.msg, i.to_string());
+        }
+        assert_eq!(seen[total].msg.len(), WORKER_LOG_MSG_MAX);
+    }
+
+    /// FR-43 P3b — a worker that hands no floor over never wakes for one; one
+    /// that does wakes when the person's `rc_*` floor is set (a `config set`),
+    /// and says their `auto_grant_session` as it was given.
+    #[tokio::test]
+    async fn the_floor_watch_wakes_only_a_worker_that_hands_its_floor_over() {
+        let mut none = None;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), floor_changed(&mut none))
+                .await
+                .is_err(),
+            "no floor handed over: never"
+        );
+        let mut watching = Some(crate::session_policy::watch_device_policy());
+        // The value it already holds: a change for the watch, none for any
+        // other test reading the floor.
+        crate::session_policy::set_device_policy(crate::session_policy::device_policy());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), floor_changed(&mut watching))
+                .await
+                .is_ok(),
+            "a set wakes it"
+        );
+        let floor = person_floor(false);
+        assert!(!floor.auto_grant_session);
+        assert_eq!(floor.session_policy, crate::session_policy::device_policy());
     }
 }

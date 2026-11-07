@@ -71,17 +71,10 @@ fn baseline_path() -> PathBuf {
 }
 
 async fn snapshot() -> Snapshot {
-    // Every compiled module MOUNTED, including FR-90's `hive`, `vault` and
-    // `knowhow`, whose switches default off: a default-off module's routes
-    // and indexes are still a claim this build makes, and a change to them
-    // must be a reviewed line in the baseline rather than invisible until
-    // someone turns it on.
-    let app = TestApp::spawn_with_settings(|s| {
-        s.modules.hive = true;
-        s.modules.vault = true;
-        s.modules.knowhow = true;
-    })
-    .await;
+    // Every compiled module MOUNTED, as the test settings have it: a module
+    // switched off would hide its routes and indexes from the baseline, and
+    // a change to them must be a reviewed line in it.
+    let app = TestApp::spawn_with_settings(|_| {}).await;
     // A second router from the same state: the one `TestApp` serves is owned
     // by its listener task, and `build_router` is pure composition.
     let router = build_router(app.state.clone());
@@ -217,5 +210,24 @@ fn diff_lists(what: &str, expected: &[String], actual: &[String], report: &mut S
     }
     for extra in act.difference(&exp) {
         report.push_str(&format!("{what} unexpected: {extra}\n"));
+    }
+}
+
+/// FR-137 S-B4 — the user socket's retired namespace (`hive:`, FR-90's viewer
+/// and search) has no handler, and no module may claim it again: a tab opened
+/// before Hive was parked gets the socket's unknown-type answer.
+#[tokio::test]
+async fn no_module_serves_a_retired_user_ws_namespace() {
+    let app = TestApp::spawn_with_settings(|_| {}).await;
+    for ns in roomler_ai_remote_control::models::RETIRED_USER_WS_NAMESPACES {
+        for msg_type in [format!("{ns}:view.open"), format!("{ns}:search.open")] {
+            assert!(
+                app.state
+                    .modules
+                    .ws_handler(roomler_core::Role::User, &msg_type)
+                    .is_none(),
+                "{msg_type} must find no handler"
+            );
+        }
     }
 }

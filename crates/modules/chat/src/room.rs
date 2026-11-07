@@ -41,9 +41,9 @@ pub struct RoomResponse {
     pub conference_status: Option<String>,
     pub meeting_code: Option<String>,
     pub participant_count: u32,
-    /// FR-90 — what owns this room's meaning (an agent session), if anything:
-    /// a client renders such a room as that module's surface. Chat never
-    /// interprets it.
+    /// FR-90 — what owns this room's meaning, if anything: a stored session
+    /// room keeps its parked session's (FR-137), and the SPA opens it as a
+    /// plain Secret room. Chat never interprets it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<roomler_ai_db::models::Binding>,
 }

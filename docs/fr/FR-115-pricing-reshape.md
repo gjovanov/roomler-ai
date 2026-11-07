@@ -193,7 +193,7 @@ like the device cap: no org is over it today.
 (`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1717`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1658`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
@@ -208,13 +208,13 @@ session ending or Business. Kill switch `rc.org_session_cap = false`.
 ### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
-(`crates/modules/fleet/src/hub.rs:1668`). Under tenant affinity, that hub holds every live
+(`crates/modules/fleet/src/hub.rs:1609`). Under tenant affinity, that hub holds every live
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
 uncapped (`crates/modules/remote/src/extauth.rs:341`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
-instant can both pass (`hub.rs:1681`).
+instant can both pass (`hub.rs:1622`).
 
 **The record: session slots in the cluster directory.** C-1's directory
 (`crates/core/src/cluster/directory.rs`) already keeps per-entity records in Redis on exactly
@@ -254,7 +254,7 @@ sequenceDiagram
 **Why this is durable.**
 
 - **One atomic claim.** The Lua claim drops expired members, checks the count and adds the
-  session in one step, so the race at `hub.rs:1681` closes.
+  session in one step, so the race at `hub.rs:1622` closes.
 - **It heals itself.** A lease lives 90 s and is renewed every 30 s by the pod that holds the
   session. A pod that dies stops renewing, and its slots free themselves within 90 s. A Redis
   restart loses the set, but renewal is an upsert, so within one renewal round every live
@@ -313,7 +313,7 @@ analytics surface for external sessions.
 
 ```mermaid
 flowchart LR
-    D["DERP forward_frame<br/>(derp.rs:584)"] -->|bytes| L[("stats_usage<br/>per org, per minute")]
+    D["DERP forward_frame<br/>(derp.rs:655)"] -->|bytes| L[("stats_usage<br/>per org, per minute")]
     T["coturn<br/>--redis-statsdb (P4b)"] -->|bytes per allocation| L
     L --> MTD["month-to-date per org<br/>(60 s flush)"]
     MTD -->|over allowance| F{{"over-allowance set"}}
@@ -324,9 +324,9 @@ flowchart LR
 ```
 
 - DERP already meters per network on the forward path
-  (`crates/modules/network/src/derp.rs:683`). The throttle adds **one** set lookup on that
+  (`crates/modules/network/src/derp.rs:754`). The throttle adds **one** set lookup on that
   path, consulted only for networks the 60 s flush flagged; the path must stay within FR-18's
-  budget, measured with the same bench FR-20 used (`derp.rs:704`).
+  budget, measured with the same bench FR-20 used (`derp.rs:775`).
 - TURN attribution is FR-20's deferred P3, taken up with the option FR-20 already chose
   (`--redis-statsdb`; the username is `<expiry>:<id>`, `crates/remote_control/src/turn_creds.rs:6`).
 - Throttled, never refused (D4). The tenant analytics page shows usage against the allowance in
@@ -350,7 +350,7 @@ the throttle shapes **bulk only**:
 
 ```mermaid
 flowchart LR
-    FL["usage flush, every pod<br/>(derp.rs:178)"] --> L[("stats_usage")]
+    FL["usage flush, every pod<br/>(derp.rs:179)"] --> L[("stats_usage")]
     PP["PoP /stats poll<br/>(relay_load.rs:633)"] --> L
     L --> J["allowance job, one pod, every 5 min:<br/>month-to-date per org vs<br/>relay_bytes_per_month × seats"]
     J -->|plans_sold only| S[("over-allowance set<br/>(Redis, networks of flagged orgs)")]
@@ -368,7 +368,7 @@ flowchart LR
   (an upgrade takes effect within one job period).
 - **API pods** refresh a local `DashSet<network_id>` every 60 s. The forward path adds one
   lock-free lookup, and only for frames already past the ACL; it is measured with FR-20's bench
-  (`crates/modules/network/src/derp.rs:704`) against FR-18's latency budget before it ships.
+  (`crates/modules/network/src/derp.rs:775`) against FR-18's latency budget before it ships.
 - **PoPs are DB-free and must stay so.** Tickets cannot carry the flag: they live 24 h and are
   checked once, at connect (`crates/remote_control/src/derp_ticket.rs:33`). Instead the API,
   which already polls each PoP's `/stats`, sends the PoP the set on that poll, signed with the
@@ -558,7 +558,7 @@ mechanism does not exist, so this section replaces it.
   (`crates/modules/network/src/relay_allowance.rs:53`) and read by `rate_of(network)` in one
   atomic load (`:66`).
 - **TURN credentials are minted in ten places.** Only the overlay's pair grant
-  (`crates/modules/network/src/overlay.rs:1111`) and warm grant (`:201`) can ask `rate_of`
+  (`crates/modules/network/src/overlay.rs:1309`) and warm grant (`:204`) can ask `rate_of`
   cheaply. The remote-desktop hub, the credentials route, conference and hive cannot: they do
   not depend on the network module, and the hub's mints are synchronous.
 - **coturn has nothing to throttle with.** It runs one realm, one shared secret, no user
@@ -570,7 +570,7 @@ mechanism does not exist, so this section replaces it.
   floor (`crates/tunnel-core/src/overlay/relay_link.rs:2119`), and P4a already holds DERP's
   bulk frames to the plan's rate while letting every handshake through. The server can also
   stamp a pair's relay tier itself (`server_relay_verdict`,
-  `crates/modules/network/src/overlay.rs:2375`), flipping both ends at once.
+  `crates/modules/network/src/overlay.rs:2573`), flipping both ends at once.
 
 **Proposal, in two steps.**
 
@@ -587,7 +587,7 @@ mechanism does not exist, so this section replaces it.
   its 10-person, 60-minute meetings (P5).
 - A tunnel's TURN leg cannot be steered from the server: `quic-derp-v1` is negotiated only
   when the client asked for it and sent its DERP identity
-  (`crates/modules/network/src/tunnel.rs:878`).
+  (`crates/modules/network/src/tunnel.rs:736`).
 
 Their bytes still count toward the allowance (P4c-0), so an org that relays heavily through
 them has its mesh throttled. The alternative to O10 is a second coturn listener per site with
@@ -605,16 +605,16 @@ handshake held.
 ### P4c, as built (dark, 2026-10-23)
 
 Built as proposed, behind two switches that ship **off**: `relay_allowance.count_turn` for
-P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:421`, `:427`).
+P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:325`, `:331`).
 
 | Piece | Where |
 |---|---|
 | TURN in the month to date (P4c-0) | `crates/services/src/dao/stats.rs:208`: `turn_bytes` beside `derp_bytes`, read by the job and the org's page alike, so the two never disagree; the page says which it counts (`counts_turn`, `crates/api/src/routes/cost.rs:578`) |
-| An over-allowance org (P4c-1) | `crates/modules/network/src/overlay.rs:2413` (`turn_withheld`) |
-| The relay request | `overlay.rs:963`: no TURN grant, both ends' verdicts re-stamped DERP, a forced-DERP pin for a node too old for verdicts. Only when `keeps_pair_on_derp` (`:2423`) says both ends have a DERP floor and the requester's `/derp` is up |
-| The verdict | `overlay.rs:2375`: the org's pairs are pinned to DERP, as a churn pin would; an active org relay still outranks it |
-| The warm creds | `overlay.rs:207`: none while over (a latency optimisation, never reach) |
-| The re-stamp | `overlay.rs:1361` (`refan_networks`), called when the pod's set changes (`crates/modules/network/src/relay_allowance.rs:208`), so a pair flips when its org crosses, not at the next incidental re-fan |
+| An over-allowance org (P4c-1) | `crates/modules/network/src/overlay.rs:2611` (`turn_withheld`) |
+| The relay request | `overlay.rs:1161`: no TURN grant, both ends' verdicts re-stamped DERP, a forced-DERP pin for a node too old for verdicts. Only when `keeps_pair_on_derp` (`:2621`) says both ends have a DERP floor and the requester's `/derp` is up |
+| The verdict | `overlay.rs:2573`: the org's pairs are pinned to DERP, as a churn pin would; an active org relay still outranks it |
+| The warm creds | `overlay.rs:210`: none while over (a latency optimisation, never reach) |
+| The re-stamp | `overlay.rs:1559` (`refan_networks`), called when the pod's set changes (`crates/modules/network/src/relay_allowance.rs:208`), so a pair flips when its org crosses, not at the next incidental re-fan |
 | The pod's map | `relay_allowance.rs:170`: each entry is tagged with its database, and an app's refresh replaces only its own entries. Production is unchanged, and it is what lets the integration test drive the map |
 
 - **Proof:** `relay_allowance_tests::turn_bytes_count_toward_the_allowance_only_with_count_turn`
@@ -629,7 +629,7 @@ P4c-0 and `relay_allowance.turn` for P4c-1 (`crates/config/src/settings.rs:421`,
   - **Enterprise has no relay allowance.** Its relay is "custom" on the ladder
     (`crates/db/src/models/tenant.rs:624`).
   - **The operator's orgs are exempt.** `relay_allowance.exempt_tenants`
-    (`crates/config/src/settings.rs:433`) names them, and `is_exempt`
+    (`crates/config/src/settings.rs:337`) names them, and `is_exempt`
     (`crates/services/src/relay_allowance.rs:42`) is asked by both the job and the org's page.
   - **That org's real seats are recorded** (data, in the annex).
 
@@ -734,8 +734,8 @@ sequenceDiagram
 
 | Guard | Where | What it prevents |
 |---|---|---|
-| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:743` | two pods warning one meeting; warning a meeting that ended |
-| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:762` | ending the **next** meeting in a room restarted between the sweep's read and its write |
+| The warning is a write conditional on `current_call_id = call` and `cap_warned_call_id ≠ call` | `crates/services/src/dao/room.rs:674` | two pods warning one meeting; warning a meeting that ended |
+| The end is a write conditional on `current_call_id = call` and `in_progress` | `room.rs:693` | ending the **next** meeting in a room restarted between the sweep's read and its write |
 | The FR-102 collision is counted after the won end | `meeting_cap.rs:198` | a meeting counted twice when two pods reach it together |
 | `meetings.free_cap = false` | `crates/config/src/settings.rs` (`MeetingsSettings`) | the kill switch: no meeting is warned or ended |
 

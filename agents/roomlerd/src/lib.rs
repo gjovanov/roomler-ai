@@ -26,16 +26,13 @@ pub mod app;
 // `apps` re-exports the moved config shapes; the ACL is re-exported inside
 // `tunnel/mod.rs` so `crate::tunnel::acl::…` still resolves.
 pub use roomler_node_core::{
-    appdirs, config, config_surface, crash_recorder, enrollment, files_dir, logging, logs_upload,
-    machine, pairing, pairing_terminal, token_slot,
+    appdirs, boot_id, config, config_surface, crash_recorder, enrollment, files_dir, logging,
+    logs_upload, machine, pairing, pairing_terminal, token_slot,
 };
 
 pub mod apps;
 /// FR-97 P0d — the machine's native CPU architecture, for the hello.
 pub(crate) mod arch;
-/// FR-90 P2h-1 — `roomlerd enroll --archive-replica`: an archive replica's
-/// posture, written with the enrolled config.
-pub mod archive_replica;
 pub mod artifact_version;
 #[cfg(feature = "audio")]
 pub mod audio;
@@ -85,16 +82,9 @@ pub mod fp16;
 #[cfg(any(target_os = "linux", all(unix, feature = "recording")))]
 pub(crate) mod fs_identity;
 pub mod gpu_clock;
-/// FR-90 — Hive agent sessions on this device (`hive_enabled`, default off).
-/// Linux, macOS and Windows (`cfg(hive_host)`, set by `build.rs`): elsewhere
-/// the feature compiles nothing here and the build does not advertise `hive`,
-/// so no server sends it a session.
-#[cfg(hive_host)]
-pub mod hive;
-/// FR-90 P1i — agent sessions on Windows: the console user, the harness, the
-/// session's preparation, its toolbelt pipe and its directories' DACLs.
-#[cfg(all(windows, feature = "hive"))]
-pub mod hive_win;
+/// #3439 — a session asked for before the capability probe's first answer waits
+/// for it, in its connection.
+pub mod held_requests;
 /// FR-99 P4 — the host's speakers are muted while a privacy curtain is up, and
 /// restored after it, after a crash too; the controller keeps the audio.
 pub mod host_mute;
@@ -147,6 +137,8 @@ pub mod unenrolled;
 )]
 pub(crate) mod media_share;
 pub mod notify;
+/// FR-43 P3c — `sudo roomlerd one-row`: a two-row Mac becomes one row.
+pub mod one_row;
 pub mod org_join;
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod overlay;
@@ -230,10 +222,6 @@ pub mod sleep_notice;
 /// [`overlay`]: without an overlay there is no address to serve on.
 #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
 pub mod ssh;
-/// FR-90 P3-8-2b — this daemon's own SSH client, for an agent session's one
-/// command on another device. With the SSH server, whose `russh` it shares.
-#[cfg(feature = "ssh-server")]
-pub mod ssh_client;
 /// The ORIGINATING side of Roomler SSH. Ungated on purpose — [`ssh`] needs an
 /// overlay to serve on, but an answer to a request WE sent arrives on the
 /// plain control WS and must be deliverable in every build.
@@ -267,15 +255,6 @@ pub mod thread_dump;
 pub mod token_renewal;
 pub mod tunnel;
 pub mod updater;
-/// FR-90 P3-3 — the device's vault key: made while `vault_enabled` is on, in
-/// memory only, its public half in the primary enrollment's hello. Compiled
-/// everywhere; without the `vault` feature it makes nothing.
-pub mod vault;
-/// FR-90 P3-5 — the vault's proxies: an endpoint that authenticates upstream
-/// with a leased value. P3-5b-1 builds the engine; the endpoint
-/// (`hive::vault_connect`, P3-5b-2, and P3-5b-4 on Windows) serves it.
-#[cfg(feature = "vault")]
-pub(crate) mod vault_proxy;
 pub mod version_sweep;
 pub mod virtual_desktop;
 pub mod watchdog;
@@ -299,37 +278,42 @@ pub mod win_token;
 /// (`tunnel_core::ctl_dns`), so a dead exit DNS can never keep them offline.
 pub mod ws_connect;
 
-/// P5 exit-node crash-safety (A2) — synchronously purge any leftover
-/// split-default routes from the overlay NIC. Called at agent startup (the
-/// boot-time reconciler: heal a `/1` a crash / kill / unclean reboot left
-/// behind) AND immediately before each `std::process::exit` that bypasses the
-/// runtime's RAII teardown (watchdog stall, self-update, agent-deleted) — those
-/// paths run NO destructors, so without this a Windows host keeps a stale
-/// `0.0.0.0/1` pointed at a dead Wintun adapter and blackholes all egress until
-/// reboot.
+/// P5 exit-node crash-safety (A2) — synchronously purge what the overlay leaves
+/// in the host as a process ends: the split-default routes, the peer/subnet
+/// routes on a persisted TUN, the exit-DNS steer and the host ledger. A start
+/// runs the same purges through [`purge_exit_routes_at_start`], and the two
+/// watchdog exits through [`purge_exit_routes_before_restart`]. This one runs:
 ///
-/// Lives at the crate root (always compiled) so the exit paths in `watchdog` /
-/// `signaling` / `main` can call it WITHOUT an overlay-feature gate — the
-/// `overlay` module itself is `cfg`-gated. No-op unless this is an `overlay-l3`
-/// build (only the OS-TUN surface installs OS routes; the userspace netstack has
-/// none). Best-effort + scoped to the roomler NIC.
+/// - in `app::purge_after_daemon`, once a process that ran the daemon has
+///   dropped its runtime: every end of the daemon, a plain stop and an
+///   update's exit included (FR-97 P0e);
+/// - immediately before each `std::process::exit` that skips the runtime's RAII
+///   teardown with nothing to replace it: a fatal goodbye and a
+///   duplicate-instance loser (`signaling`), and `roomlerd self-update` with no
+///   daemon running ([`purge_exit_routes_unless_owned`]). Those paths run NO
+///   destructors, so without this a Windows host keeps a stale `0.0.0.0/1`
+///   pointed at a dead Wintun adapter and blackholes all egress until reboot;
+/// - once more as a requested restart leaves, a belt after
+///   `app::purge_after_daemon`.
+///
+/// Lives at the crate root (always compiled), like its siblings, so the exit
+/// paths in `app`, `signaling` and `watchdog` can call them WITHOUT an
+/// overlay-feature gate — the `overlay` module itself is `cfg`-gated. No-op
+/// unless this is an `overlay-l3` build (only the OS-TUN surface installs OS
+/// routes; the userspace netstack has none). Best-effort + scoped to the
+/// roomler NIC.
 pub fn purge_exit_routes() {
     #[cfg(feature = "overlay-l3")]
     {
-        // Multi-org v2 — the purges are per-adapter now; this boot/pre-exit
-        // path heals the LEGACY/PRIMARY adapter (per-org adapters are Phase
+        // Multi-org v2 — the purges are per-adapter now; this exit path
+        // heals the LEGACY/PRIMARY adapter (per-org adapters are Phase
         // 2c, whose reconciler will walk the configured set).
         tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
-        // Drop peer/subnet routes a PREVIOUS generation left on a persisted TUN.
-        // Their crypto-router entries died with that runtime, so they black-hole
-        // silently: the OS route looks right, the peer is online, and only the
-        // traffic vanishes (field case 2026-08-03). Safe here because the router
-        // is empty until `install_peers` runs, which re-adds the live set.
-        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        purge_peer_routes_at_exit();
         // S4b — also drop any leftover exit-node DNS steer. On Windows the `.`-root
         // NRPT rule is machine-global and PERSISTS across a crash/reboot, so a stale
         // rule pointing at a dead resolver would blackhole ALL DNS until removed —
-        // this boot/pre-exit purge is the load-bearing cleanup for it.
+        // this purge (and a start's) is the load-bearing cleanup for it.
         tunnel_core::overlay::dns::purge_exit_dns();
         // FR-97 P0b-2b / P0e — and what the host ledger records: the IPv4
         // forwarding a Windows router turned on (its revert runs in `Drop`,
@@ -338,6 +322,139 @@ pub fn purge_exit_routes() {
         // leftover pin on the server's address blocks the next start's
         // control WS after a network change). A no-op when it is empty.
         tunnel_core::overlay::host_ledger::purge();
+    }
+}
+
+/// An exit's purge of the peer/subnet routes on the overlay's TUN
+/// (`tunnel_core::overlay::tun::purge_stale_peer_routes`). Their crypto-router
+/// entries die with the runtime, so left behind on a persisted TUN they
+/// black-hole silently: the OS route looks right, the peer is online, and only
+/// the traffic vanishes (field case 2026-08-03).
+///
+/// Its line is not the start's `boot reconcile` one: every exit drops the
+/// routes it leaves, so this line is routine, while routes a start finds mean
+/// the process before it never purged them.
+#[cfg(feature = "overlay-l3")]
+fn purge_peer_routes_at_exit() {
+    let dropped =
+        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+    if !dropped.is_empty() {
+        tracing::info!(
+            count = dropped.len(), routes = ?dropped,
+            "overlay: exit purge — dropped the overlay's routes from its TUN, so none outlives \
+             this process to black-hole"
+        );
+    }
+}
+
+/// #3291 — how long a start waits for the exit-DNS purge before it goes on
+/// without it. Unloaded, the purge's `powershell` ended in 1.7–1.8 s on a
+/// 4-vCPU Windows 11 guest; a host kept busy by higher-priority work holds it
+/// for as long as the load lasts.
+pub const START_DNS_PURGE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// #3291 — [`purge_exit_routes`] for a start: the same purges in the same order,
+/// but the start waits for the exit-DNS purge for at most
+/// [`START_DNS_PURGE_WAIT`]. Before the bound, a starved Windows host stayed
+/// offline for as long as the purge's `powershell` waited, and nothing came
+/// before the purge that could bring the device online.
+///
+/// Past the bound the purge keeps running on its own thread until it ends, and
+/// every DNS change the overlay makes waits for it
+/// (`tunnel_core::overlay::dns::purge_exit_dns_within`), so it can never delete
+/// a steer made after it began. The route purges stay synchronous: they are
+/// typed calls into the IP helper, with no child process to wait on.
+///
+/// #3440 — a purge an earlier exit handed over is counted first, so the start's
+/// DNS changes wait for it as they wait for the start's own.
+pub fn purge_exit_routes_at_start() {
+    #[cfg(feature = "overlay-l3")]
+    {
+        let adopted = tunnel_core::overlay::dns::adopt_handed_over_purges();
+        if !adopted.is_empty() {
+            tracing::info!(
+                ?adopted,
+                "boot reconcile: an exit-DNS purge an earlier exit handed over is still running; \
+                 DNS changes wait for it too (#3440)"
+            );
+        }
+        tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
+        let stale =
+            tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        if !stale.is_empty() {
+            tracing::info!(
+                count = stale.len(), routes = ?stale,
+                "overlay: boot reconcile — dropped stale routes left by a previous generation \
+                 on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
+            );
+        }
+        if !tunnel_core::overlay::dns::purge_exit_dns_within(START_DNS_PURGE_WAIT) {
+            tracing::warn!(
+                wait_s = START_DNS_PURGE_WAIT.as_secs(),
+                "boot reconcile: the exit-DNS purge has not ended within its bound, so the start \
+                 goes on; the purge runs to its end on its own, and DNS changes wait for it (#3291)"
+            );
+        }
+        tunnel_core::overlay::host_ledger::purge();
+    }
+}
+
+/// #3440 — how long an exit a replacement follows waits for the exit-DNS purge
+/// before it hands the purge to that replacement. Unloaded, the purge's
+/// `powershell` ended in 1.7–1.8 s on the #3291 guest, so an unloaded exit
+/// still finishes it.
+pub const EXIT_DNS_PURGE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`EXIT_DNS_PURGE_WAIT`], or `ROOMLERD_EXIT_PURGE_WAIT_S` seconds. `0` is
+/// the kill switch: no bound, as before #3440.
+#[cfg(feature = "overlay-l3")]
+fn exit_dns_purge_wait() -> Option<std::time::Duration> {
+    exit_dns_purge_wait_from(tunnel_core::env::node_env("EXIT_PURGE_WAIT_S").as_deref())
+}
+
+/// [`exit_dns_purge_wait`] for a given setting. One that does not parse is
+/// ignored, as an absent one is.
+#[cfg(any(feature = "overlay-l3", test))]
+fn exit_dns_purge_wait_from(setting: Option<&str>) -> Option<std::time::Duration> {
+    match setting.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(s) => Some(std::time::Duration::from_secs(s)),
+        None => Some(EXIT_DNS_PURGE_WAIT),
+    }
+}
+
+/// #3440 — [`purge_exit_routes`] for an exit a replacement follows: the two
+/// watchdog exits, whose code the supervisor restarts. The same purges in the same order,
+/// but the exit waits for the exit-DNS purge for at most
+/// [`EXIT_DNS_PURGE_WAIT`] and hands one still running to the replacement
+/// (`tunnel_core::overlay::dns::purge_exit_dns_before_exit`). Before the bound
+/// a stalled worker on a starved host waited for that purge as long as the
+/// load lasted, and the supervisor could not start the worker that replaces it.
+///
+/// The exits nothing replaces keep [`purge_exit_routes`]: a plain stop, a fatal
+/// goodbye and a duplicate-instance loser. Nothing waits on them, and a purge
+/// they cut short would have no next start behind it. A requested restart
+/// keeps it too: `purge_after_daemon` has run the whole purge before it.
+///
+/// Returns `false` when it handed the DNS purge over.
+pub fn purge_exit_routes_before_restart() -> bool {
+    #[cfg(feature = "overlay-l3")]
+    {
+        tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
+        purge_peer_routes_at_exit();
+        let ended = match exit_dns_purge_wait() {
+            Some(wait) => tunnel_core::overlay::dns::purge_exit_dns_before_exit(wait),
+            None => {
+                tunnel_core::overlay::dns::purge_exit_dns();
+                true
+            }
+        };
+        tunnel_core::overlay::host_ledger::purge();
+        ended
+    }
+    #[cfg(not(feature = "overlay-l3"))]
+    {
+        true
     }
 }
 
@@ -366,5 +483,18 @@ mod tests {
     #[test]
     fn a_running_daemon_keeps_its_routes() {
         assert!(!super::purge_exit_routes_unless_owned(true));
+    }
+
+    /// #3440 — an exit's wait for the DNS purge: 5 s, a number of seconds, or
+    /// `0`, which is no bound at all, as before.
+    #[test]
+    fn an_exit_waits_for_the_dns_purge_five_seconds_unless_told() {
+        use std::time::Duration;
+        let wait = super::exit_dns_purge_wait_from;
+        assert_eq!(wait(None), Some(Duration::from_secs(5)));
+        assert_eq!(wait(Some("12")), Some(Duration::from_secs(12)));
+        assert_eq!(wait(Some(" 3 ")), Some(Duration::from_secs(3)));
+        assert_eq!(wait(Some("0")), None, "the kill switch: no bound");
+        assert_eq!(wait(Some("soon")), Some(Duration::from_secs(5)), "ignored");
     }
 }

@@ -43,7 +43,7 @@ pub fn reset_input_diag_counter() {
 /// as truthy; anything else (including `None`) is false.
 ///
 /// Lives here (in `input/mod.rs`) rather than `enigo_backend.rs` so
-/// it's reachable from `main.rs` regardless of whether the
+/// it's reachable from `app.rs` regardless of whether the
 /// `enigo-input` feature is on for this build — the startup log line
 /// surfaces the gate value even on signalling-only builds.
 ///
@@ -501,8 +501,10 @@ pub(crate) fn stale(inj: &dyn InputInjector) -> bool {
 
 /// #3164 — does the OS grant THIS process input injection right now? macOS:
 /// Accessibility, read live (`AXIsProcessTrusted` sees a grant at once, no
-/// restart). Elsewhere no grant is waited on, so `false`: an injector opened
-/// without permission there stays as it was opened, exactly as before.
+/// restart). #2066 — elsewhere no grant is waited on, so `true`: what has no
+/// permission there is a Noop (enigo, SystemContext and uinput all report
+/// permission once open), and only opening one tells whether a backend can open
+/// now. The arbiter backs these opens off.
 pub(crate) fn os_grants_input() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -510,7 +512,7 @@ pub(crate) fn os_grants_input() -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        true
     }
 }
 

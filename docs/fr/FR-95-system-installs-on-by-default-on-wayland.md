@@ -34,12 +34,12 @@ Where an indicator exists today, by install:
 | host | "being viewed" banner + Disconnect | source |
 |---|---|---|
 | Debian family, x86_64, system | ✅ the companion (FR-27 P11) | the companion ships as **one x86_64 `.deb`** (`release-agent.yml:917`) |
-| any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:621`, at master `88897bff6`) |
-| aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:628`, at master `88897bff6`) |
+| any non-Debian (Fedora, Arch, openSUSE), system | ❌ none | `install.sh` skips it: "no dpkg here, the desktop companion ships as a .deb only" (`scripts/install.sh:657`, at master `88897bff6`) |
+| aarch64, any distro | ❌ none | no `.deb` for the arch (`scripts/install.sh:664`, at master `88897bff6`) |
 | the greeter and the lock screen, anywhere | ❌ none | FR-93 D1b (`FR-93-wayland-out-of-the-box.md:559`), deferred |
 
 A root daemon whose prompt has nowhere to show already says so: `no_prompt_surface`
-(`agents/roomlerd/src/signaling.rs:234`, `companion.rs:224`). That is the hook this FR uses.
+(`agents/roomlerd/src/signaling.rs:259`, `companion.rs:224`). That is the hook this FR uses.
 
 ## 3. Key design
 

@@ -177,6 +177,93 @@ impl Tier {
     }
 }
 
+/// #2871 — which daemon a key belongs to on a host that runs TWO: a Mac with
+/// a root half (the LaunchDaemon: the private network, Roomler SSH, remote
+/// commands, access policy, the updater, the supervisor) and a per-user half
+/// (the GUI worker that serves the remote-desktop session, which FR-43 keeps
+/// on its own enrollment and file through P2). The companion's Device
+/// configuration page shows the Mac as one device, so each row must come
+/// from, and a change go to, the half that READS the key — a switch written
+/// into the other half's file changes nothing the device does (#2871: the
+/// app showed `ssh_enabled = off` while the root half served SSH). Every
+/// other install runs one daemon, which reads every key, and this is moot.
+///
+/// Derived from the key's [`Group`] ([`Group::owner`]), one table: the
+/// session-side groups are the worker's, the rest the root half's.
+///
+/// ⚠️ Two caveats the split cannot express, both resolved by FR-43 P3 (one
+/// enrollment, one file):
+/// - the root half forwards its OWN value of a few session knobs to the
+///   worker as a floor (`macos_supervisor::WORKER_ENV_FORWARD`: display match,
+///   the encoder and fps denylists, the Mac kill switches), and the worker
+///   keeps the stricter — so editing the worker's value, where this routes a
+///   session key, never loosens a machine policy, and has no effect while the
+///   root has one;
+/// - a delegated session's policies are judged twice, by the root half's
+///   signalling with its config (the browser check, the session-policy mask,
+///   consent) and by the worker's with its own, so the effective policy is
+///   the stricter of the two halves' and the worker's copy — the one this
+///   routes to — can only tighten what the root half allows.
+///
+/// Locked by `every_key_has_an_owner_and_the_console_persons_keys_split_as_designed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Owner {
+    /// The root half reads it: the private network, SSH, remote commands,
+    /// access and consent policy, the daemon itself.
+    Machine,
+    /// The per-user half that serves the session reads it: remote desktop,
+    /// capture and input, video, files.
+    Session,
+}
+
+impl Owner {
+    /// A stable spelling, for logs and tests.
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Owner::Machine => "machine",
+            Owner::Session => "session",
+        }
+    }
+}
+
+impl Group {
+    /// #2871 — which half of a two-half Mac reads this group's keys
+    /// ([`Owner`]). Exhaustive on purpose: a new group places itself.
+    pub const fn owner(self) -> Owner {
+        match self {
+            Group::Access
+            | Group::Network
+            | Group::NetworkCarriers
+            | Group::NetworkRouting
+            | Group::Tunnels
+            | Group::Ssh
+            | Group::Device => Owner::Machine,
+            Group::RemoteDesktop
+            | Group::CaptureInput
+            | Group::VideoEncoding
+            | Group::VideoRate
+            | Group::Files => Owner::Session,
+        }
+    }
+
+    /// The group with this wire id (`ConfigEntry::group`), if any.
+    pub fn from_wire(wire: &str) -> Option<Group> {
+        Group::ALL.into_iter().find(|g| g.wire() == wire)
+    }
+}
+
+/// #2871 — the [`Owner`] of a key: by this build's registry when the key is
+/// known, else by the group the daemon sent beside it (`ConfigEntry::group`),
+/// else the session half — which keeps the per-user half's row for a key
+/// this build has never heard of, as the page always showed it.
+pub fn owner_for(key: &str, group_wire: &str) -> Owner {
+    KEYS.iter()
+        .find(|m| m.key == key)
+        .map(|m| m.group.owner())
+        .or_else(|| Group::from_wire(group_wire).map(Group::owner))
+        .unwrap_or(Owner::Session)
+}
+
 /// One registry row. Every field is a claim the desktop puts on screen, so
 /// a wrong one is a lie to the person at the machine — `live` above all:
 /// `true` means the daemon applies a change WITHOUT a restart, which today
@@ -388,202 +475,6 @@ const KEYS: &[KeyMeta] = &[
         live: true,
         kind: "bool",
         description: "FR-84 - let a person at this device restart the service from the companion (Apply now) or `roomler restart`. The daemon restarts itself only under a service manager it can prove (a Windows service or scheduled task, systemd, launchd), and at most once every 30 s; a hand-started `roomlerd run` always refuses. Off = every such request is refused. Never settable by the server, which cannot restart a daemon at all. Default: on.",
-    },
-    // FR-90 — Hive. Every key is the DEVICE's: none is settable by the server
-    // (they are absent from `DesiredConfig`), because which account runs a
-    // session and where it may run are exactly what a compromised server must
-    // not be able to choose.
-    KeyMeta {
-        key: "hive_enabled",
-        group: Group::Access,
-        tier: Tier::Essential,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - run AI agent sessions (Claude Code) on this device when a member of the org starts one. Each runs as the local account hive_accounts maps that member to - never SYSTEM/root - and only in a folder under hive_roots. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_accounts",
-        group: Group::Access,
-        tier: Tier::Standard,
-        live: false,
-        kind: "json",
-        description: "FR-90 - which local account a Roomler user's agent sessions run as: JSON {\"<user id or proven email>\": \"<account>\"}. Unmapped = refused (no_account), and a uid-0 account is refused too. Empty = nobody.",
-    },
-    KeyMeta {
-        key: "hive_roots",
-        group: Group::Access,
-        tier: Tier::Standard,
-        live: false,
-        kind: "list",
-        description: "FR-90 - comma-separated absolute folders agent sessions may run in, checked on the resolved path (no `..` or symlink escape). Empty = nowhere.",
-    },
-    KeyMeta {
-        key: "hive_max_sessions",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "string",
-        description: "FR-90 - the most agent sessions this device runs at once (1-64). Empty = built-in default (4).",
-    },
-    KeyMeta {
-        key: "hive_harness",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "string",
-        description: "FR-90 - absolute path of the agent harness (Claude Code). Empty = the first of ~/.local/bin/claude, /usr/local/bin/claude, /usr/bin/claude that exists for the mapped account.",
-    },
-    KeyMeta {
-        key: "hive_api_key_helper",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "string",
-        description: "FR-90 - a command the DAEMON runs (as SYSTEM/root) to print the model API key. Sessions never see it: each gets a per-session token for the loopback model sidecar. Empty = no model credential, and sessions' model calls fail.",
-    },
-    KeyMeta {
-        key: "hive_api_workspace_id",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "string",
-        description: "FR-90 - the provider workspace for a model key that is not scoped to one: the sidecar sends it as anthropic-workspace-id with every model call. Empty = no header (right for a workspace-scoped key).",
-    },
-    KeyMeta {
-        key: "hive_update_wait_secs",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "string",
-        description: "FR-90 - how long an update waits for running agent turns before it restarts the daemon (0-7200 seconds; 0 = never wait). It holds a server-pushed update too. Empty = built-in default (1800, 30 minutes).",
-    },
-    KeyMeta {
-        key: "hive_core_memory",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - show the organization's core memory (facts its people keep in Roomler) to the agent sessions on this device, as the session's CLAUDE.md and auto-memory. Claude Code reads CLAUDE.md as the user's own overriding instructions, so this is the one place text from the server reaches a session's model. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_adopt",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - let the people who use this device adopt the Claude Code sessions they run in a terminal (roomler hive adopt): mirrored into this device's store and shown to their owner alone, read-only. Each person still opts in, and their account must map in hive_accounts. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_allow_passwordless_sudo",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - macOS: run agent sessions as an account whose sudo needs no password. Off, such a start is refused: macOS's sudo reads the account's groups from the directory, so the session would have root whatever groups it drops. No effect on Linux, where a session cannot sudo at all. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_replica",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - hold copies of the agent sessions this device's owner runs on their other devices, so a session can move here when its device is gone. A copy is everything the agent saw, in plain text on this device. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_archive",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - offer this device as the organization's archive replica: once an administrator designates it, it holds every agent session the organization's rules allow, for their retention. Needs hive_replica on. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_store_quota_mib",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "string",
-        description: "FR-90 - the most this device keeps of the agent sessions it holds as a replica, in MiB (1-4194304). Never settable by the server. Empty = no bound but the disk's.",
-    },
-    KeyMeta {
-        key: "vault_enabled",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - let the organization's vault lease secrets to the agent sessions on this device. On, the daemon makes a key at each start, in memory only, and a leased value is decrypted in the daemon, never in the session's process. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "vault_activity_log",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - report to the org what this device does with the values its vault leases it: each command a session ran with them (the program and how it ended) and each file it wrote (the name). Never a value. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_net",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - offer the agent sessions on this device their own egress (net_socks, net_forward): a loopback listener per call, served to the session's account alone, its flows decided by the organization's vault and tunnel policies. Only with vault_enabled. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_ssh",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - offer the agent sessions on this device ssh_run: one command on another device of the organization over Roomler SSH, as the account that device's SSH policy maps (it may be SYSTEM or root there), each call decided by the organization's vault and approved by a person. Only with vault_enabled. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_egress",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - run every agent session on this device in Claude Code's sandbox: its commands reach only the hosts the organization's vault allows the session's role (net:egress), through a proxy in this daemon, and write only to their working directory, temp, and the session's own cache. A session is refused where the sandbox cannot run: Linux without bubblewrap and socat, Claude Code before 2.1.285. On Windows, where no sandbox runs, every session gets the proxy named in its environment, advisory. Only with vault_enabled. Never settable by the server. Default: OFF.",
-    },
-    KeyMeta {
-        key: "hive_worker",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: false,
-        kind: "bool",
-        description: "FR-90 - run a worker beside each agent session on this device, and one for the device itself (roomlerd hive-worker, the daemon's own supervised child), so a fault in what one serves costs that worker and never the daemon. Builds with the vault run the device's. Read as the daemon starts. Never settable by the server. Default: OFF.",
-    },
-    // FR-90 P4-3b-1 — what a knowhow scan reads (decision 38): the device's,
-    // like every Hive key, and absent from `DesiredConfig`, since a server
-    // that could set it would choose which folders a device reads.
-    KeyMeta {
-        key: "knowhow_scan_roots",
-        group: Group::Access,
-        tier: Tier::Standard,
-        live: true,
-        kind: "list",
-        description: "FR-90 - comma-separated absolute paths this device's knowhow scans read, each as the account that owns it - never SYSTEM/root, and never a path root owns: a folder is walked for its git checkouts (their remotes, branch, first commit and the services their compose and Kubernetes manifests name), a file is read as a kubeconfig (its contexts, servers and CA fingerprints - never its users). Metadata only, never file contents. Read again at each scan. Never settable by the server. Empty = nothing is read.",
-    },
-    // FR-90 P4-3b-3 — whether a knowhow scan reports the ports this device
-    // listens on (decision 47): the device's, and absent from `DesiredConfig`.
-    KeyMeta {
-        key: "knowhow_scan_listeners",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: true,
-        kind: "bool",
-        description: "FR-90 - let this device's knowhow scans report the TCP ports it listens on: each port, its bound address and the process holding it, read by the daemon from the system's own table (this daemon's own ports left out). A listener is under no root, so it has its own switch. Read again at each scan. Never settable by the server. Default: OFF.",
-    },
-    // FR-90 P4-5-1b — where a knowhow probe may go (decision 53): the
-    // device's, absent from `DesiredConfig`, since a server that could set
-    // it would choose where every device connects to from inside its network.
-    KeyMeta {
-        key: "knowhow_probe_reach",
-        group: Group::Access,
-        tier: Tier::Advanced,
-        live: true,
-        kind: "list",
-        description: "FR-90 - comma-separated places this device's knowhow probes may reach, each HOST or HOST:PORTS: an address or range (100.64.0.0/10, 10.0.4.12, [fd00::/8]), a DNS name (db.example.com) or *. and a suffix (*.example.com), and one port or a range (5432, 8000-8999; all ports when absent). A probe connects and closes, and for TLS reads the server's certificate, never sending a request or a credential. Link-local and cloud metadata addresses are never reached, whatever it lists. Read again at each probe. Never settable by the server. Empty = nowhere.",
     },
     KeyMeta {
         key: "ssh_enabled",
@@ -2005,6 +1896,9 @@ fn to_entry(cfg: &AgentConfig, m: &KeyMeta) -> ConfigEntry {
         group_label: m.group.label().to_string(),
         tier: m.tier.wire().to_string(),
         default: builtin_default(m.key),
+        // #2871 — set only by the person socket's view (`localapi::person_view`),
+        // never by the surface: a daemon's own endpoint sets every key.
+        read_only: None,
     }
 }
 
@@ -2074,29 +1968,6 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "ssh_account_mode" => cfg.ssh_account_mode.clone(),
         "ssh_max_privilege" => cfg.ssh_max_privilege.clone(),
         "ssh_activity_log" => Some(fmt_bool(cfg.ssh_activity_log)),
-        "hive_enabled" => Some(fmt_bool(cfg.hive_enabled)),
-        "hive_accounts" => serde_json::to_string(&cfg.hive_accounts).ok(),
-        "hive_roots" => Some(cfg.hive_roots.join(",")),
-        "hive_max_sessions" => cfg.hive_max_sessions.map(|n| n.to_string()),
-        "hive_harness" => cfg.hive_harness.clone(),
-        "hive_api_key_helper" => cfg.hive_api_key_helper.clone(),
-        "hive_api_workspace_id" => cfg.hive_api_workspace_id.clone(),
-        "hive_update_wait_secs" => cfg.hive_update_wait_secs.map(|n| n.to_string()),
-        "hive_core_memory" => Some(fmt_bool(cfg.hive_core_memory)),
-        "hive_adopt" => Some(fmt_bool(cfg.hive_adopt)),
-        "hive_allow_passwordless_sudo" => Some(fmt_bool(cfg.hive_allow_passwordless_sudo)),
-        "hive_replica" => Some(fmt_bool(cfg.hive_replica)),
-        "hive_archive" => Some(fmt_bool(cfg.hive_archive)),
-        "hive_store_quota_mib" => cfg.hive_store_quota_mib.map(|n| n.to_string()),
-        "vault_enabled" => Some(fmt_bool(cfg.vault_enabled)),
-        "vault_activity_log" => Some(fmt_bool(cfg.vault_activity_log)),
-        "hive_net" => Some(fmt_bool(cfg.hive_net)),
-        "hive_ssh" => Some(fmt_bool(cfg.hive_ssh)),
-        "hive_egress" => Some(fmt_bool(cfg.hive_egress)),
-        "hive_worker" => Some(fmt_bool(cfg.hive_worker)),
-        "knowhow_scan_roots" => Some(cfg.knowhow_scan_roots.join(",")),
-        "knowhow_scan_listeners" => Some(fmt_bool(cfg.knowhow_scan_listeners)),
-        "knowhow_probe_reach" => Some(cfg.knowhow_probe_reach.join(",")),
         "ssh_exec_streaming" => Some(fmt_bool(cfg.ssh_exec_streaming)),
         "encoder_preference" => Some(
             match cfg.encoder_preference {
@@ -2410,75 +2281,6 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "ssh_enabled" => cfg.ssh_enabled = parse_bool_or(value, false)?,
         // Clearing it means OFF, like every other reporting/capability switch.
         "ssh_activity_log" => cfg.ssh_activity_log = parse_bool_or(value, false)?,
-        "hive_enabled" => cfg.hive_enabled = parse_bool_or(value, false)?,
-        // Validated on the way IN, like `ssh_account_mode`: a typo should be a
-        // rejected `config set`, not a session refused `no_account` for a
-        // reason the owner then has to dig out of the daemon log.
-        "hive_accounts" => cfg.hive_accounts = parse_hive_accounts(value)?,
-        // Clearing empties the list, i.e. nowhere — the fail-safe direction.
-        "hive_roots" => cfg.hive_roots = parse_absolute_list("hive_roots", value)?,
-        "hive_max_sessions" => {
-            cfg.hive_max_sessions = parse_u32_range("hive_max_sessions", value, 1, 64)?
-        }
-        "hive_harness" => cfg.hive_harness = parse_absolute_path("hive_harness", value)?,
-        "hive_api_key_helper" => {
-            cfg.hive_api_key_helper = match value.map(str::trim).filter(|s| !s.is_empty()) {
-                None => None,
-                Some(v) if v.chars().any(char::is_control) => {
-                    return Err("hive_api_key_helper must be one line".into());
-                }
-                Some(v) => Some(v.to_string()),
-            }
-        }
-        // An identifier, sent as a header: letters, digits, `_` and `-` only.
-        "hive_api_workspace_id" => {
-            cfg.hive_api_workspace_id = match value.map(str::trim).filter(|s| !s.is_empty()) {
-                None => None,
-                Some(v)
-                    if v.len() > 128
-                        || !v
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
-                {
-                    return Err(
-                        "hive_api_workspace_id is a workspace id (letters, digits, _ and -)".into(),
-                    );
-                }
-                Some(v) => Some(v.to_string()),
-            }
-        }
-        // FR-90 P1d-1 — clearing restores the built-in 30 minutes; 0 is an
-        // owner's choice to let updates cut turns at once.
-        "hive_core_memory" => cfg.hive_core_memory = parse_bool_or(value, false)?,
-        "hive_adopt" => cfg.hive_adopt = parse_bool_or(value, false)?,
-        "hive_allow_passwordless_sudo" => {
-            cfg.hive_allow_passwordless_sudo = parse_bool_or(value, false)?
-        }
-        "hive_replica" => cfg.hive_replica = parse_bool_or(value, false)?,
-        "hive_archive" => cfg.hive_archive = parse_bool_or(value, false)?,
-        "hive_store_quota_mib" => {
-            cfg.hive_store_quota_mib =
-                parse_u32_range("hive_store_quota_mib", value, 1, 4 * 1024 * 1024)?
-        }
-        "vault_enabled" => cfg.vault_enabled = parse_bool_or(value, false)?,
-        "vault_activity_log" => cfg.vault_activity_log = parse_bool_or(value, false)?,
-        "hive_net" => cfg.hive_net = parse_bool_or(value, false)?,
-        "hive_ssh" => cfg.hive_ssh = parse_bool_or(value, false)?,
-        "hive_egress" => cfg.hive_egress = parse_bool_or(value, false)?,
-        "hive_worker" => cfg.hive_worker = parse_bool_or(value, false)?,
-        // Clearing empties the list: nothing is read, the fail-safe direction.
-        "knowhow_scan_roots" => {
-            cfg.knowhow_scan_roots = parse_absolute_list("knowhow_scan_roots", value)?
-        }
-        // Clearing turns it off, like every reporting switch.
-        "knowhow_scan_listeners" => cfg.knowhow_scan_listeners = parse_bool_or(value, false)?,
-        // Clearing empties the list: no probe reaches anywhere.
-        "knowhow_probe_reach" => {
-            cfg.knowhow_probe_reach = crate::probe_reach::parse_list("knowhow_probe_reach", value)?
-        }
-        "hive_update_wait_secs" => {
-            cfg.hive_update_wait_secs = parse_u32_range("hive_update_wait_secs", value, 0, 7200)?
-        }
         // FR-89 — clearing restores the built-in ON: this is a kill switch
         // for a data-path shape, not a gate, so OFF is an owner's choice.
         "ssh_exec_streaming" => cfg.ssh_exec_streaming = parse_bool_or(value, true)?,
@@ -3018,73 +2820,6 @@ fn parse_u32_range(
     }
 }
 
-/// FR-90 — `hive_accounts`: a JSON object of `"<user id or email>": "<account>"`.
-/// Empty clears to nobody. A key must name a user the way the start frame
-/// does — a 24-hex user id, or an address (`@`) — and an account must be one
-/// plain local name. `root` is refused here as well as at launch: the launch
-/// refuses any uid-0 account whatever its name, but a mapping to root should
-/// never get as far as being saved.
-fn parse_hive_accounts(
-    value: Option<&str>,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
-    let Some(v) = value.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(Default::default());
-    };
-    let raw: std::collections::BTreeMap<String, String> = serde_json::from_str(v).map_err(|e| {
-        format!("hive_accounts: invalid JSON (want {{\"<user id or email>\": \"<account>\"}}): {e}")
-    })?;
-    let mut out = std::collections::BTreeMap::new();
-    for (user, account) in raw {
-        let user = user.trim();
-        let account = account.trim();
-        let is_id = user.len() == 24 && user.chars().all(|c| c.is_ascii_hexdigit());
-        if !(is_id || user.contains('@')) || user.chars().any(char::is_control) {
-            return Err(format!(
-                "hive_accounts: {user:?} is neither a user id (24 hex) nor an email address"
-            ));
-        }
-        if account.is_empty()
-            || account.len() > 64
-            || account
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '/' | '\\'))
-        {
-            return Err(format!(
-                "hive_accounts: {account:?} is not a local account name"
-            ));
-        }
-        if account == "root" {
-            return Err("hive_accounts: sessions never run as root".into());
-        }
-        out.insert(user.to_string(), account.to_string());
-    }
-    Ok(out)
-}
-
-/// A comma-separated list of absolute paths; empty clears.
-fn parse_absolute_list(key: &str, value: Option<&str>) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    for token in value.unwrap_or("").split(',').map(str::trim) {
-        if token.is_empty() {
-            continue;
-        }
-        if !std::path::Path::new(token).is_absolute() {
-            return Err(format!("{key}: {token:?} is not an absolute path"));
-        }
-        out.push(token.to_string());
-    }
-    Ok(out)
-}
-
-/// One absolute path, or empty to clear.
-fn parse_absolute_path(key: &str, value: Option<&str>) -> Result<Option<String>, String> {
-    match value.map(str::trim).filter(|s| !s.is_empty()) {
-        None => Ok(None),
-        Some(v) if std::path::Path::new(v).is_absolute() => Ok(Some(v.to_string())),
-        Some(v) => Err(format!("{key}: {v:?} is not an absolute path")),
-    }
-}
-
 /// Shared parse/validate for the four `rate_factor_*` keys: empty clears
 /// (built-in applies), numeric must be 50–400 %.
 fn parse_rate_factor(key: &str, value: Option<&str>) -> Result<Option<u32>, String> {
@@ -3486,12 +3221,6 @@ mod tests {
             "external_access_enabled",
             "external_consent_mode",
             "external_max_permissions",
-            // FR-90 P4-3b-1 — read at use: from the config FILE at every
-            // knowhow scan, so nothing re-seeds them.
-            "knowhow_scan_roots",
-            "knowhow_scan_listeners",
-            // FR-90 P4-5-1b — and at every knowhow probe.
-            "knowhow_probe_reach",
         ]
         .into_iter()
         .map(String::from)
@@ -3632,7 +3361,6 @@ mod tests {
             "exec_enabled",
             "remote_config_enabled",
             "ssh_enabled",
-            "hive_enabled",
             "encoder_preference",
             "files_dir",
             "power_policy",
@@ -4799,414 +4527,6 @@ mod tests {
         );
     }
 
-    /// FR-90 — every Hive gate defaults CLOSED and clears closed: off, nobody,
-    /// nowhere. The defaults are the security property here, as for
-    /// `remote_config_enabled` below.
-    #[test]
-    fn hive_gates_default_closed_and_clear_closed() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_enabled);
-        assert!(cfg.hive_accounts.is_empty(), "nobody");
-        assert!(cfg.hive_roots.is_empty(), "nowhere");
-        // The wire default agrees with the serde default of an absent key.
-        let e = entry_for(&cfg, "hive_enabled").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-
-        apply(&mut cfg, "hive_enabled", Some("true")).unwrap();
-        let root = if cfg!(windows) {
-            r"C:\src"
-        } else {
-            "/home/dev/src"
-        };
-        apply(&mut cfg, "hive_roots", Some(&format!(" {root} , "))).unwrap();
-        assert_eq!(
-            cfg.hive_roots,
-            vec![root.to_string()],
-            "trimmed, blanks dropped"
-        );
-        apply(
-            &mut cfg,
-            "hive_accounts",
-            Some(r#"{"dev@example.com": "dev", "0123456789abcdef01234567": " svc "}"#),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.hive_accounts.get("dev@example.com").map(String::as_str),
-            Some("dev")
-        );
-        assert_eq!(
-            cfg.hive_accounts
-                .get("0123456789abcdef01234567")
-                .map(String::as_str),
-            Some("svc"),
-            "values are trimmed"
-        );
-        // It echoes as the JSON it was set from.
-        let echoed = entry_for(&cfg, "hive_accounts").unwrap().value.unwrap();
-        assert!(echoed.contains("\"dev@example.com\":\"dev\""), "{echoed}");
-
-        // Clearing closes every gate again.
-        for key in ["hive_enabled", "hive_accounts", "hive_roots"] {
-            apply(&mut cfg, key, None).unwrap();
-        }
-        assert!(!cfg.hive_enabled && cfg.hive_accounts.is_empty() && cfg.hive_roots.is_empty());
-    }
-
-    /// FR-90 P4-3b-1 — a knowhow scan reads nothing until the owner lists a
-    /// root: empty by default and again when cleared, absolute paths only,
-    /// and live, since every scan reads it from the file.
-    #[test]
-    fn knowhow_scan_roots_default_empty_absolute_and_live() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(cfg.knowhow_scan_roots.is_empty(), "nothing is read");
-        let e = entry_for(&cfg, "knowhow_scan_roots").unwrap();
-        assert_eq!(e.group, Group::Access.wire());
-        assert_eq!(e.kind, "list");
-        assert!(!e.restart_required, "read at every scan");
-
-        let (a, b) = if cfg!(windows) {
-            (r"C:\src", r"D:\work")
-        } else {
-            ("/home/dev/src", "/srv/work")
-        };
-        apply(
-            &mut cfg,
-            "knowhow_scan_roots",
-            Some(&format!(" {a} ,{b}, ")),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.knowhow_scan_roots,
-            vec![a.to_string(), b.to_string()],
-            "trimmed, blanks dropped"
-        );
-        assert_eq!(
-            entry_for(&cfg, "knowhow_scan_roots").unwrap().value,
-            Some(format!("{a},{b}"))
-        );
-        assert!(
-            apply(&mut cfg, "knowhow_scan_roots", Some("src,relative/dir")).is_err(),
-            "a relative path is refused"
-        );
-        assert_eq!(cfg.knowhow_scan_roots.len(), 2, "a refusal changes nothing");
-        apply(&mut cfg, "knowhow_scan_roots", None).unwrap();
-        assert!(
-            cfg.knowhow_scan_roots.is_empty(),
-            "cleared: nothing is read"
-        );
-    }
-
-    /// FR-90 P4-5-1b — where a probe may go: nowhere by default and again
-    /// when cleared, live, read into one spelling, and a list with one entry
-    /// that does not read refused whole.
-    #[test]
-    fn knowhow_probe_reach_defaults_nowhere_and_reads_whole() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(cfg.knowhow_probe_reach.is_empty(), "nowhere");
-        let e = entry_for(&cfg, "knowhow_probe_reach").unwrap();
-        assert_eq!(e.group, Group::Access.wire());
-        assert_eq!(e.kind, "list");
-        assert!(!e.restart_required, "read at every probe");
-
-        apply(
-            &mut cfg,
-            "knowhow_probe_reach",
-            Some(" 100.64.0.0/10:22, DB.Example.com:5432 ,*.example.org:443 "),
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.knowhow_probe_reach,
-            [
-                "100.64.0.0/10:22",
-                "db.example.com:5432",
-                "*.example.org:443"
-            ]
-        );
-        assert_eq!(
-            entry_for(&cfg, "knowhow_probe_reach").unwrap().value,
-            Some("100.64.0.0/10:22,db.example.com:5432,*.example.org:443".into())
-        );
-        assert!(
-            apply(
-                &mut cfg,
-                "knowhow_probe_reach",
-                Some("10.0.0.1:22,fd00::1:443")
-            )
-            .is_err(),
-            "an unbracketed IPv6 entry refuses the list"
-        );
-        assert_eq!(
-            cfg.knowhow_probe_reach.len(),
-            3,
-            "a refusal changes nothing"
-        );
-        apply(&mut cfg, "knowhow_probe_reach", None).unwrap();
-        assert!(cfg.knowhow_probe_reach.is_empty(), "cleared: nowhere");
-    }
-
-    /// FR-90 P4-3b-3 — a scan reports the device's listeners only when the
-    /// owner says so: off by default and again when cleared, live, and the
-    /// wire default agrees with the serde default of an absent key.
-    #[test]
-    fn knowhow_scan_listeners_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.knowhow_scan_listeners);
-        let e = entry_for(&cfg, "knowhow_scan_listeners").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(!e.restart_required, "read at every scan");
-        apply(&mut cfg, "knowhow_scan_listeners", Some("true")).unwrap();
-        assert!(cfg.knowhow_scan_listeners);
-        apply(&mut cfg, "knowhow_scan_listeners", None).unwrap();
-        assert!(!cfg.knowhow_scan_listeners, "cleared: off");
-        assert!(apply(&mut cfg, "knowhow_scan_listeners", Some("sometimes")).is_err());
-    }
-
-    /// FR-90 P1e — core memory is shown to a session only when the device's
-    /// owner says so: off by default, off again when cleared, and the wire
-    /// default agrees with the serde default of an absent key.
-    #[test]
-    fn hive_core_memory_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_core_memory);
-        let e = entry_for(&cfg, "hive_core_memory").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        apply(&mut cfg, "hive_core_memory", Some("true")).unwrap();
-        assert!(cfg.hive_core_memory);
-        assert_eq!(
-            entry_for(&cfg, "hive_core_memory")
-                .unwrap()
-                .value
-                .as_deref(),
-            Some("true")
-        );
-        apply(&mut cfg, "hive_core_memory", None).unwrap();
-        assert!(!cfg.hive_core_memory, "cleared is off");
-        assert!(apply(&mut cfg, "hive_core_memory", Some("maybe")).is_err());
-    }
-
-    /// FR-90 P1j — adopting terminal sessions is the device owner's to allow,
-    /// off until they say so and off again when cleared.
-    #[test]
-    fn hive_adopt_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_adopt);
-        let e = entry_for(&cfg, "hive_adopt").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        apply(&mut cfg, "hive_adopt", Some("true")).unwrap();
-        assert!(cfg.hive_adopt);
-        apply(&mut cfg, "hive_adopt", None).unwrap();
-        assert!(!cfg.hive_adopt, "cleared is off");
-        assert!(apply(&mut cfg, "hive_adopt", Some("sometimes")).is_err());
-    }
-
-    /// FR-90 P2c — holding copies of sessions, offering the device as an
-    /// archive, and how much it keeps are the device owner's: off and unbound
-    /// until they say so, and so again when cleared.
-    #[test]
-    fn hive_replica_archive_and_quota_are_the_owners_and_off_by_default() {
-        let mut cfg = crate::config::test_fixture();
-        for key in ["hive_replica", "hive_archive"] {
-            let e = entry_for(&cfg, key).unwrap();
-            assert_eq!(e.default.as_deref(), Some("false"), "{key}");
-            assert_eq!(e.group, Group::Access.wire());
-            apply(&mut cfg, key, Some("true")).unwrap();
-            apply(&mut cfg, key, None).unwrap();
-            assert!(apply(&mut cfg, key, Some("sometimes")).is_err());
-        }
-        assert!(!cfg.hive_replica && !cfg.hive_archive, "cleared is off");
-        apply(&mut cfg, "hive_replica", Some("true")).unwrap();
-        assert!(cfg.hive_replica);
-        apply(&mut cfg, "hive_archive", Some("true")).unwrap();
-        assert!(cfg.hive_archive);
-
-        assert_eq!(cfg.hive_store_quota_mib, None);
-        apply(&mut cfg, "hive_store_quota_mib", Some("10240")).unwrap();
-        assert_eq!(cfg.hive_store_quota_mib, Some(10240));
-        assert!(apply(&mut cfg, "hive_store_quota_mib", Some("0")).is_err());
-        assert!(apply(&mut cfg, "hive_store_quota_mib", Some("4194305")).is_err());
-        assert!(apply(&mut cfg, "hive_store_quota_mib", Some("10GiB")).is_err());
-        apply(&mut cfg, "hive_store_quota_mib", None).unwrap();
-        assert_eq!(cfg.hive_store_quota_mib, None, "cleared is unbound");
-    }
-
-    /// FR-90 P3-3 — whether the vault may lease values to this device's
-    /// sessions is the device owner's: off until they say so, off again when
-    /// cleared, and read at start, where the daemon makes its key.
-    #[test]
-    fn vault_enabled_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.vault_enabled);
-        let e = entry_for(&cfg, "vault_enabled").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(e.restart_required, "the key is made at start");
-        apply(&mut cfg, "vault_enabled", Some("true")).unwrap();
-        assert!(cfg.vault_enabled);
-        apply(&mut cfg, "vault_enabled", None).unwrap();
-        assert!(!cfg.vault_enabled, "cleared is off");
-        assert!(apply(&mut cfg, "vault_enabled", Some("sometimes")).is_err());
-    }
-
-    /// FR-90 P3-7-3c — whether a session here may reach a network through
-    /// this device is the device owner's: off until they say so, off again
-    /// when cleared, and read at start, as the other `hive_*` keys are.
-    #[test]
-    fn hive_net_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_net);
-        let e = entry_for(&cfg, "hive_net").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(e.restart_required, "the hive snapshot is read at start");
-        apply(&mut cfg, "hive_net", Some("true")).unwrap();
-        assert!(cfg.hive_net);
-        apply(&mut cfg, "hive_net", None).unwrap();
-        assert!(!cfg.hive_net, "cleared is off");
-        assert!(apply(&mut cfg, "hive_net", Some("on-ish")).is_err());
-    }
-
-    /// FR-90 P3b-1b-2 — and whether every session here runs sandboxed, its
-    /// egress decided by the vault: off until the owner says so, off again
-    /// when cleared, and read at start.
-    #[test]
-    fn hive_egress_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_egress);
-        let e = entry_for(&cfg, "hive_egress").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(e.restart_required, "the hive snapshot is read at start");
-        apply(&mut cfg, "hive_egress", Some("true")).unwrap();
-        assert!(cfg.hive_egress);
-        apply(&mut cfg, "hive_egress", None).unwrap();
-        assert!(!cfg.hive_egress, "cleared is off");
-        assert!(apply(&mut cfg, "hive_egress", Some("sometimes")).is_err());
-    }
-
-    /// FR-90 P8-2a-1 — whether a session here gets a worker beside it: off
-    /// until the owner says so, off again when cleared, and read at start.
-    #[test]
-    fn hive_worker_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_worker);
-        let e = entry_for(&cfg, "hive_worker").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(e.restart_required, "the hive snapshot is read at start");
-        apply(&mut cfg, "hive_worker", Some("true")).unwrap();
-        assert!(cfg.hive_worker);
-        apply(&mut cfg, "hive_worker", None).unwrap();
-        assert!(!cfg.hive_worker, "cleared is off");
-        assert!(apply(&mut cfg, "hive_worker", Some("sometimes")).is_err());
-    }
-
-    /// FR-90 P3-8-2b-2 — so is whether a session here may run a command on
-    /// another device: off until the owner says so, off again when cleared,
-    /// and read at start.
-    #[test]
-    fn hive_ssh_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_ssh);
-        let e = entry_for(&cfg, "hive_ssh").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(e.restart_required, "the hive snapshot is read at start");
-        apply(&mut cfg, "hive_ssh", Some("true")).unwrap();
-        assert!(cfg.hive_ssh);
-        assert!(!cfg.hive_net, "and it is not hive_net");
-        apply(&mut cfg, "hive_ssh", None).unwrap();
-        assert!(!cfg.hive_ssh, "cleared is off");
-        assert!(apply(&mut cfg, "hive_ssh", Some("on-ish")).is_err());
-    }
-
-    /// FR-90 P3-4d-2 — whether the device reports what it does with its
-    /// leases is the device owner's, as `ssh_activity_log` is: off until they
-    /// say so, off again when cleared, read at the primary connection.
-    #[test]
-    fn vault_activity_log_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.vault_activity_log);
-        let e = entry_for(&cfg, "vault_activity_log").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        assert!(e.restart_required);
-        apply(&mut cfg, "vault_activity_log", Some("true")).unwrap();
-        assert!(cfg.vault_activity_log);
-        apply(&mut cfg, "vault_activity_log", None).unwrap();
-        assert!(!cfg.vault_activity_log, "cleared is off");
-        assert!(apply(&mut cfg, "vault_activity_log", Some("sometimes")).is_err());
-    }
-
-    /// FR-90 decision 15 — a Mac session as an account whose `sudo` needs no
-    /// password is the device owner's to allow: off until they say so, and
-    /// off again when cleared.
-    #[test]
-    fn hive_allow_passwordless_sudo_defaults_off_and_clears_off() {
-        let mut cfg = crate::config::test_fixture();
-        assert!(!cfg.hive_allow_passwordless_sudo);
-        let e = entry_for(&cfg, "hive_allow_passwordless_sudo").unwrap();
-        assert_eq!(e.default.as_deref(), Some("false"));
-        assert_eq!(e.group, Group::Access.wire());
-        apply(&mut cfg, "hive_allow_passwordless_sudo", Some("true")).unwrap();
-        assert!(cfg.hive_allow_passwordless_sudo);
-        apply(&mut cfg, "hive_allow_passwordless_sudo", None).unwrap();
-        assert!(!cfg.hive_allow_passwordless_sudo, "cleared is off");
-        assert!(apply(&mut cfg, "hive_allow_passwordless_sudo", Some("yes-ish")).is_err());
-    }
-
-    /// FR-90 — what `config set` refuses for the Hive keys, so a typo is a
-    /// refusal now rather than a session refused later for a reason the owner
-    /// has to dig out of a log.
-    #[test]
-    fn hive_keys_refuse_what_a_launch_would_misread() {
-        let mut cfg = crate::config::test_fixture();
-        for bad in [
-            r#"{"dev@example.com": "root"}"#,
-            r#"{"dev@example.com": ""}"#,
-            r#"{"dev@example.com": "two words"}"#,
-            r#"{"dev@example.com": "named:dev"}"#,
-            r#"{"just-a-name": "dev"}"#,
-            r#"{"0123": "dev"}"#,
-            "not json",
-            r#"["dev"]"#,
-        ] {
-            let err = apply(&mut cfg, "hive_accounts", Some(bad)).unwrap_err();
-            assert!(err.contains("hive_accounts"), "{bad}: {err}");
-        }
-        assert!(cfg.hive_accounts.is_empty(), "nothing half-applied");
-
-        assert!(apply(&mut cfg, "hive_roots", Some("src,relative/dir")).is_err());
-        assert!(apply(&mut cfg, "hive_harness", Some("claude")).is_err());
-        assert!(apply(&mut cfg, "hive_max_sessions", Some("0")).is_err());
-        assert!(apply(&mut cfg, "hive_max_sessions", Some("65")).is_err());
-        apply(&mut cfg, "hive_max_sessions", Some("2")).unwrap();
-        assert_eq!(cfg.hive_max_sessions, Some(2));
-        assert!(apply(&mut cfg, "hive_api_key_helper", Some("a\nb")).is_err());
-        // A header value: an identifier, nothing that could smuggle another.
-        for bad in ["wrkspc 1", "wrkspc\r\nx-api-key: k", "a:b"] {
-            assert!(
-                apply(&mut cfg, "hive_api_workspace_id", Some(bad)).is_err(),
-                "{bad:?}"
-            );
-        }
-        apply(&mut cfg, "hive_api_workspace_id", Some("wrkspc_01Ab-9")).unwrap();
-        assert_eq!(cfg.hive_api_workspace_id.as_deref(), Some("wrkspc_01Ab-9"));
-        apply(&mut cfg, "hive_api_workspace_id", None).unwrap();
-        assert_eq!(cfg.hive_api_workspace_id, None);
-        // P1d-1 — 0 is a real choice (never wait), the ceiling is two hours,
-        // and a clear goes back to the built-in 30 minutes.
-        apply(&mut cfg, "hive_update_wait_secs", Some("0")).unwrap();
-        assert_eq!(cfg.hive_update_wait_secs, Some(0));
-        assert!(apply(&mut cfg, "hive_update_wait_secs", Some("7201")).is_err());
-        assert!(apply(&mut cfg, "hive_update_wait_secs", Some("-1")).is_err());
-        apply(&mut cfg, "hive_update_wait_secs", None).unwrap();
-        assert_eq!(cfg.hive_update_wait_secs, None);
-    }
-
     /// The opt-in that keeps `exec_enabled` / `ssh_enabled` refusable by a
     /// compromised control plane (`docs/remote-config.md`). Locked here
     /// because the DEFAULT is the security property: a device that has not
@@ -5312,12 +4632,129 @@ mod tests {
         assert!(cfg.forward_acl.enabled, "default ACL is enabled");
     }
 
+    /// #2871 — every key has an owner on a two-half Mac, derived from its
+    /// group, and the keys the person socket serves split as designed: the
+    /// FR-52 external-access keys are the root half's (its row is the device
+    /// an outsider reaches, and it holds the password record), every other
+    /// one the session half's (the worker serves the session; its policies
+    /// apply to a delegated one too, and can only tighten the root half's).
+    /// The device-owned gates and the network are the root half's.
+    #[test]
+    fn every_key_has_an_owner_and_the_console_persons_keys_split_as_designed() {
+        for m in KEYS {
+            assert_eq!(owner_for(m.key, ""), m.group.owner(), "{}", m.key);
+            assert_eq!(
+                owner_for(m.key, m.group.wire()),
+                m.group.owner(),
+                "{}",
+                m.key
+            );
+        }
+        for key in [
+            "exec_enabled",
+            "ssh_enabled",
+            "remote_config_enabled",
+            "overlay_enabled",
+            "auto_update",
+            "auto_grant_session",
+            "allow_plaintext_server",
+            "external_access_enabled",
+            "external_consent_mode",
+            "external_max_permissions",
+            "macos_supervise_gui_worker",
+            "relay_server_enabled",
+        ] {
+            assert_eq!(owner_for(key, ""), Owner::Machine, "{key}");
+        }
+        for key in [
+            "record_dir",
+            "record_remote_enabled",
+            "record_remote_audio",
+            "files_dir",
+            "keep_busy_enabled",
+            "privacy_mode_allowed",
+            "lock_on_end",
+            "display_match",
+            "peer_auth",
+            "rc_clipboard",
+            "rc_files",
+            "rc_audio",
+            "encoder_preference",
+            "drm_capture",
+            "rate_factor_h264",
+        ] {
+            assert_eq!(owner_for(key, ""), Owner::Session, "{key}");
+        }
+        // The person socket's `ConfigSet` allowlist (localapi), key by key:
+        // the external-access surface is the root half's, the rest the
+        // worker's — so on a two-half Mac the companion edits exactly
+        // `external_*` over the person socket and everything else where it
+        // always did.
+        let served: Vec<&str> = KEYS
+            .iter()
+            .map(|m| m.key)
+            .filter(|k| roomler_localapi::person_socket_admits_key(k))
+            .collect();
+        // #2871 (review) — by name, in registry order, never a bare count a
+        // new key would just bump.
+        assert_eq!(
+            served,
+            [
+                "files_dir",
+                "external_access_enabled",
+                "external_consent_mode",
+                "external_max_permissions",
+                "record_remote_enabled",
+                "record_remote_audio",
+                "keep_busy_enabled",
+                "privacy_mode_allowed",
+                "lock_on_end",
+                "display_match",
+                "peer_auth",
+                "rc_clipboard",
+                "rc_files",
+                "rc_audio",
+            ],
+            "the keys the person-at-the-device socket of a ROOT install lets the person at the \
+             seat set changed. Does the new one belong to that person — where their incoming \
+             files land, what a session may take from their screen — or to the device, \
+             which on a root install everyone who sits there later shares? Only the first kind \
+             goes in `localapi::CONSOLE_PERSON_KEYS`' `person_socket` lists"
+        );
+        for key in &served {
+            let expected = if key.starts_with("external_") {
+                Owner::Machine
+            } else {
+                Owner::Session
+            };
+            assert_eq!(owner_for(key, ""), expected, "{key}");
+        }
+        // A key this build does not know: by the group the daemon sent, else
+        // the session half (the per-user row, as the page always showed it).
+        assert_eq!(owner_for("brand_new", "ssh"), Owner::Machine);
+        assert_eq!(owner_for("brand_new", "files"), Owner::Session);
+        assert_eq!(owner_for("brand_new", ""), Owner::Session);
+        assert_eq!(owner_for("brand_new", "no_such_group"), Owner::Session);
+        assert_eq!(
+            Group::from_wire("remote_desktop"),
+            Some(Group::RemoteDesktop)
+        );
+        assert_eq!(Group::from_wire("Remote desktop"), None);
+        assert_eq!(Owner::Machine.wire(), "machine");
+        assert_eq!(Owner::Session.wire(), "session");
+    }
+
     #[test]
     fn secrets_and_identity_are_not_exposed() {
         let cfg = crate::config::test_fixture();
         for hidden in [
             "agent_token",
             "overlay_wg_secret_key",
+            // #2871 — the host's SSH private key, and the per-org tokens and WG
+            // keys under `[[orgs]]`. `ConfigSet` logs the value it saved, so a
+            // secret that reached this surface would also reach the daemon's log.
+            "ssh_host_key",
+            "orgs",
             "machine_id",
             "machine_name",
             "tunnel_routes",

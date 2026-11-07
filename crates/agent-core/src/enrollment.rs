@@ -283,34 +283,6 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
-        // FR-90 — a freshly enrolled device runs no agent sessions: every
-        // Hive gate starts closed, and only whoever holds the box opens them.
-        hive_enabled: false,
-        hive_accounts: Default::default(),
-        hive_roots: Vec::new(),
-        hive_max_sessions: None,
-        hive_harness: None,
-        hive_api_key_helper: None,
-        hive_api_workspace_id: None,
-        hive_update_wait_secs: None,
-        hive_core_memory: false,
-        hive_adopt: false,
-        hive_allow_passwordless_sudo: false,
-        hive_replica: false,
-        hive_archive: false,
-        hive_store_quota_mib: None,
-        vault_enabled: false,
-        vault_activity_log: false,
-        hive_net: false,
-        hive_ssh: false,
-        hive_egress: false,
-        hive_worker: false,
-        // FR-90 P4-3b-1: nothing scanned until the owner lists a root.
-        knowhow_scan_roots: Vec::new(),
-        // FR-90 P4-3b-3: no listener reported until the owner says so.
-        knowhow_scan_listeners: false,
-        // FR-90 P4-5-1b: no probe reaches anywhere until the owner lists it.
-        knowhow_probe_reach: Vec::new(),
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,
@@ -484,6 +456,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         // Stamp the current schema version directly on enrollment so
         // a fresh install skips the rc.18 migration on first launch.
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),

@@ -63,7 +63,7 @@ sequenceDiagram
 - ⚠️ **Both frames are gated at both ends.** An older agent cannot parse them. The agent advertises
   `mouse-rel` in `AgentCaps.input` only where its injector carries relative motion
   ([`mod.rs:185`](../agents/roomlerd/src/input/mod.rs#L185) `advertises_mouse_rel`, appended at every
-  announcement, [`signaling.rs:7372`](../agents/roomlerd/src/signaling.rs#L7372)). The viewer offers the
+  announcement, [`signaling.rs:6660`](../agents/roomlerd/src/signaling.rs#L6660)). The viewer offers the
   control only to an agent that says so, matched by equality
   ([`relativeMouse.ts:17`](../ui/src/composables/relativeMouse.ts#L17) `agentSupportsRelativeMouse`).
 
@@ -140,7 +140,7 @@ each absolute move as a large jump. In relative mode the same probe read the del
 ## The viewer
 
 - **The control** is a toolbar button, shown only for an agent that advertises `mouse-rel`
-  ([`RemoteControl.vue:3757`](../ui/src/views/remote/RemoteControl.vue#L3757) `relativeMouseOffered`).
+  ([`RemoteControl.vue:3758`](../ui/src/views/remote/RemoteControl.vue#L3758) `relativeMouseOffered`).
   Pointer Lock needs a user gesture, and the click is one.
 - **Entering** asks for raw, unaccelerated deltas (`unadjustedMovement`). A browser that rejects the option
   gets plain Pointer Lock ([`useRemoteControl.ts:6999`](../ui/src/composables/useRemoteControl.ts#L6999)
@@ -220,7 +220,7 @@ person's.
 
 - It never reads input on the host. The agent only injects; there is no hook and no raw-input reader in
   `roomlerd` (FR-92's rule). A unit test scans the relative-mouse code for any of them
-  ([`input/mod.rs:871`](../agents/roomlerd/src/input/mod.rs#L871) `fr109_relative_mouse_reads_no_input`).
+  ([`input/mod.rs:873`](../agents/roomlerd/src/input/mod.rs#L873) `fr109_relative_mouse_reads_no_input`).
 - No ghost cursor in relative mode: other viewers see the host's own cursor in the picture.
 - The host's pointer speed and acceleration settings are not changed.
 - Not measured on macOS: an app that reads the GameController framework (`GCMouse`). It reads the mouse

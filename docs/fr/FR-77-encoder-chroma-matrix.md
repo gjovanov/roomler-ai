@@ -23,20 +23,20 @@ openh264 / libvpx), **encoder** = codec × backend (`hevc_nvenc`), **chroma form
 - `AgentCaps` (`crates/remote_control/src/models.rs:40-186`) carries chroma as a
   transport name (`data-channel-vp9-444`, `:59` — used even when libvpx emits 4:2:0), a
   string `vp9_chroma` (`:165`) and a list `hevc_chroma` (`:177`). The session request
-  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:1014,679`).
+  carries `preferred_transport` + `chroma_pref` (`crates/remote_control/src/signaling.rs:978,641`).
 - The agent hard-wires `yuv420` for the VP9/AV1/H.264 data-channel codecs
-  (`agents/roomlerd/src/peer.rs:5464-5471`); the ONLY hardware 4:4:4 path is
+  (`agents/roomlerd/src/peer.rs:5477-5484`); the ONLY hardware 4:4:4 path is
   `hevc_nvenc` with the RExt profile (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:770-787`),
-  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:1532-1535`).
-- The picker (`ui/src/views/remote/RemoteControl.vue:3051-3059`) is a hard-coded list
+  advertised by `hevc_chroma` iff the name is `hevc_nvenc` (`agents/roomlerd/src/encode/caps.rs:1662-1665`).
+- The picker (`ui/src/views/remote/RemoteControl.vue:3052-3060`) is a hard-coded list
   — `auto / av1 / hevc / hevc-444 / vp9-444 / vp9-420 / h264` — English literals, no
   i18n, chroma inside the value. Its per-agent override allow-list omitted `hevc-444`
   (fixed in #1468 by making the list the single source the type derives from).
 - The FFmpeg dispatch tables (`encoder.rs:113,107,133,148`) try
   `h264/hevc/av1 × nvenc/qsv/amf/videotoolbox` + `vp9_qsv` (profile 0 only, `:655-659`).
-  VAAPI was never wired (`agents/roomlerd/Cargo.toml:208-209` still promises it for
+  VAAPI was never wired (`agents/roomlerd/Cargo.toml:185-186` still promises it for
   "rc.74"); no `*_mf` name exists anywhere. macOS ships FFmpeg again since 2026-08-25
-  (`release-agent.yml:2406-2429`) — several docs still say it does not.
+  (`release-agent.yml:2512-2535`) — several docs still say it does not.
 - There is **no video decoder anywhere on the agent side** (grep-confirmed). The
   browser decodes, through WebCodecs, and probes per codec string
   (`ui/src/composables/useRemoteControl.ts:3027-3057`).
@@ -150,7 +150,7 @@ flowchart LR
    hardware-only device, so a software implementation fails the open. (FR-16's
    "advertises hardware, runs software" case.)
 3. **The probe is eager, in the child, bounded.** One timeout per open; the probe's
-   duration reported in the hello. Today's probe (`caps.rs:77-1128`) opens the first
+   duration reported in the hello. Today's probe (`caps.rs:85-1195`) opens the first
    working backend per codec in ~2.6 s on the dev box; the matrix prunes to roughly
    16–18 opens on a Windows host. A cache keyed by GPU + driver version is added only if
    fleet p95 crosses ~3 s.

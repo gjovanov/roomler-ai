@@ -38,7 +38,7 @@
 //! (e.g. SCM service launcher) already pinned the process to a
 //! different mode, our `SetProcessDpiAwarenessContext` call silently
 //! refuses and capture/input run with the wrong coordinate space.
-//! `main.rs` now logs the outcome at INFO so a single agent startup
+//! `app.rs` now logs the outcome at INFO so a single agent startup
 //! line surfaces the bug.
 
 #![cfg(target_os = "windows")]
@@ -93,7 +93,7 @@ pub struct DpiOutcome {
 
 /// Try to enable per-monitor-V2 DPI awareness for the current process.
 /// Returns a [`DpiOutcome`] carrying both the API success flag and the
-/// actual mode the OS reports after the call. Caller (`main.rs`) logs
+/// actual mode the OS reports after the call. Caller (`app.rs`) logs
 /// the outcome at INFO so the agent startup log surfaces the value.
 pub fn set_per_monitor_aware() -> DpiOutcome {
     // SAFETY: SetProcessDpiAwarenessContext takes a static-lifetime
