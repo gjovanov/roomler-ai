@@ -214,7 +214,7 @@ installing peers — a fleet-wide outage delivered by the server, visible only a
 Four requirements, all in P0:
 
 1. A **`supports_org_relay` hello bit** (`#[serde(default)] bool`, the shape of
-   `supports_server_relay_strategy`, `signaling.rs:2517`), gated at the existing both-ends
+   `supports_server_relay_strategy`, `crates/remote_control/src/signaling.rs:1607`), gated at the existing both-ends
    gate in `server_relay_verdict` (`crates/api/src/ws/overlay.rs:1877`). The gate is
    **permanent**, not "until everyone upgrades".
 2. `#[serde(other)] Unknown` (or a `deserialize_with` mapping unknown → `None`), making the
@@ -525,7 +525,7 @@ Three results, in order of consequence:
 3. **41641 is not a viable alternative**, so the high-port fallback is dead for this
    population.
 
-⚠️ **This narrows the codebase's own claim.** `signaling.rs:5897` says a corp egress
+⚠️ **This narrows the codebase's own claim.** `crates/remote_control/src/signaling.rs:3974` says a corp egress
 *"whitelists STUN:3478 still drops the ~10-13k relay band"*. Measured, CORPLAP-3 drops **11000
 and 41641** — it whitelists *only* 3478, so the constraint is "one allowed port", not "all
 but the relay band".
@@ -687,24 +687,30 @@ evidence that justifies it.
 ### 8. Observability — shipped with its reader, per counter
 
 ⚠️ **The precedent:** FR-18's field log records `dropped_stale` *"could NOT be evaluated —
-the counter was added without a reader"*. Still true: `stale_drops()`
-(`transport/derp.rs:421`) has zero consumers in the tree.
+the counter was added without a reader"*. It has one now: the agent's `/derp` loop logs
+`stale_drops()` (`transport/derp.rs:421`) as `dropped_stale` whenever it moves
+(`agents/roomlerd/src/derp.rs:469`).
 
 | surface | addition |
 |---|---|
-| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`localclient.rs:1047`) |
-| `roomler peers --json` | `relay_kind: "org"`, `relay_via`, `relay_endpoint` (`PeerInfo`, `crates/localapi/src/lib.rs:435`) |
+| `roomler peers` | `CONN` reads `relay:org/udp` — free via `relay_qualified_label` (`agents/roomler-cli/src/localclient.rs:2220`) |
+| `roomler peers --json` | `relay_kind: "org"`, `relay_transport: "udp"` and `relay_server`, the relay node's name (`PeerInfo`, `crates/localapi/src/lib.rs:814`; `OrgRelayConn::relay_server`, `crates/tunnel-core/src/overlay/orgrelay/client.rs:347-349`) |
 | `roomler why <peer>` | the relay row names the kind; the tier ladder is unchanged (§6) |
-| `roomler netcheck` | relay node: `relay server: listening :3478, N sessions` |
-| relay node | per-session `packets_rx`/`bytes_rx`, **one labelled counter per refusal reason** — bad MAC, unknown VNI, wrong tenant, at-capacity, expired, unbound-source — each with a `NodeStatus` reader. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood |
-| process-global | `ORG_RELAY_SESSIONS_OPENED_TOTAL` / `_CLOSED_TOTAL` only. ⚠️ **Not a gauge**: `evidence.rs:1-4` is *"cumulative since daemon start — consumers DIFF two readings, never judge absolutes"*. The live session count is a `NodeStatus` field |
+| `roomler status` | relay node: an `org relay` line with the bound `ip:port` and `reachable (probes answered)`, or `bound — NOT yet proven reachable` until a probe is answered, then `answered=… refused: shape=… not-probe=… rate=…` (`print_status`, `agents/roomler-cli/src/localclient.rs:2771-2785`). `roomler netcheck` prints no org-relay line |
+| relay node | **one counter per refusal reason** in `RelayStats` (`crates/tunnel-core/src/overlay/orgrelay/server.rs:44-69`): unknown VNI, unbound source, not yet bound, session expired or idle, past the bind deadline, at the session cap, rate-limited, not relay-shaped, unknown control, and `drop_bad_tag1` / `drop_bad_cookie` / `drop_bad_tag2`, beside `forwarded`, `bound` and the session counts. ⚠️ One counter for six causes cannot tell an attack from a misconfiguration during a flood. Two readers: `roomler status` (the probe responder's counters, above) and a daemon log line, `org-relay server counters`, every 300 s when they have changed (`report_loop`, `agents/roomlerd/src/relay_server.rs:143`). ⚠️ That line carries 13 counters. The session cap, `refused_not_shaped`, `refused_unknown_control` and the not-yet-bound, expired, idle and bind-deadline drops have no reader (`relay_stats()`, `:66`, has no caller). There are no per-session packet or byte counts, and no wrong-tenant reason |
+| process-global | none for the org relay. `ORG_RELAY_SESSIONS_OPENED_TOTAL` / `_CLOSED_TOTAL` were never added, and `crates/tunnel-core/src/evidence.rs` holds no org-relay counter. The session counts are the relay's own `sessions_installed`, `_revoked` and `_reaped` (above). ⚠️ **Not a gauge**: like the overlay's evidence counters (`crates/tunnel-core/src/evidence.rs:3-6`), they are *"cumulative since start; readers DIFF two snapshots, they never judge an absolute"* (`server.rs:44-45`). No surface shows the live session count |
 | server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
 
-⚠️ An empty `relay_via` is not evidence of "no relay available" — it may mean the node never
-measured (`signaling.rs:2148`).
-⚠️ `relay_via` must resolve from **the requesting tenant's own node row**. A multi-org
+⚠️ A pair that is not on `relay:org` is not evidence of "no relay available": the node may
+never have measured, and an unmeasured capability is `None`, never `false` (`CapVectorWire`,
+`crates/remote_control/src/signaling.rs:3434-3438`).
+⚠️ `relay_server` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.
+It does: the name is the one this network's netmap gives the relay node
+(`crates/tunnel-core/src/overlay/runtime.rs:3062`, `:4240`), and the netmap takes it from that
+network's own row (`to_netmap_peer`, `crates/modules/network/src/overlay.rs:2867-2871`). A
+relay node missing from the map shows as its node id in hex.
 
 ### 9. Where the code goes — implementation map
 

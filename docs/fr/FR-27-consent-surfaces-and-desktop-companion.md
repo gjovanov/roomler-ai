@@ -654,16 +654,19 @@ arches.
 
 ### 2026-09-25 — AC4 on the WSL node: the local floor holds against a server `auto`
 
+Its anchors name the code of that day: the agent's at `agent-v0.4.102`, the build under test,
+and the server's at master `00d4cf7e1`.
+
 Device **NEO16-WSL** (display name; Linux, the root `roomlerd.service` unit,
 virtual desktop, no companion), API `0.4.101`. The controller is the device's
 **owner**, so `resolve_session_authz`
-(`crates/modules/remote/src/controller.rs:448`) resolves `auto` by the owner
+(`crates/modules/remote/src/controller.rs:436`) resolves `auto` by the owner
 shortcut; the device's server policy was additionally set to `consent_mode =
 auto` for the run (as found: unset) so the directive did not rest on the
 shortcut alone. Nothing in the consent code differs between the two agent
 builds below (`git log agent-v0.4.101..agent-v0.4.102` touches no consent
 file), and the hub sends `consent_timeout_secs = host_prompt_timeout_secs =
-300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:1058`,
+300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:888`,
 `crates/remote_control/src/consent.rs:115`).
 
 | | control (as found) | with the floor | restored |
@@ -690,10 +693,10 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2566`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2302`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
-directive: `Prompt { timeout: host_window }` (`signaling.rs:2526`). The control
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2352`). The control
 run pins the other half: same account, device and policy, only the local
 setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
 1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device
