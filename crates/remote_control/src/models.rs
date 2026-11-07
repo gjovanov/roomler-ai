@@ -5928,6 +5928,11 @@ pub struct SessionStats {
 /// and absent is **not counted**, never zero. The struct defaults field by
 /// field, so a later agent that drops one costs that reading, through
 /// [`Self::checked`], and never the rest of the sample.
+///
+/// Two counts are the viewer's (`frames_painted`, `freezes`): its decode worker
+/// reports them on `rc:decodestat`, and the agent passes them on. The agent
+/// keeps only a count inside this struct's bounds, so a viewer cannot send one
+/// that would have the whole reading dropped here.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct SessionVideo {
@@ -5964,6 +5969,16 @@ pub struct SessionVideo {
     /// queue: the agent's half of the time to the first frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_frame_ms: Option<u32>,
+    /// FR-135 R0 (N16) — frames the session's viewer drew, as its decode
+    /// worker last reported them on `rc:decodestat`: beside `frames_encoded`,
+    /// what the encoder made against what reached the screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_painted: Option<u64>,
+    /// FR-135 R0 (N11) — the viewer's freezes: two painted frames more than
+    /// 200 ms apart, counted by its decode worker. A still screen is re-sent
+    /// every 60 ms, so a healthy session has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freezes: Option<u32>,
 }
 
 impl SessionVideo {
@@ -5977,6 +5992,9 @@ impl SessionVideo {
     pub const MAX_FOLLOWERS: u32 = 64;
     /// The longest first frame worth storing: an hour.
     pub const MAX_FIRST_FRAME_MS: u32 = 3_600_000;
+    /// The most freezes a count may hold: one lasts over 200 ms, so at most
+    /// five a second, for 30 days.
+    pub const MAX_FREEZES: u32 = 30 * 24 * 3600 * 5;
 
     /// The reading if every name is a short lowercase name and every count is
     /// in range, else `None`. Checked on receipt: the reporting side is the
@@ -6004,7 +6022,9 @@ impl SessionVideo {
             && self.followers.is_none_or(|f| f <= Self::MAX_FOLLOWERS)
             && self
                 .first_frame_ms
-                .is_none_or(|ms| ms <= Self::MAX_FIRST_FRAME_MS))
+                .is_none_or(|ms| ms <= Self::MAX_FIRST_FRAME_MS)
+            && frames(self.frames_painted)
+            && self.freezes.is_none_or(|f| f <= Self::MAX_FREEZES))
         .then_some(self)
     }
 }
@@ -10469,10 +10489,27 @@ mod session_video_tests {
             frames_keepalive: Some(600),
             followers: Some(1),
             first_frame_ms: Some(900),
+            frames_painted: Some(3_950),
+            freezes: Some(2),
             ..reading()
         };
         assert_eq!(summary.clone().checked(), Some(summary.clone()));
+        let at_the_bounds = SessionVideo {
+            frames_painted: Some(SessionVideo::MAX_FRAMES),
+            freezes: Some(SessionVideo::MAX_FREEZES),
+            ..summary.clone()
+        };
+        assert!(at_the_bounds.checked().is_some());
         for bad in [
+            // FR-135 R0 — the viewer's two counts, bounded as the agent's are.
+            SessionVideo {
+                frames_painted: Some(SessionVideo::MAX_FRAMES + 1),
+                ..summary.clone()
+            },
+            SessionVideo {
+                freezes: Some(SessionVideo::MAX_FREEZES + 1),
+                ..summary.clone()
+            },
             SessionVideo {
                 chroma: Some("YUV444".into()),
                 ..summary.clone()
@@ -10517,9 +10554,37 @@ mod session_video_tests {
             "frames_keepalive",
             "followers",
             "first_frame_ms",
+            "frames_painted",
+            "freezes",
         ] {
             assert!(!s.contains(absent), "{absent}: {s}");
         }
+    }
+
+    /// FR-135 R0 — a reading from an agent before the viewer's counts parses
+    /// with both absent, and one with them keeps them on the row and the wire.
+    #[test]
+    fn the_viewers_counts_are_absent_until_reported_and_kept_when_they_are() {
+        let old: SessionVideo = serde_json::from_value(serde_json::json!({
+            "encoder": "hevc_qsv", "capture": "wgc", "input_path": "gpu",
+            "frames_encoded": 900,
+        }))
+        .unwrap();
+        assert_eq!((old.frames_painted, old.freezes), (None, None));
+        assert!(old.checked().is_some());
+        let new = SessionVideo {
+            frames_painted: Some(880),
+            freezes: Some(0),
+            ..reading()
+        };
+        let d = bson::to_document(&new).unwrap();
+        assert_eq!(d.get_i64("frames_painted"), Ok(880));
+        assert_eq!(
+            d.get_i64("freezes").or(d.get_i32("freezes").map(i64::from)),
+            Ok(0)
+        );
+        let back: SessionVideo = bson::from_document(d).unwrap();
+        assert_eq!(back, new, "a measured zero stays a zero");
     }
 
     /// FR-132 P1d — every name the agent sends passes, `system-context`'s

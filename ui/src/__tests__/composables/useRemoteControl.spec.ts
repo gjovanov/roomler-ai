@@ -4115,6 +4115,97 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
   })
 })
 
+describe('decodeStatWireMessage — FR-135 R0, the worker’s window for the agent', () => {
+  const hist = (bucket: number, n = 1) => Array.from({ length: 12 }, (_, i) => (i === bucket ? n : 0))
+  const window = {
+    dec: hist(3, 50),
+    paint: hist(0, 60),
+    fwd: hist(0, 61),
+    backlog: hist(1, 59),
+    arrGap: hist(4, 58),
+    gate: hist(8),
+    chunkGaps: 2,
+    freezes: 1,
+    painted: 1_234,
+    decoderHw: true,
+  }
+  const NEW_KEYS = [
+    'dec_ms',
+    'paint_ms',
+    'fwd_ms',
+    'backlog_ms',
+    'arr_gap_ms',
+    'gate_ms',
+    'chunk_gaps',
+    'freezes',
+    'painted',
+    'decoder_hw',
+  ]
+  const link = { rxBps: 395_122, queueMs: 240 }
+  const age = { avgMs: 123.4, minMs: 61.8 }
+
+  it('carries every field the worker counted, in the wire’s names', () => {
+    const m = decodeStatWireMessage(30, false, age, 12, link, { avgMs: 100 }, window)
+    expect(m).toMatchObject({
+      dec_ms: hist(3, 50),
+      paint_ms: hist(0, 60),
+      fwd_ms: hist(0, 61),
+      backlog_ms: hist(1, 59),
+      arr_gap_ms: hist(4, 58),
+      gate_ms: hist(8),
+      chunk_gaps: 2,
+      freezes: 1,
+      painted: 1_234,
+      decoder_hw: true,
+    })
+    expect(decodeStatWireMessage(30, false, null, null, null, null, { ...window, decoderHw: false }).decoder_hw).toBe(
+      false,
+    )
+  })
+
+  it('leaves every field it carried before exactly as it was, queue_ms and fps included', () => {
+    // FR-63's shadow and the live law read these; the window only adds keys.
+    const before = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 100 })
+    const after = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 100 }, window)
+    for (const [k, v] of Object.entries(before)) expect(after[k], k).toEqual(v)
+    expect(Object.keys(after).filter((k) => !(k in before)).sort()).toEqual([...NEW_KEYS].sort())
+  })
+
+  it('sends none of them from an older worker, or a window that is not one', () => {
+    for (const media of [undefined, null]) {
+      const m = decodeStatWireMessage(30, false, null, null, null, null, media)
+      for (const k of NEW_KEYS) expect(k in m, k).toBe(false)
+    }
+  })
+
+  it('drops a field it cannot read, and keeps the rest: absent is not counted, never zero', () => {
+    const m = decodeStatWireMessage(30, false, null, null, null, null, {
+      ...window,
+      dec: hist(3).slice(0, 11), // too short
+      paint: [...hist(0).slice(0, 11), -1], // a negative count
+      fwd: [...hist(0).slice(0, 11), 1.5], // not a count
+      chunkGaps: -1,
+      freezes: Number.NaN,
+      painted: undefined,
+      decoderHw: null, // the browser did not say
+    })
+    for (const k of ['dec_ms', 'paint_ms', 'fwd_ms', 'chunk_gaps', 'freezes', 'painted', 'decoder_hw']) {
+      expect(k in m, k).toBe(false)
+    }
+    expect(m.backlog_ms).toEqual(hist(1, 59))
+    expect(m.gate_ms).toEqual(hist(8))
+    // A zero the worker measured is sent as a zero.
+    const zero = decodeStatWireMessage(30, false, null, null, null, null, { ...window, freezes: 0, gate: hist(0, 0) })
+    expect(zero.freezes).toBe(0)
+    expect(zero.gate_ms).toEqual(hist(0, 0))
+  })
+
+  it('clamps a bucket into the u32 the agent reads it as', () => {
+    const m = decodeStatWireMessage(30, false, null, null, null, null, { ...window, gate: hist(2, 2 ** 40) })
+    expect((m.gate_ms as number[])[2]).toBe(4_294_967_295)
+  })
+})
+
 describe('decodeErrorWireMessage (FR-132 P1, decode errors counted)', () => {
   it('names the stage the agent matches by equality, for every worker error type', () => {
     expect(decodeErrorStage('decoder-configure-error')).toBe('configure')
