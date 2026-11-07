@@ -636,10 +636,10 @@ A new tier would additionally have required navigating four hazards, three of th
 
 | hazard | anchor | why it fails silently |
 |---|---|---|
-| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:96` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:146`), `establish.rs:2851` makes **both ends initiate** the WG handshake, `:2817` books a direct-tier failure on demote-follow |
-| `is_sticky` `_ =>` catch-all | `path.rs:825` | silently inherits LAN/public's 2-strike escalation |
-| `suppression_half_life` `_ =>` catch-all | `path.rs:285` | same |
-| `PathAction` / `Incumbent` | `path.rs:440`, `:428` | neither can represent an org relay; `decide` (`:1021`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1478`, `:1566`, `:1638`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
+| `is_direct()` = `!matches!(self, Relay)` | `lifecycle.rs:98` | a new variant reads as **direct** everywhere: `rx_stale_deadline` gives it the 60 s direct deadline (`:148`), `establish.rs:2876` makes **both ends initiate** the WG handshake, `:2842` books a direct-tier failure on demote-follow |
+| `is_sticky` `_ =>` catch-all | `path.rs:862` | silently inherits LAN/public's 2-strike escalation |
+| `suppression_half_life` `_ =>` catch-all | `path.rs:287` | same |
+| `PathAction` / `Incumbent` | `path.rs:459`, `:447` | neither can represent an org relay; `decide` (`:1073`) iterates `DIRECT_TIERS` and its executor dials directly (`establish.rs:1503`, `:1591`, `:1663`) — an org relay needs a server mint plus an async 3-way bind, so `Install(OrgRelay)` would be handed to a direct-dial executor |
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
