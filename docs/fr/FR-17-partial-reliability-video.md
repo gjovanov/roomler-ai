@@ -205,10 +205,10 @@ completion path returned `gap: false` (the `finish` call at `:274`, with an unco
 `false` written at the call site), while the eviction path for the same situation
 returned `gap: true` (`:252`); a `chunk_count` collision (`:263-264`) did the same. Both
 workers reset the byte assembler and request the resync IDR only on the flag
-(`rc-hevc-worker.ts:500-514`, `rc-vp9-444-worker.ts:482-496`), so the newer frame was
+(`rc-hevc-worker.ts:511-528`, `rc-vp9-444-worker.ts:493-510`), so the newer frame was
 submitted to the decoder as a delta against a reference that never arrived — the case the
 backlog gate's own comment names as "decode-error against the missing reference and tear
-the path down to `<video>`" (`rc-hevc-worker.ts:848-853`). The test "abandons a frame a
+the path down to `<video>`" (`rc-hevc-worker.ts:875-880`). The test "abandons a frame a
 NEWER completed one has overtaken, and says so" (`rcChunkFraming.spec.ts:124`) asserted
 the counter, not the flag, and stayed green for eight weeks. Unreachable while the channel
 is ordered (a frame cannot be overtaken); reachable with the opt-in on, under loss — and
@@ -257,11 +257,11 @@ that could not tolerate reordering; what unordered delivery costs or buys on thi
 not been measured.
 
 ⚠️ **The default flip is NOT taken, and its criterion is written down.** `videoDcOptions`
-(`useRemoteControl.ts:4925`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:4930`)
+(`useRemoteControl.ts:4966`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:4971`)
 only behind `roomler-rc-unordered-video=1` (`storedUnorderedVideo`, `:4808`). FR-59's
 criterion for the flip: an airport-class session with the opt-in ON showing
 `chunkStragglers` climbing while `chunkGaps` stays flat and fps holds — both counters are
-in the worker's stats (`rc-hevc-worker.ts:390`, `rc-vp9-444-worker.ts:366`). Stragglers
+in the worker's stats (`rc-hevc-worker.ts:395`, `rc-vp9-444-worker.ts:371`). Stragglers
 rising with steady fps is the transport working; gaps rising is real loss costing an IDR
 each. The flip cannot be scoped to constrained paths (the deviation recorded under B), so
 it is a fleet-wide decision — and it should wait on the field read of #3112's repair

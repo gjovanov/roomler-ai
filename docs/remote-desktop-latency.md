@@ -124,13 +124,13 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:6965`
+P6 drives sends from a timer instead (`useRemoteControl.ts:7010`
 `INPUT_MOVE_GAP_MS`, `:6978` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12645`). The gap is a per-browser knob,
+always queued (`useRemoteControl.ts:12721`). The gap is a per-browser knob,
 0 to 16 ms (`roomler-rc-input-gap`, `:2671` `storedInputGapMs`, from FR-98 C3); the
 same timer drives the relative-pointer path (`:7071`).
 
@@ -150,7 +150,7 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3712` `clock_echo_json`, handled at
   `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:6913` `CLOCK_RING`, `:6917`
+  sample of the last 8 (`useRemoteControl.ts:6958` `CLOCK_RING`, `:6962`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
