@@ -151,7 +151,7 @@ sequenceDiagram
 |---|---|---|
 | the posture | `crates/remote_control/src/models.rs:2134` `PowerBrief`, on the heartbeat at `crates/remote_control/src/signaling.rs:704` | `policy`, `on_ac?`, `held`. `held: false` is "asleep by policy" (`by_policy`, `crates/remote_control/src/models.rs:2155`) |
 | the hooks | `agents/roomlerd/src/sleep_notice.rs:569` (logind), `:708` (Windows), `:783` (IOKit) | they listen only and take nothing; bounded at 3.2 s on Linux and 1.5 s elsewhere, never blocking on the runtime (`agents/roomlerd/src/sleep_notice.rs:392` `will_sleep`) |
-| the goodbye | `agents/roomlerd/src/signaling.rs:2029` | sends `rc:agent.sleeping`, closes every peer, then the socket. The run loop holds every dial until the wake (`agents/roomlerd/src/signaling.rs:1003`), 60 s at most (`agents/roomlerd/src/sleep_notice.rs:308`) |
+| the goodbye | `agents/roomlerd/src/signaling.rs:2063` | sends `rc:agent.sleeping`, closes every peer, then the socket. The run loop holds every dial until the wake (`agents/roomlerd/src/signaling.rs:1028`), 60 s at most (`agents/roomlerd/src/sleep_notice.rs:308`) |
 | the record | `crates/modules/fleet/src/socket.rs:729`, `crates/services/src/dao/agent.rs:529` `record_sleep` | recorded first, then the ordinary teardown. Keyed by the hello's `conn_id`, so a displaced connection cannot mark a reconnected device asleep |
 | the reading | `crates/remote_control/src/models.rs:2184` `SleepView::of` | a notice shows only on a device that is not online; the next hello unsets it (`crates/services/src/dao/agent.rs:517`) |
 | the surfaces | `agents/roomler-cli/src/localclient.rs:2459` and `:3369`, `ui/src/utils/devicePresence.ts:90` | `roomler status`'s power line, `roomler devices`'s `asleep`, the dashboard's chip and its title |

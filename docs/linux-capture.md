@@ -529,7 +529,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:63`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:6695`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:6758`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2472`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -2092,7 +2092,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4409-4427`, `watchdog.rs:550`) and it forced
+watchdog's 90 s window (`app.rs:4409-4427`, `watchdog.rs:579`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

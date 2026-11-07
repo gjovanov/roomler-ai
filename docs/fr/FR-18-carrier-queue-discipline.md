@@ -97,10 +97,10 @@ are.
       `cap_send_buffer` reads the size back with `getsockopt(SO_SNDBUF)`, judges it
       in the request's units (Linux reports twice the size in force) and logs one
       line per `/derp` connect with `requested`, `applied` and `clamped`
-      (`agents/roomlerd/src/derp.rs:71`, `:135`, `:165`). Unit tests cover the
+      (`agents/roomlerd/src/derp.rs:76`, `:140`, `:170`). Unit tests cover the
       verdict per OS, a real loopback socket through a WebSocket, a filled socket
       keeping its cap, and the line's fields
-      (`agents/roomlerd/src/derp.rs:675`, `:753`, `:781`, `:841`). They
+      (`agents/roomlerd/src/derp.rs:701`, `:779`, `:807`, `:867`). They
       are green on Windows and on Linux 6.6. **Field half met (2026-10-31, on
       0.4.191):** a read-only log read shows the *"overlay derp: send buffer"* line
       with the size each kernel applied: `clamped=true applied=212992` on mars, zeus
