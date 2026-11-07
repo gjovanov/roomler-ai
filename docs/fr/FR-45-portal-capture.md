@@ -376,7 +376,7 @@ precedent (`current_exe()`, `#[command(hide = true)]`).
       and it never captures a greeter. *Reworded 2026-11-02 from "attended-only — no
       greeter, no locked screen". The UI half is FR-93 P2c, this criterion's option (b):
       `rc:video-info` carries `capture_arm` and `attended`, and the viewer's pill reads
-      "desktop portal · allowed at the screen" (`useRemoteControl.ts:1277`), watched on
+      "desktop portal · allowed at the screen" (`useRemoteControl.ts:1279`), watched on
       P2d-3's build and on 0.4.138 (FR-93 §11, 2026-10-13 and 2026-10-16). "No locked screen" is
       not true of every desktop: KWin keeps streaming its lock screen, on a token a person
       granted (same rows). FR-93's D4 names option (b) as a recommendation and has no

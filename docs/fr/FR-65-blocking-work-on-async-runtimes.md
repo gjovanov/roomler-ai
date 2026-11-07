@@ -145,8 +145,8 @@ speculatively.
 > section designed was built under FR-70 (M2, "make-before-break, as designed
 > and built", 2026-09-05) and field-verified as M2a on 0.4.75 the next day: a
 > dims change opens the replacement off the frame path while the pump serves
-> at the old dims (`peer.rs:8857`, "FR-70 M2: dims change"), adopts it in one
-> pass (`peer.rs:7657`, "dims swap adopted — the picture never froze"), and
+> at the old dims (`peer.rs:8861`, "FR-70 M2: dims change"), adopts it in one
+> pass (`peer.rs:7661`, "dims swap adopted — the picture never froze"), and
 > counts it in the heartbeat's `dims_swaps`. On CORPLAP-3 (`av1_qsv`, direct)
 > both moves adopted in 252–285 ms off-path with an in-path adoption of
 > `apply=15 ms`; on CORPLAP-2 (`av1_nvenc`, relay) four moves, `apply=41–44 ms`,

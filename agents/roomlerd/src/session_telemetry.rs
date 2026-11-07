@@ -112,6 +112,35 @@ pub struct SessionCounters {
     /// micros plus one; 0 = none waiting. The pump takes it when the key frame
     /// that answers it is queued ([`Self::take_keyframe_ask`]).
     kf_ask_at: AtomicU64,
+    /// FR-135 R0 (N9-N12, N16) — what the session's viewer said on its
+    /// `rc:decodestat`s ([`Self::note_viewer_report`]). Empty until a viewer
+    /// that counts reports, and with `stats` on the session's old path, whose
+    /// control handler keeps nothing.
+    viewer: std::sync::Mutex<ViewerTally>,
+}
+
+/// FR-135 R0 — the viewer's reports, kept between two heartbeats.
+#[derive(Debug, Default)]
+struct ViewerTally {
+    /// The viewer's windows since the heartbeat last took them, summed.
+    window: crate::media_window::ViewerReport,
+    windows: u32,
+    /// The viewer's counts as last reported, kept across takes (only the
+    /// counts are ever set here).
+    latest: crate::media_window::ViewerReport,
+    /// A viewer that counts has reported.
+    counted: bool,
+}
+
+/// FR-135 R0 — the viewer's windows since the heartbeat last took them, with
+/// its counts as last reported, for the FFmpeg heartbeat's `viewer_*` fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewerWindow {
+    /// How many of the viewer's windows (one a second) the histograms sum: 0
+    /// when it sent none since the last heartbeat, and the histograms are then
+    /// `None`.
+    pub windows: u32,
+    pub report: crate::media_window::ViewerReport,
 }
 
 /// FR-135 R0 (N16) — what a session's windows add up to, beside P1d's reading.
@@ -182,6 +211,7 @@ impl SessionCounters {
         let media = *self.media.lock().unwrap_or_else(|p| p.into_inner());
         let folded = media.filter(|m| m.folds > 0);
         let secs = |ms: u64| (ms / 1000).min(u64::from(SessionVideo::MAX_SECS)) as u32;
+        let viewer = self.viewer.lock().unwrap_or_else(|p| p.into_inner()).latest;
         Some(SessionVideo {
             encoder: form.encoder.to_string(),
             capture: form.capture.to_string(),
@@ -196,6 +226,53 @@ impl SessionCounters {
             first_frame_ms: media
                 .and_then(|m| m.first_frame_ms)
                 .map(|ms| ms.min(SessionVideo::MAX_FIRST_FRAME_MS)),
+            // FR-135 R0 (N16, N11) — the viewer's own counts, bounded on intake
+            // (`ViewerReport::parse`); absent until a viewer that counts says.
+            frames_painted: viewer.painted,
+            freezes: viewer.freezes,
+        })
+    }
+
+    /// FR-135 R0 — one `rc:decodestat`'s viewer numbers. A report with none
+    /// (an older viewer) leaves everything as it was, so its session's fields
+    /// stay absent rather than read zero.
+    pub fn note_viewer_report(&self, report: crate::media_window::ViewerReport) {
+        if report.is_empty() {
+            return;
+        }
+        let mut v = self.viewer.lock().unwrap_or_else(|p| p.into_inner());
+        v.window.fold(&report);
+        v.windows = v.windows.saturating_add(1);
+        v.latest.fold(&crate::media_window::ViewerReport {
+            chunk_gaps: report.chunk_gaps,
+            freezes: report.freezes,
+            painted: report.painted,
+            decoder_hw: report.decoder_hw,
+            ..Default::default()
+        });
+        v.counted = true;
+    }
+
+    /// FR-135 R0 — the viewer's windows since the last take, with its counts
+    /// as last reported, starting the next window. `None` until a viewer that
+    /// counts has reported.
+    pub fn take_viewer_window(&self) -> Option<ViewerWindow> {
+        let mut v = self.viewer.lock().unwrap_or_else(|p| p.into_inner());
+        if !v.counted {
+            return None;
+        }
+        let window = std::mem::take(&mut v.window);
+        let windows = std::mem::take(&mut v.windows);
+        let latest = v.latest;
+        Some(ViewerWindow {
+            windows,
+            report: crate::media_window::ViewerReport {
+                chunk_gaps: latest.chunk_gaps,
+                freezes: latest.freezes,
+                painted: latest.painted,
+                decoder_hw: latest.decoder_hw,
+                ..window
+            },
         })
     }
 
@@ -751,6 +828,92 @@ mod tests {
             (3, 1),
             "taking leaves the counts"
         );
+        forget(s);
+    }
+
+    /// FR-135 R0 (N11, N16) — the viewer's painted and freeze counts ride the
+    /// reading once a viewer that counts reports them, and an older viewer's
+    /// decodestat leaves them absent, never zero.
+    #[test]
+    fn the_viewers_counts_ride_the_reading() {
+        use crate::media_window::ViewerReport;
+        let s = ObjectId::new();
+        counters(s).note_video(VideoForm {
+            encoder: "hevc_nvenc",
+            capture: "wgc",
+            input_path: "gpu",
+            input_reason: "",
+            chroma: "yuv420",
+        });
+        counters(s).note_viewer_report(ViewerReport::default());
+        let v = counters(s).video().unwrap();
+        assert_eq!((v.frames_painted, v.freezes), (None, None), "not counted");
+        counters(s).note_viewer_report(ViewerReport {
+            painted: Some(600),
+            freezes: Some(0),
+            ..Default::default()
+        });
+        let v = counters(s).video().unwrap();
+        assert_eq!(
+            (v.frames_painted, v.freezes),
+            (Some(600), Some(0)),
+            "a measured zero"
+        );
+        // A later window without the counts keeps the last ones.
+        counters(s).note_viewer_report(ViewerReport {
+            dec: Some([1; crate::media_window::BUCKETS]),
+            ..Default::default()
+        });
+        counters(s).note_viewer_report(ViewerReport {
+            painted: Some(1_200),
+            freezes: Some(3),
+            ..Default::default()
+        });
+        let v = counters(s).video().unwrap();
+        assert_eq!((v.frames_painted, v.freezes), (Some(1_200), Some(3)));
+        assert!(v.checked().is_some());
+        forget(s);
+    }
+
+    /// FR-135 R0 — the heartbeat takes the viewer's windows once each, summed,
+    /// with the counts as last reported; nothing before a viewer that counts.
+    #[test]
+    fn the_heartbeat_takes_the_viewers_windows_once() {
+        use crate::media_window::{BUCKETS, ViewerReport};
+        let s = ObjectId::new();
+        assert_eq!(counters(s).take_viewer_window(), None, "an older viewer");
+        let mut one = [0; BUCKETS];
+        one[4] = 30;
+        for painted in [60, 120] {
+            counters(s).note_viewer_report(ViewerReport {
+                dec: Some(one),
+                gate: Some([0; BUCKETS]),
+                painted: Some(painted),
+                freezes: Some(1),
+                chunk_gaps: Some(0),
+                decoder_hw: Some(true),
+                ..Default::default()
+            });
+        }
+        let w = counters(s)
+            .take_viewer_window()
+            .expect("a viewer that counts");
+        assert_eq!(w.windows, 2);
+        let mut two = [0; BUCKETS];
+        two[4] = 60;
+        assert_eq!(w.report.dec, Some(two), "the two windows summed");
+        assert_eq!(w.report.gate, Some([0; BUCKETS]), "measured, and none");
+        assert_eq!(w.report.paint, None, "never sent");
+        assert_eq!(
+            (w.report.painted, w.report.freezes, w.report.decoder_hw),
+            (Some(120), Some(1), Some(true))
+        );
+        let w = counters(s)
+            .take_viewer_window()
+            .expect("still a viewer that counts");
+        assert_eq!(w.windows, 0, "nothing came since");
+        assert_eq!(w.report.dec, None);
+        assert_eq!(w.report.painted, Some(120), "the counts carry on");
         forget(s);
     }
 

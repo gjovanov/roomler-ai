@@ -67,6 +67,7 @@ import { createBenchSampler } from './rc-bench-sampler'
 import { startViewerHzBursts } from './rc-viewer-hz'
 import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
 import { createDecodeRecovery } from './rc-decode-recovery'
+import { createViewerMediaRecorder } from './rc-media-window'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
@@ -138,6 +139,8 @@ type RenderModeMessage = { type: 'render-mode'; sharpen?: string; sharpness?: nu
 type ClockOffsetMessage = { type: 'clock-offset'; offsetUs: number | null }
 /** FR-16 L4 — the main thread just sent bench probe `seq`. */
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
+/** FR-135 R0c — the agent announced a capture hold (`rc:media-waiting`). */
+type MediaHoldMessage = { type: 'media-hold' }
 type CloseMessage = { type: 'close' }
 type IncomingMessage =
   | InitCanvasMessage
@@ -146,6 +149,7 @@ type IncomingMessage =
   | RenderModeMessage
   | ClockOffsetMessage
   | BenchArmMessage
+  | MediaHoldMessage
   | CloseMessage
 
 const HEADER_BYTES = 13
@@ -187,6 +191,10 @@ const decoderColorSpace = createDecoderColorSpace((stage, error) =>
 
 /** FR-135 R1 — whether a failed decoder is replaced in place. */
 const decodeRecovery = createDecodeRecovery()
+
+/** FR-135 R0 — the window of media numbers the page carries to the agent on
+ *  `rc:decodestat` (`rc-media-window.ts`). Records only. */
+const mediaWindow = createViewerMediaRecorder()
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -408,6 +416,8 @@ function maybeEmitStats(): void {
     render: lastRenderPass === 'easu-rcas' ? 'fsr' : lastRenderPass === 'rcas' ? 'rcas' : '2d',
     renderW: canvas?.width ?? 0,
     renderH: canvas?.height ?? 0,
+    // FR-135 R0 — the window for the agent (`rc-media-window.ts`).
+    media: mediaWindow.take(framingState.gaps),
   })
   outGapMaxMs = 0
   statsBytesInWindow = 0
@@ -478,6 +488,9 @@ workerScope.onmessage = (e) => {
     viewport = { cssW: msg.cssW, cssH: msg.cssH, dpr: msg.dpr }
   } else if (msg.type === 'clock-offset') {
     clockOffsetUs = typeof msg.offsetUs === 'number' ? msg.offsetUs : null
+  } else if (msg.type === 'media-hold') {
+    // FR-135 R0c — the agent announced a capture hold: its gap is no freeze.
+    mediaWindow.onHold()
   } else if (msg.type === 'bench-arm') {
     bench.arm(msg.seq)
   } else if (msg.type === 'render-mode') {
@@ -485,7 +498,11 @@ workerScope.onmessage = (e) => {
     if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
   } else if (msg.type === 'chunk') {
     framesReceived++
-    if (typeof msg.sentAt === 'number') fwdStats.add(epochNowMs() - msg.sentAt)
+    if (typeof msg.sentAt === 'number') {
+      const fwdMs = epochNowMs() - msg.sentAt
+      fwdStats.add(fwdMs)
+      mediaWindow.onForward(fwdMs)
+    }
     const u8 = new Uint8Array(msg.bytes)
     statsBytesInWindow += u8.byteLength
     statsBytesTotal += u8.byteLength
@@ -504,7 +521,10 @@ workerScope.onmessage = (e) => {
         // so they wait at the gate for the IDR asked for below. Decoded, they
         // paint garbage until it lands, or fail the decoder. Not where a gap is
         // routine, or with the switch off (`gapClosesGate`).
-        if (decodeRecovery.gapClosesGate()) sawKeyframe = false
+        if (decodeRecovery.gapClosesGate()) {
+          sawKeyframe = false
+          mediaWindow.onGateArmed(performance.now())
+        }
         workerScope.postMessage({
           type: 'frame-rejected',
           reason: 'chunk-gap',
@@ -536,6 +556,8 @@ function rebuildDecoder(): void {
   decoder = null
   configured = false
   sawKeyframe = false
+  // FR-135 R0 (N12) — the picture waits from here (R1's recovery is this case).
+  mediaWindow.onGateArmed(performance.now())
   framesSkippedAwaitingKey = 0
   // The failed decoder's submissions will never come out; left in, they
   // would read as a growing backlog and shed the new decoder's deltas.
@@ -576,7 +598,10 @@ function initDecoder() {
       // P1 — submit→output latency (queue + decoder time); FR-119 P2b-7 —
       // the same bookkeeping is the decode backlog the shed rule reads.
       const decodeMs = backlog.output(frame.timestamp, performance.now())
-      if (decodeMs !== undefined) decodeStats.add(decodeMs)
+      if (decodeMs !== undefined) {
+        decodeStats.add(decodeMs)
+        mediaWindow.onDecoded(decodeMs)
+      }
       // rc.100/rc.102 — Chrome's NVDEC HEVC decode mis-reports the picture
       // geometry for our hevc_nvenc stream (field DEVBOX, RTX 5090):
       // the agent encodes a FULL 2560×1600 desktop (proven by the FFmpeg DC
@@ -653,8 +678,11 @@ function initDecoder() {
       // `render`; null unless a bench probe is outstanding.
       const benchClone = bench.take(render)
       const paintT0 = performance.now()
-      paintFrame(render, renderW, renderH)
-      paintStats.add(performance.now() - paintT0)
+      const drew = paintFrame(render, renderW, renderH)
+      const paintT1 = performance.now()
+      paintStats.add(paintT1 - paintT0)
+      // FR-135 R0 (N9, N11, N12, N16) — a frame on the canvas.
+      if (drew) mediaWindow.onPainted(paintT1, paintT1 - paintT0, wireTsUs)
       if (benchClone) bench.settle(benchClone, epochNowMs())
       // FR-135 R1 — this paint ends an outage, if one is open.
       const recovered = decodeRecovery.onOutput(performance.now())
@@ -731,6 +759,8 @@ function initDecoder() {
       hardwareAcceleration: decodePref,
     } as VideoDecoderConfig, colorSpace))
     configured = true
+    // FR-135 R0 (N9) — and whether the browser has hardware for it.
+    mediaWindow.probeDecoderHw(activeCodec, decodePref)
     workerScope.postMessage({
       type: 'decoder-configured',
       codec: activeCodec,
@@ -808,6 +838,8 @@ function consumeBytes(bytes: Uint8Array): void {
 }
 
 function emitFrame(): void {
+  // FR-135 R0 (N10) — the cadence whole frames arrive at, decoder or not.
+  mediaWindow.onArrival(performance.now())
   if (!decoder || !configured) return
   const payload = assembler.payloadBuf
   if (!payload) return
@@ -840,6 +872,7 @@ function emitFrame(): void {
   }
   if (isKey && !sawKeyframe) {
     sawKeyframe = true
+    mediaWindow.onGateOpened(Number(assembler.pendingTimestampUs))
     workerScope.postMessage({
       type: 'keyframe-acquired',
       droppedBefore: framesSkippedAwaitingKey,
@@ -852,9 +885,11 @@ function emitFrame(): void {
   // the backlog in ms, sampled here once per arriving frame (the struggling
   // rule reads the window's mean of these samples).
   const backlogMs = backlog.sample(performance.now())
+  mediaWindow.onBacklog(backlogMs)
   if (!isKey && backlogShouldDrop(backlogMs, maxBacklogMs)) {
     framesDroppedBacklog++
     sawKeyframe = false
+    mediaWindow.onGateArmed(performance.now())
     requestKeyframeResync()
     if (framesDroppedBacklog === 1 || framesDroppedBacklog % 60 === 0) {
       workerScope.postMessage({
@@ -885,10 +920,11 @@ function emitFrame(): void {
   }
 }
 
-function paintFrame(frame: VideoFrame, w: number, h: number): void {
+/** Draw a decoded frame; true when it reached the canvas. */
+function paintFrame(frame: VideoFrame, w: number, h: number): boolean {
   if (!canvas || !ctx) {
     frame.close()
-    return
+    return false
   }
   try {
     // P7 — FSR sharpening upscale (see rc-fsr-render.ts). The sizing policy
@@ -939,8 +975,10 @@ function paintFrame(frame: VideoFrame, w: number, h: number): void {
       ctx.drawImage(frame, 0, 0, w, h)
       lastRenderPass = 'blit'
     }
+    return true
   } catch {
     /* canvas lost mid-teardown */
+    return false
   } finally {
     frame.close()
   }
@@ -975,6 +1013,7 @@ function teardown(): void {
   queueDrift.reset()
   clockOffsetUs = null
   outGapMaxMs = 0
+  mediaWindow.reset()
   // P7 — release the GL renderer; a fresh session re-creates lazily and
   // gets a fresh unavailability verdict (a new tab/GPU state may differ).
   fsr?.dispose()

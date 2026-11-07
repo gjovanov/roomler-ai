@@ -1200,6 +1200,9 @@ impl AgentPeer {
         // (FR-102 P9d): a session someone leaves right after a black screen
         // would otherwise end before the next 30 s tick carried it.
         let stats_now_for_dc = carrier_ready_tx.clone();
+        // FR-135 R0 — the control handler keeps the viewer's media numbers
+        // only with `stats` on this session's new path.
+        let stats_new_for_dc = media_paths.is_new(crate::media_paths::MediaPath::Stats);
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let cursor_dc_for_callback = cursor_dc_stash.clone();
@@ -1302,6 +1305,7 @@ impl AgentPeer {
                             viewer_report_for_dc,
                             priority_for_dc,
                             stats_now_for_dc,
+                            stats_new_for_dc,
                         )
                     }
                     "cursor" => {
@@ -10229,6 +10233,11 @@ async fn media_pump_ffmpeg_dc(
             let kf_asks = media
                 .as_ref()
                 .map(|_| crate::session_telemetry::counters(session_id).keyframe_asks());
+            // FR-135 R0 — the viewer's windows since the last line, from its
+            // `rc:decodestat`s through `session_telemetry`, never the pump.
+            let viewer = media
+                .as_ref()
+                .and_then(|_| crate::session_telemetry::counters(session_id).take_viewer_window());
             // FR-132 P1d — what `rc:session.stats` names: the heartbeat's own
             // words, plus the capture backend the heartbeat does not carry. A
             // new reading goes at once, by the carrier's road and as
@@ -10434,6 +10443,21 @@ async fn media_pump_ffmpeg_dc(
                 idr_causes = ?media.as_ref().map(|m| m.idr_causes),
                 dc_lock_ms = ?media.as_ref().map(|m| m.dc_lock.counts()),
                 maxrate_bps = ?media.as_ref().map(|_| enc.current_maxrate_bps()),
+                // FR-135 R0, the viewer's half (N9-N12, N16): its decode
+                // worker's 1 s windows since the last line, `viewer_windows` of
+                // them, summed in the same buckets; its counts are cumulative.
+                // `None` from a viewer that does not count, and with `stats` old.
+                viewer_windows = ?viewer.map(|v| v.windows),
+                viewer_dec_ms = ?viewer.and_then(|v| v.report.dec),
+                viewer_paint_ms = ?viewer.and_then(|v| v.report.paint),
+                viewer_fwd_ms = ?viewer.and_then(|v| v.report.fwd),
+                viewer_backlog_ms = ?viewer.and_then(|v| v.report.backlog),
+                viewer_arr_gap_ms = ?viewer.and_then(|v| v.report.arr_gap),
+                viewer_gate_ms = ?viewer.and_then(|v| v.report.gate),
+                viewer_chunk_gaps = ?viewer.and_then(|v| v.report.chunk_gaps),
+                viewer_freezes = ?viewer.and_then(|v| v.report.freezes),
+                viewer_painted = ?viewer.and_then(|v| v.report.painted),
+                viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             // Stopped BEFORE the snapshot below, so the rebase carries it.
@@ -10892,6 +10916,25 @@ pub(crate) fn viewer_counts_decode_errors(val: &serde_json::Value) -> bool {
         .is_some_and(|v| v.as_u64() == Some(1) || v.as_bool() == Some(true))
 }
 
+/// FR-135 R0 (N9-N12, N16) — keep a `rc:decodestat`'s viewer numbers
+/// ([`crate::media_window::ViewerReport`]) in the session's counters, for the
+/// FFmpeg heartbeat's `viewer_*` fields and `rc:session.stats`. With `stats` on
+/// the session's old path (`rc_media_legacy=stats`) nothing is kept, so the
+/// heartbeat and the reading are what they were before R0.
+pub(crate) fn note_viewer_decodestat(
+    session_id: bson::oid::ObjectId,
+    val: &serde_json::Value,
+    stats_new: bool,
+) {
+    if !stats_new {
+        return;
+    }
+    let report = crate::media_window::ViewerReport::parse(val);
+    if !report.is_empty() {
+        crate::session_telemetry::counters(session_id).note_viewer_report(report);
+    }
+}
+
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
 /// applies them. Today the only message is `rc:quality` (mutating the
 /// shared atomic that the media pump polls before each encode); future
@@ -10913,6 +10956,9 @@ fn attach_control_handler(
     // FR-132 P1 — asks the signalling loop for one `rc:session.stats` for this
     // session now (the FR-102 P9d carrier-ready channel), on a decode error.
     stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — `stats` is on this session's new path: keep the viewer's
+    // media numbers from `rc:decodestat` (`note_viewer_decodestat`).
+    stats_new: bool,
 ) {
     // A handle the on_message closure sends replies through (e.g.
     // rc:logs-fetch.reply) over the same DC. #1740 — WEAK: the closure is
@@ -11310,6 +11356,10 @@ fn attach_control_handler(
                             q.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
                         ));
                     }
+                    // FR-135 R0 (N9-N12, N16) — and the decode worker's window,
+                    // kept for the heartbeat and the session's reading. Record
+                    // only: nothing above reads it.
+                    note_viewer_decodestat(session_id, &val, stats_new);
                 }
                 "rc:display-match" => {
                     // rc.191 — viewer asked the host to switch its display to
@@ -15109,6 +15159,43 @@ mod tests {
         ] {
             assert!(!counts(&older), "{older}");
         }
+    }
+
+    /// FR-135 R0 — the control arm keeps a decodestat's viewer numbers only
+    /// with `stats` on the session's new path; with it old, or from an older
+    /// viewer, the session's reading and heartbeat stay as they were.
+    #[test]
+    fn a_decodestat_window_is_kept_only_with_stats_on_its_new_path() {
+        use super::note_viewer_decodestat as note;
+        use crate::session_telemetry::{counters, forget};
+        let sample = serde_json::json!({
+            "t": "rc:decodestat", "fps": 60, "struggling": false, "de": 1,
+            "gate_ms": [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            "painted": 600, "freezes": 2,
+        });
+        let old = bson::oid::ObjectId::new();
+        note(old, &sample, false);
+        assert_eq!(
+            counters(old).take_viewer_window(),
+            None,
+            "stats on its old path"
+        );
+
+        let new = bson::oid::ObjectId::new();
+        note(
+            new,
+            &serde_json::json!({ "t": "rc:decodestat", "fps": 60, "de": 1 }),
+            true,
+        );
+        assert_eq!(counters(new).take_viewer_window(), None, "an older viewer");
+        note(new, &sample, true);
+        let w = counters(new).take_viewer_window().expect("kept");
+        assert_eq!(w.windows, 1);
+        assert_eq!(w.report.painted, Some(600));
+        assert_eq!(w.report.freezes, Some(2));
+        assert_eq!(w.report.gate.map(|g| g[8]), Some(1));
+        forget(old);
+        forget(new);
     }
 
     /// rc.227 / FR-97 P3e — the `rc:layout` envelope as the viewer's

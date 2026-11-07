@@ -7107,6 +7107,9 @@ mod tests {
                 frames_keepalive: Some(40),
                 followers: Some(1),
                 first_frame_ms: Some(480),
+                // FR-135 R0 — and the viewer's counts.
+                frames_painted: Some(690),
+                freezes: Some(1),
             }),
         };
         match session_stats_msg(sid, &t, Default::default()) {
