@@ -5619,7 +5619,8 @@ mod system {
         }
     }
 
-    /// Boot reconciler for STALE PEER/SUBNET ROUTES on a persisted TUN.
+    /// Purge the PEER/SUBNET ROUTES on a persisted TUN that no crypto-router
+    /// backs, and return the ones it found (each purged best-effort).
     ///
     /// `install_subnets` writes an OS route **and** the crypto-router entry in
     /// one call, so within a single runtime generation the two cannot diverge.
@@ -5636,33 +5637,37 @@ mod system {
     /// with a healthy carrier while every connection timed out; a daemon
     /// restart (which re-ran `install_peers`) fixed it instantly.
     ///
-    /// Called at TUN bring-up, BEFORE any peer is installed. At that instant the
-    /// router is empty by construction, so every route on the device except its
-    /// own connected prefixes is a leftover — which is why this needs no
-    /// keep-set and cannot race a legitimate install. `install_peers` then
-    /// re-adds exactly what the current netmap says.
+    /// Both ends of a generation call it. At a start no router exists yet, and
+    /// at an exit the router is gone or goes with the process, so every route
+    /// on the device except its own connected prefixes goes, with no keep-set:
+    ///
+    /// - a **start** (`roomlerd::purge_exit_routes_at_start`), BEFORE any peer
+    ///   is installed. The router is empty by construction, so whatever this
+    ///   finds is a previous generation's, and it cannot race a legitimate install.
+    ///   `install_peers` then re-adds exactly what the current netmap says.
+    /// - an **exit** (`roomlerd::purge_exit_routes` and
+    ///   `purge_exit_routes_before_restart`): the routes the process leaves,
+    ///   dropped so none outlives its router to black-hole while no daemon
+    ///   runs.
+    ///
+    /// It logs nothing, because only the caller knows which end it is: routes
+    /// found at a start mean the previous process ended without its exit
+    /// purge, and at an exit they are routine.
     ///
     /// Best-effort and sync, like [`purge_split_default`]: a failure just leaves
     /// the pre-existing (broken) state, never a worse one.
     ///
     /// Multi-org v2 — `if_name` scopes the reconcile to ONE adapter; legacy
     /// callers pass [`IF_NAME`] (the historical singleton).
-    pub fn purge_stale_peer_routes(if_name: &str) {
+    pub fn purge_stale_peer_routes(if_name: &str) -> Vec<String> {
         let stale: Vec<String> = enumerate_if_routes(if_name)
             .into_iter()
             .filter(|c| !is_derived_prefix(c))
             .collect();
-        if stale.is_empty() {
-            return;
-        }
         for cidr in &stale {
             purge_one(if_name, cidr);
         }
-        tracing::info!(
-            count = stale.len(), routes = ?stale,
-            "overlay: boot reconcile — dropped stale routes left by a previous generation \
-             on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
-        );
+        stale
     }
 
     /// FR-97 N14 — is `ifref` one of this process's live adapters? `ifref` is

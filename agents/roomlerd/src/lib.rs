@@ -278,37 +278,42 @@ pub mod win_token;
 /// (`tunnel_core::ctl_dns`), so a dead exit DNS can never keep them offline.
 pub mod ws_connect;
 
-/// P5 exit-node crash-safety (A2) — synchronously purge any leftover
-/// split-default routes from the overlay NIC. Called at agent startup (the
-/// boot-time reconciler: heal a `/1` a crash / kill / unclean reboot left
-/// behind) AND immediately before each `std::process::exit` that bypasses the
-/// runtime's RAII teardown (watchdog stall, self-update, agent-deleted) — those
-/// paths run NO destructors, so without this a Windows host keeps a stale
-/// `0.0.0.0/1` pointed at a dead Wintun adapter and blackholes all egress until
-/// reboot.
+/// P5 exit-node crash-safety (A2) — synchronously purge what the overlay leaves
+/// in the host as a process ends: the split-default routes, the peer/subnet
+/// routes on a persisted TUN, the exit-DNS steer and the host ledger. A start
+/// runs the same purges through [`purge_exit_routes_at_start`], and the two
+/// watchdog exits through [`purge_exit_routes_before_restart`]. This one runs:
 ///
-/// Lives at the crate root (always compiled) so the exit paths in `watchdog` /
-/// `signaling` / `main` can call it WITHOUT an overlay-feature gate — the
-/// `overlay` module itself is `cfg`-gated. No-op unless this is an `overlay-l3`
-/// build (only the OS-TUN surface installs OS routes; the userspace netstack has
-/// none). Best-effort + scoped to the roomler NIC.
+/// - in `app::purge_after_daemon`, once a process that ran the daemon has
+///   dropped its runtime: every end of the daemon, a plain stop and an
+///   update's exit included (FR-97 P0e);
+/// - immediately before each `std::process::exit` that skips the runtime's RAII
+///   teardown with nothing to replace it: a fatal goodbye and a
+///   duplicate-instance loser (`signaling`), and `roomlerd self-update` with no
+///   daemon running ([`purge_exit_routes_unless_owned`]). Those paths run NO
+///   destructors, so without this a Windows host keeps a stale `0.0.0.0/1`
+///   pointed at a dead Wintun adapter and blackholes all egress until reboot;
+/// - once more as a requested restart leaves, a belt after
+///   `app::purge_after_daemon`.
+///
+/// Lives at the crate root (always compiled), like its siblings, so the exit
+/// paths in `app`, `signaling` and `watchdog` can call them WITHOUT an
+/// overlay-feature gate — the `overlay` module itself is `cfg`-gated. No-op
+/// unless this is an `overlay-l3` build (only the OS-TUN surface installs OS
+/// routes; the userspace netstack has none). Best-effort + scoped to the
+/// roomler NIC.
 pub fn purge_exit_routes() {
     #[cfg(feature = "overlay-l3")]
     {
-        // Multi-org v2 — the purges are per-adapter now; this boot/pre-exit
-        // path heals the LEGACY/PRIMARY adapter (per-org adapters are Phase
+        // Multi-org v2 — the purges are per-adapter now; this exit path
+        // heals the LEGACY/PRIMARY adapter (per-org adapters are Phase
         // 2c, whose reconciler will walk the configured set).
         tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
-        // Drop peer/subnet routes a PREVIOUS generation left on a persisted TUN.
-        // Their crypto-router entries died with that runtime, so they black-hole
-        // silently: the OS route looks right, the peer is online, and only the
-        // traffic vanishes (field case 2026-08-03). Safe here because the router
-        // is empty until `install_peers` runs, which re-adds the live set.
-        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        purge_peer_routes_at_exit();
         // S4b — also drop any leftover exit-node DNS steer. On Windows the `.`-root
         // NRPT rule is machine-global and PERSISTS across a crash/reboot, so a stale
         // rule pointing at a dead resolver would blackhole ALL DNS until removed —
-        // this boot/pre-exit purge is the load-bearing cleanup for it.
+        // this purge (and a start's) is the load-bearing cleanup for it.
         tunnel_core::overlay::dns::purge_exit_dns();
         // FR-97 P0b-2b / P0e — and what the host ledger records: the IPv4
         // forwarding a Windows router turned on (its revert runs in `Drop`,
@@ -317,6 +322,28 @@ pub fn purge_exit_routes() {
         // leftover pin on the server's address blocks the next start's
         // control WS after a network change). A no-op when it is empty.
         tunnel_core::overlay::host_ledger::purge();
+    }
+}
+
+/// An exit's purge of the peer/subnet routes on a persisted TUN
+/// (`tunnel_core::overlay::tun::purge_stale_peer_routes`). Their crypto-router
+/// entries die with the runtime, so left behind they black-hole silently: the
+/// OS route looks right, the peer is online, and only the traffic vanishes
+/// (field case 2026-08-03).
+///
+/// Its line is not the start's `boot reconcile` one: every exit drops the
+/// routes it leaves, so this line is routine, while routes a start finds mean
+/// the process before it never purged them.
+#[cfg(feature = "overlay-l3")]
+fn purge_peer_routes_at_exit() {
+    let dropped =
+        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+    if !dropped.is_empty() {
+        tracing::info!(
+            count = dropped.len(), routes = ?dropped,
+            "overlay: exit purge — dropped the overlay's routes from a persisted TUN, so none \
+             outlives this process to black-hole"
+        );
     }
 }
 
@@ -352,7 +379,15 @@ pub fn purge_exit_routes_at_start() {
             );
         }
         tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
-        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        let stale =
+            tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        if !stale.is_empty() {
+            tracing::info!(
+                count = stale.len(), routes = ?stale,
+                "overlay: boot reconcile — dropped stale routes left by a previous generation \
+                 on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
+            );
+        }
         if !tunnel_core::overlay::dns::purge_exit_dns_within(START_DNS_PURGE_WAIT) {
             tracing::warn!(
                 wait_s = START_DNS_PURGE_WAIT.as_secs(),
@@ -406,7 +441,7 @@ pub fn purge_exit_routes_before_restart() -> bool {
     #[cfg(feature = "overlay-l3")]
     {
         tunnel_core::overlay::tun::purge_split_default(tunnel_core::overlay::tun::IF_NAME);
-        tunnel_core::overlay::tun::purge_stale_peer_routes(tunnel_core::overlay::tun::IF_NAME);
+        purge_peer_routes_at_exit();
         let ended = match exit_dns_purge_wait() {
             Some(wait) => tunnel_core::overlay::dns::purge_exit_dns_before_exit(wait),
             None => {
