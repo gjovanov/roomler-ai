@@ -126,6 +126,9 @@ pub struct MediaTally {
     pub followers: u32,
     /// From the pump's start to the first frame in the channel's queue.
     pub first_frame_ms: Option<u32>,
+    /// Windows folded so far. The fold's fields are absent until one has, so a
+    /// first frame noted before the first fold adds no zeros.
+    pub folds: u32,
 }
 
 /// The clock the keyframe ask's arrival is kept in: microseconds since the
@@ -170,22 +173,29 @@ impl SessionCounters {
 
     /// FR-132 P1d — what `rc:session.stats` carries. FR-135 R0 (N16) adds the
     /// session's media summary to the same reading once the pump has folded a
-    /// window; without one those fields are absent, never zero.
+    /// window; without one those fields are absent, never zero. Every count
+    /// saturates at the bound the server checks (`SessionVideo::checked`), so
+    /// a session past one (an hour's wait for its first frame) costs that
+    /// count's precision and never the reading, which the server drops whole.
     pub fn video(&self) -> Option<SessionVideo> {
         let form = (*self.video.lock().unwrap_or_else(|p| p.into_inner()))?;
         let media = *self.media.lock().unwrap_or_else(|p| p.into_inner());
+        let folded = media.filter(|m| m.folds > 0);
+        let secs = |ms: u64| (ms / 1000).min(u64::from(SessionVideo::MAX_SECS)) as u32;
         Some(SessionVideo {
             encoder: form.encoder.to_string(),
             capture: form.capture.to_string(),
             input_path: form.input_path.to_string(),
             input_reason: (!form.input_reason.is_empty()).then(|| form.input_reason.to_string()),
             chroma: (!form.chroma.is_empty()).then(|| form.chroma.to_string()),
-            moving_s: media.map(|m| (m.moving_ms / 1000).min(u32::MAX as u64) as u32),
-            sparse_s: media.map(|m| (m.sparse_ms / 1000).min(u32::MAX as u64) as u32),
-            frames_encoded: media.map(|m| m.frames_encoded),
-            frames_keepalive: media.map(|m| m.frames_keepalive),
-            followers: media.map(|m| m.followers),
-            first_frame_ms: media.and_then(|m| m.first_frame_ms),
+            moving_s: folded.map(|m| secs(m.moving_ms)),
+            sparse_s: folded.map(|m| secs(m.sparse_ms)),
+            frames_encoded: folded.map(|m| m.frames_encoded.min(SessionVideo::MAX_FRAMES)),
+            frames_keepalive: folded.map(|m| m.frames_keepalive.min(SessionVideo::MAX_FRAMES)),
+            followers: folded.map(|m| m.followers.min(SessionVideo::MAX_FOLLOWERS)),
+            first_frame_ms: media
+                .and_then(|m| m.first_frame_ms)
+                .map(|ms| ms.min(SessionVideo::MAX_FIRST_FRAME_MS)),
         })
     }
 
@@ -202,6 +212,7 @@ impl SessionCounters {
         m.frames_encoded = m.frames_encoded.saturating_add(fold.frames_encoded);
         m.frames_keepalive = m.frames_keepalive.saturating_add(fold.frames_keepalive);
         m.followers = m.followers.max(followers);
+        m.folds = m.folds.saturating_add(1);
     }
 
     /// FR-135 R0 (N16) — the session's first frame reached the channel's queue
@@ -651,6 +662,69 @@ mod tests {
         assert_eq!(v.followers, Some(2), "the most at once");
         assert_eq!(v.first_frame_ms, Some(640), "the first call wins");
         assert!(v.clone().checked().is_some(), "{v:?}");
+        forget(s);
+    }
+
+    /// FR-135 R0b's review — a first frame noted before the first fold (a slow
+    /// inline open straddling the 2 s mark) adds no zeros: the fold's fields stay
+    /// absent, not counted, until a window has folded.
+    #[test]
+    fn a_first_frame_before_any_fold_adds_no_zeros() {
+        let s = ObjectId::new();
+        counters(s).note_video(VideoForm {
+            encoder: "h264_nvenc",
+            capture: "wgc",
+            input_path: "gpu",
+            input_reason: "",
+            chroma: "yuv420",
+        });
+        counters(s).note_first_frame(std::time::Duration::from_millis(2_100));
+        let v = counters(s).video().unwrap();
+        assert_eq!(v.first_frame_ms, Some(2_100));
+        assert_eq!(
+            (
+                v.moving_s,
+                v.sparse_s,
+                v.frames_encoded,
+                v.frames_keepalive,
+                v.followers
+            ),
+            (None, None, None, None, None),
+            "no fold yet: not counted, never zero"
+        );
+        forget(s);
+    }
+
+    /// FR-135 R0b's review — the server drops a reading with a count past its
+    /// bound whole, so the agent saturates every count at that bound: a session
+    /// that waited over an hour for its first frame still names its cell.
+    #[test]
+    fn the_reading_never_carries_a_count_the_server_drops() {
+        use crate::media_window::FoldReport;
+        let s = ObjectId::new();
+        counters(s).note_video(VideoForm {
+            encoder: "hevc_qsv",
+            capture: "system-context",
+            input_path: "cpu",
+            input_reason: "switch_off",
+            chroma: "yuv420",
+        });
+        counters(s).note_first_frame(std::time::Duration::from_secs(2 * 3600));
+        counters(s).note_media_fold(
+            FoldReport {
+                ms: u64::from(SessionVideo::MAX_SECS) * 1000 + 5_000,
+                moving: true,
+                frames_encoded: SessionVideo::MAX_FRAMES + 1,
+                frames_keepalive: 0,
+            },
+            SessionVideo::MAX_FOLLOWERS + 1,
+        );
+        let v = counters(s).video().unwrap();
+        assert_eq!(v.first_frame_ms, Some(SessionVideo::MAX_FIRST_FRAME_MS));
+        assert_eq!(v.moving_s, Some(SessionVideo::MAX_SECS));
+        assert_eq!(v.frames_encoded, Some(SessionVideo::MAX_FRAMES));
+        assert_eq!(v.followers, Some(SessionVideo::MAX_FOLLOWERS));
+        assert!(v.clone().checked().is_some(), "the server keeps it: {v:?}");
         forget(s);
     }
 

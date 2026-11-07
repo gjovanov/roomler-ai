@@ -920,9 +920,9 @@ pub struct RateStats {
     pub stage: StageTimes,
     /// FR-118 P2-2 — GPU frames or CPU frames, and why.
     pub input: super::gpu_hint::InputForm,
-    /// FR-135 R0 — the bitrate ceiling the encoder runs now (`rc_max_rate`,
-    /// moved by every rate apply). R12's red reads the 25 M cap here. 0 from a
-    /// failed read, which is `RateStats::default()`.
+    /// FR-135 R0 — the bitrate ceiling at this read (`rc_max_rate`). 0 from a
+    /// failed read (`RateStats::default()`), so the heartbeat reads the handle's
+    /// own copy, `current_maxrate_bps`, which no failed read can zero.
     pub maxrate_bps: u32,
 }
 

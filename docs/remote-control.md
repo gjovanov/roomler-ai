@@ -770,7 +770,7 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:13859`](../agents/roomlerd/src/peer.rs#L13859)) sends it
+The pump ([`peer.rs:14001`](../agents/roomlerd/src/peer.rs#L14001)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5784`](../agents/roomlerd/src/peer.rs#L5784); the viewer parses it
@@ -3039,9 +3039,9 @@ sequenceDiagram
 | Piece | What it does | Where |
 |---|---|---|
 | the message | `{t: 'rc:decode-error', stage, path, codec, error}`: `stage` is `configure` (the decoder's `configure()`), `decode` (its error callback, or `decode()` throwing) or `pipe` (the RTP transform's reader or pipe); `path` is `webcodecs`, `vp9-444` or `hevc`; the codec and the message are cut to 64 and 160 characters | `decodeErrorWireMessage`, `ui/src/composables/useRemoteControl.ts:2518`; sent by `reportDecodeError` (`:7479`) from all three worker handlers |
-| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2493`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10861` |
-| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11390`; `viewer_decode_error`, `peer.rs:10836` |
-| the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:319` |
+| the counted marker | every `rc:decodestat` carries `de: 1`, so the agent knows this viewer counts and a zero is a measured one | `useRemoteControl.ts:2493`; read by `viewer_counts_decode_errors`, `agents/roomlerd/src/peer.rs:10890` |
+| the agent's arm | counts the error, logs the first eight with their stage, path, codec and message (bounded, control characters dropped; the spellings matched by equality), and asks for one sample at once; past eight a flood is counted, never logged or sent early | `"rc:decode-error"`, `peer.rs:11422`; `viewer_decode_error`, `peer.rs:10865` |
+| the count | per session, saturating; `None` until the viewer counts, so absent means **not counted**; carried to a new peer when a re-offer replaces one, as the clipboard tallies are | `SessionCounters::note_decode_error` / `decode_errors` / `carry_decode_errors`, `agents/roomlerd/src/session_telemetry.rs:330` |
 | the early samples | the first `de` and each of the first eight errors send one `rc:session.stats` at once, by the carrier's road (§11.9): a session someone leaves right after a black screen still records its count, and a short clean one its zero | the FR-102 P9d channel, `peer.rs` `attach_control_handler` |
 | the wire | `decode_errors: Option<u32>` on `rc:session.stats`, absent unless counted; an older server ignores it | `crates/remote_control/src/signaling.rs:754` |
 | the row | `remote_sessions.stats.decode_errors`, `$set` only from a sample that counted: a sample without it never writes a zero over a stored count | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:157` |
@@ -3111,7 +3111,7 @@ with no grep of `agent_logs`.
 | Piece | What it does | Where |
 |---|---|---|
 | the reading | taken at the pump's 2 s heartbeat: the encoder's name, the capturer's `backend()` (`wgc`, `scrap`, `system-context`, `portal`, `mutter`, `drm`), and the input form's path and reason. Only the FFmpeg DC pump has an input form to name | `media_pump_ffmpeg_dc`, `agents/roomlerd/src/peer.rs:10237` |
-| a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:163` |
+| a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:166` |
 | the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
 | the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:761` |
 | the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:5986` |
@@ -3137,7 +3137,7 @@ say which cell it ran and how long it was in motion. Before this, those numbers 
 (`MediaWindow`, `agents/roomlerd/src/media_window.rs:184`), and two things are built from it: new
 heartbeat fields, and a **summary** that rides P1d's reading into `remote_sessions.video`. The
 VP9 pump folds its window at `agents/roomlerd/src/peer.rs:4440`, the FFmpeg one at `:7525`, each
-into the session's tally (`note_media_fold`, `agents/roomlerd/src/session_telemetry.rs:194`).
+into the session's tally (`note_media_fold`, `agents/roomlerd/src/session_telemetry.rs:204`).
 
 ```mermaid
 flowchart LR
@@ -3155,7 +3155,7 @@ counted**, never zero:
 |---|---|
 | `chroma` | `yuv420` or `yuv444`; with `encoder`, the cell |
 | `moving_s`, `sparse_s` | seconds of 2 s windows capturing 5 or more real frames a second, and the rest (FR-135 §2.1). A window longer than 10 s (a gate, a long capture wait) counts 10 s (`MOVING_FPS`, `FOLD_EVERY`, `MAX_FOLD`, `media_window.rs:42-52`) |
-| `frames_encoded`, `frames_keepalive` | frames the encoder returned, and of them the re-encodes of an unchanged screen |
+| `frames_encoded`, `frames_keepalive` | frames the encoder returned, and the pump's keepalives: its decisions to re-encode an unchanged screen, one of which a drain or a gate can still skip before the encoder, so the second is not strictly part of the first |
 | `followers` | the most viewers that shared the session's pipeline |
 | `first_frame_ms` | from the pump's start to its first frame in the channel's queue: the agent's half of the time to the first frame |
 
@@ -3163,8 +3163,15 @@ The VP9 pump now sends P1d's reading too (`vp9_libvpx`, CPU, `no_gpu_cell`,
 `agents/roomlerd/src/peer.rs:4437-4448`), so a VP9 session names its cell as an FFmpeg one does.
 The server checks every count against a bound (30 days, 240 fps, 64 followers, an hour) and drops
 a reading with one out of range whole, as it drops a bad name (`SessionVideo::checked`,
-`crates/remote_control/src/models.rs:5986`). The struct defaults field by field, so a later agent that drops a field costs that reading
-and never the rest of the sample.
+`crates/remote_control/src/models.rs:5986`). The agent saturates every count at those bounds
+(`SessionCounters::video`), so a session past one, an hour's wait for its first frame, keeps its
+cell and loses only that count's precision. The struct defaults field by field, so a later agent
+that drops a field costs that reading and never the rest of the sample.
+
+⚠️ **A reading names a cell before the cell has encoded anything.** It is noted at the pump's
+first fold, so a host whose capture never delivered reports, say, `vp9_libvpx` with `capture:
+none` and no frames. A read that takes a reading as proof of a cell also requires
+`frames_encoded > 0`.
 
 ⚠️ **A short session reports its first window only.** The summary rides the samples P1d sends:
 one when the reading first appears, about 2 s in, then the 30 s tick. A session the viewer ends
@@ -3174,7 +3181,9 @@ last sample lands (above). By FR-135 §2.1's numbers those sessions hold about 6
 **The heartbeat fields**, on the FFmpeg data-channel pump's line
 (`agents/roomlerd/src/peer.rs:10423-10436`), appended and never renamed. Each reads `None` with
 `stats` on the session's old path. A `_ms` list is twelve log-2 ms buckets,
-`[0,1)` up to `[1024,∞)`.
+`[0,1)` up to `[1024,∞)`. The `_ms` lists, `frames_keepalive`, `keepalive_bytes` and
+`idr_causes` are this window's; `kf_asks` and `kf_asks_gapped` are the session's so far, as the
+line's older `frames_encoded` is.
 
 | Field | Instrument | Says |
 |---|---|---|
@@ -3182,13 +3191,14 @@ last sample lands (above). By FR-135 §2.1's numbers those sessions hold about 6
 | `window_ms` | ledger L03 | the window's real length; "≈2s" is only its floor |
 | `cap_to_handoff_ms`, `_p50_ms`, `_p95_ms` | N7 | from when the pump took a real frame to its hand-off to the channel, in the process's one clock. On a push arm (WGC, the portal) it starts when the pump takes the frame, not at capture |
 | `handoff_gap_ms` | N10, the agent's half | the cadence the channel is fed at |
-| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and every ask with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter |
-| `idr_causes` | IDR by cause | forces per window: `[asked, shared, lock, backstop, resync, settle]` (`IdrCause`, `media_window.rs:144`). `asked` is the shared flag, which the viewer, the settle request and the channel-not-open request all set |
+| `kf_ask_to_queued_ms`, `kf_asks`, `kf_asks_gapped` | N12 | how long the oldest unanswered `rc:keyframe` waited for a key frame, and the session's asks so far with how many the 500 ms gap dropped. FR-135 R1's slow recoveries pointed at that gap with no counter |
+| `idr_causes` | IDR by cause | forces per window: `[asked, shared, lock, backstop, resync, settle]` (`IdrCause`, `media_window.rs:144`). `asked` is the session's key-frame flag, which the viewer, the settle request and the channel-not-open request all set; `shared` is the pipeline's. ⚠️ The causes overlap: one force with both flags set counts `asked` and `shared`, a settle counts `settle` when requested and `asked` when forced, and each pass while the channel is not open forces and counts `asked`. Their sum is not the number of key frames, and `idr_count` minus it means nothing |
 | `dc_lock_ms` | §2.5 | the video channel's mutex wait, which `send_wait` does not contain |
-| `maxrate_bps` | R12's red | the bitrate ceiling the encoder runs now |
+| `maxrate_bps` | R12's red | the bitrate ceiling the encoder runs now, from the handle's own copy, which a failed `rate_stats` read cannot zero |
 
-The switch is `rc_media_legacy=stats` (§5.1, "The media paths"): with it, the pumps keep no window,
-the heartbeat is the line it was, and no summary is sent. The fix that rides with it: a heartbeat
+The switch is `rc_media_legacy=stats` (§5.1, "The media paths"): with it, the pumps keep no window
+and send no summary, and the heartbeat's new fields all read `None` under their names. The FFmpeg
+reading still carries `chroma`, so a chroma change can still send an immediate sample. The fix that rides with it: a heartbeat
 whose `rate_stats` read failed no longer reaches `rc:media-plan`, where it wrote a false "gpu →
 cpu" step and its way back (`agents/roomlerd/src/peer.rs:10217`).
 

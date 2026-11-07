@@ -10433,7 +10433,7 @@ async fn media_pump_ffmpeg_dc(
                 kf_asks_gapped = ?kf_asks.map(|(_, gapped)| gapped),
                 idr_causes = ?media.as_ref().map(|m| m.idr_causes),
                 dc_lock_ms = ?media.as_ref().map(|m| m.dc_lock.counts()),
-                maxrate_bps = ?media.as_ref().map(|_| rate_stats.maxrate_bps),
+                maxrate_bps = ?media.as_ref().map(|_| enc.current_maxrate_bps()),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             // Stopped BEFORE the snapshot below, so the rebase carries it.
