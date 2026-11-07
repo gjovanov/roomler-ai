@@ -58,7 +58,7 @@ and the places where the policy is set say so (§2).
 The policy belongs to the device. A server cannot push it (whether it should is
 an open decision in the spec). It is set in two places, and both carry the
 clamshell sentence from the key's description
-([`config_surface.rs:418`](../crates/agent-core/src/config_surface.rs#L418)):
+([`config_surface.rs:420`](../crates/agent-core/src/config_surface.rs#L420)):
 
 - **The companion's settings row** (Settings → Essentials), which renders the
   description under the control
@@ -142,9 +142,9 @@ every live control connection its goodbye
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2154`](../agents/roomlerd/src/signaling.rs#L2154)). Then the run
+([`signaling.rs:2158`](../agents/roomlerd/src/signaling.rs#L2158)). Then the run
 loop holds every new dial until the wake
-([`signaling.rs:1132`](../agents/roomlerd/src/signaling.rs#L1132),
+([`signaling.rs:1136`](../agents/roomlerd/src/signaling.rs#L1136),
 [`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
 `hold_while_asleep`). A dial inside the window the OS gave the computer to go to
 sleep would say hello again and erase the reason.
@@ -180,7 +180,7 @@ sleep would say hello again and erase the reason.
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:640`](../crates/modules/fleet/src/agent.rs#L640)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3430`](../crates/remote_control/src/models.rs#L3430)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3493`](../crates/remote_control/src/models.rs#L3493)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 

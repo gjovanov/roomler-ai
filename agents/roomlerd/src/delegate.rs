@@ -352,6 +352,15 @@ pub struct SessionParams {
     /// the field) leaves the owner's own `lock_on_end`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_on_end: Option<roomler_ai_remote_control::models::LockOnEnd>,
+    /// FR-135 §7.1 — the daemon's `rc_media_legacy` entries, its env fold
+    /// included (`RemoteConfigServices::media_legacy_for_delegate`). The worker
+    /// adds them to its own before it decides the session's media paths: it
+    /// builds the peer from its own file, which a push to the root's row never
+    /// reaches. Legacy entries only send a path back, so adding them can never
+    /// turn new code on. `None` from a daemon older than the field, or with no
+    /// entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_legacy: Option<String>,
 }
 
 /// FR-85 P1e-mac — what a delegated session's `record` channel needs, carried
@@ -2464,6 +2473,7 @@ mod params_tests {
             rc_overlay: None,
             idle_secs: None,
             lock_on_end: None,
+            media_legacy: None,
         };
         let wire = serde_json::to_string(&DelegateFrame::SessionParams(Box::new(params)))
             .expect("serialises");
@@ -2486,6 +2496,38 @@ mod params_tests {
         }
     }
 
+    /// FR-135 §7.1 — the daemon's `rc_media_legacy` entries cross with the
+    /// session, absent when there are none, and a frame from a daemon older
+    /// than the field still parses, as `None`.
+    #[test]
+    fn the_daemons_media_legacy_entries_cross_and_an_older_frame_parses() {
+        let mut p = SessionParams {
+            session_id: bson::oid::ObjectId::new().to_hex(),
+            codec: "h264".into(),
+            transport: None,
+            chroma: None,
+            chunk_framing: false,
+            audio: false,
+            permissions: roomler_ai_remote_control::permissions::Permissions::empty(),
+            controller_name: "someone".into(),
+            input_mode: None,
+            asking_org: None,
+            record: None,
+            rc_overlay: None,
+            idle_secs: None,
+            lock_on_end: None,
+            media_legacy: Some("media_plan".into()),
+        };
+        let wire = serde_json::to_string(&p).unwrap();
+        let back: SessionParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.media_legacy.as_deref(), Some("media_plan"));
+        p.media_legacy = None;
+        let wire = serde_json::to_string(&p).unwrap();
+        assert!(!wire.contains("media_legacy"), "{wire}");
+        let older: SessionParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(older.media_legacy, None);
+    }
+
     /// `None` is a real negotiated value (the legacy track), not "unset" — so a
     /// future refactor must not collapse it with a missing field.
     #[test]
@@ -2505,6 +2547,7 @@ mod params_tests {
             rc_overlay: None,
             idle_secs: None,
             lock_on_end: None,
+            media_legacy: None,
         };
         let track = serde_json::to_string(&p).unwrap();
         p.transport = Some("data-channel-h264".into());
@@ -2531,6 +2574,7 @@ mod params_tests {
             rc_overlay: None,
             idle_secs: None,
             lock_on_end: None,
+            media_legacy: None,
         }
     }
 

@@ -271,6 +271,10 @@ type SessionMeta = (
     crate::rc_overlay::RcOverlay,
     Option<u32>,
     Option<roomler_ai_remote_control::models::LockOnEnd>,
+    // FR-135 §7.1 — a delegating daemon's `rc_media_legacy` entries
+    // (`SessionParams::media_legacy`); `None` on a session this process
+    // resolved itself.
+    Option<String>,
 );
 
 /// FR-85 P3b — what a session's `record` channel needs, resolved when the
@@ -3022,6 +3026,10 @@ async fn connect_once(
                                         p.idle_secs,
                                         // FR-99 P3b — and so is the lock ask.
                                         p.lock_on_end,
+                                        // FR-135 §7.1 — the daemon's legacy
+                                        // entries, added to this worker's own
+                                        // at the offer.
+                                        p.media_legacy,
                                     ),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
@@ -3821,6 +3829,8 @@ async fn handle_server_msg(
                     idle_secs,
                     // FR-99 P3b — `None` from an older server: no ask.
                     lock_on_end,
+                    // FR-135 §7.1 — resolved here, from this process's keys.
+                    None,
                 ),
             );
             info!(
@@ -4010,6 +4020,10 @@ async fn handle_server_msg(
                             // FR-99 P3b — and takes the lock ask into the lock:
                             // the session goes live in its process.
                             lock_on_end,
+                            // FR-135 §7.1 — and this daemon's legacy entries,
+                            // which a push to its row put in force here but
+                            // not in the worker that builds the peer.
+                            media_legacy: remote_cfg.media_legacy_for_delegate(),
                         },
                     )),
                 );
@@ -4405,6 +4419,7 @@ async fn handle_server_msg(
                 rc_overlay,
                 idle_secs,
                 lock_ask,
+                delegated_media_legacy,
             ) = pending_session_meta.remove(&session_id).unwrap_or_else(|| {
                 (
                     "Controller".to_string(),
@@ -4412,6 +4427,7 @@ async fn handle_server_msg(
                     None,
                     None,
                     crate::rc_overlay::RcOverlay::resolve(false),
+                    None,
                     None,
                     None,
                 )
@@ -4461,6 +4477,12 @@ async fn handle_server_msg(
                 return Ok(());
             }
 
+            // FR-135 §7.1 — which media paths this session runs, old or new:
+            // the ONE read of `rc_media_legacy` and `rc_media_canary`, so the
+            // session never changes path mid-flight and a push applies from the
+            // next session. One log line when either key spoke, none otherwise.
+            let media_paths = remote_cfg.media_paths_with(delegated_media_legacy.as_deref());
+            media_paths.log(session_id);
             let peer = match AgentPeer::new(
                 session_id,
                 &ice_servers,
@@ -4494,6 +4516,7 @@ async fn handle_server_msg(
                 // FR-102 P9d — so this peer's carrier observation signals the
                 // loop that holds it (the clone drops with the peer).
                 carrier_ready_tx.clone(),
+                media_paths,
             )
             .await
             {
@@ -6969,6 +6992,7 @@ mod tests {
                 crate::rc_overlay::RcOverlay::resolve(false),
                 None,
                 None,
+                None,
             )
         };
         let record = Permissions::default() | Permissions::RECORD;
@@ -7157,6 +7181,7 @@ mod tests {
             // The carrier-ready signal: nothing reads it here, the test calls
             // the helper the arm would call.
             mpsc::channel(1).0,
+            crate::media_paths::MediaPaths::default(),
         )
         .await
         .expect("AgentPeer::new")

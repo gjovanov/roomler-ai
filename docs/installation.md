@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3791`, `crates/agent-core/src/config.rs:4426`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3791`, `crates/agent-core/src/config.rs:4449`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:651`, `:983`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -386,7 +386,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3514`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3777`) |
+| `config::load` (`crates/agent-core/src/config.rs:3537`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3800`) |
 | `config::read_if_present` (`:4045`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -422,7 +422,7 @@ question; two moved to `read_if_present`.
 
 `roomlerd` rewrites `config.toml` far more often than anyone edits it. It saves at every
 start and clean stop (`mark_run_starting`, `mark_clean_shutdown`,
-`crates/agent-core/src/config.rs:2546`, `:2568`), at the clean-run promotion
+`crates/agent-core/src/config.rs:2567`, `:2589`), at the clean-run promotion
 (`record_clean_run_at`, `:2555`), at every `ConfigSet`, and at enrollment. The daemon, the
 desktop app and the setup wizard all write it through `config::save` (`:4406`). Each save
 serialises the `AgentConfig` struct, and before #2078 that erased every key the running build
@@ -1892,7 +1892,7 @@ changed the per-user half's file and nothing the mesh node reads — measured on
 0.4.169: the app showed `ssh_enabled = off` while the root half served SSH.
 Since #2871 (design A) the app shows the Mac as one device: each row comes from,
 and a change goes to, the half that reads the key, by the key's group
-(`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:210`; the
+(`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`; the
 table in [desktop-companion.md](desktop-companion.md) §5), and its banner names
 both files. `roomler config ls` / `config set` as the signed-in user still reach
 the per-user half, every key of its file, and print the "a second roomler daemon
@@ -1991,7 +1991,7 @@ handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3503`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
-back to the version that is running (`crates/agent-core/src/config.rs:2631`).
+back to the version that is running (`crates/agent-core/src/config.rs:2652`).
 
 ### No pipe can stall the supervisor (#3080)
 

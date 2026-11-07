@@ -200,6 +200,30 @@
           next daemon restart. Turning the GPU path on is the device's own
           setting, and cannot be pushed.
         </div>
+        <v-text-field
+          v-model="mediaLegacyText"
+          label="Media paths back on their old code (rc_media_legacy)"
+          placeholder="media_plan"
+          density="compact"
+          variant="outlined"
+          hide-details
+          persistent-placeholder
+          class="mb-1"
+        />
+        <div class="text-caption text-medium-emphasis mb-4 ml-1">
+          Comma-separated media path names, one per stage of the remote-desktop
+          pipeline's rebuild (FR-135): each one sends the device's sessions back
+          to that stage's old code. The kill switch for a new stage that
+          misbehaves. Whole names only; a name the device's build does not know
+          is ignored. Blank = not managed (the device keeps its own);
+          <code>none</code> = no entries, which also clears an entry set on the
+          device itself. It can send sessions back to old code or clear the
+          list, never turn a new stage on early, so no extra permission bit; it
+          applies from the device's next session, with no restart. Turning a new
+          stage on early is the device's own setting, and cannot be pushed. A
+          device whose agent predates this key ignores it and reports the push
+          applied.
+        </div>
         <!-- FR-130 P1b — four states, because a tribool key has three and a
              request adds "not managed". Cleared and "default" differ: the
              first leaves the device's value alone, the second clears it. -->
@@ -530,6 +554,15 @@ const zeroCopyDenyText = computed({
     draft.value.zero_copy_deny = t === '' ? undefined : t
   },
 })
+/** FR-135 §7.1 — the media paths sent back to their old code, the same shape
+ *  again: a blank box is "not managed", and `none` says "no entries". */
+const mediaLegacyText = computed({
+  get: () => draft.value.rc_media_legacy ?? '',
+  set: (v: string) => {
+    const t = v.trim()
+    draft.value.rc_media_legacy = t === '' ? undefined : t
+  },
+})
 /** FR-130 P1b — the colour-description switch. A cleared select is "not
  *  managed"; "default" sends `''`, which clears the device's key. */
 const colorDescriptionChoice = computed({
@@ -572,6 +605,7 @@ watch(
       fps_deny: d?.fps_deny,
       color_description: d?.color_description,
       zero_copy_deny: d?.zero_copy_deny,
+      rc_media_legacy: d?.rc_media_legacy,
     }
     original.value = JSON.stringify(draft.value)
     if (agentStore.orgExecEnabled === null) void agentStore.fetchOrgExecEnabled(props.tenantId)
