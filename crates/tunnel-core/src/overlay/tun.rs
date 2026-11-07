@@ -5639,7 +5639,7 @@ mod system {
     ///
     /// Both ends of a generation call it. At a start no router exists yet, and
     /// at an exit the router is gone or goes with the process, so every route
-    /// on the device except its own connected prefixes goes, with no keep-set:
+    /// `enumerate_if_routes` finds, bar the device's connected prefixes, goes, with no keep-set:
     ///
     /// - a **start** (`roomlerd::purge_exit_routes_at_start`), BEFORE any peer
     ///   is installed. The router is empty by construction, so whatever this
@@ -5848,8 +5848,8 @@ mod system {
 
     /// macOS: empty, and correctly so — there is nothing to reconcile.
     ///
-    /// This reconciler exists for a PERSISTED device: Wintun adapters (and a
-    /// cached Linux tun) outlive the process, so a previous generation's
+    /// This reconciler exists for a PERSISTED device: a Wintun adapter
+    /// outlives the process (a Linux tun does not), so a previous generation's
     /// routes can still be installed at the next boot with no crypto-router
     /// entries behind them. A utun is bound to the file descriptor that
     /// created it — when the process dies the interface goes, and the kernel
@@ -5865,6 +5865,12 @@ mod system {
         Vec::new()
     }
 
+    /// Linux: the device's prefix routes. iproute2 prints a host route without
+    /// its `/32`, so no per-peer route is listed, and none needs to be: the
+    /// overlay TUN is not persistent (`ip -d link`: `persist off`), so the
+    /// kernel removes it, and every route on it, when its last descriptor
+    /// closes. Either end therefore drops, and logs, prefix routes only, such
+    /// as a subnet route (0.4.204, #3533's field read). `ip route show` is IPv4.
     #[cfg(target_os = "linux")]
     fn enumerate_if_routes(if_name: &str) -> Vec<String> {
         let out = std::process::Command::new("ip")
