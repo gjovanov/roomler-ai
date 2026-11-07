@@ -4,7 +4,7 @@
 #   pump_lines_ffmpeg_dc=3950 # r0:FOO-1: retires with R8's delete
 # Set at FR-135 R0b, on the instruments it added to both data-channel pumps.
 agent_env_reads=178 # r9:ENV-1: stays, a test-only fixture switch
-viewer_knobs=31
+viewer_knobs=32 # r3:VIEW-1: retires when S11 flips the default and the switch is deleted
 pump_lines_rtp=1312
 pump_lines_vp9_dc=1465
 pump_lines_ffmpeg_dc=3958 # r0:VIEW-1: folds into R8's one loop

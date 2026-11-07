@@ -76,28 +76,39 @@ flowchart TB
     IN["incoming session"] --> Q{"transport ×<br/>codec support probes"}
     Q -->|default| V["&lt;video&gt; element<br/>RTP → Chrome jitter buffer (~80 ms floor)"]
     Q -->|"WebCodecs path"| W["RTCRtpScriptTransform →<br/>VideoDecoder → OffscreenCanvas"]
-    Q -->|"DC H.264 / DC HEVC"| DC["reliable DataChannel bitstream →<br/>worker decode → canvas"]
-    Q -->|"VP9 4:4:4"| VP["DataChannel → rc-vp9-444-worker<br/>(chroma-full screen content)"]
-    W & DC & VP --> HUD["per-hop stats: fwd · decode · paint<br/>(rc-hop-stats, opt-in diag HUD)"]
+    Q -->|"DC: VP9 · AV1 · H.264 · HEVC"| DC["video-bytes DataChannel →<br/>rc-dc-worker decode → canvas"]
+    W & DC --> HUD["per-hop stats: fwd · decode · paint<br/>(rc-hop-stats, opt-in diag HUD)"]
 ```
 
-- **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker`, `rc-hevc-worker`,
-  `rc-vp9-444-worker`, with `rc-hop-stats` shared hop-timing instrumentation. Each
+- **Decode workers** (`ui/src/workers/`): `rc-webcodecs-worker` (the RTP transform)
+  and `rc-dc-worker`, the one worker for every codec over the data channel (two
+  until FR-135 R3:
+  [remote-control.md §11.14](remote-control.md#1114-one-data-channel-worker-fr-135-r3)),
+  with `rc-hop-stats` shared hop-timing instrumentation. Each
   tells its decoder the agent's BT.601 limited colour space through
   `rc-decoder-config` (FR-130 P2; kill switch `roomler-rc-colorspace=off`):
   [remote-control.md §18.6.2](remote-control.md#1862-the-decoder-is-told-the-colour-space-fr-130-p2).
-  The two data-channel workers also keep `rc-media-window`: decode, paint, hop,
+  The data-channel worker also keeps `rc-media-window`: decode, paint, hop,
   arrival and key-frame-gate times in the agent's log-2 buckets, the freeze and
-  painted counts, and whether the decoder is hardware, folded into their 1 s `stats`
+  painted counts, and whether the decoder is hardware, folded into its 1 s `stats`
   message for the agent (FR-135 R0,
   [remote-control.md §11.13.1](remote-control.md#11131-the-viewers-half-r0c)).
+  The page relays the `video-bytes` channel to it, one `postMessage` per
+  message; under `roomler-rc-dc-worker=1`, where the browser can transfer an
+  `RTCDataChannel`, the page moves the channel itself into the worker instead,
+  and a page whose move the worker does not confirm relays from then on.
+  The default is the relay until FR-135's S11 reads the move
+  ([remote-control.md §11.14.1](remote-control.md#11141-the-channel-in-the-worker-roomler-rc-dc-worker)).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
   its frame-skip rate control, and since FR-135 R0 also carries the worker's media
-  window, which only records), one `rc:decode-error` per decode error, counted into
+  window, which only records; since R3 also `queue_arr_ms`, the transit queue read
+  at arrival beside `queue_ms`, which no agent reads yet:
+  [remote-control.md §11.14.2](remote-control.md#11142-the-arrival-reading-queue_arr_ms)),
+  one `rc:decode-error` per decode error, counted into
   the session's stats (FR-132 P1,
   [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
   a data-channel decoder that fails after its first frame replaced in place, off with
@@ -142,7 +153,7 @@ flowchart TB
 
 The Video tab of the viewer's settings offers **Frame rate**, with 60, 120 and
 144, only for an agent whose hello carries `fps-high`
-(`views/remote/RemoteControl.vue:1783`). The agent's side, the grant and its
+(`views/remote/RemoteControl.vue:1770`). The agent's side, the grant and its
 step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-the-viewer-asks-the-host-proves-it-fr-119).
 
 - **The options** (`frameRateOptions`, `composables/frameRate.ts:52`): 60 is
@@ -151,7 +162,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7789`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7850`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -161,7 +172,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   …)". A reason word from a newer agent is shown as it came. With no session
   open, the hint reads "Above 60 only where this device has shown it can sustain
   it".
-- **"Try N fps again"** (`views/remote/RemoteControl.vue:1793`) appears under
+- **"Try N fps again"** (`views/remote/RemoteControl.vue:1780`) appears under
   the picker for an `unproven` refusal, from an agent that advertises
   `fps-retry` (`frameRateCanRetry`, `composables/frameRate.ts:166`). It re-sends
   the pick with `retry: true`, and the agent trials the step-down again from the

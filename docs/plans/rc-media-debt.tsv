@@ -660,7 +660,7 @@ view:C11	per-codec-branch		ui/src/composables/useRemoteControl.ts:8260	VP9 worke
 view:C12	per-codec-branch		ui/src/workers/rc-webcodecs-worker.ts:425	`codecMimeForShort`	delete	R13	RTP transform removed
 view:C13	per-codec-branch		ui/src/composables/useRemoteControl.ts:2960	Seven WebCodecs probes with hard-coded strings (:2978, :3013, :3039, :3152, :3246, :3271)	TransportPick	R13	One probe table
 view:C14	per-codec-branch		ui/src/composables/useRemoteControl.ts:3071	Four MC probes (:3171, :3205, :3292)	TransportPick	R13	One probe table
-view:C15	per-codec-branch		ui/src/workers/rc-vp9-444-worker.ts:822	`drawImage(frame,0,0)` vs `hevcw:901` with size	DecodeWorker	R3	One worker
+view:C15	per-codec-branch		ui/src/workers/rc-vp9-444-worker.ts:822	`drawImage(frame,0,0)` vs `hevcw:901` with size	DecodeWorker	R3	Done in #3552: One worker
 view:C16	per-codec-branch		ui/src/composables/useRemoteControl.ts:3481	Rung 3 only for `vp9_qsv` by name	CellTable	R10	Rank reads `video_cells.hw`
 view:C17	per-codec-branch		ui/src/views/remote/RemoteControl.vue:4716	Pill names by codec, prettify at :4780, HW guess :4787	Stats	R0	Label from the cell
 view:C18	per-codec-branch		ui/src/components/admin/agentCodecChips.ts:45	Legacy chips group labels by codec substring	CellTable	R9	R9 (#3545) leaves it: a census decides, and the chips are the viewer's (R13): No agent without `video_cells`
@@ -691,22 +691,22 @@ view:M24	string-match		agents/roomlerd/src/peer.rs:2420	`Some('data-channel-av1'
 view:M25	string-match		agents/roomlerd/src/signaling.rs:3502	Transport string equality against live caps	TransportPick	R13	Agent side of the table; inv-peer
 view:M26	string-match		agents/roomlerd/src/peer.rs:13671	`starts_with('data-channel-')`	TransportPick	R13	Agent side of the table; inv-peer
 view:M27	string-match		agents/roomlerd/src/encode/caps.rs:2949	`PRIORITY` names, vp9 and vp8 never in `codecs`	TransportPick	R13	Agent side of the table; inv-peer
-view:X01	copied-code		ui/src/workers/rc-hevc-worker.ts:1	Whole worker: 573 of vp9w's 599 code lines also appear here	DecodeWorker	R3	One worker with a crop option
-view:X02	copied-code		ui/src/composables/useRemoteControl.ts:8096	`startVp9_444Path` and `startHevcPath` :8386, 133 of about 175 code lines common	DecodeWorker	R3	One worker with a crop option
-view:X03	copied-code		ui/src/composables/useRemoteControl.ts:8109	Worker message handlers, twin :8399	DecodeWorker	R3	One worker with a crop option
-view:X04	copied-code		ui/src/composables/useRemoteControl.ts:8319	`dc.onmessage` forwarders, twin :8588	ViewerSession	R3	One worker with a crop option
-view:X05	copied-code		ui/src/composables/useRemoteControl.ts:8348	`stopVp9_444Path`, twin :8617	ViewerSession	R3	One worker with a crop option
-view:X06	copied-code		ui/src/composables/useRemoteControl.ts:8365	Canvas watchers, twin :8630	ViewerSession	R3	One worker with a crop option
-view:X07	copied-code		ui/src/composables/useRemoteControl.ts:5865	`vp9_444Worker`, `Active`, `FramesDecoded`, `Stats`, `CanvasEl`, twins :5904-5959	ViewerSession	R3	One worker with a crop option
-view:X08	copied-code		ui/src/views/remote/RemoteControl.vue:1320	Three `<canvas>` elements	ViewerSession	R3	One worker with a crop option
+view:X01	copied-code		ui/src/workers/rc-hevc-worker.ts:1	Whole worker: 573 of vp9w's 599 code lines also appear here	DecodeWorker	R3	Done in #3552: One worker with a crop option
+view:X02	copied-code		ui/src/composables/useRemoteControl.ts:8096	`startVp9_444Path` and `startHevcPath` :8386, 133 of about 175 code lines common	DecodeWorker	R3	Done in #3552: One worker with a crop option
+view:X03	copied-code		ui/src/composables/useRemoteControl.ts:8109	Worker message handlers, twin :8399	DecodeWorker	R3	Done in #3552: One worker with a crop option
+view:X04	copied-code		ui/src/composables/useRemoteControl.ts:8319	`dc.onmessage` forwarders, twin :8588	ViewerSession	R3	Done in #3552: One worker with a crop option
+view:X05	copied-code		ui/src/composables/useRemoteControl.ts:8348	`stopVp9_444Path`, twin :8617	ViewerSession	R3	Done in #3552: One worker with a crop option
+view:X06	copied-code		ui/src/composables/useRemoteControl.ts:8365	Canvas watchers, twin :8630	ViewerSession	R3	Done in #3552: One worker with a crop option
+view:X07	copied-code		ui/src/composables/useRemoteControl.ts:5865	`vp9_444Worker`, `Active`, `FramesDecoded`, `Stats`, `CanvasEl`, twins :5904-5959	ViewerSession	R3	Done in #3552: One worker with a crop option
+view:X08	copied-code		ui/src/views/remote/RemoteControl.vue:1320	Three `<canvas>` elements	ViewerSession	R3	Done in #3552: One worker with a crop option
 view:X09	copied-code		ui/src/views/remote/RemoteControl.vue:4454	hevc, vp9, rtp triple branch; also :4795, :4817, :4831, :4859	Stats	R0	One stats object
 view:X10	copied-code		ui/src/composables/useRemoteControl.ts:2960	WebCodecs probe body, seven copies	TransportPick	R13	One probe table
 view:X11	copied-code		ui/src/composables/useRemoteControl.ts:3071	MC probe body, four copies	TransportPick	R13	One probe table
-view:X12	copied-code		ui/src/workers/rc-vp9-444-worker.ts:887	`parseFrameHeader`, `isKeyframe`, `shouldDecodeFrame`, twin hevcw:964	DecodeWorker	R3	One worker
+view:X12	copied-code		ui/src/workers/rc-vp9-444-worker.ts:887	`parseFrameHeader`, `isKeyframe`, `shouldDecodeFrame`, twin hevcw:964	DecodeWorker	R3	Done in #3552: One worker
 view:X13	copied-code		ui/src/composables/useRemoteControl.ts:2077	Hand-written storage access: 17 read and persist pairs, 10 more readers, each its own try/catch	ViewerSession	R3	One settings store
 view:X14	copied-code		ui/src/composables/useRemoteControl.ts:7377	Hand-rolled guarded `ch.send` (:7392, :7417, :7528, :7544, :7564, :7671) beside `sendControl` :7312	ViewerSession	R3	Use the one helper
-view:X15	copied-code		ui/src/composables/useRemoteControl.ts:6818	Worker fan-out by handle: clock :6820, bench :7089, sharpen :5841	ViewerSession	R3	One worker handle
-view:X16	copied-code		ui/src/workers/rc-vp9-444-worker.ts:851	Teardown lists drifted, hevcw:931 lacks three resets	DecodeWorker	R3	One worker
+view:X15	copied-code		ui/src/composables/useRemoteControl.ts:6818	Worker fan-out by handle: clock :6820, bench :7089, sharpen :5841	ViewerSession	R3	Done in #3552: One worker handle
+view:X16	copied-code		ui/src/workers/rc-vp9-444-worker.ts:851	Teardown lists drifted, hevcw:931 lacks three resets	DecodeWorker	R3	Done in #3552: One worker
 view:N01	no-op		ui/src/workers/rc-vp9-444-worker.ts:352	`chunkGaps`, `chunkStragglers` posted each second, nothing reads them; twin hevcw:376	Stats	R0	Read them, or remove
 view:N02	no-op		ui/src/workers/rc-vp9-444-worker.ts:172	`framesReceived` write-only and counts chunks; twin hevcw:182	delete	R13	Now
 view:N03	no-op		ui/src/composables/useRemoteControl.ts:11141	`agentConvertsBt601Limited = true`, constant hook	DecodeWorker	R3	FR-130 closed
@@ -725,7 +725,7 @@ view:G01	misleading-log		ui/src/composables/useRemoteControl.ts:8131	`[rc] vp9-4
 view:G02	misleading-log		ui/src/composables/useRemoteControl.ts:8155	`auto-fallback to <video>` on a session with no RTP samples; also :8445, peer.rs:10884	ViewerSession	R3	Reconnect instead
 view:G03	misleading-log		ui/src/composables/useRemoteControl.ts:3600	`webrtc H.264 fallback`; agent picks the codec. Printed at :10942	TransportPick	R13	Pick names the cell
 view:G04	misleading-log		ui/src/composables/useRemoteControl.ts:11096	`Falling back to VP9 4:2:0 (hardware)`, hardware unproven	TransportPick	R13	Pick names the cell
-view:G05	misleading-log		ui/src/composables/useRemoteControl.ts:8186	`backlog drop - decode queue N`, the rule reads ms and the log prints the queue; also :8481	DecodeWorker	R3	One worker
+view:G05	misleading-log		ui/src/composables/useRemoteControl.ts:8186	`backlog drop - decode queue N`, the rule reads ms and the log prints the queue; also :8481	DecodeWorker	R3	Done in #3552: One worker
 view:G06	misleading-log		ui/src/composables/useRemoteControl.ts:7769	`Use the Codec toolbar to force H.264 for a guaranteed WebCodecs path`: H.264 pick is DC, and the gate blocks RTP	delete	R13	RTP transform removed
 view:G07	misleading-log		ui/src/composables/useRemoteControl.ts:8155	591 file lines hold mojibake, 18 of them console calls	delete	R13	Re-encoded
 view:G08	misleading-log		ui/src/views/remote/RemoteControl.vue:1401	`waiting for agent to publish a video track ... --features media`	ViewerSession	R3	Reworded
@@ -737,16 +737,16 @@ view:K01	misleading-comment		ui/src/composables/useRemoteControl.ts:8153	'RTP H.
 view:K02	misleading-comment		ui/src/composables/useRemoteControl.ts:8441	Same claim, HEVC	delete	R13	One worker
 view:K03	misleading-comment		ui/src/workers/rc-webcodecs-worker.ts:26	'intentionally do NOT write frames to the writable'; code does at :381	delete	R13	RTP transform removed
 view:K04	misleading-comment		ui/src/views/remote/RemoteControl.vue:5464	'receiver transform swallows them', same conflict	delete	R13	RTP transform removed
-view:K05	misleading-comment		ui/src/workers/rc-hevc-worker.ts:83	Default 'L3.1 (1080p)', default is L5.1 at :154	DecodeWorker	R3	One worker
-view:K06	misleading-comment		ui/src/workers/rc-vp9-444-worker.ts:6	'VP9 4:4:4 decoder worker': also profile 0, AV1, H.264	DecodeWorker	R3	One worker
+view:K05	misleading-comment		ui/src/workers/rc-hevc-worker.ts:83	Default 'L3.1 (1080p)', default is L5.1 at :154	DecodeWorker	R3	Done in #3552: One worker
+view:K06	misleading-comment		ui/src/workers/rc-vp9-444-worker.ts:6	'VP9 4:4:4 decoder worker': also profile 0, AV1, H.264	DecodeWorker	R3	Done in #3552: One worker
 view:K07	misleading-comment		ui/src/composables/useRemoteControl.ts:3436	Rank docblock: six rungs, H.264 track 'universal fallback'	TransportPick	R13	One table
 view:K08	misleading-comment		ui/src/composables/useRemoteControl.ts:3457	'4:2:0 is the right DEFAULT'; default dial is Sharper	TransportPick	R13	One table
 view:K09	misleading-comment		ui/src/composables/useRemoteControl.ts:3413	'absent = balanced'; connect always passes `priority`, default Sharper	TransportPick	R13	One table
 view:K10	misleading-comment		ui/src/composables/useRemoteControl.ts:2709	'same default a fresh profile does', returns `on`, fresh is `auto`	DecodeWorker	R3	Fixed
 view:K11	misleading-comment		ui/src/composables/videoCells.ts:217	`hevc` 'double gate'; RC.vue:4082 passes the WebCodecs flag only	CellTable	R10	Shared gates
 view:K12	misleading-comment		ui/src/composables/videoCells.ts:227	`vp9` implies profile 0; used as if profile 0 needs profile 1, RC.vue:4085	CellTable	R10	Shared gates
-view:K13	misleading-comment		ui/src/workers/rc-vp9-444-worker.ts:22	'monotonic capture timestamp', also :756, hevcw:27; it is `agent_epoch_us()` at framing, peer.rs:5063, :9556	DecodeWorker	R3	One worker
-view:K14	misleading-comment		ui/src/workers/rc-hop-stats.ts:109	QueueDrift 'the point in the pipeline does not matter'; fed after paint, `arrivalUs` at vp9w:545, hevcw:622, so decode backlog reads as link growth	Stats	R0	Sampled at frame arrival
+view:K13	misleading-comment		ui/src/workers/rc-vp9-444-worker.ts:22	'monotonic capture timestamp', also :756, hevcw:27; it is `agent_epoch_us()` at framing, peer.rs:5063, :9556	DecodeWorker	R3	Done in #3552: One worker
+view:K14	misleading-comment		ui/src/workers/rc-hop-stats.ts:109	QueueDrift 'the point in the pipeline does not matter'; fed after paint, `arrivalUs` at vp9w:545, hevcw:622, so decode backlog reads as link growth	Stats	R0	Done in #3552: Sampled at frame arrival
 view:K15	misleading-comment		ui/src/workers/rc-hop-stats.ts:158	'every couple of seconds'; probes every 500 ms, uRC:8660	Stats	R0	Fixed
 view:K16	misleading-comment		ui/src/composables/useRemoteControl.ts:10533	Cursor '~30 Hz', also peer.rs:10961; default 8 ms, capture/cursor.rs:37	keep	stays	Fixed
 view:K17	misleading-comment		ui/src/composables/useRemoteControl.ts:6841	'one per animation frame'; it is an 8 ms timer	keep	stays	Fixed
@@ -1059,3 +1059,4 @@ r9:HELLO-1	special-case	MF HEVC	agents/roomlerd/src/encode/caps.rs	With `ROOMLER
 r9:SHADOW-1	misleading-log	probe	agents/roomlerd/src/encode/cell_table.rs ; agents/roomlerd/src/encode/caps.rs	R9's shadow warns in the caps-probe child, whose line reaches no uploaded log, and a cached probe's daemon-side shadow is driver-free and agrees by construction, so its silence in `agent_logs` says nothing. From R9's review (#3545)	CellTable	R10	The disagreement rides the probe report, so the parent logs and uploads it
 r9:ENV-1	env-knob	tests	agents/roomlerd/src/encode/cell_table/tests.rs	`CELL_TABLE_UPDATE`, read only under `cargo test`: it re-records the cell table's hello fixtures, R9's gate (#3545). The ratchet counts it because a test-only read counts like any other	CellTable	stays	Stays: a test's re-record switch, which the agent never reads
 r0:VIEW-1	file-size	FFmpeg DC	agents/roomlerd/src/peer.rs	The viewer's half of R0 on the FFmpeg DC heartbeat: eleven `viewer_*` fields (N9-N12, N16) read through `session_telemetry`, 20 more lines in `media_pump_ffmpeg_dc`. Added by R0c beside R0b's fields	Stats	R8	Folds into R8's one loop
+r3:VIEW-1	local-storage-knob	DC	ui/src/composables/useRemoteControl.ts	`roomler-rc-dc-worker`, default off (`DC_WORKER_DEFAULT`): `1` moves the `video-bytes` channel into the decode worker where the browser can transfer one, `0` keeps the page relaying it. Added by R3 as its kill switch (§7.5); temporary by design	delete outright	R3	S11 decides: the default flips (one line) and the switch goes on the delete gate with the relay it guards, or the transfer goes and the switch with it. Before a flip, two edges #3552's review found close: a move the worker confirms and that then delivers no frame must count as failed (else the viewer moves it again on every session and stays black), and a path that stops with the channel in the worker must not leave it unread (else, once the browser closes it, the pump drops every frame before its fan-out and a follower freezes until the watchdog)

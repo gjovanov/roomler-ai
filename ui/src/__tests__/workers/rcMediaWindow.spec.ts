@@ -3,11 +3,12 @@
 /**
  * FR-135 R0 — the decode worker's window of media numbers for the agent: the
  * buckets, the freeze and painted counts, the gate's wait, the decoder's form,
- * and both data-channel workers carrying them in their `stats` message.
+ * and the data-channel worker carrying them in its `stats` message.
  *
- * The second half is black-box, in the manner of `rcDecodeRecovery`: each real
- * DC worker is driven through the messages the composable sends it, with
- * WebCodecs replaced by a recording fake and a clock the test moves.
+ * The second half is black-box, in the manner of `rcDecodeRecovery`: the real
+ * DC worker is driven through the messages the composable sends it, once per
+ * codec it decodes (`dcCodecs.ts`), with WebCodecs replaced by a recording fake
+ * and a clock the test moves.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import {
@@ -19,6 +20,7 @@ import {
   logBucket,
   type ViewerMediaWindow,
 } from '@/workers/rc-media-window'
+import { DC_CODECS } from './dcCodecs'
 
 /** A taken window's samples as their buckets, lowest first. */
 const only = (h: number[]) => h.flatMap((n, i) => Array<number>(n).fill(i))
@@ -215,7 +217,7 @@ describe('FR-135 R0 — what the browser says about the decoder', () => {
   })
 })
 
-// ── both data-channel workers, black-box ──────────────────────────────────────
+// ── the data-channel worker, black-box, on every codec ────────────────────────
 
 type DecoderInit = { output: (frame: unknown) => void; error: (err: unknown) => void }
 
@@ -317,16 +319,11 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-const DC_WORKERS = [
-  { name: 'rc-vp9-444-worker', load: () => import('@/workers/rc-vp9-444-worker') },
-  { name: 'rc-hevc-worker', load: () => import('@/workers/rc-hevc-worker') },
-] as const
-
-describe.each(DC_WORKERS)('FR-135 R0 — $name carries the window in its stats', ({ load }) => {
+describe.each(DC_CODECS)('FR-135 R0 — the data-channel worker carries the window in its stats, on $name', ({ codec }) => {
   async function start(init: Record<string, unknown> = {}) {
-    await load()
+    await import('@/workers/rc-dc-worker')
     const onmessage = scope.onmessage!
-    onmessage({ data: { type: 'init-canvas', canvas: fakeCanvas(), ...init } })
+    onmessage({ data: { type: 'init-canvas', canvas: fakeCanvas(), codec, ...init } })
     return (msg: Record<string, unknown>) => onmessage({ data: msg })
   }
 
