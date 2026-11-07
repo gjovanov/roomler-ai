@@ -226,7 +226,7 @@ encodes at that geometry.
 - **WGC drop ratio** (`wgc_backend.rs:790`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
-### End-to-end age (AC8) — **partial**
+### End-to-end age (AC8) — **met**
 
 | Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
 |---|---|---|---|---|
@@ -253,6 +253,27 @@ two DataChannel pumps, with 6 sentinels and no `viewer_age_implausible`.
 The direct tail the 10-26 read showed (p90 1108, p99 1194) is not in this week's
 numbers. This read does not say why.
 
+**2026-11-02, the pill beside the wire.** A headed Chromium 151 on the production
+viewer, with the page visible and focused, held two sessions to a throwaway Linux
+device on 0.4.197. A script read the `~N ms` pill about once a second, 164 samples
+from 36 to 2 865 ms. The agent's `agent_logs` for those two sessions hold 66
+heartbeats with a `viewer_age_ms`.
+
+| Session | Heartbeats with an age | Equal to a pill value within 5 s | Of those at 300 ms or more | Equal to a value from the *other* session (chance control) |
+|---|---|---|---|---|
+| 1 | 52 | 50 | 18 of 18 | 0 |
+| 2 | 14 | 13 | 10 of 11 | 1 |
+
+So the wire carries the number the person reads. Each window's `age` goes to the
+pill and to `sendDecodeStat` from one worker `stats` message
+(`useRemoteControl.ts:7578`, `:8224`, `RemoteControl.vue:4878`). A once-a-second
+read can skip a window, which fits the three misses, though this read can't prove it.
+
+That is all this read shows. The session was VP9 software on a loaded host, under
+software compositing, with `carrier=direct`, so its ages say nothing about how low
+the number gets on real hardware. The comparison with RustDesk's own Delay readout
+is the operator's A/B (AC9).
+
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 
 The decoupling is in the source (§4): sends run off a `setTimeout` floor, never
@@ -261,6 +282,36 @@ flat while the viewer's rAF is tanked by compositor load — needs a **foregroun
 browser with forced control to measure, which a relay-only, background-throttled
 automation tab cannot do (a background tab throttles `setTimeout` too). It is owed
 on the operator's own browser or a dedicated idle host.
+
+**2026-11-03, a real pointer: two tries, no result yet.** A headed Chromium on the
+production viewer, page visible and focused, under software compositing, with an X
+pointer moved by `xdotool` at 234 moves/s. Earlier runs through the DevTools protocol
+read nothing useful, because its acks arrive at renderer pace, so the driver itself
+followed rAF. The second try on 0.4.197:
+
+| Arm | rAF/s | Sends/s | Sends/s while input flowed | Raw events/s | Send gap p50 / p95 ms | Host load |
+|---|---|---|---|---|---|---|
+| A1, no load | 48.5 | 99.2 | 126.4 | 186.5 | 7.8 / 9.1 | 2.4-3.6 |
+| B1, compositor load | 31.7 | 94.4 | 127.3 | 176.4 | 7.8 / 9.4 | 5.2-6.7 |
+| A2, no load | 44.0 | 93.0 | 128.6 | 174.6 | 7.7 / 9.0 | 7.2-7.6 |
+| B2, compositor load | 29.6 | 100.4 | 127.0 | 186.9 | 7.8 / 9.2 | 7.4-8.9 |
+| B_heavy, compositor nearly dead | 5.1 | 90.1 | 125.2 | 166.9 | 7.7 / 8.7 | 9.0-9.6 |
+
+"While input flowed" leaves out gaps over 30 ms. Main-thread stalls, 230-380 ms each,
+took about a quarter of every arm, loaded or not, and their cause isn't known.
+
+While input flowed, sends sat at the 8 ms coalescer's ceiling of 125/s, from rAF 48
+down to rAF 5. That is what P6 claims, but **it isn't a result**, because a read counts
+only with its controls:
+
+- The second try stopped on a host-pressure limit before its controls ran. That host
+  is shared, and the pressure fell as soon as the rig stopped.
+- The first try ran every arm, on a larger window with more paint. Its busy-frame
+  control behaved: 14 sends/s, gap p50 86 ms. Its 16 ms control missed the 55-62 sends/s
+  it had to reach, at 34.7/s, though its gap p50 read 16.0 ms, so the counter does
+  follow the coalescer.
+
+AC7 stays owed. It needs an idle host, where this rig is a 5-minute run.
 
 ## 7. Config & kill-switch reference
 
