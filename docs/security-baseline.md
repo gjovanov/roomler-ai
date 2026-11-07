@@ -521,7 +521,7 @@ person at the device cannot turn the record off.
 The value in the daemon's line is never a secret, because no secret is on the config surface:
 `agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
 password record have no row there, and `apply` refuses them like any unknown key
-(`crates/agent-core/src/config_surface.rs:2796`). Two tests lock it:
+(`crates/agent-core/src/config_surface.rs:2834`). Two tests lock it:
 `secrets_and_identity_are_not_exposed` (`:4748`) and
 `no_external_credential_key_is_editable_through_the_config_surface` (`:5339`).
 

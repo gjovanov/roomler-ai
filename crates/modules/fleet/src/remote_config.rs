@@ -87,6 +87,9 @@ pub enum ConfigDenyReason {
     CannotGrantSsh,
     /// FR-52 — the body names an `external_*` key, which no server may push.
     DeviceOwnedKey,
+    /// FR-135 §7.1 — the body names `rc_media_canary`, the switch that turns a
+    /// media path's new code on early, which is the device's.
+    DeviceOwnedSwitch,
 }
 
 impl ConfigDenyReason {
@@ -96,6 +99,7 @@ impl ConfigDenyReason {
             Self::CannotGrantExec => "cannot_grant_exec",
             Self::CannotGrantSsh => "cannot_grant_ssh",
             Self::DeviceOwnedKey => "device_owned_key",
+            Self::DeviceOwnedSwitch => "device_owned_switch",
         }
     }
 
@@ -113,6 +117,10 @@ impl ConfigDenyReason {
             Self::DeviceOwnedKey => {
                 "External access is the device owner's to set, on the device: no server can \
                  push an external_* key"
+            }
+            Self::DeviceOwnedSwitch => {
+                "rc_media_canary turns a media path's new code on early, which is the \
+                 device's decision or a release's: no server can push it"
             }
         }
     }
@@ -264,6 +272,13 @@ pub async fn set_desired_config(
         .as_deref()
         .map(|v| pushed_tribool("color_description", v))
         .transpose()?;
+    // FR-135 §7.1 — the same for the media-path list's SHAPE: a typo would be
+    // written, reported applied, and read by the device as no entry at all.
+    // The names are the device build's own, so a later phase's name passes.
+    if let Some(v) = body.rc_media_legacy.as_deref() {
+        roomler_ai_remote_control::models::check_media_path_list(v)
+            .map_err(|e| ApiError::BadRequest(format!("rc_media_legacy: {e}")))?;
+    }
 
     // Membership first: `get_member_permissions` is the membership check too,
     // so a non-member never reaches the policy below.
@@ -299,6 +314,11 @@ pub async fn set_desired_config(
     let verdict = decide(perms, &agent.desired_config, &requested).and_then(|()| {
         if names_a_device_owned_key(&body.rest) {
             Err(ConfigDenyReason::DeviceOwnedKey)
+        } else if body.rest.contains_key("rc_media_canary") {
+            // FR-135 §7.1 — by WHOLE name: it shares no prefix with the
+            // pushable `rc_media_legacy`, and a 200 would say a push took that
+            // never will.
+            Err(ConfigDenyReason::DeviceOwnedSwitch)
         } else {
             Ok(())
         }
@@ -324,6 +344,12 @@ pub async fn set_desired_config(
             tracing::warn!(
                 tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
                 "desired-config: an external_* key was pushed — refused, it is the device's"
+            );
+        }
+        if reason == ConfigDenyReason::DeviceOwnedSwitch {
+            tracing::warn!(
+                tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
+                "desired-config: rc_media_canary was pushed — refused, it is the device's"
             );
         }
         return Err(ApiError::Forbidden(reason.message().to_string()));

@@ -2814,12 +2814,17 @@ pub struct DesiredConfig {
     pub zero_copy_deny: Option<String>,
     /// FR-135 §7.1 — the media paths a session must run on their OLD code
     /// (`rc_media_legacy`): comma-separated path names, one per FR-135 phase
-    /// (`media_plan`, `stats`, …), or `none`. Pushable for the denylists'
-    /// reason: it only ever sends a session back to code the device already
-    /// ran, so `MANAGE_AGENTS` is enough, and the server passes it on unread,
-    /// because a device ignores a name it does not know. Blank clears the
-    /// device's key. LIVE on the device: its one read site is each session's
-    /// open, so it applies from the next session with no restart.
+    /// (`media_plan`, `stats`, …), or `none`. Pushable with `MANAGE_AGENTS` for
+    /// the denylists' reason: a push sends sessions back to code the device
+    /// already ran, or clears the list back to the built-in defaults, and never
+    /// further. It cannot turn a path's new code on ahead of its default. As
+    /// with `zero_copy_deny`, pushed and local values share the one key, so a
+    /// push that clears it also clears an entry the owner set on the device.
+    /// The server checks the shape (`check_media_path_list`) and not the names,
+    /// which belong to the device's build: it ignores one it does not know.
+    /// Blank clears the device's key. LIVE on the device: its one read site is
+    /// each session's open, so it applies from the next session with no
+    /// restart.
     ///
     /// ⚠️ `rc_media_canary`, the key that turns a path's new code ON early, is
     /// ABSENT and stays absent: turning a path on is a decision made on the
@@ -2937,6 +2942,47 @@ pub fn parse_pushed_tribool(v: &str) -> Result<Option<bool>, String> {
             ))
         }
     }
+}
+
+/// FR-135 §7.1 — the SHAPE of an `rc_media_legacy` / `rc_media_canary` value:
+/// comma-separated path names (lowercase letters, digits and underscores, at
+/// most 32 characters each, at most 32 of them), `none`, or blank. Checked at
+/// the server's door and by `roomler config set`, so a typo (`media-plan`,
+/// `Media_Plan`, `media_plan;stats`) is a 400 there instead of a push the
+/// device reports applied and reads as nothing. The names themselves belong to
+/// the device's build, which ignores one it does not know: a later phase's
+/// name passes here.
+pub fn check_media_path_list(v: &str) -> Result<(), String> {
+    const MAX_ENTRY: usize = 32;
+    const MAX_ENTRIES: usize = 32;
+    let v = v.trim();
+    if v.is_empty() || v == "none" {
+        return Ok(());
+    }
+    let entries: Vec<&str> = v
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if entries.len() > MAX_ENTRIES {
+        return Err(format!(
+            "at most {MAX_ENTRIES} path names, got {}",
+            entries.len()
+        ));
+    }
+    for entry in entries {
+        if entry.len() > MAX_ENTRY
+            || !entry
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            let shown: String = entry.chars().take(MAX_ENTRY).collect();
+            return Err(format!(
+                "{shown:?} is not a path name: lowercase letters, digits and underscores (e.g. media_plan)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The spelling the server stores and pushes for what [`parse_pushed_tribool`]
@@ -10617,5 +10663,44 @@ mod expired_on_arrival_text {
             "{text}"
         );
         assert!(text.contains("0.4.202"), "{text}");
+    }
+}
+
+/// FR-135 §7.1 — the shape the server's door and `roomler config set` both
+/// check for the media-path lists.
+#[cfg(test)]
+mod media_path_list_tests {
+    use super::check_media_path_list;
+
+    #[test]
+    fn names_none_and_blank_pass_and_a_later_phases_name_passes_too() {
+        for ok in [
+            "",
+            "  ",
+            "none",
+            "media_plan",
+            "media_plan, stats",
+            "later_phase_2",
+        ] {
+            assert_eq!(check_media_path_list(ok), Ok(()), "{ok:?}");
+        }
+    }
+
+    /// The review's typos: each would be written, reported applied, and read by
+    /// the device as nothing.
+    #[test]
+    fn a_spelling_no_device_can_read_is_refused() {
+        let long = "x".repeat(33);
+        let many = vec!["a"; 33].join(",");
+        for bad in [
+            "media-plan",
+            "Media_Plan",
+            "media_plan;stats",
+            "media plan",
+            long.as_str(),
+            many.as_str(),
+        ] {
+            assert!(check_media_path_list(bad).is_err(), "{bad:?}");
+        }
     }
 }

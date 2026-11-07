@@ -432,6 +432,38 @@ async fn a_pushed_media_plan_entry_takes_the_next_sessions_plan_away_with_no_res
         "media_plan is on this session's old path"
     );
 
+    // What the door refuses, from the review: a spelling no device can read is
+    // a 400 (it would be written, reported applied, and read as nothing), and
+    // the key that turns new code on is the device's, a 403. Neither moves the
+    // stored revision.
+    for (body, want) in [
+        (json!({ "rc_media_legacy": "media-plan" }), 400),
+        (json!({ "rc_media_legacy": "Media_Plan" }), 400),
+        (json!({ "rc_media_legacy": "media_plan;stats" }), 400),
+        (json!({ "rc_media_canary": "media_plan" }), 403),
+    ] {
+        let resp = app
+            .auth_put(&desired, &seeded.admin.access_token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), want, "{body}");
+    }
+    let row: Value = app
+        .auth_get(&url, &seeded.admin.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        row["remote_config"]["desired"]["revision"].as_u64(),
+        Some(revision),
+        "a refused body stores nothing: {row}"
+    );
+
     viewer.pc.close().await.ok();
     let _ = stop_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), sig).await;

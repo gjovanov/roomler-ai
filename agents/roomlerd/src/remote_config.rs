@@ -266,17 +266,62 @@ impl RemoteConfigServices {
     /// the legacy list, so the switch it always was keeps working beside the
     /// pushable one.
     pub fn media_paths(&self) -> crate::media_paths::MediaPaths {
-        use crate::media_paths::{MediaPath, parse, resolve};
+        self.media_paths_with(None)
+    }
+
+    /// [`Self::media_paths`], with the legacy entries a delegating daemon sent
+    /// along with the session (`SessionParams::media_legacy`) added to this
+    /// process's own. On a supervised Mac the GUI worker builds the peer from
+    /// its own file, which a push to the root's row never reaches; the
+    /// daemon's entries can only send a path back, so adding them can never
+    /// turn new code on.
+    pub fn media_paths_with(&self, delegated: Option<&str>) -> crate::media_paths::MediaPaths {
+        use crate::media_paths::{parse, resolve};
         let keys = self
             .media_keys
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        let mut legacy = Self::legacy_entries(&keys);
+        for p in parse(delegated).paths {
+            if !legacy.paths.contains(&p) {
+                legacy.paths.push(p);
+            }
+        }
+        resolve(&legacy, &parse(keys.canary.as_deref()))
+    }
+
+    /// This process's legacy entries: its key, and R2's env switch folded in
+    /// as a `media_plan` entry marked as the environment's.
+    fn legacy_entries(keys: &MediaKeys) -> crate::media_paths::Entries {
+        use crate::media_paths::{MediaPath, parse};
         let mut legacy = parse(keys.legacy.as_deref());
         if !crate::media_plan::enabled() && !legacy.paths.contains(&MediaPath::MediaPlan) {
             legacy.paths.push(MediaPath::MediaPlan);
+            legacy.from_env.push(MediaPath::MediaPlan);
         }
-        resolve(&legacy, &parse(keys.canary.as_deref()))
+        legacy
+    }
+
+    /// FR-135 §7.1 — the legacy entries a delegated session carries to the
+    /// macOS GUI worker (`SessionParams::media_legacy`): this daemon's own, the
+    /// env fold included, by name. `None` when there are none, so an idle key
+    /// adds nothing to the frame.
+    pub fn media_legacy_for_delegate(&self) -> Option<String> {
+        let keys = self
+            .media_keys
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let legacy = Self::legacy_entries(&keys);
+        (!legacy.paths.is_empty()).then(|| {
+            legacy
+                .paths
+                .iter()
+                .map(|p| p.wire())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
     }
 
     /// FR-132 P1c — record what this process started on, from the config it
@@ -1013,6 +1058,57 @@ mod tests {
         cfg.rc_media_canary = None;
         svc.adopt_local(&cfg);
         assert_eq!(svc.media_paths(), crate::media_paths::MediaPaths::default());
+    }
+
+    /// FR-135 §7.1, the review's bug on a supervised Mac: a push to the root's
+    /// row reaches the daemon's holder, while the GUI worker builds the peer
+    /// from its own file. So a delegated session carries the daemon's entries
+    /// (`media_legacy_for_delegate`), and the worker adds them to its own
+    /// (`media_paths_with`). Adding them only ever sends a path back: a
+    /// worker's own canary loses to them, and nothing in them turns code on.
+    #[test]
+    fn a_delegated_session_carries_the_daemons_legacy_entries_to_the_worker() {
+        use crate::media_paths::MediaPath;
+        let new_svc = || {
+            RemoteConfigServices::new(
+                std::env::temp_dir().join("fr135-delegate-unused.toml"),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                false,
+            )
+        };
+        let daemon = new_svc();
+        let worker = new_svc();
+        assert_eq!(daemon.media_legacy_for_delegate(), None, "nothing to carry");
+
+        let mut root_cfg = crate::config::test_fixture();
+        root_cfg.rc_media_legacy = Some("media_plan, later_phase".into());
+        daemon.adopt_local(&root_cfg);
+        assert_eq!(
+            daemon.media_legacy_for_delegate().as_deref(),
+            Some("media_plan"),
+            "by name, the names this build knows"
+        );
+
+        // The worker's own file is the person's, and says nothing.
+        assert!(worker.media_paths().is_new(MediaPath::MediaPlan));
+        let carried = daemon.media_legacy_for_delegate();
+        let s = worker.media_paths_with(carried.as_deref());
+        assert!(
+            !s.is_new(MediaPath::MediaPlan),
+            "the root's push reaches the session"
+        );
+
+        // Its own canary for the same path loses to the daemon's legacy.
+        let mut person_cfg = crate::config::test_fixture();
+        person_cfg.rc_media_canary = Some("media_plan".into());
+        worker.adopt_local(&person_cfg);
+        let s = worker.media_paths_with(carried.as_deref());
+        assert!(!s.is_new(MediaPath::MediaPlan));
+        assert_eq!(s.refused_wire(), vec!["media_plan:legacy"]);
+
+        // And a frame that carries nothing (an older daemon) changes nothing.
+        assert_eq!(worker.media_paths_with(None), worker.media_paths());
     }
 
     /// FR-132 P1 — a pushed GPU-input denylist is written and reported as

@@ -216,10 +216,13 @@
           to that stage's old code. The kill switch for a new stage that
           misbehaves. Whole names only; a name the device's build does not know
           is ignored. Blank = not managed (the device keeps its own);
-          <code>none</code> = no entries. It only ever goes back to old code,
-          so no extra permission bit; it applies from the device's next session,
-          with no restart. Turning a new stage on early is the device's own
-          setting, and cannot be pushed.
+          <code>none</code> = no entries, which also clears an entry set on the
+          device itself. It can send sessions back to old code or clear the
+          list, never turn a new stage on early, so no extra permission bit; it
+          applies from the device's next session, with no restart. Turning a new
+          stage on early is the device's own setting, and cannot be pushed. A
+          device whose agent predates this key ignores it and reports the push
+          applied.
         </div>
         <!-- FR-130 P1b — four states, because a tribool key has three and a
              request adds "not managed". Cleared and "default" differ: the

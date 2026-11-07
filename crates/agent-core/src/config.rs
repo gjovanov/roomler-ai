@@ -1481,9 +1481,13 @@ pub struct AgentConfig {
     /// Unset or `none` = no entries. Entries match whole names, never a prefix;
     /// an unknown name is ignored. LIVE: read at each session's open, so the
     /// next session runs the new value with no restart. Pushable through remote
-    /// config, because it can only send a session back to code it already ran.
-    /// Beats `rc_media_canary`. Temporary: it is removed when FR-135's last old
-    /// path is deleted.
+    /// config: a push can send sessions back to code they already ran, or clear
+    /// the list to the defaults, never turn new code on early. Pushed and local
+    /// values share this one key, so a cleared push also clears an entry set
+    /// here, as `zero_copy_deny`'s does. On a supervised Mac the root's entries
+    /// travel with each session to the GUI worker that builds it. Beats
+    /// `rc_media_canary`. Temporary: it is removed when FR-135's last old path
+    /// is deleted.
     #[serde(default)]
     pub rc_media_legacy: Option<String>,
     /// FR-135 §7.1 — media paths a session runs on their NEW code before the

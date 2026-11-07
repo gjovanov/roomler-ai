@@ -2952,21 +2952,8 @@ pub fn validate_fps_denylist(v: &str) -> Result<(), String> {
 /// here: the names belong to the daemon's build, which ignores one it does not
 /// know, so a name from a newer FR-135 phase is not a typo to this crate.
 pub fn validate_media_path_list(key: &str, v: &str) -> Result<(), String> {
-    if v.trim() == "none" {
-        return Ok(());
-    }
-    for entry in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if entry.len() > 32
-            || !entry
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        {
-            return Err(format!(
-                "{key} entry {entry:?} must be a path name: lowercase letters, digits and underscores (e.g. media_plan)"
-            ));
-        }
-    }
-    Ok(())
+    // The one check the server's door runs too, so the two never disagree.
+    roomler_ai_remote_control::models::check_media_path_list(v).map_err(|e| format!("{key}: {e}"))
 }
 
 /// FR-118 — `zero_copy_deny` entries are `name:gpu`: a plain FFmpeg encoder

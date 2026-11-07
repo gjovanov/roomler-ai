@@ -125,22 +125,34 @@ impl MediaPath {
             .filter(move |p| p.needed_by().contains(&self))
     }
 
-    /// Whether this build has the path's new code. A canary entry for a path
-    /// without it is refused, so a phase's name reads the same on an agent from
-    /// before that phase as a typo does.
-    pub const fn built(self) -> bool {
-        matches!(self, MediaPlan)
-    }
-
-    /// The built-in default once no key speaks: the new code, for a path whose
-    /// phase has flipped it.
-    const fn new_by_default(self) -> bool {
-        matches!(self, MediaPlan)
+    /// Whether this build has the path's new code ([`Rules::THIS_BUILD`]).
+    pub fn built(self) -> bool {
+        Rules::THIS_BUILD.built & self.bit() != 0
     }
 
     const fn bit(self) -> u16 {
         1 << self as u16
     }
+}
+
+/// Which paths a build has new code for, and which of them it runs by default.
+/// One per build, [`Rules::THIS_BUILD`]; a parameter only so the tests can walk
+/// builds that do not exist yet, where the requirement rules can fire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rules {
+    /// Paths with new code. A canary entry for a path without it is refused,
+    /// so a later phase's name reads on an earlier agent as a typo does.
+    pub built: u16,
+    /// Paths whose built-in default is the new code: a phase that has flipped.
+    pub new_by_default: u16,
+}
+
+impl Rules {
+    /// This build: R2's plan has new code, on by default.
+    pub const THIS_BUILD: Rules = Rules {
+        built: MediaPlan.bit(),
+        new_by_default: MediaPlan.bit(),
+    };
 }
 
 impl fmt::Display for MediaPath {
@@ -152,7 +164,8 @@ impl fmt::Display for MediaPath {
 /// Why a canary entry did not turn its path on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// `rc_media_legacy` names the same path, and legacy beats canary.
+    /// `rc_media_legacy` sends the path back, by naming it or a path it stands
+    /// on, and legacy beats canary.
     Legacy,
     /// This build has no new code for the path.
     NotBuilt,
@@ -176,6 +189,10 @@ pub struct Entries {
     pub paths: Vec<MediaPath>,
     /// Entries no path of this build is named: ignored, and logged.
     pub unknown: Vec<String>,
+    /// Paths in `paths` that came from the environment, not from a key
+    /// (`ROOMLERD_MEDIA_PLAN=0`, R2's first switch). They send a path back as
+    /// a key's entry does, and alone they are not worth a log line per session.
+    pub from_env: Vec<MediaPath>,
 }
 
 /// Read a key's comma list. Entries are trimmed and matched whole, by equality
@@ -201,8 +218,11 @@ pub fn parse(value: Option<&str>) -> Entries {
 pub struct MediaPaths {
     /// The paths on their old code, one bit each.
     old: u16,
-    /// `rc_media_legacy`'s entries this build knows, as listed.
+    /// `rc_media_legacy`'s entries this build knows, in [`MediaPath::ALL`]'s
+    /// order (the environment's included, which `from_env` names apart).
     legacy: Vec<MediaPath>,
+    /// Those of `legacy` that came from the environment alone.
+    from_env: Vec<MediaPath>,
     /// Paths on their old code because a path they stand on is, and that
     /// `rc_media_legacy` does not list itself.
     implied: Vec<MediaPath>,
@@ -227,13 +247,15 @@ impl MediaPaths {
         self.old & path.bit() == 0
     }
 
-    /// Whether either key said anything this session should be told about.
+    /// Whether either key said anything this session should be told about. The
+    /// environment's own entries do not count: a host that set
+    /// `ROOMLERD_MEDIA_PLAN=0` before the keys existed logs nothing new.
     pub fn any_key(&self) -> bool {
-        !(self.legacy.is_empty()
-            && self.implied.is_empty()
-            && self.canary.is_empty()
-            && self.refused.is_empty()
-            && self.unknown.is_empty())
+        self.legacy.iter().any(|p| !self.from_env.contains(p))
+            || !(self.implied.is_empty()
+                && self.canary.is_empty()
+                && self.refused.is_empty()
+                && self.unknown.is_empty())
     }
 
     /// The paths `rc_media_legacy` sent back, listed or implied, for
@@ -265,6 +287,7 @@ impl MediaPaths {
         tracing::info!(
             %session_id,
             legacy = ?names(&self.legacy),
+            from_env = ?names(&self.from_env),
             implied = ?names(&self.implied),
             canary = ?names(&self.canary),
             refused = ?self.refused_wire(),
@@ -275,8 +298,15 @@ impl MediaPaths {
 }
 
 /// Decide each path, in [`MediaPath::ALL`]'s order: legacy, then canary, then
-/// the built-in default. Pure, so every combination is testable.
+/// the built-in default, under this build's [`Rules`].
 pub fn resolve(legacy: &Entries, canary: &Entries) -> MediaPaths {
+    resolve_with(legacy, canary, Rules::THIS_BUILD)
+}
+
+/// [`resolve`] under any [`Rules`]. Pure, so every combination is testable.
+pub fn resolve_with(legacy: &Entries, canary: &Entries, rules: Rules) -> MediaPaths {
+    let built = |p: MediaPath| rules.built & p.bit() != 0;
+    let new_by_default = |p: MediaPath| rules.new_by_default & p.bit() != 0;
     // Old because `rc_media_legacy` says so, directly or through a path it
     // stands on. ALL's order puts every requirement first, so one pass closes
     // the set.
@@ -291,6 +321,10 @@ pub fn resolve(legacy: &Entries, canary: &Entries) -> MediaPaths {
         legacy: MediaPath::ALL
             .into_iter()
             .filter(|p| legacy.paths.contains(p))
+            .collect(),
+        from_env: MediaPath::ALL
+            .into_iter()
+            .filter(|p| legacy.from_env.contains(p))
             .collect(),
         implied: MediaPath::ALL
             .into_iter()
@@ -317,7 +351,7 @@ pub fn resolve(legacy: &Entries, canary: &Entries) -> MediaPaths {
             false
         } else if asked {
             // A requirement decided earlier in this pass, by any of the three.
-            match (p.built(), p.requires().find(|r| out.old & r.bit() != 0)) {
+            match (built(p), p.requires().find(|r| out.old & r.bit() != 0)) {
                 (false, _) => {
                     out.refused.push((p, Refusal::NotBuilt));
                     false
@@ -335,7 +369,7 @@ pub fn resolve(legacy: &Entries, canary: &Entries) -> MediaPaths {
             // A default stands on its requirements too, so a phase that flips
             // one path's default before the path under it cannot put new code
             // over old.
-            p.new_by_default() && p.requires().all(|r| out.old & r.bit() == 0)
+            new_by_default(p) && p.requires().all(|r| out.old & r.bit() == 0)
         };
         if !new {
             out.old |= p.bit();
@@ -351,9 +385,34 @@ mod tests {
     fn entries(paths: &[MediaPath]) -> Entries {
         Entries {
             paths: paths.to_vec(),
-            unknown: Vec::new(),
+            ..Entries::default()
         }
     }
+
+    fn default_new(rules: Rules, p: MediaPath) -> bool {
+        rules.new_by_default & p.bit() != 0
+    }
+
+    /// The closure of `listed` under `needed_by`, computed apart from
+    /// `resolve`, by fixpoint rather than by ALL's order.
+    fn closure(listed: &[MediaPath]) -> u16 {
+        let mut set = listed.iter().fold(0u16, |a, p| a | p.bit());
+        loop {
+            let next = MediaPath::ALL.into_iter().fold(set, |a, p| {
+                if set & p.bit() != 0 {
+                    p.needed_by().iter().fold(a, |b, q| b | q.bit())
+                } else {
+                    a
+                }
+            });
+            if next == set {
+                return set;
+            }
+            set = next;
+        }
+    }
+
+    const EVERY: u16 = (1 << 12) - 1;
 
     fn subset(mask: u16) -> Vec<MediaPath> {
         MediaPath::ALL
@@ -437,7 +496,7 @@ mod tests {
     fn no_key_is_the_defaults() {
         let d = MediaPaths::default();
         for p in MediaPath::ALL {
-            assert_eq!(d.is_new(p), p.new_by_default(), "{p}");
+            assert_eq!(d.is_new(p), default_new(Rules::THIS_BUILD, p), "{p}");
         }
         assert!(!d.any_key());
         assert!(d.legacy_wire().is_empty() && d.refused_wire().is_empty());
@@ -478,14 +537,70 @@ mod tests {
         assert_eq!(s.implied, vec![EncodeStage, RtpSink, HighRefresh]);
     }
 
-    /// A canary entry for a path this build has no new code for is refused,
-    /// and so is one whose requirement is on the old path.
+    /// A canary entry for a path this build has no new code for is refused.
     #[test]
-    fn a_canary_entry_is_refused_without_its_code_or_its_requirement() {
+    fn a_canary_entry_is_refused_without_its_code() {
         let s = resolve(&Entries::default(), &entries(&[EncodeStage]));
         assert!(!s.is_new(EncodeStage));
         assert_eq!(s.refused, vec![(EncodeStage, Refusal::NotBuilt)]);
         assert_eq!(s.refused_wire(), vec!["encode_stage:not_built"]);
+    }
+
+    /// On a build where a path has new code but a path under it is still old
+    /// by default, its canary entry is refused for that requirement, and a
+    /// default stands on its requirements: neither branch can fire in this
+    /// build, where only `media_plan` has new code and it stands on nothing.
+    #[test]
+    fn a_requirement_on_the_old_path_holds_a_canary_and_a_default_back() {
+        let built_all = Rules {
+            built: EVERY,
+            new_by_default: 0,
+        };
+        let s = resolve_with(&Entries::default(), &entries(&[EncodeStage]), built_all);
+        assert!(!s.is_new(EncodeStage));
+        assert_eq!(
+            s.refused,
+            vec![(EncodeStage, Refusal::Requires(CaptureWait))]
+        );
+        assert_eq!(s.refused_wire(), vec!["encode_stage:requires:capture_wait"]);
+
+        let s = resolve_with(
+            &Entries::default(),
+            &entries(&[CaptureWait, CaptureStage, DcSink, EncodeStage]),
+            built_all,
+        );
+        assert!(s.is_new(EncodeStage), "with what it stands on, it takes");
+        assert!(s.refused.is_empty());
+
+        let early_flip = Rules {
+            built: EVERY,
+            new_by_default: EncodeStage.bit(),
+        };
+        let s = resolve_with(&Entries::default(), &Entries::default(), early_flip);
+        assert!(
+            !s.is_new(EncodeStage),
+            "a default over old requirements stays old"
+        );
+    }
+
+    /// `ROOMLERD_MEDIA_PLAN=0` sends the plan back as a key's entry does, and
+    /// alone it is not a log line: such a host logged nothing new before.
+    #[test]
+    fn the_environments_entry_alone_is_not_a_key() {
+        let env_only = Entries {
+            paths: vec![MediaPlan],
+            from_env: vec![MediaPlan],
+            ..Entries::default()
+        };
+        let s = resolve(&env_only, &Entries::default());
+        assert!(!s.is_new(MediaPlan));
+        assert!(!s.any_key(), "the environment alone logs nothing");
+        let with_key = Entries {
+            paths: vec![MediaPlan, Stats],
+            from_env: vec![MediaPlan],
+            ..Entries::default()
+        };
+        assert!(resolve(&with_key, &Entries::default()).any_key());
     }
 
     /// Unknown names are reported once, from either key, and change nothing.
@@ -494,18 +609,50 @@ mod tests {
         let s = resolve(&parse(Some("later,stats_v2")), &parse(Some("later")));
         assert_eq!(s.unknown, vec!["later".to_string(), "stats_v2".to_string()]);
         for p in MediaPath::ALL {
-            assert_eq!(s.is_new(p), p.new_by_default(), "{p}");
+            assert_eq!(s.is_new(p), default_new(Rules::THIS_BUILD, p), "{p}");
         }
         assert!(s.any_key(), "it is still worth a log line");
     }
 
-    /// §7.1: "A unit test walks every combination." Every legacy subset of the
-    /// twelve, against no canary, each single canary entry, and every canary
-    /// subset against no legacy: about 57,000 sessions, each held to the rules.
+    /// §7.1: "A unit test walks every combination." Under this build's rules and
+    /// under three builds that do not exist yet (every path built and none on,
+    /// every path built and on, and one where a path flips before the paths it
+    /// stands on): every legacy subset of the twelve, against no canary, each
+    /// single canary entry, and every canary subset against no legacy. About
+    /// 230,000 sessions, each held to the rules.
     #[test]
     fn every_combination_keeps_the_rules() {
+        let builds = [
+            Rules::THIS_BUILD,
+            Rules {
+                built: EVERY,
+                new_by_default: 0,
+            },
+            Rules {
+                built: EVERY,
+                new_by_default: EVERY,
+            },
+            Rules {
+                built: EVERY,
+                new_by_default: EncodeStage.bit() | RtpSink.bit() | MediaPlan.bit(),
+            },
+        ];
+        for rules in builds {
+            check_all(rules);
+        }
+    }
+
+    fn check_all(rules: Rules) {
         let check = |legacy: &[MediaPath], canary: &[MediaPath]| {
-            let s = resolve(&entries(legacy), &entries(canary));
+            let s = resolve_with(&entries(legacy), &entries(canary), rules);
+            // 6. What the plan names is exactly the closure of the listed
+            // entries: every forced path reported, and nothing else.
+            let reported = s
+                .legacy
+                .iter()
+                .chain(&s.implied)
+                .fold(0u16, |a, p| a | p.bit());
+            assert_eq!(reported, closure(legacy), "{rules:?} {legacy:?}");
             for p in MediaPath::ALL {
                 // 1. A listed legacy entry is always on the old path.
                 if legacy.contains(&p) {
@@ -520,7 +667,7 @@ mod tests {
                 // 3. New code needs either the default or a canary that took.
                 if s.is_new(p) {
                     assert!(
-                        p.new_by_default() || s.canary.contains(&p),
+                        default_new(rules, p) || s.canary.contains(&p),
                         "{legacy:?} {canary:?}: {p} new for no reason"
                     );
                 }

@@ -25,7 +25,7 @@ The rest of the design follows from taking that sentence seriously.
 
 Everything is P2P over the session's existing `control` data channel — no
 server change, and the server never sees a window title. `peer.rs` routes three
-envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11244`),
+envelopes to `apps::handle_control_message` (`agents/roomlerd/src/peer.rs:11251`),
 runs it on `spawn_blocking` because every backend shells out or calls FFI, and
 sends the returned reply back on the same channel. The request/reply shape and
 the id correlation are `rc:logs-fetch`'s.
@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:39`,
 `:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
-(`agents/roomlerd/src/signaling.rs:1514`, `:2195`)
+(`agents/roomlerd/src/signaling.rs:1518`, `:2199`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -487,10 +487,10 @@ label    = "Safari"
 
 | Key | Where | Default | Notes |
 |---|---|---|---|
-| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1854`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
+| `virtual_desktop_apps.enabled` | config (`crates/agent-core/src/apps_config.rs:21`); `roomler config get virtual_desktop_apps` prints the JSON (`config_surface.rs:1872`) | `true` | the kill switch; the hello stops advertising `list` (on a caps-cache hit **and** a miss, since the review of #1667 — §4.3), and a request answers `disabled` |
 | `virtual_desktop_apps.allowlist.<key>` | config | `bash` on Linux and macOS, `cmd` on Windows | `command` is argv; an empty command is skipped from `launchable` and refused on launch. On a Mac a `terminal`/`tmux` entry opens a new Terminal window running it, and an app is `["open", "-b", "<bundle id>"]` (§2b) |
 | `ROOMLERD_APPS` | env (`apps::APPS_ENV`); published as `0` by `env_fallbacks` from a config that says `false` | unset | FR-97 P2c — a **floor**: `0`/`false`/`no`/`off` switches Remote Apps off (`switched_off`), nothing switches them on. A supervised Mac's root forwards it to its GUI worker, which is how the root's `enabled = false` reaches the sessions |
-| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1183`) | **off** | P4 — attended by construction; restart required |
+| `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1185`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
 `roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6764`) answers the whole
@@ -508,7 +508,7 @@ The prose beside an empty list says explicitly that empty is not unsupported
 and that native Wayland windows would not appear even if present. ⚠️ Before P6
 the probe ran on the built-in default config, so it could print
 `apps supported: true` on a device whose owner had disabled the feature. It
-reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2950`),
+reads the file with FR-66's `read_if_present` (`crates/agent-core/src/config.rs:2971`),
 not `load`: `load` self-heals — an unreadable live file logs *the host must be
 re-enrolled* and can promote the `.prev` copy back over it — and a diagnostic
 must never write the device's config as a side effect of being run.

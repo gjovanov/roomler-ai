@@ -206,7 +206,7 @@ the "unknown" half and the code does not implement it.** The enum is a plain
 and no custom decoder. `#[serde(default)]` on `NetmapPeer.relay_strategy` (`:2156`) handles a
 *missing* field, not an *unrecognised* one. An unknown tag is a hard serde error failing the
 **entire enclosing `ServerMsg`**, and the agent's parse arm swallows it at `debug!`
-(`agents/roomlerd/src/signaling.rs:1774`).
+(`agents/roomlerd/src/signaling.rs:1778`).
 
 Add a variant carelessly and every pre-FR-19 agent **drops whole netmap frames** and stops
 installing peers — a fleet-wide outage delivered by the server, visible only at `debug!`.
@@ -701,7 +701,7 @@ the counter was added without a reader"*. Still true: `stale_drops()`
 | server | `peer_relay_audit` (90 d TTL) — every **approval**, mint and refusal, reason enumerated, written in one place via `decide() -> Result<Granted, DenyReason>`, read behind `VIEW_EXEC_AUDIT` (`VIEW_RELAY_AUDIT` after #888). **P3b:** `GET …/peer-relay-audit` (`?agent_id=`), one row shape for both actions (`action: approve \| mint`) so "who made this device a relay, and what went through it?" is one query on `agent_id`; `PeerRelayDenyReason` is the enumerated vocabulary (12 arms, wire-locked) |
 
 ⚠️ An empty `relay_via` is not evidence of "no relay available" — it may mean the node never
-measured (`signaling.rs:2144`).
+measured (`signaling.rs:2148`).
 ⚠️ `relay_via` must resolve from **the requesting tenant's own node row**. A multi-org
 device has N per-tenant rows with independently-set names; resolving from any other would
 leak tenant A's label for a shared device to tenant B, against `docs/multi-org.md:87-90`.
@@ -730,8 +730,8 @@ Verified against `origin/master`, 2026-08-28.
 | CLI surfaces | `agents/roomler-cli/src/localclient.rs:1047` (`relay_qualified_label`), `:271` (`print_why`), `:160` (`netcheck`) |
 
 **Config keys** — four wiring points each, per the contract at
-`crates/agent-core/src/config_surface.rs:36-38`: field on `AgentConfig`; `const KEYS` entry
-(`config_surface.rs:40`); getter + setter arms; and `env_bridge_bools` (`config.rs:3108`),
+`crates/agent-core/src/config_surface.rs:38-40`: field on `AgentConfig`; `const KEYS` entry
+(`config_surface.rs:42`); getter + setter arms; and `env_bridge_bools` (`config.rs:3131`),
 whose return type is `[(&'static str, Option<bool>); 54]` — **a fixed-size array whose
 length must be bumped** — with `env_bridge_pairs_have_surface_parity` enforcing the pairing.
 
