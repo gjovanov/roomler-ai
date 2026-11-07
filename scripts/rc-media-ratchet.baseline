@@ -3,7 +3,7 @@
 # the ledger row it adds and when that row retires:
 #   pump_lines_ffmpeg_dc=3950 # r0:FOO-1: retires with R8's delete
 # Set at FR-135 R0b, on the instruments it added to both data-channel pumps.
-agent_env_reads=177
+agent_env_reads=178 # r9:ENV-1: stays, a test-only fixture switch
 viewer_knobs=31
 pump_lines_rtp=1312
 pump_lines_vp9_dc=1465
