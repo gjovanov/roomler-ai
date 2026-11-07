@@ -1635,7 +1635,7 @@ A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `a_ticketed_ssh_request_is_refused_and_audited`
 (`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
 (`:118`) and `ssh_audit_rows_written_before_p2_still_load`
-(`crates/remote_control/src/models.rs:8837`) lock it. The other surfaces FR-90
+(`crates/remote_control/src/models.rs:8857`) lock it. The other surfaces FR-90
 left reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
