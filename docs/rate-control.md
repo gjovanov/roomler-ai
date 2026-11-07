@@ -1441,6 +1441,12 @@ converge under.
 | FR-59 P1 — floor relief | the legibility floor descends toward `0.85 × measured`, floored at `slow_link_min_bitrate` | evidence-gated for an UNREMEMBERED pair: with no measurement it is byte-for-byte unchanged. A remembered pair's seed stands in for the measurement (FR-59 P8) — and since FR-70 P1 it **decays** (`prior_bps`) instead of holding the floor AND the P2 queue budget at the memory for the session, which on 2026-09-04 kept a session at 200 kbps for four minutes while the budget it set prevented the very measurement that would have freed it |
 | FR-59 P3 — arrival clamp | the ceiling is bounded by what the VIEWER reports arriving while its transit queue grows | constrained paths only; applied AFTER the learner, because a live report outranks past evidence |
 
+⚠️ The viewer reads that growth (`queue_ms`) when a frame is painted, so a decoder
+falling behind reports as a growing queue. Since FR-135 R3 the viewer also sends
+`queue_arr_ms`, the same sum read when each frame arrives, before the decoder. No
+agent reads it yet; FR-63's B2 chooses between the two
+([remote-control.md §11.14.2](remote-control.md#11142-the-arrival-reading-queue_arr_ms)).
+
 ⚠️ The two are **coupled**, and the coupling is not obvious: `set_ceiling`
 raises any ceiling back up to the floor, so the P3 clamp is silently undone
 unless the P1 relief lowers the floor with it. That coupling bit FR-63's opener

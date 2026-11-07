@@ -138,9 +138,9 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:2436–2537`, parser `peer.rs:11285–11363`): `frames_lost`
-(chunk gaps, already in `rc-dc-worker.ts:408`), `frames_rx`, `delay_slope_ms_s` (least-squares
-slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:102–138` already
+`decodeStatWireMessage` `useRemoteControl.ts:2437–2549`, parser `peer.rs:11285–11363`): `frames_lost`
+(chunk gaps, already in `rc-dc-worker.ts:421`), `frames_rx`, `delay_slope_ms_s` (least-squares
+slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:106–145` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
 pins; floor is a constant per path (`area_min_bitrate_bps` direct, 200 k constrained), ceiling =
 `rate_plan` × shared split × encode factor, bounded by `relay_max_hi_bps` on Relay. **Priors:**
@@ -174,7 +174,7 @@ buffer_bytes, loss_pct, rtt_ms, stalls }` (token-bucket FIFO, arrival = `max(pre
 bytes×8/rate`, frozen in stalls, tail-drop, seeded loss, reports blocked time in the `GoodputSink`
 shape); `EncoderSim { fps, target, motion(t) }` (CBR bytes, IDR = 25×, set_bitrate with/without an
 IDR); `ViewerSim` folding arrivals into decodestat-shaped windows (age, rx_bps, `queue_ms =
-Σ(Δarrival−Δwire)` — the same formula as `rc-hop-stats.ts:112–127`, loss, slope). Harness
+Σ(Δarrival−Δwire)` — the same formula as `rc-hop-stats.ts:119–134`, loss, slope). Harness
 `run(scenario, ctl) → Trace` with assertions `settling_time`, `steady_state_error ≤ 15 %`, `p95 age ≤
 floor + 150 ms`, `idr_count`, `pauses_on_direct == 0`. **Trace-replay fixtures** (CSV, one row per
 2-s heartbeat: `t_s,target_bps,frames_encoded_d,bytes_d,bytes_inflight,goodput_bps,viewer_age_ms,

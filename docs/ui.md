@@ -93,13 +93,21 @@ flowchart TB
   painted counts, and whether the decoder is hardware, folded into its 1 s `stats`
   message for the agent (FR-135 R0,
   [remote-control.md §11.13.1](remote-control.md#11131-the-viewers-half-r0c)).
+  The page relays the `video-bytes` channel to it, one `postMessage` per
+  message; under `roomler-rc-dc-worker=1`, where the browser can transfer an
+  `RTCDataChannel`, the page moves the channel itself into the worker instead.
+  The default is the relay until FR-135's S11 reads the move
+  ([remote-control.md §11.14.1](remote-control.md#11141-the-channel-in-the-worker-roomler-rc-dc-worker)).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
   detection; HEVC-over-DC is offered only when *agent hardware encode × viewer
   hardware decode* both hold.
 - **Transport control**: auto-pick, priority dial (balanced / sharper / smoother),
   keyframe requests, decoder-stats feedback to the agent (`rc:decodestat` — drives
   its frame-skip rate control, and since FR-135 R0 also carries the worker's media
-  window, which only records), one `rc:decode-error` per decode error, counted into
+  window, which only records; since R3 also `queue_arr_ms`, the transit queue read
+  at arrival beside `queue_ms`, which no agent reads yet:
+  [remote-control.md §11.14.2](remote-control.md#11142-the-arrival-reading-queue_arr_ms)),
+  one `rc:decode-error` per decode error, counted into
   the session's stats (FR-132 P1,
   [remote-control.md §11.10](remote-control.md#1110-the-viewers-decode-errors-fr-132-p1)),
   a data-channel decoder that fails after its first frame replaced in place, off with
@@ -153,7 +161,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7784`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7835`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
