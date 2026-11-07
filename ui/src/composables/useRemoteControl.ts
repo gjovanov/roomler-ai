@@ -10990,6 +10990,10 @@ export function useRemoteControl(
           hint: parsed.hint,
         }
         mediaWaitingSinceMs = Date.now()
+        // FR-135 R0c — the pumps send nothing while capture waits, so the
+        // decode workers must not count the gap across the hold as a freeze.
+        hevcWorker?.postMessage({ type: 'media-hold' })
+        vp9_444Worker?.postMessage({ type: 'media-hold' })
         console.info(
           `[rc] the host is waiting for the person at the screen (${parsed.for}), up to ${Math.round(parsed.waitsMs / 1000)} s`,
         )

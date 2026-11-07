@@ -139,6 +139,8 @@ type RenderModeMessage = { type: 'render-mode'; sharpen?: string; sharpness?: nu
 type ClockOffsetMessage = { type: 'clock-offset'; offsetUs: number | null }
 /** FR-16 L4 — the main thread just sent bench probe `seq`. */
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
+/** FR-135 R0c — the agent announced a capture hold (`rc:media-waiting`). */
+type MediaHoldMessage = { type: 'media-hold' }
 type CloseMessage = { type: 'close' }
 type IncomingMessage =
   | InitCanvasMessage
@@ -147,6 +149,7 @@ type IncomingMessage =
   | RenderModeMessage
   | ClockOffsetMessage
   | BenchArmMessage
+  | MediaHoldMessage
   | CloseMessage
 
 const HEADER_BYTES = 13
@@ -485,6 +488,9 @@ workerScope.onmessage = (e) => {
     viewport = { cssW: msg.cssW, cssH: msg.cssH, dpr: msg.dpr }
   } else if (msg.type === 'clock-offset') {
     clockOffsetUs = typeof msg.offsetUs === 'number' ? msg.offsetUs : null
+  } else if (msg.type === 'media-hold') {
+    // FR-135 R0c — the agent announced a capture hold: its gap is no freeze.
+    mediaWindow.onHold()
   } else if (msg.type === 'bench-arm') {
     bench.arm(msg.seq)
   } else if (msg.type === 'render-mode') {

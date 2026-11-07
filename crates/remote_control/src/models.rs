@@ -5975,8 +5975,8 @@ pub struct SessionVideo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frames_painted: Option<u64>,
     /// FR-135 R0 (N11) — the viewer's freezes: two painted frames more than
-    /// 200 ms apart, counted by its decode worker. A still screen is re-sent
-    /// every 60 ms, so a healthy session has none.
+    /// 200 ms apart, counted by its decode worker, which restarts its clock at
+    /// a capture hold the agent announces (`rc:media-waiting`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freezes: Option<u32>,
 }

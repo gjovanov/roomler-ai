@@ -85,6 +85,33 @@ describe('FR-135 R0 — the recorder', () => {
     expect(take(r).freezes).toBe(0)
   })
 
+  it('counts no freeze across a capture hold the agent announced, and only that gap', () => {
+    const r = createViewerMediaRecorder(async () => null)
+    r.onPainted(1_000, 1, 1)
+    // The display went off: the pumps send nothing, and about 2 s in the
+    // agent says so (rc:media-waiting). The first paint after it is no freeze.
+    r.onHold()
+    r.onPainted(9_000, 1, 2)
+    expect(take(r).freezes).toBe(0)
+    // Past the hold the clock runs again: a stall still counts.
+    r.onPainted(9_000 + FREEZE_GAP_MS + 1, 1, 3)
+    expect(take(r).freezes).toBe(1)
+  })
+
+  it('drops a gate wait that spans an announced hold: the wait was the host', () => {
+    const r = createViewerMediaRecorder(async () => null)
+    r.onPainted(0, 1, 1)
+    r.onGateArmed(100)
+    r.onHold()
+    r.onGateOpened(50)
+    r.onPainted(8_000, 1, 50)
+    expect(only(take(r).gate)).toEqual([])
+    // A recovery after the hold is timed as before.
+    r.onGateArmed(8_100)
+    r.onGateOpened(60)
+    r.onPainted(8_400, 1, 60)
+    expect(only(take(r).gate)).toEqual([logBucket(300)])
+  })
   it('times the gate from its first arming to the painted key frame, after the first paint only', () => {
     const r = createViewerMediaRecorder(async () => null)
     // Before the first paint the gate is the time to first frame: not timed.

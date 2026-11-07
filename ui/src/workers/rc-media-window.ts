@@ -37,8 +37,12 @@ export const MEDIA_BUCKETS = 12
 /** N11 — two painted frames further apart than this are a freeze. Both
  *  data-channel pumps re-send the last frame every 60 ms on a still screen
  *  (`IDLE_KEEPALIVE`) and the viewer-rate cap stops at 12 fps, so a healthy
- *  session never paints this far apart: a gap this long is a stall somewhere
- *  between the capture and the canvas. */
+ *  session paints closer than this, except across a capture hold: the pumps
+ *  send nothing while capture waits (a display off, a session away, a lock).
+ *  The agent announces a hold (`rc:media-waiting`, about 2 s in) and the
+ *  worker restarts its clock then ({@link ViewerMediaRecorder.onHold}). A hold
+ *  shorter than its announcement still counts once, and a host held below
+ *  5 fps (`ROOMLERD_FFMPEG_FPS`) counts every paint. */
 export const FREEZE_GAP_MS = 200
 
 /** The bucket a sample in ms lands in, as the agent buckets microseconds:
@@ -137,6 +141,10 @@ export interface ViewerMediaRecorder {
   /** N9 — ask the browser whether this decoder is hardware. A later ask, or a
    *  reset, drops an earlier ask's answer. */
   probeDecoderHw(codec: string, pref: DecodePref): void
+  /** N11, N12 — the agent announced a capture hold (`rc:media-waiting`): the
+   *  gap across it is the host waiting, not a stall. The freeze clock and a
+   *  gate wait restart at the next paint. */
+  onHold(): void
   /** The window for the stats message, and a fresh one; the cumulative counts
    *  carry on. */
   take(chunkGaps: number): ViewerMediaWindow
@@ -204,6 +212,11 @@ export function createViewerMediaRecorder(
         },
         () => undefined,
       )
+    },
+    onHold() {
+      lastPaintMs = null
+      gateSinceMs = null
+      gateKeyTsUs = null
     },
     take(chunkGaps) {
       return {

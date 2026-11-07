@@ -3231,7 +3231,7 @@ cumulative for the worker's session.
 | `chunk_gaps` | N9 | the framing layer's gaps (FR-17), cumulative |
 | `decoder_hw` | N9 | whether the browser says a hardware decoder takes this configuration: `isConfigSupported` with `prefer-hardware`, asked once per `configure()`, and `false` under `prefer-software` without asking. Absent until it answers, or when it cannot say. It can be wrong wherever `isConfigSupported` is |
 | `arr_gap_ms` | N10, the viewer's half | the interval between whole frames reaching the worker |
-| `freezes` | N11 | painted frames more than 200 ms apart. Both pumps re-send a still screen every 60 ms and the viewer-rate cap stops at 12 fps, so a healthy session has none |
+| `freezes` | N11 | painted frames more than 200 ms apart. Both pumps re-send a still screen every 60 ms and the viewer-rate cap stops at 12 fps, so a healthy session has none outside a capture hold: the pumps send nothing while capture waits (a display off, a session away, a lock), and the worker restarts its clock when the agent announces the hold (`rc:media-waiting`, about 2 s in). A hold shorter than its announcement still counts once, and a host held below 5 fps (`ROOMLERD_FFMPEG_FPS`) counts every paint |
 | `gate_ms` | N12, the viewer's half | from the key-frame gate closing after the first paint (a backlog drop, a chunk gap, or a decoder R1 rebuilt) to the paint of the key frame through it. The frames the decoder still held paint first and do not end the wait, and the first closing stands while one waits. R1's recovery is this case, timed from the failure |
 | `painted` | N16 | frames drawn to the canvas |
 
@@ -3243,6 +3243,10 @@ cumulative for the worker's session.
 | the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10924` |
 | the tally | windows summed between two heartbeats, and the counts as last reported | `SessionCounters::note_viewer_report` / `take_viewer_window`, `agents/roomlerd/src/session_telemetry.rs:229` |
 | the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:5930` |
+
+⚠️ **`frames_painted` and `freezes` are the viewer's word.** They are bounded on intake, never
+checked against what the agent sent. A read that takes painted frames as a cell's proof checks
+`frames_painted ≤ frames_encoded` and never rests on one session.
 
 **The heartbeat fields**, on the FFmpeg data-channel pump's line after R0b's, each `None` from a
 viewer that does not count and with `stats` old: `viewer_windows` (how many of the viewer's
@@ -3262,8 +3266,8 @@ not a short lowercase name or a size is left out (`buildL4Upload`, `ui/src/compo
 
 ⚠️ **Skew, both ways.** A new viewer on an older agent: the older arm reads only its own keys, so
 the new ones cost a few hundred bytes a second and nothing else. An older viewer on a new agent: no
-key, nothing kept, every field absent. A new agent under `rc_media_legacy=stats`: nothing kept, and
-the heartbeat and the reading are what they were before R0. An older server drops the two new
+key, nothing kept, every field absent. A new agent under `rc_media_legacy=stats`: nothing kept, the
+reading is what it was before R0, and the heartbeat's new fields read `None` under their names. An older server drops the two new
 fields from the reading and stores the rest. **Record, never decide**: the struggling bit, the
 backlog drop and `queueMs` are as they were, and FR-63's shadow reads what it read.
 
