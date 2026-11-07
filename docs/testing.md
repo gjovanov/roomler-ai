@@ -119,8 +119,8 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14769`,
-  `:15039`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14812`,
+  `:14902`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -179,7 +179,7 @@ any PR that touches `ui/`.
 | Case | Asserts |
 |---|---|
 | the relay | every frame decodes, the page's channel is not a husk, `fwd` counts the page's hop, and the far end's close reaches the page |
-| the channel in the worker | the transfer is taken and the page is left a closed husk, every frame decodes off the moved channel, `fwd` counts nothing while `arr_gap` counts every arrival, `queueArrMs` is read, and the far end's close reaches the worker |
+| the channel in the worker | the transfer is taken and the page is left a closed husk, the worker says it has the channel (`attached`) before it opens, every frame decodes off the moved channel, `fwd` counts nothing while `arr_gap` counts every arrival, `queueArrMs` is read, and the far end's close reaches the worker |
 | a refused transfer | `DataCloneError` leaves the channel on the page, whole, and the relay carries every frame |
 | every case | the size the worker paints is the picture's, 320×180. Chromium's software VP9 decoder reports a coded width 64 px wider, and with `classifyCrop` acting on VP9 this read 384×180 ([remote-control.md §11.14](remote-control.md#1114-one-data-channel-worker-fr-135-r3)) |
 

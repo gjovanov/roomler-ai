@@ -139,7 +139,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
 `decodeStatWireMessage` `useRemoteControl.ts:2437–2549`, parser `peer.rs:11285–11363`): `frames_lost`
-(chunk gaps, already in `rc-dc-worker.ts:421`), `frames_rx`, `delay_slope_ms_s` (least-squares
+(chunk gaps, already in `rc-dc-worker.ts:422`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:106–145` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of
 pins; floor is a constant per path (`area_min_bitrate_bps` direct, 200 k constrained), ceiling =

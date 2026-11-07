@@ -95,7 +95,8 @@ flowchart TB
   [remote-control.md §11.13.1](remote-control.md#11131-the-viewers-half-r0c)).
   The page relays the `video-bytes` channel to it, one `postMessage` per
   message; under `roomler-rc-dc-worker=1`, where the browser can transfer an
-  `RTCDataChannel`, the page moves the channel itself into the worker instead.
+  `RTCDataChannel`, the page moves the channel itself into the worker instead,
+  and a page whose move the worker does not confirm relays from then on.
   The default is the relay until FR-135's S11 reads the move
   ([remote-control.md §11.14.1](remote-control.md#11141-the-channel-in-the-worker-roomler-rc-dc-worker)).
 - **Support probes** per codec (H.264/HEVC/AV1/VP9): software + hardware decode
@@ -161,7 +162,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7835`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7850`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
