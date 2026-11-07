@@ -4636,17 +4636,20 @@ sequenceDiagram
   behind per tick (tokio rounds a sleep up to the next millisecond).
   After a resume the window is a few milliseconds wide, so random
   freezes almost never hit it. The field read (2026-11-07, a root
-  system daemon on an Ubuntu 24.04 lab guest) froze 70 s at 1–8 ms after the
-  thread's fourth check since the previous thaw. The release, 0.4.203,
-  exited on the first such round with `stuck_for` 70.0016 s.
+  system daemon on an Ubuntu 24.04 lab guest) froze the release,
+  0.4.203, for 70 s a round. Frozen 1–8 ms after the thread's fourth
+  check since the previous thaw, it exited in 9 rounds of 10, with
+  `stuck_for` 70.0001–70.0081 s; the tenth, at 1 ms, sat on the
+  window's edge. Frozen at a random phase, it exited in none of 10.
 
 **The lines a resume writes** (#3530). After the same freeze the agent
 blamed the network for a silence it had made itself: `half-open socket
 (middlebox still ACKs our pings)`, `signaling connect failed` with no
-connect tried, `half-open /derp WS`, and a relay `not delivering the
-peer's frames`. A loop that convicts a carrier of silence now first
+connect tried, `half-open /derp WS`, a relay `not delivering the
+peer's frames`, and a direct carrier's `peer roamed / NAT rebind /
+path died`. A loop that convicts a carrier of silence now first
 asks its own late tick (`tunnel_core::frozen::did_not_run_for`,
-`crates/tunnel-core/src/frozen.rs:40`). When the tick that found the
+`crates/tunnel-core/src/frozen.rs:41`). When the tick that found the
 silence came late by about as long, the line says the agent did not
 run. This is wording only: every verdict and every reconnect stays
 what it was.
@@ -4656,7 +4659,8 @@ what it was.
 | control WS RX deadline (`signaling.rs:2233`) | the keepalive's own due instant, which `tick()` returns (`:2178`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
 | the reconnect after it (`signaling.rs:1428`) | the session's reason, `AgentDidNotRun` (`:80`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:437`) | the keepalive's due instant (`:424`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
-| relay carrier rx-stale (`crates/tunnel-core/src/overlay/runtime/establish.rs:734`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3082`, `tick_late_ms`) | 25 s + 2 ticks | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended) …` |
+| direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:675`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3082`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
+| relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:757`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
 
 - ⚠️ The slack is what "about as long" means: how quiet the carrier gets
   while the loop runs. A carrier that had gone quiet before the agent
