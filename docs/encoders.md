@@ -1502,7 +1502,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10340-10373`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10349-10382`):
 
 | Field | Meaning |
 |---|---|
