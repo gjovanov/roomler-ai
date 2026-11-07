@@ -14,11 +14,12 @@
 //!
 //! **It drives nothing.** `caps::compute_caps_with` keeps writing the real
 //! hello, through `caps::assemble`, from the same [`ProbeFindings`]. The table
-//! derives beside it: a gate over recorded platform fixtures
+//! derives beside it: a gate over platform fixtures, written from fleet records or modelled
 //! (`tests/fixtures/cell-table.hellos.json`) proves the two byte-identical, and
-//! [`shadow`] says once, at the real hello's build, if a host ever makes them
-//! differ. That is FR-70 M3a's pattern, a shadow and a count of where it
-//! disagrees. Where the old wire says something other than the row's own truth
+//! [`shadow`] compares them once per process where the hello is built. On a
+//! real probe that is the caps-probe child, whose line reaches no uploaded log
+//! (`docs/encoders.md`), so the gate, never the shadow's silence, is the
+//! evidence. That is FR-70 M3a's pattern without its count. Where the old wire says something other than the row's own truth
 //! is a named [`Divergence`], read per fixture: FR-135 §5.7's Dv rows.
 //!
 //! Columns of the spec's `CellSpec` with no source in the code today are left

@@ -199,8 +199,8 @@ questions asked of every row: **does the hello advertise anything this host
 cannot do**, and **does the refusal carry its reason in the reply** — not only
 in the daemon log. The hello column is `AgentCaps.apps`
 (`crates/remote_control/src/models.rs:203`), assigned once per process by
-`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4497`,
-`:2388` via `with_config_lists` `:2944`) — in the daemon, never in the
+`detect()` from `apps_caps()` (`agents/roomlerd/src/encode/caps.rs:4628`,
+`:2390` via `with_config_lists` `:2946`) — in the daemon, never in the
 caps-probe child (§4.3).
 
 | Tier / path | Hello `apps` on 0.4.102 | `rc:apps.list.reply` on 0.4.102 | Reason reached the screen? | After P6 |

@@ -286,7 +286,8 @@ chips share.
 `encode/cell_table.rs` has one row per cell the agent can advertise (`CELLS`), and derives
 the hello's six probed fields from the probe's `ProbeFindings`. `caps::assemble` still writes
 them; a gate over `tests/fixtures/cell-table.hellos.json` proves the two byte-identical, and
-`cell_table::shadow` logs once if a host makes them differ (`docs/encoders.md`).
+`cell_table::shadow` compares them once per process, in the probe child, whose line reaches
+no uploaded log: the gate is the evidence, never the shadow's silence (`docs/encoders.md`).
 
 ⚠️ **A new cascade name, 4:4:4 form, GPU form or vendored encoder needs its row**, or the
 table's tests fail: they read the columns against `*_ENCODER_NAMES`, `FFMPEG_444_CAPABLE`,

@@ -171,9 +171,15 @@ the order the probe opens them. A host's probe adds an overlay of proof, and `de
 makes every open it made before and records what it found in `ProbeFindings`
 (`cell_table.rs:624`). `assemble` (`caps.rs:4397`) writes the real hello from that, with
 the pushes the probe used to make inline, in the same order and on the same conditions.
-The table derives beside it (`caps.rs:4229`): a gate proves the two byte-identical, and
-`shadow` (`cell_table.rs:1286`) puts one warn line in the log if a host ever makes them
-differ, and touches nothing. That is FR-70 M3a's pattern. Readers move onto the rows in
+The table derives beside it, and `shadow` (`caps.rs:4230`, `cell_table.rs:1286`) compares
+the two once per process and touches nothing. **The evidence is the gate**, which proves the
+two byte-identical on every host class below. The shadow's warning is not evidence: on a real
+probe it runs in the caps-probe child, whose stdout the daemon reads only for its report line
+(`caps.rs:1644`) and whose own log is not a service log, so the warning reaches no uploaded
+log. On a cached probe the daemon's only shadow is its driver-free `compute_caps(false,
+false)` (`caps.rs:3099`), which agrees by construction. No `cell table:` line in
+`agent_logs` therefore says nothing about a host. That is FR-70 M3a's pattern without its
+count. Readers move onto the rows in
 R10 ([FR-135 §6.5](fr/FR-135-one-rc-media-pipeline.md#65-encoder-and-codec-choice-one-source-of-truth)).
 
 ```mermaid
@@ -186,7 +192,7 @@ flowchart LR
     PF --> PR["proofs: a CellProof per row"]
     CELLS["CELLS: 36 rows"] --> DV["derive"]
     PR --> DV
-    DV -. "shadow: one warn line if they differ" .-> AS
+    DV -. "shadow: compared once, in the probe child" .-> AS
     DV --> DIV["divergences: FR-135 §5.7's Dv rows"]
     FIX["tests/fixtures/cell-table.hellos.json<br/>17 hosts"] --> GATE["the gate"]
     AS --> GATE
