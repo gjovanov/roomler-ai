@@ -5920,7 +5920,16 @@ pub struct SessionStats {
 /// ended. Absent is **not reported**, never "CPU": a session on an older agent,
 /// a follower on a shared pipeline (its owner's row has the reading), or a pump
 /// without an input form to name.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+///
+/// FR-135 R0 (N16) extends the same reading with the session's media summary,
+/// so one bounded query over `remote_sessions` says which cell a session ran,
+/// for how long in motion, and what it encoded: the proof of a cell (FR-135
+/// §6.5). Every summary field is absent until the pump has folded a window,
+/// and absent is **not counted**, never zero. The struct defaults field by
+/// field, so a later agent that drops one costs that reading, through
+/// [`Self::checked`], and never the rest of the sample.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
 pub struct SessionVideo {
     /// The encoder's own name: `h264_qsv`, `av1_nvenc`, `hevc_videotoolbox`.
     pub encoder: String,
@@ -5931,18 +5940,49 @@ pub struct SessionVideo {
     pub input_path: String,
     /// Why the frames came through memory, the heartbeat's `input_reason`.
     /// Absent on GPU input.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_reason: Option<String>,
+    /// FR-135 R0 — `yuv420` or `yuv444`: with `encoder`, the cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chroma: Option<String>,
+    /// FR-135 R0 — seconds of 2 s windows capturing 5 or more frames a second
+    /// (FR-135 §2.1's moving), and the rest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moving_s: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_s: Option<u32>,
+    /// FR-135 R0 — frames the encoder returned, and of them the keepalive
+    /// re-encodes of an unchanged screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_encoded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frames_keepalive: Option<u64>,
+    /// FR-135 R0 — the most viewers that shared this session's pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followers: Option<u32>,
+    /// FR-135 R0 — from the pump's start to its first frame in the channel's
+    /// queue: the agent's half of the time to the first frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_frame_ms: Option<u32>,
 }
 
 impl SessionVideo {
     /// The longest name a field may hold. The agent's are all well under it.
     pub const MAX_NAME: usize = 32;
+    /// The most seconds a count may hold: 30 days, past any session.
+    pub const MAX_SECS: u32 = 30 * 24 * 3600;
+    /// The most frames a count may hold: 30 days at 240 fps.
+    pub const MAX_FRAMES: u64 = 30 * 24 * 3600 * 240;
+    /// The most followers a pipeline has (`rc_max_sessions` caps at 8).
+    pub const MAX_FOLLOWERS: u32 = 64;
+    /// The longest first frame worth storing: an hour.
+    pub const MAX_FIRST_FRAME_MS: u32 = 3_600_000;
 
-    /// The reading if every field is a short lowercase name, else `None`.
-    /// Checked on receipt: the reporting side is the untrusted one, and a row
-    /// is no place for whatever a host chose to send. Dropped whole, so the row
-    /// keeps the last reading it could trust, as a bad carrier does.
+    /// The reading if every name is a short lowercase name and every count is
+    /// in range, else `None`. Checked on receipt: the reporting side is the
+    /// untrusted one, and a row is no place for whatever a host chose to send.
+    /// Dropped whole, so the row keeps the last reading it could trust, as a
+    /// bad carrier does.
     pub fn checked(self) -> Option<Self> {
         let name = |s: &str| {
             !s.is_empty()
@@ -5950,10 +5990,21 @@ impl SessionVideo {
                 && s.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
         };
+        let secs = |v: Option<u32>| v.is_none_or(|s| s <= Self::MAX_SECS);
+        let frames = |v: Option<u64>| v.is_none_or(|f| f <= Self::MAX_FRAMES);
         (name(&self.encoder)
             && name(&self.capture)
             && name(&self.input_path)
-            && self.input_reason.as_deref().is_none_or(name))
+            && self.input_reason.as_deref().is_none_or(name)
+            && self.chroma.as_deref().is_none_or(name)
+            && secs(self.moving_s)
+            && secs(self.sparse_s)
+            && frames(self.frames_encoded)
+            && frames(self.frames_keepalive)
+            && self.followers.is_none_or(|f| f <= Self::MAX_FOLLOWERS)
+            && self
+                .first_frame_ms
+                .is_none_or(|ms| ms <= Self::MAX_FIRST_FRAME_MS))
         .then_some(self)
     }
 }
@@ -10402,6 +10453,72 @@ mod session_video_tests {
             capture: "system-context".into(),
             input_path: "cpu".into(),
             input_reason: Some("adapter_mismatch".into()),
+            ..Default::default()
+        }
+    }
+
+    /// FR-135 R0 — the summary's counts are kept in range, and one out of range
+    /// drops the reading whole, as a bad name does.
+    #[test]
+    fn a_summary_out_of_range_is_dropped_whole() {
+        let summary = SessionVideo {
+            chroma: Some("yuv444".into()),
+            moving_s: Some(60),
+            sparse_s: Some(600),
+            frames_encoded: Some(4_000),
+            frames_keepalive: Some(600),
+            followers: Some(1),
+            first_frame_ms: Some(900),
+            ..reading()
+        };
+        assert_eq!(summary.clone().checked(), Some(summary.clone()));
+        for bad in [
+            SessionVideo {
+                chroma: Some("YUV444".into()),
+                ..summary.clone()
+            },
+            SessionVideo {
+                moving_s: Some(SessionVideo::MAX_SECS + 1),
+                ..summary.clone()
+            },
+            SessionVideo {
+                frames_encoded: Some(SessionVideo::MAX_FRAMES + 1),
+                ..summary.clone()
+            },
+            SessionVideo {
+                followers: Some(SessionVideo::MAX_FOLLOWERS + 1),
+                ..summary.clone()
+            },
+            SessionVideo {
+                first_frame_ms: Some(SessionVideo::MAX_FIRST_FRAME_MS + 1),
+                ..summary.clone()
+            },
+        ] {
+            assert_eq!(bad.clone().checked(), None, "{bad:?}");
+        }
+    }
+
+    /// FR-135 R0 — the reviewer's risk on P1d: a sample whose reading lacks a
+    /// field still parses, the reading is then dropped by `checked`, and the
+    /// rest of the sample survives. An absent summary stays absent on the wire.
+    #[test]
+    fn a_reading_missing_a_field_costs_the_reading_and_nothing_else() {
+        let partial: SessionVideo =
+            serde_json::from_value(serde_json::json!({ "encoder": "h264_qsv", "capture": "wgc" }))
+                .expect("a missing field defaults");
+        assert_eq!(partial.input_path, "");
+        assert_eq!(partial.checked(), None, "an empty name drops the reading");
+        let s = serde_json::to_string(&reading()).unwrap();
+        for absent in [
+            "chroma",
+            "moving_s",
+            "sparse_s",
+            "frames_encoded",
+            "frames_keepalive",
+            "followers",
+            "first_frame_ms",
+        ] {
+            assert!(!s.contains(absent), "{absent}: {s}");
         }
     }
 

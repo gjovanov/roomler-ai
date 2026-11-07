@@ -7201,6 +7201,14 @@ mod tests {
                 capture: "system-context".into(),
                 input_path: "cpu".into(),
                 input_reason: Some("denied".into()),
+                // FR-135 R0 — and the summary rides the same reading.
+                chroma: Some("yuv420".into()),
+                moving_s: Some(12),
+                sparse_s: Some(40),
+                frames_encoded: Some(700),
+                frames_keepalive: Some(40),
+                followers: Some(1),
+                first_frame_ms: Some(480),
             }),
         };
         match session_stats_msg(sid, &t, Default::default()) {
