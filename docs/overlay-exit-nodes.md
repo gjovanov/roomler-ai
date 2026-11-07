@@ -249,8 +249,8 @@ into `roomlerd::purge_exit_routes()` and called:
   runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2148`):
   see [exit-client pins](#exit-client-pins-fr-97-p0e) below.
 
-The stale-route purge drops every peer/subnet route on the overlay's TUN, and
-the end of a generation that logs it tells the two cases apart:
+The stale-route purge drops the peer and subnet routes it finds on the overlay's
+TUN, and the end of a generation that logs it tells the two cases apart:
 
 | Line | Logged by | Means |
 |---|---|---|
@@ -259,6 +259,16 @@ the end of a generation that logs it tells the two cases apart:
 
 Older agents log the boot line at both ends, so on them an update's own exit
 reads like a stale-route find.
+
+On Linux it finds prefix routes only. It lists `ip route show dev <tun>` and
+keeps the first fields that carry a length
+(`crates/tunnel-core/src/overlay/tun.rs:5883`), and iproute2 prints a host route
+without its `/32`. The per-peer routes need no purge there, because the TUN is
+not persistent (`persist off`): the kernel removes it, and every route on it,
+when its last descriptor closes. So a Linux exit logs the exit line only when
+its TUN carries a prefix route, such as a subnet route. On 0.4.204 a TUN with
+15 per-peer routes logged nothing, and the same TUN with one prefix added logged
+`count=1` (#3533's field read).
 
 Why it matters most on Windows: a Wintun adapter **persists by name** across a
 crash, so a leftover `0.0.0.0/1 → roomler` would black-hole all egress to a dead
