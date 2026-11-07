@@ -135,7 +135,7 @@ attacker-controllable field is a CRTC-id equality filter. That is the right
 target for a binary shipping to every fleet host — and it maps onto this repo's
 existing self-spawn precedent (`roomlerd caps-probe`,
 `#[command(hide = true)]` at `app.rs:162`, spawned via `current_exe()` at
-`encode/caps.rs:170`), so it needs **no new packaged artifact**.
+`encode/caps.rs:172`), so it needs **no new packaged artifact**.
 
 ### The seam is unchanged
 
