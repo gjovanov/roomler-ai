@@ -145,12 +145,15 @@ test('FR-135 R1: a forced decode failure, timed to the next paint', async ({ con
   expect(agentId, `agent "${AGENT_NAME}" never reported online`).toBeTruthy()
 
   await context.addInitScript(
-    ([id, codec, switchValue, prefix]: string[]) => {
+    ([id, codec, switchValue, prefix, mode]: string[]) => {
       try {
         window.localStorage.setItem('roomler-signed-in', '1')
         window.localStorage.setItem(`roomler-rc-display-match.v2:${id}`, '0')
         if (codec) window.localStorage.setItem(`${prefix}${id}`, codec)
         if (switchValue) window.localStorage.setItem('roomler-rc-decode-recover', switchValue)
+        // FR-135 R3 — the gap is dropped on the page's relay; a channel moved
+        // into the worker would carry every chunk past this script.
+        if (mode === 'gap') window.localStorage.setItem('roomler-rc-dc-worker', '0')
       } catch {
         /* the cookie still authenticates */
       }
@@ -171,7 +174,7 @@ test('FR-135 R1: a forced decode failure, timed to the next paint', async ({ con
         return (origPost as (...a: unknown[]) => void).apply(this, args)
       } as typeof Worker.prototype.postMessage
     },
-    [agentId as string, RC_CODEC, SWITCH, CODEC_STORAGE_PREFIX],
+    [agentId as string, RC_CODEC, SWITCH, CODEC_STORAGE_PREFIX, MODE],
   )
   await context.route('https://purestat.ai/**', (route) => route.abort())
   await context.route(`${BASE_URL}/**`, async (route) => {

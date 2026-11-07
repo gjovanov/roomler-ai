@@ -58,6 +58,7 @@ import {
 } from '@/workers/rc-fsr-render'
 import { colorSpaceLabel } from '@/workers/rc-decoder-config'
 import { MEDIA_BUCKETS, type ViewerMediaWindow } from '@/workers/rc-media-window'
+import { createDeliveryGapClock, moveVideoChannelToWorker } from '@/workers/rc-video-channel'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -2441,6 +2442,7 @@ export function decodeStatWireMessage(
   link?: { rxBps: number; queueMs: number | null } | null,
   arrival?: { avgMs: number } | null,
   media?: Partial<ViewerMediaWindow> | null,
+  queueArrMs?: number | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -2489,6 +2491,16 @@ export function decodeStatWireMessage(
     // The agent packs this into an i16; clamp here so a pathological
     // window cannot wrap into its own sign.
     msg.queue_ms = Math.min(Math.max(Math.round(link.queueMs), -32768), 32767)
+  }
+  // FR-135 R3 — the same growth read at ARRIVAL: the worker's queue drift over
+  // whole frames as their last chunk lands, before the gate, the backlog drop
+  // and the decoder (`queueArrMs`), where `queue_ms` is read at paint, so a
+  // decoder falling behind cannot read as the link growing. Beside it, never
+  // instead: the live law and FR-63's shadow read `queue_ms`, and FR-63's B2
+  // chooses. Sent only when the worker counted it (two whole frames or more in
+  // the window), on its own, in `queue_ms`'s i16 clamp. No agent reads it yet.
+  if (typeof queueArrMs === 'number' && Number.isFinite(queueArrMs)) {
+    msg.queue_arr_ms = Math.min(Math.max(Math.round(queueArrMs), -32768), 32767)
   }
   // FR-135 R0 (N9-N12, N16) — the decode worker's window of media numbers
   // (`rc-media-window.ts`), for the agent's heartbeat and the session's
@@ -4384,6 +4396,33 @@ export function storedDecodeRecover(): boolean {
   }
 }
 
+/** FR-135 R3 — the per-browser switch that moves the `video-bytes` channel
+ *  into the data-channel decode worker, so the main thread leaves the
+ *  per-chunk path (`moveVideoChannelToWorker`). `localStorage.setItem(
+ *  'roomler-rc-dc-worker', '1')` turns it on and `'0'` off, then reconnect.
+ *  Anything else, no value, or storage that cannot be read is
+ *  {@link DC_WORKER_DEFAULT}. Where this browser cannot transfer an
+ *  RTCDataChannel the page relays the channel either way. Read once per
+ *  connect, like every `roomler-rc-*` knob. Pure + exported for tests. */
+export const DC_WORKER_STORAGE_KEY = 'roomler-rc-dc-worker'
+
+/** FR-135 R3 — whether the channel moves into the worker when this browser has
+ *  not said. OFF until S11, a real session at 60 Mbit/s or more, shows the
+ *  move beats the relay on `fwd_ms` p95 by more than run-to-run spread
+ *  (FR-135 §7.5's R3 row). The flip is this one line. */
+export const DC_WORKER_DEFAULT = false
+
+export function storedDcWorker(): boolean {
+  try {
+    const raw = (globalThis.localStorage?.getItem(DC_WORKER_STORAGE_KEY) ?? '').trim()
+    if (raw === '1') return true
+    if (raw === '0') return false
+  } catch {
+    /* storage unreadable: the default */
+  }
+  return DC_WORKER_DEFAULT
+}
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -5896,6 +5935,13 @@ export function useRemoteControl(
    *  `sessionChunkFraming`; the data-channel worker gets it in `init-canvas`,
    *  and the media watchdog reads it for what counts as progress. */
   let sessionDecodeRecover = false
+  /** FR-135 R3 — true when THIS session tries to move its video channel into
+   *  the decode worker (`storedDcWorker`, `roomler-rc-dc-worker`). Resolved
+   *  beside `sessionChunkFraming`, before the path starts. */
+  let sessionDcWorker = false
+  /** FR-135 R3 — true while the active path's channel is in the worker: the
+   *  browser took the transfer. False on the relay, the default. */
+  let dcChannelInWorker = false
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -7591,12 +7637,13 @@ export function useRemoteControl(
     link?: { rxBps: number; queueMs: number | null } | null,
     arrival?: { avgMs: number } | null,
     media?: Partial<ViewerMediaWindow> | null,
+    queueArrMs?: number | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(
-        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media)),
+        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs)),
       )
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
@@ -7622,6 +7669,8 @@ export function useRemoteControl(
     /** FR-59 P3 — ms the transit queue grew this window; `null`/absent =
      *  fewer than two frames arrived, which is no-signal, not stability. */
     queueMs?: number | null
+    /** FR-135 R3 — the same growth read at arrival; `null`/absent the same way. */
+    queueArrMs?: number | null
     /** FR-135 R0 — the worker's window for the agent (`rc-media-window.ts`). */
     media?: Partial<ViewerMediaWindow> | null
   }) {
@@ -7670,6 +7719,8 @@ export function useRemoteControl(
       link,
       arrival,
       media,
+      // FR-135 R3 — rides alone; `decodeStatWireMessage` sends it only when counted.
+      typeof m.queueArrMs === 'number' ? m.queueArrMs : null,
     )
   }
 
@@ -8161,26 +8212,30 @@ export function useRemoteControl(
   // between "bytes stopped arriving" (network/SCTP) and "the main thread was
   // blocked so nothing was forwarded" (jank). These two detectors split that:
 
-  /** Network-side delivery-gap detector. `dc.onmessage` runs on the main
-   *  thread as bytes come off SCTP; a multi-second silence here (logged once,
-   *  on resume) means bytes were NOT arriving Ã¢ÂÂ network/SCTP layer. */
-  let lastVideoDcMsgMs = 0
+  /** Network-side delivery-gap detector. On the relay `dc.onmessage` runs on
+   *  the main thread as bytes come off SCTP; a multi-second silence here
+   *  (logged once, on resume) means bytes were NOT arriving - network/SCTP
+   *  layer. With the channel in the worker (FR-135 R3) the worker keeps the
+   *  same clock (`createDeliveryGapClock`) and posts `video-channel-gap`, which
+   *  is logged with the same line. */
+  const videoDcGap = createDeliveryGapClock()
   function noteVideoDcDelivery() {
-    const now = performance.now()
-    if (lastVideoDcMsgMs > 0 && now - lastVideoDcMsgMs > 1500) {
-      console.warn(
-        '[rc] video DC delivery gap',
-        Math.round(now - lastVideoDcMsgMs),
-        'ms Ã¢ÂÂ no video bytes arrived from the network for this long',
-      )
-    }
-    lastVideoDcMsgMs = now
+    const gapMs = videoDcGap.note(performance.now())
+    if (gapMs !== null) warnVideoDcGap(gapMs)
+  }
+  function warnVideoDcGap(gapMs: number) {
+    console.warn(
+      '[rc] video DC delivery gap',
+      Math.round(gapMs),
+      'ms - no video bytes arrived from the network for this long',
+    )
   }
 
   /** Self-measuring main-thread jank detector. A 250 ms interval whose tick
-   *  arrives late by >1.5 s means the main thread (which also forwards DC
-   *  chunks to the worker) was blocked that long Ã¢ÂÂ the freeze is page jank,
-   *  not network and not the decoder. */
+   *  arrives late by >1.5 s means the main thread was blocked that long - the
+   *  freeze is page jank, not network and not the decoder. On the relay the
+   *  main thread also forwards the DC chunks to the worker, so they waited
+   *  too; with the channel in the worker (FR-135 R3) they did not. */
   let jankTimer: ReturnType<typeof setInterval> | null = null
   let jankLastTickMs = 0
   function startJankDetector() {
@@ -8193,7 +8248,9 @@ export function useRemoteControl(
         console.warn(
           '[rc] MAIN-THREAD STALL ~',
           Math.round(gap),
-          'ms Ã¢ÂÂ the page (and DCÃ¢ÂÂworker chunk forwarding) was blocked this long',
+          dcChannelInWorker
+            ? 'ms - the page was blocked this long (the video channel is in the decode worker, so its chunks were not)'
+            : 'ms - the page (and DC-to-worker chunk forwarding) was blocked this long',
         )
       }
       jankLastTickMs = now
@@ -8388,30 +8445,47 @@ export function useRemoteControl(
       try { worker.terminate() } catch { /* ignore */ }
       return null
     }
-    dc.binaryType = 'arraybuffer'
-    lastVideoDcMsgMs = 0 // fresh path - don't count the setup silence as a gap
+    // FR-135 R3 — the channel into the worker, in the task that made it (the
+    // only one in which a channel can move), where this browser can transfer
+    // one and this session asks. Refused, it is still the page's, untouched,
+    // and the relay below carries it as before.
+    const refused = sessionDcWorker ? moveVideoChannelToWorker(worker, dc) : 'off'
+    videoDcGap.reset() // fresh path - don't count the setup silence as a gap
     startJankDetector()
-    dc.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return
-      noteVideoDcDelivery()
-      try {
-        // P1 - sentAt stamps the main-to-worker forwarding hop (epoch-absolute).
-        worker.postMessage(
-          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
-          [ev.data],
-        )
-      } catch (err) {
-        console.warn(`[rc] ${label} worker post failed`, err)
+    if (refused === null) {
+      // Its open, close and delivery gaps come back as worker messages
+      // (`onDcWorkerMessage`); the page's object is a closed husk now, so it
+      // stays out of `channels`, and the session's `pc.close()` closes the real one.
+      dcChannelInWorker = true
+      console.info(`[rc] ${label} video channel moved into the decode worker (roomler-rc-dc-worker)`)
+    } else {
+      dcChannelInWorker = false
+      if (sessionDcWorker) {
+        console.info(`[rc] ${label} video channel stays on the page, relayed to the worker: this browser refused to move it (${refused})`)
       }
+      dc.binaryType = 'arraybuffer'
+      dc.onmessage = (ev) => {
+        if (!(ev.data instanceof ArrayBuffer)) return
+        noteVideoDcDelivery()
+        try {
+          // P1 - sentAt stamps the main-to-worker forwarding hop (epoch-absolute).
+          worker.postMessage(
+            { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
+            [ev.data],
+          )
+        } catch (err) {
+          console.warn(`[rc] ${label} worker post failed`, err)
+        }
+      }
+      dc.onopen = () => {
+        markConnect('dc_open')
+        console.info(`[rc] ${label} DC opened`)
+      }
+      dc.onclose = () => {
+        console.info(`[rc] ${label} DC closed`)
+      }
+      channels.videoBytes = dc
     }
-    dc.onopen = () => {
-      markConnect('dc_open')
-      console.info(`[rc] ${label} DC opened`)
-    }
-    dc.onclose = () => {
-      console.info(`[rc] ${label} DC closed`)
-    }
-    channels.videoBytes = dc
     dcWorker = worker
     dcPathLabel = label
     dcPathTransport = transport
@@ -8442,6 +8516,21 @@ export function useRemoteControl(
       // rc.130 - worker dropped deltas on a decode backlog; ask the agent
       // for a fresh IDR so it can resync.
       requestKeyframe()
+      return
+    }
+    // FR-135 R3 — the channel moved into the worker says what the page's own
+    // handlers say for a relayed one, with the same lines.
+    if (msg.type === 'video-channel-open') {
+      markConnect('dc_open')
+      console.info(`[rc] ${label} DC opened`)
+      return
+    }
+    if (msg.type === 'video-channel-closed') {
+      console.info(`[rc] ${label} DC closed`)
+      return
+    }
+    if (msg.type === 'video-channel-gap') {
+      if (typeof msg.gapMs === 'number') warnVideoDcGap(msg.gapMs)
       return
     }
     if (msg.type === 'first-frame'
@@ -8599,6 +8688,10 @@ export function useRemoteControl(
     renderInfo.value = null
     dcPathLabel = null
     dcPathTransport = null
+    // FR-135 R3 — a channel in the worker goes with it: terminating the worker
+    // stops it being read, as a relayed one stops being read once its worker
+    // is gone, and the session's `pc.close()` closes either.
+    dcChannelInWorker = false
     if (!dcWorker) return
     try { dcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { dcWorker.terminate() } catch { /* ignore */ }
@@ -11156,6 +11249,8 @@ export function useRemoteControl(
     if (!sessionDecodeRecover) {
       console.info('[rc] decode recovery: off this session (roomler-rc-decode-recover=0) - a decode error stops the path and the watchdog re-creates the session (FR-135 R1)')
     }
+    // FR-135 R3 — off unless this browser turned it on, until S11 decides.
+    sessionDcWorker = storedDcWorker()
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {

@@ -159,6 +159,9 @@ import {
   COLORSPACE_STORAGE_KEY,
   storedDecodeRecover,
   DECODE_RECOVER_STORAGE_KEY,
+  storedDcWorker,
+  DC_WORKER_STORAGE_KEY,
+  DC_WORKER_DEFAULT,
   mediaAdvanced,
   storedCtxMode,
   storedPerFrameMsg,
@@ -6000,6 +6003,70 @@ describe('S3 resilience: sessionGateAllows', () => {
 
   it('never matches non-string ids', () => {
     expect(sessionGateAllows(123 as unknown, '123')).toBe(true) // non-string → treated as absent
+  })
+})
+
+describe('FR-135 R3 — the switch that moves the video channel into the worker', () => {
+  afterEach(() => {
+    localStorage.removeItem(DC_WORKER_STORAGE_KEY)
+  })
+
+  it('is the key the spec names, and ships off', () => {
+    expect(DC_WORKER_STORAGE_KEY).toBe('roomler-rc-dc-worker')
+    // S11 decides the default; until then the transfer is opt-in.
+    expect(DC_WORKER_DEFAULT).toBe(false)
+  })
+
+  it('is on at 1, off at 0, and the default otherwise', () => {
+    expect(storedDcWorker(), 'absent').toBe(DC_WORKER_DEFAULT)
+    for (const raw of ['1', ' 1 ']) {
+      localStorage.setItem(DC_WORKER_STORAGE_KEY, raw)
+      expect(storedDcWorker(), raw).toBe(true)
+    }
+    for (const raw of ['0', ' 0 ']) {
+      localStorage.setItem(DC_WORKER_STORAGE_KEY, raw)
+      expect(storedDcWorker(), raw).toBe(false)
+    }
+    for (const raw of ['', 'on', 'true', 'yes', '2']) {
+      localStorage.setItem(DC_WORKER_STORAGE_KEY, raw)
+      expect(storedDcWorker(), raw).toBe(DC_WORKER_DEFAULT)
+    }
+  })
+
+  it('is the default when storage cannot be read', () => {
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('denied')
+    })
+    expect(storedDcWorker()).toBe(DC_WORKER_DEFAULT)
+    spy.mockRestore()
+  })
+})
+
+describe('FR-135 R3 — the queue read at arrival, beside queue_ms', () => {
+  const link = { rxBps: 8_000_000, queueMs: 40 }
+
+  it('rides as queue_arr_ms when the worker counted it, clamped and rounded like queue_ms', () => {
+    expect(decodeStatWireMessage(60, false, null, null, link, null, null, 0).queue_arr_ms).toBe(0)
+    expect(decodeStatWireMessage(60, false, null, null, link, null, null, -12.6).queue_arr_ms).toBe(-13)
+    expect(decodeStatWireMessage(60, false, null, null, null, null, null, 7).queue_arr_ms).toBe(7)
+    expect(decodeStatWireMessage(60, false, null, null, null, null, null, 99_999).queue_arr_ms).toBe(32767)
+    expect(decodeStatWireMessage(60, false, null, null, null, null, null, -99_999).queue_arr_ms).toBe(-32768)
+  })
+
+  it('is absent when the worker did not count it: absent is not counted, never zero', () => {
+    for (const v of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect('queue_arr_ms' in decodeStatWireMessage(60, false, null, null, link, null, null, v), String(v)).toBe(false)
+    }
+  })
+
+  it('leaves every key it sent before as it was, queue_ms included', () => {
+    // The live law and FR-63's shadow read queue_ms; R3 only adds a key.
+    const age = { avgMs: 80, minMs: 40 }
+    const before = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 60 })
+    const after = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 60 }, null, -3)
+    for (const [k, v] of Object.entries(before)) expect(after[k], k).toEqual(v)
+    expect(Object.keys(after).filter((k) => !(k in before))).toEqual(['queue_arr_ms'])
+    expect(after.queue_ms).toBe(40)
   })
 })
 

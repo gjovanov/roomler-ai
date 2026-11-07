@@ -12,11 +12,14 @@
  * since P2) and its copy for HEVC, `rc-hevc-worker.ts` (rc.78). See
  * `docs/remote-control.md` §11.14 and `docs/encoders.md`.
  *
- * Receives length-prefixed encoded frames from the main thread (which
- * forwards them off `RTCDataChannel.onmessage`), reassembles them, feeds
+ * Receives length-prefixed encoded frames, reassembles them, feeds
  * `VideoDecoder`, and paints the resulting `VideoFrame`s to an
- * `OffscreenCanvas`. No `RTCRtpScriptTransform` involvement — this worker is
- * independent of the broken-in-Chrome 131 RTP transform path.
+ * `OffscreenCanvas`. The frames come one of two ways: the main thread forwards
+ * each `RTCDataChannel` message as a `chunk` (the relay, and the default), or,
+ * where the browser can transfer the channel and `roomler-rc-dc-worker` says
+ * so, the page moves the channel itself here (`video-channel`, FR-135 R3) and
+ * the main thread is out of the path. No `RTCRtpScriptTransform` involvement —
+ * this worker is independent of the broken-in-Chrome 131 RTP transform path.
  *
  * Wire format (`frame_video_bytes`, `agents/roomlerd/src/peer.rs`):
  *
@@ -69,6 +72,7 @@ import { startViewerHzBursts } from './rc-viewer-hz'
 import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
 import { createDecodeRecovery } from './rc-decode-recovery'
 import { createViewerMediaRecorder } from './rc-media-window'
+import { createDeliveryGapClock, type VideoChannelMessage } from './rc-video-channel'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
@@ -153,6 +157,7 @@ type CloseMessage = { type: 'close' }
 type IncomingMessage =
   | InitCanvasMessage
   | ChunkMessage
+  | VideoChannelMessage
   | ViewportMessage
   | RenderModeMessage
   | ClockOffsetMessage
@@ -335,7 +340,15 @@ const ageStats = new HopStats()
 // FR-59 P3 — how much the transit queue grew this window. Needs NO clock
 // probe (it is a difference of intervals), so unlike `ageStats` it keeps
 // reporting on exactly the links where the probe is biased or absent.
+// ⚠️ It is fed at PAINT, after the decode queue and the decoder, so a decoder
+// falling behind reads as the link growing. The live law and FR-63's shadow
+// read it as `queue_ms`, so it stays as it is (FR-135 §4.2).
 const queueDrift = new QueueDrift()
+// FR-135 R3 — the same growth read at ARRIVAL: every whole frame when its last
+// chunk is in hand, before the key-frame gate, the backlog drop and the
+// decoder, decoded or not. It goes beside the old reading as `queue_arr_ms`,
+// and FR-63's B2 chooses between them.
+const arrivalQueueDrift = new QueueDrift()
 let clockOffsetUs: number | null = null
 let outGapMaxMs = 0
 // Decode-submission times keyed by chunk timestamp, matched in the output
@@ -417,6 +430,8 @@ function maybeEmitStats(): void {
     // FR-59 P3 — window queue growth in ms (null = fewer than two frames
     // arrived, which is no-signal rather than a stable queue).
     queueMs: queueDrift.snapshotAndReset(),
+    // FR-135 R3 — the same growth read at arrival (null the same way).
+    queueArrMs: arrivalQueueDrift.snapshotAndReset(),
     fwd: fwdStats.snapshotAndReset(),
     decode: decodeStats.snapshotAndReset(),
     outGapMaxMs: round1(outGapMaxMs),
@@ -514,49 +529,118 @@ workerScope.onmessage = (e) => {
     if (msg.sharpen !== undefined) sharpenMode = normalizeSharpenMode(msg.sharpen)
     if (msg.sharpness !== undefined) sharpness = normalizeSharpness(msg.sharpness)
   } else if (msg.type === 'chunk') {
-    framesReceived++
-    if (typeof msg.sentAt === 'number') {
-      const fwdMs = epochNowMs() - msg.sentAt
-      fwdStats.add(fwdMs)
-      mediaWindow.onForward(fwdMs)
-    }
-    const u8 = new Uint8Array(msg.bytes)
-    statsBytesInWindow += u8.byteLength
-    statsBytesTotal += u8.byteLength
-    noteChunkForStallCheck()
-    // FR-17 — when the session negotiated framing, every message carries
-    // an 8-byte prefix and a gap in it means the frame under assembly can
-    // never complete. Feeding its surviving chunks to `consumeBytes`
-    // would splice two frames into one bitstream, which the decoder
-    // reports as corruption rather than loss, so the assembler is reset
-    // and a fresh IDR requested instead.
-    if (chunkFraming) {
-      const { payload, gap } = stripChunkPrefix(framingState, u8)
-      if (gap) {
-        resetAssembler()
-        // FR-135 R1 — the deltas behind the gap reference the frame it lost,
-        // so they wait at the gate for the IDR asked for below. Decoded, they
-        // paint garbage until it lands, or fail the decoder. Not where a gap is
-        // routine, or with the switch off (`gapClosesGate`).
-        if (decodeRecovery.gapClosesGate()) {
-          sawKeyframe = false
-          mediaWindow.onGateArmed(performance.now())
-        }
-        workerScope.postMessage({
-          type: 'frame-rejected',
-          reason: 'chunk-gap',
-          gaps: framingState.gaps,
-        })
-        requestKeyframeResync()
-      }
-      if (payload) consumeBytes(payload)
-    } else {
-      consumeBytes(u8)
-    }
-    maybeEmitStats()
+    onChunk(msg.bytes, msg.sentAt)
+  } else if (msg.type === 'video-channel') {
+    // FR-135 R3 — the page moved the channel itself here.
+    attachVideoChannel(msg.channel)
   } else if (msg.type === 'close') {
     teardown()
   }
+}
+
+/** One message off the `video-bytes` channel, however it came: relayed by the
+ *  page (`chunk`, stamped with the page's `sentAt`, so the hop is timed) or
+ *  straight off the channel the page moved here (FR-135 R3), which has no
+ *  page hop to time. */
+function onChunk(bytes: ArrayBuffer, sentAt: number | undefined): void {
+  framesReceived++
+  if (typeof sentAt === 'number') {
+    const fwdMs = epochNowMs() - sentAt
+    fwdStats.add(fwdMs)
+    mediaWindow.onForward(fwdMs)
+  }
+  const u8 = new Uint8Array(bytes)
+  statsBytesInWindow += u8.byteLength
+  statsBytesTotal += u8.byteLength
+  noteChunkForStallCheck()
+  // FR-17 — when the session negotiated framing, every message carries
+  // an 8-byte prefix and a gap in it means the frame under assembly can
+  // never complete. Feeding its surviving chunks to `consumeBytes`
+  // would splice two frames into one bitstream, which the decoder
+  // reports as corruption rather than loss, so the assembler is reset
+  // and a fresh IDR requested instead.
+  if (chunkFraming) {
+    const { payload, gap } = stripChunkPrefix(framingState, u8)
+    if (gap) {
+      resetAssembler()
+      // FR-135 R1 — the deltas behind the gap reference the frame it lost,
+      // so they wait at the gate for the IDR asked for below. Decoded, they
+      // paint garbage until it lands, or fail the decoder. Not where a gap is
+      // routine, or with the switch off (`gapClosesGate`).
+      if (decodeRecovery.gapClosesGate()) {
+        sawKeyframe = false
+        mediaWindow.onGateArmed(performance.now())
+      }
+      workerScope.postMessage({
+        type: 'frame-rejected',
+        reason: 'chunk-gap',
+        gaps: framingState.gaps,
+      })
+      requestKeyframeResync()
+    }
+    if (payload) consumeBytes(payload)
+  } else {
+    consumeBytes(u8)
+  }
+  maybeEmitStats()
+}
+
+/** FR-135 R3 — the `video-bytes` channel the page moved here
+ *  (`moveVideoChannelToWorker`), and the delivery-gap clock the page keeps for
+ *  a channel it relays: only the worker sees this one's messages. */
+let videoChannel: RTCDataChannel | null = null
+const videoChannelGap = createDeliveryGapClock()
+let videoChannelOpenSaid = false
+let videoChannelClosedSaid = false
+
+/** Read `channel` here. Its open and close go to the page
+ *  (`video-channel-open`, `video-channel-closed`), which logs them and marks
+ *  `dc_open` as it does for a channel it relays, and a silence longer than
+ *  `VIDEO_DC_GAP_MS` goes as `video-channel-gap`. The binary type does not
+ *  travel with a channel, so it is set here. */
+function attachVideoChannel(channel: RTCDataChannel): void {
+  detachVideoChannel()
+  videoChannel = channel
+  channel.binaryType = 'arraybuffer'
+  channel.onmessage = (ev: MessageEvent) => {
+    if (!(ev.data instanceof ArrayBuffer)) return
+    const gapMs = videoChannelGap.note(performance.now())
+    if (gapMs !== null) workerScope.postMessage({ type: 'video-channel-gap', gapMs: Math.round(gapMs) })
+    onChunk(ev.data, undefined)
+  }
+  channel.onopen = () => sayVideoChannel('open')
+  channel.onclose = () => sayVideoChannel('closed')
+  // Moved in the task that made it, a channel arrives connecting. One already
+  // past that says so now, because its event will not come again.
+  if (channel.readyState === 'open') sayVideoChannel('open')
+  else if (channel.readyState === 'closed') sayVideoChannel('closed')
+}
+
+/** Tell the page the moved channel opened or closed, once each. */
+function sayVideoChannel(state: 'open' | 'closed'): void {
+  if (state === 'open') {
+    if (videoChannelOpenSaid) return
+    videoChannelOpenSaid = true
+    workerScope.postMessage({ type: 'video-channel-open' })
+  } else {
+    if (videoChannelClosedSaid) return
+    videoChannelClosedSaid = true
+    workerScope.postMessage({ type: 'video-channel-closed' })
+  }
+}
+
+/** Stop reading the moved channel. It is not closed: a relayed channel stays
+ *  open when its path stops too, and the session's `pc.close()` closes either. */
+function detachVideoChannel(): void {
+  if (videoChannel) {
+    videoChannel.onmessage = null
+    videoChannel.onopen = null
+    videoChannel.onclose = null
+    videoChannel = null
+  }
+  videoChannelGap.reset()
+  videoChannelOpenSaid = false
+  videoChannelClosedSaid = false
 }
 
 /** An error closes a VideoDecoder, so start a new one and wait for a key frame
@@ -714,9 +798,9 @@ function initDecoder() {
       }
       // Age at paint on the agent's clock (mapped via the rc:clock probe):
       // framing → send queue → network → decode → paint, end to end.
-      const arrivalUs = epochNowUs()
+      const paintedUs = epochNowUs()
       if (clockOffsetUs !== null) {
-        ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivalUs))
+        ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, paintedUs))
       }
       // FR-70 M0 — the same age at the moment the frame ARRIVED, and the
       // local arrival→paint time; see `arrivalStats`.
@@ -726,10 +810,11 @@ function initDecoder() {
         if (clockOffsetUs !== null) {
           arrivalStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivedUs))
         }
-        viewerStats.add((arrivalUs - arrivedUs) / 1000)
+        viewerStats.add((paintedUs - arrivedUs) / 1000)
       }
-      // FR-59 P3 — unconditional: the drift needs no probe lock.
-      queueDrift.add(wireTsUs, arrivalUs)
+      // FR-59 P3 — unconditional: the drift needs no probe lock. Fed at paint
+      // (see `queueDrift`); `arrivalQueueDrift` is the reading at arrival.
+      queueDrift.add(wireTsUs, paintedUs)
       if (rewrapped) frame.close() // paintFrame closed `render`; close the original too
       // rc.187 — report dims on frame 1 AND on every size change (live
       // downscale), so the composable updates the cursor-mapping intrinsic.
@@ -872,6 +957,8 @@ function consumeBytes(bytes: Uint8Array): void {
 function emitFrame(): void {
   // FR-135 R0 (N10) — the cadence whole frames arrive at, decoder or not.
   mediaWindow.onArrival(performance.now())
+  // FR-135 R3 — and the transit queue's growth, read here, at arrival.
+  arrivalQueueDrift.add(Number(assembler.pendingTimestampUs), epochNowUs())
   if (!decoder || !configured) return
   const payload = assembler.payloadBuf
   if (!payload) return
@@ -1029,6 +1116,8 @@ function teardown(): void {
   configured = false
   canvas = null
   ctx = null
+  // FR-135 R3 — a moved channel stops being read with the session.
+  detachVideoChannel()
   framesDecoded = 0
   framesReceived = 0
   lastPostedW = 0
@@ -1049,6 +1138,8 @@ function teardown(): void {
   viewerStats.snapshotAndReset()
   queueDrift.snapshotAndReset()
   queueDrift.reset()
+  arrivalQueueDrift.snapshotAndReset()
+  arrivalQueueDrift.reset()
   clockOffsetUs = null
   outGapMaxMs = 0
   mediaWindow.reset()

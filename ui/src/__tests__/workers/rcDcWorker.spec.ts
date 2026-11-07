@@ -159,11 +159,12 @@ async function boot(init: Record<string, unknown>) {
 }
 
 /** Every key the 1 s `stats` message carries: the composable reads them by
- *  name, and the page carries some on to the agent's live law. */
+ *  name, and the page carries some on to the agent's live law. `queueArrMs`
+ *  is R3's arrival reading, added beside `queueMs`. */
 const STATS_KEYS = [
   'type', 'bitrateBps', 'fps', 'width', 'height', 'framesDecodedTotal', 'bytesReceivedTotal',
   'decodeQueueSize', 'backlogMs', 'backlogMaxMs', 'framesDroppedBacklog', 'chunkGaps',
-  'chunkStragglers', 'paint', 'age', 'arrival', 'viewer', 'queueMs', 'fwd', 'decode',
+  'chunkStragglers', 'paint', 'age', 'arrival', 'viewer', 'queueMs', 'queueArrMs', 'fwd', 'decode',
   'outGapMaxMs', 'ctxMode', 'render', 'renderW', 'renderH', 'media',
 ]
 const MEDIA_KEYS = [
@@ -297,5 +298,156 @@ describe.each(DC_CODECS)('FR-135 R3 — the data-channel worker on $name', ({ co
     out(new FakeFrame(3, 1280, 720, rect(1280, 720))) // the agent downscaled
     expect(ofType('first-frame').map((m) => [m.width, m.height])).toEqual([[1920, 1080], [1280, 720]])
     expect(ofType('frame-decoded').map((m) => m.count)).toEqual([2, 3])
+  })
+})
+
+// ── FR-135 R3 — the channel in the worker, and the arrival reading ────────────
+
+/** The `video-bytes` channel as the worker sees one the page moved to it. */
+class FakeChannel {
+  binaryType = 'blob'
+  readyState: 'connecting' | 'open' | 'closing' | 'closed' = 'connecting'
+  onmessage: ((ev: { data: unknown }) => void) | null = null
+  onopen: (() => void) | null = null
+  onclose: (() => void) | null = null
+  closeCalls = 0
+  close(): void {
+    this.closeCalls++
+  }
+  deliver(data: unknown): void {
+    this.onmessage?.({ data })
+  }
+  open(): void {
+    this.readyState = 'open'
+    this.onopen?.()
+  }
+  shut(): void {
+    this.readyState = 'closed'
+    this.onclose?.()
+  }
+}
+
+const sum = (h: unknown) => (h as number[]).reduce((a, b) => a + b, 0)
+
+describe.each(DC_CODECS)('FR-135 R3 — the video channel moved into the worker, on $name', ({ codec }) => {
+  it('decodes off the channel, with no page hop to time and every arrival counted', async () => {
+    const { send } = await boot({ codec })
+    const ch = new FakeChannel()
+    send({ type: 'video-channel', channel: ch })
+    expect(ch.binaryType).toBe('arraybuffer')
+    ch.open()
+    expect(ofType('video-channel-open')).toHaveLength(1)
+
+    clock += 16
+    ch.deliver(bare(true, 16_000))
+    clock += 16
+    ch.deliver(bare(false, 32_000))
+    ch.deliver('a text message is no frame')
+    const dec = FakeDecoder.instances[0]!
+    expect(dec.chunks.map((c) => c.type)).toEqual(['key', 'delta'])
+    dec.init.output(new FakeFrame(16_000, 1920, 1080, rect(1920, 1080)))
+    dec.init.output(new FakeFrame(32_000, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    ch.deliver(bare(false, 1_232_000))
+
+    const stats = ofType('stats')
+    expect(stats).toHaveLength(1)
+    const media = stats[0]!.media as Record<string, unknown>
+    expect(sum(media.fwd), 'no page hop').toBe(0)
+    expect((stats[0]!.fwd as { n: number }).n).toBe(0)
+    expect(sum(media.arrGap)).toBe(2)
+    expect(stats[0]!.framesDecodedTotal).toBe(2)
+    expect(stats[0]!.bytesReceivedTotal).toBe(3 * 18)
+  })
+
+  it('says the channel closed, once, and logs a delivery gap as the page does', async () => {
+    const { send } = await boot({ codec })
+    const ch = new FakeChannel()
+    send({ type: 'video-channel', channel: ch })
+    ch.deliver(bare(true, 1))
+    clock += 1_600
+    ch.deliver(bare(false, 2))
+    expect(ofType('video-channel-gap')).toEqual([{ type: 'video-channel-gap', gapMs: 1_600 }])
+    ch.shut()
+    ch.shut()
+    expect(ofType('video-channel-closed')).toHaveLength(1)
+  })
+
+  it('says open at once for a channel already open when it arrives', async () => {
+    const { send } = await boot({ codec })
+    const ch = new FakeChannel()
+    ch.readyState = 'open'
+    send({ type: 'video-channel', channel: ch })
+    ch.open() // a late event says nothing twice
+    expect(ofType('video-channel-open')).toHaveLength(1)
+  })
+
+  it('stops reading the channel at close, and leaves it open, as a relayed one is', async () => {
+    const { send } = await boot({ codec })
+    const ch = new FakeChannel()
+    send({ type: 'video-channel', channel: ch })
+    send({ type: 'close' })
+    expect(ch.onmessage).toBeNull()
+    expect(ch.onopen).toBeNull()
+    expect(ch.onclose).toBeNull()
+    expect(ch.closeCalls).toBe(0)
+  })
+
+  it('still times the page hop on a relayed chunk', async () => {
+    const { send } = await boot({ codec })
+    send({ type: 'chunk', bytes: bare(true, 1), sentAt: performance.timeOrigin + clock - 3 })
+    FakeDecoder.instances[0]!.init.output(new FakeFrame(1, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 2), sentAt: performance.timeOrigin + clock - 3 })
+    const media = ofType('stats')[0]!.media as Record<string, unknown>
+    expect(sum(media.fwd)).toBe(2)
+  })
+
+  it('reads the queue at arrival beside the old reading at paint, which a slow decoder moves', async () => {
+    const { send } = await boot({ codec })
+    const dec = () => FakeDecoder.instances[0]!
+    // Frames framed and delivered every 16 ms: the link holds steady. The
+    // decoder falls 10 ms further behind with each frame.
+    for (let i = 0; i < 5; i++) {
+      clock = 100_000 + i * 16
+      send({ type: 'chunk', bytes: bare(i === 0, 1 + i * 16_000) })
+    }
+    for (let i = 0; i < 5; i++) {
+      clock = 100_000 + i * 16 + 20 + i * 10
+      dec().init.output(new FakeFrame(1 + i * 16_000, 1920, 1080, rect(1920, 1080)))
+    }
+    // A sixth frame on the same cadence, past the window's second.
+    clock = 101_300
+    send({ type: 'chunk', bytes: bare(false, 1 + 64_000 + 1_236_000) })
+    const stats = ofType('stats')
+    expect(stats).toHaveLength(1)
+    // At paint the decoder's 10 ms a frame reads as queue growth (4 pairs);
+    // at arrival the link reads flat.
+    expect(stats[0]!.queueMs).toBe(40)
+    expect(stats[0]!.queueArrMs).toBe(0)
+  })
+
+  it('says nothing for the queue at arrival before two whole frames have arrived', async () => {
+    const { send } = await boot({ codec })
+    send({ type: 'chunk', bytes: bare(true, 1) })
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 2).slice(0, 5) }) // a frame's first bytes only
+    const stats = ofType('stats')
+    expect(stats).toHaveLength(1)
+    expect(stats[0]!.queueArrMs).toBeNull()
+    expect(stats[0]!.queueMs).toBeNull()
+  })
+
+  it('counts a growing link at arrival whatever the decoder does', async () => {
+    const { send } = await boot({ codec })
+    // Framed every 16 ms, delivered every 20: the queue grows 4 ms a frame.
+    for (let i = 0; i < 6; i++) {
+      clock = 100_000 + i * 20
+      send({ type: 'chunk', bytes: bare(i === 0, 1 + i * 16_000) })
+    }
+    clock = 101_200
+    send({ type: 'chunk', bytes: bare(false, 2).slice(0, 5) })
+    expect(ofType('stats')[0]!.queueArrMs).toBe(20)
+    expect(ofType('stats')[0]!.queueMs, 'nothing painted').toBeNull()
   })
 })
