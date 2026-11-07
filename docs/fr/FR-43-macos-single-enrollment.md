@@ -752,7 +752,7 @@ Each is default-off, so none waits for the FR-63 read. All the field proof runs 
       3 without. All three platforms are measured.)*
       *(Reworded 2026-10-31: it said "no `caps` at all", which stopped being true when later
       FRs made more of the caps live, so a heartbeat now re-announces on any change
-      (`signaling.rs:2413-2424`). Measured with a capture server on released agents, a live
+      (`signaling.rs:2350-2361`). Measured with a capture server on released agents, a live
       `rc_clipboard off` as the same-run control. Linux 0.4.190: 15 heartbeats, 14 without
       `caps`, one 16 s after the flip. macOS 0.4.190, root daemon, key absent, hello
       `no-gui-session`: 5 without, one after the flip, then none. **Windows is not measured**:
