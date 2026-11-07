@@ -2217,6 +2217,32 @@ jobs:
       - name: Audit anchor ranges
         run: bash scripts/anchor-range-audit.sh
 
+  rc-media-ratchet:
+    name: The remote-desktop media path does not grow (FR-135 ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # FR-135 §7.1 — the media path's debt may only fall while the plan pays it
+    # down: env-knob reads in the agent's media path, the viewer's roomler-rc-*
+    # keys, and the length of each of the three copied pumps. A count may rise
+    # only with its baseline line raised in the same PR and naming the ledger
+    # row it adds (scripts/rc-media-ratchet.baseline). A count that falls
+    # passes, and the log says the lower number to lock in. On a PR the
+    # script reads the base's baseline, so a raised line that names no ledger
+    # row fails; the base branch arrives through env, never into the script.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the base's baseline (a PR's raised line must name a ledger row)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git fetch --no-tags --depth=1 origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
+      - name: Count the media path against its baseline
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ]; then export RATCHET_BASE_REF="origin/$BASE_REF"; fi
+          bash scripts/rc-media-ratchet.sh
+
   mermaid-sequences:
     name: Every mermaid sequence diagram parses
     runs-on: ubuntu-latest

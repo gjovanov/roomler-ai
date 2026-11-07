@@ -125,6 +125,9 @@ pub mod media_paths;
 /// FR-135 R2 — `rc:media-plan`: what a session promised its viewer, and every
 /// step it took down from there.
 pub mod media_plan;
+/// FR-135 R0 — one data-channel pump's window of media numbers: the
+/// heartbeat's new fields and the session's summary.
+pub mod media_window;
 pub mod mem_trim;
 pub mod power;
 pub mod remote_config;
