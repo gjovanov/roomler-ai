@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use super::cells::{cell_denied, denied_cells, ffmpeg_444_capable};
+// FR-135 R9 — what the probe found, and the six fields the hello takes from it.
+use super::cell_table::{ProbeFindings, ProbedFields};
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 /// #3280 — a later try's answer, once one is adopted ([`adopt`]). [`CACHED_CAPS`]
@@ -3815,41 +3817,30 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
 /// build probes nothing and legitimately never reads them.
 #[allow(unused_variables)]
 fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -> AgentCaps {
-    // `mut` is only consumed inside the cfg-gated push blocks below
-    // (openh264-encoder / mf-encoder). Default-feature builds skip
-    // both blocks and the vecs stay empty; silence the unused-mut
-    // lint to keep the CI `cargo clippy --workspace -- -D warnings`
+    // FR-135 R9 — what the opens below find, kept apart from what the hello
+    // says about it: [`assemble`] writes the probed fields from this, and the
+    // cell table derives the same fields beside them (`cell_table::shadow`).
+    // `mut` is only consumed inside the cfg-gated blocks below. A
+    // default-feature build skips them all and finds nothing; silence the
+    // unused-mut lint to keep the CI `cargo clippy --workspace -- -D warnings`
     // build green on Linux.
     #[allow(unused_mut)]
-    let mut codecs: Vec<String> = Vec::new();
-    #[allow(unused_mut)]
-    let mut hw_encoders: Vec<String> = Vec::new();
-    // FR-77 — every cell (codec × chroma) this host OPENED, one entry per
-    // encoder (codec × backend). Filled next to the legacy fields, which keep
-    // their exact pre-FR-77 meaning; the cells carry the whole matrix.
-    #[allow(unused_mut)]
-    let mut video_cells: Vec<VideoCell> = Vec::new();
+    let mut found = ProbeFindings::default();
 
     #[cfg(feature = "openh264-encoder")]
     {
-        codecs.push("h264".into());
-        hw_encoders.push("openh264-sw".into());
         // Software by definition — needs no driver, so it is a cell even when
         // the hardware probes are not run.
-        video_cells.push(VideoCell::new(
-            VideoCodec::H264,
-            VideoBackend::Openh264,
-            &[ChromaFormat::Yuv420],
-            false,
-        ));
+        found.openh264 = true;
     }
 
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
     if run_hw_probes {
         // #3267 — a denied MF cell is not opened, and its legacy label goes
-        // with it (the H.264 label below is enumeration-gated, so an open that
-        // is refused would not take it away).
+        // with it (the H.264 label is enumeration-gated, so an open that is
+        // refused would not take it away).
         let mf_deny = denied_cells();
+        let mut mf = super::cell_table::MfFindings::default();
         // H.264: enumeration is sufficient. If any H.264 MFT
         // enumerates the cascade always succeeds (at worst it falls
         // through to the default-adapter SW MFT via
@@ -3860,26 +3851,13 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
             && let Ok(adapters) = super::mf::probe_adapter_count()
             && adapters > 0
         {
-            hw_encoders.push("mf-h264-hw".into());
             // FR-77 — the cell must say whether the cascade lands on
-            // silicon, and only an activation knows (the legacy label above
-            // is enumeration-only and says `-hw` even for the SW MFT).
-            let probe = activates(CodecProbe::H264);
-            if !matches!(probe, ProbeResult::Failed) {
-                video_cells.push(VideoCell::new(
-                    VideoCodec::H264,
-                    VideoBackend::MediaFoundation,
-                    &[ChromaFormat::Yuv420],
-                    matches!(probe, ProbeResult::Hardware),
-                ));
-            }
+            // silicon, and only an activation knows (the legacy label is
+            // enumeration-only and says `-hw` even for the SW MFT).
+            mf.h264 = Some(activates(CodecProbe::H264).into());
         }
 
-        let allow_sw = allow_sw_heavy_override();
-        let advertise = |r: ProbeResult| -> bool {
-            matches!(r, ProbeResult::Hardware)
-                || (allow_sw && matches!(r, ProbeResult::SoftwareOnly))
-        };
+        mf.allow_sw_heavy = allow_sw_heavy_override();
 
         // HEVC: enumeration + real activation probe. MFTs that
         // enumerate but fail ActivateObject (driver/adapter
@@ -3888,22 +3866,13 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // before the encoder opens, so failure means black video not
         // fallback-decode. Gate advertising on a successful HW probe;
         // SW-only paths are dropped so H.264 wins negotiation
-        // (mediasoup-screenshare-grade quality on iGPU hosts).
+        // (mediasoup-screenshare-grade quality on iGPU hosts). The gate is
+        // `assemble`'s, on the verdict recorded here.
         if !cell_denied(&mf_deny, super::cells::MF_HEVC, ChromaFormat::Yuv420)
             && let Ok(adapters) = super::mf::probe_hevc_adapter_count()
             && adapters > 0
         {
-            let probe = activates(CodecProbe::Hevc);
-            if advertise(probe) {
-                codecs.push("h265".into());
-                hw_encoders.push("mf-h265-hw".into());
-                video_cells.push(VideoCell::new(
-                    VideoCodec::Hevc,
-                    VideoBackend::MediaFoundation,
-                    &[ChromaFormat::Yuv420],
-                    matches!(probe, ProbeResult::Hardware),
-                ));
-            }
+            mf.hevc = Some(activates(CodecProbe::Hevc).into());
         }
 
         // AV1: same reasoning as HEVC, with sharper impact — the
@@ -3916,27 +3885,10 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
             && let Ok(adapters) = super::mf::probe_av1_adapter_count()
             && adapters > 0
         {
-            let probe = activates(CodecProbe::Av1);
-            if advertise(probe) {
-                codecs.push("av1".into());
-                hw_encoders.push("mf-av1-hw".into());
-                video_cells.push(VideoCell::new(
-                    VideoCodec::Av1,
-                    VideoBackend::MediaFoundation,
-                    &[ChromaFormat::Yuv420],
-                    matches!(probe, ProbeResult::Hardware),
-                ));
-            }
+            mf.av1 = Some(activates(CodecProbe::Av1).into());
         }
+        found.mf = Some(mf);
     }
-
-    #[allow(unused_mut)]
-    let mut transports: Vec<String> = Vec::new();
-    // P7 — chroma formats the HEVC DC transport can emit (see the probe's
-    // Ok arm below + AgentCaps::hevc_chroma). Stays empty when the ffmpeg
-    // HEVC probe fails or the feature is off.
-    #[allow(unused_mut)]
-    let mut hevc_chroma: Vec<String> = Vec::new();
 
     // rc.77 — FFmpeg HEVC over DataChannel.
     //
@@ -3971,6 +3923,10 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         if !deny.is_empty() {
             tracing::info!(denied = ?deny, "caps probe: cells on the denylist are not opened");
         }
+        let mut ff = super::cell_table::FfmpegFindings {
+            qsv_hw,
+            ..Default::default()
+        };
 
         // rc.83 — probe vp9_qsv to surface in caps + heartbeat whether
         // this host can use Intel HW VP9. The transport advertisement
@@ -4002,7 +3958,6 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                         elapsed_ms = start_vp9.elapsed().as_millis(),
                         "caps probe: ffmpeg VP9 (vp9_qsv) encoder activates — runtime peer dispatch will prefer it over libvpx SW on data-channel-vp9-444 sessions"
                     );
-                    hw_encoders.push(format!("ffmpeg-{name}"));
                     // FR-77 — the VP9 cell. 4:4:4 (profile 1) is attempted
                     // when the FFmpeg source matrix allows it for this name
                     // and the cell is not denylisted; today the open asks for
@@ -4011,28 +3966,25 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                     // that format. The session pump keeps vp9_qsv 4:2:0-only
                     // regardless (`peer.rs`).
                     let mut chroma = vec![ChromaFormat::Yuv420];
-                    if let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) {
-                        if attempt_444
-                            && ffmpeg_444_capable(name)
-                            && !cell_denied(&deny, name, ChromaFormat::Yuv444)
-                        {
-                            match announced_open(name, ChromaFormat::Yuv444, || {
-                                FfmpegEncoder::new_named_probe(
-                                    name,
-                                    PROBE_WIDTH,
-                                    PROBE_HEIGHT,
-                                    true,
-                                )
+                    if VideoBackend::from_ffmpeg_name(name).is_some()
+                        && attempt_444
+                        && ffmpeg_444_capable(name)
+                        && !cell_denied(&deny, name, ChromaFormat::Yuv444)
+                    {
+                        match announced_open(name, ChromaFormat::Yuv444, || {
+                            FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, true)
                                 .map(drop)
-                            }) {
-                                Ok(()) => chroma.push(ChromaFormat::Yuv444),
-                                Err(e) => {
-                                    tracing::debug!(encoder = name, %e, "caps probe: 4:4:4 cell did not open")
-                                }
+                        }) {
+                            Ok(()) => chroma.push(ChromaFormat::Yuv444),
+                            Err(e) => {
+                                tracing::debug!(encoder = name, %e, "caps probe: 4:4:4 cell did not open")
                             }
                         }
-                        video_cells.push(VideoCell::new(cell_codec, backend, &chroma, qsv_hw));
                     }
+                    ff.vp9 = Some(super::cell_table::Opened {
+                        name: name.to_string(),
+                        chroma,
+                    });
                     // P4 — measure whether THIS host's vp9_qsv honours
                     // runtime forced IDRs, per low_power mode. Hosts that
                     // do get GOP 64800 + on-demand-only keys (kills the
@@ -4102,12 +4054,12 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
             }
             let start = std::time::Instant::now();
             let mut winner: Option<&'static str> = None;
-            let mut winner_has_444 = false;
+            let mut opened: Vec<super::cell_table::Opened> = Vec::new();
             for name in FfmpegEncoder::cascade_names(codec) {
                 // A table name outside the vocabulary would open and then
                 // advertise nothing; `every_cascade_name_is_in_the_cell_vocabulary`
                 // makes that a test failure rather than a silent hole.
-                let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) else {
+                let Some((_, backend)) = VideoBackend::from_ffmpeg_name(name) else {
                     continue;
                 };
                 // FR-77 P4 — the denylist is the kill switch for BOTH chroma
@@ -4162,9 +4114,11 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                         );
                         if winner.is_none() {
                             winner = Some(name);
-                            winner_has_444 = chroma.contains(&ChromaFormat::Yuv444);
                         }
-                        video_cells.push(VideoCell::new(cell_codec, backend, &chroma, hw));
+                        opened.push(super::cell_table::Opened {
+                            name: name.to_string(),
+                            chroma,
+                        });
                     }
                     Err(e) => {
                         // A backend the host lacks failing is the matrix doing
@@ -4174,62 +4128,41 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                 }
             }
             let elapsed_ms = start.elapsed().as_millis();
+            // What each winner advertises is `assemble`'s.
             match (codec, winner) {
-                (VideoCodec::Hevc, Some(name)) => {
-                    tracing::info!(
-                        encoder = name,
-                        elapsed_ms,
-                        "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
-                    );
-                    if !codecs.iter().any(|c| c == "h265") {
-                        codecs.push("h265".into());
-                    }
-                    transports.push("data-channel-hevc".into());
-                    hw_encoders.push(format!("ffmpeg-{name}"));
-                    // P7 — the session's 4:4:4 (Rext) path tries `hevc_nvenc`
-                    // only, so the legacy field says 4:4:4 only when THAT
-                    // backend won AND its 4:4:4 open succeeded just now.
-                    hevc_chroma.push("yuv420".into());
-                    if name == "hevc_nvenc" && winner_has_444 {
-                        hevc_chroma.push("yuv444".into());
-                    }
-                }
+                (VideoCodec::Hevc, Some(name)) => tracing::info!(
+                    encoder = name,
+                    elapsed_ms,
+                    "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
+                ),
                 (VideoCodec::Hevc, None) => tracing::warn!(
                     elapsed_ms,
                     "caps probe: ffmpeg HEVC encoder failed to init — NOT advertising data-channel-hevc"
                 ),
-                (VideoCodec::Av1, Some(name)) => {
-                    tracing::info!(
-                        encoder = name,
-                        elapsed_ms,
-                        "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
-                    );
-                    if !codecs.iter().any(|c| c == "av1") {
-                        codecs.push("av1".into());
-                    }
-                    transports.push("data-channel-av1".into());
-                    hw_encoders.push(format!("ffmpeg-{name}"));
-                }
+                (VideoCodec::Av1, Some(name)) => tracing::info!(
+                    encoder = name,
+                    elapsed_ms,
+                    "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
+                ),
                 (VideoCodec::Av1, None) => tracing::info!(
                     elapsed_ms,
                     "caps probe: ffmpeg AV1 encoder not available (no AV1 encode silicon on this host) — NOT advertising data-channel-av1"
                 ),
-                (VideoCodec::H264, Some(name)) => {
-                    tracing::info!(
-                        encoder = name,
-                        elapsed_ms,
-                        "caps probe: ffmpeg H.264 encoder activates — advertising data-channel-h264"
-                    );
-                    transports.push("data-channel-h264".into());
-                    hw_encoders.push(format!("ffmpeg-{name}"));
-                }
+                (VideoCodec::H264, Some(name)) => tracing::info!(
+                    encoder = name,
+                    elapsed_ms,
+                    "caps probe: ffmpeg H.264 encoder activates — advertising data-channel-h264"
+                ),
                 (VideoCodec::H264, None) => tracing::info!(
                     elapsed_ms,
                     "caps probe: ffmpeg H.264 HW encoder not available — H.264 sessions stay on the RTP track"
                 ),
                 (VideoCodec::Vp9, _) => {}
             }
+            ff.matrix
+                .push(super::cell_table::CodecOpened { codec, opened });
         }
+        found.ffmpeg = Some(ff);
     }
 
     #[cfg(feature = "vp9-444")]
@@ -4249,30 +4182,32 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                     elapsed_ms = start.elapsed().as_millis(),
                     "caps probe: vp9-444 libvpx encoder activates — advertising data-channel-vp9-444 transport"
                 );
-                transports.push("data-channel-vp9-444".into());
-                hw_encoders.push("libvpx-vp9-444-sw".into());
                 // FR-77 — the libvpx cell: profile 0 (4:2:0) is opened for
                 // real too, so the cell claims only what opened.
-                let mut chroma = Vec::new();
-                match announced_open(super::cells::LIBVPX_VP9, ChromaFormat::Yuv420, || {
-                    crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
-                        PROBE_WIDTH,
-                        PROBE_HEIGHT,
-                        30,
-                        crate::encode::libvpx::Vp9Chroma::Yuv420,
-                    )
-                    .map(drop)
-                }) {
-                    Ok(()) => chroma.push(ChromaFormat::Yuv420),
-                    Err(e) => tracing::debug!(%e, "caps probe: libvpx 4:2:0 cell did not open"),
-                }
-                chroma.push(ChromaFormat::Yuv444);
-                video_cells.push(VideoCell::new(
-                    VideoCodec::Vp9,
-                    VideoBackend::Libvpx,
-                    &chroma,
-                    false,
-                ));
+                let yuv420 =
+                    match announced_open(super::cells::LIBVPX_VP9, ChromaFormat::Yuv420, || {
+                        crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
+                            PROBE_WIDTH,
+                            PROBE_HEIGHT,
+                            30,
+                            crate::encode::libvpx::Vp9Chroma::Yuv420,
+                        )
+                        .map(drop)
+                    }) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::debug!(%e, "caps probe: libvpx 4:2:0 cell did not open");
+                            false
+                        }
+                    };
+                found.libvpx = Some(super::cell_table::LibvpxFindings {
+                    yuv420,
+                    // rc.61 — the chroma the transport emits (`assemble` puts
+                    // it in `vp9_chroma`).
+                    vp9_chroma: crate::encode::libvpx::vp9_chroma_from_env()
+                        .as_str()
+                        .to_string(),
+                });
             }
             Err(e) => {
                 tracing::warn!(
@@ -4288,24 +4223,11 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
     // from `files_caps()` in the daemon — `browse` follows a config flag the
     // caps-probe child never loads (#1672); see that function.
 
-    // rc.61 — surface VP9 chroma format in caps so the browser worker
-    // picks the right codec string for VideoDecoder.configure(). Empty
-    // when vp9-444 transport isn't advertised (so we don't lie to the
-    // client about a format we don't emit).
-    let vp9_chroma: String = if transports.iter().any(|t| t == "data-channel-vp9-444") {
-        #[cfg(feature = "vp9-444")]
-        {
-            crate::encode::libvpx::vp9_chroma_from_env()
-                .as_str()
-                .to_string()
-        }
-        #[cfg(not(feature = "vp9-444"))]
-        {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
+    // FR-135 R9 — the probed fields, from what the opens above found; and the
+    // cell table's derivation of the same fields beside them, which says so
+    // in the log if the two ever differ and does nothing else.
+    let probed = assemble(&found);
+    super::cell_table::shadow(&found, &probed);
 
     // Audio track advertisement. Only when the `audio` feature is
     // compiled in do we offer a WebRTC Opus track (system/desktop
@@ -4394,8 +4316,8 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
     }
 
     AgentCaps {
-        hw_encoders,
-        codecs,
+        hw_encoders: probed.hw_encoders,
+        codecs: probed.codecs,
         // Was `cfg!(feature = "enigo-input")` — a COMPILE-TIME constant, so a
         // Mac with Accessibility denied still advertised working input while
         // silently dropping every event. The feature must be compiled in AND
@@ -4407,7 +4329,7 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: true,
         max_simultaneous_sessions: rc_max_sessions(),
-        transports,
+        transports: probed.transports,
         // FR-17 — this build frames every DataChannel message, so a
         // receiver can reassemble without relying on the channel being
         // ordered. Advertised unconditionally: it is a property of the
@@ -4416,15 +4338,15 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // Empty in the child's struct BY DESIGN; `detect()` fills it in the
         // daemon (`files_caps`). A test locks this.
         files: Vec::new(),
-        vp9_chroma,
-        hevc_chroma,
+        vp9_chroma: probed.vp9_chroma,
+        hevc_chroma: probed.hevc_chroma,
         audio,
         // Empty in the child's struct BY DESIGN; `detect()` fills it in the
         // daemon (`apps_caps`). A test locks this.
         apps: Vec::new(),
         clipboard,
         layout,
-        video_cells,
+        video_cells: probed.video_cells,
         // Stamped by the PARENT after the child reports (`child::probe`);
         // the driver-free fallback has no probe to time.
         probe_ms: None,
@@ -4466,6 +4388,215 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // (`with_honest_words`), like the config lists above.
         unavailable: Default::default(),
     }
+}
+
+/// FR-135 R9 — the probed fields from what [`compute_caps_with`]'s opens found:
+/// the pushes it used to make inline, in the same order and on the same
+/// conditions, so a fixture can be handed to the code that writes the real
+/// hello (`cell_table`'s gate). Each block is the probe's block of the same name.
+pub(crate) fn assemble(found: &ProbeFindings) -> ProbedFields {
+    use super::cell_table::{Activation, Opened};
+
+    let mut codecs: Vec<String> = Vec::new();
+    let mut hw_encoders: Vec<String> = Vec::new();
+    // FR-77 — every cell (codec × chroma) this host OPENED, one entry per
+    // encoder (codec × backend). Filled next to the legacy fields, which keep
+    // their exact pre-FR-77 meaning; the cells carry the whole matrix.
+    let mut video_cells: Vec<VideoCell> = Vec::new();
+    let mut transports: Vec<String> = Vec::new();
+    // P7 — chroma formats the HEVC DC transport can emit (see the HEVC arm
+    // below + AgentCaps::hevc_chroma). Stays empty when the ffmpeg HEVC probe
+    // fails or the feature is off.
+    let mut hevc_chroma: Vec<String> = Vec::new();
+
+    if found.openh264 {
+        codecs.push("h264".into());
+        hw_encoders.push("openh264-sw".into());
+        video_cells.push(VideoCell::new(
+            VideoCodec::H264,
+            VideoBackend::Openh264,
+            &[ChromaFormat::Yuv420],
+            false,
+        ));
+    }
+
+    if let Some(mf) = &found.mf {
+        // H.264: the label is enumeration's, so it stands even when the
+        // activation failed; the cell is the activation's.
+        if let Some(probe) = mf.h264 {
+            hw_encoders.push("mf-h264-hw".into());
+            if probe != Activation::Failed {
+                video_cells.push(VideoCell::new(
+                    VideoCodec::H264,
+                    VideoBackend::MediaFoundation,
+                    &[ChromaFormat::Yuv420],
+                    probe == Activation::Hardware,
+                ));
+            }
+        }
+        // HEVC and AV1: advertised on a hardware activation, or on a software
+        // one under `ROOMLERD_ALLOW_SW_HEAVY` (the probe block says why).
+        let advertise = |r: Activation| -> bool {
+            r == Activation::Hardware || (mf.allow_sw_heavy && r == Activation::SoftwareOnly)
+        };
+        if let Some(probe) = mf.hevc
+            && advertise(probe)
+        {
+            codecs.push("h265".into());
+            hw_encoders.push("mf-h265-hw".into());
+            video_cells.push(VideoCell::new(
+                VideoCodec::Hevc,
+                VideoBackend::MediaFoundation,
+                &[ChromaFormat::Yuv420],
+                probe == Activation::Hardware,
+            ));
+        }
+        if let Some(probe) = mf.av1
+            && advertise(probe)
+        {
+            codecs.push("av1".into());
+            hw_encoders.push("mf-av1-hw".into());
+            video_cells.push(VideoCell::new(
+                VideoCodec::Av1,
+                VideoBackend::MediaFoundation,
+                &[ChromaFormat::Yuv420],
+                probe == Activation::Hardware,
+            ));
+        }
+    }
+
+    if let Some(ff) = &found.ffmpeg {
+        // rc.83 — the first FFmpeg VP9 encoder that opened. Its cell takes
+        // `hw` from the QSV check whatever its backend (ledger enc:I185).
+        if let Some(vp9) = &ff.vp9 {
+            hw_encoders.push(format!("ffmpeg-{}", vp9.name));
+            if let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(&vp9.name) {
+                video_cells.push(VideoCell::new(cell_codec, backend, &vp9.chroma, ff.qsv_hw));
+            }
+        }
+        // FR-77 — the MATRIX: every encoder that opened is a cell, and the
+        // legacy fields keep their pre-FR-77 meaning, the FIRST backend in
+        // cascade order that opened.
+        for probed in &ff.matrix {
+            let mut winner: Option<&Opened> = None;
+            for opened in &probed.opened {
+                let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(&opened.name)
+                else {
+                    continue;
+                };
+                let hw = match backend {
+                    VideoBackend::Qsv => ff.qsv_hw,
+                    _ => true,
+                };
+                if winner.is_none() {
+                    winner = Some(opened);
+                }
+                video_cells.push(VideoCell::new(cell_codec, backend, &opened.chroma, hw));
+            }
+            let Some(winner) = winner else {
+                continue;
+            };
+            let name = winner.name.as_str();
+            match probed.codec {
+                VideoCodec::Hevc => {
+                    if !codecs.iter().any(|c| c == "h265") {
+                        codecs.push("h265".into());
+                    }
+                    transports.push("data-channel-hevc".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                    // P7 — the session's 4:4:4 (Rext) path tries `hevc_nvenc`
+                    // only, so the legacy field says 4:4:4 only when THAT
+                    // backend won AND its 4:4:4 open succeeded.
+                    hevc_chroma.push("yuv420".into());
+                    if name == "hevc_nvenc" && winner.chroma.contains(&ChromaFormat::Yuv444) {
+                        hevc_chroma.push("yuv444".into());
+                    }
+                }
+                VideoCodec::Av1 => {
+                    if !codecs.iter().any(|c| c == "av1") {
+                        codecs.push("av1".into());
+                    }
+                    transports.push("data-channel-av1".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                VideoCodec::H264 => {
+                    transports.push("data-channel-h264".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                VideoCodec::Vp9 => {}
+            }
+        }
+    }
+
+    // Phase Y.4 — libvpx: the transport and its label on the 4:4:4 open, and
+    // the cell with whichever forms opened.
+    if let Some(vpx) = &found.libvpx {
+        transports.push("data-channel-vp9-444".into());
+        hw_encoders.push("libvpx-vp9-444-sw".into());
+        let mut chroma = Vec::new();
+        if vpx.yuv420 {
+            chroma.push(ChromaFormat::Yuv420);
+        }
+        chroma.push(ChromaFormat::Yuv444);
+        video_cells.push(VideoCell::new(
+            VideoCodec::Vp9,
+            VideoBackend::Libvpx,
+            &chroma,
+            false,
+        ));
+    }
+
+    // rc.61 — surface VP9 chroma format in caps so the browser worker
+    // picks the right codec string for VideoDecoder.configure(). Empty
+    // when vp9-444 transport isn't advertised (so we don't lie to the
+    // client about a format we don't emit).
+    let vp9_chroma = if transports.iter().any(|t| t == "data-channel-vp9-444") {
+        found
+            .libvpx
+            .as_ref()
+            .map(|v| v.vp9_chroma.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    ProbedFields {
+        hw_encoders,
+        codecs,
+        transports,
+        vp9_chroma,
+        hevc_chroma,
+        video_cells,
+    }
+}
+
+/// FR-135 R9 — the production path's two children, for the cell table's gate:
+/// `base` answers the 4:2:0 matrix, the `444` child opens what
+/// [`child::candidates_444`] asks of it, and [`child::merge_444`] folds that
+/// in. `found` stands for what each child would have opened.
+#[cfg(test)]
+pub(crate) fn assemble_in_two_children(found: &ProbeFindings, deny: &[String]) -> ProbedFields {
+    let base = assemble(&found.base_phase());
+    let mut report = child::ProbeReport {
+        caps: AgentCaps {
+            hw_encoders: base.hw_encoders,
+            codecs: base.codecs,
+            transports: base.transports,
+            vp9_chroma: base.vp9_chroma,
+            hevc_chroma: base.hevc_chroma,
+            video_cells: base.video_cells,
+            ..AgentCaps::default()
+        },
+        vp9_qsv_idr: None,
+        gpu_input: Vec::new(),
+    };
+    let opened = found.opened_444();
+    let ok: Vec<String> = child::candidates_444(&report.caps, deny)
+        .into_iter()
+        .filter(|name| opened.contains(name))
+        .collect();
+    child::merge_444(&mut report, &ok);
+    ProbedFields::of(&report.caps)
 }
 
 /// FR-56 — the Remote Apps verbs, assigned by [`detect`] in the DAEMON and
@@ -4750,6 +4881,18 @@ enum ProbeResult {
     SoftwareOnly,
     /// No working encoder found at all. Caller MUST drop from caps.
     Failed,
+}
+
+/// FR-135 R9 — the verdict as the probe's findings record it.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+impl From<ProbeResult> for super::cell_table::Activation {
+    fn from(r: ProbeResult) -> Self {
+        match r {
+            ProbeResult::Hardware => Self::Hardware,
+            ProbeResult::SoftwareOnly => Self::SoftwareOnly,
+            ProbeResult::Failed => Self::Failed,
+        }
+    }
 }
 
 /// How long [`activates`] waits for an MF encoder's worker to finish its

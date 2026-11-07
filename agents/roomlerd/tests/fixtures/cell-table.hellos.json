@@ -1,0 +1,2555 @@
+{
+  "_about": [
+    "FR-135 R9: the cell table's gate (agents/roomlerd/src/encode/cell_table.rs and its tests).",
+    "Each fixture is one host class. `probe` is what its capability probe found, written by hand from the record named in `source`. `hello` is the six probed fields the agent's own code (`caps::assemble`) writes from it, and `divergences` is where that hello says something other than the table's rows (FR-135 section 5.7's Dv rows). Both are recorded, never hand-edited.",
+    "Re-record only when a change is intended, and say why in the commit message: CELL_TABLE_UPDATE=1 cargo test -p roomlerd --lib encode::cell_table"
+  ],
+  "fixtures": [
+    {
+      "name": "windows-nvenc-dgpu",
+      "covers": "Windows x86_64, an NVIDIA RTX dGPU beside an AMD iGPU (the dev box class: RTX 5090 Laptop + Radeon 610M)",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's dev-box row, less hevc/vulkan and av1/vulkan, which the built-in denylist has named since (FR-78 P3, #3267). Media Foundation as FR-130 P1 read it there: NVIDIA's and AMD's MFTs did not open, so H.264 lands on Microsoft's software MFT",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "software_only",
+          "hevc": "failed",
+          "av1": "failed",
+          "allow_sw_heavy": false
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_nvenc",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                },
+                {
+                  "name": "hevc_amf",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "hevc_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": [
+                {
+                  "name": "av1_nvenc",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_nvenc",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                },
+                {
+                  "name": "h264_amf",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "h264_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "h264_vulkan",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "ffmpeg-hevc_nvenc",
+          "ffmpeg-av1_nvenc",
+          "ffmpeg-h264_nvenc",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265",
+          "av1"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-av1",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420",
+          "yuv444"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "amf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "av1",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "amf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "vulkan",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv2",
+          "at": "av1",
+          "what": "`codecs` lists it from a DataChannel cell; no RTP row the hello carries opens it"
+        },
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv4",
+          "at": "mf-h264-hw",
+          "what": "the label says hardware; its cell says software"
+        },
+        {
+          "dv": "Dv12",
+          "at": "hevc_nvenc:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "av1_nvenc:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "h264_nvenc:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_amf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-qsv-office-desktop",
+      "covers": "Windows x86_64 on an Intel iGPU with QuickSync HEVC and no AV1 encode (the office-desktop class that holds most hevc_qsv hours, FR-135 section 2.1)",
+      "source": "Modelled on FR-135 section 5.1's QSV rows: hevc_qsv, h264_qsv and vp9_qsv open in 4:2:0, D3D12 opens HEVC and the Intel driver refuses FFmpeg's D3D12 H.264 (as on the Meteor Lake laptop), no Vulkan encode queue. Media Foundation: Intel's H.264 MFT on hardware, its HEVC MFT falling to software (caps.rs, ProbeResult's 2026-04 field reports)",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "hardware",
+          "hevc": "software_only",
+          "allow_sw_heavy": false
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "vp9": {
+            "name": "vp9_qsv",
+            "chroma": [
+              "yuv420"
+            ]
+          },
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "hevc_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "ffmpeg-vp9_qsv",
+          "ffmpeg-hevc_qsv",
+          "ffmpeg-h264_qsv",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv12",
+          "at": "hevc_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "h264_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_qsv:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_qsv:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-qsv-meteor-lake-laptop",
+      "covers": "Windows x86_64 on an Intel Meteor Lake iGPU: AV1 through QSV, HEVC only through D3D12 (a corporate laptop)",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's CORPLAP-3 row. Media Foundation's HEVC and AV1 leave nothing in that row: refused, software or not enumerated, the hello is the same, so the record leaves them out",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "hardware",
+          "allow_sw_heavy": false
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "vp9": {
+            "name": "vp9_qsv",
+            "chroma": [
+              "yuv420"
+            ]
+          },
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": [
+                {
+                  "name": "av1_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "ffmpeg-vp9_qsv",
+          "ffmpeg-hevc_d3d12va",
+          "ffmpeg-av1_qsv",
+          "ffmpeg-h264_qsv",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265",
+          "av1"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-av1",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "av1",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv2",
+          "at": "av1",
+          "what": "`codecs` lists it from a DataChannel cell; no RTP row the hello carries opens it"
+        },
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv12",
+          "at": "av1_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "h264_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_qsv:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-amf-apu",
+      "covers": "Windows x86_64 on an AMD APU alone (RDNA2 iGPU, no AV1 encode)",
+      "source": "Modelled on the dev box's AMD half: hevc_amf, h264_amf, D3D12 and h264_vulkan open on the Radeon 610M (docs/encoders.md, the 0.4.88 row; hevc_vulkan is denied on Windows since #3267). Media Foundation as FR-130 P1 read it there: AMD's MFTs did not open",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "software_only",
+          "hevc": "failed",
+          "allow_sw_heavy": false
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_amf",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "hevc_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_amf",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "h264_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "h264_vulkan",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "ffmpeg-hevc_amf",
+          "ffmpeg-h264_amf",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "amf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "amf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "vulkan",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv4",
+          "at": "mf-h264-hw",
+          "what": "the label says hardware; its cell says software"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_amf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-guest-no-gpu",
+      "covers": "A Windows guest with no GPU (Microsoft Basic Render): software only",
+      "source": "FR-135 section 5.1's MF H.264 software row (the Basic Render guest of FR-16 and FR-98): only Microsoft's software H.264 MFT enumerates, and every FFmpeg open fails with no GPU behind it",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "software_only",
+          "allow_sw_heavy": false
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": []
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": []
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264"
+        ],
+        "transports": [
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv4",
+          "at": "mf-h264-hw",
+          "what": "the label says hardware; its cell says software"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-ffmpeg-opted-out",
+      "covers": "Windows with ROOMLERD_USE_FFMPEG=0 on a host whose HEVC MFT activates on hardware: Media Foundation and the software cells alone",
+      "source": "Modelled: the rc.107 opt-out (`ffmpeg::available()` false, so the FFmpeg block does not run) on a host whose MFTs open",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "hardware",
+          "hevc": "hardware",
+          "allow_sw_heavy": false
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "mf-h265-hw",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv7",
+          "at": "hevc/mf",
+          "what": "a cell with no DataChannel transport for its codec on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-allow-sw-heavy",
+      "covers": "The office-desktop class with ROOMLERD_ALLOW_SW_HEAVY=1: Media Foundation's software HEVC advertised",
+      "source": "Modelled: windows-qsv-office-desktop's probe, with the operator's escape hatch",
+      "platform": "windows",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420",
+        "hevc_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "hardware",
+          "hevc": "software_only",
+          "allow_sw_heavy": true
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "vp9": {
+            "name": "vp9_qsv",
+            "chroma": [
+              "yuv420"
+            ]
+          },
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "hevc_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "mf-h265-hw",
+          "ffmpeg-vp9_qsv",
+          "ffmpeg-hevc_qsv",
+          "ffmpeg-h264_qsv",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "vp9",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv4",
+          "at": "mf-h265-hw",
+          "what": "the label says hardware; its cell says software"
+        },
+        {
+          "dv": "Dv12",
+          "at": "hevc_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "h264_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_qsv:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_qsv:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "windows-qsv-444-asked",
+      "covers": "The office-desktop class with encoder_cells_deny = none: QSV's 4:4:4 forms asked, and opening",
+      "source": "Modelled: hevc_qsv:yuv444 and vp9_qsv:yuv444 sit on the built-in denylist and no fleet host has opened them; this is what the hello would say if one did, with the operator's list cleared",
+      "platform": "windows",
+      "deny": [],
+      "probe": {
+        "openh264": true,
+        "mf": {
+          "h264": "hardware",
+          "hevc": "software_only",
+          "allow_sw_heavy": false
+        },
+        "ffmpeg": {
+          "qsv_hw": true,
+          "vp9": {
+            "name": "vp9_qsv",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ]
+          },
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_qsv",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                },
+                {
+                  "name": "hevc_d3d12va",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_qsv",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv420"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "mf-h264-hw",
+          "ffmpeg-vp9_qsv",
+          "ffmpeg-hevc_qsv",
+          "ffmpeg-h264_qsv",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv420",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "h264",
+            "backend": "mf",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "d3d12",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "qsv",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv4",
+          "at": "hevc_qsv:yuv444",
+          "what": "the HEVC winner opened 4:4:4; `hevc_chroma` says 4:2:0 only (P7 names hevc_nvenc alone)"
+        },
+        {
+          "dv": "Dv12",
+          "at": "hevc_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "h264_qsv:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_mf:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_qsv:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_qsv:yuv444",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_qsv:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_qsv:yuv444",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "linux-amd-vaapi-vulkan",
+      "covers": "Linux x86_64 on an AMD Raphael APU (VCN 3.1) with RADV_PERFTEST=video_encode: VAAPI and Vulkan",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's AMD Raphael row with the flag in the daemon's environment (RADV refuses AV1: VCN 3.1 has no AV1 encode)",
+      "platform": "linux-x64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_vaapi",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "hevc_vulkan",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_vaapi",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                },
+                {
+                  "name": "h264_vulkan",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "ffmpeg-hevc_vaapi",
+          "ffmpeg-h264_vaapi",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "hevc",
+            "backend": "vulkan",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "vulkan",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_vaapi:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_vaapi:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "linux-amd-vaapi",
+      "covers": "Linux x86_64 on the same AMD silicon without the RADV flag: VAAPI alone",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's second AMD Raphael row (RADV exposes Vulkan encode only under RADV_PERFTEST=video_encode)",
+      "platform": "linux-x64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_vaapi",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_vaapi",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "ffmpeg-hevc_vaapi",
+          "ffmpeg-h264_vaapi",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_vaapi:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_vaapi:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "linux-vp9-only",
+      "covers": "Linux x86_64 with no GPU: VP9 is the only DataChannel codec (libvpx), OpenH264 the RTP track's",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's GPU-less Linux server row; FR-135 section 7.1 names two VP9-only Linux hosts",
+      "platform": "linux-x64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": []
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": []
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264"
+        ],
+        "transports": [
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "linux-nvenc-wsl",
+      "covers": "Linux x86_64 under WSL, NVENC through WSL's libcuda",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's WSL row (its four software Vulkan ICDs open and refuse)",
+      "platform": "linux-x64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": true,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_nvenc",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": [
+                {
+                  "name": "av1_nvenc",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_nvenc",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "ffmpeg-hevc_nvenc",
+          "ffmpeg-av1_nvenc",
+          "ffmpeg-h264_nvenc",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265",
+          "av1"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-av1",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420",
+          "yuv444"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "av1",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv2",
+          "at": "av1",
+          "what": "`codecs` lists it from a DataChannel cell; no RTP row the hello carries opens it"
+        },
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "linux-arm64-nvenc",
+      "covers": "Linux arm64 on an NVIDIA GB10 (a rented DGX Spark): NVENC in both chroma forms; this build carries no QSV",
+      "source": "docs/encoders.md, the arm64 row (FR-122, 0.4.189)",
+      "platform": "linux-arm64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": false,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_nvenc",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": [
+                {
+                  "name": "av1_nvenc",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_nvenc",
+                  "chroma": [
+                    "yuv420",
+                    "yuv444"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "ffmpeg-hevc_nvenc",
+          "ffmpeg-av1_nvenc",
+          "ffmpeg-h264_nvenc",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265",
+          "av1"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-av1",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420",
+          "yuv444"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "av1",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "nvenc",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv2",
+          "at": "av1",
+          "what": "`codecs` lists it from a DataChannel cell; no RTP row the hello carries opens it"
+        },
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "linux-arm64-vaapi",
+      "covers": "Linux arm64 with a VAAPI driver that encodes VP9, HEVC and H.264; this build carries no QSV",
+      "source": "Modelled: docs/encoders.md says VAAPI and Vulkan on arm64 ship unproven, and no fleet host has one. This is what the hello would say",
+      "platform": "linux-arm64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": false,
+          "vp9": {
+            "name": "vp9_vaapi",
+            "chroma": [
+              "yuv420"
+            ]
+          },
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_vaapi",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_vaapi",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "ffmpeg-vp9_vaapi",
+          "ffmpeg-hevc_vaapi",
+          "ffmpeg-h264_vaapi",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "vp9",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "vaapi",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv6",
+          "at": "vp9_vaapi:yuv420",
+          "what": "`hw` is the QSV build flag; the row says otherwise"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_vaapi:yuv420",
+          "what": "writes no colour description"
+        },
+        {
+          "dv": "Dv19",
+          "at": "hevc_vaapi:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "h264_vaapi:yuv420",
+          "what": "nobody has read whether it describes its colour"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "macos-videotoolbox",
+      "covers": "macOS arm64 (an M-series MacBook): VideoToolbox HEVC and H.264, no AV1 encode block",
+      "source": "docs/encoders.md, the 0.4.88 fleet table's MacBook row",
+      "platform": "macos",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true,
+        "ffmpeg": {
+          "qsv_hw": false,
+          "matrix": [
+            {
+              "codec": "hevc",
+              "opened": [
+                {
+                  "name": "hevc_videotoolbox",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            },
+            {
+              "codec": "av1",
+              "opened": []
+            },
+            {
+              "codec": "h264",
+              "opened": [
+                {
+                  "name": "h264_videotoolbox",
+                  "chroma": [
+                    "yuv420"
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "libvpx": {
+          "yuv420": true,
+          "vp9_chroma": "yuv444"
+        }
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw",
+          "ffmpeg-hevc_videotoolbox",
+          "ffmpeg-h264_videotoolbox",
+          "libvpx-vp9-444-sw"
+        ],
+        "codecs": [
+          "h264",
+          "h265"
+        ],
+        "transports": [
+          "data-channel-hevc",
+          "data-channel-h264",
+          "data-channel-vp9-444"
+        ],
+        "vp9_chroma": "yuv444",
+        "hevc_chroma": [
+          "yuv420"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          },
+          {
+            "codec": "hevc",
+            "backend": "videotoolbox",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "h264",
+            "backend": "videotoolbox",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": true
+          },
+          {
+            "codec": "vp9",
+            "backend": "libvpx",
+            "chroma": [
+              "yuv420",
+              "yuv444"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        },
+        {
+          "dv": "Dv12",
+          "at": "hevc_videotoolbox:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv12",
+          "at": "h264_videotoolbox:yuv420",
+          "what": "has a GPU input form; whether it opened is not on the wire"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv420",
+          "what": "describes its colour in part (matrix and range)"
+        },
+        {
+          "dv": "Dv19",
+          "at": "vp9_libvpx:yuv444",
+          "what": "describes its colour in part (matrix and range)"
+        }
+      ]
+    },
+    {
+      "name": "headless-no-hardware-probe",
+      "covers": "A host whose probe child did not come back, or a cache hit's fresh half: the driver-free answer on a full build",
+      "source": "caps::compute_caps(false, false), what detect() falls back to (and merge_cached computes beside the cached fields)",
+      "platform": "linux-x64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": true
+      },
+      "hello": {
+        "hw_encoders": [
+          "openh264-sw"
+        ],
+        "codecs": [
+          "h264"
+        ],
+        "video_cells": [
+          {
+            "codec": "h264",
+            "backend": "openh264",
+            "chroma": [
+              "yuv420"
+            ],
+            "hw": false
+          }
+        ]
+      },
+      "divergences": [
+        {
+          "dv": "Dv10",
+          "at": "h264_openh264:yuv420",
+          "what": "advertised from the build alone: nothing opened it"
+        }
+      ]
+    },
+    {
+      "name": "signalling-only-build",
+      "covers": "A build with no encoder backend (the no-feature CI agent): a Noop host that advertises no cell",
+      "source": "cargo build -p roomlerd with no features (CLAUDE.md: signalling-only, not usable in production)",
+      "platform": "linux-x64",
+      "deny": [
+        "hevc_qsv:yuv444",
+        "hevc_vaapi:yuv444",
+        "vp9_qsv:yuv444",
+        "vp9_vaapi:yuv444",
+        "hevc_vulkan:yuv444",
+        "av1_vulkan:yuv420"
+      ],
+      "probe": {
+        "openh264": false
+      },
+      "hello": {
+        "hw_encoders": [],
+        "codecs": []
+      },
+      "divergences": []
+    }
+  ]
+}
