@@ -154,7 +154,7 @@ against the same hosts' CPU-path week before it, from the heartbeats and `rc:ses
 |---|---|---|
 | decode errors per session-hour | `rc:session.stats` (3b) | no rise (open decision 3) |
 | keyframe requests per session-hour | `rc:session.stats` | no rise |
-| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:10019-10033`) | `gpu` on every session of the cell; no `open_failed` that persists |
+| `input_reason` | the DC heartbeat (`agents/roomlerd/src/peer.rs:10057-10071`) | `gpu` on every session of the cell; no `open_failed` that persists |
 | capture + encode, CPU per frame | the heartbeat; the process's CPU time | FR-118's saving for that cell, roughly |
 
 The capture + encode row reads moving and idle windows apart, with under 5 fps captured as idle. FR-118 measured its
@@ -173,7 +173,7 @@ the flip on every host that runs the cell, canary or not.
 | P1 | 3a and 3b: `zero_copy_deny` in `DesiredConfig` and the agent's `apply`; the viewer's decode-error message and its count in `rc:session.stats` | the push is absent (no change); a viewer without the message sends nothing | **built 2026-10-30, released 2026-10-31** ([#3154](https://github.com/gjovanov/roomler-ai/pull/3154), in 0.4.191 and `hosted-20261031-28dfd72`). 3a: `MANAGE_AGENTS` alone, passed on unread, written by the device with `needs_restart`, end to end in `agent_tests` (AC2's integration half). 3b: `rc:decode-error` per error before the fallback, `de: 1` on every `rc:decodestat`, `decode_errors` on `rc:session.stats` (absent = not counted), the first `de` and the first eight errors sent at once, end to end through a real agent and viewer peer in `session_decode_errors_tests` (AC3's integration half). The field halves of AC2 and AC3 are met (§8) |
 | P1b | 3a: a save nudges a connected device with the same frame, and one hub call sends every `rc:agent.config` | the previous image: the connect path never left, so a device still converges | **built** ([#3242](https://github.com/gjovanov/roomler-ai/pull/3242)): server and UI only, so it needs a promote and no release. **On production since 2026-11-03** (`hosted-20261103-5f12695`); AC8's field half in §8 |
 | P1c | 3a: `needs_restart` holds until the daemon runs the value | the previous agent: a reconnect reads `applied` again | **built** ([#3283](https://github.com/gjovanov/roomler-ai/pull/3283)) and **released in 0.4.199** (2026-11-03); AC9's field half is read on it |
-| P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | not started |
+| P1d | 3d: `rc:session.stats` carries the encoder, the capture arm and the input form (decision 8) | absent from an older agent, and the week reads the heartbeats | **built** ([#3284](https://github.com/gjovanov/roomler-ai/pull/3284)): the server half rides a promote and the agent half the next release, and each is harmless without the other: an older agent sends no reading, and an older server ignores the field. The reading lands in `remote_sessions.video` ([`remote-control.md`](../remote-control.md) §11.12) |
 | P2 | 3c: the three-valued reading, the default list (empty), `default_off`, at both entry points | `zero_copy = off`; the list empty | not started |
 | P3 | QSV: the canary week, then the flip (if open decision 4 orders it first). `hevc_qsv` and `h264_qsv` also wait for decision 9 | `zero_copy_deny` pushed; the cell off the list in the next release | not started |
 | P4 | NVENC on the WGC arm: the same | the same | not started |
