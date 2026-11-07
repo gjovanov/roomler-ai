@@ -159,6 +159,124 @@ Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
 The probe's cost grew with the device walk (the dev box 4.3 → 6.1 s, WSL 2.5 →
 5.9 s); the cache pays it once per build, driver and hardware.
 
+## The cell table: the hello's encoder fields from one table (FR-135 R9)
+
+Every cell the agent can advertise is one row of `CELLS`
+(`agents/roomlerd/src/encode/cell_table.rs:574`): codec × backend × chroma, 36 rows, in
+the order the probe opens them. A host's probe adds an overlay of proof, and `derive`
+(`cell_table.rs:982`) writes from the two the six fields a probe answers: `hw_encoders`,
+`codecs`, `transports`, `vp9_chroma`, `hevc_chroma` and `video_cells`.
+
+**It drives nothing.** `compute_caps_with` (`agents/roomlerd/src/encode/caps.rs:3819`)
+makes every open it made before and records what it found in `ProbeFindings`
+(`cell_table.rs:624`). `assemble` (`caps.rs:4397`) writes the real hello from that, with
+the pushes the probe used to make inline, in the same order and on the same conditions.
+The table derives beside it (`caps.rs:4229`): a gate proves the two byte-identical, and
+`shadow` (`cell_table.rs:1286`) puts one warn line in the log if a host ever makes them
+differ, and touches nothing. That is FR-70 M3a's pattern. Readers move onto the rows in
+R10 ([FR-135 §6.5](fr/FR-135-one-rc-media-pipeline.md#65-encoder-and-codec-choice-one-source-of-truth)).
+
+```mermaid
+flowchart LR
+    subgraph child["probe child: compute_caps_with"]
+        OP["every open, unchanged"] --> PF["ProbeFindings<br/>what opened, MF's verdicts,<br/>qsv_hw, ALLOW_SW_HEAVY, VP9_CHROMA"]
+    end
+    PF --> AS["caps::assemble"]
+    AS --> HELLO["rc:agent.hello, unchanged"]
+    PF --> PR["proofs: a CellProof per row"]
+    CELLS["CELLS: 36 rows"] --> DV["derive"]
+    PR --> DV
+    DV -. "shadow: one warn line if they differ" .-> AS
+    DV --> DIV["divergences: FR-135 §5.7's Dv rows"]
+    FIX["tests/fixtures/cell-table.hellos.json<br/>17 hosts"] --> GATE["the gate"]
+    AS --> GATE
+    DV --> GATE
+```
+
+| Column | What it holds | Where the code holds it |
+|---|---|---|
+| `id` | the cell's stable name in the denylist's spelling: `hevc_qsv:yuv420`, `hevc_d3d12va:yuv420`, `h264_mf:yuv420`, `vp9_libvpx:yuv444`, and `h264_openh264:yuv420`, which no list names yet | the cascade tables, `cells::MF_*`, `cells::LIBVPX_VP9` |
+| `codec`, `backend`, `ffmpeg_name`, `chroma` | the cell | `models::VideoBackend::from_ffmpeg_name` |
+| `family` | `mf`, `openh264`, `ffmpeg`, `libvpx` | `bench::BuildCaps`'s build line |
+| `paths` | `Dc`, `Rtp`, `Recording` | `open_for_codec`: H.264 through MF then OpenH264, HEVC through FFmpeg's cascade then MF, AV1 through MF alone; the recorder's FFmpeg H.264 then OpenH264; the DataChannel pumps |
+| `input_forms` | `Cpu` everywhere; `D3d11` on QSV's and NVENC's 4:2:0 (Windows); `IoSurface` on VideoToolbox's 4:2:0 HEVC and H.264 | `gpu_input::gpu_cell`, `vt_input::gpu_cell` |
+| `rate_move` | `InPlace { idr }`, `Rebuild`, `RebuildOrInPlace` (QSV under `encoder_inplace_rate`) | `resolve_rate_mode`, `reconfig_forces_idr_for`, libvpx's `EncoderCaps` |
+| `rate_factor_pct` | the DataChannel pump's maxrate factor, codec × chroma | `codec_rate_factor_pct` × `chroma_rate_factor_pct`, as `rate_plan` multiplies them |
+| `describes` | `Full`, `Partial` (libvpx: matrix and range), `Unwritten`, `Unread` | the reads in FR-130's P1 and P3 |
+| `factors` | the feature, the platforms whose release carries it, a driver floor, a drop-in | the vendored FFmpeg jobs' `--enable-encoder` lists, the NVENC floor, `RADV_PERFTEST` |
+| `hw` | `Hardware`, `Software`, `ByProbe` (Media Foundation), `ByBuild` (QSV: the oneVPL build) | `assemble`, `qsv_is_hardware_by_construction` |
+| `legacy` | how the pre-FR-77 fields spell the row, with every way they differ from its truth: `in_codecs`, `transport`, `hevc_chroma` (P7: 4:4:4 for `hevc_nvenc` alone), `label_on_enumeration` (MF H.264), `hw_from_qsv_build` (FFmpeg's VP9) | `assemble` |
+
+Left out, because nothing in the code holds them yet: the spec's `max_tier`, and in
+`CellProof` the frame counts, the decode check, the GPU and shared-device proofs, the VUI
+reorder read, the last fault and the build id. A fact a row carries that nobody has
+measured says so (`Describes::Unread`, `idr: None`).
+
+### The gate
+
+The composition baseline's pattern: recorded hellos in
+`agents/roomlerd/tests/fixtures/cell-table.hellos.json`, one per host class, read by
+`agents/roomlerd/src/encode/cell_table/tests.rs`.
+
+| Check | Test | Fails on |
+|---|---|---|
+| The agent's assembly writes each recorded hello; so do the `base` and `444` children through `candidates_444` and `merge_444`; the table derives it byte for byte; the divergences are the recorded ones | `the_table_derives_every_recorded_hello_byte_for_byte` (`tests.rs:135`) | any change to what a recorded probe makes the hello say, by either path |
+| The gate can fail | `one_changed_row_fails_the_gate` (`tests.rs:202`) | a row's `hw`, transport, `codecs` entry, P7 column or MF rule, a row removed, two rows swapped: each must be a mismatch on the hosts that carry it |
+| Each column is the code's | `the_ffmpeg_rows_are_the_cascade_tables_in_their_order`, `the_444_rows_are_the_names_the_probe_asks_for_444`, `the_platform_column_is_the_vendored_ffmpeg_builds`, `the_gpu_forms_are_the_cells_that_take_gpu_frames`, `the_rate_factor_column_is_the_rate_plans`, `dv20_…` on an FFmpeg build | a cascade name, a 4:4:4 name, a vendored encoder, a GPU form, a factor or a rate move the table does not hold |
+| The fixtures are the wire's | `probed_fields_serialise_as_the_hello_does`, `every_fixture_proof_is_a_row_of_its_platform` | a field spelt or skipped otherwise than `AgentCaps`; a proof with no row, off its platform, or on its own denylist |
+| The shadow | `the_shadow_says_once_and_leaves_the_hello_alone`, `the_shadow_takes_a_host_outside_the_table` | a second warn line, a changed hello, or a panic on a host the table has never seen |
+
+**Re-record only when a change is intended**, and say why in the commit message:
+`CELL_TABLE_UPDATE=1 cargo test -p roomlerd --lib encode::cell_table`. Each fixture's
+`probe` is written by hand from the record its `source` names; `hello` and
+`divergences` are recorded from the agent's own code.
+
+| Fixture | Host class | From |
+|---|---|---|
+| `windows-nvenc-dgpu` | RTX dGPU beside an AMD iGPU | the dev-box row above, less the two Vulkan cells denied since; MF as FR-130 P1 read it there |
+| `windows-qsv-office-desktop` | Intel iGPU, QSV HEVC, no AV1 | modelled on FR-135 §5.1's QSV rows |
+| `windows-qsv-meteor-lake-laptop` | Intel Meteor Lake, AV1 on QSV, HEVC on D3D12 | the CORPLAP-3 row above |
+| `windows-amf-apu` | AMD APU alone | modelled on the dev box's AMD half |
+| `windows-guest-no-gpu` | Basic Render guest, software only | FR-135 §5.1's MF H.264 software row |
+| `windows-ffmpeg-opted-out` | `ROOMLERD_USE_FFMPEG=0`, MF HEVC on hardware | modelled |
+| `windows-allow-sw-heavy` | the office desktop with `ROOMLERD_ALLOW_SW_HEAVY=1` | modelled |
+| `windows-qsv-444-asked` | the office desktop with `encoder_cells_deny = none` | modelled: no host has opened these 4:4:4 forms |
+| `linux-amd-vaapi-vulkan`, `linux-amd-vaapi` | AMD Raphael with and without `RADV_PERFTEST` | the two AMD rows above |
+| `linux-vp9-only` | no GPU: libvpx and OpenH264 | the GPU-less Linux row above |
+| `linux-nvenc-wsl` | NVENC through WSL's libcuda | the WSL row above |
+| `linux-arm64-nvenc` | NVIDIA GB10, a build with no QSV | the arm64 row above |
+| `linux-arm64-vaapi` | arm64 VAAPI | modelled: VAAPI on arm64 ships unproven |
+| `macos-videotoolbox` | M-series MacBook | the MacBook row above |
+| `headless-no-hardware-probe` | the driver-free answer | `compute_caps(false, false)` |
+| `signalling-only-build` | no encoder backend, a Noop host | the no-feature build |
+
+### What the table reads as a divergence today
+
+FR-135 §5.7's rows, against the table. `divergences` (`cell_table.rs:1062`) reads the
+per-host ones on every fixture, and the gate holds them to the recorded list. The rest are
+tests that read the code against a column.
+
+| Dv | Read as | Where it shows |
+|---|---|---|
+| Dv1 | a DataChannel pick reads the `codecs` union, not its transport: `data-channel-h264` bound to AV1 | `dv1_a_datachannel_pick_reads_the_union_not_the_transport` |
+| Dv2 | `codecs` lists AV1 from an FFmpeg cell that no RTP opener reaches | NVENC hosts (dev box, WSL, arm64), the Meteor Lake laptop |
+| Dv3 | the RTP track's codec is patched by rule: a VP8 placeholder no row carries, a refusal by name | `dv3_the_rtp_track_is_patched_not_derived` |
+| Dv4 | `mf-h264-hw` over a software cell (read on the dev box's own probe too, master built with `media-hw`), `mf-h265-hw` over software HEVC, `hevc_chroma` silent on a QSV winner's 4:4:4 | dev box, AMD APU, guest; `allow-sw-heavy`; `qsv-444-asked` |
+| Dv6 | the VP9 cell's `hw` is the QSV build flag: `vp9_vaapi` reads software on a build with no QSV; the VP9 probe stops at its first opener | `linux-arm64-vaapi`; no recorded host reaches the second |
+| Dv7 | Media Foundation's HEVC cell with no DataChannel transport behind it | `windows-ffmpeg-opted-out` |
+| Dv10 | OpenH264's cell from the build alone, nothing opened; a label from an enumeration whose activation failed | every host with OpenH264 |
+| Dv11 | a denylist entry no gate reads: `h264_openh264:yuv420` changes nothing on the wire | `dv11_a_row_no_gate_reads` |
+| Dv12 | a GPU input form whose proof never reaches the wire | QSV and NVENC on Windows, VideoToolbox |
+| Dv13 | the fps verdict cache keys a class by encoder name: `hevc_nvenc`'s three cells share one verdict | `dv13_the_fps_class_key_cannot_tell_a_cell_from_its_other_forms` |
+| Dv15 | H.264's rows span three paths, each with its own order, plus MF's own cascade inside one row | `dv15_h264_is_four_cascades` |
+| Dv16 | none since #3245: the RTP track binds H.264 first, as the table's RTP column does; the DataChannel rank stays best-of | `dv16_the_rtp_track_binds_h264_first_as_the_table_does` |
+| Dv19 | a cell whose colour is described in part, not at all or unread, under one host-wide `color-described` | every host |
+| Dv20 | `resolve_rate_mode` decides from substrings of the name; the column holds the same answer | `dv20_the_rate_move_column_is_what_resolve_rate_mode_says` (FFmpeg builds) |
+| Dv5, Dv8, Dv9 | not here: the viewer's rank, picker and `legacyCells` | R13 |
+| Dv14 | not here: `encoder_preference` filters at a session's open | R10 |
+| Dv17 | not here: a supervised Mac's worker probe never reaches the root | no source yet |
+| Dv18 | in part: a learned deny's fault rides `unavailable["encoder-cells"]` since #3271; a per-row last open has no source | R10 |
+
 ## The cell resolution — from the matrix to a session
 
 The picker offers two independent dropdowns, **codec** and **chroma format**, and

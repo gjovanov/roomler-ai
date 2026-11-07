@@ -280,3 +280,19 @@ and **`data-channel-vp9-444` stays on the wire forever**. Unknown cell names are
 ignored, never an error. The viewer derives cells for old agents in
 `ui/src/composables/videoCells.ts` — the one reading the picker and the admin
 chips share.
+
+## 7 · The cell table derives the hello beside the code that writes it (FR-135 R9)
+
+`encode/cell_table.rs` has one row per cell the agent can advertise (`CELLS`), and derives
+the hello's six probed fields from the probe's `ProbeFindings`. `caps::assemble` still writes
+them; a gate over `tests/fixtures/cell-table.hellos.json` proves the two byte-identical, and
+`cell_table::shadow` logs once if a host makes them differ (`docs/encoders.md`).
+
+⚠️ **A new cascade name, 4:4:4 form, GPU form or vendored encoder needs its row**, or the
+table's tests fail: they read the columns against `*_ENCODER_NAMES`, `FFMPEG_444_CAPABLE`,
+`gpu_cell` and the vendor jobs' `--enable-encoder` lists.
+⚠️ **A change to what a probe's findings make the hello say re-records the fixtures**
+(`CELL_TABLE_UPDATE=1 cargo test -p roomlerd --lib encode::cell_table`), with the reason in
+the commit message, the composition baseline's rule.
+⚠️ **Nothing reads the table yet.** A fix to what a session opens goes where the session
+reads it; R10 moves those readers onto the rows.

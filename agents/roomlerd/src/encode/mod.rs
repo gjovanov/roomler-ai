@@ -23,6 +23,11 @@ use crate::capture::{DirtyRect, Frame};
 pub mod bench;
 pub mod caps;
 pub mod caps_cache;
+/// FR-135 R9 — one table of encoder cells; the hello's encoder fields derived
+/// from it beside the code that writes them. It drives nothing yet: its readers
+/// are R10's, so outside the gate's tests most of it is unread.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod cell_table;
 pub mod cells;
 pub mod color;
 /// FR-130 P1 — the colour description every encoder writes, in one place.
