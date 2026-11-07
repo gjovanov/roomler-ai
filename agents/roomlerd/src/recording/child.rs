@@ -243,7 +243,7 @@ fn stop_reason_from(word: Option<&str>) -> StopReason {
 }
 
 /// Register the encoder knobs the record child reads from config, exactly the
-/// keys `main.rs` registers for the daemon's own encoders (`ENCODER_CELLS_DENY`,
+/// keys `app.rs` registers for the daemon's own encoders (`ENCODER_CELLS_DENY`,
 /// FR-130's `COLOR_DESCRIPTION` and the pinned hardware devices). An env var
 /// set by a parent still wins — that is `node_env`'s precedence.
 pub fn register_encoder_fallbacks(cfg: &roomler_node_core::config::AgentConfig) {

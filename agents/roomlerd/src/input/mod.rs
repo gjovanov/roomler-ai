@@ -43,7 +43,7 @@ pub fn reset_input_diag_counter() {
 /// as truthy; anything else (including `None`) is false.
 ///
 /// Lives here (in `input/mod.rs`) rather than `enigo_backend.rs` so
-/// it's reachable from `main.rs` regardless of whether the
+/// it's reachable from `app.rs` regardless of whether the
 /// `enigo-input` feature is on for this build — the startup log line
 /// surfaces the gate value even on signalling-only builds.
 ///

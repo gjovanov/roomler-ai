@@ -709,7 +709,7 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// process start, so the watchdog's 90 s timer ran during initial
 /// exponential backoff against an unreachable server — every cold
 /// start with a flaky network got force-exited at 90 s and the
-/// supervisor crash-looped forever. See `main.rs` register call for
+/// supervisor crash-looped forever. See `app.rs` register call for
 /// the symmetric flip there.
 struct SignalingPumpGuard {
     pump: &'static str,
@@ -7658,7 +7658,7 @@ mod tests {
 
     #[test]
     fn ws_send_timeout_fits_inside_the_watchdog_budget() {
-        // The signaling pump's stall threshold is 90 s (main.rs
+        // The signaling pump's stall threshold is 90 s (app.rs
         // registration). The worst un-ticked dwell in one select arm was
         // TWO bounded sends back-to-back (heartbeat + first session-stats
         // frame). Since FR-102 P9d a session's stats are `try_send`-queued

@@ -2670,7 +2670,7 @@ fn watches_clipboard_images() -> bool {
 }
 
 /// FR-97 P3e-2 — see [`HostFacts::display_switchable`]. A virtual desktop is
-/// up before the hello (`main.rs` starts it before connecting).
+/// up before the hello (`app.rs` starts it before connecting).
 fn display_switchable() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -4535,7 +4535,7 @@ fn apps_caps_for(cfg: &crate::apps::VirtualDesktopAppsConfig) -> Vec<String> {
 /// which is why the daemon must fill the list and not merely append to it.
 ///
 /// A boot-time snapshot in `detect()` is the honest home: the flag is stored
-/// once by `main.rs::run_cmd` before the signalling loop starts and is not
+/// once by `app.rs::run_cmd` before the signalling loop starts and is not
 /// live (`config_surface.rs` says so; no LocalAPI `ConfigSet` re-seeds it) —
 /// unlike `record`, whose gate IS live and is therefore filled at every
 /// announcement by `signaling::stub_caps`.

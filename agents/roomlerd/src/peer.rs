@@ -8923,7 +8923,7 @@ async fn media_pump_ffmpeg_dc(
             // late first frame.
             //
             // ⚠️ SIZE THE CLAIM HONESTLY. The runtime is `new_multi_thread()`
-            // with no `worker_threads` (main.rs), so it defaults to the core
+            // with no `worker_threads` (app.rs), so it defaults to the core
             // count and blocking one worker is a 1/N capacity hit that
             // work-stealing routes around — severe on a 2-core VM, a cluster
             // node or WSL, modest on a 16-core desktop. It is NOT a whole-

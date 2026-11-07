@@ -2315,7 +2315,7 @@ pub fn spawn_rtt_prober(
 
 /// B1 — optional per-sample prober callback: `(node_id_hex, rtt_ms)` for
 /// every SUCCESSFUL probe. Feature-agnostic — the overlay-enabled caller
-/// (main.rs) bridges it into the runtime's `OverlayEvent` channel via a
+/// (app.rs) bridges it into the runtime's `OverlayEvent` channel via a
 /// weak sender, so this module never grows an overlay-feature dependency.
 pub type RttSampleHook = Arc<dyn Fn(&str, u32) + Send + Sync>;
 

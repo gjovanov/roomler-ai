@@ -644,7 +644,7 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     Ok(EnsureOutcome::Started)
 }
 
-/// Which spawn shape this process needs. Mirrors the probe `main.rs` does for
+/// Which spawn shape this process needs. Mirrors the probe `app.rs` does for
 /// the update path, kept here so the consent path cannot pick a different one.
 #[cfg(target_os = "windows")]
 fn respawn_context_for_self() -> RespawnContext {
