@@ -85,7 +85,7 @@ targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `enc
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
 default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:203`; parity test :1935).
-Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10275–10462`) with
+Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10276–10463`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:30`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
 rate once, count key flags — per host, per codec, OnceLock; a driver table is not evidence.
@@ -102,7 +102,7 @@ Windows by injecting `PATCHES` into the copied portfile's `vcpkg_from_github(` (
 technique :75–95). Drift gate: each builder writes `ROOMLER-PATCHES.txt` (sha256 per patch) into
 the asset and `release-agent.yml`'s three fetch steps (:341–352, :1002–1004, :1926–1934) assert it
 matches `.github/ffmpeg-patches/*`. `const NVENC_RECONFIG_FORCES_IDR: bool` flips to false in the
-asset-bump PR; the pump's `held_increase` arm (`peer.rs:9620–9626`) keys on it.
+asset-bump PR; the pump's `held_increase` arm (`peer.rs:9621–9627`) keys on it.
 
 **A3 — VideoToolbox / AMF.** From A0 on a Mac: patch 0002 + `InPlace`, or keep `Rebuild` on a
 simple "rebuild at settle, ≥ 15 s apart" rule; AMF stays `Rebuild` on the same rule.
@@ -138,7 +138,7 @@ Inputs: per frame `SendSample { capacity, depth, bytes_inflight, queue_budget, n
 `pre_encode_tick`'s position; per 1 s `Window { fps, struggling, age (avg,min,rtt), rx_bps,
 queue_ms, goodput, sent_bps, frames_lost, delay_slope_ms_s }` at `tick_viewer_window`; events
 (full channel, overflow, blocked-send stall). **Viewer adds** (all optional; older viewers omit;
-`decodeStatWireMessage` `useRemoteControl.ts:2437–2549`, parser `peer.rs:11285–11363`): `frames_lost`
+`decodeStatWireMessage` `useRemoteControl.ts:2437–2549`, parser `peer.rs:11286–11364`): `frames_lost`
 (chunk gaps, already in `rc-dc-worker.ts:422`), `frames_rx`, `delay_slope_ms_s` (least-squares
 slope of the window's per-frame `arrival − wire` — `QueueDrift` in `rc-hop-stats.ts:106–145` already
 holds the pairs), `age_p95_ms`. **Bounds:** `RateDomain { floor, ceiling }` — the single source of

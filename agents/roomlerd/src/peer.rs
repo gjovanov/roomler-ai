@@ -9152,6 +9152,7 @@ async fn media_pump_ffmpeg_dc(
                         session_id,
                         encoder_name,
                         enc.chroma444(),
+                        fps_state.is_none().then_some(target_fps),
                         capturer.backend(),
                         capture_gpu,
                         &open_trail.take(),
