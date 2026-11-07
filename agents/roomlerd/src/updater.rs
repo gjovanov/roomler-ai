@@ -1292,7 +1292,7 @@ fn is_stale(age: Duration) -> bool {
 }
 
 /// GHSA-r3xj-4wh9-xh2v — remove this daemon's own abandoned staging
-/// directories from a PRIOR update, once, at startup (called from `main.rs`
+/// directories from a PRIOR update, once, at startup (called from `app.rs`
 /// next to the Linux `tarball_owner` repair, behind the same single-instance
 /// lock).
 ///
@@ -1306,8 +1306,8 @@ fn is_stale(age: Duration) -> bool {
 /// exists at startup: this runs once, before any update task is spawned, so
 /// every directory it can find was made by a PREVIOUS process generation
 /// that already exited after creating it (every success path here ends in
-/// [`spawn_installer_with_watch`] followed by `std::process::exit` — see its
-/// doc comment). [`STALE_STAGING_DIR_AGE`] is the second, independent guard
+/// [`spawn_installer_with_watch`] and an exit: a graceful one, or `process::exit`
+/// for `roomlerd self-update`). [`STALE_STAGING_DIR_AGE`] is the second, independent guard
 /// for the one remaining edge: an update's watcher may still be running when
 /// the FRESH binary it just installed reaches ITS OWN startup (an MSI install
 /// restarts the service while the watcher is still polling it), so a
@@ -1702,8 +1702,8 @@ pub async fn check_once() -> CheckOutcome {
 }
 
 /// Spawn the installer detached. Returns after the installer is
-/// running so the caller can `std::process::exit(0)` — the agent's
-/// binary is about to be overwritten.
+/// running so the caller can exit (a graceful shutdown, or `process::exit`
+/// for `roomlerd self-update`) — the agent's binary is about to be overwritten.
 ///
 /// - **Windows**: `msiexec /i <path> /qn /norestart`. Requires
 ///   per-user MSI (no UAC) — which is what cargo-wix emits by
@@ -1729,9 +1729,9 @@ pub fn spawn_installer(installer_path: &std::path::Path) -> Result<()> {
 /// agent exits the installer is reparented to init/explorer and the
 /// watcher polls it from there.
 ///
-/// `expected_version=None` keeps the legacy "fire and forget" path —
-/// useful for tests and the manual `self-update` CLI where the
-/// outcome JSON adds nothing the operator can't see directly.
+/// `expected_version=None` keeps the legacy "fire and forget" path
+/// ([`spawn_installer`]). No caller takes it: every install the daemon spawns,
+/// the manual `self-update` CLI's included since rc.18, passes its version.
 pub fn spawn_installer_with_watch(
     installer_path: &std::path::Path,
     expected_version: Option<&str>,
