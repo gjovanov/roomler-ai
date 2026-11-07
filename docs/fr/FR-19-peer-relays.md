@@ -601,36 +601,36 @@ row makes `roomler why` unable to answer 'why am I on DERP when there is a relay
 there'."*
 
 **That reason describes the status quo the codebase already accepts.** `explain`
-(`path.rs:917`) iterates `DIRECT_TIERS.chain(once(&DirectTier::Relay))`, and
+(`path.rs:962`) iterates `DIRECT_TIERS.chain(once(&DirectTier::Relay))`, and
 `base(Relay) = B_RELAY` for **both TURN and DERP** — so `roomler why` *already* cannot
 distinguish a 52 ms coturn hop from a 175 ms DERP hop. That distinction has never lived in
 the tier ladder; it lives in `PeerInfo.relay_kind` + `relay_transport`, rendered by
-`relay_qualified_label` (`localclient.rs:1047`) as `relay:{kind}/{transport}`.
+`relay_qualified_label` (`localclient.rs:2220`) as `relay:{kind}/{transport}`.
 
 So the design is:
 
-- **`RelayKind::Org`** joins `Turn` and `Derp` (`crates/tunnel-core/src/overlay/relay_link.rs:158`).
+- **`RelayKind::Org`** joins `Turn` and `Derp` (`crates/tunnel-core/src/overlay/relay_link.rs:165`).
   `relay:org/udp` appears in the CONN column **for free** via `relay_transport_info`
   (`wg.rs:204`), with `relay_server()` supplying `relay_via`.
 - **The transport is a fourth `RelayConn` impl.** `Carrier::Relay { conn: Arc<dyn RelayConn>, dst, dead }`
-  (`wg.rs:155`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:410`)
+  (`wg.rs:159`) is already fully opaque to the send path, and `Carrier::send` (`wg.rs:416`)
   just calls `conn.send_to(buf, dst)`. DERP plugs in exactly this way — `impl RelayConn for
   DerpConn` (`transport/derp.rs:276`), `DerpMux::conn_for` (`derp.rs:434`) vending one per
   peer off a shared connection — and there are already **three** production impls
-  (`DerpConn`, `TurnRelayConn` `transport/relay.rs:348`, `UdpRelayConn` `:491`). An org relay
+  (`DerpConn`, `TurnRelayConn` `transport/relay.rs:415`, `UdpRelayConn` `:564`). An org relay
   is a fourth, plus an `OrgRelayMux` shaped like `DerpMux`.
-- **`relay_strategy` (`relay_link.rs:1125`) gains a branch**; the server verdict picks Org
+- **`relay_strategy` (`relay_link.rs:1160`) gains a branch**; the server verdict picks Org
   over Turn/Derp when a session exists.
 
 ⚠️ **What this avoids is the whole point.** The first draft's §9 named
-`send_ip_packet` (`wg.rs:938`) as *"the send path that must learn 'via peer X'"*. It is not:
-relay carriers already get a dedicated per-peer recv task (`wg.rs:1542`) and never touch the
+`send_ip_packet` (`wg.rs:940`) as *"the send path that must learn 'via peer X'"*. It is not:
+relay carriers already get a dedicated per-peer recv task (`wg.rs:1541`) and never touch the
 carrier plane's shape demux. `send_ip_packet`, `send_to_peer`, `SendPeer` and the `Router`
 need **zero changes**. The first draft also pointed the receive arm at
-`CarrierPlane::route_by_index` (`carrier_plane.rs:738`) — which takes a WireGuard receiver
+`CarrierPlane::route_by_index` (`carrier_plane.rs:745`) — which takes a WireGuard receiver
 index *already extracted from a parsed WG packet* (its three callers are `handle_datagram`'s
-arms at `:561-563`), so a Geneve frame can never reach it; and its `expected_src` contract
-(`:766-800`) would trip the roam machinery on packets arriving from the relay's address.
+arms at `:568-570`), so a Geneve frame can never reach it; and its `expected_src` contract
+(`:773-807`) would trip the roam machinery on packets arriving from the relay's address.
 
 A new tier would additionally have required navigating four hazards, three of them **silent**:
 
@@ -643,9 +643,9 @@ A new tier would additionally have required navigating four hazards, three of th
 
 ⚠️ **And one of the first draft's own "blockers" was a misreading, retracted here.** It
 claimed the eligibility floor `base(tier) - penalty >= B_RELAY - ELIGIBILITY_EPS`
-(`path.rs:850`) would leave a BASE-230 tier only **30 points** of penalty headroom against
+(`path.rs:887`) would leave a BASE-230 tier only **30 points** of penalty headroom against
 srflx's 60. But the penalty is **scaled to each tier's own headroom** —
-`weight(tier) = 2.0 * (base(tier) - B_RELAY)` (`path.rs:274-278`), whose doc states the
+`weight(tier) = 2.0 * (base(tier) - B_RELAY)` (`path.rs:276-280`), whose doc states the
 invariant: *"eligibility … is re-crossed after exactly one half-life."* Every tier is
 suppressed for exactly one half-life; there is no asymmetry, and both "fixes" the first
 draft proposed would have destroyed that invariant for every tier. The real constraint —
