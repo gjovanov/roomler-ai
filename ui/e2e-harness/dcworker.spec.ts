@@ -85,7 +85,9 @@ test.describe('FR-135 R3 — the data-channel worker, on both arms', () => {
     expect(sum(r.windows.map((w) => w.fwd)), 'no page hop').toBe(0)
     expect(sum(r.windows.map((w) => w.arrGap)), 'every arrival counted').toBeGreaterThan(20)
     expect(r.windows.some((w) => typeof w.queueArrMs === 'number'), 'the arrival reading').toBe(true)
-    expect(r.channelEvents, "the far end's close reaches the worker").toEqual(['open', 'closed'])
+    // `attached` first: the worker says it has the channel before SCTP opens it,
+    // and the page, which kept no copy, waits for that word.
+    expect(r.channelEvents, "the far end's close reaches the worker").toEqual(['attached', 'open', 'closed'])
   })
 
   test('a refused transfer: the channel stays on the page, whole, and the relay carries it', async ({ page }) => {

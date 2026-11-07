@@ -175,6 +175,7 @@ let activeCodec: string = DEFAULT_CODEC
 
 const workerScope = self as unknown as {
   onmessage: ((ev: MessageEvent<IncomingMessage>) => void) | null
+  onmessageerror: ((ev: MessageEvent) => void) | null
   postMessage: (msg: unknown) => void
 }
 
@@ -531,11 +532,20 @@ workerScope.onmessage = (e) => {
   } else if (msg.type === 'chunk') {
     onChunk(msg.bytes, msg.sentAt)
   } else if (msg.type === 'video-channel') {
-    // FR-135 R3 — the page moved the channel itself here.
+    // FR-135 R3 — the page moved the channel itself here, and keeps no copy
+    // of it, so it waits to hear the channel arrived (`video-channel-attached`).
     attachVideoChannel(msg.channel)
+    workerScope.postMessage({ type: 'video-channel-attached' })
   } else if (msg.type === 'close') {
     teardown()
   }
+}
+
+/** FR-135 R3 — a message the browser could not deliver here: it could not be
+ *  deserialized in this realm. The only one carrying more than data is the
+ *  moved channel, so the page reads this as a move that failed. */
+workerScope.onmessageerror = () => {
+  workerScope.postMessage({ type: 'message-error' })
 }
 
 /** One message off the `video-bytes` channel, however it came: relayed by the

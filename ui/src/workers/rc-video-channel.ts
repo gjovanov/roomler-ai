@@ -38,6 +38,70 @@ export function createDeliveryGapClock(): { note(nowMs: number): number | null; 
 /** The page hands a channel to the worker in this message. */
 export type VideoChannelMessage = { type: 'video-channel'; channel: RTCDataChannel }
 
+/** FR-135 R3 — the page's wait for a channel it moved to arrive. The page keeps
+ *  no copy of a moved channel, so until the worker says `video-channel-attached`
+ *  the move can still have failed. The worker answers `init-canvas` before it
+ *  reads the channel, in the same run of its queue, so the wait starts at that
+ *  answer and a slow module load is not inside it. No word within `graceMs`,
+ *  or a `message-error` (the channel could not be received in the worker's
+ *  realm), and `onFailed` runs, once. Pure: the timer is given. */
+export function createChannelMoveWatch(opts: {
+  graceMs: number
+  onFailed: (why: string) => void
+  setTimer?: (fn: () => void, ms: number) => unknown
+  clearTimer?: (timer: unknown) => void
+}): {
+  /** The page posted the channel to the worker. */
+  moved(): void
+  /** A message from the worker, by type: true when it was the watch's own. */
+  onWorkerMessage(type: string): boolean
+  /** The path stopped: no verdict. */
+  stop(): void
+  readonly pending: boolean
+} {
+  const set = opts.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
+  const clear = opts.clearTimer ?? ((t: unknown) => clearTimeout(t as ReturnType<typeof setTimeout>))
+  let pending = false
+  let timer: unknown = null
+  const stop = () => {
+    pending = false
+    if (timer !== null) clear(timer)
+    timer = null
+  }
+  const fail = (why: string) => {
+    if (!pending) return
+    stop()
+    opts.onFailed(why)
+  }
+  return {
+    moved() {
+      stop()
+      pending = true
+    },
+    onWorkerMessage(type) {
+      if (type === 'video-channel-attached') {
+        stop()
+        return true
+      }
+      if (type === 'message-error' && pending) {
+        fail('the worker could not receive it (messageerror)')
+        return true
+      }
+      if (pending && timer === null && (type === 'decoder-configured' || type === 'decoder-configure-error')) {
+        timer = set(() => {
+          timer = null
+          fail('the worker never said it had it')
+        }, opts.graceMs)
+      }
+      return false
+    },
+    stop,
+    get pending() {
+      return pending
+    },
+  }
+}
+
 /** FR-135 R3 — move the `video-bytes` channel into the decode worker by
  *  posting it in the transfer list. This must run in the task that created the
  *  channel: the WebRTC spec stops a channel being transferable at the end of

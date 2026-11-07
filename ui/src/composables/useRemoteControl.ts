@@ -58,7 +58,7 @@ import {
 } from '@/workers/rc-fsr-render'
 import { colorSpaceLabel } from '@/workers/rc-decoder-config'
 import { MEDIA_BUCKETS, type ViewerMediaWindow } from '@/workers/rc-media-window'
-import { createDeliveryGapClock, moveVideoChannelToWorker } from '@/workers/rc-video-channel'
+import { createChannelMoveWatch, createDeliveryGapClock, moveVideoChannelToWorker } from '@/workers/rc-video-channel'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -4423,6 +4423,12 @@ export function storedDcWorker(): boolean {
   return DC_WORKER_DEFAULT
 }
 
+/** FR-135 R3 — how long after the worker's first answer the page waits to hear
+ *  a moved channel arrived. The worker answers `init-canvas` before it reads
+ *  the channel, in the same run of its queue, so this only has to cover a
+ *  worker that could not take the channel; a slow module load is not in it. */
+export const DC_WORKER_ATTACH_GRACE_MS = 2000
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -5942,6 +5948,15 @@ export function useRemoteControl(
   /** FR-135 R3 — true while the active path's channel is in the worker: the
    *  browser took the transfer. False on the relay, the default. */
   let dcChannelInWorker = false
+  /** FR-135 R3 — a move failed on this page, so every later session relays. */
+  let dcWorkerMoveFailed = false
+  /** FR-135 R3 — the page keeps no copy of a channel it moved, so until the
+   *  worker says `video-channel-attached` the move can still have failed
+   *  (`createChannelMoveWatch`, then `onVideoChannelMoveFailed`). */
+  const dcChannelMove = createChannelMoveWatch({
+    graceMs: DC_WORKER_ATTACH_GRACE_MS,
+    onFailed: (why) => onVideoChannelMoveFailed(why),
+  })
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -8457,6 +8472,7 @@ export function useRemoteControl(
       // (`onDcWorkerMessage`); the page's object is a closed husk now, so it
       // stays out of `channels`, and the session's `pc.close()` closes the real one.
       dcChannelInWorker = true
+      dcChannelMove.moved()
       console.info(`[rc] ${label} video channel moved into the decode worker (roomler-rc-dc-worker)`)
     } else {
       dcChannelInWorker = false
@@ -8516,6 +8532,12 @@ export function useRemoteControl(
       // rc.130 - worker dropped deltas on a decode backlog; ask the agent
       // for a fresh IDR so it can resync.
       requestKeyframe()
+      return
+    }
+    // FR-135 R3 — a moved channel's arrival, or its failure (`dcChannelMove`).
+    if (dcChannelMove.onWorkerMessage(msg.type)) return
+    if (msg.type === 'message-error') {
+      console.warn(`[rc] ${label} worker could not receive a message (messageerror)`)
       return
     }
     // FR-135 R3 — the channel moved into the worker says what the page's own
@@ -8682,6 +8704,9 @@ export function useRemoteControl(
   function stopDcPath() {
     dcActive.value = false
     dcFramesDecoded.value = 0
+    // FR-135 R3 — the pill and the size hints read these while a path is up;
+    // the next path, of any codec, starts from nothing rather than this one's.
+    dcStats.value = { bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 }
     // P7 — drop the viewport reporter + render-path mirror with the path.
     dcViewportCleanup?.()
     dcViewportCleanup = null
@@ -8692,10 +8717,24 @@ export function useRemoteControl(
     // stops it being read, as a relayed one stops being read once its worker
     // is gone, and the session's `pc.close()` closes either.
     dcChannelInWorker = false
+    dcChannelMove.stop()
     if (!dcWorker) return
     try { dcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { dcWorker.terminate() } catch { /* ignore */ }
     dcWorker = null
+  }
+
+  /** FR-135 R3 — the page moved the channel and the worker did not take it
+   *  (no `video-channel-attached` in time, or `messageerror`). The page kept no
+   *  copy, so this session has no picture: stop the path, relay on every later
+   *  session of this page, and reconnect now rather than at the watchdog. */
+  function onVideoChannelMoveFailed(why: string) {
+    if (!dcWorker || !dcChannelInWorker) return
+    const label = dcPathLabel ?? 'dc'
+    dcWorkerMoveFailed = true
+    console.warn(`[rc] ${label} video channel moved into the decode worker, but ${why} - relaying it on the page from now on, and reconnecting`)
+    stopDcPath()
+    if (lastConnectArgs) scheduleReconnect()
   }
 
   /** When the view mounts a real `<canvas>`, swap it in for the
@@ -11249,8 +11288,12 @@ export function useRemoteControl(
     if (!sessionDecodeRecover) {
       console.info('[rc] decode recovery: off this session (roomler-rc-decode-recover=0) - a decode error stops the path and the watchdog re-creates the session (FR-135 R1)')
     }
-    // FR-135 R3 — off unless this browser turned it on, until S11 decides.
-    sessionDcWorker = storedDcWorker()
+    // FR-135 R3 — off unless this browser turned it on, until S11 decides, and
+    // off for the rest of the page once a move has failed on it.
+    sessionDcWorker = storedDcWorker() && !dcWorkerMoveFailed
+    if (dcWorkerMoveFailed && storedDcWorker()) {
+      console.info('[rc] video channel: relayed by the page this session - a move into the decode worker failed earlier on this page (roomler-rc-dc-worker)')
+    }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {

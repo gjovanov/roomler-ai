@@ -118,6 +118,7 @@ function bare(key: boolean, timestampUs: number): ArrayBuffer {
 type Scope = {
   postMessage: (msg: unknown) => void
   onmessage: ((ev: { data: unknown }) => void) | null
+  onmessageerror: ((ev: unknown) => void) | null
 }
 const scope = self as unknown as Scope
 let originalPost: Scope['postMessage']
@@ -146,6 +147,7 @@ beforeEach(() => {
 afterEach(() => {
   scope.postMessage = originalPost
   scope.onmessage = null
+  scope.onmessageerror = null
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -335,6 +337,8 @@ describe.each(DC_CODECS)('FR-135 R3 — the video channel moved into the worker,
     const ch = new FakeChannel()
     send({ type: 'video-channel', channel: ch })
     expect(ch.binaryType).toBe('arraybuffer')
+    // The page kept no copy of the channel, and waits for this word.
+    expect(ofType('video-channel-attached')).toHaveLength(1)
     ch.open()
     expect(ofType('video-channel-open')).toHaveLength(1)
 
@@ -380,6 +384,12 @@ describe.each(DC_CODECS)('FR-135 R3 — the video channel moved into the worker,
     send({ type: 'video-channel', channel: ch })
     ch.open() // a late event says nothing twice
     expect(ofType('video-channel-open')).toHaveLength(1)
+  })
+
+  it('tells the page when a message could not reach it: the move the page made failed', async () => {
+    await boot({ codec })
+    scope.onmessageerror!({ data: null })
+    expect(ofType('message-error')).toEqual([{ type: 'message-error' }])
   })
 
   it('stops reading the channel at close, and leaves it open, as a relayed one is', async () => {

@@ -45,7 +45,8 @@ export interface HarnessResult {
    *  a decoder's padded buffer. */
   firstFrame: { width: number; height: number } | null
   windows: HarnessWindow[]
-  /** What the viewer side heard about the channel: `open`, `closed`. */
+  /** What the viewer side heard about the channel: `attached` (the worker has
+   *  a moved channel), `open`, `closed`. */
   channelEvents: string[]
   errors: string[]
 }
@@ -127,6 +128,7 @@ async function run(arm: HarnessArm, frames = 50, fps = 20): Promise<HarnessResul
       result.framesDecoded = Math.max(result.framesDecoded, 1)
       result.firstFrame ??= { width: m.width as number, height: m.height as number }
     } else if (m.type === 'frame-decoded') result.framesDecoded = Math.max(result.framesDecoded, m.count as number)
+    else if (m.type === 'video-channel-attached') result.channelEvents.push('attached')
     else if (m.type === 'video-channel-open') result.channelEvents.push('open')
     else if (m.type === 'video-channel-closed') result.channelEvents.push('closed')
     else if (m.type === 'decoder-error' || m.type === 'decode-error' || m.type === 'decoder-configure-error') {
