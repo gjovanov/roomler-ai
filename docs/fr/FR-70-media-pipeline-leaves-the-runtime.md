@@ -915,7 +915,7 @@ every rate move is a background open and a swap):
 **It is not a plan bug.** The loop built that replacement at exactly the plan's
 rate at the moment it decided it: `rebuild_spec(bps)` coarsens the controller's
 applied rate onto the ladder, and `after_tick` folds the same
-`governor.applied_bps()` into the plan (`peer.rs:9662`). What the counter
+`governor.applied_bps()` into the plan (`peer.rs:9663`). What the counter
 measured is the plan MOVING during a build that takes seconds — which is what
 make-before-break is, with one swap in flight and an encoder that cannot re-rate
 in place. M3b's loop, reading the plan, would do the same thing. The check
@@ -987,8 +987,8 @@ been lost.
     Re-rated there although the plan did not move is a divergence — the `zeus`
     finding above.
   - **It moved**: a **stale adoption**, counted apart — `plan_stale_swaps` on
-    the heartbeat (`peer.rs:10268`), and the session's first logs once at INFO
-    with its three rates (`log_plan_stale_swap`, `peer.rs:10335`): *`FR-70 M3a: a
+    the heartbeat (`peer.rs:10269`), and the session's first logs once at INFO
+    with its three rates (`log_plan_stale_swap`, `peer.rs:10336`): *`FR-70 M3a: a
     replacement was adopted after the plan moved while it opened (built at the
     plan of its spawn; first time this session)`*. Not judged at the tick. That
     is the lag M4 will trade against an IDR per adoption.
@@ -1237,10 +1237,10 @@ flowchart TD
 | `DimsInputs` gains `PartialEq` (`policy.rs:42`) | the shadow compares the inputs it was produced from with the ones the inline arithmetic read |
 | `Shadow::check_dims` takes the inline inputs (`plan.rs:604`), the pump passes them (`peer.rs:8660`) | a geometry difference whose inputs moved is a lag (`moved_input`, `plan.rs:375`, names the first that moved). One whose inputs held is still a `dims` divergence. The pump binds the inline `DimsInputs` once (`peer.rs:8627`), so the plan dims and the check read the same struct |
 | `Shadow::note_built` (`plan.rs:660`) | an inline open records whether it was built from moved inputs, so its dims at the tick are a lag too, not a divergence |
-| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:683`, `peer.rs:9757`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:722`) |
-| the heartbeat (`peer.rs:10376`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:10521`; `log_plan_lag`, `peer.rs:10545`) |
-| the flip's open (`flip_rebuild_pending`, `peer.rs:6732`, set at `:7884`; the open at `:9057`; the pass's tick at `:9580`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
-| the tick's direct background-swap arm (`peer.rs:9625`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:8290`; the send overflow, `:10065`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
+| `Shadow::after_tick` takes the frame's ceiling (`plan.rs:683`, `peer.rs:9758`) | a REPLACEMENT this very tick re-rated, built within that ceiling, is a stale tick (`note_stale_tick`, `plan.rs:722`) |
+| the heartbeat (`peer.rs:10377`) | `plan_stale_ticks` and `plan_lags` beside `plan_stale_swaps`. The first of each logs once (`log_plan_stale_tick`, `peer.rs:10522`; `log_plan_lag`, `peer.rs:10546`) |
+| the flip's open (`flip_rebuild_pending`, `peer.rs:6732`, set at `:7884`; the open at `:9057`; the pass's tick at `:9581`) | **B1's fix.** On the rebuild a persisted flip forced, the controller ticks FIRST, with the pass's own arguments, and the encoder opens at what it decides. The pass's own tick is then skipped, so a pass still ticks once. A target deferred for the dropped encoder is cleared: the open supersedes it |
+| the tick's direct background-swap arm (`peer.rs:9626`), and both arms of the two congestion decreases (the backpressure skip, `peer.rs:8290`; the send overflow, `:10066`) | **B3's fix.** Applying or scheduling the controller's newest target clears any target still held, as the tick's in-place arm already did. The quiet flush can no longer apply a superseded rate, over a decrease or anywhere else. Only an arm that HOLDS sets the hold |
 
 - **Why only a replacement can be a stale tick.** The inline open runs in the
   same pass as the tick, so the loop can consult the controller before it

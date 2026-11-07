@@ -60,7 +60,7 @@
     | 18:58:49 | +1 | our `rc:keyframe` at 18:58:48.3, the positive control; a move 1.5 M → 1 M shares the window and adds nothing |
     | 18:59:01 | +1 | the resize to 1600×900, `dims_swaps` +1, the positive control |
     | 18:59:15 | +1 | the resize back, `dims_swaps` +1 |
-    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11469`) |
+    | 18:59:28 | +1 | the viewer's own `rc:keyframe` at 18:59:26.6, seen by the viewer-side tap; the agent logs the request at `debug` (`peer.rs:11470`) |
 
     The other 12 moves sit in windows where `idr_count` did not move: 216 windows judged, none
     unexplained. The inequality holds as written: 4 ≤ 2 dims changes + 2 keyframe requests.
@@ -220,7 +220,7 @@
     the heartbeat's cumulative counters: **every Δ`idr_count` must have a Δ`dims_swaps`, a
     Δ`frames_dropped_backpressure`, a `keyframe_requests` tick or a lock edge beside it.
     An unexplained IDR in a window with Δ`rate_moves` > 0 is the RED.** The session must
-    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9204`)
+    also show real moves, or the read proves nothing. An inline re-open (`peer.rs:9205`)
     builds a new encoder whose counters restart at zero, so a window across one is not
     diffed.
   - 🔑 **AC2's read had the wrong denominator and the wrong trigger.**

@@ -483,7 +483,7 @@ own starvation.
 
   ⚠️ **The stand-in reaches the pair memory: field-seen once.** When the learner
   holds no above-nominal stable rate, the write-back takes `pipe_bps` as the
-  session's evidence (`peer.rs:9436`–`8994`), and `pipe_bps`'s last source is
+  session's evidence (`peer.rs:9437`–`8994`), and `pipe_bps`'s last source is
   the stand-in (`governor.rs:648`). The 2026-10-30 12:19 session anchored at
   180,484, lost its goodput to the TTL at 12:20:50, and walked eight rungs down
   in 28 s: 180,484 → 164,076 → … → 84,195, the last one exact to the unit. It
