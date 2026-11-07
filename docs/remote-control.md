@@ -4663,12 +4663,21 @@ sequenceDiagram
   wakes first, and the async watchdog then falls about 0.6 ms further
   behind per tick (tokio rounds a sleep up to the next millisecond).
   After a resume the window is a few milliseconds wide, so random
-  freezes almost never hit it. The field read (2026-11-07, a root
-  system daemon on an Ubuntu 24.04 lab guest) froze the release,
+  freezes almost never hit it. The field read of 2026-11-07, on a root
+  system daemon on an Ubuntu 24.04 lab guest, froze the release,
   0.4.203, for 70 s a round. Frozen 1–8 ms after the thread's fourth
   check since the previous thaw, it exited in 9 rounds of 10, with
   `stuck_for` 70.0001–70.0081 s; the tenth, at 1 ms, sat on the
   window's edge. Frozen at a random phase, it exited in none of 10.
+  The build with the fix ran 40 rounds of the same 70 s freeze on one
+  process, 20 by `SIGSTOP`, 10 by `systemctl freeze` and 10 by
+  `cgroup.freeze`, 37 of them aligned. It exited in none, and the
+  thread logged its new baseline in all 40, 30 of them with
+  `heartbeat_moved=false`. Two more froze it for 152 s, the issue's
+  own case, and it exited in neither. The release that carries the
+  fix, 0.4.204, ran 11 rounds of 70 s, 10 of them aligned: no exit, the
+  new baseline in all 11 (8 with `heartbeat_moved=false`), and the
+  service manager's restart count unchanged.
 
 **The lines a resume writes** (#3530). After the same freeze the agent
 blamed the network for a silence it had made itself: `half-open socket
@@ -4685,7 +4694,8 @@ what it was.
 | line | the lateness it reads | slack | after a freeze it reads |
 |---|---|---|---|
 | control WS RX deadline (`signaling.rs:2282`) | the keepalive's own due instant, which `tick()` returns (`:2227`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the network's; reconnecting` |
-| the reconnect after it (`signaling.rs:1477`) | the session's reason, `AgentDidNotRun` (`:81`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
+| control WS, a failed heartbeat send (`signaling.rs:2683`) or read (`:3281`) | the keepalive's overdue time: the time since its last tick (`skew_mono`) less its 25 s period, read before the send, or on a read error before the closes (`session_ended`, `:117`) | 2 × 25 s, and never under 30 s (`WS_PAUSE_MIN`, `:97`) | the reconnect's `why=heartbeat send: …: this agent did not run for ~N s before it (frozen or suspended)`, or `why=ws read: …` |
+| the reconnect after any of them (`signaling.rs:1477`) | the session's reason, `AgentDidNotRun` (`:81`), which a suspend's A5 cycle carries too | | `signaling: the session ended while this agent did not run; reconnecting`, not `signaling connect failed` |
 | `/derp` RX deadline (`agents/roomlerd/src/derp.rs:437`) | the keepalive's due instant (`:424`) | 2 × 25 s | `… but this agent did not run for ~N s of it (frozen or suspended): the silence is its own, not the relay's; reconnecting` |
 | direct carrier rx-stale, at 60 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:675`) | the sweep tick's lateness, stored next to `mono_elapsed` (`runtime.rs:3082`, `tick_late_ms`) and read once a sweep (`establish.rs:608`) | 25 s + 2 ticks (`CARRIER_QUIET_WHILE_RUNNING`, `:28`) | `established direct carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the path's …` |
 | relay carrier rx-stale, at 90 s (`crates/tunnel-core/src/overlay/runtime/establish.rs:757`) | the same | the same | `relay carrier went silent while this agent did not run for ~N s (frozen or suspended): the silence is its own, not the relay's …` |
@@ -4698,6 +4708,45 @@ what it was.
   pause itself was longer by up to one keepalive period.
 - On Windows a host sleep reaches these lines as a freeze does, so
   after a sleep the line names the pause instead of a middlebox.
+- **Why a send or a read names a pause from 30 s up only.** After a
+  long freeze the far end has reset the socket, and whichever arm
+  `select!` runs first at the thaw can meet the reset before the RX
+  deadline does. A loop that ran can still come late into those exits:
+  the heartbeat arm awaits its own reads first, and one send can be
+  held for `WS_SEND_TIMEOUT` (15 s, `signaling.rs:153`) while a corp
+  VPN captures the route. That wait is the network's, so a pause under
+  `WS_PAUSE_MIN` keeps today's line. 30 s is the shortest pause the RX
+  deadline's line can name (80 s less its 50 s slack), so all three
+  exits name a pause on the same terms. The error keeps its own type
+  under the new context, so the reconnect still reads it (FR-28's 502
+  check downcasts it). The tests are
+  `a_session_reset_during_a_freeze_names_the_pause`,
+  `a_session_reset_while_running_keeps_its_error` and
+  `the_pause_floor_matches_the_rx_deadline_line` (`:7870`, `:7901`,
+  `:7921`).
+- **In the field** (the same lab guest). In the 40 rounds of 70 s,
+  `/derp` tripped 3 times and read "did not run" each time, while the
+  control WS's 80 s and the relay's 90 s deadlines never tripped. In
+  the two 152 s rounds `/derp` read "did not run" twice and the relay
+  rx-stale line three times. The control WS's session was reset by the
+  far end during both freezes, so it ended on the heartbeat's send
+  (`Broken pipe`) and on the read (`Connection reset without closing
+  handshake`), and logged `signaling connect failed` with no connect
+  tried. The build with the send and read exits, frozen twice more for
+  152 s, ended both sessions at the RX deadline instead, and the
+  reconnect read `the session ended while this agent did not run …
+  why=ws rx deadline: no inbound frames for 159 s: this agent did not
+  run for ~134 s of it (frozen or suspended)` (then 152 s and ~145 s),
+  with no `connect failed`. The session loop's `select!` is unbiased, so
+  which ready arm meets the thaw first is a draw; the tests above pin
+  the send and read exits.
+- ⚠️ A relay carrier on `/derp` can still be convicted after a freeze,
+  by a failed active revalidation (`forced rekey unanswered — one-way
+  over /derp`), 45–49 s after 11 of the 40 thaws. That verdict comes
+  from a sweep that ran on time, so no lateness explains it (#3539).
+- ⚠️ Not covered: the keepalive's own ping, a pong reply and an
+  outbound frame are sends too, and one that meets the same reset after
+  a thaw still logs `signaling connect failed`. None did in the field.
 
 **What the second named stall found** (#2551). A second Windows device
 stalled on 2026-10-27, under 0.4.177, and read
