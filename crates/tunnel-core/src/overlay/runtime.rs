@@ -1339,7 +1339,7 @@ pub struct OverlayRuntime {
     /// #3530 — how late the last sweep tick came past [`FALLBACK_TICK`], in
     /// ms: for that long the whole process did not run (a freeze, a host sleep
     /// `Instant` counts). Stored by the tick, read by `sweep_carrier_health`
-    /// only to word a relay carrier's rx-stale line.
+    /// only to word a carrier's rx-stale line, direct or relay.
     /// ⚠️ Log only: no verdict and no carrier action reads it.
     tick_late_ms: std::sync::atomic::AtomicU64,
 }

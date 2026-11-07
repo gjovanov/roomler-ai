@@ -332,7 +332,7 @@ pub mod l0 {
 }
 
 /// One `rc:session.stats` sample: what this session actually did.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionTelemetry {
     pub bytes_sent: u64,
     pub bytes_recv: u64,
@@ -351,6 +351,9 @@ pub struct SessionTelemetry {
     /// (`session_telemetry::SessionCounters::decode_errors`); `None` = not
     /// counted, never zero.
     pub decode_errors: Option<u32>,
+    /// FR-132 P1d — what the session's video ran on, the pump's newest
+    /// reading; `None` = not reported, never CPU.
+    pub video: Option<roomler_ai_remote_control::models::SessionVideo>,
 }
 
 impl AgentPeer {
@@ -1676,6 +1679,7 @@ impl AgentPeer {
             priority,
             rc_sessions,
             no_video.clone(),
+            carrier_ready_tx,
         ));
 
         // FR-93 P5h — told when this computer goes to sleep.
@@ -1791,6 +1795,8 @@ impl AgentPeer {
         out.carrier = self.carrier.get().copied();
         // FR-132 P1 — the viewer's decode errors, once it counts them.
         out.decode_errors = c.decode_errors();
+        // FR-132 P1d — and what the video ran on, once the pump has said.
+        out.video = c.video();
         out
     }
 
@@ -2397,7 +2403,15 @@ async fn media_pump(
     // #3245 — set before the RTP pump asks for its session's end with no encoder
     // (`end_no_video`), so the signalling loop names that end.
     no_video: Arc<std::sync::atomic::AtomicBool>,
+    // FR-132 P1d — asks the signalling loop for one `rc:session.stats` now, by
+    // the carrier observation's road (FR-102 P9d). Only the FFmpeg DC pump has
+    // a reading to send.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
 ) {
+    // `stats_now` is consumed only by the FFmpeg DC pump; keep the other
+    // builds warning-clean.
+    #[cfg(not(feature = "ffmpeg-encoder"))]
+    let _ = &stats_now;
     // `viewer_report` is consumed only by the DC video pumps (vp9-444 +
     // ffmpeg-encoder); keep the signalling-only build warning-clean.
     #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
@@ -2469,6 +2483,7 @@ async fn media_pump(
                     false,
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
                 )
                 .await;
             }
@@ -2513,6 +2528,7 @@ async fn media_pump(
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
                 )
                 .await;
             }
@@ -2554,6 +2570,7 @@ async fn media_pump(
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
                 )
                 .await;
             }
@@ -2633,6 +2650,7 @@ async fn media_pump(
                         wants_444,
                         chunk_framing,
                         rc_sessions,
+                        stats_now,
                     )
                     .await;
                 }
@@ -3797,6 +3815,8 @@ async fn run_ffmpeg_dc_session(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
 ) {
     // P7 — chroma-discriminated hard-profile label (HEVC only; every other
     // codec ignores the flag).
@@ -3847,6 +3867,7 @@ async fn run_ffmpeg_dc_session(
             chroma444,
             chunk_framing,
             rc_sessions,
+            stats_now,
         )
         .await;
     }
@@ -6456,6 +6477,8 @@ async fn media_pump_ffmpeg_dc(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
 ) {
     use crate::encode::VideoEncoder;
 
@@ -10022,6 +10045,21 @@ async fn media_pump_ffmpeg_dc(
                 rate_stats.input.gpu,
                 rate_stats.input.reason,
             );
+            // FR-132 P1d — what `rc:session.stats` names: the heartbeat's own
+            // words, plus the capture backend the heartbeat does not carry. A
+            // new reading goes at once, by the carrier's road and as
+            // best-effort, so a session someone leaves before the next 30 s
+            // tick is still in a canary week's read.
+            if crate::session_telemetry::counters(session_id).note_video(
+                crate::session_telemetry::VideoForm {
+                    encoder: enc.name(),
+                    capture: capturer.backend(),
+                    input_path: rate_stats.input.path(),
+                    input_reason: rate_stats.input.reason,
+                },
+            ) {
+                let _ = stats_now.try_send(session_id);
+            }
             // FR-118 P0 — `avg_encode_ms` split into its four steps, and the
             // capture thread's own readback, per frame over this window (0.0
             // when the window had none, like `avg_encode_ms`). The readback runs

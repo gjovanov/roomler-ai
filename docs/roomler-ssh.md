@@ -1623,7 +1623,7 @@ stay, each for a reason that outlives it:
 
 | What stays | Why | Where | It may go when |
 |---|---|---|---|
-| `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:841` | no agent at 0.4.199 or older is left (FR-137 D8) |
+| `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:848` | no agent at 0.4.199 or older is left (FR-137 D8) |
 | a request that carries one is refused `TicketRefused` and audited, never served as the owner's | the same | bound to a refused caller at `crates/modules/network/src/agent_arms.rs:193`, refused at `crates/modules/network/src/routes/agent_ssh.rs:338`, and recorded by `dispatch` like any refusal | with the field |
 | `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5084-5094` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
 
@@ -1635,7 +1635,7 @@ A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `a_ticketed_ssh_request_is_refused_and_audited`
 (`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
 (`:118`) and `ssh_audit_rows_written_before_p2_still_load`
-(`crates/remote_control/src/models.rs:8666`) lock it. The other surfaces FR-90
+(`crates/remote_control/src/models.rs:8718`) lock it. The other surfaces FR-90
 left reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 

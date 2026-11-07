@@ -863,7 +863,7 @@ know. Dropped from the wire, such an open would parse as the device's own and
 reach whatever the device may reach. So:
 
 - `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
-  (`crates/remote_control/src/signaling.rs:1319`), and no build sends it;
+  (`crates/remote_control/src/signaling.rs:1326`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
   (`crates/modules/network/src/tunnel.rs:697`), before a tunnel session exists
   (step 4, `:780`), with `rc:error {code: net_grant_refused}`
