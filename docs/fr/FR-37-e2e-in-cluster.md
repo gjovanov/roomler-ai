@@ -96,7 +96,9 @@ seam for a production-shaped hazard on a node that also runs real workloads.
       browser is in the pod, so the app is localhost to it
 - [x] `e2e-expected-failures.txt` loses the conference entries; anything still
       failing is either fixed or re-justified in writing
-- [ ] The nightly writes its usual `LATEST` line from the new path
+- [x] The nightly writes its usual `LATEST` line from the new path. **Met (read
+      2026-11-03):** the run of 2026-11-02 wrote it from the `pwrunner` sidecar (the log
+      below). The issue closed before this box was read.
 
 ## Open decisions
 
@@ -239,3 +241,9 @@ shape and only the probe showed why.
 
 **Stack restored**: probe pod deleted, `frontend_url` back to
 `http://127.0.0.1:18080` so the existing nightly keeps working tonight.
+
+**2026-11-03 — the last criterion, read on the build host.** `LATEST` holds
+`20261102-0230 OK (2failed 8skipped 180passed(7.2m)) tag=hosted-20261101-5d59e47
+agents=agent-e2e-v0.4.196 rc=1`. That run's log has a `runner:` line naming the app pod's
+`pwrunner` sidecar and no `port-forward` line. Both failures are `e2e/rc-vp9-444.spec.ts`,
+which `scripts/e2e-expected-failures.txt` lists, so the script wrote `OK`.
