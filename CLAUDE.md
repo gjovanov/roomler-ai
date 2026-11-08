@@ -476,8 +476,8 @@ The rules that bind new code. The reasoning behind each is in
 `docs/permissions.md`.
 
 - **`is_member(tid)` is NOT authorization for anything keyed by id.** Resolve the
-  object *within* the tenant (`helpers::require_room_in_tenant` /
-  `require_message_in_tenant`; a `message_id` handler uses the message guard), so a
+  object *within* the tenant (`guards::require_room_in_tenant` /
+  `require_message_in_room` / `require_file`; a `message_id` handler uses the message guard), so a
   foreign id 404s.
 - **A 403 is an answer, not an expired credential.** It never ends a session. The only
   403 that navigates is `not_a_member`, matched on a server-sent code.

@@ -28,8 +28,8 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
 - **`is_member(tid)` is NOT an authorization check for anything keyed by id.**
   Anyone can create a tenant for free, so a caller can always satisfy `is_member`
   for a tenant they own and then pass **another** tenant's `room_id`/`message_id`.
-  Resolve the object **within** the tenant: `helpers::require_room_in_tenant` /
-  `require_message_in_tenant`, so a foreign id 404s and leaks neither content nor
+  Resolve the object **within** the tenant: `guards::require_room_in_tenant` /
+  `require_message_in_room` / `require_file`, so a foreign id 404s and leaks neither content nor
   existence. ⚠️ A handler keyed by `message_id` must use the **message** guard — the
   two ids are decoupled. ⚠️ Never re-fetch with a bare `find_by_id` after a
   tenant-scoped write.
