@@ -331,6 +331,10 @@ room. A message also carries `author_type` (`user` · `bot` · `webhook` · `sys
 author keeps its own name in `author_name`, and the edit and delete routes match the author, so
 they refuse every person on such a message.
 
+A send names its thread with `thread_id` and may quote with `referenced_message_id`. Either must be
+a live message of the same room, or the send answers 404 and stores nothing. A thread lists the
+replies of its own room, and `mentions.users` notifies members of the room only.
+
 ### Files, tasks, export
 
 | Method | Path | Purpose |
