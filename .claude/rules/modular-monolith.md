@@ -26,7 +26,7 @@ Full treatment: `docs/modular-monolith.md`.
 Full treatment: **`docs/modular-monolith.md`**. What constrains new work:
 
 1. **The DAG is data** (`crates/core/src/graph.rs`). Any module → core;
-   `conference → chat`, `remote → fleet`, `network → fleet`, `hive → fleet`, `hive → chat`. **Core never calls a
+   `conference → chat`, `remote → fleet`, `network → fleet`. **Core never calls a
    module** — the inverse flows are hooks core invokes in `hooks::HOOK_ORDER`
    (session holders → lease holders → the record owner), and a failing holder
    STOPS the cascade. A hook is the *only* way a module reaches "up".
@@ -102,14 +102,4 @@ FR-21 until FR-69 — its pre-FR-21 name is retired, never bring it back).
                         leases, L3 ACL, relay grants), the org relay mint, the DERP ACL
                         cache, seven route files, `/derp`, the tunnel-client socket.
                         Built ON `fleet`
-  modules/hive/       → FR-90 agent sessions, server side: the session record + lifecycle,
-                        `rc:hive.*`, `hive_audit` — never session content. Built ON
-                        `fleet` and `chat` (a session IS a secret room, written to only
-                        as notes + turn stubs); its `[modules]` switch defaults OFF
-  modules/vault/      → FR-90 P3 secrets: each value sealed under its own data key,
-                        wrapped to an `age` KEK; RRNs; `vault_audit`. No route answers a
-                        value. On core alone so far; switch defaults OFF (`docs/vault.md`)
-  modules/knowhow/    → FR-90 P4 the organization's map: entities, the links between them,
-                        `knowhow_history`. A map, not a gate: it grants nothing. On core
-                        alone so far; switch defaults OFF (`docs/knowhow.md`)
 ```

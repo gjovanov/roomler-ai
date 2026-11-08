@@ -100,7 +100,7 @@ let awaitingKeyAfterRebuild = false
 let lastKeyframeReqMs = 0
 
 /** Ask the agent (the composable → `rc:keyframe` on the control channel) for
- *  a key frame; debounced like the data-channel workers' resync request.
+ *  a key frame; debounced like the data-channel worker's resync request.
  *  `now` skips the debounce, for the once-a-session rebuild: early in a
  *  worker's life the debounce would swallow it (the clock starts at the
  *  worker's creation). */
@@ -431,8 +431,9 @@ export function codecMimeForShort(short: string): string {
       // rc.94 — Level 5.1 (`L153`), not L3.1 (`L93`). L3.1 maxes at
       // ~1280×720; desktops at 1920×1200 / 1440p / 4K exceed it and the
       // HW HEVC decoder renders black. L5.1 (up to 4K@64) is a declared
-      // MAX, so smaller streams still decode. Matches rc-hevc-worker's
-      // DEFAULT_HEVC_CODEC + the isHevcDecodeSupported probe.
+      // MAX, so smaller streams still decode. Matches the composable's
+      // HEVC_MAIN_CODEC_STRING, which the data-channel worker is given and
+      // the isHevcDecodeSupported probe asks about.
       return 'hev1.1.6.L153.B0'
     case 'av1':
       return 'av01.0.08M.08'

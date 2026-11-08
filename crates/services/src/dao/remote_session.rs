@@ -43,6 +43,7 @@ impl RemoteSessionDao {
             recording_url: None,
             stats: SessionStats::default(),
             carrier: None,
+            video: None,
         };
         // Insert with explicit _id so the Hub-provided ObjectId remains the canonical key.
         self.base.collection().insert_one(&session).await?;
@@ -125,6 +126,9 @@ impl RemoteSessionDao {
         // beside `stats`, never inside it, so `mark_ended`'s whole-`stats`
         // write cannot reset it. `None` leaves whatever the row holds.
         carrier: Option<&str>,
+        // FR-132 P1d — what the video ran on, already checked by the socket,
+        // written beside `stats` for the same reason.
+        video: Option<&roomler_ai_remote_control::models::SessionVideo>,
     ) -> DaoResult<bool> {
         let mut set = doc! {
             "stats.bytes_sent": stats.bytes_sent as i64,
@@ -141,6 +145,11 @@ impl RemoteSessionDao {
         };
         if let Some(c) = carrier {
             set.insert("carrier", c);
+        }
+        if let Some(v) = video
+            && let Ok(v) = bson::to_bson(v)
+        {
+            set.insert("video", v);
         }
         // FR-132 P1 — the viewer's decode errors, only from a sample that
         // counted them: absent means "not counted", so it must never write a

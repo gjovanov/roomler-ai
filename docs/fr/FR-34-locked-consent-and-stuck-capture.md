@@ -34,7 +34,7 @@ host cannot show the prompt at all. The operator had to unlock first, which is
 what set up defect 2. (The M3 lock-screen work put the video *capture* on the
 secure desktop; this newer window is not there.)
 
-### 2. A DXGI duplication bound during the lock→unlock transition returns empty frames forever — `system_context/capture_pump.rs:570`
+### 2. A DXGI duplication bound during the lock→unlock transition returns empty frames forever — `system_context/capture_pump.rs:949`
 
 The black session's own log (session `6a930b60`) is unambiguous:
 
@@ -117,21 +117,44 @@ smaller, fully-verifiable "tell the controller it is locked" above.
       (rebind → GDI backstop), so the controller gets a live screen without a
       reconnect. **Field-verified on CORPLAP-1, 2026-08-29** (P1, #919): locked →
       session → unlock+approve → neo16 got the screen live, no refresh.
-- [ ] A session that has ever delivered a frame is unaffected (no extra
+- [x] A session that has ever delivered a frame is unaffected (no extra
       rebuilds, idle optimisation intact).
+      *The P1 gate: `capture_is_stuck(delivered_since_build, …)` can only fire
+      when nothing was ever delivered, locked by
+      `capture_is_stuck_only_when_nothing_was_ever_delivered`
+      (`system_context/capture_pump.rs`), which the Windows `--lib` lane now runs
+      (`--features …,system-context`, `ci.yml`). Field read 2026-11-02, prod
+      `agent_logs`, 7 days: the recovery's own line,
+      `DXGI duplication delivered no frames`, in 0 batches, against 8 718 batches of
+      `system-context capture` from the same workers, 821 lines of them opening DXGI.
+      The recovery did not fire on a working session because it did not fire at all.*
 - [x] Connecting to a genuinely static screen shows an initial frame, not black.
       Met by P1 (GDI backstop delivers within ~2 s — never permanent black) and
       tightened by **P2** (one-shot GDI first frame within ~300 ms of connect).
       ⏳ field-verify P2's timing on a truly static screen on the next release.
-- [ ] The controller is TOLD the host is locked while a consent prompt is
+- [x] The controller is TOLD the host is locked while a consent prompt is
       pending, so its wait reads as "unlock the device and approve" rather than
       a hang (phase 3). ⚠️ Rendering the panel on the secure desktop is
       REJECTED (see above) — unlocking to approve is the intended flow.
+      *Field-verified on CORPLAP-1 (perMachine / SYSTEM) on `agent-v0.4.24` and
+      re-confirmed on 0.4.35: the viewer reads "That device is locked. Someone
+      needs to unlock it on the machine, then approve the request there — you
+      have 5 minutes." ([#917 — P3b](https://github.com/gjovanov/roomler-ai/issues/917#issuecomment-5468083980)).
+      The first field run had found the emit structurally dead on every SYSTEM
+      host (P3b fixed the probe).*
 - [x] Field-verified on **CORPLAP-1** (2026-08-29): lock → session → unlock →
       approve → the screen comes up live, **no refresh** (the black-until-refresh
       is fixed). The prompt is still not visible *while* locked — that is P3.
-- [ ] The attended `prompt` window is long enough to reach a locked machine
+- [x] The attended `prompt` window is long enough to reach a locked machine
       (P4, 5 min).
+      *`DEFAULT_CONSENT_TIMEOUT = Duration::from_secs(300)`
+      (`crates/remote_control/src/consent.rs`), used by the hub; the P3b field
+      run shows the viewer announcing it on a locked host. 30 s had been shown
+      too short in the P1 field run.*
+
+*The three above ticked 2026-11-02 — shipped and verified by 2026-08-30
+([#917 — closing](https://github.com/gjovanov/roomler-ai/issues/917#issuecomment-5471944393)),
+never ticked in the spec.*
 
 ## Out of scope
 

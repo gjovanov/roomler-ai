@@ -2,7 +2,8 @@
 // Copyright (C) 2026 G ROX EOOD
 //! `PUT /api/tenant/{tenant_id}/agent/{agent_id}/desired-config` — record the
 //! device config an operator wants, for the agent to reconcile when it next
-//! connects. Step 2 of `docs/remote-config.md`.
+//! connects, and nudge it now if it is connected. Step 2 of
+//! `docs/remote-config.md`.
 //!
 //! This route writes an INTENT, never a fact. The device is free to ignore it
 //! (and does, unless it has opted in via `remote_config_enabled`), so nothing
@@ -12,9 +13,10 @@ use axum::{
     Json,
     extract::{Path, State},
 };
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{DesiredConfig, parse_pushed_tribool, pushed_tribool_wire};
+use roomler_ai_services::dao::base::DaoError;
 use serde::{Deserialize, Serialize};
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
@@ -44,6 +46,11 @@ pub struct DesiredConfigBody {
     /// key). Passed on unread, as the two denylists above are.
     #[serde(default)]
     pub zero_copy_deny: Option<String>,
+    /// FR-135 §7.1 — media path names a session must run on their old code,
+    /// `none`, or blank (clear the device's key). Passed on unread, as the
+    /// denylists are: the device ignores a name its build does not know.
+    #[serde(default)]
+    pub rc_media_legacy: Option<String>,
     /// Every other key in the body, kept only to be refused if it is a device
     /// owner's ([`names_a_device_owned_key`]). Dropped silently, an `external_*`
     /// key would answer 200 as if the push had taken. Never stored or logged.
@@ -80,6 +87,9 @@ pub enum ConfigDenyReason {
     CannotGrantSsh,
     /// FR-52 — the body names an `external_*` key, which no server may push.
     DeviceOwnedKey,
+    /// FR-135 §7.1 — the body names `rc_media_canary`, the switch that turns a
+    /// media path's new code on early, which is the device's.
+    DeviceOwnedSwitch,
 }
 
 impl ConfigDenyReason {
@@ -89,6 +99,7 @@ impl ConfigDenyReason {
             Self::CannotGrantExec => "cannot_grant_exec",
             Self::CannotGrantSsh => "cannot_grant_ssh",
             Self::DeviceOwnedKey => "device_owned_key",
+            Self::DeviceOwnedSwitch => "device_owned_switch",
         }
     }
 
@@ -106,6 +117,10 @@ impl ConfigDenyReason {
             Self::DeviceOwnedKey => {
                 "External access is the device owner's to set, on the device: no server can \
                  push an external_* key"
+            }
+            Self::DeviceOwnedSwitch => {
+                "rc_media_canary turns a media path's new code on early, which is the \
+                 device's decision or a release's: no server can push it"
             }
         }
     }
@@ -185,6 +200,59 @@ fn pushed_tribool(key: &str, v: &str) -> Result<String, ApiError> {
         .map_err(|e| ApiError::BadRequest(format!("{key}: {e}")))
 }
 
+/// FR-132 P1b — tell a connected device about a save now, with the frame the
+/// connect path sends, so a kill switch does not wait for the socket to drop.
+///
+/// Called after the document is stored, which is what makes a miss harmless: a
+/// device that connects at any point after that reads this revision. Best
+/// effort for the same reason. Reconcile-on-connect is still what a device
+/// converges by, so a lost nudge costs only the wait for it, and nothing here
+/// changes what the device will accept: gate 4 is its own to keep, and the
+/// report still comes back over its socket.
+///
+/// Local first; the ctrl lane covers a device homed on another pod, as for a
+/// cross-org join. Only "not on this pod" goes that way: a connection that
+/// does not read the frame says so here as it does on every connect.
+async fn nudge_connected_device(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    desired: &DesiredConfig,
+) {
+    // The connect path's rule: a cleared form is nothing to reconcile.
+    if desired.is_empty() {
+        return;
+    }
+    match state
+        .rc_hub
+        .push_desired_config(agent_id, tenant_id, desired.clone())
+    {
+        Err(roomler_ai_remote_control::error::Error::AgentOffline(_)) => {
+            let desired = match serde_json::to_value(desired) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(%e, "desired config did not serialise for the ctrl lane");
+                    return;
+                }
+            };
+            crate::ctrl::publish_rc_ctrl(
+                state,
+                "config_push",
+                serde_json::json!({
+                    "agent_id": agent_id.to_hex(),
+                    "tenant_id": tenant_id.to_hex(),
+                    "desired": desired,
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            tracing::info!(agent = %agent_id, %e, "desired config not pushed on save");
+        }
+        Ok(()) => {}
+    }
+}
+
 pub async fn set_desired_config(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -204,6 +272,13 @@ pub async fn set_desired_config(
         .as_deref()
         .map(|v| pushed_tribool("color_description", v))
         .transpose()?;
+    // FR-135 §7.1 — the same for the media-path list's SHAPE: a typo would be
+    // written, reported applied, and read by the device as no entry at all.
+    // The names are the device build's own, so a later phase's name passes.
+    if let Some(v) = body.rc_media_legacy.as_deref() {
+        roomler_ai_remote_control::models::check_media_path_list(v)
+            .map_err(|e| ApiError::BadRequest(format!("rc_media_legacy: {e}")))?;
+    }
 
     // Membership first: `get_member_permissions` is the membership check too,
     // so a non-member never reaches the policy below.
@@ -227,6 +302,7 @@ pub async fn set_desired_config(
         fps_deny: body.fps_deny,
         color_description,
         zero_copy_deny: body.zero_copy_deny,
+        rc_media_legacy: body.rc_media_legacy,
         revision: agent.desired_config.revision + 1,
         updated_by: Some(auth.user_id),
         updated_at: Some(DateTime::now()),
@@ -238,6 +314,11 @@ pub async fn set_desired_config(
     let verdict = decide(perms, &agent.desired_config, &requested).and_then(|()| {
         if names_a_device_owned_key(&body.rest) {
             Err(ConfigDenyReason::DeviceOwnedKey)
+        } else if body.rest.contains_key("rc_media_canary") {
+            // FR-135 §7.1 — by WHOLE name: it shares no prefix with the
+            // pushable `rc_media_legacy`, and a 200 would say a push took that
+            // never will.
+            Err(ConfigDenyReason::DeviceOwnedSwitch)
         } else {
             Ok(())
         }
@@ -265,16 +346,25 @@ pub async fn set_desired_config(
                 "desired-config: an external_* key was pushed — refused, it is the device's"
             );
         }
+        if reason == ConfigDenyReason::DeviceOwnedSwitch {
+            tracing::warn!(
+                tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
+                "desired-config: rc_media_canary was pushed — refused, it is the device's"
+            );
+        }
         return Err(ApiError::Forbidden(reason.message().to_string()));
     }
 
-    let bson = bson::to_bson(&requested)
-        .map_err(|e| ApiError::Internal(format!("serialising desired_config: {e}")))?;
-    state
+    // `false`: the removal won the race with the lookup above, and nothing was
+    // stored.
+    if !state
         .agents
-        .base
-        .update_by_id(aid, doc! { "$set": { "desired_config": bson } })
-        .await?;
+        .set_desired_config(tid, aid, &requested)
+        .await?
+    {
+        return Err(DaoError::NotFound.into());
+    }
+    nudge_connected_device(&state, tid, aid, &requested).await;
 
     Ok(Json(DesiredConfigResponse {
         revision: requested.revision,
@@ -616,6 +706,31 @@ mod tests {
             for short in [0, DEFAULT_MEMBER] {
                 assert_eq!(
                     decide(short, &DesiredConfig::default(), &deny),
+                    Err(ConfigDenyReason::NotDeviceAdmin),
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    /// FR-135 §7.1 — `rc_media_legacy` is every FR-135 phase's kill switch: it
+    /// only ever sends a session back to code the device already ran, so
+    /// `MANAGE_AGENTS` alone may push it, a clear included, and nothing less may
+    /// push any of it. `rc_media_canary` has no field to push at all.
+    #[test]
+    fn the_media_legacy_list_needs_only_manage_agents() {
+        for value in ["media_plan,stats", "none", ""] {
+            let push = DesiredConfig {
+                rc_media_legacy: Some(value.into()),
+                ..Default::default()
+            };
+            decide(DEFAULT_ADMIN, &DesiredConfig::default(), &push)
+                .unwrap_or_else(|e| panic!("MANAGE_AGENTS alone may push {value:?}: {e:?}"));
+            assert!(!push.touches_exec() && !push.touches_ssh(), "{value:?}");
+            assert!(!push.is_empty(), "{value:?}: a clear is a request too");
+            for short in [0, DEFAULT_MEMBER] {
+                assert_eq!(
+                    decide(short, &DesiredConfig::default(), &push),
                     Err(ConfigDenyReason::NotDeviceAdmin),
                     "{value:?}"
                 );

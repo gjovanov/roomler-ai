@@ -11,6 +11,17 @@
 //! handler in `media_cluster.rs`, which is why it must never re-enter the
 //! gate. Replies are connection-addressed and routed, so an error raised
 //! while executing a forwarded command still reaches the viewer's pod.
+//!
+//! Every command passes the participation gate (`media_gate`) first: a
+//! `media:join` needs what REST `call/join` checks — the room's tenant, the
+//! room's visibility, and an open call session for this connection — and
+//! every other command needs this connection's seat in that room's media.
+//! The handlers below take the gate's proof ([`JoinPass`] or [`Seat`]), never
+//! a bare room id, user or connection, so none can be reached around it.
+//! [`route_and_dispatch_media`] admits a join BEFORE placement, so a refused
+//! join claims no room; the owner admits a forwarded join again before it
+//! seats it (`media_cluster::handle_media_cmd_rpc`), and
+//! [`dispatch_media_local`] checks every other command's seat where it lives.
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -23,6 +34,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::ConferenceState;
+use crate::media_gate::{self, JoinPass, Seat};
+
+/// The one command a connection may send before it holds a seat.
+const JOIN: &str = "media:join";
 
 /// The namespace handler the module registers for `Role::User` / `media`.
 pub struct Media {
@@ -129,33 +144,59 @@ async fn route_and_dispatch_media(
 ) {
     use crate::media_cluster::{MediaRoute, forward_media_cmd, resolve_media_route};
 
-    let rid = data
-        .and_then(|d| d.get("room_id"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| ObjectId::parse_str(s).ok());
-    let Some(rid) = rid else {
-        // Missing/invalid room_id — the local handlers own the error shape.
-        dispatch_media_local(state, user_id, connection_id, msg_type, data, false).await;
-        return;
+    let (rid, frame) = match requested_room(data) {
+        Ok(requested) => requested,
+        Err(why) => {
+            refuse(state, user_id, connection_id, msg_type, why).await;
+            return;
+        }
     };
-    let is_join = msg_type == "media:join";
-    match resolve_media_route(state, &rid, is_join).await {
-        MediaRoute::Local { create } => {
+    if msg_type == JOIN {
+        // Admitted BEFORE placement: a refused join claims no room, builds no
+        // router and reaches no other pod.
+        let pass = match media_gate::admit_join(state, *user_id, connection_id, rid).await {
+            Ok(pass) => pass,
+            Err(refusal) => {
+                refuse_join(state, user_id, connection_id, rid, &refusal).await;
+                return;
+            }
+        };
+        match resolve_media_route(state, &rid, true).await {
+            MediaRoute::Local { create } => {
+                // A conn whose room came home (fold/rehome) no longer needs
+                // close-time forwarding to a remote owner.
+                state.remote_media_conns.remove(connection_id);
+                handle_media_join(state, &pass, frame, create).await;
+            }
+            MediaRoute::Remote(owner) => {
+                // The owner admits the join again before it seats the
+                // connection (`handle_media_cmd_rpc`): the pod that creates
+                // the participant decides, whichever pod forwarded the join.
+                let ok =
+                    forward_media_cmd(state, &owner, user_id, connection_id, msg_type, data).await;
+                // Track remote membership so WS close can tell the owner to
+                // drop the transports. (The prune fallback may have served
+                // the join LOCALLY after all — skip the marker then.)
+                if ok && !state.room_manager.has_room(&rid) {
+                    state
+                        .remote_media_conns
+                        .insert(connection_id.to_string(), rid);
+                }
+            }
+        }
+        return;
+    }
+    match resolve_media_route(state, &rid, false).await {
+        MediaRoute::Local { .. } => {
             // A conn whose room came home (fold/rehome) no longer needs
             // close-time forwarding to a remote owner.
             state.remote_media_conns.remove(connection_id);
-            dispatch_media_local(state, user_id, connection_id, msg_type, data, create).await;
+            dispatch_media_local(state, user_id, connection_id, msg_type, data, false).await;
         }
         MediaRoute::Remote(owner) => {
-            let ok = forward_media_cmd(state, &owner, user_id, connection_id, msg_type, data).await;
-            // Track remote membership so WS close can tell the owner to
-            // drop the transports. (The prune fallback may have served
-            // the join LOCALLY after all — skip the marker then.)
-            if is_join && ok && !state.room_manager.has_room(&rid) {
-                state
-                    .remote_media_conns
-                    .insert(connection_id.to_string(), rid);
-            } else if msg_type == "media:leave" {
+            // The seat lives on the owner, which checks it there.
+            forward_media_cmd(state, &owner, user_id, connection_id, msg_type, data).await;
+            if msg_type == "media:leave" {
                 state.remote_media_conns.remove(connection_id);
             }
         }
@@ -166,6 +207,12 @@ async fn route_and_dispatch_media(
 /// the WS dispatch above and the owner-side `media.cmd` bus handler
 /// (`ws/media_cluster.rs`) — which is why it must never re-enter the
 /// placement gate.
+///
+/// The participation gate runs here for every caller, on the pod that
+/// executes: a join (the prune fallback's re-served one) is admitted before
+/// the connection is seated, and every other command needs the connection's
+/// seat in this pod's room, so a command forwarded to the owner is checked
+/// where the seats live, whichever pod forwarded it.
 pub async fn dispatch_media_local(
     state: &ConferenceState,
     user_id: &ObjectId,
@@ -174,41 +221,119 @@ pub async fn dispatch_media_local(
     data: Option<&serde_json::Value>,
     create_allowed: bool,
 ) {
-    match msg_type {
-        "media:join" => {
-            handle_media_join(state, user_id, connection_id, data, create_allowed).await;
+    let (rid, frame) = match requested_room(data) {
+        Ok(requested) => requested,
+        Err(why) => {
+            refuse(state, user_id, connection_id, msg_type, why).await;
+            return;
         }
+    };
+    if msg_type == JOIN {
+        match media_gate::admit_join(state, *user_id, connection_id, rid).await {
+            Ok(pass) => handle_media_join(state, &pass, frame, create_allowed).await,
+            Err(refusal) => refuse_join(state, user_id, connection_id, rid, &refusal).await,
+        }
+        return;
+    }
+    let Some(seat) = media_gate::seat(state, *user_id, connection_id, rid) else {
+        // No seat in this room's media on this pod: the connection never
+        // joined it, or has left, or the room closed or moved meanwhile.
+        refuse(
+            state,
+            user_id,
+            connection_id,
+            msg_type,
+            media_gate::NOT_A_PARTICIPANT,
+        )
+        .await;
+        return;
+    };
+    dispatch_seated(state, &seat, msg_type, frame).await;
+}
+
+/// One command of a connection that holds a seat. Nothing here has a bare
+/// user, connection or room: each handler acts on the [`Seat`].
+async fn dispatch_seated(
+    state: &ConferenceState,
+    seat: &Seat,
+    msg_type: &str,
+    data: &serde_json::Value,
+) {
+    match msg_type {
         "media:connect_transport" => {
-            handle_media_connect_transport(state, connection_id, data).await;
+            handle_media_connect_transport(state, seat, data).await;
         }
         "media:produce" => {
-            handle_media_produce(state, user_id, connection_id, data).await;
+            handle_media_produce(state, seat, data).await;
         }
         "media:consume" => {
-            handle_media_consume(state, user_id, connection_id, data).await;
+            handle_media_consume(state, seat, data).await;
         }
         "media:producer_close" => {
-            handle_media_producer_close(state, user_id, connection_id, data).await;
+            handle_media_producer_close(state, seat, data).await;
         }
         "media:producer_pause" => {
-            handle_media_producer_pause(state, user_id, connection_id, data).await;
+            handle_media_producer_pause(state, seat, data).await;
         }
         "media:view" => {
-            handle_media_view(state, user_id, connection_id, data).await;
+            handle_media_view(state, seat, data).await;
         }
         "media:leave" => {
-            handle_media_leave(state, user_id, connection_id, data).await;
+            handle_media_leave(state, seat).await;
         }
         "media:play_audio" => {
-            handle_play_audio(state, user_id, connection_id, data).await;
+            handle_play_audio(state, seat, data).await;
         }
         "media:stop_audio" => {
-            handle_stop_audio(state, user_id, connection_id, data).await;
+            handle_stop_audio(state, seat, data).await;
         }
         _ => {
-            debug!(?user_id, msg_type, "Unknown media message type");
+            debug!(user_id = ?seat.user_id(), msg_type, "Unknown media message type");
         }
     }
+}
+
+/// The room a frame names, which the gate checks and every handler acts on,
+/// with the frame's data.
+fn requested_room(
+    data: Option<&serde_json::Value>,
+) -> Result<(ObjectId, &serde_json::Value), &'static str> {
+    let data = data.ok_or("Missing room_id")?;
+    let raw = data
+        .get("room_id")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing room_id")?;
+    let rid = ObjectId::parse_str(raw).map_err(|_| "Invalid room_id")?;
+    Ok((rid, data))
+}
+
+/// Refuse a command. Only the commands that already answered their own
+/// failures — join, produce, consume — say why; the rest stay silent as they
+/// always were (a `media:leave` after the room closed, or a view report that
+/// races a fold, wants no answer).
+async fn refuse(
+    state: &ConferenceState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    msg_type: &str,
+    why: &str,
+) {
+    debug!(?user_id, %connection_id, msg_type, why, "media command not run");
+    if matches!(msg_type, JOIN | "media:produce" | "media:consume") {
+        send_media_error(state, connection_id, why).await;
+    }
+}
+
+/// A join the gate refused: logged with its reason, answered without one.
+pub(crate) async fn refuse_join(
+    state: &ConferenceState,
+    user_id: &ObjectId,
+    connection_id: &str,
+    rid: ObjectId,
+    refusal: &media_gate::Refusal,
+) {
+    info!(?user_id, %connection_id, room = %rid, %refusal, "media:join refused");
+    send_media_error(state, connection_id, media_gate::NOT_A_PARTICIPANT).await;
 }
 
 async fn send_media_error(state: &ConferenceState, connection_id: &str, message: &str) {
@@ -227,28 +352,16 @@ async fn send_media_error(state: &ConferenceState, connection_id: &str, message:
     .await;
 }
 
-async fn handle_media_join(
+/// Run a join the gate admitted, on the pod that serves the room: seat the
+/// connection and hand it the transports, the TURN credential and the
+/// producers already in the call.
+pub(crate) async fn handle_media_join(
     state: &ConferenceState,
-    user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
+    pass: &JoinPass,
+    data: &serde_json::Value,
     create_allowed: bool,
 ) {
-    let room_id_str = match data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str()) {
-        Some(s) => s,
-        None => {
-            send_media_error(state, connection_id, "Missing room_id").await;
-            return;
-        }
-    };
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => {
-            send_media_error(state, connection_id, "Invalid room_id").await;
-            return;
-        }
-    };
+    let (rid, user_id, connection_id) = (pass.room_id(), pass.user_id(), pass.connection_id());
 
     let mut room_exists = state.room_manager.has_room(&rid);
     debug!(?user_id, %connection_id, ?rid, room_exists, create_allowed, "media:join room check");
@@ -280,16 +393,15 @@ async fn handle_media_join(
     //
     // A rejoining participant is already in the map, so `>=` would refuse them
     // their own seat — hence the membership test before the count.
-    let room = state.rooms.base.find_by_id(rid).await.ok();
+    //
     // FR-115 P4b — the org that pays for this meeting's TURN relay, named in
-    // the TURN username below so coturn's statistics name it.
-    let room_org = room.as_ref().map(|r| r.tenant_id);
-    if let Some(room) = room.as_ref()
-        && let Ok(tenant) = state.tenants.base.find_by_id(room.tenant_id).await
-    {
+    // the TURN username below so coturn's statistics name it: the room's own
+    // tenant, which the gate read from the room.
+    let room_org = pass.tenant_id();
+    if let Ok(tenant) = state.tenants.base.find_by_id(room_org).await {
         let present = state.room_manager.get_participant_user_ids(&rid);
         // FR-102 P4 — through core, which also counts the collision per org.
-        if !present.contains(user_id)
+        if !present.contains(&user_id)
             && let Err(d) = roomler_core::quota::check(
                 state,
                 &tenant,
@@ -312,13 +424,13 @@ async fn handle_media_join(
     // whatever the client says, and tells it so in `meeting.view` below.
     let view_capable = state.settings.meetings.visible_tiles
         && data
-            .and_then(|d| d.get("caps"))
+            .get("caps")
             .and_then(|c| c.as_array())
             .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some("view")));
 
     let transport_pair = match state
         .room_manager
-        .create_transports(rid, *user_id, connection_id.to_string(), view_capable)
+        .create_transports(rid, user_id, connection_id.to_string(), view_capable)
         .await
     {
         Ok(tp) => tp,
@@ -365,15 +477,11 @@ async fn handle_media_join(
         .as_deref()
         .map(str::trim)
         .filter(|u| !u.is_empty());
-    // FR-115 P4b — the TURN user, charged to the room's org when it is known
+    // FR-115 P4b — the TURN user, charged to the room's org
     // (`<expiry>:<user>:org-<org>`), so coturn's statistics name the org that
     // pays; coturn reads only the expiry part.
-    let turn_user = match room_org {
-        Some(org) => {
-            roomler_ai_remote_control::turn_creds::charged(&user_id.to_hex(), &org.to_hex())
-        }
-        None => user_id.to_hex(),
-    };
+    let turn_user =
+        roomler_ai_remote_control::turn_creds::charged(&user_id.to_hex(), &room_org.to_hex());
     let ice_servers: Vec<serde_json::Value> = if let Some(url) = turn_url_configured {
         let (turn_username, turn_credential) =
             if let Some(ref secret) = state.settings.turn.shared_secret {
@@ -491,18 +599,10 @@ async fn handle_media_join(
 
 async fn handle_media_connect_transport(
     state: &ConferenceState,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
+    seat: &Seat,
+    data: &serde_json::Value,
 ) {
-    let data = match data {
-        Some(d) => d,
-        None => return,
-    };
-
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
+    let (rid, connection_id) = (seat.room_id(), seat.connection_id());
     let transport_id = match data.get("transport_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
@@ -515,11 +615,6 @@ async fn handle_media_connect_transport(
         None => return,
     };
 
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
-
     if let Err(e) = state
         .room_manager
         .connect_transport(&rid, connection_id, transport_id, dtls_parameters)
@@ -529,27 +624,8 @@ async fn handle_media_connect_transport(
     }
 }
 
-async fn handle_media_produce(
-    state: &ConferenceState,
-    user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
-    let data = match data {
-        Some(d) => d,
-        None => {
-            send_media_error(state, connection_id, "Missing data").await;
-            return;
-        }
-    };
-
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            send_media_error(state, connection_id, "Missing room_id").await;
-            return;
-        }
-    };
+async fn handle_media_produce(state: &ConferenceState, seat: &Seat, data: &serde_json::Value) {
+    let (rid, user_id, connection_id) = (seat.room_id(), seat.user_id(), seat.connection_id());
     let kind: MediaKind = match data
         .get("kind")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -578,14 +654,6 @@ async fn handle_media_produce(
             MediaKind::Video => "camera",
         })
         .to_string();
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => {
-            send_media_error(state, connection_id, "Invalid room_id").await;
-            return;
-        }
-    };
 
     match state
         .room_manager
@@ -637,27 +705,8 @@ async fn handle_media_produce(
     }
 }
 
-async fn handle_media_consume(
-    state: &ConferenceState,
-    _user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
-    let data = match data {
-        Some(d) => d,
-        None => {
-            send_media_error(state, connection_id, "Missing data").await;
-            return;
-        }
-    };
-
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => {
-            send_media_error(state, connection_id, "Missing room_id").await;
-            return;
-        }
-    };
+async fn handle_media_consume(state: &ConferenceState, seat: &Seat, data: &serde_json::Value) {
+    let (rid, connection_id) = (seat.room_id(), seat.connection_id());
     let producer_id_str = match data.get("producer_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => {
@@ -672,14 +721,6 @@ async fn handle_media_consume(
         Some(c) => c,
         None => {
             send_media_error(state, connection_id, "Invalid rtp_capabilities").await;
-            return;
-        }
-    };
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => {
-            send_media_error(state, connection_id, "Invalid room_id").await;
             return;
         }
     };
@@ -749,12 +790,8 @@ pub fn meeting_levers(meetings: &roomler_ai_config::MeetingsSettings) -> serde_j
 /// Dispatched where `media:consume` is — through the placement gate, so a
 /// viewer whose socket is on another pod reaches the owner's
 /// `ParticipantMedia` over `media.cmd` like every other command.
-async fn handle_media_view(
-    state: &ConferenceState,
-    user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
+async fn handle_media_view(state: &ConferenceState, seat: &Seat, data: &serde_json::Value) {
+    let (rid, user_id, connection_id) = (seat.room_id(), seat.user_id(), seat.connection_id());
     // The kill switch: the server never joined this client as view-capable
     // (`view = None`), so its report would be ignored anyway — say so once
     // at debug and skip the parse.
@@ -762,13 +799,6 @@ async fn handle_media_view(
         debug!(?user_id, %connection_id, "media:view ignored: visible_tiles is off");
         return;
     }
-    let Some(data) = data else { return };
-    let Some(room_id_str) = data.get("room_id").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let Ok(rid) = ObjectId::parse_str(room_id_str) else {
-        return;
-    };
     let seq = data.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
     // A tile whose producer id does not parse is skipped, not an error: the
     // producer may have closed between the client's render and this report.
@@ -818,14 +848,10 @@ async fn handle_media_view(
 /// older client never sends this and ignores the event it would receive.
 async fn handle_media_producer_pause(
     state: &ConferenceState,
-    user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
+    seat: &Seat,
+    data: &serde_json::Value,
 ) {
-    let Some(data) = data else { return };
-    let Some(room_id_str) = data.get("room_id").and_then(|v| v.as_str()) else {
-        return;
-    };
+    let (rid, user_id, connection_id) = (seat.room_id(), seat.user_id(), seat.connection_id());
     let Some(producer_id_str) = data.get("producer_id").and_then(|v| v.as_str()) else {
         return;
     };
@@ -833,9 +859,6 @@ async fn handle_media_producer_pause(
     // predates the resume half, and pausing is the safe reading.
     let paused = data.get("paused").and_then(|v| v.as_bool()).unwrap_or(true);
 
-    let Ok(rid) = ObjectId::parse_str(room_id_str) else {
-        return;
-    };
     let Ok(producer_id) = producer_id_str.parse::<ProducerId>() else {
         return;
     };
@@ -879,27 +902,13 @@ async fn handle_media_producer_pause(
 
 async fn handle_media_producer_close(
     state: &ConferenceState,
-    user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
+    seat: &Seat,
+    data: &serde_json::Value,
 ) {
-    let data = match data {
-        Some(d) => d,
-        None => return,
-    };
-
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
+    let (rid, user_id, connection_id) = (seat.room_id(), seat.user_id(), seat.connection_id());
     let producer_id_str = match data.get("producer_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
-    };
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => return,
     };
 
     let producer_id = match producer_id_str.parse::<ProducerId>() {
@@ -940,21 +949,11 @@ async fn handle_media_producer_close(
     }
 }
 
-async fn handle_media_leave(
-    state: &ConferenceState,
-    user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
-    let room_id_str = match data.and_then(|d| d.get("room_id")).and_then(|c| c.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
+/// The seat's own leave: only a connection seated in the room can leave it,
+/// so a leave can no longer announce a `media:peer_left` for someone who was
+/// never there, nor drop the connection's mapping to the room it IS in.
+async fn handle_media_leave(state: &ConferenceState, seat: &Seat) {
+    let (rid, user_id, connection_id) = (seat.room_id(), seat.user_id(), seat.connection_id());
 
     let other_conns = state
         .room_manager
@@ -983,36 +982,24 @@ async fn handle_media_leave(
     }
 }
 
-async fn handle_play_audio(
-    state: &ConferenceState,
-    _user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
-    let data = match data {
-        Some(d) => d,
+/// Play one of the call's room files to everyone in the call. The file must
+/// be live, in the room's tenant, and one of THIS room's files — the list the
+/// call's files panel shows (`GET …/room/{room_id}/file`) — so a participant
+/// cannot announce a file of a room they may not read, or a removed one.
+async fn handle_play_audio(state: &ConferenceState, seat: &Seat, data: &serde_json::Value) {
+    let (rid, connection_id) = (seat.room_id(), seat.connection_id());
+    let fid = match data
+        .get("file_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| ObjectId::parse_str(s).ok())
+    {
+        Some(id) => id,
         None => return,
     };
 
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
-    let file_id = match data.get("file_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
-    let fid = match ObjectId::parse_str(file_id) {
-        Ok(id) => id,
-        Err(_) => return,
-    };
-
-    // Look up the room to get tenant_id
+    // The room's tenant. The seat proves this connection is in the room's
+    // call, so the id is one the caller may use; the read only learns whose
+    // room it is.
     let room = match state.rooms.base.find_by_id(rid).await {
         Ok(r) => r,
         Err(e) => {
@@ -1022,18 +1009,26 @@ async fn handle_play_audio(
     };
 
     // FR-69 P3 — `files` is the `chat` module's; a DAO is a stateless handle
-    // on the collection, so this playback path builds its own until the
-    // media handlers move with conference (P4).
+    // on the collection, so this playback path builds its own.
     let files = roomler_ai_services::dao::file::FileDao::new(&state.db);
-    let file = match files.base.find_by_id_in_tenant(room.tenant_id, fid).await {
-        Ok(f) => f,
+    let file = match files
+        .base
+        .find_live_by_id_in_tenant(room.tenant_id, fid)
+        .await
+    {
+        Ok(f) if f.context.room_id == Some(rid) => f,
+        Ok(_) => {
+            debug!(room = %rid, file_id = %fid, "playback refused: not one of this room's files");
+            return;
+        }
         Err(e) => {
-            warn!(%e, "Failed to find file for playback");
+            debug!(room = %rid, file_id = %fid, %e, "playback refused: no live file");
             return;
         }
     };
 
-    let playback_id = String::new();
+    // Each playback has its own id, so a stop names the playback it ends.
+    let playback_id = ObjectId::new().to_hex();
 
     let file_url = format!(
         "/api/tenant/{}/file/{}/download",
@@ -1045,10 +1040,10 @@ async fn handle_play_audio(
         "data": {
             "action": "start",
             "file_url": file_url,
-            "file_id": file_id,
+            "file_id": fid.to_hex(),
             "filename": file.filename,
             "playback_id": playback_id,
-            "room_id": room_id_str,
+            "room_id": rid.to_hex(),
         }
     });
 
@@ -1072,32 +1067,15 @@ async fn handle_play_audio(
         .await;
     }
 
-    info!(%rid, %file_id, %playback_id, "Audio playback started");
+    info!(%rid, file_id = %fid, %playback_id, "Audio playback started");
 }
 
-async fn handle_stop_audio(
-    state: &ConferenceState,
-    _user_id: &ObjectId,
-    connection_id: &str,
-    data: Option<&serde_json::Value>,
-) {
-    let data = match data {
-        Some(d) => d,
-        None => return,
-    };
-
-    let room_id_str = match data.get("room_id").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return,
-    };
+/// Stop a playback for everyone in the call; only a participant may.
+async fn handle_stop_audio(state: &ConferenceState, seat: &Seat, data: &serde_json::Value) {
+    let (rid, connection_id) = (seat.room_id(), seat.connection_id());
     let playback_id = match data.get("playback_id").and_then(|v| v.as_str()) {
         Some(s) => s,
         None => return,
-    };
-
-    let rid = match ObjectId::parse_str(room_id_str) {
-        Ok(id) => id,
-        Err(_) => return,
     };
 
     let msg = serde_json::json!({
@@ -1105,7 +1083,7 @@ async fn handle_stop_audio(
         "data": {
             "action": "stop",
             "playback_id": playback_id,
-            "room_id": room_id_str,
+            "room_id": rid.to_hex(),
         }
     });
 

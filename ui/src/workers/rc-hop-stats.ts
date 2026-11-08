@@ -12,7 +12,11 @@
  * Hops measured:
  *  - `fwd`    — main-thread DC `onmessage` → worker `chunk` arrival
  *               (epoch-absolute clocks via `epochNowMs`, valid across
- *               contexts because both sides use timeOrigin + now()).
+ *               contexts because both sides use timeOrigin + now(), to
+ *               about the clocks' coarsening: a hop shorter than the two
+ *               contexts' skew reads negative and is dropped). The relay
+ *               only: a channel moved into the worker (FR-135 R3) has no
+ *               page hop, and no `fwd`.
  *  - `decode` — `decoder.decode(chunk)` submission → `output` callback
  *               (queue + decoder latency; indicts the decoder itself).
  *  - `paint`  — the `paintFrame` body (canvas blit cost).
@@ -106,9 +110,12 @@ export class QueueDrift {
   private n = 0
 
   /** One frame. `wireTsUs` is the agent-clock framing timestamp carried in
-   *  the frame header; `arrivalUs` is any consistent local clock — the
-   *  point in the pipeline does not matter, only that it is the same point
-   *  every frame, because a constant offset cancels in the delta. */
+   *  the frame header; `arrivalUs` is one consistent local clock, read at the
+   *  same point in the pipeline every frame, because a CONSTANT offset cancels
+   *  in the delta. A varying one does not: read after the decode queue and the
+   *  paint, a decoder falling behind adds to the sum as if the link had grown.
+   *  The DC worker keeps one read at paint (`queueMs`, which the live law
+   *  reads) and, since FR-135 R3, one read at arrival (`queueArrMs`). */
   add(wireTsUs: number, arrivalUs: number): void {
     if (!Number.isFinite(wireTsUs) || !Number.isFinite(arrivalUs)) return
     const prevWire = this.lastWireUs

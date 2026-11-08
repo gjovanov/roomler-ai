@@ -68,6 +68,41 @@ flowchart LR
 | Writer | `recording/mp4.rs` `FragmentedWriter` | Fragmented while recording, so a crash loses at most one fragment (~2 s). See §2. |
 | Finalize | `recording/mp4.rs` `finalize` | A remux to a progressive, `moov`-first file that QuickTime, Movies & TV and editors open. Payloads are copied, never re-encoded. |
 
+⚠️ **Measured: on a software-only host, a session beside a recording costs it ticks.** On a 4-vCPU guest with
+no GPU (release 0.4.199, FR-85's field log), a 1080p30 recording over a small moving region dropped 0.72 % of its
+ticks alone, and about 3.1 % while a session's software VP9-444 encoder ran beside it. The frames stayed native and
+the file kept time, because a missed tick is the previous frame lasting longer. The sidecar's `late_ticks` is that
+count, and AC1 bounds it at 0.5 %. With 8 vCPUs (2026-11-04) the moving region alone dropped 0.32 %, inside the
+bound, and 1.62 % with the session beside it: more CPU halves the cost, and the session's encoder still breaks it.
+AC1's bound is held to hosts with a hardware encoder (decided 2026-11-05). Giving the recorder the CPU first on a
+host with no GPU is [#3492](https://github.com/gjovanov/roomler-ai/issues/3492).
+
+⚠️ **Measured: on a Mac, the recorder's own disk check cost a tick every 5 s.** On a MacBook (Apple M5 Pro,
+release 0.4.200, FR-85's field log), a 3024×1964 recording on `h264_videotoolbox` read 0.63 % late ticks with a
+relay-capped session on `hevc_videotoolbox` beside it, and 0.64 % with none: the session cost nothing measurable.
+The late ticks fell exactly one every 5.02 s. Every 5 s the paced loop asked `folder::available_space` how much room
+was left. That was a full `sysinfo` disk refresh, which on macOS queries every volume and walks IOKit for each one,
+and the loop's next tick waited for it. **Since FR-85 P7 the check is off the loop.**
+[`recorder.rs:141`](../agents/roomlerd/src/recording/recorder.rs#L141) `watch_free_space` asks it on a blocking
+thread every `disk_check_every` (5 s) and raises a flag. The loop only reads that flag and stops `disk_low` as
+before. [`folder.rs:300`](../agents/roomlerd/src/recording/folder.rs#L300) refreshes storage only, so the IOKit
+walks are gone too. A check that takes 120 ms, asked every 250 ms, cost a 3-second recording 25 late ticks inside
+the loop, and costs it none now (`tests/recorder.rs`). On release 0.4.201, which carries P7, the same MacBook
+recorded 10:29 beside a relay-capped session with 0 late ticks of 18,871, and 2:33 with no session with 0 of 4,598.
+
+⚠️ **A recording holds the display** ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)). On an X11
+host nobody had touched for five minutes, a viewer that connected made display match
+([`display-match.md`](display-match.md)) switch the display to the viewer's size under a running recording
+(release 0.4.199). A local recording kept its frame size, but everything outside the matched area froze until the
+session let the display go, and a remote recording started in that session was recorded at the matched size. Now
+the recording holds the display from just before its recorder launches until it has stopped: a mode a session
+switched goes back first, and display match refuses `recording` meanwhile, then decides those requests again at
+its end ([`display-match.md`](display-match.md#a-recording-holds-the-display-3467)). **Fixed in agent 0.4.201**,
+read on that release on the same kind of host on 2026-11-05
+([FR-108 §8 row 16](fr/FR-108-display-follows-the-viewer.md#8-field-verification-log)): the viewer that joined was
+refused `recording`, the clock in the file moved to its last frame, and a remote recording started in a switched
+session was recorded at 1920×1080. On an older agent, `display_match = never` in its config avoids the problem.
+
 ⚠️ **A process of its own.** `roomlerd record` is a child, like the capability
 probe, so a driver fault in a recording's encoder costs the recorder, never
 the daemon or a live session. It stops when its stdin closes, so a recorder
@@ -167,8 +202,9 @@ flowchart TB
   every colour.
 - **Crash recovery.** `read_fragmented` walks top-level boxes and stops at
   the first incomplete fragment. `reconcile_partials` remuxes whatever a dead
-  recorder left, marks it `interrupted`, and removes a partial that holds
-  nothing recoverable.
+  recorder left, marks it `interrupted`, and removes a partial only when the
+  file itself shows it holds nothing. Any other failure keeps the fragmented
+  file under the final name (§5).
 - If the remux itself fails (for example, no room for a second copy), the
   fragmented file is kept under the final name and the `stopped` event says
   `fragmented: true`.
@@ -330,7 +366,7 @@ the first log line. Use `recording::child::parse_event_line`.
 | `progress` | every second | `duration_ms`, `bytes`, `frames`, `late_ticks` |
 | `stopped` | the file is final | `reason`, `path`, `bytes`, `duration_ms`, `frames`, `fragmented` |
 | `refused` | it never started | `code`: `no_frame` · `disk_low` · `encoder_unavailable` · `folder_unwritable` · `audio_unavailable` · `system_audio_unavailable` · `mic_unavailable` |
-| `recovered` | a dead recorder's partial in this folder was finalized | `path` |
+| `recovered` | a dead recorder's partial in this folder was finalized, or kept under its final name because the remux failed | `path` |
 
 **stdin:** `{"cmd":"stop"}`, optionally with a `"reason"`. **End of stdin
 stops the recording** (`parent_gone`), and so does Ctrl+C. Every stop
@@ -357,7 +393,37 @@ says. It prints `saved <path>` with `ended: recorder_exited` and the line "the
 file may be finalized at the next recording". The file appears when the next
 recording starts in that folder, so the first read after a crash finds nothing
 at that path. Measured on Windows 11 and Ubuntu X11, six hard kills lost at most
-1.81 s.
+1.81 s; two more on release 0.4.198, on Windows, at most 0.54 s.
+
+⚠️ **A failed attempt never deletes a recording.** A recorder that dies during
+the remux leaves its temp (`<name>.remux-tmp`) beside the destination and its
+partial whole. The retry used to refuse that temp, and the reconciler read any
+error as "nothing recoverable", so it deleted the partial: a finished recording
+lost, every fragment of it (measured 2026-11-02 on Windows, 0.4.197; every
+release had it, on every OS). `mp4::finalize` now removes that temp and creates
+its own with `create_new`: the caller holds the partial's lock, so nothing else
+writes that name, and a link planted there is not written through.
+`reconcile_partials` removes a partial only on `mp4::NothingRecoverable`: no
+`moov`, or no complete fragment. Read on release 0.4.198 (2026-11-03): a
+Windows recorder terminated with its temp written and no final file came back
+whole at the next start, all 14,772 frames, marked `interrupted`.
+
+Every other failure, such as a full disk or a corrupt fragment, follows the stop
+path's rule: the fragmented file goes under its final name, marked `interrupted`,
+the whole error chain goes to the log, and the `recovered` event names it. That
+is one attempt per partial. Read on release 0.4.198 with a folder holding the
+temp's name: `Access is denied` in the log, the partial under its final name with
+its 31 fragments, listed, and Windows' Media Player plays it. Listing, deleting and downloading never read a
+recording's contents, so this file takes them like any other. The sidecar's
+duration, frames and bytes come from its fragments. The editor reads progressive
+files only and finds no video in it, as in the stop path's fragmented file. A
+partial stays for the next start only if that rename fails too, because the
+folder is gone or another program holds the file.
+
+A remux that cannot fit is not started. `mp4::finalize` compares the copy's exact
+size with `folder::available_space` first, because running the volume to zero to
+find out would stop whatever else writes there, the next recording included.
+Where the room cannot be told, the remux goes ahead.
 
 ⚠️ **A partial is finalized only if its `.partial.lock` can be taken**
 (`recorder::PartialLock`). The recorder takes that OS file lock before it
@@ -368,6 +434,11 @@ manual `roomlerd record` beside the daemon's) would remux a file under its
 writer, or, before the writer's first fragment, **delete it as
 unrecoverable**. `a_live_partial_is_left_alone_by_the_reconciler` is red with
 the lock disabled.
+
+A recorder's own WGC capture can end it during the remux. `docs/remote-control.md`
+§5.1 has that fault, which was over a moving screen, and its fix. A recording of a
+few seconds exits before the capture thread leaves its apartment, so it never gets
+that far.
 
 ## 6. Recording through the daemon — the local verbs (P2a)
 
@@ -387,6 +458,7 @@ sequenceDiagram
     L->>L: peer is the console user?<br/>(else: refused, never reaches M)
     L->>M: record_start(opts)
     M->>M: nobody to record as? refuse (P1e)<br/>one already running? refuse
+    M->>M: hold the display: a mode display match switched goes back first (issue 3467)
     M->>R: launch AS the person at the device (P1e):<br/>record --config … [--out record_dir]<br/>env: config fallbacks (the encoder denylist)
     R-->>M: ROOMLER_REC_JSON:{"ev":"started",…}
     M-->>C: Recording {active, path, encoder, w×h@fps}
@@ -425,8 +497,11 @@ sequenceDiagram
   peer it could not name is refused. Without these the Recordings view is
   dead, and the banner's and the tray's **Stop recording** answer nothing:
   the host could not stop a remote recording of their own screen. `ConfigSet`
-  stays refused on that socket, so where recordings go and the two remote
-  switches are `sudo roomler config set`.
+  of `record_dir` stays refused on that socket, so where recordings go is
+  `sudo roomler config set`, pending a check of the folder each time a
+  recording starts. Since #2871's design A the two remote switches are that
+  person's there, the seat asked again before a change is written
+  (`at_the_seat_now`).
 - ⚠️ **The recorder runs as the person signed in at the device, at normal
   integrity, whatever the daemon runs as** (P1e, `recording/launch.rs`, see
   "Who the recorder runs as" below). Where there is nobody to record as —
@@ -742,6 +817,11 @@ flowchart LR
 | **A source asked for and not opened refuses the start, by name** | `system_audio_unavailable` (no loopback or monitor: set `ROOMLERD_AUDIO_SOURCE`), `mic_unavailable` (none, or on Windows the "Let desktop apps access your microphone" switch, or on a Mac a microphone turned off or restricted in Privacy & Security, FR-97 P2f), `audio_unavailable` (a build without the `audio` feature). A recording that silently lacked the audio the person asked for would be worse. |
 | **A source lost mid-recording is not fatal** | The recording goes on with that source's silence. The sidecar records `audio_source_lost`, or `audio_failed` if the encoder failed and the rest is video-only. |
 
+⚠️ **Measured (release 0.4.199, FR-85 AC3):** over a 30-minute recording on Linux, neither source drifted against
+the picture: a clap's sound held its place to within about 10 ms from the first minute to the last. The clap test
+read computer audio from −25 to +23 ms of its flash, and a virtual microphone from +5 to +48 ms. Every reading has
+a frame's slack, and the microphone's also hold the test signal's own way into it.
+
 ### The codec: AAC where FFmpeg has it, Opus everywhere else (P4)
 
 `recording/audio_codec.rs` picks once per recording (`AudioEncoder::best`),
@@ -937,6 +1017,7 @@ sequenceDiagram
         Note over D: one more turn of the slowest poll, 1.1 s
     end
     Note over D,H: nothing can show it, or nothing read it in 5 s ⇒ refused {no_indicator_surface}
+    Note over D: the recording holds the display, as a local one does (display-match.md)
     D->>R: start_remote (never the microphone)
     D-->>V: rc:record.state recording {name}, then progress each second
     V->>D: rc:record.stop
@@ -969,6 +1050,66 @@ within the re-attach grace, P3b-3 below), or with the recorder's own reasons
 ⚠️ **A fresh prompt id, never the session's.** The session already has an
 answered prompt. A decision recorded against its id, or anything derived from
 it, must not be able to answer this one: the `ssh` / `ssh-consent` lesson.
+
+⚠️ **Armed before it is shown, and withdrawn by its session's end (#3433).**
+The device registers the question with its session and arms it before anything
+shows it: the panel, the marker, a companion it may have to start (up to 3 s),
+a notification. So an answer counts from the moment the question is visible. A
+session that ends after that takes the question with it, and from then on the
+question takes no answer: `ConsentBroker::cancel` takes it off the books before
+it wakes it. A session that ended before then is never asked. The launch checks
+the session's end as well as its channel, so an Allow given just before an end
+that left the channel open starts nothing. The window runs from the show: the
+prompt starts its clock once every surface is up, and each surface counts down
+from when it went up.
+
+⚠️ **One lock for every change to a question (#3433, from review).** The
+broker's books (`BrokerInner.pending`) are held for each one: a question armed
+(its old answers cleared), answered, withdrawn, decided, and released with its
+marker and answers. Each look the prompt takes is made under them too, and
+reads the books before any answer (`PendingGuard::look`). Two files are written
+outside them: the `.pending` marker, by the caller that shows the question, and
+an answer from the CLI's fallback, which checks nothing. The books-first look
+is what keeps the second from deciding a question that has ended. Every caller
+writes the marker only after it has armed the question: the recording question,
+and since #3442 the screen-control, exec and SSH ones (`docs/roomler-ssh.md`,
+Operator consent).
+
+| A question that is… | now | before, found by review |
+|---|---|---|
+| withdrawn | takes nothing that lands after it, whoever wrote it | the poll read the answer first: an Allow that passed `record_decision`'s check just before a cancel, or one the CLI's fallback wrote with no check at all, was taken |
+| decided | is released in the same step | an answer in the gap between the two was reported taken, and its file left behind |
+| answered | gets the answer checked and written in one step, so it lands only while the question still asks | an answer that passed the check as its question was decided landed after the question had cleared its files |
+| an older one for the same id | leaves the newer one's marker and answers alone, once the newer one is armed: a marker written before its question is on the books is not one the older release can tell apart, which is why every caller arms first (#3442) | its release unlinked the marker of a question still asking |
+| a newer one for the same id | clears the old answers and takes the id in one step | an answer given in between, for the older question, was taken by the newer one, given before it existed |
+
+A withdrawal before the prompt's next look still wins over an answer that had
+landed: the session it was for is over. ⚠️ A `release` closure runs under the
+books' lock, and the lock is not reentrant: nothing inside one may call
+`record_decision`, `cancel` or `arm`.
+
+⚠️ **The tradeoff: file work under the books.** A look stats two files and may
+unlink three, and an answer creates, writes and renames one, all under the
+books. A withdrawal (`cancel`, which the signalling loop calls on a session's
+end) waits for any of that in progress. That is microseconds on a local disk.
+But a per-user daemon keeps its sentinels under the roaming application-data
+folder, which Folder Redirection can put on a file share, and a stalled share
+then stalls the withdrawal behind it. Accepted: the alternative was an answer
+reported taken by a question that had already ended.
+
+The session's side holds the same line (`recording::remote`):
+- the question is armed before the session's prompt lock is taken, then
+  registered under it. Arming clears old answers off the disk, and
+  `end_session` waits on that lock from the signalling loop. It is as tight:
+  the end marks the session over before it reads the lock;
+- an Allow taken after the session ended is not one. The end marks the session
+  over before it withdraws the question, and an answer can land in between, so
+  nothing is reported for it, as for a withdrawn question;
+- nothing more goes up for a session that ended while its question was going
+  up (a companion can take its whole start budget): no notification, and the
+  marker is not written again;
+- a recorder whose session ended while it launched stops `session_ended`, and is
+  never left to the re-attach grace (P3b-3 below).
 
 ⚠️ **Something on screen says "recording" before the first frame.** On Windows
 the daemon's own badge is pinned open while recording and reads "Recording,
@@ -1108,7 +1249,11 @@ sequenceDiagram
   there, `host_stopped`, and waits for nobody. Detaching it, as a drop is,
   kept recording someone who had just ended the session, and a controller
   whose device auto-grants would have reconnected straight back into it
-  (found by review).
+  (found by review). That includes a recording the re-attach grace holds
+  (#3474): `host_ended` claims the grace's recording for the session
+  (`stop_held`), stops it `host_stopped` if it is still that session's, and
+  reports it once, so the controller's next session finds nothing to pick
+  up. It never stops another session's recording.
 - ⚠️ **A deliberate Disconnect in the viewer stops the recording first**
   (`stopBeforeLeaving`, then the terminate). The device cannot tell a
   hang-up from the reconnect ladder's retry (both are `controller_hangup`),
@@ -1132,9 +1277,71 @@ sequenceDiagram
   (the controller's Stop, the owner's OFF, the host's Disconnect) is not
   detached if the session ends while the file finalizes: that session's
   follower reports it.
+- ⚠️ **A detached recording is the grace's to report only once its follower
+  has handed it on** (#3447). A session's end detaches the recording at once,
+  but its follower looks only once a second. A recording that ends before that
+  look (the host's Stop, a full disk) is reported by the follower, and so is
+  one whose session asked it to end as the session ended (the controller's
+  Stop read on a closing channel, the host's Disconnect, the owner's OFF). The
+  grace held it all the same and reported it too: two `stopped` for one
+  recording, its banner taken down twice. So the follower marks its hand-on on
+  the slot's entry, under the slot's lock (`Detached::handed_on`), and whoever
+  takes out an entry that was never handed on says nothing: the grace, a
+  detach over it, a pick-up whose recording had ended. The follower stops
+  following only once the grace holds the recording. It used to leave on any
+  detach, and one that did nothing (its session asked it to end between the
+  follower's look and the detach, or its recorder was still launching) left
+  the ending with nobody to report it and the banner up until the daemon
+  restarted.
 - **A re-offer on the same session** (its old peer replaced; the session
-  goes on) is picked up like any other, but the banner is left alone: "the
-  old banner" is this one.
+  goes on) comes only from a server that forwards a second offer. The hub
+  forwards one per session (`admit_offer`), and a peer the agent builds from
+  a second offer gets the default grant, without RECORD, and no record
+  context, so nothing on it can pick a recording up (#3468, from review).
+  The handler is ready for a replacement that carries the recording: it is
+  picked up like any other, but the banner is left alone, because "the old
+  banner" is this one. Only for such a replacement does the loop say so
+  before it closes the old peer (`remote::peer_replaced`, #3451), so that the
+  old peer's channel ending is not taken for the session's end. The cells for
+  it give the new channel a record context themselves.
+- ⚠️ **A recording whose session ended before it began is not detached**
+  (#3433, from review). A recorder takes a while to launch, and a session's
+  end in that time found nothing recording yet, or detached what had just
+  begun. The recording then waited in the grace, and the controller's next
+  session picked up a recording made for a session that was over. The start
+  now looks again once its recorder runs: on the session's end it stops it
+  `session_ended`, and that session's follower reports it once, like any stop
+  the session asked for.
+- ⚠️ **Nothing detaches a recording while its recorder launches** (#3451). The
+  start marks the slot before the launch (`Launch`), and a detach for that
+  session is refused while the mark stands. The mark comes off once the start
+  has looked, after it set `ending` if it stops the recording, and a detach
+  reads both under the slot's lock. Detached during the launch, a recording
+  could be picked up by the controller's next session before the start looked.
+  The start then took the ending over and stopped it, and the picking session's
+  banner stayed up. #3434 took back whatever a detach had put in the slot,
+  which could not undo a pick-up.
+- ⚠️ **It is the SESSION's end, not its channel's** (#3451). The loop's word
+  (`session_ended`, `host_ended`) ends a session, and so does its channel gone
+  with no replacement behind it that carries the recording. Only such a
+  re-offer, while the recorder launches, replaces the channel with the session
+  going on: the recording carries on, and its follower hands it to the new
+  channel as for any drop. A handler stays registered after its channel's end,
+  so a start launching there still hears its session's end, or its peer's
+  replacement. An end something else asked for first (the controller's Stop,
+  the host's Disconnect) stands: the start stops nothing more.
+- ⚠️⚠️ **Today every channel end during the launch is the session's end**
+  (#3468, from review). The loop says `peer_replaced` only when the new peer
+  carries RECORD and a record context (`signaling::reoffer_carries_record`),
+  and a second offer, the only re-offer there is, carries neither. #3451 had
+  it said for any re-offer: a recording launching under the old peer then
+  waited in the grace, the host's Disconnect reached only the old, ended
+  handler, and the controller's next session picked it up. The early exits of
+  the offer's arm, once the old peer is gone, say `session_ended`. The start
+  also fills in what a detach reads (the controller's id, `unattended`) and
+  reports `started` before its mark comes off: a detach right after the mark
+  read an empty id and `unattended: false`, and the grace then never stopped an
+  unattended recording when someone signed in.
 - **Known limit:** a detached recording reports its ending on the queue of
   the connection its session lived on. If the control connection itself was
   lost (a pod roll) and nobody picks the recording up, that last report has
@@ -1176,10 +1383,10 @@ sequenceDiagram
 
 | Piece | Where | What it guarantees |
 |---|---|---|
-| The record context crosses | `delegate.rs:172` (`SessionParams::record`), `signaling.rs:2697` (sent AFTER the consent mode is resolved), `signaling.rs:1937` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1101`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
-| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:592` (`effective_record`), `signaling.rs:1749` (the heartbeat, primary org only) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
-| An OFF is live | `remote.rs:463` (`subscribe_gates`), `delegate_worker.rs:428-441` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
-| The worker's account of a recording | `delegate.rs:554` (noted where the grant crosses), `delegate.rs:794` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:195`). The server bounds it again to a live session of this agent |
+| The record context crosses | `delegate.rs:213` (`SessionParams::record`), `signaling.rs:2919` (sent AFTER the consent mode is resolved), `signaling.rs:2073` (the worker stores it) | the worker's `SdpOffer` builds the channel's `SessionCtx` with its own consent broker, indicator and companion (`peer.rs:1108`). A daemon older than P1e-mac sends none, and the channel refuses `unavailable`, as before |
+| The row says what the worker can do | `delegate_worker.rs:105` (`own_caps`: `record` = `remote::advertised()` in the worker), `delegate.rs:1170` (`effective_record`), `signaling.rs:2607` (the heartbeat, on a loop that holds the host: the primary, and on a one-row Mac every org, FR-43 P3b) | the hub keeps `RECORD` only when the PERSON's gate is on. An older worker sends an empty list, so the device never advertises what it cannot serve |
+| An OFF is live | `remote.rs:591` (`subscribe_gates`), `delegate_worker.rs:462-475` (re-sends its caps on a change) | the person switching remote recording off reaches the hub within a heartbeat, not at the next attach; the worker's own loop also stops a remote recording in progress |
+| The worker's account of a recording | `delegate.rs:638` (noted where the grant crosses), `delegate.rs:878` (`records_session_of`) | `RecordingActivity` is the ONE message outside the delegation whitelist the worker may send, and only about a session handed over with `RECORD` (bounded memory, `delegate.rs:236`). The server bounds it again to a live session of this agent |
 
 - **Whose gates:** the worker's, which are the person's own config: the
   worker runs without `--config`, so it reads the user's. The companion's
@@ -1378,7 +1585,8 @@ down:
 | An RC session holding `INPUT` | The person's own desktop: roomler-desktop or a terminal, worked with the host's mouse and keyboard | The host's consent to `INPUT` | The Recordings view is the person's own process |
 | `roomler exec` | Root on Linux, SYSTEM in the console session on a SystemContext host, the person on an attended Windows install | `EXEC_DEVICE` (`ADMINISTRATOR` only) and the owner's `exec_enabled` | `peer_is_console_user`: uid 0, or the console session. An anchored service, SYSTEM in session 0, does not pass |
 | `roomler ssh` in `console_user` mode | The console session on Windows. On Linux it drops to the person at the screen | `SSH_DEVICE` (`ADMINISTRATOR` only) and the owner's `ssh_enabled` | The console session on Windows. On a Linux system install, that person's socket (P2e). `daemon` mode is the exec row on Linux |
-| A Hive session (default off) | Its mapped account | The device's `hive_accounts` | Where that account is the daemon's or root, or on a Linux system install the person at the seat |
+
+The fourth, an agent session, left master when FR-90 was parked (FR-137).
 
 A local gate cannot tell them from the person, which is the limit keep busy
 documents (`peer_may_start_keep_busy`, FR-92 §3g, #2021). A stricter gate on the
@@ -1586,7 +1794,8 @@ the music in the preview.
 | `recording::folder` unit test and the CI unit start (P2c) | a read-only file system on Linux is named as the service's sandbox ("… read-only for the Roomler service (on a Linux desktop it runs sandboxed …)"), and any other refusal keeps its own words. In CI, a unit carrying `roomler.service`'s sandbox lines VERBATIM starts on a runner with no pre-rename folders, the real `roomlerd record --where` inside it chooses `~/Videos/Roomler`, and the rest of home stays read-only. Shown failing first, locally (systemd 255, a user unit): master's unit fails `226/NAMESPACE` on a host without the pre-rename folders, and with them present it starts but keeps the recorder out of `~/Videos` (the recording falls back to the data folder); the CI step's own commands fail on master's unit ("did not start") and pass on this one. With unprivileged user namespaces refused (`user.max_user_namespaces=0`), master's user unit STARTS and writes `~/Videos`: the user manager skips the whole sandbox, which the CI step's system unit never does | "Test the recorder (FR-85)" (`--lib recording::`); "The Linux user unit's sandbox (FR-85 P2c)" |
 | `tests/recorder.rs`, Windows (P1e) | the recorder an elevated daemon launches reports (`record --whoami`) the same user at MEDIUM integrity with the admin group deny-only; red with the integrity left alone, red with no group made deny-only; the positive control, launched as the daemon itself, IS elevated. A whole recording through the rule: the folder asked of the recorder (`record --where`), start, stop, and the list and delete done as it | the same Windows job |
 | `tests/recorder.rs`, the kill switch | `ROOMLERD_RECORDING=0` closes every path and says so: the state a client greys Start out with, a start, `available` (so the device stops advertising `record`), the listing and the folder a download is served from; the control, the same manager without the switch, can record. `launch::switched_off` reads only an explicit off (`0`, `false`, `off`, `no`), never a typo | "Test the recorder (FR-85)", `--test recorder` and `--lib recording::` |
-| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled); and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
+| `tests/recorder.rs` | A counter-pattern capture → openh264 recording encoder → MP4 → openh264 decode, reading the counters back (the oracle is proven to discriminate first); display change; disk-low and no-frame refusals; the real `roomlerd record` process: the stop command, stdin EOF, `kill -9` followed by `reconcile_partials`, a **live** partial left alone (red with the lock disabled), a recorder dead during the remux losing nothing, a failed remux keeping the fragmented file under its final name with every fragment and nothing left to retry, a partial that cannot reach its folder kept for the next start, a link at the temp's name not written through, one that holds nothing or only a header removed; and the manager end to end (start into `record_dir`, a second start refused, stop, list, delete), a missed start deadline killing the child (red without the kill), and the refusal where there is nobody to record as | same step, `--test recorder` |
+| `tests/recorder.rs`, the disk check (P7) | a free-space check that takes 120 ms, asked every 250 ms, costs a 3-second recording no late tick (6 allowed for a noisy runner); red with the check inside the paced loop, 25 late ticks | "Test the recorder (FR-85)", `--test recorder` |
 | `recording::pointer` unit tests (P1d) | the pointer lands where the source says and nowhere else; a translucent pixel blends (premultiplied "over"), a transparent one changes nothing, a malformed one saturates; moving it leaves no trail (byte-equal to drawing it once at the new place); hiding it gives the frame back byte for byte; clipped at every edge and never wrapped, wholly outside draws nothing; row padding respected; an unchanged pointer re-uses the same frame; **the frame the encoder still holds is never written** (red when the canvas is written without `make_mut`); a new capture is not patched with the old one's pixels (red when `replace` keeps them), and gets the pointer even when it did not move; a frame that is not BGRA passes untouched; a scaled frame takes the position through the ratio; one poll per frame | "Test the recorder (FR-85)" (`--lib recording::`) |
 | `capture::pointer` unit tests (P1d) | Windows' straight alpha premultiplied, XFixes' words read as B, G, R, A; a short or absurd image refused, never read past; the hotspot and the display's origin both taken off, a monitor left of the primary included. Windows only: a recording's WGC session draws the pointer, the live one only under `ROOMLERD_WGC_CURSOR=1` | every unfiltered `--lib` run ("Test agent under vp9-444"); the WGC cell in "Windows recorder identity (FR-85)", which also compiles and lints the Windows capture code (WGC, DXGI, the cursor tracker) that no other lane builds |
 | `capture::pointer::x11_tests` (P1d) | against a real X server: the pointer warped to a known place reads back there less its hotspot, and less a monitor's origin; it follows a second warp; an unchanged shape is not rebuilt | `ci.yml` "The recorder's pointer on X11 (FR-85 P1d)", under Xvfb. `ROOMLERD_TEST_X11=1` makes a missing server a failure, never a skip |
@@ -1607,8 +1816,9 @@ the music in the preview.
 | `tests/control_dc_record.rs` (P3b) | A loopback PeerConnection pair, the PRODUCTION `record` handler and the real recorder child. The owner's switch and the audio gate refuse by name (`audio_unsupported`, with the words and stamped on the state, where the build cannot record computer audio — this lane runs without `audio`; `audio_not_allowed` where it can, #1760), leave no file and no banner, and are reported to the server; a grant without RECORD gets a refusing channel. No indicator surface means no recording and no running recorder. An auto-granted session records: the banner is up before the file, a second start is `busy`, Stop ends it `requested`, and the sidecar names the controller with no microphone. A host-consented session asks again with a FRESH prompt id (never the session's), the detail line carries the question, a deny holds for a minute (`rate_limited`), and an approval records. The owner's OFF ends it `gate_revoked`, the host's Stop `host_stopped`, the controller going away `session_ended` | same step, `--test control_dc_record` |
 | `rc_sessions` (P3b) | the banner's `recording` follows the session, survives a re-announce, and cannot be set on a session the banner does not show | the default `--lib` step |
 | `rc_sessions`, `indicator` (P3b-3) | a session that ends while RECORDING keeps its banner entry, `reconnecting` on the wire (absent otherwise), with nothing to disconnect; a watcher's goes at once; the kept entry goes with its recording; on a live session the recording's end only clears `recording`. Through the indicator: `hide_session` keeps a recording session's banner, `end_recording` takes it down | every unfiltered `--lib` run |
-| `tests/control_dc_record.rs` (P3b-3) | a session dropped mid-recording the way a network drops it (the DEVICE's peer closed first, so its channel usually stops at `Closing` without `on_close`; then the loop's `hide_session`): the recording goes on, its banner `reconnecting`. The SAME controller's new session asks for the status and gets the same recording (id, file), its banner takes over and the old one goes; the old session reported `started` only, the new one `reattached` then `stopped`. Another controller is told `idle`, the banner stays, and after the grace it ends `session_ended` (reported once, on the dropped session). An unattended one whose session dropped still ends `session_changed` the moment someone signs in (red without the watch in the grace). A Record question whose session drops comes off the host's screen, and an Allow after it starts nothing, over six sessions: a drop that lands on `Closed` fires `on_close` and would pass without the channel watch (one session was red without it in 3 runs of 4). From review: the host's Disconnect stops the recording `host_stopped`, reported once, and the controller's next session finds nothing to pick up (red when it is detached like a drop); a session the loop ends with its channel still OPEN is detached and picked up (red without `session_ended`); the grace, looking again after a second controller's recording began, leaves that one running and reports its own, over, once (red when it looks at "whatever is recording"); a re-offer on the same session keeps its banner (red when the pick-up takes it down) | "Test the recorder (FR-85)", `--test control_dc_record` |
-| `recording::remote` unit tests (P3b-3) | the slot hands a detached recording to one party: one the grace is stopping is never picked up, the same session never detaches twice, a detach over another session's recording hands that one back; one speaker per recording: a pick-up's claim silences the dropped session's follower, a NEW recording's claim does not silence the last one's | "Test the recorder (FR-85)" |
+| `tests/control_dc_record.rs` (P3b-3) | a session dropped mid-recording the way a network drops it (the DEVICE's peer closed first, so its channel usually stops at `Closing` without `on_close`; then the loop's `hide_session`): the recording goes on, its banner `reconnecting`. The SAME controller's new session asks for the status and gets the same recording (id, file), its banner takes over and the old one goes; the old session reported `started` only, the new one `reattached` then `stopped`. Another controller is told `idle`, the banner stays, and after the grace it ends `session_ended` (reported once, on the dropped session). An unattended one whose session dropped still ends `session_changed` the moment someone signs in (red without the watch in the grace). A Record question whose session drops comes off the host's screen, and an Allow after it starts nothing, over six sessions: a drop that lands on `Closed` fires `on_close` and would pass without the channel watch (one session was red without it in 3 runs of 4). From review: the host's Disconnect stops the recording `host_stopped`, reported once, and the controller's next session finds nothing to pick up (red when it is detached like a drop); a session the loop ends with its channel still OPEN is detached and picked up (red without `session_ended`); the grace, looking again after a second controller's recording began, leaves that one running and reports its own, over, once (red when it looks at "whatever is recording"); a re-offer on the same session keeps its banner (red when the pick-up takes it down). A recording whose session the loop ends, and which the host's Stop ends a moment later, before that session's follower looks again, is reported once, `host_stopped`, and its banner comes down (`a_recording_that_ends_as_its_session_ends_is_reported_once`, #3447; red 10 of 10: the follower and the grace each reported it). A host Disconnect ends a recording the re-attach grace holds, `host_stopped`, reported once, and the controller's next session finds nothing (`the_hosts_disconnect_stops_a_recording_the_grace_holds`, #3474; red 5 of 5: the next session picked the recording up); its control, with no Disconnect, picks the same recording up, so the grace does hold it (`a_recording_whose_channel_ended_waits_for_its_controller`); and that Disconnect stops its own session's recording only: another controller's, begun after the first ended by itself, goes on (`the_hosts_disconnect_never_stops_another_recording`; red 3 of 3 with `stop_held`'s session check cut: it stopped the other recording `host_stopped`) | "Test the recorder (FR-85)", `--test control_dc_record` |
+| `tests/control_dc_record.rs` (#3433); `consent::tests::a_withdrawn_question_takes_no_answer`, `an_answer_the_poll_takes_at_once_still_counts`, `an_answer_that_lands_after_the_withdrawal_is_not_taken`, `a_decided_question_takes_no_more_answers`, `an_older_question_leaves_a_newer_ones_marker`, `a_newer_question_takes_no_answer_given_before_it` | the question is armed before it is shown, with a companion that is up only 2 s after it is asked (`Companion::Starting`). An answer sent once, the moment the question appears, is taken (red when it is shown first: "no active prompt"). A session the signalling loop ends while its question is still going up takes the question down, and an Allow then or after is refused (red: it stood its whole window). An Allow given just before the session ended, its channel still open, starts nothing (red: `[PromptGranted, Started]`). A recorder whose session ends while it launches, spawned and not yet recording, stops `session_ended`, reported once on its own session, and the controller's next session is told `idle` (`a_recorder_whose_session_ended_as_it_launched_stops`; red: `recording`, picked up from the grace). A re-offer while the recorder launches, whose new peer carries the recording, is not the session's end: the recording carries on, and the new peer's channel picks it up under its id (`a_reoffer_while_the_recorder_launches_keeps_the_recording`, #3451; red: `idle`, the recording stopped `session_ended`). That cell, and the same-session re-offer cell, give the new channel a record context themselves: they test the handler for a hub that sends RECORD again, which today's does not. From the review of #3468, each stopping the recording `session_ended`, reported once, with the controller's next session told `idle`: a re-offer whose new peer cannot carry the recording, then the host's Disconnect (`a_reoffer_that_cannot_carry_the_recording_ends_it`; red 5 of 5: the next session picked it up, id `h1`); the channel gone while the recorder launches, with no word from the loop (`a_recorder_whose_channel_went_as_it_launched_stops`; red with the start's look cut to the loop's word); a re-offer that would carry it, then the session's end, in one launch (`a_reoffer_and_the_sessions_end_in_one_launch_stop_it`). `signaling::tests::only_a_reoffer_with_record_and_its_context_carries_the_recording`: the grant alone, or the context alone, does not carry it. In the broker, an answer after `cancel` is refused and the prompt resolves `Cancelled` (red: `(true, Granted)`), and on unix an answer the poll takes the instant it lands is still reported as counted, the sentinel landing whole by a rename (red: 360 of 5,000 reported refused). From review: an answer written after the withdrawal, as the CLI's fallback writes it, is not taken (red: `Granted`); an answer sent at the moment of the decision is refused, with nothing left behind (red: taken, and a stale `.deny` left); an older question's release leaves a newer one's marker for the same id (red: the marker gone); a newer question for the same id takes no answer given, for the older one, while it was being armed (red: `Granted`) | "Test the recorder (FR-85)", `--test control_dc_record`; "Agent library" (`--lib`) |
+| `recording::remote` unit tests (P3b-3) | the slot hands a detached recording to one party: one the grace is stopping is never picked up, the same session never detaches twice, a detach over another session's recording hands that one back; one speaker per recording: a pick-up's claim silences the dropped session's follower, a NEW recording's claim does not silence the last one's; nothing detaches a recording while its recorder launches, and a second start's mark comes off without the launching one's (#3451); a follower's hand-on is marked on the slot's entry whoever put it there, and no later detach takes it off; whoever takes out an entry whose follower still follows it reports nothing, and one handed on is reported once (#3447) | "Test the recorder (FR-85)" |
 | `recording::remote` unit tests (P3b-2) | a recording is a controller's only when its sidecar says THAT user started it remotely (not a local one, not another controller's, not one with no or a broken sidecar); the list holds exactly those; a directory, and a link at a recording's name, are never opened (the link case where the OS lets a test make one). ⚠️ The link cell stays green with EITHER layer removed, the `symlink_metadata` pre-check or the no-follow open, because each refuses a link on its own; it is red only with both gone. A green run after deleting one is not evidence that the other is redundant: the pre-check also keeps a FIFO from blocking the handler in `open`, and the no-follow open closes the swap between the check and the open | "Test the recorder (FR-85)" |
 | `tests/control_dc_record.rs`, download (P3b-2) | the controller lists its recording, downloads it whole (bytes equal to the file, `sha256` equal to the file's) and resumed from the middle (only the rest sent, the same whole-file `sha256`); `bad_name`, `bad_offset` and `not_found` said by name; both transfers reported `downloaded` with their bytes; a second controller of the same device lists nothing and gets `not_found` for the name | same step, `--test control_dc_record` |
 | `tests/control_dc_record.rs`, unattended (P1f); `tests/recorder.rs`; `recording::launch::unix` | a service with nobody signed in refuses a LOCAL start, then records a remote session with NO indicator surface at all (companion down, session unlisted), says `unattended: true`, and writes into the daemon's own folder (0700 on unix), never the person's `record_dir`. When someone signs in, it stops `session_changed` (red without the watch: it ran on, bannerless), and the controller still lists and downloads it. A fresh ask for who is signed in sees a sign-in the 5 s cache would hide (red when `fresh` is ignored). The identity is decided once: a remote start decided unattended is refused when someone is signed in by the time the recorder launches (red without the check) | "Test the recorder (FR-85)" (`--test control_dc_record`, `--test recorder`) |

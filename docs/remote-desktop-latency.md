@@ -74,15 +74,15 @@ Three independent levers, each hatched (`agents/roomlerd/src/encode/`):
 
 1. **Parallel convert** (`par_convert`, default on). Frames ≥ 2 MPix run the
    BGRA→NV12/I444 conversion in row bands, since FR-119 P2b-11 on a pool that
-   stays up (`encoder.rs:3383` `convert_pool`) — byte-identical output (even-row
+   stays up (`encoder.rs:3388` `convert_pool`) — byte-identical output (even-row
    cuts, chroma pairs never straddle a band boundary). Band count is
-   `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2306`
-   `convert_bands`, `:2325` `band_cuts`; `mod.rs:631` `par_convert_enabled`).
+   `min(4, cores)`; under 2 MPix the single call wins (`encoder.rs:2310`
+   `convert_bands`, `:2325` `band_cuts`; `mod.rs:639` `par_convert_enabled`).
 2. **Off-runtime encode.** The 20–30 ms HW encode no longer stalls the async
    runtime the DataChannel send task shares. P5 did it with `block_in_place`;
    since FR-70 M1 (default on since 0.4.70) the encoder lives on its own thread per
    session and the pump awaits the packets (`thread.rs:387` `encode`, called at
-   `peer.rs:9535`). `block_in_place` remains the inline path, `media_thread = false`.
+   `peer.rs:9781`). `block_in_place` remains the inline path, `media_thread = false`.
 3. **fps-first shedding** (`fps_pace`, default on). When the encoder can't hold
    the target frame rate, frames are consumed on an **even grid** at the
    sustainable rate — instead of WGC dropping ~33 % of frames at *random* phases,
@@ -104,7 +104,7 @@ a resolution tier, not more pacing). While paced, the exposed `encode_factor` is
 masked at 1.0 (`governor.rs:1602`): the pixels-bound HW encode time never
 responded to the bitrate factor, so resolution stays the second lever. The pump
 reads `governor.paced_fps()` each loop (`governor.rs:1614`; consumed at
-`peer.rs:8084`, logged at `:9906`). FR-112 gave a software encoder a pace of its
+`peer.rs:8296`, logged at `:10188`). FR-112 gave a software encoder a pace of its
 own, `SoftwarePace`, which holds its steps up by a margin and never goes below 30.
 
 > ⚠️ **The pace keys on encode time, not full-pipeline time.** `FpsPace` derives
@@ -124,15 +124,15 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:6965`
-`INPUT_MOVE_GAP_MS`, `:6978` `schedulePendingMove`): send immediately when the
+P6 drives sends from a timer instead (`useRemoteControl.ts:7067`
+`INPUT_MOVE_GAP_MS`, `:7080` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12637`). The gap is a per-browser knob,
-0 to 16 ms (`roomler-rc-input-gap`, `:2671` `storedInputGapMs`, from FR-98 C3); the
-same timer drives the relative-pointer path (`:7071`).
+always queued (`useRemoteControl.ts:12592`). The gap is a per-browser knob,
+0 to 16 ms (`roomler-rc-input-gap`, `:2726` `storedInputGapMs`, from FR-98 C3); the
+same timer drives the relative-pointer path (`:7179`).
 
 The point of the design is that `setTimeout` cadence is **independent of rAF**:
 under a compositor load that drops rAF to 20 fps, pointer sends still leave at
@@ -145,18 +145,18 @@ built **without a wire-format change**: the 13-byte video header already carried
 µs timestamp.
 
 - **One process clock.** Both DataChannel pumps stamp the header from a single
-  process-wide epoch (`peer.rs:3667` `agent_epoch_us`). Stamped at framing, so the
+  process-wide epoch (`peer.rs:3709` `agent_epoch_us`). Stamped at framing, so the
   send-queue wait is *inside* the measured age.
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
-  verbatim plus the agent's epoch µs (`peer.rs:3674` `clock_echo_json`, handled at
-  `:11053`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:6913` `CLOCK_RING`, `:6917`
+  verbatim plus the agent's epoch µs (`peer.rs:3716` `clock_echo_json`, handled at
+  `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
+  sample of the last 8 (`useRemoteControl.ts:7016` `CLOCK_RING`, `:7020`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
-  `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:213` `frameAgeMs`). The
+  `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:220` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:4875` `statsAgeLabel`, rendered at `:289`).
+  (`RemoteControl.vue:4843` `statsAgeLabel`, rendered at `:289`).
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,
@@ -198,7 +198,7 @@ and the motion windows are what matter.
   (WINHOST-J) is offline and runs AV1, not the HEVC the original reference
   used, so the literal cell could not be driven live; this is the best available
   evidence.
-- **WGC drop ratio** (`wgc_backend.rs:717` `wgc: capture cadence`,
+- **WGC drop ratio** (`wgc_backend.rs:718` `wgc: capture cadence`,
   `drop_ratio_pct`): on the one WGC-capture host in the window (NEO16, 0.4.172,
   635 samples) the ratio was **median 2 %** (p90 27, max 65) — the ~33 % random
   drop pathology is gone. That host is NVENC/WGC, not a 2880×1800 Iris-Xe one (no
@@ -223,7 +223,7 @@ encodes at that geometry.
   allows 55 fps, while a frame costs about 25 ms in all, so delivery stays near 38.
 - **So P5's numbers are reachable on this hardware, and the default does not reach them
   yet.** `zero_copy` is off by default until [FR-132](fr/FR-132-zero-copy-by-default.md).
-- **WGC drop ratio** (`wgc_backend.rs:789`): median 2 %, p90 2, max 42, over 2 571
+- **WGC drop ratio** (`wgc_backend.rs:790`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
 ### End-to-end age (AC8) — **met**

@@ -13,8 +13,9 @@
 // silently: the only symptom is a console CSP line nobody reads.
 
   // Vite serves TS sources directly in dev, so importing the production
-  // worker keeps the harness tied to whatever the app actually ships.
-  const WORKER_URL = '/src/workers/rc-vp9-444-worker.ts'
+  // worker keeps the harness tied to whatever the app actually ships. Since
+  // FR-135 R3 that is the one data-channel worker, for every codec.
+  const WORKER_URL = '/src/workers/rc-dc-worker.ts'
 
   const statusEl = document.getElementById('status')
   const logEl = document.getElementById('log')
@@ -174,7 +175,10 @@
     // negotiated codec down so the worker's VideoDecoder configures
     // correctly (default is profile 1; e2e overrides to profile 0).
     const off = canvasEl.transferControlToOffscreen()
-    worker.postMessage({ type: 'init-canvas', canvas: off, codec: encodableCodec }, [off])
+    // `perFrameMsg`: the worker counts frames in its 1 s `stats` only, since
+    // P1, and this run is shorter than a second, so it asks for the
+    // per-frame `frame-decoded` the count below waits on.
+    worker.postMessage({ type: 'init-canvas', canvas: off, codec: encodableCodec, perFrameMsg: true }, [off])
 
     // Two PeerConnections in the same window, looped via direct SDP
     // exchange. ICE candidates resolve to host candidates only

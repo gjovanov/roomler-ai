@@ -87,6 +87,25 @@ pub fn raise_attention_machine_aware_with_reason(reason: &str, message: &str) ->
     Ok(written)
 }
 
+/// #3289 — `rollback_failed` by the same route, with the accused build. A worker
+/// in SystemContext used to write this one to its own profile, where nobody looks.
+/// The machine path is read by an administrator or a fleet scanner, not by the
+/// companion of a standard user: the hardened directory refuses it (#3373).
+/// `failed_version` is what lets a later build's healthy connect clear it (FR-53).
+pub fn raise_rollback_attention(message: &str, failed_version: &str) -> Result<PathBuf> {
+    let (path, machine_global) =
+        attention_path_for_worker().context("no attention path resolvable")?;
+    let parent = path.parent().context("attention path has no parent")?;
+    let written = raise_attention_at_full(parent, REASON_ROLLBACK, message, Some(failed_version))?;
+    tracing::warn!(
+        path = %written.display(),
+        machine_global,
+        failed_version,
+        "raised rollback_failed sentinel"
+    );
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

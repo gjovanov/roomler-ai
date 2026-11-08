@@ -15,9 +15,9 @@
  * in Chrome 156 and Chromium 149, hardware and software decode, 2D and WebGL).
  *
  * One definition (`RC_DECODER_COLOR_SPACE`, set S) and one config builder
- * (`rcDecoderConfig`) serve the three decode workers: `rc-vp9-444-worker` (VP9,
- * AV1 and H.264 over the data channel), `rc-hevc-worker` and
- * `rc-webcodecs-worker` (the RTP transform). Each worker is told per session
+ * (`rcDecoderConfig`) serve both decode workers: `rc-dc-worker` (every codec
+ * over the data channel: VP9, AV1, H.264 and HEVC; two workers until FR-135
+ * R3) and `rc-webcodecs-worker` (the RTP transform). Each worker is told per session
  * whether to pass it; the composable decides (`sessionColorSpace`, with the
  * per-browser kill switch `roomler-rc-colorspace=off`).
  *

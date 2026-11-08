@@ -614,6 +614,12 @@ impl ScreenCapture for PortalCapture {
         if self.mutter { "mutter" } else { "portal" }
     }
 
+    /// FR-119 P2b-3 — none to read: the PipeWire stream does not carry the
+    /// monitor's mode here, so a trial finds out instead.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
+    }
+
     /// FR-93 P5f — this user's session is away from its seat: the pumps tell
     /// the controller, and keep no keepalive while it lasts.
     fn waits_for(&self) -> Option<crate::capture::WaitFor> {

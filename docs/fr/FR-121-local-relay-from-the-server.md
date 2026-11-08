@@ -29,11 +29,11 @@ relay (P3b, §3.6).
 The loopback-TURN corp relay (`agents/roomlerd/src/rc_local_turn.rs`) hosts a small TURN server on the device's
 overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), with fallback ports from `:41989`
 (`:53`), returning a descriptor with freshly minted 1-hour credentials (`CRED_TTL`, `:68`; minted at `:268`). The
-viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7558`,
+viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7563`,
 called at `:9168`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3810`) and
-forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `signaling.rs:2049`). The Hub stores it
-on the session (`crates/modules/fleet/src/hub.rs:1803`) and hands the remote agent `turn:<overlay>:<port>` with the
-offer (`forward_offer`, `:2133`, the relay at `:2173`), only for an overlay address (`is_overlay_relay_ip`, `:65`) and
+forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `crates/remote_control/src/signaling.rs:1980`). The Hub stores it
+on the session (`crates/modules/fleet/src/hub.rs:1908`) and hands the remote agent `turn:<overlay>:<port>` with the
+offer (`forward_offer`, `:2223`, the relay at `:2263`), only for an overlay address (`is_overlay_relay_ip`, `:66`) and
 only when the device lets remote desktop use the overlay (#1882's `rc_overlay`).
 
 ### 2.2 What it cost on the field (2026-10-24)
@@ -124,7 +124,7 @@ On `rc:session.request` with `local_relay_from` and no descriptor, the Hub answe
 The descriptor is stored on the session exactly as a probed one is, so `forward_offer` hands the remote agent the
 overlay relay as today, with the same overlay-range check. The browser adds `turn:127.0.0.1:<port>` with
 `pc.setConfiguration` when `rc:session.created` arrives. The peer connection exists by then
-(`useRemoteControl.ts:9698`) and has gathered nothing: the offer waits for `rc:ready` (`:8839`).
+(`useRemoteControl.ts:9703`) and has gathered nothing: the offer waits for `rc:ready` (`:8844`).
 
 ⚠️ The descriptor's credential lets its holder allocate on the device's relay, which the overlay and loopback reach.
 It is minted by the device, valid for an hour, held only in the Hub's memory, and handed only to the device's owner's
@@ -145,7 +145,7 @@ not on the device gets a loopback address it cannot use.
 | piece | where |
 |---|---|
 | The probe server publishes the relay on a process-wide `watch` (`report_tx`) when the TURN host comes up, moves or goes away, re-minted every half credential lifetime (`REPORT_REMINT`, 30 min); `None` on exit. The probe and the report mint through one function, which names the device | `agents/roomlerd/src/rc_local_turn.rs:138`, `:150`, `:164`, `:176` |
-| The primary org's connection subscribes after its hello, sends what it holds, then every change (`next_local_relay`, `send_local_relay`, `try_send`: a full queue waits for the next re-mint, and only the error's Display is logged) | `agents/roomlerd/src/signaling.rs:434`, `:453`, `:1979` |
+| The primary org's connection subscribes after its hello, sends what it holds, then every change (`next_local_relay`, `send_local_relay`, `try_send`: a full queue waits for the next re-mint, and only the error's Display is logged) | `agents/roomlerd/src/signaling.rs:438`, `:457`, `:1983` |
 | `local-relay` in `AgentCaps.rpc` while `ROOMLERD_LOCAL_TURN` is on | `agents/roomlerd/src/encode/caps.rs:2042` |
 | The wire: `rc:agent.local_relay` (Remote's), `local_relay_from` on the request, `local_relay` / `local_relay_refused` on the answer, `LocalRelayRefusal`'s five words | `crates/remote_control/src/signaling.rs:1013`, `:2006`, `:3300`, `:5479` |
 | The Hub keeps the report on the connection's entry (`set_agent_local_relay`), resolves a request against it (`resolve_local_relay`: same device, connected, owner, same organization, `rc_overlay`, a report), and echoes the relay or the refusal (`local_relay_reply`); a coalesced retry gets the live session's relay | `crates/modules/fleet/src/hub.rs:82`, `:3310`, `:3329`, `:3922`, `:3978` |
@@ -208,7 +208,7 @@ sequenceDiagram
 | The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3961`, `:4083`, `:4099`, `:4112`, `:8671`, `:11034` |
 | The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1958`, `:3750`; `useRemoteControl.ts:4135` |
 | The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2037`, `:2044`, `:3349`, `:5573` |
-| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:84`, `:104`, `:125`, `:1656`, `:1884`, `:2315`, `:4066`, `:4075`; `crates/remote_control/src/session.rs:63` |
+| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:85`, `:105`, `:126`, `:1746`, `:1974`, `:2405`, `:4156`, `:4165`; `crates/remote_control/src/session.rs:63` |
 
 ⚠️ **ICE keeps the path that works, not the fastest one that works.** Chrome ranks its relay candidates by the order of
 its TURN servers, the first highest, and nominates the best-ranked pair that succeeds. The browser puts the relays in

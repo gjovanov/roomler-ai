@@ -41,6 +41,14 @@ records nothing.
 crashed, or leaving at its 3 s runtime-shutdown budget, #2718) must not orphan
 a `roomlerd.exe caps-probe`. It would hold the binary an update replaces, and
 nobody would enforce the 60 s bound on a child hung in a driver.
+⚠️ **The start waits 10 s for the probe, and a session waits for all of it** (#3439). The
+probe runs on its own thread (`caps::start_probing`). Past `FIRST_ANSWER_WAIT` the hello
+carries the interim answer (`encoder-cells` code `probing`), and the first answer is announced
+the moment it lands (`caps::news`). The signalling loop reads `caps::answer_now()`, never
+`detect()`: a `detect()` there blocks a runtime thread on the probe's lock, which is a pump stall.
+A session request that comes before the first answer is held in its connection
+(`held_requests`) and is never served from the interim answer, which would open Media
+Foundation in the daemon before any child had proved it.
 ⚠️ **A child told to die may not go, and its pipe may not end** (#3273). A child
 stuck in a kernel call outlives the kill, and whatever it started can hold its
 stdout after it has gone. `child::wait_for_child` waits for neither past `TIMEOUT` +
@@ -272,3 +280,20 @@ and **`data-channel-vp9-444` stays on the wire forever**. Unknown cell names are
 ignored, never an error. The viewer derives cells for old agents in
 `ui/src/composables/videoCells.ts` — the one reading the picker and the admin
 chips share.
+
+## 7 · The cell table derives the hello beside the code that writes it (FR-135 R9)
+
+`encode/cell_table.rs` has one row per cell the agent can advertise (`CELLS`), and derives
+the hello's six probed fields from the probe's `ProbeFindings`. `caps::assemble` still writes
+them; a gate over `tests/fixtures/cell-table.hellos.json` proves the two byte-identical, and
+`cell_table::shadow` compares them once per process, in the probe child, whose line reaches
+no uploaded log: the gate is the evidence, never the shadow's silence (`docs/encoders.md`).
+
+⚠️ **A new cascade name, 4:4:4 form, GPU form or vendored encoder needs its row**, or the
+table's tests fail: they read the columns against `*_ENCODER_NAMES`, `FFMPEG_444_CAPABLE`,
+`gpu_cell` and the vendor jobs' `--enable-encoder` lists.
+⚠️ **A change to what a probe's findings make the hello say re-records the fixtures**
+(`CELL_TABLE_UPDATE=1 cargo test -p roomlerd --lib encode::cell_table`), with the reason in
+the commit message, the composition baseline's rule.
+⚠️ **Nothing reads the table yet.** A fix to what a session opens goes where the session
+reads it; R10 moves those readers onto the rows.

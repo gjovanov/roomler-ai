@@ -21,6 +21,9 @@
 //!   latest frame (or repeats the last one on a still screen — constant frame
 //!   rate), forces a keyframe every GOP when the encoder does not keep one
 //!   itself, and hands access units to the [`FragmentedWriter`].
+//! - **free space** (FR-85 P7) — asked every `disk_check_every` on a blocking
+//!   thread, never inside the loop, which reads the last answer: a check slower
+//!   than a tick, asked inside it, was a late tick.
 //!
 //! Stop is a `watch` of [`StopReason`]; every guard (disk, duration, encoder,
 //! capture) stops through the same path, so the finalize is the same code no
@@ -28,6 +31,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -69,6 +73,10 @@ pub struct RecordOptions {
     pub encoder_keeps_gop: bool,
     /// How long to wait for the first captured frame.
     pub first_frame_timeout: Duration,
+    /// FR-85 P7 — how often free space is checked while recording.
+    pub disk_check_every: Duration,
+    /// FR-85 P7 — what says how much room is left ([`FreeSpace`]).
+    pub free_space: FreeSpace,
 }
 
 impl RecordOptions {
@@ -85,6 +93,8 @@ impl RecordOptions {
             initiator,
             encoder_keeps_gop: false,
             first_frame_timeout: Duration::from_secs(10),
+            disk_check_every: Duration::from_secs(5),
+            free_space: FreeSpace::default(),
         }
     }
 
@@ -92,6 +102,63 @@ impl RecordOptions {
         self.staging_dir
             .clone()
             .unwrap_or_else(|| self.dest_dir.join(PARTIAL_DIR))
+    }
+}
+
+/// FR-85 P7 — what answers "how much room is left in this folder?". The real
+/// one is [`folder::available_space`]; a test hands in a slow one, to prove the
+/// paced loop never waits for it.
+#[derive(Clone)]
+pub struct FreeSpace(Arc<FreeSpaceFn>);
+
+type FreeSpaceFn = dyn Fn(&Path) -> Option<u64> + Send + Sync;
+
+impl FreeSpace {
+    pub fn new(f: impl Fn(&Path) -> Option<u64> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn of(&self, dir: &Path) -> Option<u64> {
+        (self.0)(dir)
+    }
+}
+
+impl Default for FreeSpace {
+    fn default() -> Self {
+        Self::new(folder::available_space)
+    }
+}
+
+impl std::fmt::Debug for FreeSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FreeSpace")
+    }
+}
+
+/// FR-85 P7 — asks `free_space` about `dir` every `every`, each time on a
+/// blocking thread, and raises `low` once the answer falls below `floor`. An
+/// answer of "can't tell" stops nothing, as the check inside the loop never did.
+async fn watch_free_space(
+    free_space: FreeSpace,
+    dir: PathBuf,
+    every: Duration,
+    floor: u64,
+    low: Arc<AtomicBool>,
+) {
+    let every = every.max(Duration::from_millis(10));
+    let mut due = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    due.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        due.tick().await;
+        let (free_space, dir) = (free_space.clone(), dir.clone());
+        let free = tokio::task::spawn_blocking(move || free_space.of(&dir))
+            .await
+            .ok()
+            .flatten();
+        if free.is_some_and(|free| free < floor) {
+            low.store(true, Ordering::Release);
+            return;
+        }
     }
 }
 
@@ -344,7 +411,7 @@ pub async fn run_with_audio(
             format!("{}: {e}", opts.dest_dir.display()),
         )
     })?;
-    if let Some(free) = folder::available_space(&staging)
+    if let Some(free) = opts.free_space.of(&staging)
         && free < opts.min_free_to_start
     {
         return Err(refuse(
@@ -557,7 +624,6 @@ pub async fn run_with_audio(
     let mut frames = 0u64;
     let mut encode_errors = 0u32;
     let mut last_progress = Instant::now();
-    let mut last_disk_check = Instant::now();
     let mut events_log: Vec<Event> = Vec::new();
     // FR-85 P1c — mixed audio waits here until the first video frame is
     // written: that frame's time is audio time zero (`audio_origin`, in
@@ -569,6 +635,17 @@ pub async fn run_with_audio(
         std::collections::VecDeque::new();
     #[cfg(feature = "audio")]
     let mut audio_origin: Option<u64> = None;
+    // FR-85 P7 — free space is asked off the loop, which only reads the last
+    // answer. Asked inside it, a full disk refresh on a Mac took longer than a
+    // tick and cost the recording one every 5 s.
+    let disk_low = Arc::new(AtomicBool::new(false));
+    let disk_watch = tokio::spawn(watch_free_space(
+        opts.free_space.clone(),
+        staging.clone(),
+        opts.disk_check_every,
+        opts.min_free_to_continue,
+        disk_low.clone(),
+    ));
 
     let reason = loop {
         tokio::select! {
@@ -704,15 +781,11 @@ pub async fn run_with_audio(
                 late_ticks,
             });
         }
-        if last_disk_check.elapsed() >= Duration::from_secs(5) {
-            last_disk_check = Instant::now();
-            if folder::available_space(&staging)
-                .is_some_and(|free| free < opts.min_free_to_continue)
-            {
-                break StopReason::DiskLow;
-            }
+        if disk_low.load(Ordering::Acquire) {
+            break StopReason::DiskLow;
         }
     };
+    disk_watch.abort();
 
     // ── finalize ────────────────────────────────────────────────────────────
     let _ = cap_stop_tx.send(true);
@@ -971,8 +1044,11 @@ fn finalize_into_place(partial: &Path, dest: &Path) -> Result<mp4::FinalizeSumma
 
 /// Finalize every partial a dead recorder left in `staging` (the boot
 /// reconciler): remux what is complete, mark it `interrupted`. Returns the
-/// finished paths. A partial with nothing recoverable is removed; one whose
-/// [`PartialLock`] is held belongs to a live recorder and is left alone.
+/// finished paths. Only a partial the file itself shows to be empty is removed
+/// ([`mp4::NothingRecoverable`]). One whose remux failed goes under its final
+/// name as it is, the stop path's rule, and stays for the next start only if
+/// that fails too. One whose [`PartialLock`] is held belongs to a live recorder
+/// and is left alone.
 pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
@@ -1005,53 +1081,66 @@ pub fn reconcile_partials(staging: &Path, dest_dir: &Path) -> Vec<PathBuf> {
         if dest.exists() {
             continue;
         }
-        match finalize_into_place(&p, &dest) {
-            Ok(s) => {
-                let sc = Sidecar {
-                    version: SIDECAR_VERSION,
-                    file: name.clone(),
-                    initiator: Initiator::Local { user: None },
-                    started_at: String::new(),
-                    ended_at: None,
-                    duration_ms: s.duration_ms,
-                    width: 0,
-                    height: 0,
-                    fps: 0,
-                    codec: "h264".into(),
-                    encoder: String::new(),
-                    color: ColorInfo::BT601_LIMITED,
-                    audio: AudioInfo::default(),
-                    frames: s.video_samples,
-                    late_ticks: 0,
-                    events: Vec::new(),
-                    stop_reason: Some(StopReason::Interrupted),
-                    bytes: s.bytes,
-                    // Unknown: the recorder that knew is gone.
-                    pointer: None,
-                    scaled_from: None,
-                };
-                // A sidecar the dead recorder never wrote: keep an existing
-                // one's facts if there is one, only mark it interrupted.
-                let sc_path = Sidecar::path_for(&dest);
-                let sc = std::fs::read_to_string(&sc_path)
-                    .ok()
-                    .and_then(|j| serde_json::from_str::<Sidecar>(&j).ok())
-                    .map(|mut old| {
-                        old.stop_reason = Some(StopReason::Interrupted);
-                        old.duration_ms = s.duration_ms;
-                        old.bytes = s.bytes;
-                        old
-                    })
-                    .unwrap_or(sc);
-                let _ = std::fs::write(&sc_path, sc.to_json());
-                tracing::info!(file = %dest.display(), truncated = s.truncated, "recording: an interrupted recording was finalized");
-                done.push(dest);
-            }
-            Err(e) => {
+        let s = match finalize_into_place(&p, &dest) {
+            Ok(s) => s,
+            Err(e) if e.is::<mp4::NothingRecoverable>() => {
                 tracing::warn!(%e, partial = %p.display(), "recording: an interrupted partial holds nothing recoverable — removing it");
                 let _ = std::fs::remove_file(&p);
+                continue;
             }
-        }
+            // ⚠️ Never removed on a failure of this attempt: the partial may
+            // hold the whole recording. Keep what exists, as the stop path does:
+            // listed, deletable and playable, and a remux that failed is not
+            // run again at every start, which on a full disk would fill the
+            // volume each time.
+            Err(e) => {
+                tracing::warn!(error = format!("{e:#}"), partial = %p.display(), "recording: an interrupted partial could not be remuxed — keeping the fragmented file");
+                if let Err(e2) = std::fs::rename(&p, &dest) {
+                    tracing::warn!(%e2, partial = %p.display(), "recording: could not even keep the fragmented file — left for the next start");
+                    continue;
+                }
+                mp4::fragmented_summary(&dest)
+            }
+        };
+        let sc = Sidecar {
+            version: SIDECAR_VERSION,
+            file: name.clone(),
+            initiator: Initiator::Local { user: None },
+            started_at: String::new(),
+            ended_at: None,
+            duration_ms: s.duration_ms,
+            width: 0,
+            height: 0,
+            fps: 0,
+            codec: "h264".into(),
+            encoder: String::new(),
+            color: ColorInfo::BT601_LIMITED,
+            audio: AudioInfo::default(),
+            frames: s.video_samples,
+            late_ticks: 0,
+            events: Vec::new(),
+            stop_reason: Some(StopReason::Interrupted),
+            bytes: s.bytes,
+            // Unknown: the recorder that knew is gone.
+            pointer: None,
+            scaled_from: None,
+        };
+        // A sidecar the dead recorder never wrote: keep an existing
+        // one's facts if there is one, only mark it interrupted.
+        let sc_path = Sidecar::path_for(&dest);
+        let sc = std::fs::read_to_string(&sc_path)
+            .ok()
+            .and_then(|j| serde_json::from_str::<Sidecar>(&j).ok())
+            .map(|mut old| {
+                old.stop_reason = Some(StopReason::Interrupted);
+                old.duration_ms = s.duration_ms;
+                old.bytes = s.bytes;
+                old
+            })
+            .unwrap_or(sc);
+        let _ = std::fs::write(&sc_path, sc.to_json());
+        tracing::info!(file = %dest.display(), truncated = s.truncated, "recording: an interrupted recording was finalized");
+        done.push(dest);
     }
     done
 }

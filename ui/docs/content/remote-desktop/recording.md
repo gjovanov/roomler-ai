@@ -66,7 +66,7 @@ A remote recording never includes the machine's microphone. There is no option
 for it, in the viewer or on the wire.
 
 :::warning Full control of the machine is a different thing
-Someone who already controls the machine itself can start a recording there as if they were sitting at it, microphone included, just as they could start any other program. That means a session with keyboard and mouse control, `roomler exec`, `roomler ssh` or a Hive session, and each of those needs its own permission. A recording started that way is a local one: the tray icon turns red, and a controller's Record menu neither lists nor downloads it.
+Someone who already controls the machine itself can start a recording there as if they were sitting at it, microphone included, just as they could start any other program. That means a session with keyboard and mouse control, `roomler exec` or `roomler ssh`, and each of those needs its own permission. A recording started that way is a local one: the tray icon turns red, and a controller's Record menu neither lists nor downloads it.
 :::
 
 ### Downloading a recording

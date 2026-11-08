@@ -91,8 +91,8 @@ not rotated, so reuse is undetectable.
 
 ⚠️ The **agent** half of this is fixed. `agent_log.rs` / `agent_crash.rs` no
 longer parse the bearer themselves: both go through
-`crates/api/src/extractors/agent.rs::AuthAgent`, which loads the row
-(`find_in_tenant`) and refuses via `refusal_reason`.
+`crates/modules/fleet/src/auth_agent.rs::AuthAgent`, which loads the row
+(`find_any_in_tenant`) and refuses via `refusal_reason`.
 ⚠️ A lookup **failure is deliberately 500, not 401** — a Mongo blip must not tell
 a healthy fleet its credentials were revoked, which would turn a database wobble
 into an enrollment storm.
@@ -304,6 +304,29 @@ distinguish "agent exists" (200 + refusal) from "no such agent" (404) across
 tenants, write attacker-timed rows into another org's `ssh_audit`, and read
 whether that org had `remote_ssh_enabled`.
 
+### The media socket admits only the call's participants
+
+A `media:*` command on the user socket names a room by id, so it gets the same
+object-level check a REST route does, on the path that carries the media. A connection
+may use `media:*` for a room only while it is a participant of that room's call, which
+is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.rs`):
+
+- **`media:join`** needs a member of the **room's** tenant (read from the room, never from
+  the frame), the room's visibility, and an open call session for this connection, or one
+  with no connection id (an older client). The socket path admits only someone the REST
+  path admitted. The join is admitted before placement, so a refused one claims no room.
+- **Every other command** needs this connection's seat in the room's media, as this user,
+  which only an admitted join creates. It is checked on the pod that holds the seat, so a
+  command forwarded to the owner pod is checked there.
+- The handlers take the gate's proof, a `JoinPass` or a `Seat`, never a bare room, user or
+  connection id. ⚠️ A new `media:*` handler takes one too: a handler keyed by the frame's
+  `room_id` alone is the cross-tenant IDOR above, on a socket.
+- A refusal is one answer for every reason, so it says neither whether a room exists nor
+  whose it is.
+
+`GET /api/cluster/status` lists every live meeting room on a pod, so it is a platform
+admin's route (`require_platform_admin`, 404 otherwise), like `/api/admin/*`.
+
 ---
 
 ## 4 · The device plane
@@ -328,6 +351,49 @@ route enforces `exp`.
   every action re-checks the row, but the device's own status still read
   "connected".
 
+### A removed thing answers nothing (#1821, #1829)
+
+Devices, tunnel clients, tunnel policies and overlay ACL policies are
+**tombstoned, not deleted**, so `{_id, tenant_id}` still finds them. Each DAO asks
+the question by name, and there is no un-suffixed `find_in_tenant`:
+
+| Lookup | Finds a tombstone | For |
+|---|---|---|
+| `find_live_in_tenant` | no: `NotFound`, like a bogus id | every GET of the thing itself, every write, every session start |
+| `find_any_in_tenant` | yes | a reader whose job is the tombstone, with the reason at the call site |
+
+`base.find_by_id_in_tenant` is the same ANY lookup with no name on it, and reaching
+through `base` is how FR-52's External access routes, written afterwards, reopened
+this hole: they minted connect codes and wrote approvals onto removed devices, and a
+tombstone revives whole when its machine re-enrolls. The admin setters are
+live-scoped on their own too (`AgentDao::live_row`), the anchor and the desired
+config among them, so a write that raced the removal matches nothing and the route
+answers 404.
+
+Readers that keep the tombstone, and why:
+
+| Reader | Why it must see one |
+|---|---|
+| `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
+| `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash`, the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
+| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone |
+| `overlay_nodes` by id after a release | the release's own `removes` frame goes to the tombstone's address (`docs/overlay-communication.md` §1). The lease order is not changed by any of this: a node is tombstoned first, then its host goes back to the pool, and pooling first would lock the next joiner out permanently |
+
+**An overlay join reads the row, and a removed row does not join.** A socket can
+outlive its row: a tunnel client's by up to the 60 s of its revocation poll, and a
+device's until the kick reaches the pod holding it. The join used to read the row by
+id, not ask whether it was live, and lease a fresh address to something already
+removed. Peers were told of it, and `DELETE` on that row is a 404, which left only an
+admin finding the node and evicting it by hand. `handle_overlay_join` now refuses a
+tombstoned identity, and any identity in an archived org. A tunnel client's `DELETE`
+tombstones before it releases, so the window is the join already past that check; an
+agent's removal keeps its own load-bearing order (`crates/modules/fleet/src/removal.rs`).
+
+What stays open by design: an **already admitted** tunnel-client socket can keep
+opening tunnels and forwards until that 60 s poll closes it. Those flows end with the
+socket and leave nothing behind, so the lag is bounded; a push on removal would need a
+cross-pod channel the tunnel socket does not have.
+
 **A WG public key cannot be claimed by two live nodes in a network** —
 `overlay_nodes::wg_key_taken_by_other`, checked in `ws::overlay` join,
 **fail-closed**.
@@ -343,41 +409,70 @@ device grid — an *order* the device answers with a locally minted key, never a
 the server chose or saw; the device's re-join under the new key is what the server
 verifies: [`overlay-key-rotation.md`](overlay-key-rotation.md) (FR-40).
 
+**A key a node moved away from cannot rejoin, where the org enforces it** (FR-40 P2).
+Each node row keeps the public halves of the keys it moved away from, written by the
+accepted join that replaced them, never by a device's report. Under the org's
+`retired_key_mode = enforce`, a join or a DERP registration presenting one — a `.prev`
+rollback, a restored backup, a config copied to another machine of the org — is refused
+`key_retired`, checked against every row of the network, tombstones included, so removal
+is not a pardon. A device that supports rotation is ordered to rotate instead of being
+left off the mesh, through the same order path, ceiling and audit as an admin's order,
+with the server named as the actor. The switch defaults to `off`: a refusal fails
+closed, but a wrong one costs a legitimate device the mesh, and `warn` shows what it
+would refuse first: [`overlay-key-rotation.md` § Retired keys](overlay-key-rotation.md#retired-keys).
+
 **The LocalAPI's ACL is the local trust boundary.** The daemon's local control
 endpoint carries administrative verbs: exec, SSH grants, config, routes, restart. On
 Windows it is a named pipe whose security descriptor admits `SYSTEM`,
 `Administrators` and the interactive user. On Unix a root daemon's socket is
 `/var/run/roomler/roomler.sock`, 0700 / 0600, root only. Per-verb checks sit on top:
-the recording verbs require the console user (FR-85) and an update hold requires
-root (FR-90).
+the recording verbs require the console user (FR-85).
 
 ⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911; FR-97 P2g).** A
 Linux system install's companion runs as the desktop user and could not reach the root
 socket. That left the person at the screen with no "being viewed" banner, no
 Disconnect, and on Wayland no consent prompt. The root daemon therefore also serves
 `/run/user/<uid>/roomler.sock`:
-- it belongs to the user of the **active** graphical session only;
+- it belongs to the person signed in at the machine's own screen: logind's active session
+  on `seat0`, when that session is a person's (`companion::seat0_uid`,
+  `agents/roomlerd/src/companion.rs:1208` — the rule received files and `console_user`
+  already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
+  although logind calls it active. Until #2871's review the socket went to the first
+  active graphical session anywhere, which on a host with remote logins could be one;
 - it is 0600 and theirs because it is **made as them**: the bind and the `chmod` run on a
   thread switched to their filesystem ids (`setfsuid`/`setfsgid`). Their own directory
   lets them swap the path between any two root calls, and `chmod`/`chown` follow
   symlinks, so a root `chown` of that path could be raced into handing them
   `/etc/shadow`. The daemon therefore never runs a root path operation there;
-- `SO_PEERCRED` is checked against that user or root on every connection;
+- `SO_PEERCRED` is checked against that user or root on every connection, and again by
+  the per-peer gates (below);
 - it serves exactly `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`,
   `ConsentDecide` and `RecordStatus`; `KeepBusyStatus`, `KeepBusyOff` and
   `KeepBusyOn` (FR-92 P10, the start gated again on the peer); since FR-97 P2g,
-  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; and
-  since FR-85 P2e, `RecordStart`, `RecordStop`, `RecordingsList` and
-  `RecordingDelete`, the start, stop and delete gated again on the peer.
+  `Devices` and `Mesh`; since P2h, `Peers`, served through `person_view`; since FR-85
+  P2e, `RecordStart`, `RecordStop`, `RecordingsList` and `RecordingDelete`, the start,
+  stop and delete gated again on the peer; and since #2871 (design A, the operator's
+  decision) `ConfigGet` — the listing, no secret being on that surface, with every key
+  the socket will not set marked `read_only = "root_only"` — and `ConfigSet` of exactly
+  the keys that are the console person's own call (`localapi::CONSOLE_PERSON_KEYS`,
+  `crates/localapi/src/lib.rs:3156`): the keys the daemon's own endpoint already
+  gated to that person because Windows' pipe admits every interactive user.
+  Never the device-owned gates `exec_enabled`, `ssh_enabled` and
+  `remote_config_enabled`, which a `ConfigSet` is refused for by name with the
+  administrator's command (`not_on_the_person_socket_for_key`, `:3487`).
 
 The recording verbs (P2e) are the second widening past the safety surface, and
 **Stop** is safety on its own: without `RecordStop` the host could not end a remote
 recording of their own screen from the banner. They reach nothing the person could not
 reach already. The recorder runs as the person at the seat, the daemon lists and deletes
 with that person's filesystem identity (`FsIdentity`), never in the unattended folder,
-and `ConfigSet` stays refused, so `record_dir` and the remote switches remain root's. The
+and `ConfigSet` of `record_dir` stays refused, so where recordings go remains root's on
+a root-mode install, pending a check of the folder each time a recording starts. Since
+#2871's design A the two remote switches (`record_remote_*`) are the person's there. The
 socket follows a user switch within 5 s, so a background user's client can act for that
 long, as the consent verbs can; it acts as the person now at the seat, whose folder it is.
+A `ConfigSet` does not wait for the switch: the daemon asks the seat again, fresh, before
+it writes (`LocalApiState::at_the_seat_now`).
 
 `Devices` and `Mesh` were the first widening for a read rather than a safety control,
 and they are bounded the same way the companion's page is everywhere else. They only
@@ -416,7 +511,45 @@ the directory is not the person's:
 
 The allowlist (`localapi::person_may`) is an exhaustive match with no `_` arm, so a
 new verb cannot reach it by default. Widening it is a security change and needs
-review like one. The root socket itself is unchanged. Kill switch:
+review like one — #2871's design A was one: it admitted `ConfigGet`, and `ConfigSet`
+for the keys of `CONSOLE_PERSON_KEYS` only, after the operator's decision, and left
+`exec_enabled`, `ssh_enabled` and `remote_config_enabled` root's on every root-mode
+install pending a separate policy call. The dispatcher gates the peer again, three ways
+(#2871's review):
+- **who**: the connection's uid, which the kernel read, must be the person the socket was
+  made for, or root (`peer_may_set_console_key`, `crates/localapi/src/lib.rs:2474`, by
+  `person_peer_ok`, `:4428`). The listener makes that check before a byte is read, and a
+  test drives the listener itself over a real socket: another account's connection is
+  closed unanswered, although it sent nothing, and nothing it sends reaches the daemon
+  (`serve_person_listener`, `:4492`). The gate makes the check again where the decision
+  is, so the rule does not rest on that one call site. An unknown peer is refused;
+- **still there**: the socket's person is seat0's on Linux and the console user on a Mac,
+  and the listener follows the seat on a 5 s poll. Before a `ConfigSet` is applied the
+  daemon asks once more, fresh, whether that uid is at the seat
+  (`LocalApiState::at_the_seat_now`, `:2758`), so a person who switched away cannot change
+  the next person's settings over a connection still open. Root is not asked;
+- **which keys**: names, matched whole (`ConsoleKey::person_socket`, `:3130`). The
+  `record_` and `external_` prefixes console-gate the daemon's own endpoint and never
+  widen this one, so a new key reaches the person socket only by a decision.
+
+An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:3806`),
+beside the daemon's own `config key updated` line, which carries the value. Its target,
+`roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
+default filter, so the daemon's filter keeps that crate at INFO under any spec that would
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:435`, #3525). A
+spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
+`roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
+person at the device cannot turn the record off.
+
+The value in the daemon's line is never a secret, because no secret is on the config surface:
+`agent_token`, `ssh_host_key`, `overlay_wg_secret_key`, each `[[orgs]]` entry's own, and FR-52's
+password record have no row there, and `apply` refuses them like any unknown key
+(`crates/agent-core/src/config_surface.rs:2834`). Two tests lock it:
+`secrets_and_identity_are_not_exposed` (`:4748`) and
+`no_external_credential_key_is_editable_through_the_config_surface` (`:5339`).
+
+The server reaches none of it (the socket is local, and `remote_config_enabled` stays
+structurally outside `DesiredConfig`). The root socket itself is unchanged. Kill switch:
 `ROOMLERD_PERSON_SOCKET=0`.
 
 **A remote-desktop session's media transport is hardened past webrtc-rs' defaults**
@@ -768,6 +901,13 @@ The actual fix for the account is GitHub Settings → Emails.
   lives in the operator's `ROOMLER__TURN__SHARED_SECRET` env.
 - **No git hooks for secrets**: there is no gitleaks/trufflehog scanner in CI.
   *(Open, [LOW], 2026-03-10.)*
+- **An error about a config file says where, never what** (#3086). The daemon's and
+  the CLI's config hold a bearer token, and a `toml` error quotes the line it stopped
+  at, so a typo on that line put the token in the daemon's log, which uploads to the
+  server, on the wizard's page and in the terminal. The parser's error ends where it
+  happens, so no chain holds it for a `{:#}` or `{:?}` to print:
+  [`docs/installation.md`](installation.md). Rows uploaded before the fix were not
+  rewritten.
 
 ### Dependency-uplift pass (2026-07-29)
 

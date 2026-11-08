@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, filter::Directive, filter::LevelFilter, fmt};
 
 use crate::logs_upload::{LogLine, LogUploadLayer};
 
@@ -162,7 +162,8 @@ fn mirror_legacy_log_target(spec: &str) -> String {
     out.join(",")
 }
 
-/// Initialise tracing subscribers. Always installs a stdout layer; adds
+/// Initialise tracing subscribers. Installs a stdout layer, except on a
+/// console nobody reads while the file has every line (#3438); adds
 /// a daily-rolling file layer + panic hook when the platform log dir
 /// is writeable. Infallible — file logging failure falls back to
 /// stdout-only without erroring out the agent (the agent's signaling
@@ -203,6 +204,8 @@ pub fn init() {
             .map_err(std::io::Error::other)
     });
     let _ = LOG_DIR.set(opened.as_ref().map(|(d, _)| d.clone()));
+    // #3438 — no line goes to a console nobody reads while the file has them all.
+    let quiet = opened.is_some() && console_nobody_reads();
 
     if let Some((dir, appender)) = opened {
         let d = dir.as_path();
@@ -215,7 +218,7 @@ pub fn init() {
             .with_ansi(false);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
-            .with(stdout)
+            .with((!quiet).then_some(stdout))
             .with(file)
             .with(upload_layer)
             .try_init();
@@ -235,6 +238,46 @@ pub fn init() {
     for note in notes {
         tracing::warn!(%note, "logging: the log directory could not be used (#3073)");
     }
+    // #3438 — and what only stderr carries goes to that file too, as #3292 does
+    // for the per-user daemon: the watchdog's last words, a panic, FFmpeg.
+    #[cfg(windows)]
+    if quiet {
+        send_stderr_to_the_log();
+        tracing::info!(
+            "logging: this console has no window, so every line goes to the log file, \
+             stderr's too (#3438)"
+        );
+    }
+}
+
+/// #3438 — whether this process's stdout is a console nobody reads: a service
+/// process's console that has no window. The supervisor starts the SystemContext
+/// worker with `CREATE_NO_WINDOW` and no standard handles, so the worker's stdio
+/// is such a console, served by a `conhost.exe` of its own at Normal priority. A
+/// write there waits for that conhost, which a host busy with higher-priority work
+/// runs only now and then: the exit-DNS purge's 10 s bound was logged 40-46 s
+/// after the purge began. Only a process with a [`ServiceLogRole`] is asked, so a
+/// verb a person runs keeps its console lines, in a terminal or over SSH.
+#[cfg(windows)]
+fn console_nobody_reads() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetConsoleWindow, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+    if SERVICE_ROLE.get().is_none() {
+        return false;
+    }
+    let mut mode = 0;
+    // SAFETY: reads this process's standard handle and its console; `mode` is a
+    // valid out-pointer.
+    unsafe {
+        GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) != 0
+            && GetConsoleWindow().is_null()
+    }
+}
+
+#[cfg(not(windows))]
+fn console_nobody_reads() -> bool {
+    false
 }
 
 /// #3073 — where [`init`] logs when the resolved directory cannot be used:
@@ -246,6 +289,14 @@ fn fallback_log_dir() -> Option<PathBuf> {
     }
     let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.data_local_dir().join("logs"))
+}
+
+/// #3302 — where a process with no [`ServiceLogRole`] logs, whatever role this one
+/// has: the per-profile data dir. A SystemContext worker logs to `service-logs`, and
+/// the post-install watcher it spawns has no role, so the watcher's install record
+/// lands here, in SYSTEM's profile. `None` under `cfg(test)`, as [`resolve_log_dir`].
+pub fn profile_log_dir() -> Option<PathBuf> {
+    fallback_log_dir()
 }
 
 /// #3073 — open the log appender in `primary`, else in `fallback`. The notes
@@ -292,14 +343,18 @@ fn open_log_appender<A>(
     }
 }
 
-/// The filter this binary's logs are kept by: [`init`]'s, and (FR-90
-/// P8-2a-5) a session's worker's, so its lines are kept as the daemon's own
-/// would be.
+/// The filter this binary's logs are kept by: [`init`]'s.
 pub fn filter() -> EnvFilter {
+    filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// [`filter`] under the given `RUST_LOG`, or with none set.
+fn filter_for(rust_log: Option<&str>) -> EnvFilter {
     // Default filter. `RUST_LOG` (env, or the SCM service Environment
     // block for the SystemContext service) overrides wholesale when
     // set. The fallback keeps `roomler_agent` at info + everything
-    // else at warn, with ONE addition: `tunnel_core=info`.
+    // else at warn, with ONE addition: `tunnel_core=info`. Either
+    // way, [`keep_info_targets`] then adds the lifecycle targets.
     //
     // rc.74: `tunnel_core=info` surfaces the per-flow throughput
     // logger (`tunnel flow throughput (2s window) …` + the
@@ -313,16 +368,14 @@ pub fn filter() -> EnvFilter {
     // admin-UI log viewer, so they belong on by default. Everything
     // else in `tunnel_core` is debug/trace and stays suppressed; the
     // chatty `webrtc_sctp` / `webrtc_ice` targets stay at warn.
-    std::env::var("RUST_LOG")
-        .ok()
-        .map(|spec| EnvFilter::new(mirror_legacy_log_target(&spec)))
-        .unwrap_or_else(|| {
-            // S1b follow-up: `roomlerd=info` — events emitted from the BIN
-            // (target = the binary crate name) were silently capped at warn,
-            // hiding the migration notes + DPI/timer diagnostics the code
-            // clearly intended to be visible.
-            EnvFilter::new("roomler_agent=info,roomlerd=info,tunnel_core=info,warn")
-        })
+    let spec = rust_log.map(mirror_legacy_log_target).unwrap_or_else(|| {
+        // S1b follow-up: `roomlerd=info` — events emitted from the BIN
+        // (target = the binary crate name) were silently capped at warn,
+        // hiding the migration notes + DPI/timer diagnostics the code
+        // clearly intended to be visible.
+        "roomler_agent=info,roomlerd=info,tunnel_core=info,warn".to_string()
+    });
+    EnvFilter::new(keep_info_targets(&spec))
         // rc.181 — silence the `turn` crate's periodic refresh-failure warns
         // (`refresh allocation/permissions failed`, target `turn::client::relay_conn`).
         // Now that the overlay re-allocates a dead relay carrier on the send-error
@@ -349,6 +402,78 @@ pub fn filter() -> EnvFilter {
                 .parse()
                 .expect("static EnvFilter directive is valid"),
         )
+}
+
+/// #1928, #3506 — targets whose INFO lines the daemon keeps under any spec that
+/// would leave them coarser. No shipped spec names either, so until #1928 both
+/// were dropped at the source: `ls`, not `roomler logs`, answered "is the person
+/// socket up?". Each speaks only at a lifecycle edge, so keeping them costs
+/// nothing in volume:
+/// - `roomler_localapi`: the LocalAPI's listeners coming up and going down, and
+///   the person-at-the-device socket (FR-27 P11). Its per-connection lines are
+///   DEBUG and stay off.
+/// - `roomler_node_core::logging`: what this module says about the log itself,
+///   such as #3438's "this console has no window". The rest of the crate keeps
+///   the spec's level.
+const KEPT_AT_INFO: [&str; 2] = ["roomler_localapi", "roomler_node_core::logging"];
+
+/// Add `<target>=info` to a `RUST_LOG` spec for each [`KEPT_AT_INFO`] target the
+/// spec leaves coarser than INFO, and change nothing else.
+///
+/// The spec keeps its say over a target it [`reaches`]: `roomler_localapi=debug`
+/// keeps DEBUG, and `roomler_localapi=off` keeps the crate silent. A bare level
+/// of INFO or finer already keeps the lines, and a directive added there would
+/// cap them, since a directive with a target outranks a bare level: under
+/// `debug,roomler_localapi=info` the crate logs at INFO. That is also why this
+/// edits the spec, where [`filter_for`]'s two fixed directives use
+/// `add_directive`: that replaces any directive for the same target, at whatever
+/// level the operator gave it.
+///
+/// A spec in which `EnvFilter` keeps no directive (empty, or every one invalid)
+/// is left alone as well. `EnvFilter::new` then logs ERROR from every target,
+/// and one directive added here would end that.
+fn keep_info_targets(spec: &str) -> String {
+    let directives: Vec<&str> = spec
+        .split(',')
+        .filter(|d| d.parse::<Directive>().is_ok())
+        .collect();
+    if directives.is_empty() {
+        return spec.to_string();
+    }
+    // A bare level covers every target no directive reaches, and the last one
+    // wins. With none, such a target logs nothing at all.
+    let global = directives
+        .iter()
+        .rev()
+        .find_map(|d| d.parse::<LevelFilter>().ok());
+    if global.is_some_and(|level| level >= LevelFilter::INFO) {
+        return spec.to_string();
+    }
+    let missing: Vec<String> = KEPT_AT_INFO
+        .iter()
+        .filter(|target| !directives.iter().any(|d| reaches(d, target)))
+        .map(|target| format!("{target}=info"))
+        .collect();
+    if missing.is_empty() {
+        spec.to_string()
+    } else {
+        format!("{spec},{}", missing.join(","))
+    }
+}
+
+/// Whether a `RUST_LOG` directive decides about some of `target`'s events: it
+/// names `target`, a module under it, or anything `target` starts with. A
+/// directive matches every event target that starts with its own, since
+/// `EnvFilter` compares with `starts_with`, not module by module.
+fn reaches(directive: &str, target: &str) -> bool {
+    let named = directive.split(['=', '[']).next().unwrap_or_default();
+    if named.is_empty() || named.parse::<LevelFilter>().is_ok() {
+        return false;
+    }
+    target.starts_with(named)
+        || named
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with("::"))
 }
 
 /// Claim the consumer end of the log-upload channel. Returns `None`
@@ -716,8 +841,9 @@ pub fn resolve_log_dir() -> Option<PathBuf> {
     // file layer writing into the live daemon log, a panic hook that turns
     // a failing test into a crash of this device (the daemon uploads it),
     // and a prune of the real dir. `None` takes init's stdout-only branch.
+    // #3438: except in a child a test started with a directory of its own.
     if cfg!(test) {
-        return None;
+        return std::env::var_os("ROOMLER_TEST_LOG_DIR").map(PathBuf::from);
     }
     #[cfg(target_os = "windows")]
     if SERVICE_ROLE.get().is_some() {
@@ -900,11 +1026,14 @@ mod tests {
 
     // ── FR-21 P2a: the lib rename must not blank a deployed unit's logs ──
 
+    /// A unit from before the rename, still on disk in the field.
+    const LEGACY_UNIT: &str = "roomler_agent=info,warn";
+
     #[test]
     fn legacy_log_target_is_mirrored_onto_the_new_one() {
         // Exactly what packaging/linux/roomlerd.service ships today.
         assert_eq!(
-            mirror_legacy_log_target("roomler_agent=info,warn"),
+            mirror_legacy_log_target(LEGACY_UNIT),
             "roomler_agent=info,roomlerd=info,warn"
         );
         // And what service.rs generates.
@@ -964,6 +1093,247 @@ mod tests {
             mirror_legacy_log_target("roomler_agent_core=debug,warn"),
             "roomler_agent_core=debug,warn"
         );
+    }
+
+    // ── #1928, #3506: the lifecycle lines no shipped spec names ──
+
+    /// What `keep_info_targets` adds to a spec that leaves out both targets.
+    const BOTH: &str = "roomler_localapi=info,roomler_node_core::logging=info";
+
+    #[test]
+    fn the_specs_the_field_runs_under_gain_both_targets() {
+        for spec in [
+            // The packaged Linux units and the packaged macOS agent plist.
+            "roomlerd=info,warn",
+            // The units service.rs generates.
+            "roomlerd=info,tunnel_core=info,warn",
+            // A coarser bare level, or none at all.
+            "error",
+            "off",
+            "roomlerd=debug",
+            "[conn]=debug",
+        ] {
+            assert_eq!(
+                keep_info_targets(spec),
+                format!("{spec},{BOTH}"),
+                "spec: {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_level_of_info_or_finer_is_left_alone() {
+        // An added directive would CAP these: one with a target outranks a
+        // bare level, so under `debug` the targets would log at INFO only.
+        for spec in ["info", "debug", "trace", "INFO", "3", "roomlerd=debug,info"] {
+            assert_eq!(keep_info_targets(spec), spec, "spec: {spec}");
+        }
+    }
+
+    #[test]
+    fn the_last_bare_level_is_the_one_that_counts() {
+        assert_eq!(keep_info_targets("warn,debug"), "warn,debug");
+        assert_eq!(
+            keep_info_targets("debug,warn"),
+            format!("debug,warn,{BOTH}")
+        );
+    }
+
+    #[test]
+    fn a_spec_that_reaches_a_target_keeps_its_say_over_it() {
+        for (spec, added) in [
+            // The operator's own level, whatever it is.
+            (
+                "roomler_localapi=debug,warn",
+                "roomler_node_core::logging=info",
+            ),
+            (
+                "roomler_localapi=off,warn",
+                "roomler_node_core::logging=info",
+            ),
+            // A module under the target, and the target with no level (TRACE).
+            (
+                "roomler_localapi::conn=debug,warn",
+                "roomler_node_core::logging=info",
+            ),
+            ("roomler_localapi,warn", "roomler_node_core::logging=info"),
+            // A parent of the target.
+            ("roomler_node_core=warn,warn", "roomler_localapi=info"),
+        ] {
+            assert_eq!(
+                keep_info_targets(spec),
+                format!("{spec},{added}"),
+                "spec: {spec}"
+            );
+        }
+        // Both targets start with `roomler`, and `EnvFilter` matches a
+        // directive's target by `starts_with`, so this one reaches both.
+        assert_eq!(
+            keep_info_targets("roomler=debug,warn"),
+            "roomler=debug,warn"
+        );
+    }
+
+    #[test]
+    fn a_target_that_merely_shares_a_prefix_is_another_crate() {
+        // `roomler_localapi_x` starts with `roomler_localapi` but is not under
+        // it, and its directive matches none of the crate's events.
+        assert_eq!(
+            keep_info_targets("roomler_localapi_x=debug,warn"),
+            format!("roomler_localapi_x=debug,warn,{BOTH}")
+        );
+    }
+
+    #[test]
+    fn a_spec_envfilter_keeps_nothing_of_is_left_alone() {
+        // `EnvFilter::new` logs ERROR from every target then. One added
+        // directive would end that and drop every other target's errors.
+        for spec in ["", ",", "=", "%"] {
+            assert_eq!(keep_info_targets(spec), spec, "spec: {spec:?}");
+        }
+    }
+
+    #[test]
+    fn keeping_is_idempotent() {
+        for spec in ["roomlerd=info,warn", "warn", "roomler_localapi=debug,warn"] {
+            let once = keep_info_targets(spec);
+            assert_eq!(keep_info_targets(&once), once, "spec: {spec}");
+        }
+    }
+
+    /// Whether [`filter_for`] under `rust_log` keeps what `check` asks about,
+    /// on a dispatcher of the test's own. Making one rebuilds every callsite's
+    /// cached interest, so no other test's filter answers for this one.
+    fn kept(rust_log: Option<&str>, check: impl FnOnce() -> bool) -> bool {
+        let dispatch =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(filter_for(rust_log)));
+        tracing::dispatcher::with_default(&dispatch, check)
+    }
+
+    #[test]
+    fn the_built_filter_keeps_the_lifecycle_lines_and_nothing_chattier() {
+        use tracing::Level;
+        for rust_log in [
+            None,
+            Some("roomlerd=info,warn"),
+            Some("roomlerd=info,tunnel_core=info,warn"),
+            // A unit still on disk from before the FR-21 rename.
+            Some(LEGACY_UNIT),
+        ] {
+            let on = |check: fn() -> bool| kept(rust_log, check);
+            assert!(
+                on(|| tracing::enabled!(target: "roomler_localapi", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: "roomler_localapi::conn", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: "roomler_node_core::logging", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "roomler_localapi", Level::DEBUG)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "roomler_node_core::logging", Level::DEBUG)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "roomler_node_core::logs_upload", Level::INFO)),
+                "{rust_log:?}"
+            );
+            // What the spec and the fixed directives kept before, kept the same.
+            assert!(
+                on(|| tracing::enabled!(target: "roomlerd", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: "tunnel_core::overlay::sockbuf", Level::INFO)),
+                "{rust_log:?}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "turn::client::relay_conn", Level::WARN)),
+                "{rust_log:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_operators_own_choice_still_wins_in_the_built_filter() {
+        use tracing::Level;
+        // Named at DEBUG, DEBUG stays on.
+        assert!(kept(Some("roomler_localapi=debug,warn"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::DEBUG)
+        }));
+        // A bare DEBUG is not capped at INFO, as an added directive would cap it.
+        assert!(kept(Some("debug"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::DEBUG)
+        }));
+        assert!(kept(Some("debug"), || {
+            tracing::enabled!(target: "roomler_node_core::logging", Level::DEBUG)
+        }));
+        // Named off, the crate is silent.
+        assert!(!kept(Some("roomler_localapi=off,warn"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::WARN)
+        }));
+        // A parent at DEBUG reaches the logging module.
+        assert!(kept(Some("roomler_node_core=debug,warn"), || {
+            tracing::enabled!(target: "roomler_node_core::logging", Level::DEBUG)
+        }));
+        // The last bare level is the one `EnvFilter` applies.
+        assert!(!kept(Some("info,warn"), || {
+            tracing::enabled!(target: "some_crate", Level::INFO)
+        }));
+        assert!(kept(Some("info,warn"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::INFO)
+        }));
+    }
+
+    #[test]
+    fn an_empty_rust_log_keeps_envfilters_error_fallback() {
+        use tracing::Level;
+        // `RUST_LOG=` logs ERROR from every target, as it did before.
+        assert!(kept(Some(""), || {
+            tracing::enabled!(target: "roomlerd", Level::ERROR)
+        }));
+        assert!(!kept(Some(""), || {
+            tracing::enabled!(target: "roomlerd", Level::WARN)
+        }));
+        assert!(!kept(Some(""), || {
+            tracing::enabled!(target: "roomler_localapi", Level::INFO)
+        }));
+    }
+
+    #[test]
+    fn every_target_kept_at_info_is_a_real_crate_or_module() {
+        // A tracing target is its crate's lib name, then the module path. A rename that left
+        // `KEPT_AT_INFO` behind would drop these lines again with no error anywhere, and #2871's
+        // record of a change the person at the device made is one of `roomler_localapi`'s.
+        let localapi = std::any::type_name::<roomler_localapi::Request>();
+        assert!(
+            KEPT_AT_INFO
+                .iter()
+                .any(|target| localapi.starts_with(&format!("{target}::"))),
+            "{localapi}"
+        );
+        let logging = module_path!().trim_end_matches("::tests");
+        assert!(KEPT_AT_INFO.contains(&logging), "{logging}");
+    }
+
+    #[test]
+    fn the_mac_root_halfs_spec_keeps_the_person_sockets_record_line() {
+        use tracing::Level;
+        // The root half serves the person socket on a Mac, under `com.roomler.daemon.plist`'s
+        // `RUST_LOG=info`: a bare level that keeps the line already, and that nothing caps.
+        assert!(kept(Some("info"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::INFO)
+        }));
+        assert!(!kept(Some("info"), || {
+            tracing::enabled!(target: "roomler_localapi", Level::DEBUG)
+        }));
     }
 
     use super::*;
@@ -1338,6 +1708,124 @@ mod tests {
                 rolling_file(dir.path(), &before).exists()
                     || rolling_file(dir.path(), &after).exists()
             );
+        }
+
+        /// #3438 — what `resolve_log_dir` reads in a test's child.
+        const CHILD_LOG_DIR: &str = "ROOMLER_TEST_LOG_DIR";
+
+        /// `child`, in a console with no window, the way the supervisor starts the
+        /// SystemContext worker (`CREATE_NO_WINDOW`, `supervisor.rs:331`). The
+        /// supervisor passes no standard handles, so the worker's are that console's.
+        /// `Command` always passes some, so the child takes its console (`CONOUT$`)
+        /// as its stdout and stderr itself.
+        fn child_in_a_console_with_no_window(name: &str, dir: &Path) -> std::process::ExitStatus {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::stderr_capture::{name}"),
+                    "--nocapture",
+                ])
+                .env(CHILD_DIR, dir)
+                .env(CHILD_LOG_DIR, dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        /// This process's console text, up to the cursor's row.
+        fn console_text() -> String {
+            use windows_sys::Win32::System::Console::{
+                CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo, GetStdHandle,
+                ReadConsoleOutputCharacterW, STD_OUTPUT_HANDLE,
+            };
+            // SAFETY: `info`, `text` and `read` are valid for the sizes passed.
+            unsafe {
+                let out = GetStdHandle(STD_OUTPUT_HANDLE);
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+                if GetConsoleScreenBufferInfo(out, &mut info) == 0 {
+                    return format!("(no screen buffer: {})", std::io::Error::last_os_error());
+                }
+                let rows = info.dwCursorPosition.Y.max(0) as u32 + 1;
+                let cells = info.dwSize.X.max(0) as u32 * rows;
+                let mut text = vec![0u16; cells as usize];
+                let mut read = 0u32;
+                let origin = COORD { X: 0, Y: 0 };
+                ReadConsoleOutputCharacterW(out, text.as_mut_ptr(), cells, origin, &mut read);
+                String::from_utf16_lossy(&text[..text.len().min(read as usize)])
+            }
+        }
+
+        /// A SystemContext worker's logging, in a console that has no window. It
+        /// leaves the parent whether the console has a window and the console's text.
+        /// Nothing after `init` may panic: the hook would record a crash.
+        #[test]
+        fn child_logs_in_a_console_with_no_window() {
+            use std::os::windows::io::IntoRawHandle;
+            use windows_sys::Win32::System::Console::{
+                GetConsoleWindow, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+            };
+            let Some(dir) = child_dir() else { return };
+            let report = dir.join("console.txt");
+            let console = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("CONOUT$")
+            };
+            let (Ok(out), Ok(err)) = (console(), console()) else {
+                let _ = std::fs::write(&report, "(no console)");
+                return;
+            };
+            // SAFETY: two valid handles, owned by the standard-handle table from here on.
+            unsafe {
+                SetStdHandle(STD_OUTPUT_HANDLE, out.into_raw_handle());
+                SetStdHandle(STD_ERROR_HANDLE, err.into_raw_handle());
+            }
+            super::super::set_service_logging(super::super::ServiceLogRole::Worker);
+            super::super::init();
+            tracing::warn!("a-line-for-the-log");
+            super::super::say_on_stderr("the-last-words");
+            super::super::say_on_stdout("a-line-on-the-console");
+            // SAFETY: takes no arguments.
+            let window = if unsafe { GetConsoleWindow() }.is_null() {
+                "none"
+            } else {
+                "some"
+            };
+            let _ = std::fs::write(&report, format!("window={window}\n{}", console_text()));
+        }
+
+        /// #3438 — the SystemContext worker's console has no window and nobody reads
+        /// it, yet every log line went there first and waited for its `conhost`: on a
+        /// starved host a 10 s bound's warning was stamped 40-46 s late. No line goes
+        /// to such a console, and what only stderr carries goes to the rolling log.
+        #[test]
+        fn a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log() {
+            let dir = tempfile::tempdir().unwrap();
+            let status = child_in_a_console_with_no_window(
+                "child_logs_in_a_console_with_no_window",
+                dir.path(),
+            );
+            assert!(status.success(), "{status:?}");
+            let console = std::fs::read_to_string(dir.path().join("console.txt")).unwrap();
+            // The premise, and a control that the console is read at all.
+            assert!(console.starts_with("window=none\n"), "{console}");
+            assert!(console.contains("a-line-on-the-console"), "{console}");
+            assert!(
+                !console.contains("a-line-for-the-log"),
+                "a log line reached the console: {console}"
+            );
+            assert!(
+                !console.contains("the-last-words"),
+                "stderr reached the console: {console}"
+            );
+            let log = today(dir.path());
+            assert!(log.contains("the-last-words"), "{log}");
         }
     }
 }

@@ -24,6 +24,26 @@ two decoy `roomlerd.log*` files (the SCM supervisor's and the updater's).
 Path archaeology has produced a false "the agent's logging is dead" verdict
 twice (2026-08-07 and 2026-08-09); the verb existed both times.
 
+**What reaches that log.** The daemon keeps lines by `RUST_LOG` when its environment
+sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
+everything else at WARN (`crates/agent-core/src/logging.rs:352`). Either way it then
+keeps INFO from two targets that no shipped unit names
+(`crates/agent-core/src/logging.rs:435`, #1928):
+
+| Target | Its INFO lines |
+|---|---|
+| `roomler_localapi` | The LocalAPI listeners coming up and going down, and the person socket's up and down (FR-27 P11). Its per-connection lines are DEBUG and stay off. |
+| `roomler_node_core::logging` | One: #3438's "this console has no window", at a worker's start. |
+
+A `RUST_LOG` that already decides about a target is used as written: it has a
+directive for the target, for a module under it or for any prefix of its name
+(`EnvFilter` matches targets by prefix), or a bare level of `info` or finer. So
+`RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
+silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
+logs ERROR from every target. Two directives are added whatever the spec says:
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:390`) and
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:401`).
+
 ## Transport
 
 Commands ride the agent's **existing control WebSocket**, not the overlay.
@@ -346,8 +366,8 @@ run the command as root:
 |---|---|---|
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:965`](../crates/modules/fleet/src/agent_exec.rs#L965) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:361`](../crates/modules/fleet/src/agent_exec.rs#L361) |
-| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3731`](../crates/modules/fleet/src/hub.rs#L3731) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5231`](../agents/roomlerd/src/signaling.rs#L5231) |
+| The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3019`](../crates/modules/fleet/src/hub.rs#L3019) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5630`](../agents/roomlerd/src/signaling.rs#L5630) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running
@@ -398,7 +418,9 @@ unbounded run (`models::exec_limits`):
   exec-driven update. Under the daemon's own restart it meant 71.6 s offline,
   measured, until the watchdog forced `exit(2)`. The daemon now shuts its runtime down
   within `runtime_exit::SHUTDOWN_BUDGET` (3 s) and logs `runtime shut down at
-  its budget` when it leaves such a read behind.
+  its budget` when it leaves such a read behind. A command here runs in no job,
+  on purpose: it has to outlive the daemon it stopped. A Roomler SSH command is the
+  opposite ([`roomler-ssh.md`](roomler-ssh.md) § What outlives a session).
 
 Output is swept for the agent token(s), `Bearer …` headers and JWT-shaped
 strings **before it leaves the host** — results are persisted in `exec_audit`
@@ -433,7 +455,7 @@ Exit status mirrors the remote command's, so `roomler exec` composes in a
 script: a refusal or failure is non-zero here too, never a silent 0.
 
 The target is a device name or a hex agent id, resolved by the server within
-the caller's org (`crates/modules/fleet/src/socket.rs:1177` `resolve_exec_target`:
+the caller's org (`crates/modules/fleet/src/socket.rs:1118` `resolve_exec_target`:
 hex id → exact name → case-insensitive name). A dashboard **display name** is
 turned into the hex id by the CLI before the request leaves — only when no
 device name matches it, and refused when two devices share it

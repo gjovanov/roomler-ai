@@ -39,23 +39,23 @@ FR-37=1   # A.5 #928 no Result comment. One nightly run settles it: does the nig
 
 # ── B. deliberately not met, and the spec says so ────────────────────────────
 FR-29=1   # B.1 #864 the spec DECLARES this criterion "NOT met — and not addressable by P1" (fps under sustained motion). Honest and intentional. Owed: a child FR or an in-spec waiver, so a later reader does not have to infer it.
+FR-56=2   # B.2 #1157 the spec WAIVES both, by the operator's decision of 2026-11-02. AC5, a native window listed and focused on wlroots: GNOME refuses enumeration (measured) and wlroots is unverifiable here, since no device reports one; follow-up #3311. AC9, launch with no Xwayland: refuted as written, because such a window can be neither listed nor focused. Owed: nothing until a wlroots host exists.
 
-# ── C. closed WITH field evidence on the issue; the record lagged ────────────
-# Each of these has a Result / field-verified comment. The likeliest reading is
-# that the work was verified and nobody walked back to the checkboxes — but see
-# the warning above: the comment does not attest to THESE boxes.
-FR-12=5   # C.2  #788 P1 and P2 spotlight tours both shipped (#797, #1117); no criterion was ticked for either.
-FR-32=7   # C.3  #898 14 comments and a field-verified Result; 0 of 7 ticked.
-FR-34=3   # C.4  #917 Result present; 3 of 6 remain, incl. "the controller is TOLD the host is locked".
-FR-39=6   # C.5  #951 Result present; the self-host compose criterion overlaps FR-42's. +4 half-met `[~]` (visible since 2026-09-25): the social-preview upload and the README demo are operator steps (GitHub has no API for the preview); subscribe/unsubscribe say "asserted, not yet run", a note that predates CI running crates/tests.
-FR-41=7   # C.6  #965 the 90-second demo. Result present; 0 of 7 ticked.
-FR-42=2   # C.7  #967 Result present; the remaining one is `docker compose down -v` leaving the machine clean. +1 half-met `[~]` (visible since 2026-09-25): enrolment via the doc's one-liner proven, "online" not (the test host already ran a daemon, and one machine serves one).
-FR-49=7   # C.8  #1084 Result present; 1 of 8 ticked (the tun-mesh criterion, by FR-97 P1d on 0.4.143, 2026-10-18); the rest: per-org overlay mode across `org ls` / `status` / `peers`.
-FR-50=6   # C.9  #1083 Result present; 0 of 6 ticked (the served installer naming its own server).
-FR-53=5   # C.10 #1123 Result present; 0 of 5 ticked (rollback sentinel lifecycle).
-FR-54=4   # C.11 #1130 Result present; 0 of 4 ticked (orphaned-network reporting).
-FR-57=6   # C.12 #1161 Result present; 0 of 6 ticked (multi-arch manifest).
-FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — and "docs before close" is a standing operator rule (2026-09-05). The only breach of it in the tree, and nothing could see it.
+# ── C. closed WITH field evidence on the issue: what the evidence did NOT reach ─
+# 2026-11-02: every criterion of this group was matched against its own evidence, one
+# at a time: the issue's Result comments, the spec's field log, the code, and today's
+# reads of prod, the registry and this box. FR-34, FR-49, FR-50 and FR-73 cleared
+# entirely. FR-73 was never the docs-rule breach this file first called it: its docs had
+# existed since #1401, and only the tick was missing. A criterion shown only by a unit
+# test, or only by how a workflow is written, is marked [~] and stays counted here.
+FR-12=4   # C.2  #788 the four P1 behaviours P1 LIVE handed to a human and nobody recorded: first-login auto-open once, the `?`/menu entry points, empty states, deep-link click-through. One browser session with a fresh account.
+FR-32=4   # C.3  #898 the thread ticked all seven; four do not survive the code. The compile-time classification of PlanLimits fields never existed (the match covers Limit's variants, not the struct's fields; two fields unclassified since the start). Also one deliberate hand-rolled read (the operator's call), Warn and Off proven for members only through the channel cap, and scenario tests rather than one per limit.
+FR-39=6   # C.5  #951 four half-met [~] since 2026-09-25: the social preview and the README demo are operator steps (GitHub has no API for the preview), subscribe and unsubscribe say "asserted, not yet run", a note that predates CI running crates/tests. The compose criterion is [~]: true on 09-01, false today (#2034). The demo criterion names enroll -> ssh -> forward; no take shows those. Same substitution as FR-41; resolves with it.
+FR-41=2   # C.6  #965 on-camera enrolment and ssh + forward: the 09-01 re-shoot swapped them for a mesh ping, the 09-30 and 10-01 takes (#1801, #1802) for four machines in one tab. The operator accepted cosmetics, not the substitution, and the spec never recorded it. Re-shoot or amend with the operator.
+FR-42=1   # C.7  #967 one half-met [~]: enrolment via the doc's one-liner proven, "online" not, since the test host already ran a daemon. A clean VM settles it.
+FR-53=3   # C.10 #1123 three of five are unit-locked and never watched on a device: the field case was a legacy sentinel. A planted sentinel on a throwaway guest settles all three.
+FR-54=1   # C.11 #1130 wording, not behaviour: by design the network ROW survives an apply, so a second run lists it with no nodes rather than "reports nothing". Amend the criterion to match the design and tick.
+FR-57=3   # C.12 #1161 the image RAN on a native aarch64 runner but no arm64 host ever PULLED it (one docker pull settles it); the amd64 timing was never re-measured after the workflow moved; a failed arm64 leg has never happened, so "does not block amd64" is by construction.
 # ── D. half-met `- [~]`, invisible to this guard until it counted them ───────
 # Added 2026-09-25 with the fix that made `ac_scan` count a `[~]` as OPEN. It had
 # matched only `[ ]` / `[x]`, so a half-met criterion on a closed FR was neither
@@ -63,6 +63,9 @@ FR-73=1   # C.13 #1389 ⚠️ the unticked one is AC9, the DOCS criterion — an
 # and FR-42's half-met ones are folded into their C lines above; an FR whose
 # ONLY debt is half-met lives here.
 FR-36=2   # D.1 #929 both `[~]` are ONE gap: 4K meets the latency bar and ~30 fps only via the production `Auto` downscale path (24.0 ms of 33); undownscaled 4K is 43.8 ms (~23 fps). The spec records it honestly; owed: tick with a stated waiver, or a child FR for native 4K.
+
+# ── E. closed NOT PLANNED: criteria for a fix that will not be built ─────────
+FR-31=7   # E.1 #897 closed 2026-11-08 not planned (triage): superseded by FR-35 #922. Its own A/B refuted both levers on 2026-08-29 (neither a post-open VBV nor `ldkfs` moves NVENC's opening keyframe), so these criteria describe a fix that will not be built. FR-35's criteria measure the opener now.
 
 # ── nodocs: bound by the docs-before-close rule, and no docs criterion ───────
 #
@@ -81,10 +84,13 @@ FR-36=2   # D.1 #929 both `[~]` are ONE gap: 4K meets the latency bar and ~30 fp
 # added ticked in the same PR. Writing FR-7's also paid its one debt pin: the
 # Apple criterion had been field-verified on 2026-09-08 and never ticked.
 #
-# So this section is empty on purpose. A line appearing here means an FR bound
-# by the rule was written, or closed, without the criterion.
+# So this section was empty on purpose until FR-31, closed not planned on
+# 2026-11-08 with nothing built to document. A line appearing here means an FR
+# bound by the rule was written, or closed, without the criterion.
 #
 # ⚠️ FR-69 is deliberately ABSENT. It closed at 11:53Z on 2026-09-05 with no
 #    reader-facing docs — the close the operator made the rule ABOUT — and its
 #    owed docs landed in #1401 itself. It is the reason the boundary is a
 #    timestamp and not a date.
+
+nodocs FR-31  # #897 closed 2026-11-08 not planned: nothing shipped under it to document (draft PR #900 closed unmerged); FR-35 #922 carries the work.

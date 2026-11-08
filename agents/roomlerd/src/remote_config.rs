@@ -41,13 +41,127 @@ use roomler_ai_remote_control::models::DesiredConfig;
 pub struct Applied {
     /// Keys that changed and are ALREADY in force.
     pub live: Vec<&'static str>,
-    /// Keys that changed on disk but need a daemon restart to take effect.
+    /// Keys on disk that need a daemon restart to take effect: the ones this
+    /// process does not run, or with no process to speak for
+    /// ([`RemoteConfigServices::running_on`]) the ones this frame changed.
     pub needs_restart: Vec<&'static str>,
+    /// This frame changed the file. The lists cannot say so on their own: a key
+    /// written back to the value this process runs leaves nothing waiting, and
+    /// that is not the `noop` of a device that already matched.
+    pub wrote: bool,
 }
 
 impl Applied {
     pub fn is_noop(&self) -> bool {
-        self.live.is_empty() && self.needs_restart.is_empty()
+        !self.wrote && self.live.is_empty() && self.needs_restart.is_empty()
+    }
+}
+
+/// FR-132 P1c — the keys the daemon reads once per process, as THIS process
+/// read them. It is what separates "written" from "in force": a key the file
+/// holds and this process does not is waiting on a restart, however many
+/// reconnects have since found the file already matching.
+#[derive(Debug, PartialEq, Eq)]
+struct RunningKeys {
+    ssh_enabled: bool,
+    ssh_authorized_keys: Vec<String>,
+    ssh_account_mode: Option<String>,
+    ssh_port: Option<u16>,
+    encoder_cells_deny: Option<String>,
+    fps_deny: Option<String>,
+    color_description: Option<bool>,
+    zero_copy_deny: Option<String>,
+}
+
+impl RunningKeys {
+    fn of(cfg: &crate::config::AgentConfig) -> Self {
+        Self {
+            ssh_enabled: cfg.ssh_enabled,
+            ssh_authorized_keys: cfg.ssh_authorized_keys.clone(),
+            ssh_account_mode: cfg.ssh_account_mode.clone(),
+            ssh_port: cfg.ssh_port,
+            encoder_cells_deny: cfg.encoder_cells_deny.clone(),
+            fps_deny: cfg.fps_deny.clone(),
+            color_description: cfg.color_description,
+            zero_copy_deny: cfg.zero_copy_deny.clone(),
+        }
+    }
+
+    /// The keys `desired` manages whose value in `cfg`, the file, this process
+    /// is not running. A key nobody pushed is left out: a local edit waiting
+    /// on a restart is the owner's, and this report is about the push.
+    fn waiting_on_restart(
+        &self,
+        desired: &DesiredConfig,
+        cfg: &crate::config::AgentConfig,
+    ) -> Vec<&'static str> {
+        // Destructured EXHAUSTIVELY, as `DesiredConfig::same_ssh_as` is: a new
+        // pushable key must say here whether it is read once before this
+        // compiles. One that fell outside the list would read `applied` while
+        // the daemon still ran the old value.
+        let DesiredConfig {
+            // Live: `apply` puts it in force itself.
+            exec_enabled: _,
+            // FR-135 — live as well: each session's open reads it.
+            rc_media_legacy: _,
+            ssh_enabled,
+            ssh_authorized_keys,
+            ssh_account_mode,
+            ssh_port,
+            encoder_cells_deny,
+            fps_deny,
+            color_description,
+            zero_copy_deny,
+            revision: _,
+            updated_by: _,
+            updated_at: _,
+        } = desired;
+        [
+            (
+                "ssh_enabled",
+                ssh_enabled.is_some(),
+                cfg.ssh_enabled != self.ssh_enabled,
+            ),
+            (
+                "ssh_authorized_keys",
+                ssh_authorized_keys.is_some(),
+                cfg.ssh_authorized_keys != self.ssh_authorized_keys,
+            ),
+            (
+                "ssh_account_mode",
+                ssh_account_mode.is_some(),
+                cfg.ssh_account_mode != self.ssh_account_mode,
+            ),
+            (
+                "ssh_port",
+                ssh_port.is_some(),
+                cfg.ssh_port != self.ssh_port,
+            ),
+            (
+                "encoder_cells_deny",
+                encoder_cells_deny.is_some(),
+                cfg.encoder_cells_deny != self.encoder_cells_deny,
+            ),
+            (
+                "fps_deny",
+                fps_deny.is_some(),
+                cfg.fps_deny != self.fps_deny,
+            ),
+            (
+                "color_description",
+                color_description.is_some(),
+                cfg.color_description != self.color_description,
+            ),
+            (
+                "zero_copy_deny",
+                zero_copy_deny.is_some(),
+                cfg.zero_copy_deny != self.zero_copy_deny,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, managed, differs)| *managed && *differs)
+        .map(|(key, _, _)| key)
+        .collect()
     }
 }
 
@@ -55,6 +169,8 @@ impl Applied {
 pub struct RemoteConfigServices {
     path: PathBuf,
     lock: crate::config::WriteLock,
+    /// FR-132 P1c — what this process started on ([`Self::running_on`]).
+    running: Option<Arc<RunningKeys>>,
     /// The LIVE `exec_enabled`, read by the `rc:rpc.exec` gate. Seeded from
     /// the startup config and the only copy that decides anything.
     exec_enabled: Arc<AtomicBool>,
@@ -69,7 +185,7 @@ pub struct RemoteConfigServices {
     /// FR-52 P3 — the device's external-login state: guess budget, in-flight
     /// logins, verified grants.
     ///
-    /// Here because this struct is built ONCE per daemon (`main.rs`) and cloned
+    /// Here because this struct is built ONCE per daemon (`app.rs`) and cloned
     /// into every org's control loop and the LocalAPI: the budget has to be the
     /// DEVICE's, and one per loop would hand an attacker a separate budget for
     /// every org the device belongs to. It is NOT a process-wide static — that
@@ -86,6 +202,18 @@ pub struct RemoteConfigServices {
     /// until [`Self::adopt_local`] seeds the configured value; only the
     /// person at the console can change it, and never the server.
     peer_auth_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// FR-135 §7.1 — `rc_media_legacy` and `rc_media_canary` as the file holds
+    /// them. Live for `exec_enabled`'s reason: one read site, each session's
+    /// open ([`Self::media_paths`]). [`Self::adopt_local`] seeds both, and
+    /// [`Self::apply`] writes the pushable one after the durable save.
+    media_keys: Arc<std::sync::RwLock<MediaKeys>>,
+}
+
+/// FR-135 §7.1 — the two media-path keys, unparsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MediaKeys {
+    legacy: Option<String>,
+    canary: Option<String>,
 }
 
 /// FR-100 P1c — the policy in an atomic: `0` off, `1` audit.
@@ -117,6 +245,7 @@ impl RemoteConfigServices {
         Self {
             path,
             lock,
+            running: None,
             exec_enabled: Arc::new(AtomicBool::new(exec_enabled)),
             remote_config_enabled: Arc::new(AtomicBool::new(remote_config_enabled)),
             #[cfg(feature = "external-access")]
@@ -125,7 +254,84 @@ impl RemoteConfigServices {
             peer_auth_policy: Arc::new(std::sync::atomic::AtomicU8::new(policy_bits(
                 crate::peer_auth::PeerAuthPolicy::Audit,
             ))),
+            media_keys: Arc::new(std::sync::RwLock::new(MediaKeys::default())),
         }
+    }
+
+    /// FR-135 §7.1 — what the session opening now runs, path by path. The ONE
+    /// read site of `rc_media_legacy` and `rc_media_canary`, so a session never
+    /// changes path mid-flight and a push applies from the next session.
+    ///
+    /// R2's `ROOMLERD_MEDIA_PLAN=0` folds in here as a `media_plan` entry of
+    /// the legacy list, so the switch it always was keeps working beside the
+    /// pushable one.
+    pub fn media_paths(&self) -> crate::media_paths::MediaPaths {
+        self.media_paths_with(None)
+    }
+
+    /// [`Self::media_paths`], with the legacy entries a delegating daemon sent
+    /// along with the session (`SessionParams::media_legacy`) added to this
+    /// process's own. On a supervised Mac the GUI worker builds the peer from
+    /// its own file, which a push to the root's row never reaches; the
+    /// daemon's entries can only send a path back, so adding them can never
+    /// turn new code on.
+    pub fn media_paths_with(&self, delegated: Option<&str>) -> crate::media_paths::MediaPaths {
+        use crate::media_paths::{parse, resolve};
+        let keys = self
+            .media_keys
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut legacy = Self::legacy_entries(&keys);
+        for p in parse(delegated).paths {
+            if !legacy.paths.contains(&p) {
+                legacy.paths.push(p);
+            }
+        }
+        resolve(&legacy, &parse(keys.canary.as_deref()))
+    }
+
+    /// This process's legacy entries: its key, and R2's env switch folded in
+    /// as a `media_plan` entry marked as the environment's.
+    fn legacy_entries(keys: &MediaKeys) -> crate::media_paths::Entries {
+        use crate::media_paths::{MediaPath, parse};
+        let mut legacy = parse(keys.legacy.as_deref());
+        if !crate::media_plan::enabled() && !legacy.paths.contains(&MediaPath::MediaPlan) {
+            legacy.paths.push(MediaPath::MediaPlan);
+            legacy.from_env.push(MediaPath::MediaPlan);
+        }
+        legacy
+    }
+
+    /// FR-135 §7.1 — the legacy entries a delegated session carries to the
+    /// macOS GUI worker (`SessionParams::media_legacy`): this daemon's own, the
+    /// env fold included, by name. `None` when there are none, so an idle key
+    /// adds nothing to the frame.
+    pub fn media_legacy_for_delegate(&self) -> Option<String> {
+        let keys = self
+            .media_keys
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let legacy = Self::legacy_entries(&keys);
+        (!legacy.paths.is_empty()).then(|| {
+            legacy
+                .paths
+                .iter()
+                .map(|p| p.wire())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+
+    /// FR-132 P1c — record what this process started on, from the config it
+    /// loaded. Called once, where the daemon starts, and deliberately not by
+    /// [`Self::adopt_local`]: a local save writes a value this process still
+    /// does not run. Without it there is no process to speak for, and
+    /// `needs_restart` says only that the file changed.
+    pub fn running_on(mut self, cfg: &crate::config::AgentConfig) -> Self {
+        self.running = Some(Arc::new(RunningKeys::of(cfg)));
+        self
     }
 
     /// FR-100 P1c — the device's `peer_auth` policy at this moment.
@@ -249,17 +455,26 @@ impl RemoteConfigServices {
         // FR-100 P1c — the next offer is judged under the owner's new word.
         self.peer_auth_policy
             .store(policy_bits(cfg.peer_auth), Ordering::Relaxed);
+        // FR-135 §7.1 — and the next session opens under the owner's lists.
+        *self.media_keys.write().unwrap_or_else(|p| p.into_inner()) = MediaKeys {
+            legacy: cfg.rc_media_legacy.clone(),
+            canary: cfg.rc_media_canary.clone(),
+        };
     }
 
     /// Reconcile the on-disk config against `desired`, persist, and put the
     /// live keys into force.
     ///
     /// Idempotent by construction: a desired state that already matches writes
-    /// NOTHING and returns an empty [`Applied`]. That matters more than it
-    /// looks — delivery is reconcile-on-connect, so this runs on every single
-    /// reconnect, and a version that wrote unconditionally would rewrite
-    /// config.toml (and later, restart the daemon) every time a flaky link
-    /// bounced.
+    /// NOTHING. That matters more than it looks — delivery is
+    /// reconcile-on-connect, so this runs on every single reconnect, and a
+    /// version that wrote unconditionally would rewrite config.toml (and later,
+    /// restart the daemon) every time a flaky link bounced.
+    ///
+    /// A matching FILE is not yet a matching daemon, though: until this process
+    /// runs a key, the key stays in `needs_restart`, so a reconnect cannot turn
+    /// a device waiting on a restart into one that reports itself converged
+    /// (FR-132 P1c). The returned [`Applied`] is empty only when both match.
     ///
     /// Reloads from DISK rather than mutating the startup snapshot: another
     /// writer (the CLI, the desktop companion) may have changed the file since
@@ -269,6 +484,8 @@ impl RemoteConfigServices {
         let path = self.path.clone();
         let desired = desired.clone();
         let exec_flag = self.exec_enabled.clone();
+        let media_keys = self.media_keys.clone();
+        let running = self.running.clone();
 
         tokio::task::spawn_blocking(move || {
             let mut cfg =
@@ -367,16 +584,59 @@ impl RemoteConfigServices {
                     applied.needs_restart.push("zero_copy_deny");
                 }
             }
-
-            if applied.is_noop() {
-                return Ok(applied);
+            // FR-135 §7.1 — `rc_media_legacy`, LIVE: each session's open reads
+            // it, so the next session runs the pushed value and no restart is
+            // owed. Blank clears the device's key; `none` keeps it managed with
+            // no entries. A name this build does not know stays in the file,
+            // read as nothing, so a newer phase's push survives an older agent.
+            if let Some(want) = desired.rc_media_legacy.as_deref() {
+                let next = Some(want.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if cfg.rc_media_legacy != next {
+                    cfg.rc_media_legacy = next;
+                    applied.live.push("rc_media_legacy");
+                }
             }
-            crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+
+            applied.wrote = !applied.live.is_empty() || !applied.needs_restart.is_empty();
+            if applied.wrote {
+                crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
+            }
             // AFTER the durable write, never before: a live flag that is on
             // while the file says off would survive a crash as a device
-            // running exec that its own config denies.
-            if applied.live.contains(&"exec_enabled") {
-                exec_flag.store(cfg.exec_enabled, Ordering::Relaxed);
+            // running exec that its own config denies. And whenever the
+            // document manages the key, not only on a change: a file edited by
+            // hand already matches, and the gate would stay on what this
+            // process started with while the report read `noop`. A gate that
+            // moves is always in `live`, so the report and the log say it did.
+            if let Some(want) = desired.exec_enabled
+                && exec_flag.swap(want, Ordering::Relaxed) != want
+                && !applied.live.contains(&"exec_enabled")
+            {
+                applied.live.push("exec_enabled");
+            }
+            // FR-135 §7.1 — the same rule for the media paths: after the
+            // write, and whenever the document manages the key, so a file
+            // edited by hand to match still moves the sessions to come.
+            if desired.rc_media_legacy.is_some() {
+                let mut keys = media_keys.write().unwrap_or_else(|p| p.into_inner());
+                if keys.legacy != cfg.rc_media_legacy {
+                    keys.legacy = cfg.rc_media_legacy.clone();
+                    if !applied.live.contains(&"rc_media_legacy") {
+                        applied.live.push("rc_media_legacy");
+                    }
+                }
+            }
+            // FR-132 P1c — the lists above say what changed in the FILE, and
+            // the report means what this process does not run yet. On a later
+            // frame nothing changes, and the report used to go out as `noop`,
+            // which reads `applied` while the daemon still runs the old value;
+            // a pod roll did that to every such device at once. A key written
+            // back to the value this process runs is the other way round: it
+            // changed, and nothing is waiting on it.
+            if let Some(running) = running.as_deref() {
+                applied.needs_restart = running.waiting_on_restart(&desired, &cfg);
             }
             Ok(applied)
         })
@@ -698,6 +958,159 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// FR-135 §7.1 — a pushed `rc_media_legacy` is LIVE: written, in force for
+    /// the next session with no restart, and reported under `live`, never
+    /// `needs_restart`, even on a daemon that knows what it started on. The same
+    /// push again changes nothing, `none` keeps the key managed with no entries,
+    /// and a blank push clears it.
+    #[tokio::test]
+    async fn a_pushed_media_legacy_list_is_live_for_the_next_session_and_a_blank_clears_it() {
+        use crate::media_paths::MediaPath;
+        let dir = std::env::temp_dir().join(format!("fr135-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        )
+        .running_on(&started);
+        svc.adopt_local(&started);
+        let push = |v: &str| DesiredConfig {
+            rc_media_legacy: Some(v.to_string()),
+            ..Default::default()
+        };
+        let on_disk = || crate::config::load(&path).unwrap().rc_media_legacy;
+        assert!(
+            svc.media_paths().is_new(MediaPath::MediaPlan),
+            "the default"
+        );
+
+        let applied = svc.apply(&push(" media_plan, later_phase ")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"]);
+        assert!(applied.needs_restart.is_empty(), "{applied:?}");
+        assert_eq!(on_disk().as_deref(), Some("media_plan, later_phase"));
+        let next = svc.media_paths();
+        assert!(
+            !next.is_new(MediaPath::MediaPlan),
+            "the next session's plan is off"
+        );
+        assert_eq!(next.legacy_wire(), vec!["media_plan"]);
+        assert!(
+            svc.apply(&push("media_plan, later_phase"))
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        let applied = svc.apply(&push("none")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"]);
+        assert_eq!(on_disk().as_deref(), Some("none"), "managed, no entries");
+        assert!(svc.media_paths().is_new(MediaPath::MediaPlan));
+
+        svc.apply(&push("media_plan")).await.unwrap();
+        let applied = svc.apply(&push("")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"]);
+        assert_eq!(on_disk(), None, "a blank push clears the device's key");
+        assert!(svc.media_paths().is_new(MediaPath::MediaPlan));
+        assert!(svc.apply(&push("")).await.unwrap().is_noop());
+
+        // A file edited to match by hand still moves the sessions to come.
+        let mut cfg = crate::config::load(&path).unwrap();
+        cfg.rc_media_legacy = Some("media_plan".into());
+        crate::config::save(&path, &cfg).unwrap();
+        assert!(
+            svc.media_paths().is_new(MediaPath::MediaPlan),
+            "not seen yet"
+        );
+        let applied = svc.apply(&push("media_plan")).await.unwrap();
+        assert_eq!(applied.live, vec!["rc_media_legacy"], "the holder moved");
+        assert!(!svc.media_paths().is_new(MediaPath::MediaPlan));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-135 §7.1 — the owner's own lists are in force from their save, as
+    /// `exec_enabled` is: `adopt_local` seeds both keys, the local-only canary
+    /// included, and legacy still beats it.
+    #[test]
+    fn adopt_local_puts_both_media_lists_in_force() {
+        use crate::media_paths::MediaPath;
+        let svc = RemoteConfigServices::new(
+            std::env::temp_dir().join("fr135-adopt-unused.toml"),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            false,
+        );
+        let mut cfg = crate::config::test_fixture();
+        cfg.rc_media_legacy = Some("media_plan".into());
+        cfg.rc_media_canary = Some("media_plan,encode_stage".into());
+        svc.adopt_local(&cfg);
+        let s = svc.media_paths();
+        assert!(!s.is_new(MediaPath::MediaPlan), "legacy beats canary");
+        assert_eq!(
+            s.refused_wire(),
+            vec!["media_plan:legacy", "encode_stage:not_built"]
+        );
+        cfg.rc_media_legacy = None;
+        cfg.rc_media_canary = None;
+        svc.adopt_local(&cfg);
+        assert_eq!(svc.media_paths(), crate::media_paths::MediaPaths::default());
+    }
+
+    /// FR-135 §7.1, the review's bug on a supervised Mac: a push to the root's
+    /// row reaches the daemon's holder, while the GUI worker builds the peer
+    /// from its own file. So a delegated session carries the daemon's entries
+    /// (`media_legacy_for_delegate`), and the worker adds them to its own
+    /// (`media_paths_with`). Adding them only ever sends a path back: a
+    /// worker's own canary loses to them, and nothing in them turns code on.
+    #[test]
+    fn a_delegated_session_carries_the_daemons_legacy_entries_to_the_worker() {
+        use crate::media_paths::MediaPath;
+        let new_svc = || {
+            RemoteConfigServices::new(
+                std::env::temp_dir().join("fr135-delegate-unused.toml"),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                false,
+            )
+        };
+        let daemon = new_svc();
+        let worker = new_svc();
+        assert_eq!(daemon.media_legacy_for_delegate(), None, "nothing to carry");
+
+        let mut root_cfg = crate::config::test_fixture();
+        root_cfg.rc_media_legacy = Some("media_plan, later_phase".into());
+        daemon.adopt_local(&root_cfg);
+        assert_eq!(
+            daemon.media_legacy_for_delegate().as_deref(),
+            Some("media_plan"),
+            "by name, the names this build knows"
+        );
+
+        // The worker's own file is the person's, and says nothing.
+        assert!(worker.media_paths().is_new(MediaPath::MediaPlan));
+        let carried = daemon.media_legacy_for_delegate();
+        let s = worker.media_paths_with(carried.as_deref());
+        assert!(
+            !s.is_new(MediaPath::MediaPlan),
+            "the root's push reaches the session"
+        );
+
+        // Its own canary for the same path loses to the daemon's legacy.
+        let mut person_cfg = crate::config::test_fixture();
+        person_cfg.rc_media_canary = Some("media_plan".into());
+        worker.adopt_local(&person_cfg);
+        let s = worker.media_paths_with(carried.as_deref());
+        assert!(!s.is_new(MediaPath::MediaPlan));
+        assert_eq!(s.refused_wire(), vec!["media_plan:legacy"]);
+
+        // And a frame that carries nothing (an older daemon) changes nothing.
+        assert_eq!(worker.media_paths_with(None), worker.media_paths());
+    }
+
     /// FR-132 P1 — a pushed GPU-input denylist is written and reported as
     /// needing a restart, the same push again changes nothing, an unmanaged
     /// key is left alone, and a blank push clears it. And it reaches the gate:
@@ -774,6 +1187,241 @@ mod tests {
         assert_eq!(applied.needs_restart, vec!["zero_copy_deny"]);
         assert_eq!(on_disk(), None);
         assert!(svc.apply(&push("")).await.unwrap().is_noop());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FR-132 P1c — `needs_restart` says the daemon is not on the value, and a
+    /// reconnect does not change that. The document is re-delivered on every
+    /// connect, the file already matches, and this used to read as nothing to
+    /// do: the row went from `needs_restart` to `applied` while the daemon
+    /// still ran the old value. For a kill switch that is the wrong way to be
+    /// wrong, and a pod roll did it to every such device at once.
+    #[tokio::test]
+    async fn a_pushed_key_waits_for_a_restart_across_reconnects() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let process = |cfg: &crate::config::AgentConfig| {
+            RemoteConfigServices::new(
+                path.clone(),
+                Arc::new(tokio::sync::Mutex::new(())),
+                false,
+                true,
+            )
+            .running_on(cfg)
+        };
+        let svc = process(&started);
+        let deny = DesiredConfig {
+            zero_copy_deny: Some("hevc_qsv:gpu".to_string()),
+            ..Default::default()
+        };
+
+        let delivered = svc.apply(&deny).await.unwrap();
+        assert_eq!(delivered.needs_restart, vec!["zero_copy_deny"]);
+        let written = std::fs::read(&path).unwrap();
+
+        // A reconnect: the same document to the same process.
+        let reconnect = svc.apply(&deny).await.unwrap();
+        assert_eq!(
+            reconnect.needs_restart,
+            vec!["zero_copy_deny"],
+            "the file matches, the daemon does not"
+        );
+        assert!(reconnect.live.is_empty());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            written,
+            "and a reconnect still writes nothing"
+        );
+
+        // A key the document stopped managing is not this report's to raise.
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+
+        // The restart: a process that loaded the file.
+        let restarted = process(&crate::config::load(&path).unwrap());
+        assert!(
+            restarted.apply(&deny).await.unwrap().is_noop(),
+            "in force now, so nothing is waiting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key `apply` calls `needs_restart` is one this process tracks, in
+    /// the order `apply` lists them, so the first report and a reconnect's
+    /// read the same. `exec_enabled` is live: once in force it is not waiting.
+    #[tokio::test]
+    async fn every_read_once_key_waits_and_a_live_key_does_not() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-all-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let started = crate::config::test_fixture();
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            started.exec_enabled,
+            true,
+        )
+        .running_on(&started);
+        let desired = DesiredConfig {
+            exec_enabled: Some(!started.exec_enabled),
+            ssh_enabled: Some(!started.ssh_enabled),
+            ssh_authorized_keys: Some(vec!["ssh-ed25519 AAAA test".to_string()]),
+            ssh_account_mode: Some("console_user".to_string()),
+            ssh_port: Some(2222),
+            encoder_cells_deny: Some("hevc_qsv:yuv444".to_string()),
+            fps_deny: Some("hevc_qsv:120".to_string()),
+            color_description: Some("off".to_string()),
+            zero_copy_deny: Some("hevc_qsv:gpu".to_string()),
+            ..Default::default()
+        };
+        let every_key = vec![
+            "ssh_enabled",
+            "ssh_authorized_keys",
+            "ssh_account_mode",
+            "ssh_port",
+            "encoder_cells_deny",
+            "fps_deny",
+            "color_description",
+            "zero_copy_deny",
+        ];
+
+        let first = svc.apply(&desired).await.unwrap();
+        assert_eq!(first.needs_restart, every_key);
+        assert_eq!(first.live, vec!["exec_enabled"]);
+
+        let reconnect = svc.apply(&desired).await.unwrap();
+        assert_eq!(reconnect.needs_restart, every_key);
+        assert!(reconnect.live.is_empty(), "exec is in force, not waiting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deny lifted before the restart that would have applied it: the file
+    /// moves back to what this process runs, so nothing is waiting and a restart
+    /// would change nothing. The file did change, so it is no `noop` either, and
+    /// a key still off the running value keeps its place in the list.
+    #[tokio::test]
+    async fn a_save_back_to_the_running_value_leaves_nothing_waiting() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut started = crate::config::test_fixture();
+        started.zero_copy_deny = Some("none".to_string());
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            false,
+            true,
+        )
+        .running_on(&started);
+        let deny = |value: &str| DesiredConfig {
+            zero_copy_deny: Some(value.to_string()),
+            ..Default::default()
+        };
+
+        let denied = svc.apply(&deny("hevc_qsv:gpu")).await.unwrap();
+        assert_eq!(denied.needs_restart, vec!["zero_copy_deny"]);
+
+        let lifted = svc.apply(&deny("none")).await.unwrap();
+        assert_eq!(
+            lifted,
+            Applied {
+                wrote: true,
+                ..Applied::default()
+            },
+            "written, and nothing waits on it"
+        );
+        assert!(!lifted.is_noop(), "the file changed");
+        assert_eq!(
+            crate::config::load(&path)
+                .unwrap()
+                .zero_copy_deny
+                .as_deref(),
+            Some("none")
+        );
+
+        // A reconnect after that: this time nothing changes at all.
+        assert!(svc.apply(&deny("none")).await.unwrap().is_noop());
+
+        // One key back on the running value, one still off it.
+        let mixed = svc
+            .apply(&DesiredConfig {
+                zero_copy_deny: Some("none".to_string()),
+                fps_deny: Some("hevc_qsv:120".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(mixed.needs_restart, vec!["fps_deny"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The live gate follows the document even when the file needs no write. A
+    /// hand edit changed the file and this process still ran the old value, so
+    /// a push saying the same found the file matching. Before, the report read
+    /// `noop`, the row read `applied`, and the gate stayed where it was. A gate
+    /// that moves is in `live` either way, because this one grants root.
+    #[tokio::test]
+    async fn a_push_moves_the_exec_gate_when_the_file_already_matches_and_says_so() {
+        let dir = std::env::temp_dir().join(format!("fr132-p1c-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut started = crate::config::test_fixture();
+        started.exec_enabled = true;
+        crate::config::save(&path, &started).unwrap();
+        let svc = RemoteConfigServices::new(
+            path.clone(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            true,
+            true,
+        )
+        .running_on(&started);
+
+        let hand_edit = |value: bool| {
+            let mut edited = started.clone();
+            edited.exec_enabled = value;
+            crate::config::save(&path, &edited).unwrap();
+        };
+        let exec = |value: bool| DesiredConfig {
+            exec_enabled: Some(value),
+            ..Default::default()
+        };
+
+        // Closing.
+        hand_edit(false);
+        assert!(svc.exec_enabled(), "a hand edit is not in force yet");
+        let closed = svc.apply(&exec(false)).await.unwrap();
+        assert_eq!(closed.live, vec!["exec_enabled"], "the gate moved");
+        assert!(!closed.wrote, "the file already said so");
+        assert!(!svc.exec_enabled());
+        assert!(svc.apply(&exec(false)).await.unwrap().is_noop());
+
+        // Opening, which is the direction a reader of the log cares about.
+        hand_edit(true);
+        assert!(!svc.exec_enabled());
+        let opened = svc.apply(&exec(true)).await.unwrap();
+        assert_eq!(opened.live, vec!["exec_enabled"], "the gate moved");
+        assert!(!opened.wrote);
+        assert!(svc.exec_enabled());
+        assert!(svc.apply(&exec(true)).await.unwrap().is_noop());
+
+        // A document that does not manage the key leaves the gate alone.
+        hand_edit(false);
+        assert!(
+            svc.apply(&DesiredConfig::default())
+                .await
+                .unwrap()
+                .is_noop()
+        );
+        assert!(svc.exec_enabled(), "not this document's to move");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -918,6 +1566,7 @@ mod tests {
         let applied = Applied {
             live: vec!["exec_enabled"],
             needs_restart: vec!["ssh_enabled"],
+            wrote: true,
         };
         assert!(!applied.is_noop());
         assert!(!applied.live.contains(&"ssh_enabled"));
