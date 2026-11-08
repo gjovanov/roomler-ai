@@ -567,6 +567,18 @@ impl RecordingManager {
         if let Some(mut old) = guard.take() {
             let _ = tokio::time::timeout(Duration::from_secs(2), old.child.wait()).await;
         }
+        // #3467 — the display is this recording's from now until the recorder
+        // has stopped: a mode a session switched goes back before the
+        // recorder opens its capture, so it records the display's own mode,
+        // and display match answers `recording` meanwhile. Let go on a start
+        // that goes no further than here, else by the reader task below.
+        let hold = tokio::task::spawn_blocking(crate::display_match::hold_for_recording)
+            .await
+            .map_err(|e| {
+                StartError::Failed(format!(
+                    "the display could not be held for the recording: {e}"
+                ))
+            })?;
 
         let mut args: Vec<OsString> = vec![
             "record".into(),
@@ -643,6 +655,9 @@ impl RecordingManager {
             let mut reported_end = false;
             // This recorder's own mark in RECORDING: added once, removed once.
             let mut counted = false;
+            // #3467 — its hold on the display, let go once it has stopped (the
+            // file is final then), or when its stdout closes, whichever is first.
+            let mut hold = Some(hold);
             while let Ok(Some(line)) = lines.next_line().await {
                 let Some(ev) = parse_event_line(&line) else {
                     continue;
@@ -668,9 +683,12 @@ impl RecordingManager {
                     if std::mem::take(&mut counted) {
                         RECORDING.fetch_sub(1, Ordering::Relaxed);
                     }
+                    // Before `ended`: a stop answers with the display let go.
+                    drop(hold.take());
                     let _ = ended_tx.send(true);
                 }
             }
+            drop(hold);
             // stdout closed: whatever it said last, the child is done. One
             // that never said how it ended (a crash, bad arguments, a binary
             // without the recorder, a kill) must not leave the state claiming

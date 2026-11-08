@@ -23,7 +23,7 @@ use crate::FleetState;
 ///
 /// The ORDER is inherited from `delete_agent` and is load-bearing: the
 /// holders run while the device is still addressable (a hook's last frame to
-/// it, P2g-4a's purge, is queued before the kick), and the lease is released
+/// it is queued before the kick), and the lease is released
 /// before the row goes, so no `removes` fan races a second release.
 ///
 /// The kick takes the device out of the hub and, since #2267, tells a

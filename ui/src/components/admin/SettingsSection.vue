@@ -163,6 +163,7 @@
         technician reaches a machine they do not administer. They need the
         device's connect code and a password held
         <strong>on the device itself</strong>, which this server never sees.
+        Turning this off also ends any session they have open.
       </v-alert>
 
       <v-switch

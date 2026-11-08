@@ -549,7 +549,7 @@ jobs:
           # cmake_minimum_required(VERSION < 3.5); CMake 3.31+ errors without
           # this policy shim.
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,hive,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
 
       # P3e Phase 2: the .deb's `roomler` is now the CLI SHIM (re-execs
       # `roomlerd cli`) — the Linux twin of the rc.365 MSI change. It must
@@ -1182,7 +1182,7 @@ jobs:
       - name: Build agent (release, full + vp9-444 + ffmpeg-encoder)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,hive,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ffmpeg-encoder,ssh-server,viewer-indicator-x11"
 
       - name: Build the roomler CLI shim (shipped in the .deb alongside roomlerd)
         run: |
@@ -1709,12 +1709,9 @@ jobs:
         # (config `overlay_enabled`).
         # `full-hw` includes `audio` (via `full`) → cpal WASAPI loopback (no
         # extra lib on Windows) + audiopus (bundled libopus via CMake).
-        # `hive` (FR-90 P1i-3): agent sessions, run as the user signed in at
-        # the console, at Medium. Inert until a device's owner sets
-        # `hive_enabled`; a device that never does keeps nothing for them.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full-hw,hive,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
+        run: cargo build -p roomlerd --release --features "full-hw,vp9-444,system-context,ffmpeg-encoder,overlay-l3,overlay-netstack,ssh-server"
 
       - name: Build the roomler CLI shim for the MSI bundle (P3e lever D)
         shell: pwsh
@@ -1750,6 +1747,28 @@ jobs:
             Write-Host "::error::roomlerdw.exe not produced — the LauncherExe wxs component would fail the MSI harvest (LGHT0103)"
             exit 1
           }
+
+      # #3375: the per-Machine MSI's custom-action DLL (agents/roomler-msi-ca),
+      # which carries the Roomler service's Environment across a major upgrade.
+      # msiexec takes it out of the MSI's Binary table and loads it alone, in a
+      # temp folder, on every Windows device an update reaches, many with no
+      # VC++ redistributable. So the CRT is linked in, or the carry fails there:
+      # a DLL that cannot load carries nothing (the upgrade still completes). A
+      # target dir of its own keeps +crt-static off every other crate. The
+      # per-Machine wxs names target\release\roomler_msi_ca.dll at harvest
+      # time, and the payload signing below signs that copy: the one in
+      # target\msi-ca stays unsigned, so a reused seed never ships an old
+      # signature. Before that signing, because nothing after it may build.
+      - name: "Build the per-Machine MSI's custom-action DLL (#3375)"
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build -p roomler-msi-ca --release --target-dir target\msi-ca
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item target\msi-ca\release\roomler_msi_ca.dll target\release\roomler_msi_ca.dll -Force
+          $kb = [math]::Round((Get-Item target\release\roomler_msi_ca.dll).Length/1KB, 0)
+          Write-Host "Staged roomler_msi_ca.dll ($kb KB) for the per-Machine MSI's Binary table"
 
       # FR-6 wave 29, as in build-linux. A reused roomlerd.exe/roomler-shim.exe/
       # roomlerdw.exe may still carry the rehearsal's signature (signing below is in place).
@@ -1862,6 +1881,7 @@ jobs:
             target\release\roomlerd.exe
             target\release\roomler-shim.exe
             target\release\roomlerdw.exe
+            target\release\roomler_msi_ca.dll
           description:              'Roomler Daemon'
           mode:                     ${{ github.event.inputs.signing_mode || 'auto' }}
           require:                  ${{ needs.validate-version.outputs.is_release == 'true' || github.event.inputs.require_signing == 'true' }}
@@ -2170,6 +2190,80 @@ jobs:
             Move-Item $stash $victim
           }
 
+      # #3375: the per-Machine MSI's custom-action DLL is not in the payload the
+      # step above lays out with `msiexec /a`. It rides in the Binary table, and
+      # msiexec loads it from a temp folder on every device a major upgrade
+      # reaches. So read it out of the MSI that ships and hold it to what a
+      # fresh Windows has: API sets and System32 DLLs, and no redistributable,
+      # refused by name because this runner HAS the VC++ redistributable. A
+      # DLL that cannot load carries nothing, though the upgrade still completes
+      # (Return="ignore"). When the payload was signed, the DLL in the MSI must
+      # carry the payload's signer: AV scans it where msiexec extracts it.
+      - name: "Assert the per-Machine MSI's custom-action DLL loads on a fresh Windows (#3375)"
+        shell: pwsh
+        env:
+          PAYLOAD_SIGNED: ${{ steps.sign_payload.outputs.signed }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path '${{ steps.locate_pm.outputs.artifact }}').Path
+          $out = Join-Path $env:RUNNER_TEMP 'msi-ca-audit'
+          Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          # `dark -x` writes each Binary row's stream to Binary\<Id>.
+          dark.exe -nologo -x $out $msi (Join-Path $out 'per-machine.wxs') | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "dark.exe failed on the per-Machine MSI: $LASTEXITCODE" }
+          $dll = Join-Path $out 'Binary\RoomlerMsiCa'
+          if (-not (Test-Path $dll)) { throw "the per-Machine MSI's Binary table has no RoomlerMsiCa" }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
+                     Sort-Object FullName | Select-Object -Last 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
+          function Get-Problems([string]$path) {
+            $imports = & $dumpbin /dependents $path |
+              Select-String -Pattern '^\s{4}(\S+\.dll)$' |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+            if (-not $imports) { return @('dumpbin listed no imports (parse broke?)') }
+            Write-Host "  $(Split-Path -Leaf $path) imports: $($imports -join ', ')"
+            @($imports | ForEach-Object {
+              if ($_ -match '^(msvcp|vcruntime|concrt|mfc|vcomp|msvcr)') { "$_ is a redistributable" }
+              elseif ($_ -match '^(api-ms-win-|ext-ms-win-)') { }
+              elseif (-not (Test-Path (Join-Path $env:SystemRoot 'System32' $_))) { "$_ does not ship with Windows" }
+            })
+          }
+          $problems = @(Get-Problems $dll)
+          if ($problems.Count -gt 0) {
+            $problems | ForEach-Object { Write-Host "::error::roomler_msi_ca.dll in the per-Machine MSI: $_" }
+            throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
+          }
+          $exports = (& $dumpbin /exports $dll) -join "`n"
+          foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
+            if ($exports -notmatch "\b$e\b") { throw "the custom-action DLL does not export $e" }
+          }
+          Write-Host 'OK: the DLL imports only what Windows ships, and exports both entry points'
+
+          # Negative control, as in the step above: roomlerd.exe imports the VC++
+          # runtime (the MSI ships it app-local), so this audit must refuse it.
+          $neg = @(Get-Problems 'target\release\roomlerd.exe' | Where-Object { $_ -match 'redistributable' })
+          if ($neg.Count -eq 0) {
+            throw 'NEGATIVE CONTROL IMPOSSIBLE: roomlerd.exe imports no VC++ runtime DLL, so this audit was never shown to refuse one. Either the daemon now links the CRT statically or the dumpbin parse is wrong; both need a human.'
+          }
+          Write-Host "OK: the same audit refuses roomlerd.exe: $($neg[0])"
+
+          $sig = Get-AuthenticodeSignature $dll
+          $cn  = if ($sig.SignerCertificate.Subject -match 'CN=([^,]+)') { $Matches[1].Trim() } else { '<none>' }
+          Write-Host "signature: $($sig.Status), signer: $cn"
+          if ($env:PAYLOAD_SIGNED -eq 'true') {
+            # The subject, not the thumbprint: an Artifact Signing certificate
+            # can rotate between two requests.
+            $want = (Get-AuthenticodeSignature 'target\release\roomlerd.exe').SignerCertificate.Subject
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -ne $want) {
+              throw "the DLL in the per-Machine MSI is not signed as the payload is ($($sig.Status), $cn)"
+            }
+            Write-Host 'OK: the DLL in the MSI carries the payload signature'
+          }
+
       - name: 'Verify MSI size budget (P4b: MSI carries the tunnel CLI)'
         # Budget history: rc.63 baseline 8 MB (pre-ffmpeg); rc.65's
         # Option B guard capped ffmpeg bloat at a 24 MB hard ceiling;
@@ -2230,8 +2324,20 @@ jobs:
           # FR-97, FR-99, FR-118/119), not a stray payload. So the baseline is
           # the measured 22.00 and the ceiling 26: the same ~4 MB of headroom,
           # the warning back at +2 (24).
-          $p4bBaseline = 22.00
-          $ceilingMB = 26
+          # FR-137 D10 re-baseline (2026-11-05). P2 (#3475) took FR-90's Hive
+          # out of the agent. 0.4.201, the first release built without it
+          # (run 42042701635), measured the per-User MSI at 19.15 MB and the
+          # per-Machine at 19.28: -2.94 each against 0.4.200 (22.09, 22.22),
+          # and the Linux amd64 .deb -2.46 (18.80 -> 16.34), so it is the
+          # agent's code, not a Windows payload. Left at 22.00, the baseline
+          # sat 2.72 MB above the real size: the next ~4.7 MB of accidental
+          # growth would have passed with no warning, the high-baseline
+          # failure this guard exists to catch. So the baseline is the larger
+          # flavour's measured 19.28 (the guard compares the max) and the
+          # ceiling moves 26 -> 23: ~3.7 MB of headroom, the warning at +2
+          # (21.28) before the fail.
+          $p4bBaseline = 19.28
+          $ceilingMB = 23
           $deltaMB = $maxMsi - $p4bBaseline
           Write-Host "::notice::per-User MSI = $([math]::Round($msiPerUser, 2)) MB"
           Write-Host "::notice::per-Machine MSI = $([math]::Round($msiPerMachine, 2)) MB"
@@ -2806,7 +2912,7 @@ jobs:
         # again sends macOS prompts back to the desktop companion, which works.
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build -p roomlerd --release --features "full,hive,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder,viewer-indicator-macos" --target aarch64-apple-darwin
+        run: cargo build -p roomlerd --release --features "full,vp9-444,vp9-444-bindgen,overlay-l3,overlay-netstack,ssh-server,ffmpeg-encoder,viewer-indicator-macos" --target aarch64-apple-darwin
 
       # The `roomler` CLI. macOS shipped WITHOUT one until rc.454 — the pkg
       # payload was the .app and nothing else — so `roomler peers` was

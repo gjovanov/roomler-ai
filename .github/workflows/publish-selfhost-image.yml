@@ -202,10 +202,15 @@ jobs:
           # file. These live for one job and die with the runner.
           DBPW="$(openssl rand -hex 16)"
           JWT="$(openssl rand -hex 32)"
+          # The compose file's own pins, read from it: this smoke exists to prove
+          # the image serves on what a self-hoster runs (#2034).
+          MONGO_REF="$(sed -nE 's/^[[:space:]]*image:[[:space:]]*(mongo:[^[:space:]]+).*/\1/p' docker-compose.selfhost.yml)"
+          REDIS_REF="$(sed -nE 's/^[[:space:]]*image:[[:space:]]*(redis:[^[:space:]]+).*/\1/p' docker-compose.selfhost.yml)"
+          echo "smoke against $MONGO_REF and $REDIS_REF"
           docker network create roomler-smoke
           docker run -d --name mongo --network roomler-smoke \
-            -e MONGO_INITDB_ROOT_USERNAME=smoke -e MONGO_INITDB_ROOT_PASSWORD="$DBPW" mongo:7
-          docker run -d --name redis --network roomler-smoke redis:7-alpine
+            -e MONGO_INITDB_ROOT_USERNAME=smoke -e MONGO_INITDB_ROOT_PASSWORD="$DBPW" "$MONGO_REF"
+          docker run -d --name redis --network roomler-smoke "$REDIS_REF"
           docker run -d --name roomler --network roomler-smoke -p 8080:80 \
             -e ROOMLER__APP__ENVIRONMENT=development \
             -e ROOMLER__JWT__SECRET="$JWT" \

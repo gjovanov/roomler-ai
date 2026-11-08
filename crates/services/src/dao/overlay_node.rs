@@ -3,7 +3,9 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
-use roomler_ai_remote_control::models::{AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode};
+use roomler_ai_remote_control::models::{
+    AgentStatus, DEFAULT_ROUTE_V4, NodeRef, OverlayNode, RetiredKey,
+};
 
 use super::base::{BaseDao, DaoResult};
 
@@ -110,6 +112,9 @@ impl OverlayNodeDao {
     ///
     /// Live-scoped: tombstones keep their key as the forensic record and must
     /// not block a new joiner.
+    ///
+    /// FR-40 P2 — served by the `(network_id, wg_public_key)` index; before
+    /// it, this was an unindexed `find_one` on every join.
     pub async fn wg_key_taken_by_other(
         &self,
         network_id: ObjectId,
@@ -126,6 +131,34 @@ impl OverlayNodeDao {
             })
             .await?
             .is_some())
+    }
+
+    /// FR-40 P2 — the ledger entry for `wg_public_key` if ANY node of this
+    /// network, live or tombstoned, has retired it.
+    ///
+    /// Network-wide on purpose: a retired key is retired, whichever row moved
+    /// away from it — a config copied to another machine of the org must not
+    /// make it live again. Still per org, because a network is: another org's
+    /// node for the same machine holds its own key (`AgentConfig::for_org`).
+    /// Tombstones count, because removal is not a pardon. Served by the
+    /// multikey `(network_id, retired_keys.public_key)` index.
+    pub async fn retired_key_in_network(
+        &self,
+        network_id: ObjectId,
+        wg_public_key: &str,
+    ) -> DaoResult<Option<RetiredKey>> {
+        Ok(self
+            .base
+            .find_one(doc! {
+                "network_id": network_id,
+                "retired_keys.public_key": wg_public_key,
+            })
+            .await?
+            .and_then(|n| {
+                n.retired_keys
+                    .into_iter()
+                    .find(|r| r.public_key == wg_public_key)
+            }))
     }
 
     /// Insert a fresh node with a freshly-allocated overlay IP.
@@ -162,6 +195,8 @@ impl OverlayNodeDao {
             overlay_ip,
             wg_public_key,
             key_epoch,
+            // FR-40 P2 — a fresh node has moved away from no key yet.
+            retired_keys: Vec::new(),
             // The join carries the agent's DIRECT LAN candidates; seed BOTH
             // buckets. The relay trickle later replaces `endpoints` only —
             // `lan_endpoints` survives so peers keep seeing the LAN address.
@@ -211,6 +246,14 @@ impl OverlayNodeDao {
     /// [`Self::find_live_by_tenant_and_machine`]), so the `deleted_at: Null` in
     /// the `$set` below is a vestigial no-op — kept as belt-and-braces in case
     /// the lookup is ever widened.
+    ///
+    /// FR-40 P2 — `retire` is the key this join replaces (the caller passes it
+    /// only when the presented key differs from the row's). It is appended to
+    /// `retired_keys` in the SAME write that installs the new key, and only if
+    /// the row still holds it and has not retired it already: a racing join
+    /// that moved the row first, or a key already in the ledger, falls back to
+    /// the plain refresh, so an entry is never written twice nor for a key the
+    /// row no longer held.
     #[allow(clippy::too_many_arguments)]
     pub async fn rehydrate(
         &self,
@@ -230,81 +273,101 @@ impl OverlayNodeDao {
         supports_org_relay: bool,
         advertised_routes: &[String],
         route_offer_withheld: Option<&str>,
+        retire: Option<&RetiredKey>,
     ) -> DaoResult<OverlayNode> {
         let node_ref_bson = bson::to_bson(node_ref).unwrap_or(bson::Bson::Null);
+        let set = doc! {
+            "node_ref": node_ref_bson,
+            // Phase 0 — the join handler passes the stable name
+            // (existing name reused, or a freshly deduped one when
+            // backfilling a pre-Phase-0 row).
+            "name": name,
+            // Phase 1 — refresh the CLAIMED routes on each join.
+            // `approved_routes` is admin-controlled and intentionally
+            // NOT touched here, so approvals survive a rejoin.
+            "advertised_routes": advertised_routes,
+            // FR-97 P0b — and why they are empty, refreshed with
+            // them: null clears a reason the device no longer has.
+            "route_offer_withheld": route_offer_withheld,
+            "wg_public_key": wg_public_key,
+            "key_epoch": key_epoch as i64,
+            // Refresh BOTH buckets from the join (rc.135) — a DHCP
+            // IP change is picked up, and the LAN bucket is restored
+            // before the next relay trickle replaces `endpoints`.
+            "endpoints": endpoints,
+            "lan_endpoints": endpoints,
+            // Phase B — clear stale srflx on re-join; the node
+            // re-gathers + re-trickles fresh srflx this connection
+            // (a prior session's NAT mapping is meaningless now).
+            "srflx_endpoints": [],
+            // Phase C (A8) — clear the stale NAT class in the SAME
+            // $set (a prior session's NAT type is meaningless after
+            // a roam); the node re-probes + re-trickles it.
+            "srflx_nat": bson::Bson::Null,
+            // Dialer honesty — clear with the srflx bucket: the
+            // restarted runtime re-earns the verdict (and its
+            // first srflx trickle re-declares it).
+            "udp_dialer_ok": bson::Bson::Null,
+            // Phase B — the capability vector is re-measured
+            // ~45 s after start; a prior session's measurements
+            // are meaningless on a possibly-new network.
+            "caps": bson::Bson::Null,
+            "caps_measured_at": bson::Bson::Null,
+            // C4 stage 2 (PR-B) — clear the stale warm-leg address
+            // for the same reason: a restarted runtime holds no
+            // allocation; its heartbeats re-mirror a fresh one.
+            "warm_relay_endpoint": bson::Bson::Null,
+            // rc.142 — refresh the QUIC capability on each re-join
+            // (an operator may flip ROOMLERD_OVERLAY_QUIC).
+            "supports_quic": supports_quic,
+            // Phase D — refresh the single-relay capability on each
+            // re-join (an operator may flip OVERLAY_RELAY_SINGLE).
+            "supports_relay_single": supports_relay_single,
+            // Phase D (DERP) — refresh the DERP capability on each
+            // re-join (an operator may flip OVERLAY_DERP).
+            "supports_derp": supports_derp,
+            // P7 — refresh the forced-DERP capability likewise.
+            "supports_forced_derp": supports_forced_derp,
+            // U2 — refresh the server-relay-strategy opt-in likewise
+            // (an operator may flip OVERLAY_SERVER_RELAY_STRATEGY).
+            "supports_server_relay_strategy": supports_server_relay_strategy,
+            "supports_derp_floor": supports_derp_floor,
+            // Data-probe — refresh the overlay-native-echo capability
+            // on each re-join (a downgrade must clear it). Hand-built
+            // doc: adding the field HERE is load-bearing (a doc!{} miss
+            // is not a compile error and silently never persists).
+            "supports_overlay_echo": supports_overlay_echo,
+            "supports_org_relay": supports_org_relay,
+            "status": bson::to_bson(&AgentStatus::Online).unwrap(),
+            "last_seen_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+            "deleted_at": bson::Bson::Null,
+        };
+        if let Some(entry) = retire {
+            let entry_bson = bson::to_bson(entry).unwrap_or(bson::Bson::Null);
+            let retired = self
+                .base
+                .update_one(
+                    doc! {
+                        "_id": node_id,
+                        "wg_public_key": &entry.public_key,
+                        "retired_keys.public_key": { "$ne": &entry.public_key },
+                    },
+                    doc! {
+                        "$set": set.clone(),
+                        "$push": { "retired_keys": {
+                            "$each": [entry_bson],
+                            "$slice": -OverlayNode::MAX_RETIRED_KEYS,
+                        }},
+                    },
+                )
+                .await?;
+            if retired {
+                return self.base.find_by_id(node_id).await;
+            }
+        }
         self.base
-            .update_by_id(
-                node_id,
-                doc! {
-                    "$set": {
-                        "node_ref": node_ref_bson,
-                        // Phase 0 — the join handler passes the stable name
-                        // (existing name reused, or a freshly deduped one when
-                        // backfilling a pre-Phase-0 row).
-                        "name": name,
-                        // Phase 1 — refresh the CLAIMED routes on each join.
-                        // `approved_routes` is admin-controlled and intentionally
-                        // NOT touched here, so approvals survive a rejoin.
-                        "advertised_routes": advertised_routes,
-                        // FR-97 P0b — and why they are empty, refreshed with
-                        // them: null clears a reason the device no longer has.
-                        "route_offer_withheld": route_offer_withheld,
-                        "wg_public_key": wg_public_key,
-                        "key_epoch": key_epoch as i64,
-                        // Refresh BOTH buckets from the join (rc.135) — a DHCP
-                        // IP change is picked up, and the LAN bucket is restored
-                        // before the next relay trickle replaces `endpoints`.
-                        "endpoints": endpoints,
-                        "lan_endpoints": endpoints,
-                        // Phase B — clear stale srflx on re-join; the node
-                        // re-gathers + re-trickles fresh srflx this connection
-                        // (a prior session's NAT mapping is meaningless now).
-                        "srflx_endpoints": [],
-                        // Phase C (A8) — clear the stale NAT class in the SAME
-                        // $set (a prior session's NAT type is meaningless after
-                        // a roam); the node re-probes + re-trickles it.
-                        "srflx_nat": bson::Bson::Null,
-                        // Dialer honesty — clear with the srflx bucket: the
-                        // restarted runtime re-earns the verdict (and its
-                        // first srflx trickle re-declares it).
-                        "udp_dialer_ok": bson::Bson::Null,
-                        // Phase B — the capability vector is re-measured
-                        // ~45 s after start; a prior session's measurements
-                        // are meaningless on a possibly-new network.
-                        "caps": bson::Bson::Null,
-                        "caps_measured_at": bson::Bson::Null,
-                        // C4 stage 2 (PR-B) — clear the stale warm-leg address
-                        // for the same reason: a restarted runtime holds no
-                        // allocation; its heartbeats re-mirror a fresh one.
-                        "warm_relay_endpoint": bson::Bson::Null,
-                        // rc.142 — refresh the QUIC capability on each re-join
-                        // (an operator may flip ROOMLERD_OVERLAY_QUIC).
-                        "supports_quic": supports_quic,
-                        // Phase D — refresh the single-relay capability on each
-                        // re-join (an operator may flip OVERLAY_RELAY_SINGLE).
-                        "supports_relay_single": supports_relay_single,
-                        // Phase D (DERP) — refresh the DERP capability on each
-                        // re-join (an operator may flip OVERLAY_DERP).
-                        "supports_derp": supports_derp,
-                        // P7 — refresh the forced-DERP capability likewise.
-                        "supports_forced_derp": supports_forced_derp,
-                        // U2 — refresh the server-relay-strategy opt-in likewise
-                        // (an operator may flip OVERLAY_SERVER_RELAY_STRATEGY).
-                        "supports_server_relay_strategy": supports_server_relay_strategy,
-                        "supports_derp_floor": supports_derp_floor,
-                        // Data-probe — refresh the overlay-native-echo capability
-                        // on each re-join (a downgrade must clear it). Hand-built
-                        // doc: adding the field HERE is load-bearing (a doc!{} miss
-                        // is not a compile error and silently never persists).
-                        "supports_overlay_echo": supports_overlay_echo,
-                        "supports_org_relay": supports_org_relay,
-                        "status": bson::to_bson(&AgentStatus::Online).unwrap(),
-                        "last_seen_at": DateTime::now(),
-                        "updated_at": DateTime::now(),
-                        "deleted_at": bson::Bson::Null,
-                    }
-                },
-            )
+            .update_by_id(node_id, doc! { "$set": set })
             .await?;
         self.base.find_by_id(node_id).await
     }

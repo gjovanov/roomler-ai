@@ -57,6 +57,8 @@ import {
   type SharpenMode,
 } from '@/workers/rc-fsr-render'
 import { colorSpaceLabel } from '@/workers/rc-decoder-config'
+import { MEDIA_BUCKETS, type ViewerMediaWindow } from '@/workers/rc-media-window'
+import { createChannelMoveWatch, createDeliveryGapClock, moveVideoChannelToWorker } from '@/workers/rc-video-channel'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -102,6 +104,7 @@ import {
   type BenchMode,
   type BenchPath,
   type BenchProber,
+  type RcL4Join,
   type VideoBenchSampler,
 } from './rcBench'
 import { useSnackbar } from './useSnackbar'
@@ -654,11 +657,12 @@ export function nextStallTicks(prev: number, advanced: boolean, agentSaidNoPixel
   return advanced || agentSaidNoPixels ? 0 : prev + 1
 }
 
-/** The counters one media-watchdog tick compares. */
+/** The counters one media-watchdog tick compares. `dcFrames` is the one
+ *  data-channel path's decoded frames (FR-135 R3: one worker for every codec,
+ *  where VP9 and HEVC each had a counter). */
 export interface MediaProgress {
   rtpBytes: number
-  vp9Frames: number
-  hevcFrames: number
+  dcFrames: number
 }
 
 /**
@@ -671,11 +675,11 @@ export interface MediaProgress {
  * that first frame RTP still counts, because the viewer opens its channel
  * speculatively and an agent that ignores it sends RTP instead. A path taken
  * down reads zero frames, so a `<video>` fallback is judged on RTP again.
- * `transportOnly` false is the old rule, any of the three, for the kill switch.
+ * `transportOnly` false is the old rule, either counter, for the kill switch.
  */
 export function mediaAdvanced(prev: MediaProgress, cur: MediaProgress, transportOnly: boolean): boolean {
-  if (cur.vp9Frames > prev.vp9Frames || cur.hevcFrames > prev.hevcFrames) return true
-  const onDataChannel = transportOnly && (cur.vp9Frames > 0 || cur.hevcFrames > 0)
+  if (cur.dcFrames > prev.dcFrames) return true
+  const onDataChannel = transportOnly && cur.dcFrames > 0
   return !onDataChannel && cur.rtpBytes > prev.rtpBytes
 }
 
@@ -2437,6 +2441,8 @@ export function decodeStatWireMessage(
   probeRttMs?: number | null,
   link?: { rxBps: number; queueMs: number | null } | null,
   arrival?: { avgMs: number } | null,
+  media?: Partial<ViewerMediaWindow> | null,
+  queueArrMs?: number | null,
 ): Record<string, unknown> {
   const f = Number.isFinite(fps) && fps > 0 ? Math.min(Math.round(fps), 240) : 0
   const msg: Record<string, unknown> = { t: 'rc:decodestat', fps: f, struggling: !!struggling }
@@ -2486,6 +2492,54 @@ export function decodeStatWireMessage(
     // window cannot wrap into its own sign.
     msg.queue_ms = Math.min(Math.max(Math.round(link.queueMs), -32768), 32767)
   }
+  // FR-135 R3 — the same growth read at ARRIVAL: the worker's queue drift over
+  // whole frames as their last chunk lands, before the gate, the backlog drop
+  // and the decoder (`queueArrMs`), where `queue_ms` is read at paint, so a
+  // decoder falling behind cannot read as the link growing. Beside it, never
+  // instead: the live law and FR-63's shadow read `queue_ms`, and FR-63's B2
+  // chooses. Sent only when the worker counted it (two whole frames or more in
+  // the window), on its own, in `queue_ms`'s i16 clamp. No agent reads it yet.
+  if (typeof queueArrMs === 'number' && Number.isFinite(queueArrMs)) {
+    msg.queue_arr_ms = Math.min(Math.max(Math.round(queueArrMs), -32768), 32767)
+  }
+  // FR-135 R0 (N9-N12, N16) — the decode worker's window of media numbers
+  // (`rc-media-window.ts`), for the agent's heartbeat and the session's
+  // summary. Each field goes only when the worker counted it, so absent is
+  // **not counted**, never zero; nothing here is read by a rate law, and the
+  // fields above are unchanged. A `_ms` field is twelve log-2 ms buckets for
+  // this window; `chunk_gaps`, `freezes` and `painted` are cumulative.
+  if (media) {
+    const hist = (v: unknown): number[] | null =>
+      Array.isArray(v) &&
+      v.length === MEDIA_BUCKETS &&
+      v.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0)
+        ? v.map((n: number) => Math.min(n, 4_294_967_295))
+        : null
+    const count = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isInteger(v) && v >= 0 ? Math.min(v, Number.MAX_SAFE_INTEGER) : null
+    const hists: [string, unknown][] = [
+      ['dec_ms', media.dec],
+      ['paint_ms', media.paint],
+      ['fwd_ms', media.fwd],
+      ['backlog_ms', media.backlog],
+      ['arr_gap_ms', media.arrGap],
+      ['gate_ms', media.gate],
+    ]
+    for (const [key, v] of hists) {
+      const h = hist(v)
+      if (h) msg[key] = h
+    }
+    const counts: [string, unknown][] = [
+      ['chunk_gaps', media.chunkGaps],
+      ['freezes', media.freezes],
+      ['painted', media.painted],
+    ]
+    for (const [key, v] of counts) {
+      const n = count(v)
+      if (n !== null) msg[key] = n
+    }
+    if (typeof media.decoderHw === 'boolean') msg.decoder_hw = media.decoderHw
+  }
   // FR-132 P1 — this viewer counts its decode errors (one `rc:decode-error`
   // each, `decodeErrorWireMessage`), so the agent reports the session's count
   // and a zero is a measured one. An older viewer sends no `de`, and its
@@ -2512,7 +2566,8 @@ export function decodeErrorStage(type: string): DecodeErrorStage {
  *  session's `rc:session.stats` (`decode_errors`), which is how a fleet week
  *  of a GPU-input cell can be read for decode errors without anyone watching
  *  a viewer. `path` is the decode worker (`webcodecs` = the RTP transform,
- *  `vp9-444` and `hevc` = the data-channel workers). The codec and the
+ *  `vp9-444` and `hevc` = the data-channel worker, on VP9/AV1/H.264 and on
+ *  HEVC: the names it kept from its two workers, `DcPathLabel`). The codec and the
  *  decoder's message are cut short; the agent bounds them again. Pure so the
  *  wire shape is unit-tested. */
 export function decodeErrorWireMessage(
@@ -3056,18 +3111,28 @@ export async function isVp9_420DecodeSupported(): Promise<boolean> {
   }
 }
 
-/** rc.78 Ã¢ÂÂ feature-detect HEVC decode via WebCodecs. rc.94 Ã¢ÂÂ probes
- *  `hev1.1.6.L153.B0` (Main profile, Level **5.1**), matching the
- *  worker's `DEFAULT_HEVC_CODEC`. MUST stay in sync with the worker:
- *  the probe has to declare the SAME level the worker will configure,
- *  or we'd green-light a level the decoder then rejects on real bytes.
- *  Bumped from L3.1 (`L93`) which maxed at ~1280ÃÂ720 and rendered the
- *  field host's 1920ÃÂ1200 capture as a black screen (see worker note).
- *  The composable probes once on construction + caches in
- *  `hevcSupported`; `connect()` re-probes on the off-chance the cache
- *  hasn't resolved yet.
+/** The HEVC codec string the data-channel worker configures for a Main-profile
+ *  session, and the one `isHevcDecodeSupported` probes: HEVC Main, Level
+ *  **5.1**, no decoder description (Annex-B). One constant, so the probe
+ *  declares the level the decoder is then configured with: a probe at another
+ *  level would green-light a stream the decoder rejects on real bytes.
+ *  rc.94 — bumped from L3.1 (`L93`). L3.1 maxes at 983,040 luma samples
+ *  (~1280×720); the field SystemContext host (WINHOST-E) captures 1920×1200 =
+ *  2,304,000 samples, which exceeds even L4.1 (2,228,224), so Chromium's HW
+ *  HEVC decoder rejected the stream and rendered a BLACK screen. L5.1
+ *  (`L153`, 8,912,896 samples, up to 4K@64) covers every realistic desktop
+ *  resolution and is HW-decodable on Iris Xe / RTX 5090 (the Gate 0 hosts).
+ *  The level is a declared MAX; a smaller stream decodes fine under it.
+ *  FR-135 R3 moved it here from the HEVC worker's default when the two
+ *  data-channel workers became one. */
+export const HEVC_MAIN_CODEC_STRING = 'hev1.1.6.L153.B0'
+
+/** rc.78 — feature-detect HEVC decode via WebCodecs, at
+ *  {@link HEVC_MAIN_CODEC_STRING}. The composable probes once on construction
+ *  + caches in `hevcSupported`; `connect()` re-probes on the off-chance the
+ *  cache hasn't resolved yet.
  *
- *  Unlike VP9, HEVC has NO software fallback in WebCodecs Ã¢ÂÂ Chromium
+ *  Unlike VP9, HEVC has NO software fallback in WebCodecs - Chromium
  *  only enables HEVC decode when the OS provides a HW decoder.
  *  Returns false on:
  *  - any pre-WebCodecs browser (no `VideoDecoder` at all)
@@ -3084,7 +3149,7 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
   const isConfigSupported = g.VideoDecoder?.isConfigSupported
   if (typeof isConfigSupported !== 'function') return false
   try {
-    const res = await isConfigSupported({ codec: 'hev1.1.6.L153.B0' })
+    const res = await isConfigSupported({ codec: HEVC_MAIN_CODEC_STRING })
     return res?.supported === true
   } catch {
     return false
@@ -3093,7 +3158,7 @@ export async function isHevcDecodeSupported(): Promise<boolean> {
 
 /** P7 — HEVC Rext (Range extensions) 8-bit 4:4:4 codec string, Level 5.1.
  *  The Annex-B no-description contract is identical to the Main-profile
- *  string the HEVC worker ships; only the profile fields differ
+ *  string ({@link HEVC_MAIN_CODEC_STRING}); only the profile fields differ
  *  (profile_idc 4 + the Rext compatibility flag). */
 export const HEVC_REXT_CODEC_STRING = 'hev1.4.10.L153.B0'
 
@@ -4331,6 +4396,39 @@ export function storedDecodeRecover(): boolean {
   }
 }
 
+/** FR-135 R3 — the per-browser switch that moves the `video-bytes` channel
+ *  into the data-channel decode worker, so the main thread leaves the
+ *  per-chunk path (`moveVideoChannelToWorker`). `localStorage.setItem(
+ *  'roomler-rc-dc-worker', '1')` turns it on and `'0'` off, then reconnect.
+ *  Anything else, no value, or storage that cannot be read is
+ *  {@link DC_WORKER_DEFAULT}. Where this browser cannot transfer an
+ *  RTCDataChannel the page relays the channel either way. Read once per
+ *  connect, like every `roomler-rc-*` knob. Pure + exported for tests. */
+export const DC_WORKER_STORAGE_KEY = 'roomler-rc-dc-worker'
+
+/** FR-135 R3 — whether the channel moves into the worker when this browser has
+ *  not said. OFF until S11, a real session at 60 Mbit/s or more, shows the
+ *  move beats the relay on `fwd_ms` p95 by more than run-to-run spread
+ *  (FR-135 §7.5's R3 row). The flip is this one line. */
+export const DC_WORKER_DEFAULT = false
+
+export function storedDcWorker(): boolean {
+  try {
+    const raw = (globalThis.localStorage?.getItem(DC_WORKER_STORAGE_KEY) ?? '').trim()
+    if (raw === '1') return true
+    if (raw === '0') return false
+  } catch {
+    /* storage unreadable: the default */
+  }
+  return DC_WORKER_DEFAULT
+}
+
+/** FR-135 R3 — how long after the worker's first answer the page waits to hear
+ *  a moved channel arrived. The worker answers `init-canvas` before it reads
+ *  the channel, in the same run of its queue, so this only has to cover a
+ *  worker that could not take the channel; a slow module load is not in it. */
+export const DC_WORKER_ATTACH_GRACE_MS = 2000
+
 /** The browser's ICE-server entry for the loopback TURN (dialled over loopback,
  *  never firewalled). Pure + exported for tests. */
 export function localRelayIceServer(desc: LocalRelayDescriptor): IceServer {
@@ -4895,6 +4993,12 @@ export function isChromeWithBrokenScriptTransform(): boolean {
  *  retransmit latency. */
 export const VP9_444_DC_LABEL = 'video-bytes'
 
+/** FR-135 R3 — the name a data-channel video path goes by: `hevc` on the HEVC
+ *  transport, `vp9-444` on VP9, AV1 and H.264, the names their two workers
+ *  had before R3 made them one. It is `rc:decode-error`'s `path`, which the
+ *  agent counts by, and the bench record's, so it stays as it was. */
+export type DcPathLabel = 'vp9-444' | 'hevc'
+
 /**
  * FR-17 stage B — how the `video-bytes` channel is opened.
  *
@@ -5391,7 +5495,7 @@ export function useRemoteControl(
   /** 1 Hz media-progress watchdog (runs only while connected). */
   let watchdogTimer: ReturnType<typeof setInterval> | null = null
   let stallTicks = 0
-  let lastMediaProgress: MediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+  let lastMediaProgress: MediaProgress = { rtpBytes: 0, dcFrames: 0 }
 
   function clearPcDisconnectedTimer() {
     if (pcDisconnectedTimer !== null) {
@@ -5439,7 +5543,7 @@ export function useRemoteControl(
       watchdogTimer = null
     }
     stallTicks = 0
-    lastMediaProgress = { rtpBytes: 0, vp9Frames: 0, hevcFrames: 0 }
+    lastMediaProgress = { rtpBytes: 0, dcFrames: 0 }
     degraded.value = null
   }
 
@@ -5456,7 +5560,7 @@ export function useRemoteControl(
   function startMediaWatchdog() {
     if (watchdogTimer !== null) return
     stallTicks = 0
-    lastMediaProgress = { rtpBytes: statsPrevBytes, vp9Frames: 0, hevcFrames: 0 }
+    lastMediaProgress = { rtpBytes: statsPrevBytes, dcFrames: 0 }
     // FR-93 P5f — when the interval this tick counts began (see advanceEndsWait).
     let tickFromMs = Date.now()
     watchdogTimer = setInterval(() => {
@@ -5465,8 +5569,7 @@ export function useRemoteControl(
       if (phase.value !== 'connected') return
       const cur = {
         rtpBytes: statsPrevBytes,
-        vp9Frames: vp9_444FramesDecoded.value,
-        hevcFrames: hevcFramesDecoded.value,
+        dcFrames: dcFramesDecoded.value,
       }
       // No hasMedia special-case: a session that reached 'connected'
       // but never produced a track/frame is just as dead as one that
@@ -5652,6 +5755,10 @@ export function useRemoteControl(
    *  built with (`avc1.640034`, `av01.0.13M.08`, …). The pill's honest label
    *  until `rc:video-info` names the agent's real encoder. */
   const dcDecoderCodec = ref<string | null>(null)
+  /** FR-135 R0 (N2) — whether the browser says the active DataChannel decoder
+   *  is hardware (`rc-media-window.ts`), for the `rc.l4` record; `null` until
+   *  the worker knows. */
+  let dcDecoderHw: boolean | null = null
   /** P6 — the agent's InputArbiter state (participants, mode, floor
    *  holder). Null until the first `rc:control.state` broadcast; old
    *  agents never send it, so the multi-user UI self-hides. */
@@ -5808,8 +5915,8 @@ export function useRemoteControl(
   let sessionCellChroma: 'yuv420' | 'yuv444' = 'yuv420'
   /** FR-17 — true when THIS session negotiated per-chunk framing: the
    *  agent advertised `chunk-framing` in `AgentCaps.video` and we asked
-   *  for it in `rc:session.request`. Read by `startVp9_444Path` /
-   *  `startHevcPath` when they hand the worker its `init-canvas`, so the
+   *  for it in `rc:session.request`. Read by `startDcPath` when it hands
+   *  the worker its `init-canvas`, so the
    *  parse side can never be enabled without the request side having
    *  been sent — an unframed stream parsed as framed is garbage, not a
    *  degraded picture, so the two must move together. */
@@ -5825,15 +5932,31 @@ export function useRemoteControl(
   /** FR-130 P2 — true when THIS session's decoders are told the colour space
    *  the agent converted with (set S: BT.601 matrix, limited range;
    *  `workers/rc-decoder-config.ts`). Resolved beside `sessionChunkFraming`,
-   *  before any worker is started: the data-channel workers get it in their
+   *  before any worker is started: the data-channel worker gets it in its
    *  `init-canvas`, the RTP WebCodecs worker in its transform's options. */
   let sessionColorSpace = false
   /** FR-135 R1 — true when THIS session recovers a decode error in place
    *  (`workers/rc-decode-recovery.ts`), which is all of them unless this
    *  browser set `roomler-rc-decode-recover=0`. Resolved beside
-   *  `sessionChunkFraming`; the data-channel workers get it in `init-canvas`,
+   *  `sessionChunkFraming`; the data-channel worker gets it in `init-canvas`,
    *  and the media watchdog reads it for what counts as progress. */
   let sessionDecodeRecover = false
+  /** FR-135 R3 — true when THIS session tries to move its video channel into
+   *  the decode worker (`storedDcWorker`, `roomler-rc-dc-worker`). Resolved
+   *  beside `sessionChunkFraming`, before the path starts. */
+  let sessionDcWorker = false
+  /** FR-135 R3 — true while the active path's channel is in the worker: the
+   *  browser took the transfer. False on the relay, the default. */
+  let dcChannelInWorker = false
+  /** FR-135 R3 — a move failed on this page, so every later session relays. */
+  let dcWorkerMoveFailed = false
+  /** FR-135 R3 — the page keeps no copy of a channel it moved, so until the
+   *  worker says `video-channel-attached` the move can still have failed
+   *  (`createChannelMoveWatch`, then `onVideoChannelMoveFailed`). */
+  const dcChannelMove = createChannelMoveWatch({
+    graceMs: DC_WORKER_ATTACH_GRACE_MS,
+    onFailed: (why) => onVideoChannelMoveFailed(why),
+  })
   let benchProber: BenchProber | null = null
   let videoBench: VideoBenchSampler | null = null
   /** The element `attachInput` was given: the `<video>` the bench sampler
@@ -5943,14 +6066,13 @@ export function useRemoteControl(
   // actual backing size) for the stats pill ("· FSR") and the diag HUD.
   const sharpenMode = ref<SharpenMode>(storedSharpenMode())
   const renderInfo = ref<{ mode: string; w: number; h: number } | null>(null)
-  let vp9ViewportCleanup: (() => void) | null = null
-  let hevcViewportCleanup: (() => void) | null = null
+  let dcViewportCleanup: (() => void) | null = null
 
   function setSharpenMode(m: SharpenMode) {
     const mode = normalizeSharpenMode(m)
     sharpenMode.value = mode
     persistSharpenMode(mode)
-    const worker = hevcWorker ?? vp9_444Worker
+    const worker = dcWorker
     if (worker) {
       try {
         worker.postMessage({ type: 'render-mode', sharpen: mode })
@@ -5971,49 +6093,50 @@ export function useRemoteControl(
     }
   }
 
-  // Phase Y.3: VP9-444 over DataChannel pipeline. Independent of the
-  // RTCRtpScriptTransform path above Ã¢ÂÂ uses its OWN worker
-  // (rc-vp9-444-worker.ts) fed off `video-bytes` DC binary messages.
-  let vp9_444Worker: Worker | null = null
+  // FR-135 R3 — the one data-channel video path: `rc-dc-worker.ts`, fed off
+  // the `video-bytes` DataChannel, for every codec the agent sends there (VP9,
+  // AV1, H.264, HEVC). Independent of the RTCRtpScriptTransform path above.
+  // Only one DC video transport is active per session, so there is one worker,
+  // one canvas and one set of numbers (Phase Y.3 and rc.78 each had their own
+  // until R3).
+  let dcWorker: Worker | null = null
+  /** What the active path calls itself in the console, on `rc:decode-error`
+   *  (`path`) and in the bench record: `hevc` on the HEVC transport, `vp9-444`
+   *  on VP9, AV1 and H.264, the names the two workers had before R3, which
+   *  the agent and the L4 reads keep. Null with no path. */
+  let dcPathLabel: DcPathLabel | null = null
+  /** The transport the active path was started for, the one a decoder that
+   *  fails before its first frame bans for this page. */
+  let dcPathTransport: string | null = null
   /** `true` once the worker has been spun up and the DC opened. The
    *  view (Y.4) reads this to swap a `<canvas>` in for the `<video>`
    *  element, mirroring how `webcodecsActive` drives the WebCodecs
    *  path. Stays `false` when the user didn't opt in OR the agent
-   *  doesn't honour the transport (no DC ever arrives Ã¢ÂÂ flag never
+   *  doesn't honour the transport (no DC ever arrives, so the flag never
    *  flips). */
-  const vp9_444Active = ref(false)
-  /** Number of decoded VP9-444 frames so far. Surfaced to the view
-   *  for diagnostics and used by tests to assert end-to-end decode
-   *  succeeded. */
-  const vp9_444FramesDecoded = ref(0)
-  /** Rolling-window stats from the VP9-444 worker (rc.35). Bitrate is
+  const dcActive = ref(false)
+  /** Number of frames the data-channel worker decoded so far. Surfaced to the
+   *  view for diagnostics and read by the media watchdog. */
+  const dcFramesDecoded = ref(0)
+  /** Rolling-window stats from the data-channel worker (rc.35). Bitrate is
    *  delivered-bytes/sec at the SCTP-receive boundary (post-network,
    *  pre-decode), so it shows the actual link throughput including
    *  any AIMD-driven adjustments. width/height reflect the latest
    *  decoded VideoFrame dims. Updated every ~1 s by the worker;
    *  the view's HUD reads these directly. */
-  const vp9_444Stats = ref<{
+  const dcStats = ref<{
     bitrateBps: number
     fps: number
     width: number
     height: number
     bytesReceivedTotal: number
   }>({ bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 })
-  /** The visible `<canvas>` the view paints VP9-444 frames into. The
-   *  view writes this on mount; the composable picks it up and
-   *  posts `init-canvas` to the worker. Null until the view
-   *  provides a canvas Ã¢ÂÂ Y.3 ships without view-side wiring, so
-   *  bytes flow + decode happens against a synthetic OffscreenCanvas
-   *  instead. */
-  const vp9_444CanvasEl = ref<HTMLCanvasElement | null>(null)
+  /** The visible `<canvas>` the view paints the data-channel frames into.
+   *  The view writes this on mount; the composable picks it up and posts
+   *  `init-canvas` to the worker. Until then the worker decodes against a
+   *  synthetic OffscreenCanvas. */
+  const dcCanvasEl = ref<HTMLCanvasElement | null>(null)
 
-  // rc.78 Ã¢ÂÂ HEVC over DataChannel pipeline (Option B). Sibling to the
-  // VP9-444 pipeline above; shares the `video-bytes` DC label (the
-  // agent emits HEVC OR VP9-444 there based on negotiated_transport,
-  // never both). Independent worker because the codec string +
-  // decoder configure differ, and we want a clean failure isolation
-  // boundary if one path regresses.
-  let hevcWorker: Worker | null = null
   /** Whether HEVC decode is supported on this browser. Probe runs
    *  once on composable construction (and re-checks in connect()).
    *  HEVC has NO software fallback in WebCodecs Ã¢ÂÂ Linux Chromium
@@ -6049,26 +6172,6 @@ export function useRemoteControl(
   void isH264High444DecodeSupported().then((codec) => {
     h264High444Supported.value = codec !== null
   })
-  /** `true` once the HEVC worker has been spun up and the DC opened.
-   *  Same semantics as `vp9_444Active`. */
-  const hevcActive = ref(false)
-  /** Number of decoded HEVC frames so far. */
-  const hevcFramesDecoded = ref(0)
-  /** Rolling-window stats from the HEVC worker. Same shape as the
-   *  VP9-444 stats so the view's HUD code is shared. */
-  const hevcStats = ref<{
-    bitrateBps: number
-    fps: number
-    width: number
-    height: number
-    bytesReceivedTotal: number
-  }>({ bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 })
-  /** The visible `<canvas>` the view paints HEVC frames into. View
-   *  writes this on mount; composable posts `init-canvas` to the
-   *  worker. Null until view-side wiring lands (rc.79+); rc.78 ships
-   *  with synthetic OffscreenCanvas so bytes still flow + decode
-   *  happens for verification. */
-  const hevcCanvasEl = ref<HTMLCanvasElement | null>(null)
 
   /** P1 Ã¢ÂÂ latest per-hop diagnostics window from the active decode worker
    *  (null until the first stats window on a DC path). */
@@ -6924,13 +7027,12 @@ export function useRemoteControl(
     }
   }
 
-  /** Post the current best offset to the active decode worker(s). Called
-   *  on every new best sample AND from each worker's start path (the
+  /** Post the current best offset to the data-channel decode worker. Called
+   *  on every new best sample AND from the worker's start path (the
    *  worker may be created after the offset is already known). */
   function pushClockOffset() {
     const msg = { type: 'clock-offset', offsetUs: clockBest?.offsetUs ?? null }
-    try { hevcWorker?.postMessage(msg) } catch { /* worker torn down */ }
-    try { vp9_444Worker?.postMessage(msg) } catch { /* worker torn down */ }
+    try { dcWorker?.postMessage(msg) } catch { /* worker torn down */ }
   }
 
   function handleClockEcho(t0: number, agentUs: number) {
@@ -7184,6 +7286,25 @@ export function useRemoteControl(
     benchProber?.onPainted(seq, paintedAt, path)
   }
 
+  /** FR-135 R0 (N2) — what this session is, for the `rc.l4` record, as the
+   *  page knows it at the flush. A decode worker's renderer and decoder count
+   *  only while one paints. */
+  function benchJoin(): RcL4Join {
+    const vi = videoInfo.value
+    const video = benchSurface?.querySelector('video') as HTMLVideoElement | null
+    const dc = dcActive.value
+    return {
+      targetFps: vi?.fps ?? mediaPlan.value?.fps?.granted ?? null,
+      width: mediaIntrinsicW.value || video?.videoWidth || null,
+      height: mediaIntrinsicH.value || video?.videoHeight || null,
+      codec: vi?.codec || null,
+      chroma: vi?.chroma || null,
+      carrier: vi?.transport || null,
+      render: dc ? (renderInfo.value?.mode ?? null) : null,
+      decoderHw: dc ? dcDecoderHw : null,
+    }
+  }
+
   /** FR-16 L4 — start probing: called when the input channel opens, and a
    *  no-op unless this session resolved `sessionBench`. Every sampler is
    *  armed per probe; only the one painting frames can answer. */
@@ -7198,8 +7319,7 @@ export function useRemoteControl(
       send: target ? sendBenchTargetMove : sendBenchProbe,
       maxSeq: target ? PROBE_TARGET.cells : undefined,
       arm: (seq) => {
-        hevcWorker?.postMessage({ type: 'bench-arm', seq })
-        vp9_444Worker?.postMessage({ type: 'bench-arm', seq })
+        dcWorker?.postMessage({ type: 'bench-arm', seq })
         webcodecsWorker?.postMessage({ type: 'bench-arm', seq })
         videoBench?.arm(seq)
       },
@@ -7210,6 +7330,7 @@ export function useRemoteControl(
           agentOrgId: lastConnectArgs?.orgId ?? null,
           agentId: lastConnectArgs?.agentId ?? null,
           sessionId: sessionId.value,
+          join: benchJoin(),
         })
       },
     })
@@ -7244,7 +7365,12 @@ export function useRemoteControl(
    *  0x08 = Meta/Win Ã¢ÂÂ matches `kbdCodeToHid` callers throughout
    *  the codebase. */
   function sendKey(code: number, down: boolean, mods: number = 0) {
-    sendInput({ t: 'key', code, down, mods })
+    sendInput({
+      t: 'key',
+      code,
+      down,
+      mods: translateModsForHost(mods, hostIsMac.value && ctrlAsCmd.value),
+    })
   }
 
   /**
@@ -7525,12 +7651,14 @@ export function useRemoteControl(
     probeRttMs?: number | null,
     link?: { rxBps: number; queueMs: number | null } | null,
     arrival?: { avgMs: number } | null,
+    media?: Partial<ViewerMediaWindow> | null,
+    queueArrMs?: number | null,
   ) {
     const ch = channels.control
     if (!ch || ch.readyState !== 'open') return
     try {
       ch.send(
-        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival)),
+        JSON.stringify(decodeStatWireMessage(fps, struggling, age, probeRttMs, link, arrival, media, queueArrMs)),
       )
     } catch {
       /* channel closed between check and send Ã¢ÂÂ drop */
@@ -7556,6 +7684,10 @@ export function useRemoteControl(
     /** FR-59 P3 — ms the transit queue grew this window; `null`/absent =
      *  fewer than two frames arrived, which is no-signal, not stability. */
     queueMs?: number | null
+    /** FR-135 R3 — the same growth read at arrival; `null`/absent the same way. */
+    queueArrMs?: number | null
+    /** FR-135 R0 — the worker's window for the agent (`rc-media-window.ts`). */
+    media?: Partial<ViewerMediaWindow> | null
   }) {
     const drops = typeof m.framesDroppedBacklog === 'number' ? m.framesDroppedBacklog : 0
     const delta = Math.max(0, drops - lastBacklogDrops)
@@ -7588,6 +7720,12 @@ export function useRemoteControl(
     // FR-70 M0 — the age at arrival, present under the same conditions as
     // `age` (probe locked, frames painted).
     const arrival = age && m.arrival && m.arrival.n > 0 ? { avgMs: m.arrival.avgMs } : null
+    // FR-135 R0 — rides along as it came; `decodeStatWireMessage` keeps only
+    // what the worker counted. The decoder's form is kept for `rc.l4` (N2).
+    const media = m.media && typeof m.media === 'object' ? m.media : null
+    if (media && (typeof media.decoderHw === 'boolean' || media.decoderHw === null)) {
+      dcDecoderHw = media.decoderHw
+    }
     sendDecodeStat(
       typeof m.fps === 'number' ? m.fps : 0,
       struggleWindow.observe(bad),
@@ -7595,6 +7733,9 @@ export function useRemoteControl(
       clockBest?.rttMs ?? null,
       link,
       arrival,
+      media,
+      // FR-135 R3 — rides alone; `decodeStatWireMessage` sends it only when counted.
+      typeof m.queueArrMs === 'number' ? m.queueArrMs : null,
     )
   }
 
@@ -7728,7 +7869,7 @@ export function useRemoteControl(
   /** FR-135 R2 — the device's plan: keep the newest, and act on the one thing in it
    *  a page must not leave to the watchdog. */
   function onMediaPlan(plan: RcMediaPlan) {
-    const action = mediaPlanAction(plan, mediaPlanEpoch, vp9_444Active.value || hevcActive.value)
+    const action = mediaPlanAction(plan, mediaPlanEpoch, dcActive.value)
     if (!action) return
     mediaPlanEpoch = plan.epoch
     mediaPlan.value = plan
@@ -7737,8 +7878,7 @@ export function useRemoteControl(
     if (action.stop !== undefined) mediaStop.value = action.stop
     if (action.showTrack) {
       console.warn('[rc] media plan: the device is sending over WebRTC, not the data channel this page opened - showing <video>')
-      stopVp9_444Path()
-      stopHevcPath()
+      stopDcPath()
     }
   }
 
@@ -8081,53 +8221,36 @@ export function useRemoteControl(
     webcodecsWorker = null
   }
 
-  /** Boot the VP9-444 worker, open the `video-bytes` DataChannel, and
-   *  forward incoming binary messages to the worker. Called from
-   *  `connect()` only when the browser opted in to
-   *  `data-channel-vp9-444` AND VP9 profile 1 decode is supported.
-   *  Idempotent Ã¢ÂÂ a second call while a worker exists is a no-op
-   *  (wraps the existing channel + worker pair).
-   *
-   *  The worker self-decodes against an `OffscreenCanvas`. For Y.3
-   *  the canvas is synthetic (created here, never displayed); Y.4
-   *  hooks the view's `<canvas>` element via
-   *  `vp9_444CanvasEl` + a `transferControlToOffscreen()` swap.
-   *  Bytes still flow + frames still decode in the synthetic case,
-   *  which is what e2e + integration tests assert against.
-   *
-   *  Returns the worker handle so tests can drive it directly.
-   *
-   *  rc.190 Ã¢ÂÂ `codecOverride` reuses this whole path for AV1-over-DC
-   *  (`AV1_CODEC_STRING`): identical 13-byte wire framing, identical DC
-   *  label, the worker's VideoDecoder just gets a different codec
-   *  string. Only one DC video transport is active per session, so the
-   *  shared worker/stats plumbing can't collide. */
   // Ã¢ÂÂÃ¢ÂÂ 2026-07-24 freeze triangulation (round 3) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
   // Field: 3-5 s video freezes with a SILENT console Ã¢ÂÂ the worker-side stall
   // detector needs chunks to arrive to run at all, so silence is ambiguous
   // between "bytes stopped arriving" (network/SCTP) and "the main thread was
   // blocked so nothing was forwarded" (jank). These two detectors split that:
 
-  /** Network-side delivery-gap detector. `dc.onmessage` runs on the main
-   *  thread as bytes come off SCTP; a multi-second silence here (logged once,
-   *  on resume) means bytes were NOT arriving Ã¢ÂÂ network/SCTP layer. */
-  let lastVideoDcMsgMs = 0
+  /** Network-side delivery-gap detector. On the relay `dc.onmessage` runs on
+   *  the main thread as bytes come off SCTP; a multi-second silence here
+   *  (logged once, on resume) means bytes were NOT arriving - network/SCTP
+   *  layer. With the channel in the worker (FR-135 R3) the worker keeps the
+   *  same clock (`createDeliveryGapClock`) and posts `video-channel-gap`, which
+   *  is logged with the same line. */
+  const videoDcGap = createDeliveryGapClock()
   function noteVideoDcDelivery() {
-    const now = performance.now()
-    if (lastVideoDcMsgMs > 0 && now - lastVideoDcMsgMs > 1500) {
-      console.warn(
-        '[rc] video DC delivery gap',
-        Math.round(now - lastVideoDcMsgMs),
-        'ms Ã¢ÂÂ no video bytes arrived from the network for this long',
-      )
-    }
-    lastVideoDcMsgMs = now
+    const gapMs = videoDcGap.note(performance.now())
+    if (gapMs !== null) warnVideoDcGap(gapMs)
+  }
+  function warnVideoDcGap(gapMs: number) {
+    console.warn(
+      '[rc] video DC delivery gap',
+      Math.round(gapMs),
+      'ms - no video bytes arrived from the network for this long',
+    )
   }
 
   /** Self-measuring main-thread jank detector. A 250 ms interval whose tick
-   *  arrives late by >1.5 s means the main thread (which also forwards DC
-   *  chunks to the worker) was blocked that long Ã¢ÂÂ the freeze is page jank,
-   *  not network and not the decoder. */
+   *  arrives late by >1.5 s means the main thread was blocked that long - the
+   *  freeze is page jank, not network and not the decoder. On the relay the
+   *  main thread also forwards the DC chunks to the worker, so they waited
+   *  too; with the channel in the worker (FR-135 R3) they did not. */
   let jankTimer: ReturnType<typeof setInterval> | null = null
   let jankLastTickMs = 0
   function startJankDetector() {
@@ -8140,7 +8263,9 @@ export function useRemoteControl(
         console.warn(
           '[rc] MAIN-THREAD STALL ~',
           Math.round(gap),
-          'ms Ã¢ÂÂ the page (and DCÃ¢ÂÂworker chunk forwarding) was blocked this long',
+          dcChannelInWorker
+            ? 'ms - the page was blocked this long (the video channel is in the decode worker, so its chunks were not)'
+            : 'ms - the page (and DC-to-worker chunk forwarding) was blocked this long',
         )
       }
       jankLastTickMs = now
@@ -8236,483 +8361,63 @@ export function useRemoteControl(
     }
   }
 
-  function startVp9_444Path(codecOverride?: string): Worker | null {
-    if (vp9_444Worker) return vp9_444Worker
-    if (!pc) return null
-    let worker: Worker
-    try {
-      worker = new Worker(
-        new URL('../workers/rc-vp9-444-worker.ts', import.meta.url),
-        { type: 'module' },
-      )
-    } catch (err) {
-      console.warn('[rc] vp9-444 worker construction failed', err)
-      return null
-    }
-    worker.onmessage = (ev) => {
-      const msg = ev.data as Record<string, unknown> | undefined
-      if (!msg || typeof msg.type !== 'string') return
-      if (msg.type === 'bench-probe') {
-        onBenchProbe(msg.seq, msg.paintedAt, 'vp9-444')
-        return
-      }
-      if (msg.type === 'viewer-hz') {
-        onViewerHz(msg.hz)
-        return
-      }
-      if (msg.type === 'request-keyframe') {
-        // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
-        // for a fresh IDR so it can resync.
-        requestKeyframe()
-        return
-      }
-      if (msg.type === 'first-frame'
-        && typeof msg.width === 'number'
-        && typeof msg.height === 'number') {
-        mediaIntrinsicW.value = msg.width
-        mediaIntrinsicH.value = msg.height
-        vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, 1)
-        markConnect('first_frame')
-        logConnectTiming('first-frame')
-        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
-        console.info('[rc] vp9-444 first frame', msg.width, 'x', msg.height, '| decoded colour space', colorSpaceLabel(msg.colorSpace))
-      } else if (msg.type === 'colorspace-dropped') {
-        warnColorSpaceDropped('vp9-444', msg)
-      } else if (msg.type === 'decoder-configured') {
-        // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
-        // configure() Ã¢ÂÂ proves whether the roomler-rc-decode-pref A/B took.
-        // FR-80 — the worker's log prefix is a legacy name; `msg.codec` is
-        // the truth (this worker decodes VP9, AV1 and H.264). The pill reads
-        // it until the agent names its encoder.
-        dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
-        console.info('[rc] vp9-444 decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
-      } else if (msg.type === 'decoder-error'
-        || msg.type === 'decoder-configure-error'
-        || msg.type === 'decode-error') {
-        // rc.43 Ã¢ÂÂ Chrome 148 field repro: VideoDecoder.configure() with
-        // vp09.01.10.08 (profile 1, 4:4:4 8-bit) reports success but the
-        // first real frame errors out with "Unsupported configuration"
-        // and the decoder closes; every subsequent frame logs
-        // "Cannot call 'decode' on a closed codec" indefinitely. Pre-
-        // rc.43 just logged the warn Ã¢ÂÂ the canvas stayed blank until the
-        // user disconnected. Tear down so the view re-mounts <video> and
-        // the standard RTP H.264 track (which the agent sends in parallel
-        // to the DC path) renders normally.
-        console.warn('[rc] vp9-444 worker', msg.type, msg.error, 'Ã¢ÂÂ auto-fallback to <video>')
-        // Same ban-and-renegotiate as the HEVC handler: a pre-first-frame
-        // failure means the probe lied (this worker serves the vp9-444,
-        // av1 AND h264 DC transports - ban whichever THIS session
-        // negotiated, `sessionDcTransport`). Post-first-frame errors stay
-        // transient and keep today's behaviour.
-        // FR-132 P1 — counted on the agent, before the teardown below.
-        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-        const vp9NeverDecoded = vp9_444FramesDecoded.value === 0
-        const failedTransport = sessionDcTransport
-        stopVp9_444Path()
-        if (vp9NeverDecoded && failedTransport && failedTransport !== 'auto' && failedTransport !== 'webrtc') {
-          failedDcTransports.add(failedTransport)
-          // FR-77 — remembered per device × cell across page loads.
-          const failedCodec = cellCodecOfTransport(failedTransport)
-          if (codecAgentId && failedCodec) {
-            rememberCellFailure(codecAgentId, failedCodec, sessionCellChroma, globalThis.navigator?.userAgent ?? '')
-          }
-          console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
-          if (lastConnectArgs) scheduleReconnect()
-        }
-      } else if (msg.type === 'decode-recovering') {
-        // FR-135 R1 — the worker replaced the decoder and waits for the key
-        // frame it asked for. The path stays up. The agent still counts it.
-        console.warn('[rc] vp9-444 decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
-        reportDecodeError('vp9-444', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-      } else if (msg.type === 'decode-recovered') {
-        console.info('[rc] vp9-444 decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
-      } else if (msg.type === 'frame-rejected') {
-        console.warn('[rc] vp9-444 frame rejected', msg)
-      } else if (msg.type === 'awaiting-keyframe') {
-        // Round 3 Ã¢ÂÂ parity with the HEVC handler: these worker messages were
-        // silently dropped on the VP9 path, hiding gate activity from the
-        // console during field freezes.
-        console.info('[rc] vp9-444 awaiting keyframe Ã¢ÂÂ dropped', msg.dropped, 'delta(s) while gated')
-      } else if (msg.type === 'keyframe-acquired') {
-        console.info('[rc] vp9-444 keyframe acquired (dropped', msg.droppedBefore, 'delta(s) before it)')
-      } else if (msg.type === 'backlog-drop') {
-        console.warn('[rc] vp9-444 backlog drop Ã¢ÂÂ decode queue', msg.queue, 'Ã¢ÂÂ gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
-      } else if (msg.type === 'decode-stall') {
-        // 2026-07-24 Ã¢ÂÂ frames are arriving but the decoder produced no
-        // output for gapMs with work queued: a decoder/GPU-process stall,
-        // NOT transport and NOT the resync gate. Field-diagnosis marker.
-        console.warn('[rc] vp9-444 DECODE STALL Ã¢ÂÂ no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
-      } else if (msg.type === 'decode-stall-recovered') {
-        console.warn('[rc] vp9-444 decode stall recovered after', msg.gapMs, 'ms')
-      } else if (msg.type === 'render-fallback') {
-        // P7 — GL unavailable/lost for good this session; the worker
-        // reverted to the byte-identical 2D paint path.
-        console.warn('[rc] vp9-444 FSR unavailable — 2D paint path:', msg.reason)
-      } else if (msg.type === 'frame-decoded') {
-        // Worker emits this for every decoded frame after the first.
-        // Driven by the worker's `output` callback, used by tests +
-        // view-side diagnostics.
-        vp9_444FramesDecoded.value++
-      } else if (msg.type === 'stats') {
-        // rc.35 Ã¢ÂÂ rolling-window bitrate / fps / resolution from the
-        // worker. Surfaces the actual DC-receive throughput so the
-        // operator can confirm rc.33's AIMD-driven bitrate target
-        // is pushing the link as expected.
-        const m = msg as {
-          bitrateBps?: number
-          fps?: number
-          width?: number
-          height?: number
-          bytesReceivedTotal?: number
-          framesDroppedBacklog?: number
-          decodeQueueSize?: number
-          backlogMs?: number
-          backlogMaxMs?: number
-          framesDecodedTotal?: number
-          paint?: HopWindow
-          fwd?: HopWindow
-          decode?: HopWindow
-          // FR-15 — end-to-end paint age window (null until the
-          // rc:clock probe locks); rides the decodestat to the agent.
-          age?: HopWindow | null
-          outGapMaxMs?: number
-          ctxMode?: string
-          render?: string
-          renderW?: number
-          renderH?: number
-        }
-        updateRenderInfo(m)
-        vp9_444Stats.value = {
-          bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
-          fps: typeof m.fps === 'number' ? m.fps : 0,
-          width: typeof m.width === 'number' ? m.width : 0,
-          height: typeof m.height === 'number' ? m.height : 0,
-          bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
-        }
-        if (vp9_444Stats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
-        // P1 Ã¢ÂÂ the per-frame `frame-decoded` message is off by default; keep
-        // the diagnostics counter monotonic from the 1 s window total.
-        if (typeof m.framesDecodedTotal === 'number') {
-          vp9_444FramesDecoded.value = Math.max(vp9_444FramesDecoded.value, m.framesDecodedTotal)
-        }
-        updateDecodeDiag(m)
-        // rc.188 Ã¢ÂÂ feed the agent this viewer's real decode rate so it caps fps.
-        handleDecoderStats(m)
-      }
-    }
-    // rc.61 Ã¢ÂÂ pick the codec string based on the agent's advertised
-    // chroma format. `'yuv420'` Ã¢ÂÂ VP9 profile 0 (`vp09.00.10.08`),
-    // `'yuv444'` (default + pre-rc.61 agents) Ã¢ÂÂ profile 1
-    // (`vp09.01.10.08`). Mismatch with the bitstream the agent
-    // actually sends would leave the canvas blank.
-    //
-    // rc.62 Ã¢ÂÂ the user's `vp9Chroma` ref OVERRIDES the agent's
-    // advertised default when it's not `'auto'`. The same value was
-    // sent as `chroma_pref` in `rc:session.request`, so the agent
-    // emits the format we picked.
+  /** rc.61, rc.62, rc.190 — the VP9 codec string for the worker: an explicit
+   *  override wins (the auto-rank's or the HEVC fallback's forced 4:2:0, and
+   *  the AV1 and H.264 transports' own strings); else the user's `vp9Chroma`
+   *  when it is not `auto` (it went to the agent as `chroma_pref` in
+   *  `rc:session.request`, so the agent emits that format); else the agent's
+   *  advertised default. `yuv420` is profile 0 (`vp09.00.10.08`), anything
+   *  else, pre-rc.61 agents included, profile 1 (`vp09.01.10.08`). A mismatch
+   *  with the bitstream the agent actually sends leaves the canvas blank. */
+  function vp9DcCodec(codecOverride?: string): string {
     let effectiveChroma: string | undefined
     if (vp9Chroma.value === 'yuv420' || vp9Chroma.value === 'yuv444') {
       effectiveChroma = vp9Chroma.value
     } else {
       effectiveChroma = agent?.value?.capabilities?.vp9_chroma
     }
-    // rc.190 Ã¢ÂÂ an explicit codec override (the AV1 path) wins over the
-    // VP9 chroma-derived string.
-    const workerCodec =
-      codecOverride ?? (effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08')
-
-    // Synthetic OffscreenCanvas Ã¢ÂÂ keeps the worker fully wired even
-    // without a view-side canvas. Y.4 swaps in the visible canvas
-    // via vp9_444CanvasEl watcher below.
-    try {
-      const synthetic = new OffscreenCanvas(2, 2)
-      worker.postMessage(
-        {
-          type: 'init-canvas',
-          canvas: synthetic,
-          codec: workerCodec,
-          decodePref: storedDecodePref(),
-          ctxMode: storedCtxMode(),
-          perFrameMsg: storedPerFrameMsg(),
-          maxBacklogMs: flowParams.maxBacklogMs,
-          // FR-17 — negotiated per session; see `sessionChunkFraming`.
-          chunkFraming: sessionChunkFraming,
-          // FR-16 L4 — resolved per session; see `sessionBench`.
-          bench: sessionBench,
-          // FR-130 P2 — resolved per session; see `sessionColorSpace`.
-          colorSpace: sessionColorSpace,
-          // FR-135 R1 — resolved per session; see `sessionDecodeRecover`.
-          decodeRecover: sessionDecodeRecover,
-          unorderedVideo: videoDcOptions(sessionChunkFraming, storedUnorderedVideo()).ordered === false,
-          // P7 — FSR knobs (sticky across the visible-canvas re-init).
-          sharpen: sharpenMode.value,
-          sharpness: storedSharpness(),
-        },
-        [synthetic],
-      )
-    } catch (err) {
-      console.warn('[rc] vp9-444: synthetic OffscreenCanvas init failed', err)
-      try { worker.terminate() } catch { /* ignore */ }
-      return null
-    }
-    // Open the DC. Forward binary messages straight through to the
-    // worker as ArrayBuffer chunks (transferred, not copied).
-    let dc: RTCDataChannel
-    try {
-      // FR-17 stage B - unordered ONLY when this session negotiated
-      // framing; `videoDcOptions` enforces that pairing.
-      dc = pc.createDataChannel(
-        VP9_444_DC_LABEL,
-        videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
-      )
-    } catch (err) {
-      console.warn('[rc] vp9-444 DC creation failed', err)
-      try { worker.terminate() } catch { /* ignore */ }
-      return null
-    }
-    dc.binaryType = 'arraybuffer'
-    lastVideoDcMsgMs = 0 // fresh path Ã¢ÂÂ don't count the setup silence as a gap
-    startJankDetector()
-    dc.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return
-      noteVideoDcDelivery()
-      try {
-        // P1 Ã¢ÂÂ sentAt stamps the mainÃ¢ÂÂworker forwarding hop (epoch-absolute).
-        worker.postMessage(
-          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
-          [ev.data],
-        )
-      } catch (err) {
-        console.warn('[rc] vp9-444 worker post failed', err)
-      }
-    }
-    dc.onopen = () => {
-      markConnect('dc_open')
-      console.info('[rc] vp9-444 DC opened')
-    }
-    dc.onclose = () => {
-      console.info('[rc] vp9-444 DC closed')
-    }
-    channels.videoBytes = dc
-    vp9_444Worker = worker
-    vp9_444Active.value = true
-    // FR-1 P7 — the clock offset may already be locked (probe started with
-    // the control DC); hand it to the fresh worker.
-    pushClockOffset()
-    return worker
+    return codecOverride ?? (effectiveChroma === 'yuv420' ? 'vp09.00.10.08' : 'vp09.01.10.08')
   }
 
-  function stopVp9_444Path() {
-    vp9_444Active.value = false
-    vp9_444FramesDecoded.value = 0
-    // P7 — drop the viewport reporter + render-path mirror with the path.
-    vp9ViewportCleanup?.()
-    vp9ViewportCleanup = null
-    renderInfo.value = null
-    if (!vp9_444Worker) return
-    try { vp9_444Worker.postMessage({ type: 'close' }) } catch { /* ignore */ }
-    try { vp9_444Worker.terminate() } catch { /* ignore */ }
-    vp9_444Worker = null
-  }
-
-  /** When the view mounts a real `<canvas>`, swap it in for the
-   *  synthetic OffscreenCanvas the worker started with. The worker
-   *  treats `init-canvas` as idempotent Ã¢ÂÂ second call replaces the
-   *  paint target. */
-  watch(vp9_444CanvasEl, (el) => {
-    vp9ViewportCleanup?.()
-    vp9ViewportCleanup = null
-    if (!el || !vp9_444Worker) return
-    try {
-      const off = el.transferControlToOffscreen()
-      vp9_444Worker.postMessage({ type: 'init-canvas', canvas: off }, [off])
-      // P7 — start reporting the element box for the FSR sizing policy.
-      vp9ViewportCleanup = startViewportReporter(el, vp9_444Worker)
-    } catch (err) {
-      console.warn('[rc] vp9-444: transferControlToOffscreen failed', err)
-    }
-  })
-
-  /** rc.78 Ã¢ÂÂ boot the HEVC worker, open the `video-bytes` DataChannel,
-   *  and forward incoming binary messages to the worker. Mirror of
-   *  `startVp9_444Path` for the HEVC transport. Called from
-   *  `connect()` only when the browser opted in to
-   *  `data-channel-hevc` AND `hevcSupported` resolved true.
+  /** FR-135 R3 — boot the one data-channel decode worker
+   *  (`rc-dc-worker.ts`), open the `video-bytes` DataChannel, and forward
+   *  incoming binary messages to the worker. Called from `connect()` when
+   *  this session asks for a data-channel transport (`transport`); `codec` is
+   *  the decoder's codec string for its cell, and `label` the name the path
+   *  goes by (`DcPathLabel`). Idempotent — a second call while a worker exists
+   *  is a no-op (wraps the existing channel + worker pair).
+   *
+   *  The worker self-decodes against an `OffscreenCanvas`: a synthetic one
+   *  (created here, never displayed) until the view mounts its `<canvas>`
+   *  and `dcCanvasEl`'s watcher swaps it in with `transferControlToOffscreen()`.
+   *  Bytes still flow + frames still decode in the synthetic case, which is
+   *  what e2e + integration tests assert against.
    *
    *  Returns the worker handle so tests can drive it directly. */
-  function startHevcPath(codecOverride?: string): Worker | null {
-    if (hevcWorker) return hevcWorker
+  function startDcPath(label: DcPathLabel, codec: string, transport: string): Worker | null {
+    if (dcWorker) return dcWorker
     if (!pc) return null
     let worker: Worker
     try {
       worker = new Worker(
-        new URL('../workers/rc-hevc-worker.ts', import.meta.url),
+        new URL('../workers/rc-dc-worker.ts', import.meta.url),
         { type: 'module' },
       )
     } catch (err) {
-      console.warn('[rc] hevc worker construction failed', err)
+      console.warn(`[rc] ${label} worker construction failed`, err)
       return null
     }
-    worker.onmessage = (ev) => {
-      const msg = ev.data as Record<string, unknown> | undefined
-      if (!msg || typeof msg.type !== 'string') return
-      if (msg.type === 'bench-probe') {
-        onBenchProbe(msg.seq, msg.paintedAt, 'hevc')
-        return
-      }
-      if (msg.type === 'viewer-hz') {
-        onViewerHz(msg.hz)
-        return
-      }
-      if (msg.type === 'request-keyframe') {
-        // rc.130 Ã¢ÂÂ worker dropped deltas on a decode backlog; ask the agent
-        // for a fresh IDR so it can resync.
-        requestKeyframe()
-        return
-      }
-      if (msg.type === 'first-frame'
-        && typeof msg.width === 'number'
-        && typeof msg.height === 'number') {
-        mediaIntrinsicW.value = msg.width
-        mediaIntrinsicH.value = msg.height
-        hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, 1)
-        markConnect('first_frame')
-        logConnectTiming('first-frame')
-        // rc.100 Ã¢ÂÂ the worker now reports the CODED size as width/height and
-        // forwards coded/display/visibleRect for field diagnosis. Logging the
-        // gap localises the NVDEC HEVC dim mismatch (DEVBOX: agent
-        // encodes 2560ÃÂ1600 but display came out 1280ÃÂ720).
-        console.info(
-          '[rc] hevc first frame', msg.width, 'x', msg.height,
-          '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
-          '| crop', msg.crop, 'rewrapped', msg.rewrapped,
-          // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
-          '| decoded colour space', colorSpaceLabel(msg.colorSpace),
-        )
-      } else if (msg.type === 'colorspace-dropped') {
-        warnColorSpaceDropped('hevc', msg)
-      } else if (msg.type === 'decoder-configured') {
-        // `pref` (round 3) Ã¢ÂÂ see the vp9-444 handler.
-        dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
-        // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
-        console.info('[rc] hevc decoder configured', msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
-      } else if (msg.type === 'decoder-error'
-        || msg.type === 'decoder-configure-error'
-        || msg.type === 'decode-error') {
-        // Mid-session HEVC HW driver hiccup OR the decoder
-        // claimed support then rejected real bytes. Tear down so
-        // the view re-mounts <video> and the standard RTP path
-        // (which the agent sends in parallel) renders normally.
-        console.warn('[rc] hevc worker', msg.type, msg.error, 'Ã¢ÂÂ auto-fallback to <video>')
-        // A failure BEFORE the first decoded frame means the pre-connect
-        // probe was wrong for this browser, and it will be wrong again on
-        // the next rank (field: Edge, where MediaCapabilities says HEVC is
-        // hardware-smooth while WebCodecs refuses hev1) - ban the transport
-        // for this page and re-negotiate NOW instead of leaving a black
-        // canvas for the watchdog to find ~10 s later (a DC session's
-        // <video> has no parallel RTP samples, so this fallback renders
-        // nothing). A post-first-frame error is a transient (driver
-        // hiccup) - the same codec may work again on reconnect.
-        // FR-132 P1 — counted on the agent, before the teardown below.
-        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-        const hevcNeverDecoded = hevcFramesDecoded.value === 0
-        stopHevcPath()
-        if (hevcNeverDecoded) {
-          failedDcTransports.add('data-channel-hevc')
-          // FR-77 — remembered per device × cell (a Rext failure bans only
-          // the 4:4:4 cell; the 4:2:0 path is a different decoder profile).
-          if (codecAgentId) {
-            rememberCellFailure(codecAgentId, 'hevc', sessionCellChroma, globalThis.navigator?.userAgent ?? '')
-          }
-          console.warn('[rc] data-channel-hevc banned for this page (decoder failed before first frame) - reconnecting on the next-best transport')
-          if (lastConnectArgs) scheduleReconnect()
-        }
-      } else if (msg.type === 'decode-recovering') {
-        // FR-135 R1 — see the vp9-444 handler.
-        console.warn('[rc] hevc decoder failed:', msg.error, '- recovering in place, attempt', msg.attempt)
-        reportDecodeError('hevc', msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
-      } else if (msg.type === 'decode-recovered') {
-        console.info('[rc] hevc decode recovered in', msg.ms, 'ms, attempts', msg.attempts)
-      } else if (msg.type === 'frame-rejected') {
-        console.warn('[rc] hevc frame rejected', msg)
-      } else if (msg.type === 'awaiting-keyframe') {
-        // rc.103 Ã¢ÂÂ the leading-delta gate is dropping deltas while it waits
-        // for the first IDR (async-encoder DC-open race). Expected for a
-        // few frames right after "hevc DC opened"; a high/growing count
-        // means the agent isn't shipping an IDR (check encoder forced-idr).
-        console.info('[rc] hevc awaiting keyframe Ã¢ÂÂ dropped', msg.dropped, 'leading delta(s)')
-      } else if (msg.type === 'keyframe-acquired') {
-        console.info('[rc] hevc first keyframe acquired (dropped', msg.droppedBefore, 'leading delta(s))')
-      } else if (msg.type === 'backlog-drop') {
-        // Round 3 Ã¢ÂÂ was silently dropped; parity with the vp9-444 handler.
-        console.warn('[rc] hevc backlog drop Ã¢ÂÂ decode queue', msg.queue, 'Ã¢ÂÂ gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
-      } else if (msg.type === 'decode-stall') {
-        // 2026-07-24 Ã¢ÂÂ see the vp9-444 handler: decoder/GPU-process stall
-        // marker (frames arriving, work queued, no output for gapMs).
-        console.warn('[rc] hevc DECODE STALL Ã¢ÂÂ no decoder output for', msg.gapMs, 'ms; queue', msg.queue)
-      } else if (msg.type === 'decode-stall-recovered') {
-        console.warn('[rc] hevc decode stall recovered after', msg.gapMs, 'ms')
-      } else if (msg.type === 'render-fallback') {
-        // P7 — GL unavailable/lost for good this session; the worker
-        // reverted to the byte-identical 2D paint path.
-        console.warn('[rc] hevc FSR unavailable — 2D paint path:', msg.reason)
-      } else if (msg.type === 'frame-decoded') {
-        hevcFramesDecoded.value++
-      } else if (msg.type === 'stats') {
-        const m = msg as {
-          bitrateBps?: number
-          fps?: number
-          width?: number
-          height?: number
-          bytesReceivedTotal?: number
-          framesDroppedBacklog?: number
-          decodeQueueSize?: number
-          backlogMs?: number
-          backlogMaxMs?: number
-          framesDecodedTotal?: number
-          paint?: HopWindow
-          fwd?: HopWindow
-          decode?: HopWindow
-          // FR-15 — end-to-end paint age window (null until the
-          // rc:clock probe locks); rides the decodestat to the agent.
-          age?: HopWindow | null
-          outGapMaxMs?: number
-          ctxMode?: string
-          render?: string
-          renderW?: number
-          renderH?: number
-        }
-        updateRenderInfo(m)
-        hevcStats.value = {
-          bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
-          fps: typeof m.fps === 'number' ? m.fps : 0,
-          width: typeof m.width === 'number' ? m.width : 0,
-          height: typeof m.height === 'number' ? m.height : 0,
-          bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
-        }
-        if (hevcStats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
-        // P1 Ã¢ÂÂ see the vp9-444 handler.
-        if (typeof m.framesDecodedTotal === 'number') {
-          hevcFramesDecoded.value = Math.max(hevcFramesDecoded.value, m.framesDecodedTotal)
-        }
-        updateDecodeDiag(m)
-        // rc.188 Ã¢ÂÂ feed the agent this viewer's real decode rate so it caps fps.
-        handleDecoderStats(m)
-      }
-    }
-    // Synthetic OffscreenCanvas Ã¢ÂÂ keeps the worker fully wired even
-    // without a view-side canvas. rc.79+ swaps in the visible canvas
-    // via hevcCanvasEl watcher below.
+    worker.onmessage = (ev) => onDcWorkerMessage(worker, label, ev)
+    // Synthetic OffscreenCanvas — keeps the worker fully wired even
+    // without a view-side canvas. Y.4 swaps in the visible canvas
+    // via the dcCanvasEl watcher below.
     try {
       const synthetic = new OffscreenCanvas(2, 2)
       worker.postMessage(
         {
           type: 'init-canvas',
           canvas: synthetic,
-          // P7 — Rext 4:4:4 sessions override the Main-profile default
-          // (hev1.4.10.L153.B0 vs hev1.1.6.L153.B0); undefined keeps it.
-          codec: codecOverride,
+          codec,
           decodePref: storedDecodePref(),
           ctxMode: storedCtxMode(),
           perFrameMsg: storedPerFrameMsg(),
@@ -8733,14 +8438,15 @@ export function useRemoteControl(
         [synthetic],
       )
     } catch (err) {
-      console.warn('[rc] hevc: synthetic OffscreenCanvas init failed', err)
+      console.warn(`[rc] ${label}: synthetic OffscreenCanvas init failed`, err)
       try { worker.terminate() } catch { /* ignore */ }
       return null
     }
-    // Open the same `video-bytes` DC the VP9-444 path uses Ã¢ÂÂ the
-    // agent's `media_pump_hevc_dc` writes there based on the
-    // negotiated_transport. Browser opens unconditionally; the
-    // agent stays silent if it picked the WebRTC track instead.
+    // Open the DC. The browser opens it unconditionally; the agent pumps
+    // bytes through it only when its caps include the same transport, and
+    // stays silent if it picked the WebRTC track instead. Binary messages
+    // go straight through to the worker as ArrayBuffer chunks
+    // (transferred, not copied).
     let dc: RTCDataChannel
     try {
       // FR-17 stage B - unordered ONLY when this session negotiated
@@ -8750,66 +8456,302 @@ export function useRemoteControl(
         videoDcOptions(sessionChunkFraming, storedUnorderedVideo()),
       )
     } catch (err) {
-      console.warn('[rc] hevc DC creation failed', err)
+      console.warn(`[rc] ${label} DC creation failed`, err)
       try { worker.terminate() } catch { /* ignore */ }
       return null
     }
-    dc.binaryType = 'arraybuffer'
-    lastVideoDcMsgMs = 0 // fresh path Ã¢ÂÂ don't count the setup silence as a gap
+    // FR-135 R3 — the channel into the worker, in the task that made it (the
+    // only one in which a channel can move), where this browser can transfer
+    // one and this session asks. Refused, it is still the page's, untouched,
+    // and the relay below carries it as before.
+    const refused = sessionDcWorker ? moveVideoChannelToWorker(worker, dc) : 'off'
+    videoDcGap.reset() // fresh path - don't count the setup silence as a gap
     startJankDetector()
-    dc.onmessage = (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return
-      noteVideoDcDelivery()
-      try {
-        // P1 Ã¢ÂÂ sentAt stamps the mainÃ¢ÂÂworker forwarding hop (epoch-absolute).
-        worker.postMessage(
-          { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
-          [ev.data],
-        )
-      } catch (err) {
-        console.warn('[rc] hevc worker post failed', err)
+    if (refused === null) {
+      // Its open, close and delivery gaps come back as worker messages
+      // (`onDcWorkerMessage`); the page's object is a closed husk now, so it
+      // stays out of `channels`, and the session's `pc.close()` closes the real one.
+      dcChannelInWorker = true
+      dcChannelMove.moved()
+      console.info(`[rc] ${label} video channel moved into the decode worker (roomler-rc-dc-worker)`)
+    } else {
+      dcChannelInWorker = false
+      if (sessionDcWorker) {
+        console.info(`[rc] ${label} video channel stays on the page, relayed to the worker: this browser refused to move it (${refused})`)
       }
+      dc.binaryType = 'arraybuffer'
+      dc.onmessage = (ev) => {
+        if (!(ev.data instanceof ArrayBuffer)) return
+        noteVideoDcDelivery()
+        try {
+          // P1 - sentAt stamps the main-to-worker forwarding hop (epoch-absolute).
+          worker.postMessage(
+            { type: 'chunk', bytes: ev.data, sentAt: performance.timeOrigin + performance.now() },
+            [ev.data],
+          )
+        } catch (err) {
+          console.warn(`[rc] ${label} worker post failed`, err)
+        }
+      }
+      dc.onopen = () => {
+        markConnect('dc_open')
+        console.info(`[rc] ${label} DC opened`)
+      }
+      dc.onclose = () => {
+        console.info(`[rc] ${label} DC closed`)
+      }
+      channels.videoBytes = dc
     }
-    dc.onopen = () => {
-      markConnect('dc_open')
-      console.info('[rc] hevc DC opened')
-    }
-    dc.onclose = () => {
-      console.info('[rc] hevc DC closed')
-    }
-    channels.videoBytes = dc
-    hevcWorker = worker
-    hevcActive.value = true
+    dcWorker = worker
+    dcPathLabel = label
+    dcPathTransport = transport
+    dcActive.value = true
     // FR-1 P7 — the clock offset may already be locked (probe started with
     // the control DC); hand it to the fresh worker.
     pushClockOffset()
     return worker
   }
 
-  function stopHevcPath() {
-    hevcActive.value = false
-    hevcFramesDecoded.value = 0
-    // P7 — drop the viewport reporter + render-path mirror with the path.
-    hevcViewportCleanup?.()
-    hevcViewportCleanup = null
-    renderInfo.value = null
-    if (!hevcWorker) return
-    try { hevcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
-    try { hevcWorker.terminate() } catch { /* ignore */ }
-    hevcWorker = null
+  /** FR-135 R3 — the data-channel worker's messages, one handler for every
+   *  codec. `label` is the name the path goes by in the console, on
+   *  `rc:decode-error` and in the bench record. A message from a worker that
+   *  is no longer the active one belongs to a stopped path, and is dropped. */
+  function onDcWorkerMessage(worker: Worker, label: DcPathLabel, ev: MessageEvent) {
+    if (worker !== dcWorker) return
+    const msg = ev.data as Record<string, unknown> | undefined
+    if (!msg || typeof msg.type !== 'string') return
+    if (msg.type === 'bench-probe') {
+      onBenchProbe(msg.seq, msg.paintedAt, label)
+      return
+    }
+    if (msg.type === 'viewer-hz') {
+      onViewerHz(msg.hz)
+      return
+    }
+    if (msg.type === 'request-keyframe') {
+      // rc.130 - worker dropped deltas on a decode backlog; ask the agent
+      // for a fresh IDR so it can resync.
+      requestKeyframe()
+      return
+    }
+    // FR-135 R3 — a moved channel's arrival, or its failure (`dcChannelMove`).
+    if (dcChannelMove.onWorkerMessage(msg.type)) return
+    if (msg.type === 'message-error') {
+      console.warn(`[rc] ${label} worker could not receive a message (messageerror)`)
+      return
+    }
+    // FR-135 R3 — the channel moved into the worker says what the page's own
+    // handlers say for a relayed one, with the same lines.
+    if (msg.type === 'video-channel-open') {
+      markConnect('dc_open')
+      console.info(`[rc] ${label} DC opened`)
+      return
+    }
+    if (msg.type === 'video-channel-closed') {
+      console.info(`[rc] ${label} DC closed`)
+      return
+    }
+    if (msg.type === 'video-channel-gap') {
+      if (typeof msg.gapMs === 'number') warnVideoDcGap(msg.gapMs)
+      return
+    }
+    if (msg.type === 'first-frame'
+      && typeof msg.width === 'number'
+      && typeof msg.height === 'number') {
+      mediaIntrinsicW.value = msg.width
+      mediaIntrinsicH.value = msg.height
+      dcFramesDecoded.value = Math.max(dcFramesDecoded.value, 1)
+      markConnect('first_frame')
+      logConnectTiming('first-frame')
+      // rc.100 - the worker reports the size it paints as width/height and
+      // forwards coded/display/visibleRect for field diagnosis. Logging the
+      // gap localises a decoder that misreports the geometry (DEVBOX: the
+      // agent encoded 2560x1600 HEVC and NVDEC's display came out 1280x720).
+      console.info(
+        `[rc] ${label} first frame`, msg.width, 'x', msg.height,
+        '| coded', msg.coded, 'display', msg.display, 'visible', msg.visible,
+        '| crop', msg.crop, 'rewrapped', msg.rewrapped,
+        // FR-130 P2 — what the decoder says it produced (P3 reads it per session).
+        '| decoded colour space', colorSpaceLabel(msg.colorSpace),
+      )
+    } else if (msg.type === 'colorspace-dropped') {
+      warnColorSpaceDropped(label, msg)
+    } else if (msg.type === 'decoder-configured') {
+      // `pref` (round 3) = the hardwareAcceleration ACTUALLY passed to
+      // configure() - proves whether the roomler-rc-decode-pref A/B took.
+      // FR-80 — `msg.codec` is the truth (the label is a path name, and
+      // `vp9-444` decodes VP9, AV1 and H.264). The pill reads it until the
+      // agent names its encoder.
+      dcDecoderCodec.value = typeof msg.codec === 'string' ? msg.codec : null
+      // FR-130 P2 — `colorSpace`: what configure() was told (none: the stream decides).
+      console.info(`[rc] ${label} decoder configured`, msg.codec, 'hwAccel:', msg.pref ?? 'no-preference', '| colour space', colorSpaceLabel(msg.colorSpace))
+    } else if (msg.type === 'decoder-error'
+      || msg.type === 'decoder-configure-error'
+      || msg.type === 'decode-error') {
+      // The decoder claimed support then rejected real bytes (rc.43: Chrome
+      // 148 accepted vp09.01.10.08 at configure() and failed the first real
+      // frame with "Unsupported configuration"), or a mid-session driver
+      // hiccup outlasted R1's recovery. Stop the path either way.
+      console.warn(`[rc] ${label} worker`, msg.type, msg.error, '- auto-fallback to <video>')
+      // FR-132 P1 — counted on the agent, before the teardown below.
+      reportDecodeError(label, msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+      const neverDecoded = dcFramesDecoded.value === 0
+      const failedTransport = dcPathTransport
+      stopDcPath()
+      // A failure BEFORE the first decoded frame means the pre-connect probe
+      // was wrong for this browser, and it will be wrong again on the next
+      // rank (field: Edge, where MediaCapabilities says HEVC is
+      // hardware-smooth while WebCodecs refuses hev1) - ban the transport for
+      // this page and re-negotiate NOW instead of leaving a black canvas for
+      // the watchdog to find ~10 s later (a DC session's <video> has no
+      // parallel RTP samples, so the fallback renders nothing). A
+      // post-first-frame error is a transient (driver hiccup) - the same
+      // codec may work again on reconnect.
+      if (neverDecoded && failedTransport && failedTransport !== 'auto' && failedTransport !== 'webrtc') {
+        failedDcTransports.add(failedTransport)
+        // FR-77 — remembered per device × cell across page loads (a Rext
+        // failure bans only the 4:4:4 cell; 4:2:0 is a different profile).
+        const failedCodec = cellCodecOfTransport(failedTransport)
+        if (codecAgentId && failedCodec) {
+          rememberCellFailure(codecAgentId, failedCodec, sessionCellChroma, globalThis.navigator?.userAgent ?? '')
+        }
+        console.warn(`[rc] ${failedTransport} banned for this page (decoder failed before first frame) - reconnecting on the next-best transport`)
+        if (lastConnectArgs) scheduleReconnect()
+      }
+    } else if (msg.type === 'decode-recovering') {
+      // FR-135 R1 — the worker replaced the decoder and waits for the key
+      // frame it asked for. The path stays up. The agent still counts it.
+      console.warn(`[rc] ${label} decoder failed:`, msg.error, '- recovering in place, attempt', msg.attempt)
+      reportDecodeError(label, msg.type, msg.error, msg.codec ?? dcDecoderCodec.value)
+    } else if (msg.type === 'decode-recovered') {
+      console.info(`[rc] ${label} decode recovered in`, msg.ms, 'ms, attempts', msg.attempts)
+    } else if (msg.type === 'frame-rejected') {
+      console.warn(`[rc] ${label} frame rejected`, msg)
+    } else if (msg.type === 'awaiting-keyframe') {
+      // rc.103 - the leading-delta gate is dropping deltas while it waits
+      // for an IDR (the async-encoder DC-open race, a backlog drop, a chunk
+      // gap or a rebuilt decoder). Expected for a few frames; a high,
+      // growing count means the agent isn't shipping an IDR.
+      console.info(`[rc] ${label} awaiting keyframe - dropped`, msg.dropped, 'delta(s) while gated')
+    } else if (msg.type === 'keyframe-acquired') {
+      console.info(`[rc] ${label} keyframe acquired (dropped`, msg.droppedBefore, 'delta(s) before it)')
+    } else if (msg.type === 'backlog-drop') {
+      // FR-119 P2b-7 — the rule reads the backlog in ms; the queue is for context.
+      console.warn(`[rc] ${label} backlog drop - backlog`, msg.backlogMs, 'ms, decode queue', msg.queue, '- gate re-armed, resync IDR requested (total dropped', msg.dropped, ')')
+    } else if (msg.type === 'decode-stall') {
+      // 2026-07-24 - frames are arriving but the decoder produced no
+      // output for gapMs with work queued: a decoder/GPU-process stall,
+      // NOT transport and NOT the resync gate. Field-diagnosis marker.
+      console.warn(`[rc] ${label} DECODE STALL - no decoder output for`, msg.gapMs, 'ms; queue', msg.queue)
+    } else if (msg.type === 'decode-stall-recovered') {
+      console.warn(`[rc] ${label} decode stall recovered after`, msg.gapMs, 'ms')
+    } else if (msg.type === 'render-fallback') {
+      // P7 — GL unavailable/lost for good this session; the worker
+      // reverted to the byte-identical 2D paint path.
+      console.warn(`[rc] ${label} FSR unavailable — 2D paint path:`, msg.reason)
+    } else if (msg.type === 'frame-decoded') {
+      // The worker emits this for every decoded frame after the first, only
+      // under `roomler-rc-per-frame-msg` (P1).
+      dcFramesDecoded.value++
+    } else if (msg.type === 'stats') {
+      // rc.35 - rolling-window bitrate / fps / resolution from the
+      // worker. Surfaces the actual DC-receive throughput so the
+      // operator can confirm the agent's bitrate target is pushing the
+      // link as expected.
+      const m = msg as {
+        bitrateBps?: number
+        fps?: number
+        width?: number
+        height?: number
+        bytesReceivedTotal?: number
+        framesDroppedBacklog?: number
+        decodeQueueSize?: number
+        backlogMs?: number
+        backlogMaxMs?: number
+        framesDecodedTotal?: number
+        paint?: HopWindow
+        fwd?: HopWindow
+        decode?: HopWindow
+        // FR-15 — end-to-end paint age window (null until the
+        // rc:clock probe locks); rides the decodestat to the agent.
+        age?: HopWindow | null
+        outGapMaxMs?: number
+        ctxMode?: string
+        render?: string
+        renderW?: number
+        renderH?: number
+      }
+      updateRenderInfo(m)
+      dcStats.value = {
+        bitrateBps: typeof m.bitrateBps === 'number' ? m.bitrateBps : 0,
+        fps: typeof m.fps === 'number' ? m.fps : 0,
+        width: typeof m.width === 'number' ? m.width : 0,
+        height: typeof m.height === 'number' ? m.height : 0,
+        bytesReceivedTotal: typeof m.bytesReceivedTotal === 'number' ? m.bytesReceivedTotal : 0,
+      }
+      if (dcStats.value.bytesReceivedTotal > 0) mediaDataArrived.value = true
+      // P1 - the per-frame `frame-decoded` message is off by default; keep
+      // the diagnostics counter monotonic from the 1 s window total.
+      if (typeof m.framesDecodedTotal === 'number') {
+        dcFramesDecoded.value = Math.max(dcFramesDecoded.value, m.framesDecodedTotal)
+      }
+      updateDecodeDiag(m)
+      // rc.188 - feed the agent this viewer's real decode rate so it caps fps.
+      handleDecoderStats(m)
+    }
   }
 
-  watch(hevcCanvasEl, (el) => {
-    hevcViewportCleanup?.()
-    hevcViewportCleanup = null
-    if (!el || !hevcWorker) return
+  function stopDcPath() {
+    dcActive.value = false
+    dcFramesDecoded.value = 0
+    // FR-135 R3 — the pill and the size hints read these while a path is up;
+    // the next path, of any codec, starts from nothing rather than this one's.
+    dcStats.value = { bitrateBps: 0, fps: 0, width: 0, height: 0, bytesReceivedTotal: 0 }
+    // P7 — drop the viewport reporter + render-path mirror with the path.
+    dcViewportCleanup?.()
+    dcViewportCleanup = null
+    renderInfo.value = null
+    dcPathLabel = null
+    dcPathTransport = null
+    // FR-135 R3 — a channel in the worker goes with it: terminating the worker
+    // stops it being read, as a relayed one stops being read once its worker
+    // is gone, and the session's `pc.close()` closes either.
+    dcChannelInWorker = false
+    dcChannelMove.stop()
+    if (!dcWorker) return
+    try { dcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
+    try { dcWorker.terminate() } catch { /* ignore */ }
+    dcWorker = null
+  }
+
+  /** FR-135 R3 — the page moved the channel and the worker did not take it
+   *  (no `video-channel-attached` in time, or `messageerror`). The page kept no
+   *  copy, so this session has no picture: stop the path, relay on every later
+   *  session of this page, and reconnect now rather than at the watchdog. */
+  function onVideoChannelMoveFailed(why: string) {
+    if (!dcWorker || !dcChannelInWorker) return
+    const label = dcPathLabel ?? 'dc'
+    dcWorkerMoveFailed = true
+    console.warn(`[rc] ${label} video channel moved into the decode worker, but ${why} - relaying it on the page from now on, and reconnecting`)
+    stopDcPath()
+    if (lastConnectArgs) scheduleReconnect()
+  }
+
+  /** When the view mounts a real `<canvas>`, swap it in for the
+   *  synthetic OffscreenCanvas the worker started with. The worker
+   *  treats `init-canvas` as idempotent - second call replaces the
+   *  paint target. */
+  watch(dcCanvasEl, (el) => {
+    dcViewportCleanup?.()
+    dcViewportCleanup = null
+    if (!el || !dcWorker) return
     try {
       const off = el.transferControlToOffscreen()
-      hevcWorker.postMessage({ type: 'init-canvas', canvas: off }, [off])
+      dcWorker.postMessage({ type: 'init-canvas', canvas: off }, [off])
       // P7 — start reporting the element box for the FSR sizing policy.
-      hevcViewportCleanup = startViewportReporter(el, hevcWorker)
+      dcViewportCleanup = startViewportReporter(el, dcWorker)
     } catch (err) {
-      console.warn('[rc] hevc: transferControlToOffscreen failed', err)
+      console.warn(`[rc] ${dcPathLabel ?? 'dc'}: transferControlToOffscreen failed`, err)
     }
   })
 
@@ -9638,8 +9580,7 @@ export function useRemoteControl(
     // FR-16 L4 — flush the last batch while the session id still names it.
     stopBench()
     stopWebCodecsPath()
-    stopVp9_444Path()
-    stopHevcPath()
+    stopDcPath()
     for (const ch of Object.values(channels)) {
       try { ch.close() } catch { /* ignore */ }
     }
@@ -9691,6 +9632,7 @@ export function useRemoteControl(
     inputReach.value = null
     idleEndsAt.value = null
     dcDecoderCodec.value = null
+    dcDecoderHw = null
     remoteLayout.value = null
     localClipboardBridge.value = null
     localClipboardBridgePort.value = null
@@ -10909,6 +10851,9 @@ export function useRemoteControl(
           hint: parsed.hint,
         }
         mediaWaitingSinceMs = Date.now()
+        // FR-135 R0c — the pumps send nothing while capture waits, so the
+        // decode worker must not count the gap across the hold as a freeze.
+        dcWorker?.postMessage({ type: 'media-hold' })
         console.info(
           `[rc] the host is waiting for the person at the screen (${parsed.for}), up to ${Math.round(parsed.waitsMs / 1000)} s`,
         )
@@ -11343,6 +11288,12 @@ export function useRemoteControl(
     if (!sessionDecodeRecover) {
       console.info('[rc] decode recovery: off this session (roomler-rc-decode-recover=0) - a decode error stops the path and the watchdog re-creates the session (FR-135 R1)')
     }
+    // FR-135 R3 — off unless this browser turned it on, until S11 decides, and
+    // off for the rest of the page once a move has failed on it.
+    sessionDcWorker = storedDcWorker() && !dcWorkerMoveFailed
+    if (dcWorkerMoveFailed && storedDcWorker()) {
+      console.info('[rc] video channel: relayed by the page this session - a move into the decode worker failed earlier on this page (roomler-rc-dc-worker)')
+    }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
     } else if (sessionBenchMode === 'target') {
@@ -11361,27 +11312,29 @@ export function useRemoteControl(
     // the same transport. An older agent ignores the channel, and a session
     // it then sends over the RTP track is black until the watchdog gives up;
     // an agent with a plan says so, and `onMediaPlan` shows the track (FR-135 R2).
+    // FR-135 R3 — one worker for every DC transport; what differs is the
+    // codec string and the name the path goes by (`DcPathLabel`).
     if (preferredTransport === 'data-channel-vp9-444') {
-      // rc.190 Ã¢ÂÂ when the pick forced 4:2:0 (auto-rank / HEVC fallback),
+      // rc.190 - when the pick forced 4:2:0 (auto-rank / HEVC fallback),
       // configure the worker for profile 0 explicitly so the codec
       // string matches the bitstream the agent will emit, instead of
       // deriving from the user's chroma pref (which may say 4:4:4).
-      startVp9_444Path(chromaOverride === 'yuv420' ? 'vp09.00.10.08' : undefined)
+      startDcPath('vp9-444', vp9DcCodec(chromaOverride === 'yuv420' ? 'vp09.00.10.08' : undefined), preferredTransport)
     } else if (preferredTransport === 'data-channel-hevc') {
       // P7 — the Rext pick reconfigures the worker's VideoDecoder with the
       // Rext codec string (same Annex-B no-description contract; only the
       // profile fields differ).
-      startHevcPath(hevcRextPick ? HEVC_REXT_CODEC_STRING : undefined)
+      startDcPath('hevc', hevcRextPick ? HEVC_REXT_CODEC_STRING : HEVC_MAIN_CODEC_STRING, preferredTransport)
     } else if (preferredTransport === 'data-channel-av1') {
-      // rc.190 Ã¢ÂÂ AV1 rides the SAME wire format + worker as VP9-over-DC
+      // rc.190 - AV1 rides the SAME wire format + worker as VP9-over-DC
       // (13-byte length-prefix framing; the worker's VideoDecoder just
-      // gets the AV1 codec string). No separate worker file needed.
-      startVp9_444Path(AV1_CODEC_STRING)
+      // gets the AV1 codec string).
+      startDcPath('vp9-444', AV1_CODEC_STRING, preferredTransport)
     } else if (preferredTransport === 'data-channel-h264') {
-      // P2 Ã¢ÂÂ H.264 rides the same worker via the avc1 codec override
-      // (the AV1 precedent). The probe ladder already picked the codec
-      // string this browser accepts.
-      startVp9_444Path(h264DcCodec ?? H264_DC_CODEC_CANDIDATES[0])
+      // P2 - H.264 rides the same worker via the avc1 codec string (the AV1
+      // precedent). The probe ladder already picked the codec string this
+      // browser accepts.
+      startDcPath('vp9-444', h264DcCodec ?? H264_DC_CODEC_CANDIDATES[0], preferredTransport)
     }
 
     // Kick off the rc:* handshake. browser_caps lets the agent pick
@@ -11676,26 +11629,25 @@ export function useRemoteControl(
       ev: PointerEvent | MouseEvent | WheelEvent,
     ): { x: number; y: number; insideVideo: boolean } {
       const video = findVideo()
-      // VP9-444 mode: the `<video>` is hidden + unfed (the agent's
+      // Data-channel mode: the `<video>` is hidden + unfed (the agent's
       // pump routed encoded frames to the `video-bytes` DC instead of
       // the WebRTC track), so `video.videoWidth` is 0. The visible
-      // surface is the `<canvas>` painted by rc-vp9-444-worker, and
+      // surface is the `<canvas>` painted by rc-dc-worker, and
       // its intrinsic dimensions (the agent's encode resolution) are
       // already cached in `mediaIntrinsicW/H` from the worker's
-      // `first-frame` message. Use that instead Ã¢ÂÂ without it the
+      // `first-frame` message. Use that instead - without it the
       // letterbox math hits divide-by-zero and every pointer event
       // gets mapped to NaN, dropping all clicks/moves silently.
       // Same shape applies to the WebCodecs render path (the canvas
       // there also reports via `first-frame`), but in that path the
       // `<video>` is also fed the RTP track so videoWidth is non-zero
-      // anyway Ã¢ÂÂ falling through to the canvas path is harmless.
-      // rc.95 Ã¢ÂÂ HEVC-over-DC is a canvas path too (rc-hevc-worker reports
-      // dims via `first-frame` Ã¢ÂÂ mediaIntrinsicW/H). It was MISSING here,
-      // so HEVC sessions mapped input against the now-hidden `<video>`'s
-      // videoWidth=0 (the sibling of the RemoteControl.vue `<video>`
-      // v-show omission that black-screened HEVC). Include it.
-      const useCanvasDims =
-        vp9_444Active.value || webcodecsActive.value || hevcActive.value
+      // anyway - falling through to the canvas path is harmless.
+      // rc.95 - HEVC-over-DC is a canvas path too; it was once MISSING
+      // here, so HEVC sessions mapped input against the now-hidden
+      // `<video>`'s videoWidth=0 (the sibling of the RemoteControl.vue
+      // `<video>` v-show omission that black-screened HEVC). Since FR-135
+      // R3 every data-channel codec is the one `dcActive`.
+      const useCanvasDims = dcActive.value || webcodecsActive.value
       const intrinsicW = useCanvasDims
         ? mediaIntrinsicW.value
         : (video?.videoWidth ?? 0)
@@ -11764,9 +11716,9 @@ export function useRemoteControl(
           mediaIntrinsicH: mediaIntrinsicH.value,
           intrinsicW,
           intrinsicH,
-          vp9_444Active: vp9_444Active.value,
+          dcActive: dcActive.value,
+          dcPath: dcPathLabel,
           webcodecsActive: webcodecsActive.value,
-          hevcActive: hevcActive.value,
           renderElTag: renderEl?.tagName ?? null,
           renderRectW: renderRect?.width ?? null,
           renderRectH: renderRect?.height ?? null,
@@ -12308,7 +12260,10 @@ export function useRemoteControl(
       const mods = pendingCtrlV.mods
       if (pendingCtrlV.timer) clearTimeout(pendingCtrlV.timer)
       pendingCtrlV = null
-      for (const frame of deferredPasteFrames(mods)) sendInput(frame)
+      // #3046: with the person's Ctrl already up, the agent presses what `mods`
+      // names, so on a Mac host that has to say Cmd.
+      const hostMods = translateModsForHost(mods, hostIsMac.value && ctrlAsCmd.value)
+      for (const frame of deferredPasteFrames(hostMods)) sendInput(frame)
     }
 
     /** Schedule a 25 ms-delayed read of the host's clipboard + mirror
@@ -14070,8 +14025,8 @@ export function useRemoteControl(
     resumeAudioPlayback,
     /** rc.62 Ã¢ÂÂ user's VP9 chroma preference ('auto' | 'yuv420' |
      *  'yuv444'). Drives the `chroma_pref` field of
-     *  `rc:session.request` AND the vp9-444 worker's codec string
-     *  selection. */
+     *  `rc:session.request` AND the VP9 codec string the data-channel
+     *  worker is given (`vp9DcCodec`). */
     vp9Chroma,
     setVp9Chroma,
     /** rc.199 Ã¢ÂÂ the viewer "Priority" dial + its setter (live; sent over the
@@ -14097,23 +14052,19 @@ export function useRemoteControl(
     setThisDevices,
     localRelayRefused,
     vp9_444Supported,
-    vp9_444Active,
-    vp9_444FramesDecoded,
-    vp9_444Stats,
-    vp9_444CanvasEl,
+    /** FR-135 R3 — the one data-channel path, whatever its codec: whether it
+     *  is up, its decoded frames, its 1 s stats, and the canvas it paints. */
+    dcActive,
+    dcFramesDecoded,
+    dcStats,
+    dcCanvasEl,
     /** P7 — whether this browser decodes HEVC Rext 4:4:4 (gates the
      *  "HEVC · crisp text (4:4:4)" picker entry with the agent's
      *  hevc_chroma caps). */
     hevcRextSupported,
     h264High444Supported,
-    /** rc.78 — HEVC over DataChannel (Option B). Same shape as the
-     *  VP9-444 fields above; view can branch on which is active to
-     *  decide which canvas/HUD to render. */
+    /** rc.78 — whether this browser decodes HEVC over the data channel. */
     hevcSupported,
-    hevcActive,
-    hevcFramesDecoded,
-    hevcStats,
-    hevcCanvasEl,
     /** P1 Ã¢ÂÂ per-hop pipeline diagnostics for the diag HUD
      *  (localStorage roomler-rc-diag-hud=1). */
     decodeDiag,
@@ -14671,6 +14622,13 @@ export function translateModifierForHost(
     return 0xe3
   }
   return code
+}
+
+/** #3046: the same substitution for the `mods` bits of a chord that has no
+ * modifier key of its own for `translateModifierForHost` to rewrite: the soft
+ * keyboard's sticky Ctrl. */
+export function translateModsForHost(mods: number, enabled: boolean): number {
+  return enabled && mods & 0x01 ? (mods & ~0x01) | 0x08 : mods
 }
 
 /** The attribute that marks an editable element as a capture surface of the

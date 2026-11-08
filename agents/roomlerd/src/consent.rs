@@ -48,7 +48,7 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -306,9 +306,20 @@ struct BrokerInner {
     /// Sessions currently awaiting a decision, each with the handle a
     /// [`ConsentBroker::cancel`] fires. Populated the moment
     /// [`ConsentBroker::request_with_mode`] is CALLED (before its future is
-    /// first polled — see there for why), cleared by the [`PendingGuard`]
-    /// when the sentinel arrives, the timeout fires, the prompt is
-    /// cancelled, or the future is dropped.
+    /// first polled — see there for why). Cleared by [`ConsentBroker::cancel`]
+    /// the moment the prompt is withdrawn, and otherwise by the prompt's look
+    /// that decides it (an answer, the window running out) or by its
+    /// [`PendingGuard`] when the future is dropped.
+    ///
+    /// ⚠️ Every change to a question happens under this lock (#3433): it is
+    /// armed (its old answers cleared), answered (the sentinel written),
+    /// withdrawn, decided and released (with its marker and answers) under
+    /// it. So an answer is on the books before its question ends, or it is
+    /// refused: never reported taken by a question that has already ended.
+    /// Two files are written outside it: the `.pending` marker, by the caller
+    /// that shows the question ([`ConsentBroker::write_prompt`]), and an
+    /// answer from the CLI's fallback, with no check at all. That is why
+    /// each look reads the books before any answer.
     pending: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
@@ -319,10 +330,12 @@ impl BrokerInner {
     }
 }
 
-/// Clears the `.pending` marker and the in-memory pending entry for one
-/// session on drop, so a prompt whose awaiting future is CANCELLED (the SSH /
-/// RC transport died before a decision) does not leak a phantom the CLI and
-/// tray keep showing. Straight-line cleanup ran only on a normal decision.
+/// One question's place on the books, and the files that show it: its
+/// `.pending` marker and any answer left for it. Released by the look that
+/// ends the question, and again on drop, so a prompt whose awaiting future is
+/// CANCELLED (the SSH / RC transport died before a decision) does not leak a
+/// phantom the CLI and tray keep showing. Straight-line cleanup ran only on a
+/// normal decision.
 ///
 /// Owns its broker handle rather than borrowing it, so the prompt future it
 /// rides in is `'static` and can be created on one task and awaited on
@@ -337,20 +350,97 @@ struct PendingGuard {
     cancel: Arc<Notify>,
 }
 
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(
-            self.inner
+impl PendingGuard {
+    /// Whether the books still hold THIS question, not a newer one for the
+    /// same id.
+    fn holds(&self, books: &HashMap<String, Arc<Notify>>) -> bool {
+        books
+            .get(&self.session_hex)
+            .is_some_and(|n| Arc::ptr_eq(n, &self.cancel))
+    }
+
+    /// One look at the question, under the books: withdrawn, answered or out
+    /// of time, in that order. A question that ends here is released in the
+    /// same step, so from its end it takes no answer and leaves none behind.
+    ///
+    /// ⚠️ The books first (#3433): off them, the question is withdrawn,
+    /// whatever has landed since. The poll used to look for an answer first,
+    /// so an Allow that passed `record_decision`'s check just before a cancel,
+    /// or one the CLI's fallback wrote with no check at all, landed after it
+    /// and was taken.
+    fn look(&self, approve: &Path, deny: &Path, deadline: Instant) -> Option<Decision> {
+        let mut books = self.inner.pending.lock().unwrap();
+        let decided = if !self.holds(&books) {
+            Decision::Cancelled
+        } else if approve.exists() {
+            Decision::Granted
+        } else if deny.exists() {
+            Decision::Denied
+        } else if Instant::now() >= deadline {
+            Decision::Timeout
+        } else {
+            return None;
+        };
+        self.release_in(&mut books, |marker| {
+            let _ = std::fs::remove_file(marker);
+        });
+        Some(decided)
+    }
+
+    /// Takes the question off the books, then off the disk: its marker, and
+    /// any answer left for it. Only while the books hold this question, or
+    /// nothing for its id.
+    ///
+    /// ⚠️ The entry first, then the marker (#3427). `record_decision` takes an
+    /// answer while the in-memory entry stands, and the companion, `roomlerd
+    /// consent --list` and the person go by the marker. With the marker
+    /// removed first, an answer sent the moment it went was still taken, for a
+    /// session that had ended.
+    ///
+    /// ⚠️ All of it under the books' lock (#3433), which every answer and every
+    /// newer question for the same id take too. So no answer lands between the
+    /// entry going and its files going, to be reported taken for nothing and
+    /// left behind. And a guard whose id a newer question holds (an RC session
+    /// asked again under its own id) leaves that question's marker and answers
+    /// alone: it used to take the marker off the screen of a question still
+    /// asking. `remove_marker` is the unlink, passed in so a test can answer at
+    /// exactly that moment.
+    fn release(&self, remove_marker: impl FnOnce(&Path)) {
+        let mut books = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.release_in(&mut books, remove_marker);
+    }
+
+    fn release_in(
+        &self,
+        books: &mut HashMap<String, Arc<Notify>>,
+        remove_marker: impl FnOnce(&Path),
+    ) {
+        if self.holds(books) {
+            books.remove(&self.session_hex);
+        } else if books.contains_key(&self.session_hex) {
+            return;
+        }
+        remove_marker(
+            &self
+                .inner
                 .sentinel_dir
                 .join(format!("{}.pending", self.session_hex)),
         );
-        if let Ok(mut pending) = self.inner.pending.lock()
-            && pending
-                .get(&self.session_hex)
-                .is_some_and(|n| Arc::ptr_eq(n, &self.cancel))
-        {
-            pending.remove(&self.session_hex);
+        for kind in [SentinelKind::Approve, SentinelKind::Deny] {
+            let _ = std::fs::remove_file(self.inner.sentinel_path(&self.session_hex, kind));
         }
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.release(|marker| {
+            let _ = std::fs::remove_file(marker);
+        });
     }
 }
 
@@ -391,32 +481,26 @@ impl ArmedPrompt {
         let deny = inner.sentinel_path(session_hex, SentinelKind::Deny);
         let deadline = Instant::now() + timeout;
         let outcome = loop {
-            if approve.exists() {
-                break Decision::Granted;
-            }
-            if deny.exists() {
-                break Decision::Denied;
-            }
-            if Instant::now() >= deadline {
-                break Decision::Timeout;
+            if let Some(decided) = guard.look(&approve, &deny, deadline) {
+                break decided;
             }
             // #1632 — a cancel lands within the poll interval, not at its
             // end: `notify_one` stores a permit when nobody is waiting, so
             // one fired between two iterations is consumed by the very next
             // `notified()`, and one fired while the sleep is pending wakes
-            // it at once.
+            // it at once. Either way the next look finds the question off
+            // the books.
             tokio::select! {
-                _ = cancel.notified() => break Decision::Cancelled,
+                _ = cancel.notified() => {}
                 _ = tokio::time::sleep(POLL_INTERVAL) => {}
             }
         };
 
-        // Clear the decision sentinels so a future re-request of the same id
-        // doesn't see a stale one. The `.pending` marker and the in-memory
-        // entry are the guard's job (above) so they are cleared on cancellation
-        // too.
-        let _ = std::fs::remove_file(&approve);
-        let _ = std::fs::remove_file(&deny);
+        // The look that decided released the question: off the books, its
+        // marker and its sentinels gone, so a re-request of the same id sees
+        // nothing stale. The guard releases again on drop. That leaves a
+        // newer question for the id alone, and with none, unlinks the
+        // question's files a second time, taking anything written since.
         tracing::info!(session = session_hex, ?outcome, "operator consent decision");
         outcome
     }
@@ -569,14 +653,18 @@ impl ConsentBroker {
         // (the RC path arms on the WS loop and polls in a spawned task). A
         // purge there ate an Approve recorded in between — the person who
         // clicked watched the prompt time out.
+        //
+        // ⚠️ And under the books, with the registration (#3433, review F2).
+        // Purged before taking them, an answer `record_decision` gave in
+        // between, for an older question still holding this id, was left
+        // for this one, whose first look took an answer given before it
+        // existed.
+        let cancel = Arc::new(Notify::new());
+        let mut books = self.inner.pending.lock().unwrap();
         let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Approve));
         let _ = std::fs::remove_file(self.inner.sentinel_path(session_hex, SentinelKind::Deny));
-        let cancel = Arc::new(Notify::new());
-        self.inner
-            .pending
-            .lock()
-            .unwrap()
-            .insert(session_hex.to_string(), cancel.clone());
+        books.insert(session_hex.to_string(), cancel.clone());
+        drop(books);
         ArmedPrompt {
             guard: PendingGuard {
                 inner: self.inner.clone(),
@@ -599,8 +687,16 @@ impl ConsentBroker {
     /// Called from the `ServerMsg::Terminate` path: the session the question
     /// is about no longer exists, so the person at the machine must not be
     /// left deciding on it, and no verdict is owed to the server.
+    ///
+    /// ⚠️ Off the books first, then woken (#3433): from this call on the
+    /// prompt takes no answer, since every look it takes goes to the books
+    /// first and finds the question withdrawn, whatever has landed since.
+    /// Woken alone, its entry stood until the prompt next ran, which for a
+    /// question armed before it is shown can be a companion's start away, and
+    /// the poll looked for an answer before the cancel: an answer in between
+    /// was taken, and won.
     pub fn cancel(&self, session_hex: &str) -> bool {
-        let handle = self.inner.pending.lock().unwrap().get(session_hex).cloned();
+        let handle = self.inner.pending.lock().unwrap().remove(session_hex);
         match handle {
             Some(cancel) => {
                 tracing::info!(
@@ -626,15 +722,41 @@ impl ConsentBroker {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        std::fs::write(&path, format!("{now_ts}\n"))
-            .with_context(|| format!("writing sentinel {}", path.display()))?;
+        let body = format!("{now_ts}\n");
+        // ⚠️ Unix: written under a name of its own, created new and 0600, then
+        // renamed into place (#3433). The prompt's poll takes a sentinel the
+        // moment it exists and removes it. A chmod after the write then failed,
+        // "No such file or directory", and `record_decision` said false for an
+        // answer that had counted. The rename is atomic: the poll sees the
+        // whole file or nothing, already 0600, and an answer counts only once
+        // the rename has landed it. Windows writes no mode, so it has no step
+        // after the write to lose.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&path, perms)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = self.inner.sentinel_dir.join(format!(
+                ".{session_hex}.{}.{}-{}.tmp",
+                kind.suffix(),
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let landed = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+                .and_then(|mut f| f.write_all(body.as_bytes()))
+                .and_then(|()| std::fs::rename(&tmp, &path));
+            if let Err(e) = landed {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e).with_context(|| format!("writing sentinel {}", path.display()));
+            }
         }
+        #[cfg(not(unix))]
+        std::fs::write(&path, body)
+            .with_context(|| format!("writing sentinel {}", path.display()))?;
         Ok(path)
     }
 
@@ -647,7 +769,16 @@ impl ConsentBroker {
     /// hex-validated by the caller (`DaemonState::consent_decide`) before it
     /// reaches this.
     pub fn record_decision(&self, session_hex: &str, allow: bool) -> bool {
-        if !self.inner.pending.lock().unwrap().contains_key(session_hex) {
+        // ⚠️ Checked and written under the books' lock (#3433), the one the
+        // prompt decides under: an answer lands only while its question still
+        // asks, for the prompt's next look to take. Checked under it and
+        // written after, an answer that passed the check as its question was
+        // decided or withdrawn landed once the question had cleared its
+        // sentinels: reported taken for nothing, and left behind. A withdrawal
+        // before that next look still wins: the session it was for is over.
+        let books = self.inner.pending.lock().unwrap();
+        if !books.contains_key(session_hex) {
+            drop(books);
             tracing::warn!(
                 session = session_hex,
                 "consent decision ignored — no active prompt for this session"
@@ -659,7 +790,9 @@ impl ConsentBroker {
         } else {
             SentinelKind::Deny
         };
-        match self.write_sentinel(session_hex, kind) {
+        let landed = self.write_sentinel(session_hex, kind);
+        drop(books);
+        match landed {
             Ok(_) => true,
             Err(e) => {
                 tracing::warn!(session = session_hex, %e, "consent sentinel write failed");
@@ -1186,6 +1319,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3433 — a withdrawn question takes no answer from the moment it is
+    /// withdrawn. `cancel` used to only wake the prompt: its entry stood until
+    /// the prompt next ran, and an answer in between was taken, and won, since
+    /// the poll looks for a decision before it looks for the cancel. The
+    /// record prompt is armed before it is shown, so "next ran" can be a
+    /// companion's start away.
+    #[tokio::test]
+    async fn a_withdrawn_question_takes_no_answer() {
+        let dir = fixture_dir("cancel-takes-no-answer");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000c0c0";
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.cancel(session), "a prompt was standing");
+        let taken = broker.record_decision(session, true);
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("a withdrawn prompt must still resolve promptly");
+        assert_eq!(
+            (taken, decision),
+            (false, Decision::Cancelled),
+            "an answer after the withdrawal was taken, and decided it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3433 — an answer that counted is never reported as refused. The
+    /// prompt's poll takes a sentinel the moment it exists and removes it. The
+    /// sentinel used to be chmod'ed after it was written, and that chmod
+    /// failed, "No such file or directory", once the poll had taken the file:
+    /// `record_decision` said false for an answer that had already decided the
+    /// prompt. A thread here takes every sentinel the moment it appears, as the
+    /// poll does.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_the_poll_takes_at_once_still_counts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = fixture_dir("sentinel-taken-at-once");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let taker = {
+            let (dir, done) = (dir.clone(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(rd) = std::fs::read_dir(&dir) {
+                        for e in rd.flatten() {
+                            if e.path().extension().is_some_and(|x| x == "deny") {
+                                let _ = std::fs::remove_file(e.path());
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        let mut misreported = 0;
+        for i in 0..5_000u32 {
+            let session = format!("3433{i:020x}");
+            let _armed = broker.arm(&session, Duration::from_secs(30));
+            if !broker.record_decision(&session, false) {
+                misreported += 1;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        taker.join().unwrap();
+        assert_eq!(
+            misreported, 0,
+            "answers that counted were reported as refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1632 — registration is eager, so a decision can be recorded between
     /// `request_with_mode` returning and its future's first poll. That
     /// decision must be honoured: the stale-sentinel purge runs at arm time,
@@ -1283,6 +1489,245 @@ mod tests {
             again.await.unwrap(),
             Decision::Granted,
             "the re-prompt must answer on its own handle, not the cancelled one's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3427 — a question taken off the screen takes no more answers. The
+    /// companion, the CLI and the person go by the marker; `record_decision`
+    /// goes by the in-memory entry. With the marker removed first, an answer
+    /// sent the moment it went was still taken, for a session that had ended
+    /// (`control_dc_record`'s six-round cell under load, #1861). The unlink
+    /// here is the test's, so it can answer at exactly that moment: from
+    /// another thread, as the companion's answer comes, since the marker goes
+    /// under the books' lock (#3433) and that answer waits for it.
+    #[test]
+    fn a_question_off_the_screen_takes_no_answer() {
+        let dir = fixture_dir("release-order");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34270000000000000000abcd";
+        broker.write_pending(session, "{}").unwrap();
+        let armed = broker.arm(session, Duration::from_secs(30));
+        let marker = broker.pending_path(session);
+        assert!(
+            marker.exists(),
+            "precondition: the question is on the screen"
+        );
+
+        let (mut under_the_books, mut answer) = (None, None);
+        armed.guard.release(|m| {
+            let _ = std::fs::remove_file(m);
+            under_the_books = Some(broker.inner.pending.try_lock().is_err());
+            let broker = broker.clone();
+            answer = Some(std::thread::spawn(move || {
+                broker.record_decision(session, true)
+            }));
+        });
+        assert_eq!(
+            under_the_books,
+            Some(true),
+            "the marker went outside the books' lock"
+        );
+        assert_eq!(
+            answer.map(|t| t.join().unwrap()),
+            Some(false),
+            "an answer sent as the marker went was still taken"
+        );
+        assert!(!marker.exists());
+        drop(armed); // its guard releases again: a no-op
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3433 — a withdrawn question takes no answer that lands after the
+    /// withdrawal, whoever writes it. An Allow that passed `record_decision`'s
+    /// check just before a session's end lands after the cancel, and the CLI's
+    /// fallback writes its sentinel with no check at all. The poll looked for
+    /// an answer before it looked at the books, so its first look after the
+    /// cancel took it: Granted, for a session that had ended.
+    #[tokio::test]
+    async fn an_answer_that_lands_after_the_withdrawal_is_not_taken() {
+        let dir = fixture_dir("lands-after-cancel");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000c1c1";
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.cancel(session), "a prompt was standing");
+        broker
+            .write_sentinel(session, SentinelKind::Approve)
+            .unwrap();
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("a withdrawn prompt must still resolve promptly");
+        assert_eq!(
+            decision,
+            Decision::Cancelled,
+            "an answer that landed after the withdrawal decided it"
+        );
+        assert!(
+            !broker
+                .sentinel_path(session, SentinelKind::Approve)
+                .exists(),
+            "the answer that came too late stayed behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3433 — a decided question takes no more answers. The prompt broke out
+    /// of its poll, cleared its sentinels and logged its decision, and only
+    /// then did its guard take it off the books: an answer in that gap was
+    /// written after the clearing, reported taken for nothing, and stayed
+    /// behind. The answer here comes at the decision's own log line, inside
+    /// that gap.
+    #[tokio::test]
+    async fn a_decided_question_takes_no_more_answers() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let dir = fixture_dir("decided-takes-no-more");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000d2d2";
+        let late = Arc::new(Mutex::new(None));
+        // ⚠️ A second dispatcher, alive as long as this one. With only one
+        // registered, tracing takes the interest of a callsite first hit on
+        // ANOTHER thread from that thread's own default (none) and caches
+        // "never" for every thread. The other tests resolve prompts at the
+        // same time, and this hook then never heard the decision.
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+        let _log = tracing::subscriber::set_default(tracing_subscriber::registry().with(
+            AnswerAtTheDecision {
+                broker: broker.clone(),
+                session,
+                late: late.clone(),
+            },
+        ));
+
+        let prompt = broker.request_with_mode(session, LONG_WINDOW);
+        assert!(broker.record_decision(session, true));
+        let decision = tokio::time::timeout(PROMPT_BOUND, prompt)
+            .await
+            .expect("an answered prompt must resolve promptly");
+        assert_eq!(decision, Decision::Granted);
+        assert_eq!(
+            *late.lock().unwrap(),
+            Some(false),
+            "a question already decided took another answer"
+        );
+        assert!(
+            !broker.sentinel_path(session, SentinelKind::Deny).exists(),
+            "the answer that came too late stayed behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Answers `session` once, with a Deny, the moment its prompt logs the
+    /// decision it made: what a click lands on when it comes just too late.
+    struct AnswerAtTheDecision {
+        broker: ConsentBroker,
+        session: &'static str,
+        late: Arc<Mutex<Option<bool>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AnswerAtTheDecision {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    if f.name() == "message" {
+                        self.0 = format!("{v:?}");
+                    }
+                }
+            }
+            let mut m = Message(String::new());
+            event.record(&mut m);
+            if m.0 == "operator consent decision" {
+                let mut late = self.late.lock().unwrap();
+                if late.is_none() {
+                    *late = Some(self.broker.record_decision(self.session, false));
+                }
+            }
+        }
+    }
+
+    /// #3433 — a question's end leaves a newer question for the same id alone.
+    /// An RC session can be asked again under its own id while its first
+    /// question still stands: arming the second takes the id's entry, and the
+    /// first one's guard then took their shared marker off the screen as it
+    /// went, leaving the second question asking with nothing to show it.
+    #[test]
+    fn an_older_question_leaves_a_newer_ones_marker() {
+        let dir = fixture_dir("older-leaves-newer");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000e3e3";
+        let older = broker.arm(session, Duration::from_secs(30));
+        let newer = broker.arm(session, Duration::from_secs(30));
+        let marker = broker.write_pending(session, "{}").unwrap();
+
+        drop(older);
+        assert!(
+            marker.exists(),
+            "an older question took a newer one's marker off the screen"
+        );
+        assert!(
+            broker.record_decision(session, true),
+            "the newer question stopped taking answers"
+        );
+        drop(newer);
+        assert!(!marker.exists(), "the newer question's end left its marker");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #3433 review, F2 — a newer question for the same id clears the old
+    /// answers and takes the id on the books in one step. Cleared outside the
+    /// books and placed under them after, an answer recorded in between, for
+    /// the older question still on the books, was left for the newer one,
+    /// whose first look took an answer given before it existed.
+    ///
+    /// The books are held here while the newer question is armed. An arm that
+    /// clears outside them clears at once (a leftover going says so), and the
+    /// answer is then given as `record_decision` gives it: under the books,
+    /// for the question they hold.
+    #[tokio::test]
+    async fn a_newer_question_takes_no_answer_given_before_it() {
+        let dir = fixture_dir("newer-takes-none-before");
+        let broker = ConsentBroker::new(LONG_WINDOW, dir.clone()).unwrap();
+        let session = "34330000000000000000f4f4";
+        let _older = broker.arm(session, Duration::from_secs(30));
+        let leftover = broker.write_sentinel(session, SentinelKind::Deny).unwrap();
+
+        // The books' guard lives in this block alone, so no await is made
+        // while it is held.
+        let arming = {
+            let books = broker.inner.pending.lock().unwrap();
+            let arming = {
+                let broker = broker.clone();
+                std::thread::spawn(move || broker.arm(session, Duration::from_millis(300)))
+            };
+            let waited = Instant::now();
+            while leftover.exists() && waited.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(books.contains_key(session), "the older question was asking");
+            broker
+                .write_sentinel(session, SentinelKind::Approve)
+                .unwrap();
+            arming
+        };
+
+        let newer = arming.join().unwrap();
+        let decision = tokio::time::timeout(PROMPT_BOUND, newer.run())
+            .await
+            .expect("the newer prompt must resolve within its window");
+        assert_eq!(
+            decision,
+            Decision::Timeout,
+            "a newer question took an answer given before it existed"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

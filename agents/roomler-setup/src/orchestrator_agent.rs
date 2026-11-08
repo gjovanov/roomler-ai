@@ -17,13 +17,12 @@
 //!
 //!   1. Preflight: probe registry, surface cross-flavour warnings
 //!   2. Resolve installer metadata via the roomler.ai proxy (rc.27)
-//!   3. Stream MSI bytes to `%TEMP%` with progress emits
-//!   4. Verify SHA256
-//!   5. Spawn msiexec via `roomlerd::updater::
-//!      spawn_installer_for_flavour_with_properties` (perMachine gets
-//!      UAC via ShellExecuteExW + verb=runas)
-//!   6. Attach `MsiRunner` to the spawned PID + wait for exit (caller's
-//!      Tauri-future cancel propagates through 250 ms-slice polling)
+//!   3. Stream MSI bytes to the run's staging folder with progress emits
+//!   4. Verify the digest and the publisher, and hold the file
+//!   5. Start the install: [`package_step::start_install`] (#3246). A limited
+//!      perMachine run prompts once, for this EXE's elevated step
+//!   6. Wait for its exit through `MsiRunner` (caller's Tauri-future cancel
+//!      propagates through 250 ms-slice polling)
 //!   7. Enroll the agent against the configured server, persist
 //!      `config.toml`. Emits `EnrollOk` then `Done`.
 //!
@@ -47,14 +46,17 @@ use std::time::Duration;
 
 use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
 use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
-use roomlerd::updater::{WindowsInstallFlavour, spawn_installer_for_flavour_with_properties};
+use roomlerd::updater::WindowsInstallFlavour;
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
-use wizard_shared::msi_runner::{MsiExitDecoded, MsiRunner};
+use wizard_shared::msi_runner::MsiExitDecoded;
+#[cfg(target_os = "windows")]
+use wizard_shared::msi_runner::MsiRunner;
 use wizard_shared::progress::{ProgressEvent, replay_log};
 
 use crate::commands::DoneReport;
 use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
+use crate::package_step;
 use crate::role::Role;
 
 /// S2 — optional advanced daemon options from the wizard's collapsed
@@ -367,10 +369,20 @@ async fn run_install_inner(
             total_bytes: health.size,
         },
     );
-    let staged = std::env::temp_dir()
-        .join("roomler-setup")
-        .join(&health.tag)
-        .join(&health.filename);
+    // #3246 — a name from the server becomes a path only if it is one plain name,
+    // and on an elevated run only under a folder of its own.
+    let mut staging = package_step::Staging::for_this_run()
+        .map_err(|e| failed(ErrorCode::Download, format!("staging folder: {e}")))?;
+    let staged = staging
+        .path_for(&health.tag, &health.filename)
+        .and_then(|path| {
+            if health.filename.to_ascii_lowercase().ends_with(".msi") {
+                Ok(path)
+            } else {
+                Err(package_step::Refusal::BadName(health.filename.clone()))
+            }
+        })
+        .map_err(package_step::Refusal::fail)?;
     let url = format!(
         "{}{}",
         crate::proxy::origin_of(&crate::proxy::agent_base()),
@@ -395,83 +407,96 @@ async fn run_install_inner(
     .map_err(|e| failed(ErrorCode::Download, format!("download installer: {e}")))?;
     diag.ok();
 
-    // --- Step 4: verify SHA256 ------------------------------------------
+    // --- Step 4: verify the digest and the publisher ---------------------
+    //
+    // #3246 — the digest comes from the same origin as the URL, so it says the
+    // bytes came through intact. The publisher says whose they are, and it
+    // decides with or without a digest. Whatever passes stays held open until
+    // the install is over.
     diag.begin(Step::Verify);
     check_cancel()?;
-    let sha256_match = match health.digest.as_deref() {
-        Some(digest) => asset_resolver::verify_sha256(&staged, digest)
-            .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?,
-        None => {
-            // Pre-Oct-2024 releases lack the digest field. Accept
-            // the download as-is but flag it loudly.
-            tracing::warn!(
-                tag = %health.tag,
-                "installer asset lacks sha256 digest — skipping verification"
-            );
-            true
+    if health.digest.is_none() {
+        tracing::warn!(
+            tag = %health.tag,
+            "installer asset lacks sha256 digest — the publisher check alone decides"
+        );
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: format!(
+                    "Release {} published no checksum for this installer, so only its signature \
+                     can be checked.",
+                    health.tag
+                ),
+            },
+        );
+    }
+    let checked = match package_step::check_held(&staged, health.digest.as_deref()) {
+        Ok(checked) => checked,
+        Err(refusal) => {
+            if matches!(refusal, package_step::Refusal::DigestMismatch) {
+                emit(
+                    on_event,
+                    ProgressEvent::DownloadVerified {
+                        sha256_match: false,
+                    },
+                );
+            }
+            let _ = std::fs::remove_file(&staged);
+            return Err(refusal.fail());
         }
     };
-    emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
-    if !sha256_match {
-        let _ = std::fs::remove_file(&staged);
-        return Err(failed(
-            ErrorCode::Sha256Mismatch,
-            format!(
-                "SHA256 mismatch for {} — staged file deleted; please retry",
-                staged.display()
-            ),
-        ));
+    if health.digest.is_some() {
+        emit(
+            on_event,
+            ProgressEvent::DownloadVerified { sha256_match: true },
+        );
     }
+    emit(
+        on_event,
+        ProgressEvent::PublisherVerified {
+            signer: checked.signer.clone(),
+        },
+    );
     diag.ok();
 
-    // --- Step 5: spawn msiexec ------------------------------------------
-    //
-    // Pass the OPERATOR-SELECTED flavour (mapped from the role picked
-    // on the SPA's Welcome cards) explicitly. DO NOT delegate to
-    // `spawn_installer_inner` — that classifies the wizard EXE's own
-    // location via `current_install_flavour`, which always resolves
-    // to PerUser inside the wizard (the EXE runs from wherever the
-    // operator double-clicked, never `\Program Files\`). A perMachine
-    // MSI launched on the perUser branch (`/qn`, no ShellExecuteExW
-    // runas) gets rejected by Windows Installer with exit code 1625
-    // ERROR_INSTALL_PACKAGE_REJECTED. Field repro 2026-05-15 on a
-    // Windows field-test host; BLOCKER B6 from the rc.27/rc.28 master
-    // plan.
+    // --- Step 5: start the install ---------------------------------------
     diag.begin(Step::Msi);
     check_cancel()?;
-    // rc.44: build the property table from the parsed flavour.
-    //   peruser              → no property (wix/main.wxs doesn't declare it)
-    //   permachine plain     → ENABLE_SYSTEM_CONTEXT=0 (explicit, so the
-    //                          WiX DisableSystemContext CA fires on a
-    //                          downgrade from a SC-on host)
-    //   permachine+SC        → ENABLE_SYSTEM_CONTEXT=1
-    let properties: Vec<(&str, &str)> = match wfx {
-        WindowsInstallFlavour::PerUser => Vec::new(),
-        WindowsInstallFlavour::PerMachine => {
-            vec![(
-                "ENABLE_SYSTEM_CONTEXT",
-                if is_system_context { "1" } else { "0" },
-            )]
-        }
-    };
-    let pid = spawn_installer_for_flavour_with_properties(&staged, wfx, &properties)
-        .map_err(|e| failed(ErrorCode::MsiSpawn, format!("spawn msiexec: {e}")))?;
+    let started = package_step::start_install(
+        &staged,
+        health.digest.as_deref(),
+        wfx,
+        is_system_context,
+        &staging,
+    )
+    .await?;
+    let pid = started.runner.pid();
     crate::ACTIVE_MSI_PID.store(pid, Ordering::SeqCst);
     emit(on_event, ProgressEvent::MsiSpawned { pid });
 
-    // --- Step 6: attach + wait + decode ----------------------------------
-    let runner = MsiRunner::attach(pid)
-        .map_err(|e| failed(ErrorCode::MsiWait, format!("attach msiexec: {e}")))?;
+    // --- Step 6: wait + decode --------------------------------------------
     // 15-min budget covers slow corporate disks + Defender scans.
-    let outcome = runner
+    let outcome = started
+        .runner
         .wait_for_exit(Duration::from_secs(15 * 60))
         .await
         .map_err(|e| failed(ErrorCode::MsiWait, format!("wait for msiexec: {e}")))?;
+    drop(checked);
+    let code = msi_exit_code(&outcome);
+    // The elevated step's own verdict: no installer ran, so there is no outcome
+    // of one to report.
+    if let Some(refusal) = package_step::Refusal::from_step_exit(code) {
+        return Err(refusal.fail());
+    }
+    if package_step::keeps_log(code) {
+        staging.keep_log_of(&staged);
+    }
     let outcome_str = format!("{outcome:?}");
     emit(
         on_event,
         ProgressEvent::MsiCompleted {
-            code: msi_exit_code(&outcome),
+            code,
             decoded: outcome_str.clone(),
         },
     );
@@ -485,23 +510,10 @@ async fn run_install_inner(
             diag.ok();
         }
         MsiExitDecoded::UserCancel => {
-            // rc.44: branch on is_system_context. SystemContext mode
-            // REQUIRES perMachine + admin (SCM Environment write +
-            // service restart), so "pick perUser mode" advice doesn't
-            // apply — the operator must either get admin rights or
-            // back off to plain perMachine.
-            let msg = if is_system_context {
-                "Installation cancelled (you clicked No on the UAC prompt). \
-                 SystemContext mode requires admin rights — it writes to the \
-                 service's Environment block and restarts the service. Try \
-                 again and approve the UAC prompt, or pick plain perMachine \
-                 mode (without SystemContext) if you only need user-context \
-                 remote control."
-            } else {
-                "Installation cancelled (you clicked No on the UAC prompt). \
-                 Try again or pick perUser mode if you can't get admin rights."
-            };
-            return Err(failed(ErrorCode::MsiUserCancel, msg.to_string()));
+            return Err(failed(
+                ErrorCode::MsiUserCancel,
+                package_step::declined_words(is_system_context).to_string(),
+            ));
         }
         MsiExitDecoded::AnotherInstall => {
             return Err(failed(
@@ -531,14 +543,19 @@ async fn run_install_inner(
             }
             return Err(failed(
                 ErrorCode::MsiFatal,
-                "MSI installer failed (exit 1603). Check the MSI log at %TEMP%\\MSI*.LOG for details."
-                    .to_string(),
+                format!(
+                    "MSI installer failed (exit 1603). {}",
+                    started.where_the_log_is()
+                ),
             ));
         }
         MsiExitDecoded::Other(code) => {
             return Err(failed(
                 ErrorCode::MsiOther,
-                format!("MSI installer exited with unexpected code {code}"),
+                format!(
+                    "MSI installer exited with unexpected code {code}. {}",
+                    started.where_the_log_is()
+                ),
             ));
         }
     }
@@ -726,7 +743,7 @@ async fn run_install_inner(
     // (P3b: recorded as its own step — `ok`, or `failed: companion` — and
     // not at all where it does not apply.)
     diag.begin(Step::Companion);
-    let desktop_installed = place_desktop_companion(wfx, on_event).await;
+    let desktop_installed = place_desktop_companion(wfx, staging.root(), on_event).await;
     best_effort_outcome(diag, desktop_installed, ErrorCode::Companion);
 
     // --- Step 7b': anchor the device for SYSTEM exec (FR-104) -----------
@@ -1233,21 +1250,95 @@ async fn anchor_device(
     None
 }
 
-/// Fetch + place the `roomler-desktop` GUI companion beside the daemon
-/// (GAP-A / P6). The GUI EXE ships as a standalone release asset
-/// (`roomler-desktop-*-x86_64-pc-windows-msvc*.exe`), not inside the
-/// MSI, so a daemon install needs this extra step to land all three
-/// binaries. Best-effort: `Some(true)` placed, `Some(false)` on any
-/// failure or a server with no desktop asset, `None` on non-Windows.
-/// Never errors the install — mirrors the terminal `install.ps1`
-/// `Install-Desktop` try/catch.
+/// The `roomler-desktop` GUI companion beside the daemon (GAP-A / P6). The GUI
+/// EXE ships as a standalone release asset
+/// (`roomler-desktop-*-x86_64-pc-windows-msvc*.exe`), not inside the MSI, so a
+/// daemon install needs this extra step to land all three binaries.
+/// Reports what is installed, not what this step did (#3174), as the Linux and
+/// macOS path does: `Some(present)` after the step, whoever placed the EXE, and
+/// `None` on non-Windows. Best-effort: never errors the install — mirrors the
+/// terminal `install.ps1` `Install-Desktop` try/catch.
 #[cfg(target_os = "windows")]
 async fn place_desktop_companion(
     flavour: WindowsInstallFlavour,
+    staging: &std::path::Path,
     on_event: &Channel<ProgressEvent>,
 ) -> Option<bool> {
     let dir =
         roomlerd::updater::install_dir_with_name(flavour, roomlerd::updater::INSTALL_FOLDER_NAME)?;
+    let target = dir.join("roomler-desktop.exe");
+    if service_places_companion(flavour, wizard_is_elevated()) {
+        if !target.exists() {
+            emit(on_event, ProgressEvent::CompanionWaiting);
+            wait_for_file(&target, COMPANION_WAIT, COMPANION_POLL).await;
+        }
+    } else {
+        fetch_and_place_companion(&dir, &target, staging, on_event).await;
+    }
+    let present = target.exists();
+    if present {
+        emit(on_event, ProgressEvent::CompanionPresent);
+    } else {
+        emit(
+            on_event,
+            ProgressEvent::CompanionAbsent {
+                message: COMPANION_COMES_LATER.to_string(),
+            },
+        );
+    }
+    Some(present)
+}
+
+/// #3174 — how long a limited wizard waits for the service to place the
+/// companion. The refresh starts with the service, so this covers one download
+/// on the person's network; past it the checklist says the EXE comes later.
+#[cfg(target_os = "windows")]
+const COMPANION_WAIT: Duration = Duration::from_secs(60);
+
+#[cfg(target_os = "windows")]
+const COMPANION_POLL: Duration = Duration::from_secs(1);
+
+/// #3174 — what the person reads when the EXE is still absent after the step.
+/// `companion::refresh_periodically` retries every `updater::CHECK_INTERVAL`.
+#[cfg(target_os = "windows")]
+const COMPANION_COMES_LATER: &str = "Roomler adds it at its next start, or within 4 hours, with \
+     nothing for you to do. The rest of the install is complete.";
+
+/// #3174 — is the companion the service's to place? Only administrators can
+/// write under `%ProgramFiles%`, so a limited wizard can neither rename the EXE
+/// aside nor copy over it, and failed with Access denied on every machine-wide
+/// install. Every machine-wide role runs the SCM host, whose
+/// `companion::refresh_if_stale` places the EXE at its start and retries.
+#[cfg(any(target_os = "windows", test))]
+fn service_places_companion(flavour: WindowsInstallFlavour, elevated: bool) -> bool {
+    flavour == WindowsInstallFlavour::PerMachine && !elevated
+}
+
+/// #3174 — wait for `path` to appear: true as soon as it does, false after
+/// `budget` or on a cancel.
+#[cfg(any(target_os = "windows", test))]
+async fn wait_for_file(path: &std::path::Path, budget: Duration, poll: Duration) -> bool {
+    let end = std::time::Instant::now() + budget;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if std::time::Instant::now() >= end || crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// Fetch the companion and swap it in. Failures only log: the caller reports
+/// whether the EXE is there afterwards, and an older one still counts.
+#[cfg(target_os = "windows")]
+async fn fetch_and_place_companion(
+    dir: &std::path::Path,
+    target: &std::path::Path,
+    staging: &std::path::Path,
+    on_event: &Channel<ProgressEvent>,
+) {
     emit(
         on_event,
         ProgressEvent::AssetResolving {
@@ -1270,16 +1361,22 @@ async fn place_desktop_companion(
             tracing::warn!(
                 "no roomler-desktop asset in the latest agent release — companion skipped"
             );
-            return Some(false);
+            return;
         }
         Err(e) => {
             tracing::warn!(error = %e, "resolving roomler-desktop failed — companion skipped");
-            return Some(false);
+            return;
         }
     };
-    let staged = std::env::temp_dir()
-        .join("roomler-setup")
-        .join(&asset.filename);
+    // #3246 — the name comes from the server, and on an elevated run the copy
+    // below lands in Program Files, so it is checked like the installer.
+    let staged = match asset_resolver::plain_name(&asset.filename) {
+        Ok(name) => staging.join(name),
+        Err(e) => {
+            tracing::warn!(error = %e, "roomler-desktop's name is refused — companion skipped");
+            return;
+        }
+    };
     let spec = asset_resolver::DownloadSpec {
         url: &asset.url,
         dest: &staged,
@@ -1288,19 +1385,16 @@ async fn place_desktop_companion(
     };
     if let Err(e) = asset_resolver::download(&spec, &crate::CANCEL_REQUESTED, |_| {}).await {
         tracing::warn!(error = %e, "downloading roomler-desktop failed — companion skipped");
-        return Some(false);
+        return;
     }
-    if let Some(digest) = asset.digest.as_deref() {
-        match asset_resolver::verify_sha256(&staged, digest) {
-            Ok(true) => {}
-            _ => {
-                tracing::warn!("roomler-desktop sha256 mismatch — companion skipped");
-                let _ = std::fs::remove_file(&staged);
-                return Some(false);
-            }
+    let checked = match package_step::check_held(&staged, asset.digest.as_deref()) {
+        Ok(checked) => checked,
+        Err(refusal) => {
+            tracing::warn!(error = %refusal.words(), "roomler-desktop refused — companion skipped");
+            let _ = std::fs::remove_file(&staged);
+            return;
         }
-    }
-    let target = dir.join("roomler-desktop.exe");
+    };
     // FR-84 D6 — the companion may already be RUNNING from `target`: the
     // service's own refresh can place it during the MSI, and its post-install
     // launch opens it as soon as the enrollment above lands. Windows refuses
@@ -1310,24 +1404,31 @@ async fn place_desktop_companion(
     // new one.
     let old = dir.join("roomler-desktop.exe.old");
     let _ = std::fs::remove_file(&old);
-    if target.exists()
-        && let Err(e) = std::fs::rename(&target, &old)
-    {
-        tracing::warn!(error = %e, path = %target.display(), "could not move the old roomler-desktop aside");
-    }
-    match std::fs::copy(&staged, &target) {
+    // #3174 — not a failure by itself: an `.old` still backing an open window
+    // refuses the rename, and the copy then goes through. The copy decides.
+    let moved_aside = if target.exists() {
+        std::fs::rename(target, &old)
+    } else {
+        Ok(())
+    };
+    let copied = std::fs::copy(&staged, target);
+    drop(checked);
+    match copied {
         Ok(_) => {
             // Best-effort: still locked while the window it backs is open.
             let _ = std::fs::remove_file(&old);
-            Some(true)
         }
         Err(e) => {
             // Never leave the host with NO companion.
             if !target.exists() && old.exists() {
-                let _ = std::fs::rename(&old, &target);
+                let _ = std::fs::rename(&old, target);
             }
-            tracing::warn!(error = %e, path = %target.display(), "placing roomler-desktop failed");
-            Some(false)
+            tracing::warn!(
+                error = %e,
+                moved_aside = ?moved_aside.err(),
+                path = %target.display(),
+                "placing roomler-desktop failed"
+            );
         }
     }
 }
@@ -1354,6 +1455,7 @@ fn start_user_task() {}
 #[cfg(not(target_os = "windows"))]
 async fn place_desktop_companion(
     _flavour: WindowsInstallFlavour,
+    _staging: &std::path::Path,
     _on_event: &Channel<ProgressEvent>,
 ) -> Option<bool> {
     None
@@ -1643,15 +1745,15 @@ pub fn cross_flavour_warning(detected: &ExistingInstall, requested: &str) -> Opt
     let requested_is_peruser = requested == "peruser";
     match detected {
         ExistingInstall::PerUser(_) if requested_is_permachine => Some(
-            "Switching from perUser → perMachine. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
+            "Switching from an install for this user only to one for the whole computer. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
                 .to_string(),
         ),
         ExistingInstall::PerMachine(_) if requested_is_peruser => Some(
-            "Switching from perMachine → perUser. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
+            "Switching from an install for the whole computer to one for this user only. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator."
                 .to_string(),
         ),
         ExistingInstall::Ambiguous { .. } => Some(
-            "Both perUser and perMachine installs detected. The MSI's cleanup custom action will remove the one not selected."
+            "Roomler is installed twice here, for this user only and for the whole computer. The install removes the one you did not pick."
                 .to_string(),
         ),
         _ => None,
@@ -1683,6 +1785,36 @@ mod tests {
         }
     }
 
+    // #3174 — the one case the wizard cannot write: everywhere else it places
+    // the companion itself.
+    #[test]
+    fn only_a_limited_wizard_on_a_machine_install_leaves_the_companion_to_the_service() {
+        use WindowsInstallFlavour::{PerMachine, PerUser};
+        assert!(service_places_companion(PerMachine, false));
+        assert!(!service_places_companion(PerMachine, true));
+        assert!(!service_places_companion(PerUser, false));
+        assert!(!service_places_companion(PerUser, true));
+    }
+
+    #[test]
+    fn waiting_for_the_companion_ends_when_it_appears_or_the_budget_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("roomler-desktop.exe");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let poll = Duration::from_millis(5);
+        assert!(!rt.block_on(wait_for_file(&exe, Duration::from_millis(30), poll)));
+        std::fs::write(&exe, b"x").unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(rt.block_on(wait_for_file(&exe, Duration::from_secs(60), poll)));
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "must not wait out the budget"
+        );
+    }
+
     #[test]
     fn flavour_parts_maps_daemon_roles() {
         assert_eq!(
@@ -1709,8 +1841,13 @@ mod tests {
         let w = cross_flavour_warning(&ExistingInstall::PerUser(info("0.3.0-rc.26")), "permachine");
         assert!(w.is_some());
         let msg = w.unwrap();
-        assert!(msg.contains("perUser"));
-        assert!(msg.contains("perMachine"));
+        // #3247: a person's words, not the MSI's.
+        assert!(msg.contains("for this user only"));
+        assert!(msg.contains("for the whole computer"));
+        assert!(
+            !msg.contains("perUser") && !msg.contains("perMachine"),
+            "{msg}"
+        );
         assert!(msg.contains("fresh enrollment token"));
     }
 
@@ -1748,7 +1885,7 @@ mod tests {
             "permachine",
         );
         assert!(w.is_some());
-        assert!(w.unwrap().contains("Both"));
+        assert!(w.unwrap().contains("installed twice"));
     }
 
     #[test]

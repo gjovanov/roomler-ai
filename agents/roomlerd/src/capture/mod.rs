@@ -548,11 +548,15 @@ pub trait ScreenCapture: Send {
 
     /// FR-119 P2b-3 — the captured display's refresh rate in Hz, read once at
     /// the open (`capture::refresh`). A screen cannot produce frames faster
-    /// than it refreshes, so the grant refuses a rate above it. `None` from
-    /// every backend that cannot read it, which decides nothing.
-    fn refresh_hz(&self) -> Option<u16> {
-        None
-    }
+    /// than it refreshes, so the grant refuses a rate above it. `None` from a
+    /// backend that cannot read it, which decides nothing.
+    ///
+    /// ⚠️ Required, with no default, so that no backend can decide nothing
+    /// silently: each one answers, and a `None` says beside it why there is no
+    /// rate to read. A default once let the SYSTEM-context arm, which every
+    /// Windows SYSTEM-service install captures through, answer `None` without a
+    /// word, and a 120 was granted on a 60 Hz panel (FR-135 §13, 2026-11-07).
+    fn refresh_hz(&self) -> Option<u16>;
 
     /// FR-29 — cumulative frames the backend declined to produce because it
     /// PROVED the screen was unchanged.
@@ -2512,6 +2516,10 @@ impl ScreenCapture for NoopCapture {
     fn backend(&self) -> &'static str {
         "none"
     }
+    // Nothing is captured, so there is no display to read.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// FR-80 — attribute a capture-open failure, or admit we cannot.
@@ -3336,7 +3344,7 @@ fn open_with(
     #[cfg(all(not(target_os = "linux"), feature = "scrap-capture"))]
     let wayland_arm_failure: Option<&str> = None;
     #[cfg(feature = "scrap-capture")]
-    let reason = match scrap_backend::ScrapCapture::primary(_target_fps, _downscale) {
+    let reason = match scrap_open(_target_fps, _downscale) {
         Ok(c) => {
             tracing::info!(
                 width = c.width(),
@@ -4810,5 +4818,105 @@ mod xwayland_probe_tests {
         // Scrap then reports its own connection error, which is the truth.
         assert_eq!(x_server_query(":4242", |_, _| true), None);
         assert!(!x_server_is_xwayland(":4242"));
+    }
+}
+
+/// #3260 — the scrap arm, with macOS's session question asked BEFORE anything
+/// waits on a window server.
+///
+/// A process outside every login session (on macOS the root LaunchDaemon, in
+/// session 0) has no WindowServer and never will, so it can never capture: the
+/// question [`classify_capture_failure`] asks to name `no_display`. It used to
+/// be asked only after the open had failed, and there the open took 30 s to
+/// fail, waiting on a window server that does not come. Measured on a
+/// supervised lab Mac on 0.4.200, in FR-43's black-row layout: `no_display`
+/// 30.0 s after each pump started, while the viewer re-creates a session that
+/// shows no frame at 10 s. So every notice went to a session already gone,
+/// three in a row, and the page blamed the network. Asked first, the refusal
+/// costs no wait at all and says the same `no_display`, with what is true of
+/// this process.
+#[cfg(feature = "scrap-capture")]
+fn scrap_open(target_fps: u32, downscale: DownscalePolicy) -> Result<scrap_backend::ScrapCapture> {
+    // Only macOS has a process that can never capture; elsewhere every
+    // process opens as before.
+    #[cfg(target_os = "macos")]
+    let in_session = crate::tcc::has_gui_session;
+    #[cfg(not(target_os = "macos"))]
+    let in_session = || true;
+    open_in_session(in_session, || {
+        scrap_backend::ScrapCapture::primary(target_fps, downscale)
+    })
+}
+
+/// #3260 — open only inside a login session: `open` never runs where
+/// `in_session` answers no, so nothing waits on a window server that is not
+/// there. Generic over the open, so a test on any platform pins the order.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+fn open_in_session<T>(
+    in_session: impl FnOnce() -> bool,
+    open: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let asked = std::time::Instant::now();
+    if !in_session() {
+        tracing::warn!(
+            checked_in_us = asked.elapsed().as_micros() as u64,
+            "capture: this process is outside every login session — nothing to open (#3260)"
+        );
+        anyhow::bail!(NO_LOGIN_SESSION);
+    }
+    open()
+}
+
+/// What a session-0 refusal tells the controller, under `no_display`.
+#[cfg_attr(not(feature = "scrap-capture"), allow(dead_code))]
+const NO_LOGIN_SESSION: &str = "this process runs outside every login session (the system service, \
+     a launchd daemon), where there is no window server to capture: the screen is captured in the \
+     person's own login session";
+
+#[cfg(test)]
+mod login_session_tests {
+    //! #3260 — the order `open_in_session` exists for, pinned on every platform.
+    use super::*;
+    use std::cell::Cell;
+
+    /// The black row's fix: no login session, so the open never runs, and the
+    /// refusal says why at once.
+    #[test]
+    fn no_login_session_refuses_before_the_open_runs() {
+        let opened = Cell::new(false);
+        let r = open_in_session(
+            || false,
+            || {
+                opened.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            !opened.get(),
+            "the open ran in a process with no login session: on a Mac it waits 30 s on a window server that never comes"
+        );
+        let e = r.expect_err("no login session refuses");
+        assert_eq!(format!("{e:#}"), NO_LOGIN_SESSION);
+    }
+
+    /// In a login session nothing changes: the open runs once, and its own
+    /// answer is the answer, a failure included.
+    #[test]
+    fn a_login_session_opens_as_before() {
+        let opened = Cell::new(0);
+        let r = open_in_session(
+            || true,
+            || {
+                opened.set(opened.get() + 1);
+                Ok(7)
+            },
+        );
+        assert_eq!((opened.get(), r.unwrap()), (1, 7));
+        let e = open_in_session(
+            || true,
+            || -> Result<()> { anyhow::bail!("creating scrap::Capturer: other error") },
+        )
+        .expect_err("the open's own failure");
+        assert_eq!(format!("{e:#}"), "creating scrap::Capturer: other error");
     }
 }

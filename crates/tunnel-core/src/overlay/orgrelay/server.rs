@@ -14,8 +14,8 @@
 //! * **One bad datagram costs one datagram.** [`RelayServer::handle`] is a pure
 //!   function and it is called under `catch_unwind`, so a parser bug degrades
 //!   the relay by one packet rather than ending the service. This daemon runs
-//!   as SYSTEM on Windows and root under systemd, alongside remote desktop,
-//!   tunnels and SSH; a panic on this socket must never reach them.
+//!   as root under systemd, and can be SYSTEM on Windows, alongside remote
+//!   desktop, tunnels and SSH; a panic on this socket must never reach them.
 //! * **Every drop has a reason, and every reason has a counter with a reader.**
 //!   [`RelayStats::snapshot`] is that reader. A counter without one is the
 //!   FR-18 `dropped_stale` failure: an acceptance criterion nobody can

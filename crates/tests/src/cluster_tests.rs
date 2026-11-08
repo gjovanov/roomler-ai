@@ -645,6 +645,21 @@ async fn seed_started_call(app1: &TestApp) -> (crate::fixtures::seed::SeededTena
     (tenant, room_id)
 }
 
+/// `call/join` as `token`, in the bodyless shape an older client sends: the
+/// media namespace admits the account's sockets only once it holds an open
+/// call session (`conference_gate_tests`).
+async fn join_call(app: &TestApp, tenant_id: &str, room_id: &str, token: &str) {
+    let resp = app
+        .auth_post(
+            &format!("/api/tenant/{tenant_id}/room/{room_id}/call/join"),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
 /// The C-4 core: a viewer on the non-owner pod joins through the bus,
 /// gets its transports conn-addressed back, and NO second router island
 /// is created; a leave on the owner reaches the remote viewer.
@@ -663,6 +678,13 @@ async fn media_join_routes_to_owner_pod_single_router() {
     assert!(!conf(&app2).room_manager.has_room(&rid));
 
     // Member joins via app2 (the NON-owner pod).
+    join_call(
+        &app2,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.member.access_token,
+    )
+    .await;
     let mut ws2 = connect_user_ws(&app2, &tenant.member.access_token).await;
     send_media(&mut ws2, "media:join", &room_id).await;
     let caps = next_media_msg(&mut ws2).await;
@@ -683,6 +705,13 @@ async fn media_join_routes_to_owner_pod_single_router() {
 
     // Admin joins locally on the owner, then leaves — the peer_left push
     // must cross pods to the remote viewer's connection.
+    join_call(
+        &app1,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.admin.access_token,
+    )
+    .await;
     let mut ws1 = connect_user_ws(&app1, &tenant.admin.access_token).await;
     send_media(&mut ws1, "media:join", &room_id).await;
     let m = next_media_msg(&mut ws1).await;
@@ -715,6 +744,13 @@ async fn media_owner_shutdown_releases_claim_rejoin_wins() {
     let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
     let key = roomler_ai_api::cluster::directory::media_key(&room_id);
 
+    join_call(
+        &app2,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.member.access_token,
+    )
+    .await;
     let mut ws2 = connect_user_ws(&app2, &tenant.member.access_token).await;
     send_media(&mut ws2, "media:join", &room_id).await;
     let m = next_media_msg(&mut ws2).await;
@@ -782,6 +818,13 @@ async fn media_conflict_folds_loser_island() {
     let (tenant, room_id) = seed_started_call(&app1).await;
     let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
 
+    join_call(
+        &app1,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.admin.access_token,
+    )
+    .await;
     let mut ws1 = connect_user_ws(&app1, &tenant.admin.access_token).await;
     send_media(&mut ws1, "media:join", &room_id).await;
     let m = next_media_msg(&mut ws1).await;
@@ -804,6 +847,78 @@ async fn media_conflict_folds_loser_island() {
     assert_eq!(closed["data"]["reason"].as_str(), Some("rehomed"));
 
     ws1.close(None).await.ok();
+}
+
+/// The participation gate holds across pods. A `media:join` from a socket on
+/// the non-owner pod is refused there, before it is forwarded; and a join
+/// that reaches the owner over the bus unchecked — what a pod that does not
+/// gate would send, mid-roll — is refused by the owner, the pod that would
+/// seat the connection.
+#[tokio::test]
+async fn media_join_is_admitted_on_both_pods() {
+    use futures::StreamExt;
+
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (_tenant, room_id) = seed_started_call(&app1).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+    assert!(conf(&app1).room_manager.has_room(&rid));
+
+    // A signed-in account of another org, its socket on the non-owner pod.
+    let outsider = app2.seed_tenant("mediac4-out").await;
+    let outsider_id = bson::oid::ObjectId::parse_str(&outsider.admin.id).unwrap();
+    let url = format!(
+        "ws://{}/ws?token={}",
+        app2.addr, outsider.admin.access_token
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("user WS connects");
+    let first = ws.next().await.expect("a frame").expect("a text frame");
+    let connected: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    let conn = connected["connection_id"]
+        .as_str()
+        .expect("the connected frame carries connection_id")
+        .to_string();
+
+    // Through its socket: refused on the non-owner pod, nothing forwarded.
+    send_media(&mut ws, "media:join", &room_id).await;
+    let m = next_media_msg(&mut ws).await;
+    assert_eq!(m["type"], "media:error", "{m}");
+    assert!(
+        conf(&app2).remote_media_conns.get(&conn).is_none(),
+        "a refused join is not forwarded"
+    );
+
+    // Straight over the bus: the owner refuses it and seats nobody.
+    let ok = roomler_ai_mod_conference::media_cluster::forward_media_cmd(
+        conf(&app2),
+        &app1.state.pod.pod_id,
+        &outsider_id,
+        &conn,
+        "media:join",
+        Some(&serde_json::json!({ "room_id": room_id })),
+    )
+    .await;
+    assert!(ok, "the owner answers the RPC");
+    let m = next_media_msg(&mut ws).await;
+    assert_eq!(m["type"], "media:error", "{m}");
+    assert_eq!(
+        conf(&app1).room_manager.get_connection_room(&conn),
+        None,
+        "the owner seated the forwarded join"
+    );
+    assert!(
+        !conf(&app1)
+            .room_manager
+            .get_participant_user_ids(&rid)
+            .contains(&outsider_id)
+    );
+
+    ws.close(None).await.ok();
 }
 
 // ── C-5: DERP directory + registration-driven rehome ────────────────
@@ -941,11 +1056,21 @@ async fn derp_split_rehomes_toward_newest_registration() {
 // ── C-6: shutdown sweep for all classes + metrics + status route ────
 
 /// The status route is auth-gated and reports this pod's identity,
-/// cluster health, the rehome/fallback counters and live gauges.
+/// cluster health, the rehome/fallback counters and live gauges — to a
+/// platform admin (`cluster_status_is_for_platform_admins_only`).
 #[tokio::test]
 async fn cluster_status_reports_pod_counters_and_gauges() {
-    let app = TestApp::spawn().await;
-    let tenant = app.seed_tenant("clstat").await;
+    let operator = bson::oid::ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let _tenant = app.seed_tenant("clstat").await;
+    let op = app
+        .state
+        .auth
+        .generate_tokens(operator, "operator@clstat.test", "clstat_operator")
+        .unwrap();
 
     // Unauthenticated → 401.
     //
@@ -972,7 +1097,7 @@ async fn cluster_status_reports_pod_counters_and_gauges() {
     );
 
     let body: serde_json::Value = app
-        .auth_get("/api/cluster/status", &tenant.admin.access_token)
+        .auth_get("/api/cluster/status", &op.access_token)
         .send()
         .await
         .unwrap()
@@ -1029,6 +1154,80 @@ async fn cluster_status_reports_pod_counters_and_gauges() {
             "own pod-alive record must be visible: {body}"
         );
     }
+}
+
+/// The status route is a platform operator's view: it names every live
+/// meeting room on the pod, from every org, and the pods' addresses. A
+/// signed-in account that is not a platform admin gets the 404 every
+/// platform-admin route gives, whatever org it belongs to or runs.
+#[tokio::test]
+async fn cluster_status_is_for_platform_admins_only() {
+    let operator = bson::oid::ObjectId::new();
+    let app = TestApp::spawn_with_settings(move |s| {
+        s.stats.platform_admins = Some(operator.to_hex());
+    })
+    .await;
+    let tenant = app.seed_tenant("clgate").await;
+    let room_id = tenant.rooms[0].id.clone();
+    // A live meeting room on this pod.
+    let start = app
+        .auth_post(
+            &format!(
+                "/api/tenant/{}/room/{}/call/start",
+                tenant.tenant_id, room_id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(start.status().as_u16(), 200);
+    let outsider = app.seed_tenant("clgate-out").await;
+
+    for (who, token) in [
+        ("another org's admin", &outsider.admin.access_token),
+        ("the meeting org's admin", &tenant.admin.access_token),
+        ("the meeting org's member", &tenant.member.access_token),
+    ] {
+        let resp = app
+            .auth_get("/api/cluster/status", token)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        assert_eq!(status, 404, "{who} read the cluster status: {body}");
+        assert!(
+            !body.contains(&room_id),
+            "{who} learned a live room id: {body}"
+        );
+    }
+
+    let op = app
+        .state
+        .auth
+        .generate_tokens(operator, "operator@clgate.test", "clgate_operator")
+        .unwrap();
+    let body: serde_json::Value = app
+        .auth_get("/api/cluster/status", &op.access_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        body["pod"]["pod_id"].as_str(),
+        Some(app.state.pod.pod_id.as_str())
+    );
+    let rooms = body["local"]["media_rooms_detail"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        rooms.iter().any(|r| r["room_id"] == room_id.as_str()),
+        "a platform admin sees the live room: {body}"
+    );
 }
 
 /// Graceful shutdown releases tunnel + derp directory records (zero
