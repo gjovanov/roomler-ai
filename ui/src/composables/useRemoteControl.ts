@@ -59,6 +59,7 @@ import {
 import { colorSpaceLabel } from '@/workers/rc-decoder-config'
 import { MEDIA_BUCKETS, type ViewerMediaWindow } from '@/workers/rc-media-window'
 import { createChannelMoveWatch, createDeliveryGapClock, moveVideoChannelToWorker } from '@/workers/rc-video-channel'
+import { CAL_MAX_RTT_MS, createClockCalibration, storedClockCal, type ClockCalibration } from '@/workers/rc-clock-cal'
 
 /**
  * Remote-control session state machine driven from the controller browser.
@@ -5945,6 +5946,16 @@ export function useRemoteControl(
    *  the decode worker (`storedDcWorker`, `roomler-rc-dc-worker`). Resolved
    *  beside `sessionChunkFraming`, before the path starts. */
   let sessionDcWorker = false
+  /** #3566 — true when THIS session measures each decode worker's clock
+   *  against the page's (`storedClockCal`, `roomler-rc-clock-cal`), which is
+   *  every session unless this browser set `0`. Resolved beside
+   *  `sessionChunkFraming`, before any worker starts. */
+  let sessionClockCal = false
+  /** #3566 — the measurement of the data-channel worker's clock, and of the RTP
+   *  WebCodecs worker's (`startWorkerClockCal`). Null with no worker, or with
+   *  the switch off. */
+  let dcClockCal: ClockCalibration | null = null
+  let webcodecsClockCal: ClockCalibration | null = null
   /** FR-135 R3 — true while the active path's channel is in the worker: the
    *  browser took the transfer. False on the relay, the default. */
   let dcChannelInWorker = false
@@ -7052,6 +7063,34 @@ export function useRemoteControl(
     clockBest = null
   }
 
+  /** #3566 — measure a decode worker's clock against the page's, once, as the
+   *  page starts the worker (`createClockCalibration`). Each context fixes its
+   *  epoch when it starts, so a worker made after its page reads a constant
+   *  apart from it, and the worker reads the page's timestamps through what
+   *  this measures: `sentAt`, the offset above, a bench probe's send. Nothing
+   *  waits for it, and the console says what it measured or that it measured
+   *  nothing. Null with this session's switch off (`roomler-rc-clock-cal=0`). */
+  function startWorkerClockCal(worker: Worker, label: string): ClockCalibration | null {
+    if (!sessionClockCal) return null
+    const cal = createClockCalibration({
+      post: (msg) => worker.postMessage(msg),
+      done: (r) => {
+        if (r.ok) {
+          console.info(
+            `[rc] ${label} decode worker clock: ${Math.abs(r.skewMs).toFixed(2)} ms ${r.skewMs < 0 ? 'behind' : 'ahead of'} the page's (the fastest of ${r.samples} round trips, ${r.rttMs.toFixed(2)} ms) - the worker reads the page's timestamps through it (#3566)`,
+          )
+        } else {
+          const fastest = r.bestRttMs === null ? 'no answer' : `the fastest ${r.bestRttMs.toFixed(2)} ms`
+          console.info(
+            `[rc] ${label} decode worker clock: not measured - no round trip in ${r.rounds} rounds came back within ${CAL_MAX_RTT_MS} ms (${fastest}), so the worker reads the page's timestamps on its own clock, as before #3566`,
+          )
+        }
+      },
+    })
+    cal.start()
+    return cal
+  }
+
   // Coalesce rapid mouse moves to one per animation frame (~60 Hz). Keys
   // and clicks are NOT coalesced Ã¢ÂÂ they're too meaningful to drop.
   let pendingMove: { x: number; y: number; mon: number } | null = null
@@ -7280,7 +7319,7 @@ export function useRemoteControl(
   }
 
   /** FR-16 L4 — a sampler read probe `seq` off a frame painted at
-   *  `paintedAt` (epoch ms). */
+   *  `paintedAt`, on the page's clock (a worker's comes through its skew, #3566). */
   function onBenchProbe(seq: unknown, paintedAt: unknown, path: BenchPath) {
     if (typeof seq !== 'number' || typeof paintedAt !== 'number') return
     benchProber?.onPainted(seq, paintedAt, path)
@@ -8076,9 +8115,13 @@ export function useRemoteControl(
       console.warn('[rc] worker construction failed', err)
       return false
     }
+    // #3566 — this worker's own measurement, so an answer from an older worker
+    // can never reach a newer one's.
+    let clockCal: ClockCalibration | null = null
     worker.onmessage = (ev) => {
       const msg = ev.data as Record<string, unknown>
       if (!msg || typeof msg.type !== 'string') return
+      if (clockCal?.onWorkerMessage(msg)) return
       if (msg.type === 'bench-probe') {
         onBenchProbe(msg.seq, msg.paintedAt, 'webcodecs')
         return
@@ -8150,6 +8193,9 @@ export function useRemoteControl(
     }
     webcodecsWorker = worker
     webcodecsActive.value = true
+    // #3566 — its bench paint stamps go back on the page's clock.
+    clockCal = startWorkerClockCal(worker, 'webcodecs')
+    webcodecsClockCal = clockCal
     // If the canvas is already mounted, attach it now; otherwise
     // the watcher picks it up when it lands.
     if (webcodecsCanvasEl.value) {
@@ -8215,6 +8261,8 @@ export function useRemoteControl(
 
   function stopWebCodecsPath() {
     webcodecsActive.value = false
+    webcodecsClockCal?.stop()
+    webcodecsClockCal = null
     if (!webcodecsWorker) return
     try { webcodecsWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { webcodecsWorker.terminate() } catch { /* ignore */ }
@@ -8509,6 +8557,9 @@ export function useRemoteControl(
     // FR-1 P7 — the clock offset may already be locked (probe started with
     // the control DC); hand it to the fresh worker.
     pushClockOffset()
+    // #3566 — and measure the worker's clock against the page's, which that
+    // offset, `sentAt` and the bench's sends are on.
+    dcClockCal = startWorkerClockCal(worker, label)
     return worker
   }
 
@@ -8520,6 +8571,8 @@ export function useRemoteControl(
     if (worker !== dcWorker) return
     const msg = ev.data as Record<string, unknown> | undefined
     if (!msg || typeof msg.type !== 'string') return
+    // #3566 — first, so the clock's answer is stamped before anything else runs.
+    if (dcClockCal?.onWorkerMessage(msg)) return
     if (msg.type === 'bench-probe') {
       onBenchProbe(msg.seq, msg.paintedAt, label)
       return
@@ -8718,6 +8771,8 @@ export function useRemoteControl(
     // is gone, and the session's `pc.close()` closes either.
     dcChannelInWorker = false
     dcChannelMove.stop()
+    dcClockCal?.stop()
+    dcClockCal = null
     if (!dcWorker) return
     try { dcWorker.postMessage({ type: 'close' }) } catch { /* ignore */ }
     try { dcWorker.terminate() } catch { /* ignore */ }
@@ -11293,6 +11348,12 @@ export function useRemoteControl(
     sessionDcWorker = storedDcWorker() && !dcWorkerMoveFailed
     if (dcWorkerMoveFailed && storedDcWorker()) {
       console.info('[rc] video channel: relayed by the page this session - a move into the decode worker failed earlier on this page (roomler-rc-dc-worker)')
+    }
+    // #3566 — each decode worker's clock is measured against the page's on every
+    // session, and not under this browser's kill switch.
+    sessionClockCal = storedClockCal()
+    if (!sessionClockCal) {
+      console.info('[rc] decode worker clocks: not measured this session (roomler-rc-clock-cal=0) - each worker reads the page\'s timestamps on its own clock, as before #3566')
     }
     if (sessionBenchMode === 'probe') {
       console.info('[rc] bench mode: the agent advertised `bench`; probing once the input channel opens (FR-16 L4)')
