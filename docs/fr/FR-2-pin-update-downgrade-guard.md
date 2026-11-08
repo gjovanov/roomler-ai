@@ -78,7 +78,7 @@ forced push, so there is nothing operational to disable.
       current pin still delivers. **Met 2026-08-27** (the log below): a stale pin against
       CORPLAP-2, online on 0.4.4, answered 409 with no device side effect. The box was
       left open when the issue closed. Read again 2026-11-03: the guard is on master at
-      both entry points (`crates/modules/fleet/src/agent.rs:1492`, `:1618`).
+      both entry points (`crates/modules/fleet/src/agent.rs:1488`, `:1614`).
 
 ## Open decisions
 

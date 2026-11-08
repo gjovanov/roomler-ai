@@ -203,7 +203,7 @@ Tailscale's ephemeral property lives on the **auth key**, and those keys are typ
 
 Roomler's enrollment token is the deliberate opposite:
 
-- `EnrollmentClaims` (`crates/services/src/auth/mod.rs:63`) carries a `jti`;
+- `EnrollmentClaims` (`crates/services/src/auth/mod.rs:56`) carries a `jti`;
 - `enroll_agent` claims it once through `used_tokens`
   (`crates/api/src/routes/remote_control.rs:185`), whose ledger is a **1-hour TTL index**
   (`crates/db/src/indexes.rs:306`);
