@@ -34,6 +34,19 @@ impl WsHandler for Typing {
         let Ok(rid) = ObjectId::parse_str(room_id_str) else {
             return Ok(());
         };
+        // The sender must be someone who may read the room: a member of the
+        // room's own tenant (the frame names no tenant, so the room's is the
+        // one to check) whom its visibility lets in. Anything else is dropped
+        // as silently as a bad frame.
+        let Ok(room) = self.state.rooms.base.find_by_id(rid).await else {
+            return Ok(());
+        };
+        if crate::guards::require_room_in_tenant(&self.state, room.tenant_id, rid, ctx.principal)
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
         // A lookup failure is not an error to the socket: the original arm
         // dropped the event silently, and so does this.
         let Ok(member_ids) = self.state.rooms.find_member_user_ids(rid).await else {
