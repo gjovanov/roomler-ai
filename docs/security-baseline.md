@@ -234,6 +234,7 @@ room is then the message's own, and every message route fans out to it.
 | room | `require_room_in_tenant` |
 | message | `require_message_in_room`: the path room, then a live message of it |
 | file | `require_file`: a live file of the path tenant, then its own room through the same visibility gate |
+| recording (`conference`) | `recording::delete`: the path room through `require_room_in_tenant`, then a live recording of that room (`RecordingDao::find_live_in_room`); deleted by its starter or a `MANAGE_CHANNELS` holder, as a room delete removes its recordings |
 
 A listing that spans rooms (the org's files, search) keeps to `room_reach`, the
 same rule over every room of the org at once: content only from rooms the caller

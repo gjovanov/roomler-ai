@@ -321,8 +321,8 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | DELETE | `…/message/{mid}/reaction/{emoji}` | Remove reaction |
 | POST | `…/message/read` · `/read-all` | Read markers |
 | GET | `…/message/unread-count` | Unread count |
-| GET/POST | `…/room/{rid}/recording` | List / create recordings |
-| DELETE | `…/recording/{rec_id}` | Delete recording |
+| GET/POST | `…/room/{rid}/recording` | List / create recordings (the room guard, visibility included) |
+| DELETE | `…/recording/{rec_id}` | Delete a live recording of the path room: by whoever started it, or by a `MANAGE_CHANNELS` holder (403 for anyone else). A recording of another room or org, or a deleted one, answers 404, as a missing one does |
 
 A room or message response may carry `binding {module, ref}`: another module owns what it
 means. Chat stores it and never interprets it, and no module sets it now. The rooms and turn

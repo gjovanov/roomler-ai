@@ -42,7 +42,7 @@ erDiagram
 | `room_members` | Per-room membership |
 | `messages` | Chat. Thread via `thread_id`, pins, embeds; text index on `content`. `author_type` `user` (default) · `bot` · `webhook` · `system`; a non-user author carries its own `author_display`, which is read **only** when `author_type` is not `user` — a person cannot rename themselves through it. Optional `binding`, set by no module now (parked FR-90's turn stubs still carry both fields) |
 | `reactions` | Unicode + custom-emoji reactions, keyed by `message_id` |
-| `recordings` | Call recordings; storage provider `S3`/`MinIO`/`Local` |
+| `recordings` | Call recordings; storage provider `S3`/`MinIO`/`Local`. `created_by`: who started it (absent on older rows) |
 | `call_sessions` | Call lifecycle rows (**730 d** TTL on `started_at` — the conference module's index set, not 90 d) |
 | `call_chat_messages` | In-call chat (no secondary indexes) |
 | `files` | Versioned uploads; uploader, room linkage |
