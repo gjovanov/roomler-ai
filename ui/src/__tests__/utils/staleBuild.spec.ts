@@ -11,6 +11,7 @@ import {
   claimReload,
   installStaleBuildRecovery,
   isChunkLoadError,
+  reloadClaimable,
 } from '@/utils/staleBuild'
 
 function memoryStorage(seed: Record<string, string> = {}) {
@@ -88,6 +89,33 @@ describe('claimReload', () => {
     expect(claimReload(undefined, 1)).toBe(false)
     const broken = { getItem: () => null, setItem: () => { throw new Error('QuotaExceededError') } }
     expect(claimReload(broken, 1)).toBe(false)
+  })
+
+  it('#3582 — another reloader keeps its own record, under its own key and window', () => {
+    const s = memoryStorage()
+    expect(claimReload(s, 1_000_000, 'roomler.other', 600_000)).toBe(true)
+    expect(s.getItem('roomler.other')).toBe('1000000')
+    expect(s.getItem(RELOAD_KEY)).toBeNull()
+    expect(claimReload(s, 1_000_000 + 599_999, 'roomler.other', 600_000)).toBe(false)
+    expect(claimReload(s, 1_000_000 + 600_000, 'roomler.other', 600_000)).toBe(true)
+    // The chunk recovery's own record is untouched by it.
+    expect(claimReload(s, 1_000_001)).toBe(true)
+  })
+})
+
+describe('reloadClaimable', () => {
+  it('says whether a claim could happen now, and records nothing', () => {
+    const s = memoryStorage()
+    expect(reloadClaimable(s, 1_000_000, 'k', 600_000)).toBe(true)
+    expect(s.getItem('k')).toBeNull()
+    s.setItem('k', '1000000')
+    expect(reloadClaimable(s, 1_000_000 + 599_999, 'k', 600_000)).toBe(false)
+    expect(reloadClaimable(s, 1_000_000 + 600_000, 'k', 600_000)).toBe(true)
+  })
+
+  it('no where storage cannot be read', () => {
+    expect(reloadClaimable(undefined, 1)).toBe(false)
+    expect(reloadClaimable({ getItem: () => { throw new Error('SecurityError') } }, 1)).toBe(false)
   })
 })
 

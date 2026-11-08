@@ -2580,6 +2580,8 @@ import { takeExternalSession } from '@/composables/useExternalLogin'
 import { useAgentStore, type Agent } from '@/stores/agents'
 import { useAuthStore } from '@/stores/auth'
 import { peerAuthBadge } from '@/utils/peerAuth'
+import { claimRcResume, notifyRcReloadSurface, registerRcReloadSurface } from '@/utils/staleBuildWatch'
+import type { RcReloadSurface } from '@/utils/staleBuildPolicy'
 import {
   useRemoteControl,
   nextDirPath,
@@ -5459,6 +5461,60 @@ function startSession() {
   rc.connect(agent.value.id, undefined, false, tenantId.value)
 }
 
+// #3582 — the one time this page connects without a click. A reload for a new
+// build that took over a session's redial (its session already cut, its next
+// one about to be opened by the ladder) left the args that redial would have
+// used; this load resumes it once, through the redial's own ladder
+// (`resumeAfterReload`), so a device still restarting is retried as the redial
+// would have retried it, and the device decides consent as it would have for
+// the redial. `claimRcResume` refuses an intent older than a minute, one
+// recorded for another page or another person, and any page but the first
+// this load rendered; the intent is gone from storage either way. Never for
+// an external session: none is ever handed over (`utils/staleBuildWatch.ts`).
+let viewUnmounted = false
+watch(
+  () => rc.phase.value,
+  () => notifyRcReloadSurface(),
+)
+/** The signed-in person's id: the shell fetches it as this page loads its device. */
+function signedInUserId(timeoutMs: number): Promise<string | null> {
+  const now = authStore.user?.id
+  if (now) return Promise.resolve(now)
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const stop = watch(
+      () => authStore.user?.id,
+      (id) => {
+        if (!id) return
+        if (timer !== null) clearTimeout(timer)
+        stop()
+        resolve(id)
+      },
+    )
+    timer = setTimeout(() => {
+      stop()
+      resolve(null)
+    }, timeoutMs)
+  })
+}
+async function resumeAfterNewBuild() {
+  if (isExternal || viewUnmounted) return
+  const userId = await signedInUserId(10_000)
+  if (viewUnmounted) return
+  const args = claimRcResume({ agentId: agentId.value, tenantId: tenantId.value ?? null, path: location.pathname, userId })
+  if (!args || agent.value?.id !== args.agentId || rc.phase.value !== 'idle') return
+  rc.resumeAfterReload(args)
+}
+// What the page asks of a reload: the viewer's own reading, and the rating
+// prompt a session's end leaves on the page, which a reload would wipe.
+const reloadSurface: RcReloadSurface = {
+  ...rc.reloadSurface,
+  state: () => {
+    const s = rc.reloadSurface.state()
+    return { ...s, hold: s.hold || ratingPending.value !== null }
+  },
+}
+
 // FR-100 P2a — the toolbar's word on the device's identity key, and the one
 // way to accept a key that changed: the person's click, then a fresh attempt
 // that must prove it.
@@ -5655,8 +5711,12 @@ watch(
   },
 )
 
+let unregisterReloadSurface: (() => void) | null = null
 onMounted(() => {
-  void loadAgent()
+  // #3582 — a reload for a new build reads this viewer's session, and may take
+  // over its redial; the load after it may resume that session, once.
+  unregisterReloadSurface = registerRcReloadSurface(reloadSurface)
+  void loadAgent().then(resumeAfterNewBuild)
   void agentStore.fetchKeepBusyDefaultPattern(tenantId.value).then((p) => {
     orgKeepBusyDefault.value = p
   })
@@ -5675,6 +5735,9 @@ onMounted(() => {
   window.addEventListener('keydown', onWindowKeyDownForDrawer)
 })
 onBeforeUnmount(() => {
+  viewUnmounted = true
+  unregisterReloadSurface?.()
+  unregisterReloadSurface = null
   if (agentStatusTimer !== null) {
     clearInterval(agentStatusTimer)
     agentStatusTimer = null

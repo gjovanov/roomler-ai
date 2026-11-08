@@ -29,7 +29,7 @@ relay (P3b, §3.6).
 The loopback-TURN corp relay (`agents/roomlerd/src/rc_local_turn.rs`) hosts a small TURN server on the device's
 overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), with fallback ports from `:41989`
 (`:53`), returning a descriptor with freshly minted 1-hour credentials (`CRED_TTL`, `:68`; minted at `:268`). The
-viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7602`,
+viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7641`,
 called at `:9223`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3811`) and
 forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `crates/remote_control/src/signaling.rs:1980`). The Hub stores it
 on the session (`crates/modules/fleet/src/hub.rs:1908`) and hands the remote agent `turn:<overlay>:<port>` with the
@@ -99,7 +99,7 @@ sequenceDiagram
 
 - A per-browser choice, **This browser runs on**: one of the signed-in person's own devices that advertise
   `local-relay`, or none. Stored in `localStorage`, beside today's `roomler-rc-local-relay` switch
-  (`useRemoteControl.ts:3702`).
+  (`useRemoteControl.ts:3741`).
 - **Suggested by the probe while the probe still works**: the probe's descriptor gains the device's `agent_id`, and
   the first successful probe records it unless the person chose none. That covers every browser that has the
   permission or does not ask for it. ⚠️ Only a device of the **person's own** is recorded: a browser on someone
@@ -124,7 +124,7 @@ On `rc:session.request` with `local_relay_from` and no descriptor, the Hub answe
 The descriptor is stored on the session exactly as a probed one is, so `forward_offer` hands the remote agent the
 overlay relay as today, with the same overlay-range check. The browser adds `turn:127.0.0.1:<port>` with
 `pc.setConfiguration` when `rc:session.created` arrives. The peer connection exists by then
-(`useRemoteControl.ts:9758`) and has gathered nothing: the offer waits for `rc:ready` (`:8899`).
+(`useRemoteControl.ts:9866`) and has gathered nothing: the offer waits for `rc:ready` (`:8938`).
 
 ⚠️ The descriptor's credential lets its holder allocate on the device's relay, which the overlay and loopback reach.
 It is minted by the device, valid for an hour, held only in the Hub's memory, and handed only to the device's owner's
@@ -294,10 +294,10 @@ its own sending is not known yet, and only `chrome://webrtc-internals` can show 
 - [~] **AC4 — no probe once chosen.** A paired viewer makes no request to 127.0.0.1 on connect (unit test on the
   connect path), and a viewer that is not paired probes exactly as today. **Partial (read 2026-11-03):** the decision is
   tested (`localRelayPlan`, `ui/src/__tests__/composables/useRemoteControl.spec.ts:4738`), and the connect path takes
-  its one relay probe behind that plan (`ui/src/composables/useRemoteControl.ts:9909`, `:9928`). No test drives
+  its one relay probe behind that plan (`ui/src/composables/useRemoteControl.ts:10017`, `:10036`). No test drives
   `connect`, so removing that gate would fail nothing, and the criterion names the connect path. Two requests stay by
   design: the legacy re-look (above) and the clipboard half (§7), which fetches 127.0.0.1 when the clipboard channel
-  opens on a device with the `native` clipboard capability (`ui/src/composables/useRemoteControl.ts:10172`).
+  opens on a device with the `native` clipboard capability (`ui/src/composables/useRemoteControl.ts:10280`).
 - [ ] **AC5 — the field.** The MacBook's Chrome, the local-network permission reset to "ask", paired with the
   MacBook: a session to neo16 (`rc_overlay` on) runs `carrier="overlay_direct"` with no prompt. The red run, on
   today's build, is the same browser relaying through the far TURN (or prompting). Both runs on the issue.

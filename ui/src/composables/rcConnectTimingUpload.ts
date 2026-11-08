@@ -25,9 +25,9 @@
  * handlers raise a snackbar. A diagnostic must never become the incident.
  *
  * ⚠️ Timing metadata only. The `msg` is the same per-step line the console
- * prints (mark names and millisecond deltas) and `fields` carries ids,
- * booleans and numbers. No URL, no token, no message text, no hostname —
- * the record is about WHEN, never about WHAT.
+ * prints (mark names and millisecond deltas) and `fields` carries ids (the
+ * page's build id among them, #3582), booleans and numbers. No URL, no token,
+ * no message text, no hostname — the record is about WHEN, never about WHAT.
  *
  * ⚠️ Rate-capped below the API's per-IP governor (60 req/min). One attempt
  * produces one POST, never a retry, and a flapping ladder that abandons an
@@ -42,6 +42,7 @@ import {
   type RcConnectMark,
   type RcConnectTiming,
 } from './rcConnectTiming'
+import { isBuildId, pageBuildId } from '@/utils/buildId'
 
 /** How the attempt ended. `abandoned` = the phase bound fired
  *  (`signalingTimeoutFor`); `closed` = the operator hung up, the view
@@ -69,11 +70,15 @@ export interface RcConnectUploadContext {
    *  "the server refused" from "nobody answered", which look identical in
    *  the marks (both stop at the same missing step). */
   errorCode?: string | null
+  /** #3582 — the build this page runs (`utils/buildId.ts`). The uploader
+   *  fills it from the page's shell when the caller does not. */
+  build?: string | null
 }
 
 export const RC_CONNECT_LOG_TARGET = 'rc.connect'
-/** Bump when `fields` changes shape, so a miner can tell records apart. */
-export const RC_CONNECT_RECORD_VERSION = 1
+/** Bump when `fields` changes shape, so a miner can tell records apart.
+ *  2 (#3582): `build`. */
+export const RC_CONNECT_RECORD_VERSION = 2
 export const RC_CONNECT_UPLOAD_PATH = '/api/log/browser'
 /** Well under the governor's 60/min per IP, and above anything the ladder
  *  can legitimately produce (its fastest steady state is one attempt per
@@ -109,6 +114,10 @@ export interface RcConnectRecordFields {
   agent_id: string | null
   agent_org_id?: string
   error_code?: string
+  /** #3582 — the build the page that connected runs, so a field read can tell
+   *  a stale viewer from a bug directly; absent where the page has none (the
+   *  dev server, a shell built before #3582). Compare with `/version.json`. */
+  build?: string
   /** Absolute ms from the attempt's start, in wait order; an unreached mark
    *  is ABSENT, never zero. The per-step deltas are in `msg`. */
   marks: Partial<Record<RcConnectMark, number>>
@@ -169,6 +178,8 @@ export function buildConnectTimingUpload(
   const agentOrg = hexOrNull(ctx.agentOrgId)
   if (agentOrg && agentOrg !== tenantId) fields.agent_org_id = agentOrg
   if (ctx.errorCode) fields.error_code = ERROR_CODE.test(ctx.errorCode) ? ctx.errorCode : 'other'
+  // Hex by shape, like the ids: nothing else can ride in this slot.
+  if (isBuildId(ctx.build)) fields.build = ctx.build
   const line: RcConnectLogLine = {
     ts: { $date: { $numberLong: String(Math.round(nowMs)) } },
     // An attempt that painted is information; one that did not is a warning
@@ -200,6 +211,8 @@ export interface RcConnectUploaderDeps {
   fetch?: (input: string, init: RequestInit) => Promise<unknown>
   now?: () => number
   maxPerMinute?: number
+  /** #3582 — the page's build. Defaults to the shell's, read once here. */
+  build?: string | null
 }
 
 /**
@@ -217,6 +230,8 @@ export function createConnectTimingUploader(
 ): RcConnectTimingUploader {
   const now = deps.now ?? (() => Date.now())
   const maxPerMinute = deps.maxPerMinute ?? RC_CONNECT_UPLOAD_MAX_PER_MIN
+  // A page's build never changes under it: the shell is read once.
+  const build = deps.build !== undefined ? deps.build : pageBuildId()
   const sentAt: number[] = []
   let sent = 0
 
@@ -235,7 +250,7 @@ export function createConnectTimingUploader(
     send(t, ctx) {
       try {
         const nowMs = now()
-        const body = buildConnectTimingUpload(t, ctx, nowMs)
+        const body = buildConnectTimingUpload(t, { ...ctx, build: ctx.build ?? build }, nowMs)
         if (!body) return
         if (!underCap(nowMs)) return
         const init: RequestInit = {

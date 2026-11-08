@@ -218,7 +218,8 @@
             Mint {{ newKind }} key
           </v-btn>
         </div>
-        <v-alert v-if="minted" type="warning" variant="tonal" density="compact" class="mb-2">
+        <!-- `data-unsaved`: a reload for a new build waits while this shows (#3582). -->
+        <v-alert v-if="minted" type="warning" variant="tonal" density="compact" class="mb-2" data-unsaved>
           <div>Shown once — store it in the pipeline's secret store now.</div>
           <code class="minted-key">{{ minted }}</code>
           <v-btn size="x-small" variant="text" @click="copyMinted">copy</v-btn>

@@ -2,6 +2,17 @@
   "app": {
     "name": "Roomler"
   },
+  "newBuild": {
+    "ready": "A new version of Roomler is ready.",
+    "reload": "Reload",
+    "later": "Later",
+    "hint": {
+      "rcResume": "Your remote session picks up again after the reload.",
+      "rcResumeAsks": "Your remote session reconnects after the reload, and the device asks for approval again.",
+      "rcExternal": "Reloading ends this session, and the device's password is needed again.",
+      "call": "Reloading leaves the call."
+    }
+  },
   "remote": {
     "codec": {
       "label": "Codec",

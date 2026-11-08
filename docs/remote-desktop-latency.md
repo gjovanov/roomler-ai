@@ -124,15 +124,15 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:7106`
-`INPUT_MOVE_GAP_MS`, `:7119` `schedulePendingMove`): send immediately when the
+P6 drives sends from a timer instead (`useRemoteControl.ts:7145`
+`INPUT_MOVE_GAP_MS`, `:7158` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12653`). The gap is a per-browser knob,
-0 to 16 ms (`roomler-rc-input-gap`, `:2727` `storedInputGapMs`, from FR-98 C3); the
-same timer drives the relative-pointer path (`:7218`).
+always queued (`useRemoteControl.ts:12761`). The gap is a per-browser knob,
+0 to 16 ms (`roomler-rc-input-gap`, `:2766` `storedInputGapMs`, from FR-98 C3); the
+same timer drives the relative-pointer path (`:7257`).
 
 The point of the design is that `setTimeout` cadence is **independent of rAF**:
 under a compositor load that drops rAF to 20 fps, pointer sends still leave at
@@ -150,13 +150,13 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3716` `clock_echo_json`, handled at
   `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:7027` `CLOCK_RING`, `:7031`
+  sample of the last 8 (`useRemoteControl.ts:7066` `CLOCK_RING`, `:7070`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:220` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
-  (`RemoteControl.vue:4843` `statsAgeLabel`, rendered at `:289`).
+  (`RemoteControl.vue:4845` `statsAgeLabel`, rendered at `:289`).
 - **On one clock.** The probe runs on the page, so the offset maps the agent's
   clock onto the page's, and a decode worker's `epochNow` is not the page's:
   each context fixes its epoch from the wall clock when it starts, and a worker
@@ -276,7 +276,7 @@ heartbeats with a `viewer_age_ms`.
 
 So the wire carries the number the person reads. Each window's `age` goes to the
 pill and to `sendDecodeStat` from one worker `stats` message
-(`useRemoteControl.ts:7578`, `:8224`, `RemoteControl.vue:4878`). A once-a-second
+(`useRemoteControl.ts:7617`, `:8263`, `RemoteControl.vue:4880`). A once-a-second
 read can skip a window, which fits the three misses, though this read can't prove it.
 
 That is all this read shows. The session was VP9 software on a loaded host, under
@@ -293,7 +293,7 @@ day: the worker now reads the offset through a skew the page measures when it st
 the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:845`). Production runs the old
 arithmetic until a promote. The read above started each session right after loading
 its page, so it stands, and the pill and the wire still take one worker `stats`
-message (`useRemoteControl.ts:7749`, `:8397`, `RemoteControl.vue:4844`). The fleet
+message (`useRemoteControl.ts:7788`, `:8436`, `RemoteControl.vue:4846`). The fleet
 tables above carry the error, and a window whose ages all read negative sent none,
 since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
 is on production and its owed GREEN read is in.

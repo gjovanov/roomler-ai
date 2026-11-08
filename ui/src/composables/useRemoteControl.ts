@@ -92,6 +92,7 @@ import {
   type RcConnectRecorder,
 } from './rcConnectTiming'
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
+import type { RcReloadState, RcReloadSurface, RcResumeArgs } from '@/utils/staleBuildPolicy'
 import {
   PROBE_TARGET,
   benchSessionMode,
@@ -424,6 +425,44 @@ export function terminateAction(args: {
 export function isRetryableRcErrorCode(code: unknown): boolean {
   return code === 'agent_busy' || code === 'agent_offline' || code === 'session_not_found'
 }
+
+/**
+ * #3582 - this viewer, as a reload for a new build sees it
+ * (`utils/staleBuildPolicy.ts`). `redialing` is the one state a reload can
+ * take over without cutting anything: the session is already gone, the
+ * ladder's timer is waiting (or a reload holds it), nothing is in flight, and
+ * the args to open the next one are known. A request or a consent prompt in
+ * flight is `live`: a reload then would abandon a question the host may be
+ * reading. An external session (FR-52) never redials, so it is never
+ * `redialing`. A session that ended within `RC_ENDED_HOLD_MS` holds the page:
+ * its notice, its error or the rating prompt is what the person is reading.
+ */
+export function rcReloadState(inp: {
+  phase: RcPhase
+  redialPending: boolean
+  hasArgs: boolean
+  external: boolean
+  work: boolean
+  endedRecently: boolean
+  asksConsent: boolean
+}): RcReloadState {
+  const session =
+    inp.phase === 'idle' || inp.phase === 'closed' || inp.phase === 'error'
+      ? 'none'
+      : inp.phase === 'reconnecting' && inp.redialPending && inp.hasArgs && !inp.external
+        ? 'redialing'
+        : 'live'
+  return {
+    session,
+    external: inp.external,
+    work: inp.work,
+    hold: session === 'none' && inp.endedRecently,
+    asksConsent: inp.asksConsent,
+  }
+}
+
+/** #3582 - how long a session's end holds the page against a reload for a new build. */
+export const RC_ENDED_HOLD_MS = 5 * 60_000
 
 /**
  * #2251 - is this `rc:error` fallout of a session the server already ended?
@@ -9573,6 +9612,75 @@ export function useRemoteControl(
   }
 
   /**
+   * #3582 - what a reload for a new build reads from this viewer and asks of
+   * it (`utils/staleBuildWatch.ts`; RemoteControl.vue registers it). The one
+   * thing it may take over is the redial: the session is already cut, so a
+   * reload that resumes it costs the person about the page's load time, and
+   * the host no consent the redial would not have asked for. `holdRedial`
+   * stops the pending retry so no request leaves a page that is unloading;
+   * `releaseRedial` re-arms the ladder, its backoff kept, if no reload came.
+   */
+  let redialHeldForReload = false
+  // When the session last ended (closed or failed): its notice is on the page.
+  let sessionEndedAt = Number.NEGATIVE_INFINITY
+  watch(phase, (p, prev) => {
+    if ((p === 'closed' || p === 'error') && p !== prev) sessionEndedAt = Date.now()
+  })
+  const reloadSurface: RcReloadSurface = {
+    state: () =>
+      rcReloadState({
+        phase: phase.value,
+        redialPending: reconnectTimer !== null || redialHeldForReload,
+        hasArgs: lastConnectArgs !== null,
+        external: externalMode,
+        // What lives only in this page's memory: a transfer the redial would
+        // resume (rc.19), a recording's download.
+        work:
+          transfers.value.some((t) => t.status === 'queued' || t.status === 'running' || t.status === 'reconnecting')
+          || recording.download.value?.status === 'active'
+          || recording.download.value?.status === 'paused',
+        endedRecently: Date.now() - sessionEndedAt < RC_ENDED_HOLD_MS,
+        asksConsent: consentAsks.value !== null,
+      }),
+    resumeArgs: () => (externalMode || !lastConnectArgs ? null : { ...lastConnectArgs }),
+    userId: () => opts?.userId?.() ?? null,
+    holdRedial: (): RcResumeArgs | null => {
+      if (externalMode || phase.value !== 'reconnecting' || reconnectTimer === null || !lastConnectArgs) return null
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+      redialHeldForReload = true
+      return { ...lastConnectArgs }
+    },
+    releaseRedial: () => {
+      if (!redialHeldForReload) return
+      redialHeldForReload = false
+      if (phase.value === 'reconnecting' && reconnectTimer === null && lastConnectArgs) scheduleReconnect({ notifyServer: false })
+    },
+  }
+
+  /**
+   * #3582 - the load after a reload for a new build resumes the session that
+   * reload took over, through the redial's own ladder and not as a first
+   * connect. A first connect starts the ladder at 0, and `rc:error` retries
+   * `agent_offline` / `agent_busy` only past it (`isRetryableRcErrorCode` in
+   * the `rc:error` handler): a tab that reloaded while its device restarted
+   * for an update would have stopped on the first `agent_offline`, where its
+   * redial keeps trying. The session worked until the reload, so its record
+   * is `after_drop`, out of FR-22's first-attempt numbers. Never external:
+   * none is ever handed over.
+   */
+  function resumeAfterReload(args: RcResumeArgs) {
+    if (externalMode) return
+    if (phase.value !== 'idle' && phase.value !== 'closed' && phase.value !== 'error') return
+    lastConnectArgs = { agentId: args.agentId, permissions: args.permissions, orgId: args.orgId }
+    endedBy.value = null
+    sessionEverPainted = true
+    reconnectAttempt.value = Math.max(reconnectAttempt.value, 1)
+    phase.value = 'reconnecting'
+    fireReconnectAttempt()
+  }
+
+  /**
    * Resolve true the moment the signalling socket reports 'connected',
    * or false after `timeoutMs`. Used by the rc pre-flight so the
    * session request never fires into a CONNECTING socket.
@@ -13887,6 +13995,10 @@ export function useRemoteControl(
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    /** #3582 - what a reload for a new build reads from this viewer and asks of it. */
+    reloadSurface,
+    /** #3582 - the load after that reload resumes the session it took over, through the redial's ladder. */
+    resumeAfterReload,
     lastTtffMs,
     /**
      * S3 Ã¢ÂÂ sub-connected health. Non-null while `phase ===
