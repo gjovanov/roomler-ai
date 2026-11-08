@@ -491,6 +491,15 @@ impl RoomDao {
         self.members.find_by_id(id).await
     }
 
+    /// Drop the person's membership row of the room. Returns whether there
+    /// was one.
+    ///
+    /// The row also holds the person's call sessions in the room, so leaving
+    /// with one open is leaving the call: the distinct-user
+    /// `participant_count` drops as a call leave's would
+    /// ([`Self::leave_participant`]), or a call they were last in could never
+    /// end. Their call seat is `conference`'s to end, told through the
+    /// membership hook once this returns.
     pub async fn leave(
         &self,
         tenant_id: ObjectId,
@@ -499,20 +508,37 @@ impl RoomDao {
     ) -> DaoResult<bool> {
         let deleted = self
             .members
-            .hard_delete(doc! {
+            .collection()
+            .find_one_and_delete(doc! {
                 "tenant_id": tenant_id,
                 "room_id": room_id,
                 "user_id": user_id,
             })
-            .await?;
+            .await
+            .map_err(DaoError::Mongo)?;
+        let Some(member) = deleted else {
+            return Ok(false);
+        };
 
-        if deleted > 0 {
+        self.base
+            .update_by_id(room_id, doc! { "$inc": { "member_count": -1 } })
+            .await?;
+        if member.sessions.iter().any(|s| s.left_at.is_none()) {
+            // Guarded like the call leave's, so a count already at 0 stays a u32.
             self.base
-                .update_by_id(room_id, doc! { "$inc": { "member_count": -1 } })
-                .await?;
+                .collection()
+                .update_one(
+                    doc! { "_id": room_id, "participant_count": { "$gt": 0 } },
+                    doc! {
+                        "$inc": { "participant_count": -1 },
+                        "$set": { "updated_at": DateTime::now() },
+                    },
+                )
+                .await
+                .map_err(DaoError::Mongo)?;
         }
 
-        Ok(deleted > 0)
+        Ok(true)
     }
 
     pub async fn list_members(
@@ -1103,6 +1129,55 @@ impl RoomDao {
             .await
             .map_err(DaoError::Mongo)?;
         Ok(found.is_some())
+    }
+
+    /// The rooms of org `tenant_id` where `user_id` may hold a call seat, each
+    /// with whether they still hold an open call session there: the rooms
+    /// they belong to whose call is live, and any where a session is open.
+    /// What the end of the person's org membership has to reach
+    /// (`conference`'s membership hook): a seat is only ever admitted on an
+    /// open session in the person's own row of the room, and leaving the org
+    /// leaves those rows in place.
+    pub async fn call_rooms_of_member(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> DaoResult<Vec<(ObjectId, bool)>> {
+        use futures::TryStreamExt;
+
+        let rows: Vec<(ObjectId, bool)> = self
+            .members
+            .find_many(doc! { "tenant_id": tenant_id, "user_id": user_id }, None)
+            .await?
+            .iter()
+            .map(|m| (m.room_id, m.sessions.iter().any(|s| s.left_at.is_none())))
+            .collect();
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        let member_of: Vec<ObjectId> = rows.iter().map(|(rid, _)| *rid).collect();
+        let mut live = Vec::new();
+        let mut cursor = self
+            .base
+            .collection()
+            .clone_with_type::<bson::Document>()
+            .find(doc! {
+                "_id": { "$in": &member_of },
+                "tenant_id": tenant_id,
+                "conference_status": "in_progress",
+            })
+            .projection(doc! { "_id": 1 })
+            .await
+            .map_err(DaoError::Mongo)?;
+        while let Some(room) = cursor.try_next().await.map_err(DaoError::Mongo)? {
+            if let Ok(id) = room.get_object_id("_id") {
+                live.push(id);
+            }
+        }
+        Ok(rows
+            .into_iter()
+            .filter(|(rid, in_session)| *in_session || live.contains(rid))
+            .collect())
     }
 
     /// Room in which the given WS connection still holds an OPEN call session.

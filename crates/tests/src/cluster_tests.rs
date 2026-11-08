@@ -921,6 +921,182 @@ async fn media_join_is_admitted_on_both_pods() {
     ws.close(None).await.ok();
 }
 
+/// Connect a user WS; returns it with the connection id the server minted.
+async fn connect_user_ws_conn(app: &TestApp, token: &str) -> (UserWs, String) {
+    use futures::StreamExt;
+    let url = format!("ws://{}/ws?token={}", app.addr, token);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("user WS connects");
+    let first = ws.next().await.expect("a frame").expect("a text frame");
+    let connected: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    let conn = connected["connection_id"]
+        .as_str()
+        .expect("the connected frame carries connection_id")
+        .to_string();
+    (ws, conn)
+}
+
+/// The next frame of type `kind`, whatever namespace it is in, within 10 s.
+async fn next_frame_of(ws: &mut UserWs, kind: &str) -> serde_json::Value {
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut seen = Vec::new();
+    loop {
+        let left = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_else(|| panic!("no {kind} within 10 s; saw {seen:?}"));
+        let msg = match tokio::time::timeout(left, ws.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            other => panic!("socket ended waiting for {kind}: {other:?}; saw {seen:?}"),
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(msg.to_text().unwrap_or(""))
+        else {
+            continue;
+        };
+        if parsed["type"] == kind {
+            return parsed;
+        }
+        seen.push(parsed["type"].as_str().unwrap_or("").to_string());
+    }
+}
+
+/// A call owned by app1 with the org's admin in its media on app1, and the
+/// org's member in it from a socket on app2: the member's seat lives on app1,
+/// its socket on app2. Returns the two sockets and the member's connection.
+async fn call_across_pods(
+    app1: &TestApp,
+    app2: &TestApp,
+) -> (
+    crate::fixtures::seed::SeededTenant,
+    String,
+    UserWs,
+    UserWs,
+    String,
+) {
+    let (tenant, room_id) = seed_started_call(app1).await;
+    let rid = bson::oid::ObjectId::parse_str(&room_id).unwrap();
+
+    join_call(
+        app1,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.admin.access_token,
+    )
+    .await;
+    let mut host = connect_user_ws(app1, &tenant.admin.access_token).await;
+    send_media(&mut host, "media:join", &room_id).await;
+    assert_eq!(
+        next_media_msg(&mut host).await["type"],
+        "media:router_capabilities"
+    );
+    assert_eq!(
+        next_media_msg(&mut host).await["type"],
+        "media:transport_created"
+    );
+
+    join_call(
+        app2,
+        &tenant.tenant_id,
+        &room_id,
+        &tenant.member.access_token,
+    )
+    .await;
+    let (mut member, conn) = connect_user_ws_conn(app2, &tenant.member.access_token).await;
+    send_media(&mut member, "media:join", &room_id).await;
+    assert_eq!(
+        next_media_msg(&mut member).await["type"],
+        "media:router_capabilities"
+    );
+    assert_eq!(
+        next_media_msg(&mut member).await["type"],
+        "media:transport_created"
+    );
+    assert_eq!(
+        conf(app1).room_manager.get_connection_room(&conn),
+        Some(rid),
+        "the member's seat is on the owner pod"
+    );
+    assert!(!conf(app2).room_manager.has_room(&rid));
+    (tenant, room_id, host, member, conn)
+}
+
+/// The seat is withdrawn on the pod that holds it, though the membership
+/// ended on the other: the member's socket (on app2) hears its call ended,
+/// the host (on app1) sees it leave, and app1 holds no seat for it.
+async fn assert_seat_gone_across_pods(
+    app1: &TestApp,
+    room_id: &str,
+    host: &mut UserWs,
+    member: &mut UserWs,
+    conn: &str,
+) {
+    let ended = next_frame_of(member, "room:call_ended").await;
+    assert_eq!(ended["data"]["room_id"], room_id, "{ended}");
+    let left = next_frame_of(host, "media:peer_left").await;
+    assert_eq!(left["data"]["connection_id"], conn, "{left}");
+    assert_eq!(
+        conf(app1).room_manager.get_connection_room(conn),
+        None,
+        "the owner pod still seats the member"
+    );
+}
+
+/// A member removed from the org by a request the NON-owner pod serves loses
+/// the seat the owner pod holds for them.
+#[tokio::test]
+async fn an_org_removal_on_one_pod_withdraws_the_seat_the_other_pod_holds() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+
+    let resp = app2
+        .auth_delete(
+            &format!(
+                "/api/tenant/{}/member/{}",
+                tenant.tenant_id, tenant.member.id
+            ),
+            &tenant.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    assert_seat_gone_across_pods(&app1, &room_id, &mut host, &mut member, &conn).await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
+/// A member who leaves the room through the NON-owner pod loses the seat the
+/// owner pod holds for them.
+#[tokio::test]
+async fn a_room_leave_on_one_pod_withdraws_the_seat_the_other_pod_holds() {
+    let (app1, app2) = TestApp::spawn_pair(|_| {}).await;
+    if app1.state.cluster_directory.is_none() {
+        eprintln!("skipping: no Redis available");
+        return;
+    }
+    let (tenant, room_id, mut host, mut member, conn) = call_across_pods(&app1, &app2).await;
+
+    let resp = app2
+        .auth_post(
+            &format!("/api/tenant/{}/room/{}/leave", tenant.tenant_id, room_id),
+            &tenant.member.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    assert_seat_gone_across_pods(&app1, &room_id, &mut host, &mut member, &conn).await;
+    host.close(None).await.ok();
+    member.close(None).await.ok();
+}
+
 // ── C-5: DERP directory + registration-driven rehome ────────────────
 
 /// A DERP network split across pods converges toward the NEWEST

@@ -32,6 +32,10 @@
 //!   (a zero-length ownerless window on a deploy) moved out of the host's
 //!   `shutdown_cleanup`.
 //!
+//! And [`Module::hooks`]: when someone's membership of an org or a room ends,
+//! core tells this module, which ends the call seats that membership admitted
+//! (`revoke`).
+//!
 //! The bus handlers (`media.cmd`, `media.leave_user`, …) and the 10 s claim
 //! heartbeat are wired in [`Module::init`] — they need only this state, so the
 //! "registered on the built AppState" step the host used to run is gone.
@@ -63,6 +67,7 @@ mod media_gate;
 pub mod media_stats;
 pub mod meeting_cap;
 pub mod recording;
+mod revoke;
 pub mod ws_media;
 
 /// The module's state: the core plus what conference owns.
@@ -244,6 +249,13 @@ impl Module for ConferenceState {
                 ],
             },
         ]
+    }
+
+    /// The inverse edge: a call seat ends with the membership that admitted
+    /// it — the person removed from the org or leaving it, or leaving the
+    /// room ([`revoke`]).
+    fn hooks(&self) -> roomler_core::Hooks {
+        revoke::hooks(self)
     }
 
     /// The stale-call reset: no call can be active at server startup, so

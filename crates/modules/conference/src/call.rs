@@ -301,7 +301,18 @@ pub async fn finalize_call_leave_db(
         // the distinct-user count is unchanged — nothing to broadcast.
         return Ok(());
     }
+    settle_call_after_departure(state, rid).await
+}
 
+/// Someone's last call session in `rid` has closed, and the room's
+/// distinct-user count dropped with it: tell the room's members the new
+/// count, or end the call when nobody is left in it. The tail of every leave:
+/// a hang-up, a socket close, and a membership's end (`revoke`), whose
+/// sessions went with the membership row (`RoomDao::leave`).
+pub(crate) async fn settle_call_after_departure(
+    state: &ConferenceState,
+    rid: ObjectId,
+) -> Result<(), ApiError> {
     let room = state.rooms.base.find_by_id(rid).await.ok();
     let (count, status) = room
         .as_ref()
