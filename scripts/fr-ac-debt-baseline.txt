@@ -29,7 +29,8 @@
 #   2026-09-23  19 closed FRs /74 criteria   <- unobserved for three weeks
 
 # ── A. closed with NO recorded field evidence on the issue ───────────────────
-# The sharp five. Each criterion here was written down because someone judged
+# The sharp five, three left: A.1 FR-2 and A.5 FR-37 were read and ticked 2026-11-03.
+# Each criterion here was written down because someone judged
 # it necessary, and then the issue closed without it and without a Result.
 FR-10=1   # A.2 #783 no Result comment. The open criterion is the `relay_idr_thrift=0` ROLLBACK path — a kill switch never exercised.
 FR-11=8   # A.3 #784 no Result comment, and NOT ONE of its 8 criteria is ticked. The ledger calls it shipped + field-verified on prod 2026-08-27; nothing in the record supports that.
