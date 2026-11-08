@@ -119,8 +119,8 @@ other pod) · cluster · stats · relay-region · remote-control · agent
   character, so the `input` event the soft keyboard types through never fires
   and a key's second owner is invisible. `softkbd.html` mounts the real
   `MobileKeyboard.vue` and a window-level capture listener running the real
-  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14812`,
-  `:14902`), both recording what the host would get and WHO sent it.
+  `routeKeyEvent` / `applyKeyRoute` (`ui/src/composables/useRemoteControl.ts:14873`,
+  `:14963`), both recording what the host would get and WHO sent it.
   `softkbd.spec.ts` presses hardware keys (`page.keyboard.press`), types as the
   OS keyboard does (`insertText`: an `input` event and no keydown), composes
   through the IME (CDP `Input.imeSetComposition`), pastes, and asserts one
@@ -445,8 +445,8 @@ With the probe dropped in the input handler before it reaches the source, the te
 ### L4 in the real viewer
 
 The same probe, timed by the browser that a person would actually use, on whatever paints the
-frames. That is one of the three decode workers, or the plain `<video>` element on the RTP
-track.
+frames. That is one of the two decode workers (the data-channel worker, one for every codec since
+FR-135 R3, or the RTP transform's), or the plain `<video>` element on the RTP track.
 
 ```mermaid
 sequenceDiagram
@@ -483,6 +483,14 @@ what it measured (`target_fps`, `width`, `height`, `codec`, `chroma`, `carrier`,
   `<video>` uses the moment the frame was submitted for composition. The display's own latency
   (a vsync or two, and the panel) comes after both. That gap is what the FR-16 AC compares
   against a 240 fps camera.
+- ⚠️ **Both stamps on the page's clock.** The prober stamps the send on the page's clock, and a
+  decode worker stamps its paint on its own, which reads a constant apart from the page's when the
+  worker was made after its page (7.25 ms, 162 s after the page, on the Windows dev box: #3566).
+  So a worker hands `paintedAt` back on the page's clock, through the skew the page measured when
+  it started the worker (`toPageEpochMs`, `ui/src/workers/rc-clock-cal.ts:160`;
+  [remote-control.md §11.14.3](remote-control.md#11143-one-clock-for-the-page-and-its-worker-3566)).
+  The `<video>` sampler stamps on the page's own clock. Under `roomler-rc-clock-cal=0`, or where
+  no round trip came back fast enough to trust, a worker's stamp is its own, as before.
 - ⚠️ **Readbacks are paid only while a probe is out.** A GPU-backed frame reads back whole
   however small the rect, so sampling every frame would tax the path being measured.
 
