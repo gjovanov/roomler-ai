@@ -3,8 +3,8 @@
 **Issue:** [#2052](https://github.com/gjovanov/roomler-ai/issues/2052) · **Status:** **CLOSED 2026-10-15** — P1 shipped in
 0.4.133; P2a (#2132), P2b (#2184) and P3 + P4 (#2225) in 0.4.137, with P3's `install.sh` served since the promote of
 `hosted-20261015-3df732f`; P5 (#2249) in 0.4.138. All ten acceptance criteria are field-verified on the lab's guests,
-the last ones on 0.4.138's own `.deb` (§8). D3, a devices-page note for hosts that were stuck before this, stays open
-as the server's half (spec and claim 2026-10-12, #2046, on the operator's
+the last ones on 0.4.138's own `.deb` (§8). D3, a devices-page note for hosts that were stuck before this, shipped
+as [FR-106](FR-106-devices-say-when-not-updating.md) (#2314, closed 2026-10-16) (spec and claim 2026-10-12, #2046, on the operator's
 "do per recommendation") · **Owner:** the agent updater and the Linux installers ·
 **Builds on:** [FR-5](FR-5-macos-unattended-update-chain.md) (the macOS update half this mirrors),
 [FR-67](FR-67-update-outcome-observability.md) (what an install reports) · **Fixes:** #2046
@@ -281,7 +281,7 @@ flowchart LR
   nothing is restarted or stopped.
 - ⚠️ **What it cannot do: reach a host that is already stuck.** That host's daemon cannot install the release that
   carries this. One install by a person heals it: `sudo apt install ./roomlerd.deb`, the Software app, or a re-run
-  of `install.sh`. D3, a devices-page note pointing at that install, is the server's half and stays open.
+  of `install.sh`. D3, a devices-page note pointing at that install, shipped as FR-106 (#2314, 2026-10-16): such a host shows a "not updating" chip with its OS's remedy.
   After that install the package half runs by itself, and the helper takes every later release as root. The
   RUNNING daemon follows on its own only if it has P2b. It restarts onto the new binary once idle, but first
   waits out the 10 min that its own last attempt leaves in `update_in_flight` (§3.3). On a stuck host that attempt
@@ -388,7 +388,7 @@ next depends on it.
 |---|---|---|
 | **D1** | the restart onto the new binary: at once, or when the daemon is idle | **Decided 2026-10-13 (operator), as recommended: when idle, with a 24 h ceiling** (P2b, §3.3). A restart under a live session cuts it, and the update is not urgent enough for that |
 | **D2** | a backstop for every other replacement (an admin's `apt upgrade`, a hand install): the daemon notices its executable was replaced and restarts when idle | **Decided 2026-10-13 (operator), as recommended: yes** — and it became the ONE mechanism (§3.3): without it a replaced binary waits for a reboot |
-| **D3** | hosts installed before this FR cannot receive it by themselves | say so where the operator looks: a devices-page note for a Linux row more than N releases behind, pointing at re-running `install.sh` |
+| **D3** | hosts installed before this FR cannot receive it by themselves | **Shipped 2026-10-16 as [FR-106](FR-106-devices-say-when-not-updating.md) (#2314)**: an online device whose oldest missed release has been out for 24 h shows a "not updating" chip, with the remedy for its OS in the tooltip. Recommended here: a devices-page note for a Linux row more than N releases behind, pointing at re-running `install.sh` |
 | **D4** | the `.deb` ladder's `pkexec`, once the helper ships | **Settled by the evidence, 2026-10-15 (P5):** under its unit no rung can elevate (`NoNewPrivileges=true`: pkexec exits 127, sudo 1), so a daemon there no longer tries the ladder, and waits for the helper instead (§3.6). The ladder stays only for a daemon started by hand, and under the kill switch |
 | **D5** | how a per-user `.deb` installed without `install.sh` gets its update half | **Decided 2026-10-15 (operator: "propose a fix. merge, field test")**: the package turns it on itself. `postinst` enables the timer and the path the Debian way, so an administrator's disable holds, and the helper steps aside on a system install (§3.6). The postinst rule "never enable anything" stays for the daemon units |
 

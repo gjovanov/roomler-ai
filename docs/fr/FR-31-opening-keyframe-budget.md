@@ -1,6 +1,6 @@
 # FR-31: The opening keyframe of an NVENC session gets one frame's budget — ffmpeg discards the HRD in `cq` mode
 
-Status: **P0 measured; P1 (post-open VBV) and P1b (`ldkfs`) BOTH REFUTED by the A/B — the opening keyframe is ~1.1–1.3 × `maxrate/fps` and nothing ffmpeg exposes changes that; decision pending on the remaining levers** (2026-08-29). Tracking issue: `FR-31` (#897). Implementation PR #900 is a draft (inert knobs + the `open_vbv_bits` log field).
+Status: **closed not planned 2026-11-08** (triage): superseded by [FR-35](FR-35-relay-ceiling-learns-the-pair.md) (#922), which took the one lever left. **P0 measured; P1 (post-open VBV) and P1b (`ldkfs`) BOTH REFUTED by the A/B — the opening keyframe is ~1.1–1.3 × `maxrate/fps` and nothing ffmpeg exposes changes that** (2026-08-29). Tracking issue: `FR-31` (#897). Implementation PR #900, a draft (inert knobs + the `open_vbv_bits` log field), closed unmerged on 2026-11-08.
 Child of the RC-quality program; sibling of FR-10 (relay IDR thrift), FR-17 (relay transport),
 FR-22 (time-to-first-frame). Spec ships with the implementation PR (the default is decided by
 an A/B, see "Open decisions").
