@@ -32,6 +32,13 @@
 import { epochNowMs } from './rc-hop-stats'
 import { createBenchSampler } from './rc-bench-sampler'
 import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-decoder-config'
+import {
+  clockCalPong,
+  normalizeSkewMs,
+  toPageEpochMs,
+  type ClockCalMessage,
+  type ClockCalPing,
+} from './rc-clock-cal'
 
 /** `bench` — FR-16 L4 bench mode, set only when the knob is on AND the
  *  agent advertised `bench`: sample the probe marker while a probe is armed. */
@@ -39,7 +46,7 @@ type InitCanvasMessage = { type: 'init-canvas'; canvas: OffscreenCanvas; bench?:
 /** FR-16 L4 — the main thread just sent bench probe `seq`. */
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
 type CloseMessage = { type: 'close' }
-type IncomingMessage = InitCanvasMessage | BenchArmMessage | CloseMessage
+type IncomingMessage = InitCanvasMessage | BenchArmMessage | ClockCalPing | ClockCalMessage | CloseMessage
 
 interface RTCTransformerLike {
   readable: ReadableStream<unknown>
@@ -71,6 +78,11 @@ const workerScope = self as unknown as {
 
 /** FR-16 L4 — reads the bench probe off painted frames, only while armed. */
 const bench = createBenchSampler({ post: (m) => workerScope.postMessage(m), now: epochNowMs })
+/** #3566 — this worker's clock less the page's, ms, as the page measured it when
+ *  it started the worker (`clock-cal`, `rc-clock-cal.ts`). The page times a bench
+ *  probe from its own clock, so a paint stamp goes back through it. 0 until it
+ *  arrives, and for a session that measures none: the stamp of before. */
+let pageSkewMs = 0
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -114,12 +126,17 @@ function requestKeyframe(opts: { now?: boolean } = {}): void {
 workerScope.onmessage = (e) => {
   const msg = e.data
   if (!msg) return
-  if (msg.type === 'init-canvas') {
+  if (msg.type === 'clock-cal-ping') {
+    // #3566 — answered first, and stamped on arrival.
+    workerScope.postMessage(clockCalPong(msg.seq, epochNowMs()))
+  } else if (msg.type === 'init-canvas') {
     canvas = msg.canvas
     ctx = canvas.getContext('2d')
     if (typeof msg.bench === 'boolean') bench.setEnabled(msg.bench)
   } else if (msg.type === 'bench-arm') {
     bench.arm(msg.seq)
+  } else if (msg.type === 'clock-cal') {
+    pageSkewMs = normalizeSkewMs(msg.skewMs)
   } else if (msg.type === 'close') {
     try {
       decoder?.close()
@@ -132,6 +149,7 @@ workerScope.onmessage = (e) => {
     configured = false
     framesDecoded = 0
     awaitingKeyAfterRebuild = false
+    pageSkewMs = 0
   }
 }
 
@@ -157,7 +175,8 @@ workerScope.onrtctransform = async (event) => {
         // FR-16 L4 — a clone for the probe read; null unless a probe is armed.
         const benchClone = bench.take(frame)
         paintFrame(frame)
-        if (benchClone) bench.settle(benchClone, epochNowMs())
+        // #3566 — on the page's clock, which times the probe.
+        if (benchClone) bench.settle(benchClone, toPageEpochMs(epochNowMs(), pageSkewMs))
         if (firstDims) {
           workerScope.postMessage({
             type: 'first-frame',
