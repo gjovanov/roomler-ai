@@ -9,8 +9,16 @@
  * that follows. Whatever paints frames reads that marker back: a decode
  * worker (`rc-bench-sampler.ts`) or, on the plain `<video>` path, the
  * sampler here. The first painted frame carrying `N` ends the round trip,
- * and `paint − send` is input to photon minus the display's own latency,
- * on one clock (`epochNowMs`), with no clock offset anywhere.
+ * and `paint − send` is input to photon minus the display's own latency.
+ *
+ * ⚠️ Both stamps must be on the page's clock, and `timeOrigin + now()` is
+ * not one clock across contexts: each fixes its `timeOrigin` from the wall
+ * clock when it starts, so a decode worker made after its page reads a
+ * constant apart from it (#3566). The send is stamped here; a worker hands
+ * its paint stamp back through the skew the page measured when it started
+ * the worker (`rc-clock-cal.ts`), and the `<video>` sampler stamps on the
+ * page's own clock. Without a measured skew (`roomler-rc-clock-cal=0`, or no
+ * round trip fast enough to trust) a worker's stamp is its own, as before.
  *
  * Gated at every entry point. The knob `roomler-rc-bench` is honoured only
  * when the agent advertised `bench` in `AgentCaps.video`; the agent paints
@@ -169,7 +177,7 @@ export interface BenchProber {
   start(): void
   /** Stop probing and flush what was measured. */
   stop(): void
-  /** A frame carrying `seq` was painted at `paintedAt` (epoch ms). Returns
+  /** A frame carrying `seq` was painted at `paintedAt` (the page's epoch ms). Returns
    *  the round trip, or null for a probe this prober did not send, sent
    *  already answered, or expired. */
   onPainted(seq: number, paintedAt: number, path: BenchPath): number | null
