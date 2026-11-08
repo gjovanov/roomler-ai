@@ -205,9 +205,12 @@ impl MessageDao {
             .await
     }
 
+    /// The author's edit of a live message of `room_id`. `false` when no such
+    /// message matched: another author's, another room's, or a deleted one.
     pub async fn update_content(
         &self,
         tenant_id: ObjectId,
+        room_id: ObjectId,
         message_id: ObjectId,
         author_id: ObjectId,
         content: String,
@@ -217,6 +220,7 @@ impl MessageDao {
                 doc! {
                     "_id": message_id,
                     "tenant_id": tenant_id,
+                    "room_id": room_id,
                     "author_id": author_id,
                     "deleted_at": null,
                 },
@@ -231,15 +235,22 @@ impl MessageDao {
             .await
     }
 
+    /// Pin or unpin a live message of `room_id`.
     pub async fn toggle_pin(
         &self,
         tenant_id: ObjectId,
+        room_id: ObjectId,
         message_id: ObjectId,
         pinned: bool,
     ) -> DaoResult<bool> {
         self.base
             .update_one(
-                doc! { "_id": message_id, "tenant_id": tenant_id },
+                doc! {
+                    "_id": message_id,
+                    "tenant_id": tenant_id,
+                    "room_id": room_id,
+                    "deleted_at": null,
+                },
                 doc! { "$set": { "is_pinned": pinned } },
             )
             .await

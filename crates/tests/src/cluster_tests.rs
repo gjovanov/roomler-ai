@@ -1295,6 +1295,7 @@ async fn cluster_status_reports_pod_counters_and_gauges() {
         "bus_deadline_total",
         "media_fold_total",
         "media_belt_fallback_total",
+        "media_frames_rate_limited_total",
         "derp_rehome_close_total",
         "derp_rehome_stuck_total",
         "split_evidence_total",

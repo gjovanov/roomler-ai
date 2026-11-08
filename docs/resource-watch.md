@@ -147,7 +147,7 @@ several reads, not one.
 
 ## 6. Field numbers
 
-Measured 2026-11-01 on 0.4.194.
+Measured 2026-11-01 on 0.4.194, and over the seven days to 2026-11-08 on 0.4.194 to 0.4.206.
 
 | | |
 |---|---|
@@ -159,6 +159,9 @@ Measured 2026-11-01 on 0.4.194.
 | Linux | 36 to 39 descriptors |
 | macOS | 20 to 33 descriptors |
 | The fleet read against 406,843 batches | one line per device, no restart |
+| Seven days of the fleet, 0.4.194 to 0.4.206 | 2,914 hourly lines; the one `WARN` was the lab climb above, and no other device warned |
+| The 9 Windows workers online all week | 396 to 1,776 handles |
+| The 7-day read against 371,501 batches | 2,914 matching batches, counted per day first: under the script's cap of 5,000, so nothing was cut; no restart |
 | `PING.EXE` started by the daemon, Windows | 0 in 610 s, with a positive control; 0.4.193 started 249 in 300 s |
 | The RTT column against a hand `ping`, median of 16 pairs | within 1 ms on a server and three LAN peers |
 | The same on a Wi-Fi peer, 40 pairs | minimum 4 and 4 ms, quartiles 5 to 54 and 6 to 63 ms: the same distribution, no offset |

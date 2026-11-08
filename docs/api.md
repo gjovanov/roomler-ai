@@ -300,7 +300,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET/POST | `…/invite` | List / create invites |
 | POST | `…/invite/batch` | Batch email invites |
 | DELETE | `…/invite/{invite_id}` | Revoke |
-| GET | `…/search?q=` | Full-text search: messages, rooms, people |
+| GET | `…/search?q=` | Full-text search: messages of rooms the caller may read, rooms the caller may see listed (a Secret room only to its members), people |
 
 ### Rooms, chat, calls
 
@@ -315,7 +315,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET | `…/room/{rid}/call/participant` | Live participants |
 | GET/POST | `…/room/{rid}/message` | Paginated history / send |
 | GET | `…/message/pin` | Pinned messages |
-| PUT/DELETE | `…/message/{mid}` | Edit / delete |
+| PUT/DELETE | `…/message/{mid}` | Edit (the author's; 404 for anyone else) / delete (the author's; 403 for anyone else) |
 | PUT | `…/message/{mid}/pin` | Toggle pin |
 | GET | `…/message/{mid}/thread` | Thread replies |
 | POST | `…/message/{mid}/reaction` | Add reaction |
@@ -332,18 +332,27 @@ room. A message also carries `author_type` (`user` · `bot` · `webhook` · `sys
 author keeps its own name in `author_name`, and the edit and delete routes match the author, so
 they refuse every person on such a message.
 
+Every route with `{mid}` in its path resolves it as a live message of the path room, and that
+room must be one the caller may read: a Secret room answers 404 and a Private one 403, as the
+room routes do. A message attachment is a live file of the message's own room.
+
 A send names its thread with `thread_id` and may quote with `referenced_message_id`. Either must be
 a live message of the same room, or the send answers 404 and stores nothing. A thread lists the
 replies of its own room, and `mentions.users` notifies members of the room only.
 
 ### Files, tasks, export
 
+A file is reached through the room it was uploaded to. `…/file/{fid}` and its download answer
+only for a live file of a room the caller may read: a Secret room answers 404 and a Private one
+403. A room's file list and both uploads take a room of the org that the caller may read. The
+org's file list (`GET …/file`) lists, and names, only such rooms' files.
+
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `…/room/{rid}/file` · POST `…/file/upload` | Room-scoped files (100 MB limit) |
 | GET/POST | `…/file` · `…/file/upload` | Tenant file library |
 | GET | `…/file/{fid}` · `/download` | Metadata / streamed download |
-| DELETE | `…/file/{fid}` | Delete |
+| DELETE | `…/file/{fid}` | Delete (the uploader's; 403 for anyone else) |
 | POST | `…/file/{fid}/recognize` | AI document recognition (Claude vision) |
 | GET | `…/task` · `…/task/{tid}` · `/download` | Background tasks + results |
 | POST | `…/export/conversation` | XLSX export |

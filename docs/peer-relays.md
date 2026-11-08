@@ -395,7 +395,7 @@ the capacity gained: the relay was in France and the members in Austria and Germ
 | the relay server + counters | [`orgrelay/server.rs`](../crates/tunnel-core/src/overlay/orgrelay/server.rs), [`agents/roomlerd/src/relay_server.rs`](../agents/roomlerd/src/relay_server.rs) |
 | the member: bind + `OrgRelayConn` | [`orgrelay/client.rs`](../crates/tunnel-core/src/overlay/orgrelay/client.rs) |
 | the member's coordinator | [`relay_link.rs`](../crates/tunnel-core/src/overlay/relay_link.rs) — `relay_strategy` `:1161`, `org_request_bind` `:2055`, `commit_org_bind` `:2081` |
-| pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:62`](../crates/api/src/cluster/metrics.rs#L62) |
+| pod-offload metric | `derp_bytes_relayed_total`, [`crates/api/src/cluster/metrics.rs:65`](../crates/api/src/cluster/metrics.rs#L65) |
 
 ## Not built
 

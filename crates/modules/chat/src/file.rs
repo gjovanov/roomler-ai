@@ -99,9 +99,8 @@ pub async fn list(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    // A room's files are its content: the room guard, visibility included.
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let (sort, desc) = file_sort_args(&params)?;
     let page_params = PaginationParams {
@@ -145,12 +144,22 @@ pub async fn list_tenant_files(
         per_page: params.per_page.clamp(1, 100),
         before: None,
     };
+    // Only the files of rooms the caller may read: the room guard's rule over
+    // every room of the org at once.
+    let reach = crate::guards::room_reach(&state, tid, auth.user_id).await?;
     let result = state
         .files
-        .find_by_tenant(tid, &page_params, params.q.as_deref(), sort, desc)
+        .find_by_tenant(
+            tid,
+            &reach.readable,
+            &page_params,
+            params.q.as_deref(),
+            sort,
+            desc,
+        )
         .await?;
 
-    // Collect unique room IDs and look up room names
+    // Collect unique room IDs and look up room names, within this tenant.
     let room_ids: Vec<ObjectId> = result
         .items
         .iter()
@@ -160,9 +169,19 @@ pub async fn list_tenant_files(
         .collect();
 
     let mut room_names: HashMap<ObjectId, String> = HashMap::new();
-    for rid in &room_ids {
-        if let Ok(room) = state.rooms.base.find_by_id(*rid).await {
-            room_names.insert(*rid, room.name);
+    if !room_ids.is_empty() {
+        let rooms = state
+            .rooms
+            .base
+            .find_many(
+                bson::doc! { "_id": { "$in": room_ids.clone() }, "tenant_id": tid },
+                None,
+            )
+            .await?;
+        for room in rooms {
+            if let Some(rid) = room.id {
+                room_names.insert(rid, room.name);
+            }
         }
     }
 
@@ -300,6 +319,14 @@ pub async fn upload(
     }
 
     let data = file_data.ok_or_else(|| ApiError::BadRequest("Missing 'file' field".to_string()))?;
+    let room_id_val =
+        room_id_str.ok_or_else(|| ApiError::BadRequest("Missing 'room_id' field".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id_val)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
+
+    // The form's room is resolved as the path's would be, before anything is
+    // stored: a room of this tenant that the caller may read.
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     // FR-32 P1b — plan `storage_bytes` cap. Uses the DELTA form: a tenant at
     // 99 MB of 100 MB must be refused a 10 MB file and ALLOWED a 100 KB one,
@@ -319,10 +346,6 @@ pub async fn upload(
             return Err(ApiError::Forbidden(d.message()));
         }
     }
-    let room_id_val =
-        room_id_str.ok_or_else(|| ApiError::BadRequest("Missing 'room_id' field".to_string()))?;
-    let rid = ObjectId::parse_str(&room_id_val)
-        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
     let resp = do_upload(&state, tid, rid, auth.user_id, data).await?;
     Ok(Json(resp))
@@ -338,11 +361,7 @@ pub async fn get(
     let fid = ObjectId::parse_str(&file_id)
         .map_err(|_| ApiError::BadRequest("Invalid file_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
-
-    let file = state.files.base.find_by_id_in_tenant(tid, fid).await?;
+    let file = crate::guards::require_file(&state, tid, fid, auth.user_id).await?;
     Ok(Json(to_response(file)))
 }
 
@@ -356,11 +375,7 @@ pub async fn download(
     let fid = ObjectId::parse_str(&file_id)
         .map_err(|_| ApiError::BadRequest("Invalid file_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
-
-    let file = state.files.base.find_by_id_in_tenant(tid, fid).await?;
+    let file = crate::guards::require_file(&state, tid, fid, auth.user_id).await?;
     let contents = state
         .storage
         .get(&file.storage_key)
@@ -453,8 +468,13 @@ pub async fn delete(
     let fid = ObjectId::parse_str(&file_id)
         .map_err(|_| ApiError::BadRequest("Invalid file_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
+    // Only the uploader deletes a file, as only the author deletes a message:
+    // a live file of a room the caller may read, and the caller uploaded it.
+    let file = crate::guards::require_file(&state, tid, fid, auth.user_id).await?;
+    if file.uploaded_by != auth.user_id {
+        return Err(ApiError::Forbidden(
+            "Only the uploader can delete this file".to_string(),
+        ));
     }
 
     state.files.soft_delete(tid, fid).await?;
@@ -473,9 +493,8 @@ pub async fn upload_room(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    // A room of this tenant that the caller may read, before the body is read.
+    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let mut file_data: Option<(String, String, Vec<u8>)> = None;
 
