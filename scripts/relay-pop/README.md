@@ -84,7 +84,7 @@ mid-2026 — re-quote at signup.
    Requires `ROOMLER__RELAY__REGIONS_ENABLED=true` and (for DERP)
    `ROOMLER__RELAY__DERP_TICKET_PRIVATE_KEY`
    (`openssl genpkey -algorithm ed25519 -outform DER | base64 -w0`).
-7. **Watch**: `relay_region_pick_total` in `/api/cluster/status`,
+7. **Watch**: `relay_region_pick_total` in `/api/cluster/status` (a platform admin's token),
    `GET /api/relay/regions`, `agents.relay_home` in Mongo / the Devices UI.
    Soak ≥1 week before the next procurement wave.
 

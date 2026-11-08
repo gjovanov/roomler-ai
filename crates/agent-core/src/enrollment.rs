@@ -249,6 +249,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         // FR-43 P1 — macOS root-daemon supervision of the GUI worker; off at
         // enrollment like every other posture switch.
         macos_supervise_gui_worker: false,
+        // FR-43 P3 — the same: one device row is a posture switch.
+        macos_one_row: false,
         power_policy: String::new(),
         // FR-84 D6 — the companion opens after install and starts at login by
         // default; a RE-enrollment keeps whatever the device had (the
@@ -281,34 +283,6 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         ssh_account_mode: None,
         ssh_max_privilege: None,
         ssh_activity_log: false,
-        // FR-90 — a freshly enrolled device runs no agent sessions: every
-        // Hive gate starts closed, and only whoever holds the box opens them.
-        hive_enabled: false,
-        hive_accounts: Default::default(),
-        hive_roots: Vec::new(),
-        hive_max_sessions: None,
-        hive_harness: None,
-        hive_api_key_helper: None,
-        hive_api_workspace_id: None,
-        hive_update_wait_secs: None,
-        hive_core_memory: false,
-        hive_adopt: false,
-        hive_allow_passwordless_sudo: false,
-        hive_replica: false,
-        hive_archive: false,
-        hive_store_quota_mib: None,
-        vault_enabled: false,
-        vault_activity_log: false,
-        hive_net: false,
-        hive_ssh: false,
-        hive_egress: false,
-        hive_worker: false,
-        // FR-90 P4-3b-1: nothing scanned until the owner lists a root.
-        knowhow_scan_roots: Vec::new(),
-        // FR-90 P4-3b-3: no listener reported until the owner says so.
-        knowhow_scan_listeners: false,
-        // FR-90 P4-5-1b: no probe reaches anywhere until the owner lists it.
-        knowhow_probe_reach: Vec::new(),
         // FR-89: on, like every fresh install; `false` is the kill switch
         // an owner reaches for, never a starting point.
         ssh_exec_streaming: true,
@@ -331,6 +305,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_init_auth_first: None,
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
+        ws_flat_redial: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -340,6 +315,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         overlay_route_tick_secs: None,
         overlay_netmon: None,
         overlay_netmon_debounce_ms: None,
+        overlay_netchange_poke_quiet_secs: None,
         overlay_relay_tls: None,
         overlay_shared_carrier: None,
         overlay_roam: None,
@@ -446,6 +422,8 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         zero_copy: None,
         color_description: None,
         zero_copy_deny: None,
+        rc_media_legacy: None,
+        rc_media_canary: None,
         nvenc_split: None,
         vaapi_device: None,
         d3d12_adapter: None,
@@ -480,6 +458,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         last_crash_unix: 0,
         rollback_attempted: false,
         last_run_unhealthy: false,
+        last_run_boot: None,
         // Stamp the current schema version directly on enrollment so
         // a fresh install skips the rc.18 migration on first launch.
         config_schema_version: Some(crate::config::CURRENT_SCHEMA_VERSION.to_string()),
@@ -582,6 +561,16 @@ pub fn apply_enrollment(
     let Some(existing) = existing else {
         return Ok((fresh, EnrollOutcome::FreshPrimary));
     };
+
+    // FR-43 P3 — a person's file on a one-row Mac holds their settings and no
+    // enrollment. One landing on it is the primary, with those settings kept:
+    // appended beside blank identity fields it would be a secondary of nothing.
+    if !existing.has_primary_enrollment() {
+        return Ok((
+            preserve_operator_config(fresh, existing),
+            EnrollOutcome::FreshPrimary,
+        ));
+    }
 
     if force_replace {
         let mut merged = preserve_operator_config(fresh, existing);
@@ -1234,6 +1223,23 @@ mod tests {
         assert_eq!(outcome, EnrollOutcome::FreshPrimary);
         assert_eq!(cfg.agent_token, fresh.agent_token);
         assert!(cfg.orgs.is_empty());
+    }
+
+    /// FR-43 P3 — an enrollment landing on a person's blank file is the primary,
+    /// with their settings kept. Appended beside blank identity fields, it would
+    /// be a secondary of nothing.
+    #[test]
+    fn apply_enrollment_on_a_blank_file_is_the_primary_and_keeps_settings() {
+        let mut blank = crate::config::AgentConfig::for_person_with_no_enrollment("mac").unwrap();
+        blank.keep_busy_enabled = true;
+        let fresh = fresh_for("https://a.invalid", "t1", "tok1");
+        let (cfg, outcome) = apply_enrollment(Some(blank), fresh, None, false).unwrap();
+        assert_eq!(outcome, EnrollOutcome::FreshPrimary);
+        assert_eq!(cfg.server_url, "https://a.invalid");
+        assert_eq!(cfg.tenant_id, "t1");
+        assert_eq!(cfg.agent_token, "tok1");
+        assert!(cfg.orgs.is_empty());
+        assert!(cfg.keep_busy_enabled);
     }
 
     #[test]

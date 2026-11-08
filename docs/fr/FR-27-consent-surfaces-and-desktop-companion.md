@@ -33,7 +33,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2181`,
+   deny. — `agents/roomlerd/src/signaling.rs:2205`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
@@ -67,12 +67,14 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:2991`, `ssh.rs:2251` vs `git grep write_pending`
+   — `signaling.rs:5706`, `ssh.rs:2176` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
-   built. — `hub.rs:39,862`, `models.rs:400`, `state.rs:1199`
+   built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:1922` (the per-mode window),
+   `models.rs:1320` (the doc-comment on the `PromptThenEmail` variant at `:1330`),
+   `consent_consumer.rs:207` (the email leg; it was `state.rs:1199`)
 
 ### Desktop companion
 
@@ -88,13 +90,13 @@ Every line below was read on `origin/master` at `861d4557`.
    `/usr/local/bin` — hence the reported
    `Spawning self-update: No such file or directory (os error 2)`. The same
    failure kills apply-update, `probe_service_state`, service install/uninstall
-   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1494`
+   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1905`
 8. ~~**macOS "Check for updates" targets the wrong mechanism.**~~ **Wrong —
    corrected during implementation.** The reported
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`app.rs:3830`), so the mechanism was already correct and
+   since FR-5 (`app.rs:6144`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
@@ -107,7 +109,7 @@ Every line below was read on `origin/master` at `861d4557`.
 9. **`companion::refresh_if_stale` is Windows-only** and nothing reports the
    companion's version to the server, so "Update all" cannot tell anyone the
    desktop stayed behind. — `agents/roomlerd/src/companion.rs:115`
-10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:494`, at master `5c5a70767`),
+10. **`roomler-desktop` is not shipped for Linux at all** (`scripts/install.sh:530`, at master `5c5a70767`),
     although it already *compiles* there — `cargo clippy --workspace` installs
     webkit2gtk and walks the crate. This is packaging, not porting.
     — `.github/workflows/ci.yml:334`
@@ -117,7 +119,7 @@ Every line below was read on `origin/master` at `861d4557`.
 11. **"Being viewed by X + Disconnect" is Windows-only**, gated on
     `all(target_os = "windows", feature = "viewer-indicator")`, with a no-op
     `Inner` on every other OS — and `viewer-indicator` is only in the `full-hw`
-    set, so the Linux and macOS release lines (`release-agent.yml:400, 621, 1922`)
+    set, so the Linux and macOS release lines (`release-agent.yml:400, 621, 1919`)
     build plain `full`. There is also no LocalAPI verb for live RC sessions, so
     no thin client can render a banner or offer a Disconnect.
 
@@ -163,10 +165,10 @@ Two things make the native backends much cheaper than they look, both verified
 against `Cargo.lock`: **`x11rb 0.13.2`, `objc2 0.6.4` and `objc2-app-kit 0.3.2`
 are already locked** (via enigo/arboard and tauri), so neither adds a new
 dependency tree; and the macOS daemon **already ships as an `.app` with
-`LSUIElement=true`** (`release-agent.yml:2542`), the bundle identity AppKit
+`LSUIElement=true`** (`release-agent.yml:2648`), the bundle identity AppKit
 windows require.
 
-⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:741`
+⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:764`
 is `#[tokio::main]`, so the main thread is parked in `block_on` for the daemon's
 whole life — the main dispatch queue never drains and AppKit can never deliver a
 click to an Approve button. The macOS arm has to build the runtime explicitly, run
@@ -291,9 +293,9 @@ started themselves).
 | | What | Where |
 |---|---|---|
 | where | `/run/user/<uid>/roomler.sock`: the person's own `$XDG_RUNTIME_DIR/roomler.sock`, the path their companion and CLI ALREADY try first, so neither changes | `localapi::person_socket_path` |
-| whose | the user of the **active** graphical session on the seat, by the same `loginctl` walk the companion launch uses. Never the display manager's greeter, never a user switched away in the background (who must not answer consent for a view of someone else's desktop), never root (root uses the daemon's own socket). It moves when that person changes | `roomlerd::person_socket` (`step`, every 4 s) |
+| whose | the person signed in at the machine's own screen: logind's `ActiveSession` on `seat0`, when that session is a person's (since #2871's review, 2026-10-26; until then the user of the first **active** graphical session anywhere, by the companion launch's `loginctl` walk, which a remote login could be, logind calling every seatless session active). Never the display manager's greeter, never a user switched away in the background (who must not answer consent for a view of someone else's desktop), never a remote login, never root (root uses the daemon's own socket). It moves when that person changes | `roomlerd::person_socket` (`step`, every 4 s), `companion::seat0_uid` |
 | who may connect | the socket is MADE AS the person: bind and chmod 0600 run on a thread switched to their filesystem ids (`setfsuid`/`setfsgid`), so it is born theirs. ⚠️ Not a root bind followed by a chown: they own the dir, so they could swap the path to a symlink in between, and `chown` follows it (to `/etc/shadow`, say). Caught in self-review before merge. Each connection's `SO_PEERCRED` uid must be theirs or root | `bind_as_person`, `person_peer_ok` |
-| what it serves | `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`, `ConsentDecide` and `RecordStatus`, and nothing else. Anything else is answered with a pointer to `sudo roomler …`. The match is **exhaustive with no `_` arm**, so a verb added later must be placed by hand | `localapi::person_may`, `Scope::Person` |
+| what it serves | `Status`, `RcSessions`, `RcDisconnect`, `ConsentPending`, `ConsentDecide` and `RecordStatus`, and nothing else. Anything else is answered with a pointer to `sudo roomler …`. The match is **exhaustive with no `_` arm**, so a verb added later must be placed by hand. (Placed later: keep busy, FR-92; `Devices`, `Mesh`, `Peers`, FR-97 P2g/P2h; the recording verbs, FR-85 P2e; and, by #2871's design A on 2026-10-25, `ConfigGet` and `ConfigSet` of the console person's own keys, `CONSOLE_PERSON_KEYS` — never the device-owned gates, nor `record_dir`) | `localapi::person_may`, `Scope::Person` |
 | what it never does | replace a LIVE socket at the path (a per-user daemon of that person owns it); remove a non-socket file; create the runtime dir (logind's); remove anything but the inode it bound | `serve_person_socket` |
 
 The root-only `/var/run/roomler` socket is **unchanged**. A per-user daemon starts no
@@ -315,7 +317,7 @@ in place of `Permission denied (os error 13)` for everything else.
 | 0 | FR + issue + ledger | n/a | **done** — the FR-24 collision was already repaired on master by #850 |
 | 1 | Consent correctness — owner override, local floor, timeout≠deny, `prompt_then_email`, `.pending` for exec+ssh, `roomlerd consent ls` | `prompt_owner` defaults to today's behaviour; the floor only tightens | **implemented** — timeout≠deny and `prompt_then_email` field-verified on 0.4.16, `.pending` for exec+ssh on 0.4.18, **the local floor on 2026-09-25** (AC4, WSL node, 0.4.102); `prompt_owner` still needs an owner-account run |
 | 2 | Desktop companion — one tray with an icon, daemon-path resolution, update-output surfacing, version honesty, `ensure_running()` | each item independent; no wire change | **implemented** (version honesty deferred to a follow-up) — field pending |
-| 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac. *FR-97 P2b (2026-10-21) ran that procedure on a tart Mac (both halves, a viewer from outside): the native panel came up, Approve connected and Deny declined, so the feature is in the macOS release set (`.github/workflows/release-agent.yml:2783`); the field Mac and a release follow* |
+| 3 | `PromptSurface` — 3.0 selection layer, 3.1 native Windows consent panel, 3.2 Tauri companion panels, 3.3 native X11, 3.4 native macOS | per-backend cargo feature; probe failure falls back to the companion | **all implemented** — field pending. ⚠️ `viewer-indicator-macos` is compiled by CI but deliberately **NOT in the macOS release feature set**: it moves tokio off the main thread, i.e. changes how every Mac agent STARTS, and macOS updates are owned by the root helper — a daemon that fails to start cannot pull its own fix. Enable only after a dispatch artifact runs on a real Mac. *FR-97 P2b (2026-10-21) ran that procedure on a tart Mac (both halves, a viewer from outside): the native panel came up, Approve connected and Deny declined, so the feature is in the macOS release set (`.github/workflows/release-agent.yml:2877`); the field Mac and a release follow* |
 | 4 | Linux packaging — a **separate** `roomler-desktop` .deb | absent package = today's behaviour | **implemented** — field pending |
 | 5 | Input arbitration — mode re-seed, visible floor requests, single-viewer rail, deterministic handover | none needed (bug fixes) | **implemented** — field pending |
 | 6 | Field test on the GROX fleet | n/a | **partly done, 2026-08-29 on 0.4.16** — the Windows native panel is verified end to end and the field log below lists exactly what is not. The test itself found 3 defects (#877), one of which froze the whole pre-0.4.16 Linux fleet |
@@ -652,16 +654,19 @@ arches.
 
 ### 2026-09-25 — AC4 on the WSL node: the local floor holds against a server `auto`
 
+Its anchors name the code of that day: the agent's at `agent-v0.4.102`, the build under test,
+and the server's at master `00d4cf7e1`.
+
 Device **NEO16-WSL** (display name; Linux, the root `roomlerd.service` unit,
 virtual desktop, no companion), API `0.4.101`. The controller is the device's
 **owner**, so `resolve_session_authz`
-(`crates/modules/remote/src/controller.rs:448`) resolves `auto` by the owner
+(`crates/modules/remote/src/controller.rs:436`) resolves `auto` by the owner
 shortcut; the device's server policy was additionally set to `consent_mode =
 auto` for the run (as found: unset) so the directive did not rest on the
 shortcut alone. Nothing in the consent code differs between the two agent
 builds below (`git log agent-v0.4.101..agent-v0.4.102` touches no consent
 file), and the hub sends `consent_timeout_secs = host_prompt_timeout_secs =
-300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:1058`,
+300` for `auto` and `prompt` alike (`crates/modules/fleet/src/hub.rs:888`,
 `crates/remote_control/src/consent.rs:115`).
 
 | | control (as found) | with the floor | restored |
@@ -688,10 +693,10 @@ The floor run, verbatim from the daemon (UTC; hostname prefix stripped):
 
 The attribution is in the two windows. The device's own mode is `Prompt {
 timeout: 30s }` (line 1 prints `consent_broker.mode()`,
-`agents/roomlerd/src/signaling.rs:2562`), yet the prompt stood for **300 s** —
+`agents/roomlerd/src/signaling.rs:2302`), yet the prompt stood for **300 s** —
 the server's window — which is exactly the shape `strictest_of`
 (`agents/roomlerd/src/consent.rs:136`) produces when it downgrades an `auto`
-directive: `Prompt { timeout: host_window }` (`signaling.rs:2526`). The control
+directive: `Prompt { timeout: host_window }` (`signaling.rs:2352`). The control
 run pins the other half: same account, device and policy, only the local
 setting differs, and it auto-granted (`decision=Granted effective_mode=AutoGrant`,
 1.5 ms after the request). Meanwhile `roomlerd consent --list` on the device

@@ -158,7 +158,7 @@ The on-screen test is an `IntersectionObserver` in `VideoTile.vue`, created in `
 (`ui/src/components/conference/VideoTile.vue:454`, `:465-473`), with the scrolling strip as its root, emitting
 `visible: [streamKey, boolean, w, h]` the way `picture-black` is emitted (`:221`) and forwarded by every layout
 (`TiledLayout.vue:22`, `SpotlightLayout.vue:24`, `SidebarLayout.vue:24`) to the view
-(`ui/src/views/conference/ConferenceView.vue:97-104`, next to `handlePictureBlack`, `:418-420`). The store turns stream
+(`ui/src/views/conference/ConferenceView.vue:97-104`, next to `handlePictureBlack`, `:426-428`). The store turns stream
 keys into video producer ids (it has them from `media:new_producer`, and `consumerStreamKey` maps the other way,
 `conference.ts:366-367`) and sends `media:view`. A tile that is rendered but whose owner paused the camera (FR-30) stays
 in the set: the producer is paused anyway, and the moment the owner resumes, the tile shows. A screen share is always

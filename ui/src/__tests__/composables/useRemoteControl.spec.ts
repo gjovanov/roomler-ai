@@ -159,6 +159,9 @@ import {
   COLORSPACE_STORAGE_KEY,
   storedDecodeRecover,
   DECODE_RECOVER_STORAGE_KEY,
+  storedDcWorker,
+  DC_WORKER_STORAGE_KEY,
+  DC_WORKER_DEFAULT,
   mediaAdvanced,
   storedCtxMode,
   storedPerFrameMsg,
@@ -174,7 +177,11 @@ import {
   DEFAULT_RC_METRICS,
   storedSharpness,
   HEVC_REXT_CODEC_STRING,
+  HEVC_MAIN_CODEC_STRING,
+  H264_DC_CODEC_CANDIDATES,
+  isHevcDecodeSupported,
   translateModifierForHost,
+  translateModsForHost,
   type AutoTransportInputs,
   type KeyDecision,
   type RcCodecChoice,
@@ -196,8 +203,7 @@ import {
 } from '@/workers/rc-fsr-render'
 import { codecMimeForShort } from '@/workers/rc-webcodecs-worker'
 import { RC_DECODER_COLOR_SPACE, rcDecoderConfig } from '@/workers/rc-decoder-config'
-import { parseFrameHeader, isKeyframe, shouldDecodeFrame } from '@/workers/rc-vp9-444-worker'
-import { shouldDecodeFrame as shouldDecodeFrameHevc, classifyCrop } from '@/workers/rc-hevc-worker'
+import { parseFrameHeader, isKeyframe, shouldDecodeFrame, classifyCrop } from '@/workers/rc-dc-worker'
 import {
   HopStats,
   StruggleWindow,
@@ -1920,7 +1926,7 @@ describe('codecFromSdp', () => {
   })
 })
 
-describe('rc-vp9-444-worker frame header', () => {
+describe('rc-dc-worker frame header', () => {
   // Lock the wire format so any change to the agent-side encoder
   // emit gets caught here. Schema: u32 size LE + u8 flags + u64 ts LE.
 
@@ -1978,10 +1984,10 @@ describe('leading-delta keyframe gate (rc.103)', () => {
   // throws "A key frame is required after configure() or flush()" on a
   // leading delta, and the FFmpeg async encoder can ship a buffered delta
   // ahead of the DC-open IDR. The worker must DROP deltas until the first
-  // keyframe, then decode everything.
+  // keyframe, then decode everything. One worker serves every codec since
+  // FR-135 R3, so one gate.
   for (const [label, gate] of [
-    ['vp9-444', shouldDecodeFrame],
-    ['hevc', shouldDecodeFrameHevc],
+    ['rc-dc-worker', shouldDecodeFrame],
   ] as const) {
     describe(label, () => {
       it('drops a leading delta before any keyframe is seen', () => {
@@ -2019,7 +2025,7 @@ describe('leading-delta keyframe gate (rc.103)', () => {
   }
 })
 
-describe('classifyCrop — HEVC conformance-window handling', () => {
+describe('classifyCrop — conformance-window handling, every codec since FR-135 R3', () => {
   // Locks the WINHOST-F fix: QSV codes a 1920×1080 desktop as
   // 1920×1088 + an 8-row bottom crop (alignment padding = per-frame junk).
   // The NVDEC-bug rewrap (rc.102) must NOT override that legit crop — doing
@@ -4114,6 +4120,97 @@ describe('decodeStatWireMessage (rc.188 viewer-rate feedback)', () => {
   })
 })
 
+describe('decodeStatWireMessage — FR-135 R0, the worker’s window for the agent', () => {
+  const hist = (bucket: number, n = 1) => Array.from({ length: 12 }, (_, i) => (i === bucket ? n : 0))
+  const window = {
+    dec: hist(3, 50),
+    paint: hist(0, 60),
+    fwd: hist(0, 61),
+    backlog: hist(1, 59),
+    arrGap: hist(4, 58),
+    gate: hist(8),
+    chunkGaps: 2,
+    freezes: 1,
+    painted: 1_234,
+    decoderHw: true,
+  }
+  const NEW_KEYS = [
+    'dec_ms',
+    'paint_ms',
+    'fwd_ms',
+    'backlog_ms',
+    'arr_gap_ms',
+    'gate_ms',
+    'chunk_gaps',
+    'freezes',
+    'painted',
+    'decoder_hw',
+  ]
+  const link = { rxBps: 395_122, queueMs: 240 }
+  const age = { avgMs: 123.4, minMs: 61.8 }
+
+  it('carries every field the worker counted, in the wire’s names', () => {
+    const m = decodeStatWireMessage(30, false, age, 12, link, { avgMs: 100 }, window)
+    expect(m).toMatchObject({
+      dec_ms: hist(3, 50),
+      paint_ms: hist(0, 60),
+      fwd_ms: hist(0, 61),
+      backlog_ms: hist(1, 59),
+      arr_gap_ms: hist(4, 58),
+      gate_ms: hist(8),
+      chunk_gaps: 2,
+      freezes: 1,
+      painted: 1_234,
+      decoder_hw: true,
+    })
+    expect(decodeStatWireMessage(30, false, null, null, null, null, { ...window, decoderHw: false }).decoder_hw).toBe(
+      false,
+    )
+  })
+
+  it('leaves every field it carried before exactly as it was, queue_ms and fps included', () => {
+    // FR-63's shadow and the live law read these; the window only adds keys.
+    const before = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 100 })
+    const after = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 100 }, window)
+    for (const [k, v] of Object.entries(before)) expect(after[k], k).toEqual(v)
+    expect(Object.keys(after).filter((k) => !(k in before)).sort()).toEqual([...NEW_KEYS].sort())
+  })
+
+  it('sends none of them from an older worker, or a window that is not one', () => {
+    for (const media of [undefined, null]) {
+      const m = decodeStatWireMessage(30, false, null, null, null, null, media)
+      for (const k of NEW_KEYS) expect(k in m, k).toBe(false)
+    }
+  })
+
+  it('drops a field it cannot read, and keeps the rest: absent is not counted, never zero', () => {
+    const m = decodeStatWireMessage(30, false, null, null, null, null, {
+      ...window,
+      dec: hist(3).slice(0, 11), // too short
+      paint: [...hist(0).slice(0, 11), -1], // a negative count
+      fwd: [...hist(0).slice(0, 11), 1.5], // not a count
+      chunkGaps: -1,
+      freezes: Number.NaN,
+      painted: undefined,
+      decoderHw: null, // the browser did not say
+    })
+    for (const k of ['dec_ms', 'paint_ms', 'fwd_ms', 'chunk_gaps', 'freezes', 'painted', 'decoder_hw']) {
+      expect(k in m, k).toBe(false)
+    }
+    expect(m.backlog_ms).toEqual(hist(1, 59))
+    expect(m.gate_ms).toEqual(hist(8))
+    // A zero the worker measured is sent as a zero.
+    const zero = decodeStatWireMessage(30, false, null, null, null, null, { ...window, freezes: 0, gate: hist(0, 0) })
+    expect(zero.freezes).toBe(0)
+    expect(zero.gate_ms).toEqual(hist(0, 0))
+  })
+
+  it('clamps a bucket into the u32 the agent reads it as', () => {
+    const m = decodeStatWireMessage(30, false, null, null, null, null, { ...window, gate: hist(2, 2 ** 40) })
+    expect((m.gate_ms as number[])[2]).toBe(4_294_967_295)
+  })
+})
+
 describe('decodeErrorWireMessage (FR-132 P1, decode errors counted)', () => {
   it('names the stage the agent matches by equality, for every worker error type', () => {
     expect(decodeErrorStage('decoder-configure-error')).toBe('configure')
@@ -4316,10 +4413,44 @@ describe('per-agent codec override (2026-07-28)', () => {
 })
 
 describe('P7 — HEVC Rext 4:4:4 codec string', () => {
-  it('locks the Rext profile fields alongside the Main-profile default', () => {
-    // Same Annex-B no-description contract as the worker's default
-    // hev1.1.6.L153.B0; profile_idc 4 + the Rext compat flag + Level 5.1.
+  it('locks the Rext profile fields alongside the Main-profile string', () => {
+    // Same Annex-B no-description contract as HEVC_MAIN_CODEC_STRING
+    // (hev1.1.6.L153.B0); profile_idc 4 + the Rext compat flag + Level 5.1.
     expect(HEVC_REXT_CODEC_STRING).toBe('hev1.4.10.L153.B0')
+  })
+})
+
+describe('FR-135 R3 — the codec strings the one data-channel worker is given', () => {
+  it('names HEVC Main at Level 5.1, the HEVC worker default it replaces (rc.94)', () => {
+    expect(HEVC_MAIN_CODEC_STRING).toBe('hev1.1.6.L153.B0')
+  })
+
+  it('probes HEVC at the string the worker then configures', async () => {
+    const asked: string[] = []
+    vi.stubGlobal('VideoDecoder', {
+      isConfigSupported: async (cfg: { codec: string }) => {
+        asked.push(cfg.codec)
+        return { supported: true }
+      },
+    })
+    try {
+      expect(await isHevcDecodeSupported()).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+    expect(asked).toEqual([HEVC_MAIN_CODEC_STRING])
+  })
+
+  it('agrees with the worker specs’ codec list', async () => {
+    const { DC_CODECS } = await import('../workers/dcCodecs')
+    expect(DC_CODECS.map((c) => c.codec)).toEqual([
+      'vp09.01.10.08',
+      'vp09.00.10.08',
+      AV1_CODEC_STRING,
+      H264_DC_CODEC_CANDIDATES[0],
+      HEVC_MAIN_CODEC_STRING,
+      HEVC_REXT_CODEC_STRING,
+    ])
   })
 })
 
@@ -5875,6 +6006,70 @@ describe('S3 resilience: sessionGateAllows', () => {
   })
 })
 
+describe('FR-135 R3 — the switch that moves the video channel into the worker', () => {
+  afterEach(() => {
+    localStorage.removeItem(DC_WORKER_STORAGE_KEY)
+  })
+
+  it('is the key the spec names, and ships off', () => {
+    expect(DC_WORKER_STORAGE_KEY).toBe('roomler-rc-dc-worker')
+    // S11 decides the default; until then the transfer is opt-in.
+    expect(DC_WORKER_DEFAULT).toBe(false)
+  })
+
+  it('is on at 1, off at 0, and the default otherwise', () => {
+    expect(storedDcWorker(), 'absent').toBe(DC_WORKER_DEFAULT)
+    for (const raw of ['1', ' 1 ']) {
+      localStorage.setItem(DC_WORKER_STORAGE_KEY, raw)
+      expect(storedDcWorker(), raw).toBe(true)
+    }
+    for (const raw of ['0', ' 0 ']) {
+      localStorage.setItem(DC_WORKER_STORAGE_KEY, raw)
+      expect(storedDcWorker(), raw).toBe(false)
+    }
+    for (const raw of ['', 'on', 'true', 'yes', '2']) {
+      localStorage.setItem(DC_WORKER_STORAGE_KEY, raw)
+      expect(storedDcWorker(), raw).toBe(DC_WORKER_DEFAULT)
+    }
+  })
+
+  it('is the default when storage cannot be read', () => {
+    const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new Error('denied')
+    })
+    expect(storedDcWorker()).toBe(DC_WORKER_DEFAULT)
+    spy.mockRestore()
+  })
+})
+
+describe('FR-135 R3 — the queue read at arrival, beside queue_ms', () => {
+  const link = { rxBps: 8_000_000, queueMs: 40 }
+
+  it('rides as queue_arr_ms when the worker counted it, clamped and rounded like queue_ms', () => {
+    expect(decodeStatWireMessage(60, false, null, null, link, null, null, 0).queue_arr_ms).toBe(0)
+    expect(decodeStatWireMessage(60, false, null, null, link, null, null, -12.6).queue_arr_ms).toBe(-13)
+    expect(decodeStatWireMessage(60, false, null, null, null, null, null, 7).queue_arr_ms).toBe(7)
+    expect(decodeStatWireMessage(60, false, null, null, null, null, null, 99_999).queue_arr_ms).toBe(32767)
+    expect(decodeStatWireMessage(60, false, null, null, null, null, null, -99_999).queue_arr_ms).toBe(-32768)
+  })
+
+  it('is absent when the worker did not count it: absent is not counted, never zero', () => {
+    for (const v of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect('queue_arr_ms' in decodeStatWireMessage(60, false, null, null, link, null, null, v), String(v)).toBe(false)
+    }
+  })
+
+  it('leaves every key it sent before as it was, queue_ms included', () => {
+    // The live law and FR-63's shadow read queue_ms; R3 only adds a key.
+    const age = { avgMs: 80, minMs: 40 }
+    const before = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 60 })
+    const after = decodeStatWireMessage(58.7, true, age, 12, link, { avgMs: 60 }, null, -3)
+    for (const [k, v] of Object.entries(before)) expect(after[k], k).toEqual(v)
+    expect(Object.keys(after).filter((k) => !(k in before))).toEqual(['queue_arr_ms'])
+    expect(after.queue_ms).toBe(40)
+  })
+})
+
 describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
   afterEach(() => {
     localStorage.removeItem(DECODE_RECOVER_STORAGE_KEY)
@@ -5912,13 +6107,11 @@ describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
     })
   })
 
-  const at = (rtpBytes: number, vp9Frames = 0, hevcFrames = 0) => ({ rtpBytes, vp9Frames, hevcFrames })
+  const at = (rtpBytes: number, dcFrames = 0) => ({ rtpBytes, dcFrames })
 
   it('counts frames on a data-channel session, and RTP bytes no longer hold off the re-create', () => {
     expect(mediaAdvanced(at(0, 10), at(0, 11), true)).toBe(true)
-    expect(mediaAdvanced(at(0, 0, 10), at(0, 0, 11), true)).toBe(true)
     expect(mediaAdvanced(at(100, 10), at(200, 10), true)).toBe(false)
-    expect(mediaAdvanced(at(100, 0, 10), at(200, 0, 10), true)).toBe(false)
   })
 
   it('still counts RTP bytes before a first data-channel frame: an agent that ignores the channel sends RTP', () => {
@@ -5927,7 +6120,7 @@ describe('FR-135 R1 — the kill switch and what the watchdog counts', () => {
   })
 
   it('judges a <video> fallback on RTP again once the path is down', () => {
-    // stopVp9_444Path zeroes the counter.
+    // stopDcPath zeroes the counter.
     expect(mediaAdvanced(at(100, 10), at(200, 0), true)).toBe(true)
     expect(mediaAdvanced(at(100, 10), at(100, 0), true)).toBe(false)
   })
@@ -6492,6 +6685,19 @@ describe('P7 — FSR localStorage knobs', () => {
 })
 
 // ─── FR-13 (#789): mac-host Ctrl→Cmd translation ─────────────────────────
+
+describe('translateModsForHost (#3046: a sticky Ctrl has no key of its own to rewrite)', () => {
+  it('turns the Ctrl bit into the Meta bit on a Mac host, keeping the others', () => {
+    expect(translateModsForHost(0x01, true)).toBe(0x08)
+    expect(translateModsForHost(0x01 | 0x04, true)).toBe(0x08 | 0x04)
+    expect(translateModsForHost(0x08, true)).toBe(0x08)
+    expect(translateModsForHost(0, true)).toBe(0)
+  })
+  it('changes nothing with the substitution off: another host, or a literal Ctrl', () => {
+    expect(translateModsForHost(0x01, false)).toBe(0x01)
+    expect(translateModsForHost(0x01 | 0x02, false)).toBe(0x01 | 0x02)
+  })
+})
 
 describe('translateModifierForHost (FR-13 mac Ctrl→Cmd)', () => {
   it('rewrites left/right Control to LeftGui when enabled', () => {

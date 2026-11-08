@@ -27,6 +27,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 | B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
+| B4 | FR-62's A4, moved here 2026-11-05: retire the IDR-rationing heuristics through the registry, per backend. NVENC only, while every other backend rebuilds with an IDR on every move (AC7) | none of their own: each deletion PR cites its row's precondition in [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) | not started; after B2 plus one release soak |
 
 **B-opener** was not in the original plan; it was added because the field
 evidence on #1243 showed the opener over-driving from *both* directions on
@@ -40,7 +41,7 @@ commitment — a proven floor (FR-59 P8's remembered-slow-pair open) still wins.
 ### The constrained cell (why this was blocked, and now is not)
 
 `constrained` is measured from the nominated ICE pair
-(`detect_constrained_transport`, `peer.rs:1500`), so the constrained posture
+(`detect_constrained_transport`, `peer.rs:1511`), so the constrained posture
 exists only on a path that actually relays. Field-measured 2026-09-03:
 CORPLAP-1 on 0.4.55 took a **direct** pair (`tgt=12096000`, `c=false`, paint
 age 11-42 ms), so slow-start could not engage and the A/B could not run —
@@ -392,6 +393,7 @@ checkout it runs from.
 - [ ] AC4 — FR-59 AC4 (< 600 ms sustained on the airport-class link) closes here.
 - [ ] AC5 — The eight replaced estimators and their six switches are deleted; `ratectl = off` restores the prior behaviour for one release.
 - [x] AC6 — **docs.** `docs/rate-control.md` documents the shadow controller — its state machine (mermaid), the six `shadow_*` heartbeat fields, the `ROOMLERD_RATECTL` kill switch and the containment property — and `docs/README.md`'s rate-control row names it. (FR-63's issue opened after the docs-before-close rule reached master, so it carries this criterion; ticked with the docs shipped in the B1 PR.)
+- [ ] AC7 — Every IDR-rationing heuristic FR-62's A4 named is retired through the registry table with its evidence, per backend (B4). Moved from FR-62's AC4 on 2026-11-05. While QSV, VideoToolbox, AMF, D3D12 and Vulkan rebuild with an IDR on every move ([FR-62](FR-62-encoder-rate-changes-without-an-idr.md) AC1), a retirement covers NVENC only.
 
 ## The ramp-exit rule — measured, not argued
 
@@ -532,7 +534,7 @@ either — which is the number B1 has to beat.
   | number | why | how firm |
   |---|---|---|
   | a gate on the spend | a bar over all clean windows has no power: B1 scores 96 %, a pinned shadow 93 % | measured, one host |
-  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:292-297`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
+  | 2 Mbps direct | the direct floor is 1.5-4 M (`encode/mod.rs:300-305`), so most lower spend cannot be capped at all; 186 of that host's 200 clean windows sit under it | measured, one host |
   | 0.5 Mbps constrained | the constrained floor is 200 k against a ~3 M nominal cap | **not measured**: no real constrained line was read. Check it against the fleet table first |
   | ×1.25 | a small excess can be overshoot. The result does not hang on it: B1 at ≥ 2 Mbps is 43 % over by more than this, 57 % over at all | judgement |
   | 90 %, ≥ 20 sessions | mirror the existing bar, so no new number to defend | judgement |

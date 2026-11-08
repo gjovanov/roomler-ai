@@ -61,11 +61,12 @@ pub struct MessageResponse {
     pub room_id: String,
     pub author_id: String,
     pub author_name: String,
-    /// FR-90 — `user` | `bot` | …: a client renders an agent's turn stub
-    /// differently from a person's message, and must not offer to DM a bot.
+    /// FR-90 — `user` | `bot` | …: a client renders a `bot` message (a
+    /// parked agent session's turn stub, FR-137) differently from a person's,
+    /// and must not offer to DM a bot.
     pub author_type: &'static str,
-    /// FR-90 — what owns this message's meaning (a turn stub's session), if
-    /// anything. Chat never interprets it.
+    /// FR-90 — what owns this message's meaning, if anything: a stored turn
+    /// stub keeps its parked session's. Chat never interprets it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<roomler_ai_db::models::Binding>,
     pub content: String,

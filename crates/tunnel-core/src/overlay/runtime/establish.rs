@@ -19,6 +19,14 @@ use super::*;
 const REINIT_WINDOW: Duration = Duration::from_secs(60);
 const REINIT_PRESSURE_MIN: u32 = 5;
 
+/// #3530 — how quiet an established carrier, direct or relay, gets while the
+/// runtime runs: the peer's WireGuard keepalive (25 s, `wg::KEEPALIVE_SECS`)
+/// and two sweep ticks, the granularity of `last_rx_at`. An rx-stale silence
+/// that the last tick's lateness (the runtime's `tick_late_ms`) covers but for
+/// this slack is the agent's own pause ([`crate::frozen::did_not_run_for`]).
+/// Wording only.
+const CARRIER_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(25 + 2 * FALLBACK_TICK.as_secs());
+
 /// #2820 — the `/derp` probe's handshake leaves this long after its nudge, so
 /// a peer that follows us onto `/derp` on hearing the nudge (its demote-follow
 /// runs on its own event loop, in milliseconds) has registered its DERP
@@ -594,6 +602,11 @@ impl OverlayRuntime {
                 }
             }
         }
+        // #3530 — how late the last sweep tick came (a net-change sweep reads
+        // the value of the tick before it): for that long the whole process
+        // did not run. It words the rx-stale lines below, and nothing else.
+        let tick_late =
+            Duration::from_millis(self.tick_late_ms.load(std::sync::atomic::Ordering::Relaxed));
         for (nid, tier, reason) in dead {
             let Some(e) = by_node.remove(&nid) else {
                 continue;
@@ -667,10 +680,27 @@ impl OverlayRuntime {
                     // once the cooldown clears; the fail count usually clears on
                     // the first receiving sweep after that, so a one-off death
                     // doesn't march toward the sticky pin.
-                    warn!(
-                        peer = %nid, tier = tier_name,
-                        "overlay: established direct carrier went silent (no keepalive within the rx-stale deadline — peer roamed / NAT rebind / path died) — rebuilding via relay"
-                    );
+                    //
+                    // #3530 — after a freeze the silence is the agent's own,
+                    // as on the relay line below. Only the sentence changes:
+                    // the strike, the penalty and the rebuild stay as they are.
+                    let silent = now.saturating_duration_since(e.last_rx_at);
+                    match crate::frozen::did_not_run_for(
+                        silent,
+                        tick_late,
+                        CARRIER_QUIET_WHILE_RUNNING,
+                    ) {
+                        Some(paused) => warn!(
+                            peer = %nid, tier = tier_name,
+                            silent_s = silent.as_secs(), paused_s = paused.as_secs(),
+                            "overlay: established direct carrier went silent while this agent did not run for ~{} s (frozen or suspended): the silence is its own, not the path's — rebuilding via relay",
+                            paused.as_secs()
+                        ),
+                        None => warn!(
+                            peer = %nid, tier = tier_name,
+                            "overlay: established direct carrier went silent (no keepalive within the rx-stale deadline — peer roamed / NAT rebind / path died) — rebuilding via relay"
+                        ),
+                    }
                 } else {
                     warn!(
                         peer = %nid, tier = tier_name,
@@ -733,10 +763,27 @@ impl OverlayRuntime {
                     } else {
                         "coturn allocation dropped?"
                     };
-                    warn!(
-                        peer = %nid, kind = ?e.relay_kind,
-                        "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — {cause}) — {rebuild}"
-                    );
+                    // #3530 — after a freeze the silence is the agent's own:
+                    // the tick that found it came late by about as long. The
+                    // verdict and the rebuild stay as they are; only the
+                    // sentence changes.
+                    let silent = now.saturating_duration_since(e.last_rx_at);
+                    match crate::frozen::did_not_run_for(
+                        silent,
+                        tick_late,
+                        CARRIER_QUIET_WHILE_RUNNING,
+                    ) {
+                        Some(paused) => warn!(
+                            peer = %nid, kind = ?e.relay_kind,
+                            silent_s = silent.as_secs(), paused_s = paused.as_secs(),
+                            "overlay: relay carrier went silent while this agent did not run for ~{} s (frozen or suspended): the silence is its own, not the relay's — {rebuild}",
+                            paused.as_secs()
+                        ),
+                        None => warn!(
+                            peer = %nid, kind = ?e.relay_kind,
+                            "overlay: relay carrier went silent (no keepalive within the rx-stale deadline — {cause}) — {rebuild}"
+                        ),
+                    }
                 } else {
                     // #28 — the one-way class is where the wrong sentence hurt
                     // most, because on DERP it has a completely different
@@ -3368,5 +3415,58 @@ mod tests {
             CandidateRotation::default(),
         );
         assert!(off_link.lan.is_none());
+    }
+
+    /// #3530 — the slack covers every rx-stale silence a freeze makes, on both
+    /// tiers' deadlines. The model: the last sweep tick before the freeze runs
+    /// at 0 s, and the last sweep that heard the peer at −h s. The peer sends at
+    /// least once per keepalive, so h stays under one keepalive period; the
+    /// walk takes it a tick past that. The freeze begins φ s after the tick and
+    /// lasts F s. The tick after the thaw then comes back φ + F − tick late,
+    /// to a silence of h + φ + F, so the silence outruns the lateness by
+    /// h + tick at most.
+    #[test]
+    fn the_carrier_slack_covers_every_silence_a_freeze_makes() {
+        use crate::frozen::{LATE_MIN, did_not_run_for};
+        use crate::overlay::lifecycle::{DIRECT_RX_STALE_DEADLINE, RELAY_RX_STALE_DEADLINE};
+        const KEEPALIVE: Duration = Duration::from_secs(25); // wg::KEEPALIVE_SECS
+        let tick = FALLBACK_TICK;
+        for deadline in [DIRECT_RX_STALE_DEADLINE, RELAY_RX_STALE_DEADLINE] {
+            let mut convicted = 0u32;
+            for h in (0..=(KEEPALIVE + tick).as_secs()).map(Duration::from_secs) {
+                for phi in (0..tick.as_millis() as u64)
+                    .step_by(250)
+                    .map(Duration::from_millis)
+                {
+                    for f in (0..=600).map(Duration::from_secs) {
+                        // A freeze that ends before the tick is due leaves it on time.
+                        let (late, silent) = if phi + f <= tick {
+                            (Duration::ZERO, h + tick)
+                        } else {
+                            (phi + f - tick, h + phi + f)
+                        };
+                        if silent <= deadline {
+                            continue; // the carrier is not convicted
+                        }
+                        convicted += 1;
+                        assert!(late >= LATE_MIN, "h={h:?} phi={phi:?} f={f:?}");
+                        assert_eq!(
+                            did_not_run_for(silent, late, CARRIER_QUIET_WHILE_RUNNING),
+                            Some(late),
+                            "deadline={deadline:?} h={h:?} phi={phi:?} f={f:?}: the pause made this silence"
+                        );
+                    }
+                }
+            }
+            assert!(convicted > 0, "the walk reaches {deadline:?}");
+            // A carrier that went silent while the agent ran was found by a
+            // tick on time, whatever the silence: today's verdict stands.
+            for silent in [deadline + Duration::from_secs(1), deadline * 10] {
+                assert_eq!(
+                    did_not_run_for(silent, Duration::ZERO, CARRIER_QUIET_WHILE_RUNNING),
+                    None
+                );
+            }
+        }
     }
 }

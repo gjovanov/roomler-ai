@@ -89,6 +89,8 @@ pub mod removal;
 pub mod setup_diagnostics;
 pub mod setup_release;
 pub mod socket;
+/// #3517 — how an agent socket ended, for its disconnect line.
+pub(crate) mod socket_end;
 pub mod tenant_hooks;
 pub mod tunnel_release;
 

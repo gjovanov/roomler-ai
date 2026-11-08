@@ -182,9 +182,7 @@ pub async fn list_members(
 /// (409 — ownership transfer is a different operation); removing YOURSELF is
 /// allowed and simply means leaving. Room-membership rows are left in place:
 /// tenant `is_member` is the access gate on every read/write path, so a
-/// removed user loses access structurally. What a pillar RUNS for the member
-/// is different — it would outlive the access check — so every holder's
-/// `member_removed` hook runs first (FR-90: their agent sessions end).
+/// removed user loses access structurally.
 pub async fn remove_member(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -217,17 +215,6 @@ pub async fn remove_member(
             "The organization owner cannot be removed".to_string(),
         ));
     }
-
-    // The holders first, in HOOK_ORDER — FR-90: `hive` ends the member's
-    // agent sessions on the org's devices. BEFORE the membership row goes, so
-    // a failure refuses the removal rather than leaving sessions running for
-    // someone a retry would then find already gone.
-    state
-        .core
-        .hooks
-        .member_removed(tid, target)
-        .await
-        .map_err(|e| ApiError::Internal(format!("member removal cascade: {e}")))?;
 
     let removed = state.tenants.remove_member(tid, target).await?;
     if !removed {

@@ -6,11 +6,13 @@
 //! refuses an ask above it (`refresh`), a rate class is keyed on it, and the
 //! viewer's picker greys the rates above it. Each backend reads it once, at its
 //! open, for the display it captures. A backend that cannot read it answers
-//! `None`, which decides nothing: a trial then finds out.
+//! `None`, which decides nothing: a trial then finds out. Every backend answers
+//! for itself: `ScreenCapture::refresh_hz` has no default.
 //!
 //! | OS | Read from |
 //! |---|---|
 //! | Windows | `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` → `dmDisplayFrequency`, for the captured monitor's device |
+//! | Windows, SYSTEM context | the same call for the primary display, on the capture thread once it is on `WinSta0` and bound to the input desktop |
 //! | macOS | `CGDisplayModeGetRefreshRate` of the main display's current mode |
 //! | Linux, X11 | the primary output's RandR mode: the dot clock over `htotal × vtotal` |
 //! | Linux, DRM | the CRTC mode's `vrefresh` |
@@ -40,7 +42,8 @@ fn of_device(device: *const u16) -> Option<u16> {
     hz(f64::from(dm.dmDisplayFrequency))
 }
 
-/// The rate of the primary display (the output scrap's DXGI arm captures).
+/// The rate of the primary display (the output scrap's DXGI arm and the
+/// SYSTEM-context arm capture).
 #[cfg(target_os = "windows")]
 pub fn of_primary() -> Option<u16> {
     of_device(std::ptr::null())

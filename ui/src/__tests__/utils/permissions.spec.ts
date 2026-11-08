@@ -31,12 +31,19 @@ import {
 // composite value changes and this fails loudly.
 
 describe('permission catalog', () => {
-  it('defines all 35 flags with unique bits and keys', () => {
-    expect(PERMISSION_FLAGS).toHaveLength(35)
+  // FR-137 (decision D1) — bits 32–34 were FR-90's. The server keeps them
+  // named and inside ALL, because stored masks hold them for good; the
+  // catalog names none of them, so no editor or preset can grant one.
+  const RESERVED_BITS = [2 ** 32, 2 ** 33, 2 ** 34]
+  const withoutReserved = (mask: number) => RESERVED_BITS.reduce((m, b) => maskClear(m, b), mask)
+
+  it('defines all 32 named flags with unique bits and keys', () => {
+    // 35 server bits, minus the three reserved ones.
+    expect(PERMISSION_FLAGS).toHaveLength(32)
     const bits = PERMISSION_FLAGS.map((f) => f.bit)
-    expect(new Set(bits).size).toBe(35)
+    expect(new Set(bits).size).toBe(32)
     const keys = PERMISSION_FLAGS.map((f) => f.key)
-    expect(new Set(keys).size).toBe(35)
+    expect(new Set(keys).size).toBe(32)
     // Every bit is a single power of two. The ceiling is now bit 52, not 30
     // (#888): the file uses arithmetic rather than bitwise operators, so the
     // limit is the JSON number's exact-integer range, not int32 coercion.
@@ -49,11 +56,12 @@ describe('permission catalog', () => {
     }
   })
 
-  it('OR of every flag equals ALL', () => {
+  it('OR of every flag, with the reserved bits, equals ALL', () => {
     // `maskUnion`, never `|`: bit 31 (RECORD_REMOTE_SCREEN, FR-85) is the
     // first flag a bitwise OR would coerce to a NEGATIVE int32.
     const all = PERMISSION_FLAGS.reduce((m, f) => maskUnion(m, f.bit), 0)
-    expect(all).toBe(ALL_PERMISSIONS)
+    expect(all).toBe(withoutReserved(ALL_PERMISSIONS))
+    expect(RESERVED_BITS.reduce((m, b) => maskUnion(m, b), all)).toBe(ALL_PERMISSIONS)
     // `(1 << 35) - 1` — the Rust spelling — is 7 in JS (a shift count is
     // taken mod 32). Assert the POSITIVE value so a copy-paste of the Rust
     // expression fails here.
@@ -76,9 +84,18 @@ describe('permission catalog', () => {
     expect(bit('SSH_DEVICE')).toBe(1 << 29)
     expect(bit('VIEW_SSH_AUDIT')).toBe(1 << 30)
     expect(bit('RECORD_REMOTE_SCREEN')).toBe(2 ** 31)
-    expect(bit('HIVE_RUN')).toBe(2 ** 32)
-    expect(bit('KNOWHOW_VIEW')).toBe(2 ** 33)
-    expect(bit('KNOWHOW_EDIT')).toBe(2 ** 34)
+  })
+
+  it('names none of the bits FR-137 reserved, while ALL keeps them', () => {
+    // Bits 32–34 were FR-90's. Stored masks keep them (the server's managed
+    // roles reconcile only by adding), so ALL_PERMISSIONS still spans them,
+    // as the server's ALL does; the editor names none and no preset sets one.
+    for (const reserved of [2 ** 32, 2 ** 33, 2 ** 34]) {
+      expect(PERMISSION_FLAGS.some((f) => f.bit === reserved)).toBe(false)
+      expect(maskHas(ALL_PERMISSIONS, reserved)).toBe(true)
+      expect(maskHas(DEFAULT_MEMBER, reserved)).toBe(false)
+      expect(maskHas(DEFAULT_ADMIN, reserved)).toBe(false)
+    }
   })
 
   it('withholds the fleet-access grants from the admin preset', () => {
@@ -87,8 +104,8 @@ describe('permission catalog', () => {
     // The preset buttons in RolesSection OVERWRITE the mask, so if these ever
     // crept into DEFAULT_ADMIN, one click would hand every admin a root shell
     // on every device in the fleet.
-    // `maskHas`, never `&`: the preset spans bit 34 (KNOWHOW_EDIT, FR-90 P4),
-    // which `&` would first cut down to its low 32 bits.
+    // `maskHas`, never `&`: a preset that spans a bit above 31 would be cut
+    // down to its low 32 bits by `&` first.
     expect(maskHas(DEFAULT_ADMIN, 1 << 27)).toBe(false) // EXEC_DEVICE
     expect(maskHas(DEFAULT_ADMIN, 1 << 29)).toBe(false) // SSH_DEVICE
     // ...while the audit views ARE granted: reviewing what the fleet served
@@ -97,8 +114,6 @@ describe('permission catalog', () => {
     expect(maskHas(DEFAULT_ADMIN, 1 << 30)).toBe(true) // VIEW_SSH_AUDIT
     // FR-85 — a recording outlives the session: never in the admin preset.
     expect(maskHas(DEFAULT_ADMIN, 2 ** 31)).toBe(false) // RECORD_REMOTE_SCREEN
-    // FR-90 — an agent session runs commands on a device: an explicit grant.
-    expect(maskHas(DEFAULT_ADMIN, 2 ** 32)).toBe(false) // HIVE_RUN
   })
 
   it('a preset round-trip preserves every bit the preset claims to set', () => {
@@ -113,7 +128,8 @@ describe('permission catalog', () => {
         (m, f) => (maskHas(preset, f.bit) ? maskUnion(m, f.bit) : m),
         0,
       )
-      expect(covered).toBe(preset)
+      // ALL keeps the reserved bits the catalog does not name (FR-137).
+      expect(covered).toBe(withoutReserved(preset))
     }
   })
 
@@ -129,15 +145,14 @@ describe('permission catalog', () => {
       (1 << 15) | // CONNECT_VOICE
       (1 << 16) | // SPEAK
       (1 << 17) // STREAM_VIDEO
-    // FR-90 P4 — KNOWHOW_VIEW, above bit 31: `maskUnion`, never `|`.
-    const expected = maskUnion(low, 2 ** 33)
-    expect(DEFAULT_MEMBER).toBe(expected)
-    expect(DEFAULT_MEMBER).toBe(249729 + 2 ** 33)
+    expect(DEFAULT_MEMBER).toBe(low)
+    expect(DEFAULT_MEMBER).toBe(249729)
   })
 
   it('DEFAULT_ADMIN matches the server composite', () => {
-    // Every flag below bit 31 composes with `|`; the preset's high bits
-    // (KNOWHOW_VIEW from DEFAULT_MEMBER, KNOWHOW_EDIT) need `maskUnion`.
+    // Every flag in the preset is below bit 31 since FR-137 took the map's
+    // two bits out of it; `maskUnion` still composes it, as it would a high
+    // bit.
     const low =
       (1 << 1) | // MANAGE_CHANNELS
       (1 << 2) | // MANAGE_ROLES
@@ -156,27 +171,15 @@ describe('permission catalog', () => {
       (1 << 26) | // VIEW_REMOTE_AUDIT
       (1 << 28) | // VIEW_EXEC_AUDIT   (the grant, EXEC_DEVICE, is withheld)
       (1 << 30) // VIEW_SSH_AUDIT    (the grant, SSH_DEVICE, is withheld)
-    const expected = maskUnion(maskUnion(DEFAULT_MEMBER, low), 2 ** 34) // KNOWHOW_EDIT
+    const expected = maskUnion(DEFAULT_MEMBER, low)
     expect(DEFAULT_ADMIN).toBe(expected)
     expect(maskHas(DEFAULT_ADMIN, ADMINISTRATOR)).toBe(false)
     // Historical cross-check: the pre-remote-perms admin composite was
     // 8388599 (still live on old tenants); the current one appends the
-    // three remote-control bits, the two fleet AUDIT views, and the map's
-    // two bits (FR-90 P4).
+    // three remote-control bits and the two fleet AUDIT views.
     expect(DEFAULT_ADMIN).toBe(
-      (8388599 | (1 << 24) | (1 << 25) | (1 << 26) | (1 << 28) | (1 << 30)) + 2 ** 33 + 2 ** 34,
+      8388599 | (1 << 24) | (1 << 25) | (1 << 26) | (1 << 28) | (1 << 30),
     )
-  })
-
-  it('reads the map from the member preset up, and changes it from the admin preset', () => {
-    // FR-90 P4 — decisions 37 and 36, as the server's managed rows carry
-    // them (`the_map_is_read_from_member_up_and_changed_by_admins`).
-    const VIEW = 2 ** 33
-    const EDIT = 2 ** 34
-    expect(maskHas(DEFAULT_MEMBER, VIEW)).toBe(true)
-    expect(maskHas(DEFAULT_MEMBER, EDIT)).toBe(false)
-    expect(maskHas(DEFAULT_ADMIN, VIEW)).toBe(true)
-    expect(maskHas(DEFAULT_ADMIN, EDIT)).toBe(true)
   })
 
   it('hasPermission mirrors the server ADMINISTRATOR bypass', () => {
@@ -201,7 +204,6 @@ describe('permission catalog', () => {
       'Moderation',
       'Remote control',
       'Fleet access',
-      'Knowhow',
     ])
   })
 })
@@ -357,7 +359,7 @@ describe('canGrantDeviceExec / canGrantDeviceSsh', () => {
   })
 
   it('the matching grant bit, on top of MANAGE_AGENTS, is what it takes', () => {
-    // `maskUnion`, never `|`: the admin preset spans bit 34 (FR-90 P4).
+    // `maskUnion`, never `|`: a preset may span a bit above 31.
     expect(canGrantDeviceExec(maskUnion(DEFAULT_ADMIN, EXEC_DEVICE), false)).toBe(true)
     expect(canGrantDeviceSsh(maskUnion(DEFAULT_ADMIN, SSH_DEVICE), false)).toBe(true)
     // …and the grant bit alone is not enough: managing a device at all is a
