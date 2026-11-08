@@ -9,6 +9,12 @@ pub struct Recording {
     pub id: Option<ObjectId>,
     pub tenant_id: ObjectId,
     pub room_id: ObjectId,
+    /// Who started the recording: one of the people who may delete it (the
+    /// others hold `MANAGE_CHANNELS`, as a room delete removes its
+    /// recordings). Absent on a recording made before it was kept, which only
+    /// a `MANAGE_CHANNELS` holder deletes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<ObjectId>,
     pub recording_type: RecordingType,
     pub status: RecordingStatus,
     pub file: StorageFile,

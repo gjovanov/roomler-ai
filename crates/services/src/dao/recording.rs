@@ -17,10 +17,12 @@ impl RecordingDao {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,
         tenant_id: ObjectId,
         room_id: ObjectId,
+        created_by: ObjectId,
         recording_type: RecordingType,
         storage_file: StorageFile,
         started_at: DateTime,
@@ -31,6 +33,7 @@ impl RecordingDao {
             id: None,
             tenant_id,
             room_id,
+            created_by: Some(created_by),
             recording_type,
             status: RecordingStatus::Processing,
             file: storage_file,
@@ -48,18 +51,40 @@ impl RecordingDao {
         self.base.find_by_id(id).await
     }
 
+    /// The live recordings of `room_id` in `tenant_id`, newest first.
     pub async fn find_by_room(
         &self,
+        tenant_id: ObjectId,
         room_id: ObjectId,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<models::Recording>> {
         self.base
             .find_paginated(
-                doc! { "room_id": room_id, "deleted_at": null },
+                doc! { "tenant_id": tenant_id, "room_id": room_id, "deleted_at": null },
                 Some(doc! { "created_at": -1 }),
                 params,
             )
             .await
+    }
+
+    /// The live recording `id` of `room_id` in `tenant_id`. A recording of
+    /// another room or tenant, a deleted one and an id that names nothing all
+    /// answer the same `NotFound`.
+    pub async fn find_live_in_room(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<models::Recording> {
+        self.base
+            .find_one(doc! {
+                "_id": id,
+                "tenant_id": tenant_id,
+                "room_id": room_id,
+                "deleted_at": null,
+            })
+            .await?
+            .ok_or(super::base::DaoError::NotFound)
     }
 
     pub async fn update_status(&self, id: ObjectId, status: RecordingStatus) -> DaoResult<bool> {
