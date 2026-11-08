@@ -3,7 +3,7 @@
 > **CLOSED 2026-08-30** — issue #917 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
 **Issue:** [#917](https://github.com/gjovanov/roomler-ai/issues/917)
-**Status:** design
+**Status:** closed 2026-08-30 (#917): every phase shipped and field-verified on agent 0.4.35. P1 stuck-capture recovery on 0.4.24; P2 first-frame guarantee in #1027; P3/P3b the locked-host indication on 0.4.24, again on 0.4.35; P4 the 5-minute attended window
 
 ## Goal
 

@@ -3,7 +3,7 @@
 > **CLOSED 2026-08-27** — issue #789 is closed and its acceptance criteria are met. Any status line below is the state while the work was in flight, kept as the record.
 
 **Issue:** [#789](https://github.com/gjovanov/roomler-ai/issues/789)
-**Status:** implemented — agent half (hid_to_key arms + fallback removed) and viewer half (Ctrl→Cmd translate + toggle) both landed; agent half awaits the next agent release, viewer half the next web deploy; field verification pending
+**Status:** closed 2026-08-27 before its field check (#789). Both halves landed and shipped: the agent half (hid_to_key arms + fallback removed) in 0.4.6, the viewer half (Ctrl→Cmd translate + toggle) in web `v20260827-e765335c2c25`. The interactive field reads were never recorded, so the criteria stay open (`scripts/fr-ac-debt-baseline.txt` A.4)
 
 ## Field report (2026-08-26)
 
