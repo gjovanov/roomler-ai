@@ -165,7 +165,7 @@ evidence is why both are already in the stats).
       goes to 0 and the target drops to 2.4 M, the nominal, which it then climbs to 3.0 M.
       Three more lines that week, all mid-session: 3.19 M → 523 kbps, 6.21 M → 200 kbps,
       3.0 M → 200 kbps.*
-- **AC4** moved: FR-63 AC4 carries it, "closes here" (`docs/fr/FR-63-one-delay-based-rate-controller.md:392`).
+- **AC4** moved: FR-63 AC4 carries it, "closes here" (`docs/fr/FR-63-one-delay-based-rate-controller.md:393`).
       Field: viewer paint age on the airport-class link falls from the measured
       2,284–7,095 ms band to **under 600 ms sustained**, with the before/after heartbeats recorded.
 - [~] **AC5** — No regression on a healthy relay (CORPLAP-3 from the office LAN) or a direct
