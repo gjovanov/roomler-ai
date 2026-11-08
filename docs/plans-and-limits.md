@@ -88,7 +88,7 @@ staged by the mode.
 | tunnel clients | `crates/modules/network/src/routes/tunnel.rs:143` | 403 |
 | members | invite and admin add (`crates/api/src/routes/invite.rs:199`) | 403 naming the counts |
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
-| meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:286`) | `media:error`; a rejoining participant keeps their seat |
+| meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:405`) | `media:error`; a rejoining participant keeps their seat |
 | meeting length | the sweep (`crates/modules/conference/src/meeting_cap.rs:100`) | `room:call_ending_soon` at 55, `room:call_ended {reason: plan_limit}` at 60 |
 | concurrent sessions | the hub, after its coalesce (`crates/modules/fleet/src/hub.rs:1658`); with `rc.session_slots` on, a cluster-wide slot claimed on the pod that owns the device before the hub runs (`crates/modules/remote/src/slots.rs`) | `org_session_limit`, naming who holds the slot and where; an external session gets `session_limit` |
 | relay past the month's allowance | the DERP forward path, on the API pods (`crates/modules/network/src/derp.rs:691`) and on every PoP (`crates/derp-relay/src/main.rs:154`) | **never refused**: bulk frames are held to the plan's rate (*The relay allowance* below) |
