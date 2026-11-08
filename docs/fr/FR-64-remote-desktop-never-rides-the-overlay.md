@@ -4,10 +4,10 @@
 
 **Parent/siblings:** FR-59 (the regression that motivated the arc). This is one of three FRs from that plan (FR-62 encoder apply path, FR-63 the controller, FR-64 the data path).
 
-**Where it stands, 2026-11-03.** C2 shipped as #1246. C1 changed shape: the `overlay_ice_candidates` switch never shipped, #1882 made the choice the device's (`AccessPolicy.rc_overlay`, default off, `docs/remote-control.md` §4.4), and FR-128 added `auto`. Two things keep this open:
+**Where it stands, 2026-11-03, re-checked 2026-11-08.** C2 shipped as #1246. C1 changed shape: the `overlay_ice_candidates` switch never shipped, #1882 made the choice the device's (`AccessPolicy.rc_overlay`, default off, `docs/remote-control.md` §4.4), and FR-128 added `auto`. Two things keep this open:
 
 - **#3359.** A session requested while the daemon starts keeps an empty filter for its whole life. In the week read, 4 of the 15 such sessions on mesh devices gathered their own overlay address. None nominated a path on it.
-- **`auto` with the far TURN dead (FR-128, #3357).** With no UDP to coturn, `auto` lets a session ride the mesh over DERP. On a corp laptop on its VPN, TURN over TLS can still be alive, so `auto` can take this FR's exact path where `off` would take TURN. That cell is being measured, so this FR's "never" is not retired yet.
+- **`auto` with the far TURN dead (FR-128, #3357).** With no UDP to coturn, `auto` lets a session ride the mesh over DERP. On a corp laptop on its VPN, TURN over TLS can still be alive, so `auto` can take this FR's exact path where `off` would take TURN. The lab cell for it was read on 2026-11-03 ([#3357](https://github.com/gjovanov/roomler-ai/issues/3357#issuecomment-6593946635)): with UDP blocked and TURN over TLS alive, under motion, `auto` rode DERP in 8 sessions of 9, held `off`'s fps and rate, and cost about 20 ms of transit, and this FR's 20–400 kbps did not reproduce. A real corporate link and the relay allowance's throttle were not reached. The default flip (#3366) is still a draft and #3357 waits on the operator, so this FR's "never" is not retired yet.
 
 ## Goal
 
