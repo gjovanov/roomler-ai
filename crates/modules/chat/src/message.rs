@@ -144,7 +144,7 @@ pub async fn create(
     let rid = ObjectId::parse_str(&room_id)
         .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
 
-    crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
+    let room = crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
     let thread_id = body
         .thread_id
@@ -160,23 +160,23 @@ pub async fn create(
         .transpose()
         .map_err(|_| ApiError::BadRequest("Invalid referenced_message_id".to_string()))?;
 
-    // Parse mentions from request
-    let mentions = if let Some(ref mention_req) = body.mentions {
-        let user_ids: Vec<ObjectId> = mention_req
+    // The room's members: who hears about this message below, and the only
+    // people a mention in it can reach.
+    let all_member_ids = state.rooms.find_member_user_ids(rid).await?;
+
+    // Parse mentions from request, keeping the members of this room
+    let mentions = body.mentions.as_ref().map(|mention_req| Mentions {
+        users: mention_req
             .users
             .iter()
             .filter_map(|s| ObjectId::parse_str(s).ok())
-            .collect();
-        Some(Mentions {
-            users: user_ids,
-            roles: Vec::new(),
-            rooms: Vec::new(),
-            everyone: mention_req.everyone,
-            here: mention_req.here,
-        })
-    } else {
-        None
-    };
+            .filter(|id| all_member_ids.contains(id))
+            .collect(),
+        roles: Vec::new(),
+        rooms: Vec::new(),
+        everyone: mention_req.everyone,
+        here: mention_req.here,
+    });
 
     // Fetch file records for attachments (tenant-scoped to prevent cross-tenant access)
     let attachments = if !body.attachment_ids.is_empty() {
@@ -201,6 +201,8 @@ pub async fn create(
         Vec::new()
     };
 
+    // A thread or a quote that is not a live message of this room answers 404
+    // here, before anything is written.
     let message = state
         .messages
         .create_with_attachments(
@@ -211,7 +213,7 @@ pub async fn create(
             thread_id,
             ref_msg_id,
             body.nonce,
-            mentions,
+            mentions.clone(),
             attachments,
         )
         .await?;
@@ -225,8 +227,6 @@ pub async fn create(
         .await
         .unwrap_or_default();
 
-    // Fetch room member IDs once and reuse for WS broadcast, thread update, and notifications
-    let all_member_ids = state.rooms.find_member_user_ids(rid).await?;
     let member_ids_excluding_sender: Vec<ObjectId> = all_member_ids
         .iter()
         .filter(|id| **id != auth.user_id)
@@ -253,9 +253,10 @@ pub async fn create(
     .await;
 
     // If this was a thread reply, broadcast an update for the parent message
-    // so other users see the updated is_thread_root + reply_count
+    // so other users see the updated is_thread_root + reply_count. The parent
+    // is re-read as the live message of this room it was resolved as.
     if let Some(parent_id) = thread_id
-        && let Ok(parent_msg) = state.messages.base.find_by_id(parent_id).await
+        && let Ok(parent_msg) = state.messages.find_live_in_room(tid, rid, parent_id).await
     {
         let parent_author_ids = vec![parent_msg.author_id];
         let parent_names = state
@@ -278,27 +279,20 @@ pub async fn create(
         .await;
     }
 
-    // Create notifications for mentioned users via helper
-    if let Some(ref mention_req) = body.mentions {
-        let mentioned_user_ids: Vec<ObjectId> = if mention_req.everyone {
+    // Create notifications for mentioned users via helper: members of this
+    // room only (`mentions` kept them above).
+    if let Some(ref mentions) = mentions {
+        let mentioned_user_ids: Vec<ObjectId> = if mentions.everyone {
             // @everyone: notify all room members except sender
             member_ids_excluding_sender.clone()
         } else {
-            mention_req
+            mentions
                 .users
                 .iter()
-                .filter_map(|s| ObjectId::parse_str(s).ok())
-                .filter(|id| *id != auth.user_id)
+                .filter(|id| **id != auth.user_id)
+                .copied()
                 .collect()
         };
-
-        let room_name = state
-            .rooms
-            .base
-            .find_by_id(rid)
-            .await
-            .map(|r| r.name)
-            .unwrap_or_default();
 
         let mentioner_name = names
             .get(&auth.user_id)
@@ -312,7 +306,7 @@ pub async fn create(
             message_id,
             auth.user_id,
             &mentioned_user_ids,
-            &room_name,
+            &room.name,
             &body.content,
             &mentioner_name,
             &tenant_id,
@@ -503,9 +497,13 @@ pub async fn thread_replies(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    let root = crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
 
-    let result = state.messages.find_thread_replies(mid, &params).await?;
+    // The replies from the root's own room.
+    let result = state
+        .messages
+        .find_thread_replies(tid, root.room_id, mid, &params)
+        .await?;
 
     let author_ids = collect_author_ids(&result.items);
     let names = state
