@@ -25,7 +25,7 @@ audience-checked token types — a token of one audience is rejected everywhere 
 | `Refresh` | `POST /api/auth/refresh` only | 30 d (config) | browser |
 | `Enrollment` | `POST /api/agent/enroll` | 10 min, single-use (`jti`) | pasted into installer |
 | `Agent` | `/ws?role=agent`, agent ingest routes, `/derp` | long-lived | `roomlerd` config |
-| `TunnelEnrollment` | `POST /api/tunnel-client/enroll` | 10 min, single-use | pasted into CLI |
+| `TunnelEnrollment` | `POST /api/tunnel-client/enroll` | 10 min, single-use (`jti`) | pasted into CLI |
 | `TunnelClient` | `/ws?role=tunnel-client`, tunnel routes | long-lived | `roomler` CLI config |
 
 ```mermaid
@@ -63,6 +63,23 @@ sequenceDiagram
 in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` →
 `{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
 impersonate a client or vice-versa.
+
+**An enrollment token enrolls once** (#3328). Every door that redeems one — the
+daemon's `POST /api/agent/enroll`, `POST /api/tunnel-client/enroll`, and the anchor
+(`POST /api/agent/anchor`) — spends its `jti` on the `used_tokens` ledger after each
+refusal that must leave the token usable and before it writes anything. Spent before,
+it answers **401** `This enrollment token has already been used`; a ledger that cannot
+answer gives a retryable **503** (`Could not verify this enrollment token is unused;
+please retry`), and the token stays valid. The archived-org 403, the plan's cap and a
+refused tunnel re-enrollment (409, below) come before the spend, so they cost the token
+nothing. FR-51's ephemeral keys are reusable by design and are counted on their own row.
+
+A tunnel enrollment token acts for the person who minted it, since the enroll request
+carries no user session: a new `machine_id` becomes their tunnel client, and a known one
+re-enrolls its client only for **its owner, while the client is live, or a holder of
+`MANAGE_AGENTS`**. A **removed** client comes back only through a holder of
+`MANAGE_AGENTS`, its owner included. Anyone else gets **409** with a sentence the CLI
+prints, and nothing is written: no row, no ledger entry, no overlay change.
 
 Since FR-129 A1 the installer can obtain the same `Enrollment` (or `TunnelEnrollment`)
 token **without anyone copying it**: `POST /api/pair/start` → the person types the
@@ -157,7 +174,7 @@ capability URLs, webhook signatures).
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
 | POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler). Every string of the report is scrubbed again on the way in, as a log line's is ([security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub)) |
 | POST | `/api/consent/{token}/approve` · `/deny` | Owner-consent capability URLs (token **is** the auth, single-use) |
-| POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential. 403 for an **archived** org, into a new row or back into an old one, in the daemon route's words |
+| POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential. The token enrolls **once**: a second use is 401 `already used`, and a ledger that cannot answer a retryable 503 with the token still valid (#3328). 403 for an **archived** org, into a new row or back into an old one, in the daemon route's words. A known `machine_id` re-enrolls its client only for the client's owner while it is live, or for a holder of `MANAGE_AGENTS` (a removed client comes back only through one); anyone else gets **409** and nothing is written. The archived-org 403, the plan's cap (403) and that 409 come before the spend and leave the token usable ([above](#authentication)) |
 | GET | `/api/tunnel-client/agents` | Reachable agents (TunnelClient bearer) |
 | GET | `/api/tunnel/latest-release` · `/installer/{platform}` (+`/health`) | Tunnel-CLI release manifest + artifact proxy |
 | GET | `/api/setup/latest-release` · `/{platform}` (+`/health`) | `roomler-setup` wizard manifest + artifact proxy. `?version=` (default `latest`). FR-129 C2, `?format=exe\|zip` (default `exe`): on Windows the default streams the signed wizard EXE itself (`roomler-setup-<v>-x86_64-pc-windows-msvc.exe`, `application/vnd.microsoft.portable-executable`) from the first `setup-v*` release that publishes one (`setup-v0.4.197`), and that release's zip otherwise; `zip` streams the zip, for a proxy that refuses an EXE download. Linux and macOS ignore the value; any other value is a 400. The health's `uri` carries a `format` the caller named. A sidecar (`.sha256`, `.asc`) is never the download (`crates/modules/fleet/src/setup_release.rs`, `pick_setup_asset`) |
@@ -404,7 +421,7 @@ before it leaves the host.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `…/tunnel-client` | List enrolled tunnel clients |
-| POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token. 403 for an **archived** org |
+| POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token (membership; 10 min, single-use). It acts for whoever minted it: their own new machine, or a machine id they may re-enroll ([rule](#authentication)). 403 for an **archived** org |
 | PUT/DELETE | `…/tunnel-client/{cid}` | Rename / relabel / re-tag a client · revoke it (releases its overlay node; a live session is kicked by the 60 s revocation sweep with `rc:tunnel.revoked`). Removal is final: from then on the client is a **404 on both routes** — PUT and a repeat DELETE — like the listing that no longer shows it. There is no GET by id; the listing is the only read |
 | GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny) |
 | GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the forward gate's compile set — it is never served, edited or compiled again |

@@ -3,7 +3,7 @@
 use bson::{DateTime, doc};
 use mongodb::Database;
 
-use super::base::{DaoError, DaoResult};
+use crate::auth::{EnrollmentClaims, SingleUse, SpendPurpose, SpendRefusal, Spent, Unspent};
 
 /// Single-use ledger for enrollment tokens.
 ///
@@ -21,6 +21,11 @@ use super::base::{DaoError, DaoResult};
 /// primary key does the arbitration, with no read-then-write race. Rows TTL
 /// out an hour after use — comfortably past the 10-minute token lifetime, so
 /// a replay always finds the record while the ledger stays small.
+///
+/// #3328 — the ledger is reached through [`Self::spend`] only, which takes an
+/// [`Unspent`] token and hands back the [`Spent`] one the credential mints
+/// require (`crate::auth::single_use`). Every enrollment door spends the same
+/// way, and answers the same two refusals.
 pub struct UsedTokenDao {
     collection: mongodb::Collection<bson::Document>,
 }
@@ -34,9 +39,43 @@ impl UsedTokenDao {
         }
     }
 
-    /// Claim `jti` for `purpose`. `Ok(())` = this caller won it (first use);
-    /// `Err(DaoError::Validation)` = it was already spent; `Err(DaoError::Mongo)`
-    /// = the ledger could not answer, which is ALSO a refusal.
+    /// Spend a single-use enrollment token: record its one use for `purpose`,
+    /// and hand back the [`Spent`] token a credential mint takes.
+    ///
+    /// A door calls this after every refusal that must leave the token usable
+    /// (an archived org, the plan's cap, a re-enrollment the token's subject
+    /// may not make, a read that failed) and before it writes anything.
+    /// [`SpendRefusal::AlreadyUsed`] = someone used this token before;
+    /// [`SpendRefusal::LedgerUnavailable`] = nothing proves it unspent, and
+    /// the token is still valid for a retry.
+    pub async fn spend<C: SingleUse>(
+        &self,
+        token: Unspent<C>,
+        purpose: SpendPurpose,
+    ) -> Result<Spent<C>, SpendRefusal> {
+        self.claim(token.claims().jti(), purpose).await?;
+        Ok(Spent::new(token.into_claims()))
+    }
+
+    /// FR-104 — the anchor's SECOND use of the token that enrolled the device
+    /// it anchors: a token minted with `anchor: true` that enrolled this very
+    /// device. Its own ledger key, `<jti>:anchor`, so it happens once, apart
+    /// from the enrollment's use. Whether the token qualifies is the anchor
+    /// route's decision, made against the device row; every other anchor
+    /// spends the token's one use through [`Self::spend`].
+    pub async fn spend_anchor_second_use(
+        &self,
+        token: Unspent<EnrollmentClaims>,
+    ) -> Result<Spent<EnrollmentClaims>, SpendRefusal> {
+        let key = format!("{}:anchor", token.claims().jti);
+        self.claim(&key, SpendPurpose::AgentAnchor).await?;
+        Ok(Spent::new(token.into_claims()))
+    }
+
+    /// Claim the ledger key `key` for `purpose`. `Ok(())` = this caller won it
+    /// (first use); [`SpendRefusal::AlreadyUsed`] = it was already spent;
+    /// [`SpendRefusal::LedgerUnavailable`] = the ledger could not answer,
+    /// which is ALSO a refusal.
     ///
     /// ## Why this fails CLOSED
     ///
@@ -44,9 +83,9 @@ impl UsedTokenDao {
     /// and bricking every enroll because the ledger is unreachable trades a
     /// narrow replay window for a total outage".
     ///
-    /// That trade does not exist. The caller writes the agent row through `?`
-    /// immediately after this claim (`routes::remote_control::enroll_agent` →
-    /// `agents.create` / `rehydrate`), and the device-cap check read the tenant
+    /// That trade does not exist. Every enrollment door writes its row through
+    /// `?` immediately after this claim (the daemon's `enroll_agent`, the
+    /// tunnel door's `enroll_tunnel_client`, the anchor), and read the tenant
     /// just before it. **An enrollment cannot succeed without Mongo**, so there
     /// is no world in which failing open here rescues one. What failing open
     /// actually did was narrower and worse: in the one case where the
@@ -63,9 +102,10 @@ impl UsedTokenDao {
     /// differently — an operator has to be able to tell "someone replayed this"
     /// from "mint a new one", and answering both with "already used" would send
     /// them hunting an attacker who is not there.
-    pub async fn claim(&self, jti: &str, purpose: &str) -> DaoResult<()> {
+    async fn claim(&self, key: &str, purpose: SpendPurpose) -> Result<(), SpendRefusal> {
+        let purpose = purpose.as_str();
         let doc = doc! {
-            "_id": jti,
+            "_id": key,
             "purpose": purpose,
             "used_at": DateTime::now(),
         };
@@ -73,16 +113,14 @@ impl UsedTokenDao {
             Ok(_) => Ok(()),
             Err(e) => {
                 if is_duplicate_key(&e) {
-                    Err(DaoError::Validation(
-                        "this enrollment token has already been used".to_string(),
-                    ))
+                    Err(SpendRefusal::AlreadyUsed)
                 } else {
                     tracing::error!(
                         %purpose, %e,
                         "single-use token ledger unavailable; REFUSING the enrollment \
                          (cannot prove this token is unspent)"
                     );
-                    Err(DaoError::Mongo(e))
+                    Err(SpendRefusal::LedgerUnavailable)
                 }
             }
         }

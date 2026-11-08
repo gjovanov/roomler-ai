@@ -44,7 +44,7 @@ flowchart TB
 | Access token | 7 d (`ROOMLER__JWT__*`) |
 | Refresh token | 30 d |
 | Hashing | Argon2 |
-| Audiences | `Access` · `Refresh` · `Enrollment` (single-use, 10 min) · `Agent` (1 y) |
+| Audiences | `Access` · `Refresh` · `Enrollment` (single-use, 10 min) · `Agent` (1 y) · `TunnelEnrollment` (single-use, 10 min) · `TunnelClient` (1 y) |
 
 `verify_agent_token` rejects a user JWT and vice-versa; locked by tests in
 `crates/services/src/auth/mod.rs::tests`.
@@ -398,6 +398,55 @@ route enforces `exp`.
   every action re-checks the row, but the device's own status still read
   "connected".
 
+### An enrollment token is spent once, through one owner (#3328)
+
+**A single-use enrollment token enrolls once**, at every door: the daemon's
+`POST /api/agent/enroll`, `POST /api/tunnel-client/enroll`, and the anchor. Single use
+used to be a convention each door had to remember, and a door that forgot it minted a
+year-long credential per replay. It is a type now (`crates/services/src/auth/single_use.rs`):
+
+| Step | What holds it |
+|---|---|
+| Verifying a single-use audience (`Enrollment`, `TunnelEnrollment`) yields an **unspent** token | it reads claims and mints nothing |
+| `UsedTokenDao::spend(token, purpose)` records the one use and yields a **spent** token | the `used_tokens` insert, `_id` = the `jti`: the unique key arbitrates, with no read-then-write race |
+| `issue_agent_token`, `issue_tunnel_client_token` and `issue_agent_service_token` take the spent token by value | nothing outside the services crate can make one, so a door that skips the spend does not compile, and one spend mints one credential |
+| An FR-51 ephemeral key's use is claimed on its own row (`EnrollmentKeyDao::claim_use`) | the agent mint takes that claimed use instead; the key is reusable by design |
+| Renewal keeps its own entry (`renew_agent_token`, `renew_tunnel_client_token`, `renew_agent_service_token`) | a renewal authenticates with a credential the device already holds |
+
+The rules each door keeps:
+
+- **Every refusal that must leave the token usable runs before the spend**: an archived
+  org, the plan's cap, a tunnel re-enrollment the token's subject may not make, a read
+  that failed. **The spend runs before anything is written.**
+- **Two answers, never one.** A token spent before is 401 `This enrollment token has
+  already been used`. A ledger that cannot answer is a retryable 503 and the token stays
+  valid. "Already used" sends a person looking for whoever used the token, so a ledger
+  blip must not borrow those words (`From<SpendRefusal> for ApiError`,
+  `crates/core/src/error.rs`).
+- **The spend fails closed.** An enrollment cannot succeed without MongoDB, so failing
+  open never rescued one; it only let a replay through in the one window where the insert
+  failed and the row write did not.
+- FR-104's anchor second use stays an explicit, named spend
+  (`UsedTokenDao::spend_anchor_second_use`, key `<jti>:anchor`).
+
+**Re-enrolling a known machine id revives a tunnel client only for its owner, while
+the client is live, or for a holder of `MANAGE_AGENTS`.** A **removed** tunnel client
+comes back only through a holder of `MANAGE_AGENTS`, its owner included. The enroll
+request carries no user session, so "who" is the person the enrollment token was minted
+for (its `sub`), with their permissions read at enrollment time.
+- Anyone else gets **409**, before the spend, and **nothing is written**: no row, no
+  ledger entry, no overlay lease or address. The refused token still enrolls a machine of
+  its own. The 409 comes first on purpose: a refusal the person can only fix elsewhere
+  must not burn the token, and the spend would otherwise write to the ledger.
+- The write holds the decision again (`ReviveScope`,
+  `crates/services/src/dao/tunnel_client.rs`): an owner's re-enrollment refreshes the row
+  only while it is still live and theirs, so a removal that lands between the check and
+  the write is not undone. That race is the one case where a refused token is spent.
+- An allowed re-enrollment behaves as it always did: it changes neither the owner nor
+  `token_gen` (a removed client's revival mints at the generation its removal set, so
+  its old tokens stay dead), and it leaves the overlay alone; the client takes a lease
+  when it joins.
+
 ### A removed thing answers nothing (#1821, #1829)
 
 Devices, tunnel clients, tunnel policies and overlay ACL policies are
@@ -423,7 +472,7 @@ Readers that keep the tombstone, and why:
 |---|---|
 | `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
 | `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash` (both read under `MANAGE_AGENTS`, [below](#device-diagnostics-manage_agents-and-a-second-scrub)), the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
-| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone |
+| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone. A tunnel client's tombstone revives only through a holder of `MANAGE_AGENTS` ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)) |
 | `overlay_nodes` by id after a release | the release's own `removes` frame goes to the tombstone's address (`docs/overlay-communication.md` §1). The lease order is not changed by any of this: a node is tombstoned first, then its host goes back to the pool, and pooling first would lock the next joiner out permanently |
 
 **An overlay join reads the row, and a removed row does not join.** A socket can

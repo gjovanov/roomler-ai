@@ -341,6 +341,11 @@ mod tombstone_tests;
 mod touch_preset_tests;
 #[cfg(test)]
 mod transfer_activity_tests;
+/// #3328 — a tunnel enrollment token enrolls once, and re-enrolling a machine
+/// id that already has a tunnel client revives it only for its owner or a
+/// holder of `MANAGE_AGENTS`.
+#[cfg(test)]
+mod tunnel_enroll_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the

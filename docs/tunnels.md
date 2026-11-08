@@ -926,6 +926,18 @@ cannot be siblings. (Before rc.454 the macOS `.pkg` shipped **no** CLI at all.) 
 | `diag host` / `diag pair` | Diagnostic evidence bundles (CLI-side, so new probes don't need a fleet rollout) |
 | `self-update` | Tunnel-only hosts update in place; on daemon hosts the MSI/.deb owns the binaries and the shim refuses |
 
+**`enroll` spends its token once** (#3328). A tunnel enrollment token enrolls one
+client; a second use answers 401 `This enrollment token has already been used`, and
+a retryable 503 means the server could not check, with the token still good. The
+client's `machine_id` is a hash of `--name`, the host name, the OS and the
+architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1213`), so running
+`enroll` again with the same name re-enrolls the same client. That takes a fresh token
+minted by the client's owner while the client is live, or by a holder of
+`MANAGE_AGENTS`, the only way a removed client comes back. Anyone else's token is
+refused 409 with a sentence the CLI prints, nothing is written, and that token still
+enrolls the machine under a different `--name` as a new client. The server side is in
+[api.md](api.md#authentication) and [security-baseline.md](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328).
+
 ## Corporate-network behaviour
 
 The whole stack is built to work from inside strict networks: outbound-only WSS

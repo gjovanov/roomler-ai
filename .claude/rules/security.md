@@ -73,6 +73,15 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   401** — a Mongo blip must not tell a healthy fleet its credentials were revoked,
   turning a database wobble into an enrollment storm. ⚠️ **Deletion wins over
   status**: an Online-looking tombstone still refuses.
+- **A single-use enrollment token is spent once, through one owner** (#3328). A door
+  verifies it (an `Unspent` value, which mints nothing), runs every refusal that must
+  leave it usable, spends it with `UsedTokenDao::spend`, and only then writes. The
+  credential mints take the `Spent` value by value, so a new door that skips the spend
+  does not compile; renewals keep their own `renew_*` entry. ⚠️ Keep the two refusals
+  apart: 401 "already used" vs a retryable 503 when the ledger cannot answer.
+  ⚠️ A tunnel client's known `machine_id` re-enrolls only for its owner (live) or a
+  `MANAGE_AGENTS` holder (live or removed): decided before the spend, held again by the
+  write (`ReviveScope`).
 - **A WG public key cannot be claimed by two live nodes in a network**
   (`wg_key_taken_by_other`, fail-CLOSED). Nothing proves possession of the private
   half, and the key is an *addressing* key — DERP authorizes registration against

@@ -9,6 +9,13 @@ use roomler_ai_config::JwtSettings;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod single_use;
+
+pub use single_use::{
+    AgentEnrollment, ClaimedKeyUse, EnrollmentCredential, SingleUse, SpendPurpose, SpendRefusal,
+    Spent, Unspent,
+};
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("Invalid credentials")]
@@ -77,7 +84,9 @@ pub struct EnrollmentClaims {
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
-    pub jti: String, // unique id — caller may persist for single-use checks
+    /// Unique id: the used-token ledger keys the token's one use on it
+    /// ([`single_use`]). For an ephemeral key it names the key's row instead.
+    pub jti: String,
     /// FR-104 — the admin minted this token to also ANCHOR the device it
     /// enrolls: `POST /api/agent/anchor` accepts it a second time, for that
     /// one device, once. Absent from every older token (and from every token
@@ -155,14 +164,17 @@ pub struct TunnelClientClaims {
 /// tunnel client and vice-versa.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelEnrollmentClaims {
-    /// Admin user id (issuer) as hex.
+    /// The user who minted the token, hex: the person the enrollment acts
+    /// for, the owner of a new tunnel client and the one whose right to
+    /// re-enroll a known machine id the enroll route checks (#3328).
     pub sub: String,
     pub tenant_id: String,
     pub iat: i64,
     pub exp: i64,
     pub iss: String,
     pub token_type: TokenType,
-    /// Unique id — caller may persist for single-use checks.
+    /// Unique id: the used-token ledger keys the token's one use on it
+    /// ([`single_use`]).
     pub jti: String,
 }
 
@@ -408,8 +420,9 @@ impl AuthService {
 
     // ─── Remote-control tokens ────────────────────────────────────────
 
-    /// Mint a single-use enrollment token. The returned `jti` is unique and
-    /// may be persisted by the caller for replay protection.
+    /// Mint a single-use enrollment token. The returned `jti` is unique; the
+    /// door that redeems the token spends it on the used-token ledger
+    /// ([`single_use`]).
     pub fn issue_enrollment_token(
         &self,
         admin_user_id: ObjectId,
@@ -445,14 +458,19 @@ impl AuthService {
         Ok((token, jti))
     }
 
-    pub fn verify_enrollment_token(&self, token: &str) -> Result<EnrollmentClaims, AuthError> {
+    /// Verify a single-use enrollment token. It comes back [`Unspent`]: the
+    /// caller reads its claims, and spends it before it mints anything.
+    pub fn verify_enrollment_token(
+        &self,
+        token: &str,
+    ) -> Result<Unspent<EnrollmentClaims>, AuthError> {
         let claims = self.decode_any::<EnrollmentClaims>(token, &self.validation())?;
         if claims.token_type != TokenType::Enrollment {
             return Err(AuthError::InvalidToken(
                 "Not an enrollment token".to_string(),
             ));
         }
-        Ok(claims)
+        Ok(Unspent::new(claims))
     }
 
     /// FR-51 P2 — mint the JWT half of an ephemeral enrollment key. `exp` is
@@ -482,28 +500,58 @@ impl AuthService {
     }
 
     /// Accept EITHER enrollment credential on the public enroll route and say
-    /// which arrived (`true` = the FR-51 ephemeral key). Everything else —
-    /// agent, user, tunnel audiences — is refused exactly as before; the two
-    /// enrollment kinds stay separate audiences everywhere else.
+    /// which arrived. Everything else — agent, user, tunnel audiences — is
+    /// refused exactly as before; the two enrollment kinds stay separate
+    /// audiences everywhere else. Only the single-use kind comes back
+    /// [`Unspent`]: an FR-51 ephemeral key is reusable, and its row decides
+    /// each use (`EnrollmentKeyDao::claim_use`).
     pub fn verify_enrollment_token_any(
         &self,
         token: &str,
-    ) -> Result<(EnrollmentClaims, bool), AuthError> {
+    ) -> Result<EnrollmentCredential, AuthError> {
         let claims = self.decode_any::<EnrollmentClaims>(token, &self.validation())?;
         match claims.token_type {
-            TokenType::Enrollment => Ok((claims, false)),
-            TokenType::EphemeralEnrollment => Ok((claims, true)),
+            TokenType::Enrollment => Ok(EnrollmentCredential::SingleUse(Unspent::new(claims))),
+            TokenType::EphemeralEnrollment => Ok(EnrollmentCredential::EphemeralKey(claims)),
             _ => Err(AuthError::InvalidToken(
                 "Not an enrollment token".to_string(),
             )),
         }
     }
 
-    /// Mint a long-lived agent token at the device row's token generation
-    /// `gen` (FR-103). The TTL is one year unless `override_ttl_secs` is
-    /// given; the server passes `rc.agent_token_ttl_secs`. A device renews its
-    /// token well before then (`POST /api/agent/self/renew`).
+    /// Mint the long-lived agent token an ENROLLMENT earns, at the device
+    /// row's token generation `generation` (FR-103), for the org the
+    /// enrollment was minted for. It takes the redemption itself — a
+    /// single-use token already spent on the ledger, or an ephemeral key's
+    /// claimed use — so a door that skips the spend cannot mint (#3328). The
+    /// TTL is one year unless `override_ttl_secs` is given; the server passes
+    /// `rc.agent_token_ttl_secs`.
     pub fn issue_agent_token(
+        &self,
+        enrollment: AgentEnrollment,
+        agent_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        let tenant_id = enrollment.tenant()?;
+        self.mint_agent_token(agent_id, tenant_id, generation, override_ttl_secs)
+    }
+
+    /// FR-103 — a fresh agent token for a device that renews the one it holds
+    /// (`POST /api/agent/self/renew`), at the row's generation. Renewal only:
+    /// an enrollment mints through [`Self::issue_agent_token`].
+    pub fn renew_agent_token(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        self.mint_agent_token(agent_id, tenant_id, generation, override_ttl_secs)
+    }
+
+    /// The agent token itself, for the two entries above.
+    fn mint_agent_token(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
@@ -565,13 +613,37 @@ impl AuthService {
         Ok(())
     }
 
-    /// FR-94 — mint the credential of a device's SYSTEM service: `sub` = the
-    /// agent id, `anchor_id` = the anchor it belongs to, its own audience,
-    /// and the agent token's one-year lifetime. The service renews it
-    /// (`POST /api/agent/service/renew`) under the same anchor, so the year
-    /// is a renewal interval, not the anchor's life; the anchor binding is
-    /// what revokes it.
+    /// FR-94 — mint the credential of a device's SYSTEM service when it is
+    /// ANCHORED: `sub` = the agent id, `anchor_id` = the anchor it belongs to,
+    /// its own audience, and the agent token's one-year lifetime, for the org
+    /// the enrollment token was minted for. It takes that token spent on the
+    /// ledger (#3328). The service renews it (`POST /api/agent/service/renew`)
+    /// under the same anchor, so the year is a renewal interval, not the
+    /// anchor's life; the anchor binding is what revokes it.
     pub fn issue_agent_service_token(
+        &self,
+        enrollment: Spent<EnrollmentClaims>,
+        agent_id: ObjectId,
+        anchor_id: &str,
+    ) -> Result<String, AuthError> {
+        let tenant_id = enrollment.tenant()?;
+        self.mint_agent_service_token(agent_id, tenant_id, anchor_id)
+    }
+
+    /// FR-94 — a fresh service credential under the SAME anchor, for a
+    /// service whose credential is still live (`POST /api/agent/service/renew`).
+    /// Renewal only: an anchor mints through [`Self::issue_agent_service_token`].
+    pub fn renew_agent_service_token(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        anchor_id: &str,
+    ) -> Result<String, AuthError> {
+        self.mint_agent_service_token(agent_id, tenant_id, anchor_id)
+    }
+
+    /// The service credential itself, for the two entries above.
+    fn mint_agent_service_token(
         &self,
         agent_id: ObjectId,
         tenant_id: ObjectId,
@@ -609,8 +681,9 @@ impl AuthService {
     // ─── tunnel client tokens ─────────────────────────────────
 
     /// Mint a single-use tunnel-enrollment token. Returned `jti` is
-    /// unique; caller may persist for replay protection. Mirrors
-    /// [`issue_enrollment_token`] but with a distinct audience.
+    /// unique; `POST /api/tunnel-client/enroll` spends it on the used-token
+    /// ledger ([`single_use`]). Mirrors [`Self::issue_enrollment_token`] but
+    /// with a distinct audience.
     pub fn issue_tunnel_enrollment_token(
         &self,
         admin_user_id: ObjectId,
@@ -633,23 +706,67 @@ impl AuthService {
         Ok((token, jti))
     }
 
+    /// Verify a tunnel-enrollment token. It comes back [`Unspent`]: the enroll
+    /// route reads its claims, and spends it before it writes anything.
     pub fn verify_tunnel_enrollment_token(
         &self,
         token: &str,
-    ) -> Result<TunnelEnrollmentClaims, AuthError> {
+    ) -> Result<Unspent<TunnelEnrollmentClaims>, AuthError> {
         let claims = self.decode_any::<TunnelEnrollmentClaims>(token, &self.validation())?;
         if claims.token_type != TokenType::TunnelEnrollment {
             return Err(AuthError::InvalidToken(
                 "Not a tunnel-enrollment token".to_string(),
             ));
         }
-        Ok(claims)
+        Ok(Unspent::new(claims))
     }
 
-    /// Mint a long-lived tunnel-client token at the client row's token
-    /// generation `gen` (FR-103). Default TTL one year, override via
-    /// `override_ttl_secs`. Mirrors [`Self::issue_agent_token`].
+    /// Mint the long-lived tunnel-client token an ENROLLMENT earns, at the
+    /// client row's token generation `generation` (FR-103). It takes the
+    /// enrollment token spent on the ledger (#3328), and the credential is
+    /// for the org that token was minted for and owned by the person it was
+    /// minted for. Default TTL one year, override via `override_ttl_secs`.
     pub fn issue_tunnel_client_token(
+        &self,
+        enrollment: Spent<TunnelEnrollmentClaims>,
+        tunnel_client_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        let tenant_id = enrollment.tenant()?;
+        let owner_user_id = enrollment.subject()?;
+        self.mint_tunnel_client_token(
+            tunnel_client_id,
+            tenant_id,
+            owner_user_id,
+            generation,
+            override_ttl_secs,
+        )
+    }
+
+    /// FR-103 — a fresh tunnel-client token for a client that renews the one
+    /// it holds (`POST /api/tunnel-client/renew`), with the same owner.
+    /// Renewal only: an enrollment mints through
+    /// [`Self::issue_tunnel_client_token`].
+    pub fn renew_tunnel_client_token(
+        &self,
+        tunnel_client_id: ObjectId,
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+        generation: u32,
+        override_ttl_secs: Option<u64>,
+    ) -> Result<String, AuthError> {
+        self.mint_tunnel_client_token(
+            tunnel_client_id,
+            tenant_id,
+            owner_user_id,
+            generation,
+            override_ttl_secs,
+        )
+    }
+
+    /// The tunnel-client token itself, for the two entries above.
+    fn mint_tunnel_client_token(
         &self,
         tunnel_client_id: ObjectId,
         tenant_id: ObjectId,
@@ -736,7 +853,7 @@ mod tests {
         let agent_id = ObjectId::new();
         let tenant_id = ObjectId::new();
         let token = s
-            .issue_agent_token(agent_id, tenant_id, 0, Some(60))
+            .mint_agent_token(agent_id, tenant_id, 0, Some(60))
             .unwrap();
         let claims = s.verify_agent_token(&token).unwrap();
         assert_eq!(claims.sub, agent_id.to_hex());
@@ -750,7 +867,8 @@ mod tests {
         let admin = ObjectId::new();
         let tenant = ObjectId::new();
         let (token, jti) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
-        let claims = s.verify_enrollment_token(&token).unwrap();
+        let unspent = s.verify_enrollment_token(&token).unwrap();
+        let claims = unspent.claims();
         assert_eq!(claims.sub, admin.to_hex());
         assert_eq!(claims.tenant_id, tenant.to_hex());
         assert_eq!(claims.jti, jti);
@@ -771,7 +889,7 @@ mod tests {
         let s = svc();
         let agent_id = ObjectId::new();
         let tenant = ObjectId::new();
-        let token = s.issue_agent_token(agent_id, tenant, 0, Some(60)).unwrap();
+        let token = s.mint_agent_token(agent_id, tenant, 0, Some(60)).unwrap();
         let err = s.verify_enrollment_token(&token).unwrap_err();
         matches!(err, AuthError::InvalidToken(_));
     }
@@ -791,23 +909,29 @@ mod tests {
             .unwrap();
 
         // _any accepts it and says which kind arrived.
-        let (claims, is_ephemeral) = s.verify_enrollment_token_any(&token).unwrap();
-        assert!(is_ephemeral);
+        let EnrollmentCredential::EphemeralKey(claims) =
+            s.verify_enrollment_token_any(&token).unwrap()
+        else {
+            panic!("an ephemeral key must read as one");
+        };
         assert_eq!(claims.jti, "jti-eph-1");
         assert_eq!(claims.token_type, TokenType::EphemeralEnrollment);
 
         // The single-use verifier refuses it (it is not that kind).
         assert!(s.verify_enrollment_token(&token).is_err());
 
-        // A standard enrollment token through _any reads as NOT ephemeral.
+        // A standard enrollment token through _any reads as the single-use
+        // kind, unspent (#3328).
         let (std_token, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
-        let (_, is_ephemeral) = s.verify_enrollment_token_any(&std_token).unwrap();
-        assert!(!is_ephemeral);
+        assert!(matches!(
+            s.verify_enrollment_token_any(&std_token).unwrap(),
+            EnrollmentCredential::SingleUse(_)
+        ));
 
         // And _any refuses every other audience — an agent token here would
         // mean any enrolled device could mint sibling devices.
         let agent_token = s
-            .issue_agent_token(ObjectId::new(), tenant, 0, Some(60))
+            .mint_agent_token(ObjectId::new(), tenant, 0, Some(60))
             .unwrap();
         assert!(s.verify_enrollment_token_any(&agent_token).is_err());
     }
@@ -827,12 +951,12 @@ mod tests {
         let (anchoring, jti) = s
             .issue_enrollment_token_with(admin, tenant, 600, true)
             .unwrap();
-        let claims = s.verify_enrollment_token(&anchoring).unwrap();
-        assert!(claims.anchor);
-        assert_eq!(claims.jti, jti);
+        let unspent = s.verify_enrollment_token(&anchoring).unwrap();
+        assert!(unspent.claims().anchor);
+        assert_eq!(unspent.claims().jti, jti);
 
         let (plain, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
-        assert!(!s.verify_enrollment_token(&plain).unwrap().anchor);
+        assert!(!s.verify_enrollment_token(&plain).unwrap().claims().anchor);
         // Not even written into a plain token's payload: byte-for-byte the
         // tokens minted before FR-104.
         let payload = plain.split('.').nth(1).unwrap();
@@ -849,7 +973,7 @@ mod tests {
         let agent = ObjectId::new();
         let tenant = ObjectId::new();
         let service = s
-            .issue_agent_service_token(agent, tenant, "anchor-1")
+            .mint_agent_service_token(agent, tenant, "anchor-1")
             .unwrap();
 
         let claims = s.verify_agent_service_token(&service).unwrap();
@@ -868,7 +992,7 @@ mod tests {
 
         // And the agent token, the one the user can read, is not a service
         // credential.
-        let agent_token = s.issue_agent_token(agent, tenant, 0, Some(60)).unwrap();
+        let agent_token = s.mint_agent_token(agent, tenant, 0, Some(60)).unwrap();
         assert!(s.verify_agent_service_token(&agent_token).is_err());
         let (enroll, _) = s
             .issue_enrollment_token(ObjectId::new(), tenant, 600)
@@ -902,7 +1026,7 @@ mod tests {
         let tid = ObjectId::new();
         let uid = ObjectId::new();
         let token = s
-            .issue_tunnel_client_token(cid, tid, uid, 0, Some(60))
+            .mint_tunnel_client_token(cid, tid, uid, 0, Some(60))
             .unwrap();
         let claims = s.verify_tunnel_client_token(&token).unwrap();
         assert_eq!(claims.sub, cid.to_hex());
@@ -917,7 +1041,8 @@ mod tests {
         let admin = ObjectId::new();
         let tenant = ObjectId::new();
         let (token, jti) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
-        let claims = s.verify_tunnel_enrollment_token(&token).unwrap();
+        let unspent = s.verify_tunnel_enrollment_token(&token).unwrap();
+        let claims = unspent.claims();
         assert_eq!(claims.sub, admin.to_hex());
         assert_eq!(claims.tenant_id, tenant.to_hex());
         assert_eq!(claims.jti, jti);
@@ -932,6 +1057,87 @@ mod tests {
         let (_, jti1) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
         let (_, jti2) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
         assert_ne!(jti1, jti2);
+    }
+
+    /// #3328 — an enrollment mint takes the redemption itself, and reads the
+    /// org from it: the credential is for the org the token (or the
+    /// ephemeral key) was minted for, and a tunnel client's is owned by the
+    /// person the token was minted for. Nothing a door passes can point it
+    /// anywhere else.
+    #[test]
+    fn an_enrollment_mints_for_the_org_and_the_person_its_token_names() {
+        let s = svc();
+        let (admin, tenant) = (ObjectId::new(), ObjectId::new());
+        // What `UsedTokenDao::spend` hands back once the ledger took the use.
+        let spend = |unspent: Unspent<EnrollmentClaims>| Spent::new(unspent.into_claims());
+
+        let (token, _) = s.issue_tunnel_enrollment_token(admin, tenant, 600).unwrap();
+        let spent = Spent::new(
+            s.verify_tunnel_enrollment_token(&token)
+                .unwrap()
+                .into_claims(),
+        );
+        let client = ObjectId::new();
+        let minted = s
+            .issue_tunnel_client_token(spent, client, 3, Some(60))
+            .unwrap();
+        let claims = s.verify_tunnel_client_token(&minted).unwrap();
+        assert_eq!(claims.sub, client.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.owner_user_id, admin.to_hex());
+        assert_eq!(claims.generation, 3);
+
+        let agent = ObjectId::new();
+        let (token, _) = s.issue_enrollment_token(admin, tenant, 600).unwrap();
+        let spent = spend(s.verify_enrollment_token(&token).unwrap());
+        let minted = s
+            .issue_agent_token(AgentEnrollment::Token(spent), agent, 1, Some(60))
+            .unwrap();
+        let claims = s.verify_agent_token(&minted).unwrap();
+        assert_eq!(claims.sub, agent.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.generation, 1);
+
+        let now = bson::DateTime::now();
+        let key = roomler_ai_remote_control::models::EnrollmentKey {
+            id: Some(ObjectId::new()),
+            tenant_id: tenant,
+            jti: "jti-eph-2".to_string(),
+            label: "ci".to_string(),
+            created_by: admin,
+            max_uses: 5,
+            uses: 1,
+            expires_at: now,
+            revoked_at: None,
+            ephemeral_ttl_secs: None,
+            last_used_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let minted = s
+            .issue_agent_token(
+                AgentEnrollment::EphemeralKey(ClaimedKeyUse::new(key)),
+                agent,
+                0,
+                Some(60),
+            )
+            .unwrap();
+        assert_eq!(
+            s.verify_agent_token(&minted).unwrap().tenant_id,
+            tenant.to_hex()
+        );
+
+        let (token, _) = s
+            .issue_enrollment_token_with(admin, tenant, 600, true)
+            .unwrap();
+        let spent = spend(s.verify_enrollment_token(&token).unwrap());
+        let minted = s
+            .issue_agent_service_token(spent, agent, "anchor-9")
+            .unwrap();
+        let claims = s.verify_agent_service_token(&minted).unwrap();
+        assert_eq!(claims.sub, agent.to_hex());
+        assert_eq!(claims.tenant_id, tenant.to_hex());
+        assert_eq!(claims.anchor_id, "anchor-9");
     }
 
     // verify_tunnel_client_token rejects every other audience
@@ -959,7 +1165,7 @@ mod tests {
     fn tunnel_client_verify_rejects_agent_token() {
         let s = svc();
         let t = s
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let err = s.verify_tunnel_client_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -1010,7 +1216,7 @@ mod tests {
     fn tunnel_enrollment_verify_rejects_agent_token() {
         let s = svc();
         let t = s
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let err = s.verify_tunnel_enrollment_token(&t).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken(_)));
@@ -1030,7 +1236,7 @@ mod tests {
     fn tunnel_enrollment_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1048,7 +1254,7 @@ mod tests {
     fn agent_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1074,7 +1280,7 @@ mod tests {
     fn access_verify_rejects_tunnel_client_token() {
         let s = svc();
         let t = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),
@@ -1136,7 +1342,7 @@ mod tests {
         let a = svc_with(SECRET_A, "");
         let b = svc_with(SECRET_B, "");
         let t = a
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         let kid = jsonwebtoken::decode_header(&t).unwrap().kid.expect("kid");
 
@@ -1161,7 +1367,7 @@ mod tests {
     fn rotation_keeps_tokens_minted_under_the_previous_secret() {
         let old = svc_with(SECRET_A, "");
         let old_token = old
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
 
         // The flag day, for contrast: swap the secret and carry nothing over.
@@ -1178,7 +1384,7 @@ mod tests {
 
         // …and it signs with the NEW key, not the retired one.
         let fresh = rotated
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
         assert_eq!(
             jsonwebtoken::decode_header(&fresh).unwrap().kid.unwrap(),
@@ -1198,7 +1404,7 @@ mod tests {
     fn a_forged_kid_buys_nothing() {
         let s = svc_with(SECRET_A, "");
         let foreign = svc_with(SECRET_B, "")
-            .issue_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
+            .mint_agent_token(ObjectId::new(), ObjectId::new(), 0, Some(60))
             .unwrap();
 
         // Signed with B, but re-labelled to name A's key.
@@ -1311,7 +1517,7 @@ mod tests {
 
         // The renewal verifier is still an AGENT verifier: no other audience.
         let tunnel = s
-            .issue_tunnel_client_token(
+            .mint_tunnel_client_token(
                 ObjectId::new(),
                 ObjectId::new(),
                 ObjectId::new(),

@@ -13,6 +13,7 @@ use axum::{
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
 use roomler_ai_remote_control::models::{AccessPolicy, AgentStatus, InstallInfo, OsKind};
+use roomler_ai_services::auth::{AgentEnrollment, EnrollmentCredential, SpendPurpose};
 use roomler_ai_services::dao::base::{DaoError, PaginationParams};
 use roomler_ai_services::dao::tenant::TenantDao;
 use roomler_ai_services::quota;
@@ -207,9 +208,10 @@ pub async fn enroll_agent(
     State(state): State<FleetState>,
     Json(body): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, ApiError> {
-    let (claims, is_ephemeral) = state
+    let credential = state
         .auth
         .verify_enrollment_token_any(&body.enrollment_token)?;
+    let claims = credential.claims();
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
     let admin_uid = ObjectId::parse_str(&claims.sub)
@@ -219,9 +221,15 @@ pub async fn enroll_agent(
     // burn the token.
     org_accepts_enrollment(&state.tenants, tid).await?;
 
-    if is_ephemeral {
-        return enroll_agent_ephemeral(&state, tid, admin_uid, &claims.jti, body).await;
-    }
+    // #3328 — a single-use token arrives UNSPENT: it reads claims and mints
+    // nothing until the spend below. An ephemeral key's row decides each of
+    // its uses instead.
+    let token = match credential {
+        EnrollmentCredential::SingleUse(token) => token,
+        EnrollmentCredential::EphemeralKey(claims) => {
+            return enroll_agent_ephemeral(&state, tid, admin_uid, &claims.jti, body).await;
+        }
+    };
 
     // If a row already exists for (tenant_id, machine_id), rehydrate it —
     // refresh name / os / agent_version, clear `deleted_at` if soft-deleted,
@@ -255,27 +263,20 @@ pub async fn enroll_agent(
     }
 
     // Enrollment tokens are single-use BY DESIGN and were never enforced —
-    // field 2026-08-05 replayed one after a cap rejection. Claimed on BOTH
+    // field 2026-08-05 replayed one after a cap rejection. Spent on BOTH
     // branches: a replay against a KNOWN machine still mints a fresh agent
     // JWT, which is the credential worth protecting.
     //
-    // The claim fails CLOSED (see `UsedTokenDao::claim`), and the two failures
+    // The spend fails CLOSED (see `UsedTokenDao::claim`), and the two failures
     // are reported differently on purpose: "already used" sends an operator
     // looking for a replay, so a ledger that merely could not answer must not
     // borrow that phrasing. It gets a 503 the caller can retry — the token is
-    // still valid for the rest of its 10 minutes.
-    state
+    // still valid for the rest of its 10 minutes (`From<SpendRefusal>`).
+    let spent = state
         .used_tokens
-        .claim(&claims.jti, "agent-enroll")
-        .await
-        .map_err(|e| match e {
-            roomler_ai_services::dao::base::DaoError::Validation(_) => {
-                ApiError::Unauthorized("This enrollment token has already been used".into())
-            }
-            _ => ApiError::ServiceUnavailable(
-                "Could not verify this enrollment token is unused; please retry".into(),
-            ),
-        })?;
+        .spend(token, SpendPurpose::AgentEnroll)
+        .await?;
+    let claims = spent.claims();
 
     // FR-102 P3 — the request's install claim, clamped to the vocabulary. A
     // known row keeps what it has unless this request says (a re-enroll by
@@ -342,10 +343,11 @@ pub async fn enroll_agent(
     }
     // FR-103 — at the row's CURRENT generation. A row revived after a removal
     // has a higher one than before, so the token minted here is accepted and
-    // every token from before the removal is not.
+    // every token from before the removal is not. The mint takes the spent
+    // token itself (#3328): one spend, one credential.
     let agent_token = state.auth.issue_agent_token(
+        AgentEnrollment::Token(spent),
         agent_id,
-        tid,
         agent.token_gen,
         Some(state.settings.rc.agent_token_ttl_secs),
     )?;
@@ -404,8 +406,9 @@ async fn enroll_agent_ephemeral(
 
     // The atomic use-claim: not revoked, not expired, ceiling not reached,
     // counter bumped — one operation, so racing replicas cannot overshoot
-    // and a revocation lands on the very next use.
-    let Some(key) = state.enrollment_keys.claim_use(tid, jti).await? else {
+    // and a revocation lands on the very next use. It is this branch's
+    // redemption, and what the agent mint below takes (#3328).
+    let Some(used) = state.enrollment_keys.claim_use(tid, jti).await? else {
         let reason = state
             .enrollment_keys
             .refusal_reason(tid, jti)
@@ -418,6 +421,7 @@ async fn enroll_agent_ephemeral(
             reason.as_str()
         )));
     };
+    let key = used.key();
     let key_id = key
         .id
         .ok_or_else(|| ApiError::Internal("enrollment key missing _id".to_string()))?;
@@ -472,8 +476,8 @@ async fn enroll_agent_ephemeral(
     // FR-103 — at the row's generation. An ephemeral row is always new
     // (never rehydrated), so that is 0; reading it keeps the rule in one place.
     let agent_token = state.auth.issue_agent_token(
+        AgentEnrollment::EphemeralKey(used),
         agent_id,
-        tid,
         agent.token_gen,
         Some(state.settings.rc.agent_token_ttl_secs),
     )?;
@@ -518,7 +522,7 @@ pub async fn self_renew(
     }
     let agent = crate::auth_agent::authenticate_for_renewal(&state, &headers).await?;
     let ttl = state.settings.rc.agent_token_ttl_secs;
-    let agent_token = state.auth.issue_agent_token(
+    let agent_token = state.auth.renew_agent_token(
         agent.agent_id,
         agent.tenant_id,
         agent.agent.token_gen,
