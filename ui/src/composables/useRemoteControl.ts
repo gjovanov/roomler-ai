@@ -92,6 +92,7 @@ import {
   type RcConnectRecorder,
 } from './rcConnectTiming'
 import { createConnectTimingUploader, type RcConnectOutcome } from './rcConnectTimingUpload'
+import type { RcReloadState, RcReloadSurface, RcResumeArgs } from '@/utils/staleBuildPolicy'
 import {
   PROBE_TARGET,
   benchSessionMode,
@@ -423,6 +424,32 @@ export function terminateAction(args: {
 
 export function isRetryableRcErrorCode(code: unknown): boolean {
   return code === 'agent_busy' || code === 'agent_offline' || code === 'session_not_found'
+}
+
+/**
+ * #3582 - this viewer, as a reload for a new build sees it
+ * (`utils/staleBuildPolicy.ts`). `redialing` is the one state a reload can
+ * take over without cutting anything: the session is already gone, the
+ * ladder's timer is waiting (or a reload holds it), nothing is in flight, and
+ * the args to open the next one are known. A request or a consent prompt in
+ * flight is `live`: a reload then would abandon a question the host may be
+ * reading. An external session (FR-52) never redials, so it is never
+ * `redialing`.
+ */
+export function rcReloadState(inp: {
+  phase: RcPhase
+  redialPending: boolean
+  hasArgs: boolean
+  external: boolean
+  work: boolean
+}): RcReloadState {
+  const session =
+    inp.phase === 'idle' || inp.phase === 'closed' || inp.phase === 'error'
+      ? 'none'
+      : inp.phase === 'reconnecting' && inp.redialPending && inp.hasArgs && !inp.external
+        ? 'redialing'
+        : 'live'
+  return { session, external: inp.external, work: inp.work }
 }
 
 /**
@@ -9573,6 +9600,45 @@ export function useRemoteControl(
   }
 
   /**
+   * #3582 - what a reload for a new build reads from this viewer and asks of
+   * it (`utils/staleBuildWatch.ts`; RemoteControl.vue registers it). The one
+   * thing it may take over is the redial: the session is already cut, so a
+   * reload that resumes it costs the person about the page's load time, and
+   * the host no consent the redial would not have asked for. `holdRedial`
+   * stops the pending retry so no request leaves a page that is unloading;
+   * `releaseRedial` gives it back when the reload does not happen.
+   */
+  let redialHeldForReload = false
+  const reloadSurface: RcReloadSurface = {
+    state: () =>
+      rcReloadState({
+        phase: phase.value,
+        redialPending: reconnectTimer !== null || redialHeldForReload,
+        hasArgs: lastConnectArgs !== null,
+        external: externalMode,
+        // What lives only in this page's memory: a transfer the redial would
+        // resume (rc.19), a recording's download.
+        work:
+          transfers.value.some((t) => t.status === 'queued' || t.status === 'running' || t.status === 'reconnecting')
+          || recording.download.value?.status === 'active'
+          || recording.download.value?.status === 'paused',
+      }),
+    resumeArgs: () => (externalMode || !lastConnectArgs ? null : { ...lastConnectArgs }),
+    holdRedial: (): RcResumeArgs | null => {
+      if (externalMode || phase.value !== 'reconnecting' || reconnectTimer === null || !lastConnectArgs) return null
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+      redialHeldForReload = true
+      return { ...lastConnectArgs }
+    },
+    releaseRedial: () => {
+      if (!redialHeldForReload) return
+      redialHeldForReload = false
+      if (phase.value === 'reconnecting' && reconnectTimer === null && lastConnectArgs) fireReconnectAttempt()
+    },
+  }
+
+  /**
    * Resolve true the moment the signalling socket reports 'connected',
    * or false after `timeoutMs`. Used by the rc pre-flight so the
    * session request never fires into a CONNECTING socket.
@@ -13887,9 +13953,11 @@ export function useRemoteControl(
      * `phase === 'reconnecting'`.
      */
     reconnectAttempt,
+    /** #3582 - what a reload for a new build reads from this viewer and asks of it. */
+    reloadSurface,
     lastTtffMs,
     /**
-     * S3 Ã¢ÂÂ sub-connected health. Non-null while `phase ===
+     * S3Ã¢ÂÂ sub-connected health. Non-null while `phase ===
      * 'connected'` but something is off: 'transport_unstable' (pc
      * left 'connected'), 'media_stalled' (keyframe probe
      * outstanding), 'signalling_offline' (WS down; media may still

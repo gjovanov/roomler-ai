@@ -11,6 +11,7 @@ import App from '@/App.vue'
 import { clearLegacyTokens } from '@/api/session'
 import { loadAnalytics } from '@/utils/analytics'
 import { installStaleBuildRecovery } from '@/utils/staleBuild'
+import { installStaleBuildWatch } from '@/utils/staleBuildWatch'
 import { useCapabilitiesStore } from '@/stores/capabilities'
 
 // Delete the tokens earlier versions kept in localStorage — an access token
@@ -37,6 +38,12 @@ app.use(pinia)
 // and the navigation hides the pillars the server does not mount. Never
 // blocks the mount and never throws — an unanswered server fails OPEN.
 void useCapabilitiesStore().load()
+// #3582 — a tab that never navigates learns of a new build itself: it compares
+// the build it runs with the one the server serves, at every /ws reconnect and
+// every 10 minutes, and reloads at a moment that loses nothing, resuming a
+// remote session the reload took over (utils/staleBuildWatch.ts). Before the
+// router: the resume a reload handed over must be taken before any page renders.
+installStaleBuildWatch(router)
 app.use(router)
 // A tab left open across a promote asks for chunks the new image no longer
 // has: load the page the server serves now, once (utils/staleBuild.ts).

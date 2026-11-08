@@ -733,6 +733,7 @@ import SearchDialog from '@/components/layout/SearchDialog.vue'
 import { useSnackbar } from '@/composables/useSnackbar'
 import { useValidation } from '@/composables/useValidation'
 import { immersiveViewer } from '@/composables/useImmersiveViewer'
+import { bindStaleBuildWatch } from '@/utils/staleBuildWatch'
 import {
   hasSeenTour,
   markTourSeen,
@@ -755,6 +756,14 @@ const orgBadges = useOrgBadgesStore()
 const conferenceStore = useConferenceStore()
 const { returnToCall, hangUp } = useCallControls()
 const wsStore = useWsStore()
+// #3582 — the shell owns the socket and sees the call: every (re)connect is a
+// moment to compare builds, and a call is a reason never to reload
+// (utils/staleBuildWatch.ts).
+const unbindStaleBuildWatch = bindStaleBuildWatch({
+  wsStatus: () => wsStore.status,
+  meetingLive: () => conferenceStore.isInCall,
+})
+onUnmounted(unbindStaleBuildWatch)
 // FR-69 P9 — which pillars THIS server mounts. Every nav item below that
 // belongs to a module reads `caps.has(...)`: one predicate for navigation
 // and routes (the router guard reads the same store), fail-open until the

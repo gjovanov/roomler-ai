@@ -16,6 +16,13 @@
  * missing from the build being served is not cured by asking again. Where
  * storage cannot be written there is no record to stop a loop with, so
  * nothing reloads at all: the old behaviour, never a worse one.
+ *
+ * This catches only a tab that navigates. A tab that stays on one page (a
+ * remote-control viewer left open all day, #3582) never asks for a chunk, so
+ * nothing here ever fires for it. `utils/staleBuildWatch.ts` covers that tab:
+ * it compares the build the page runs with the one the server serves
+ * (`/version.json`) and reloads at a moment that loses nothing, through the
+ * same claim, under its own key and a 10-minute window.
  */
 import type { Router } from 'vue-router'
 
@@ -34,14 +41,41 @@ export function isChunkLoadError(err: unknown): boolean {
 /**
  * Records the reload and returns true when one may happen now; false inside
  * the window of the last one, or when storage cannot hold the record.
+ * `key` and `windowMs` let another reloader keep its own record
+ * (`staleBuildPolicy.ts`'s `NEW_BUILD_RELOAD_KEY`).
  */
-export function claimReload(storage: Pick<Storage, 'getItem' | 'setItem'> | undefined, now: number): boolean {
+export function claimReload(
+  storage: Pick<Storage, 'getItem' | 'setItem'> | undefined,
+  now: number,
+  key: string = RELOAD_KEY,
+  windowMs: number = RELOAD_WINDOW_MS,
+): boolean {
   if (!storage) return false
   try {
-    const last = Number(storage.getItem(RELOAD_KEY) ?? 0)
-    if (Number.isFinite(last) && now - last < RELOAD_WINDOW_MS) return false
-    storage.setItem(RELOAD_KEY, String(now))
+    const last = Number(storage.getItem(key) ?? 0)
+    if (Number.isFinite(last) && now - last < windowMs) return false
+    storage.setItem(key, String(now))
     return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Whether `claimReload` could claim now, without recording anything: false
+ * inside the window, or when storage cannot be read. (Whether it can be
+ * WRITTEN is learned only by the claim itself, which then refuses.)
+ */
+export function reloadClaimable(
+  storage: Pick<Storage, 'getItem'> | undefined,
+  now: number,
+  key: string = RELOAD_KEY,
+  windowMs: number = RELOAD_WINDOW_MS,
+): boolean {
+  if (!storage) return false
+  try {
+    const last = Number(storage.getItem(key) ?? 0)
+    return !(Number.isFinite(last) && now - last < windowMs)
   } catch {
     return false
   }

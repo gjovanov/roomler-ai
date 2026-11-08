@@ -15,12 +15,15 @@
         <v-btn variant="text" @click="snackbar.hideSnackbar()">Close</v-btn>
       </template>
     </v-snackbar>
+    <!-- #3582 — a new build is out, and a reload now would lose something. -->
+    <new-build-banner :attach="fullscreenEl" />
   </v-app>
 </template>
 
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useSnackbar } from '@/composables/useSnackbar'
+import NewBuildBanner from '@/components/layout/NewBuildBanner.vue'
 
 const snackbar = useSnackbar()
 
