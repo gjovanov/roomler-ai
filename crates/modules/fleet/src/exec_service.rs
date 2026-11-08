@@ -43,6 +43,7 @@ use roomler_ai_remote_control::error::Error as HubError;
 use roomler_ai_remote_control::models::{
     Agent, ExecAnchor, ExecAuditEvent, ExecDenyReason, ExecOutcome, ExecPending, OsKind,
 };
+use roomler_ai_services::auth::SpendPurpose;
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_permission};
 
 use crate::FleetState;
@@ -122,7 +123,10 @@ pub async fn anchor(
     State(state): State<FleetState>,
     Json(body): Json<AnchorRequest>,
 ) -> Result<Json<AnchorResponse>, ApiError> {
-    let claims = state.auth.verify_enrollment_token(&body.enrollment_token)?;
+    // #3328 — UNSPENT until the spend below, which every check before it may
+    // refuse without burning the token.
+    let token = state.auth.verify_enrollment_token(&body.enrollment_token)?;
+    let claims = token.claims();
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
     let admin_uid = ObjectId::parse_str(&claims.sub)
@@ -175,23 +179,16 @@ pub async fn anchor(
     // the single use it always was (its enrollment already spent it).
     let second_use =
         claims.anchor && agent.enrolled_with_jti.as_deref() == Some(claims.jti.as_str());
-    let use_key = if second_use {
-        format!("{}:anchor", claims.jti)
+    // The spend answers as the daemon door's does: 401 for a token used
+    // before, a retryable 503 when the ledger cannot answer.
+    let spent = if second_use {
+        state.used_tokens.spend_anchor_second_use(token).await?
     } else {
-        claims.jti.clone()
+        state
+            .used_tokens
+            .spend(token, SpendPurpose::AgentAnchor)
+            .await?
     };
-    state
-        .used_tokens
-        .claim(&use_key, "agent-anchor")
-        .await
-        .map_err(|e| match e {
-            roomler_ai_services::dao::base::DaoError::Validation(_) => {
-                ApiError::Unauthorized("This enrollment token has already been used".into())
-            }
-            _ => ApiError::ServiceUnavailable(
-                "Could not verify this enrollment token is unused; please retry".into(),
-            ),
-        })?;
 
     // A fresh id per anchor: writing it revokes every credential an earlier
     // anchor of this device minted. It binds a signed token, so it needs to
@@ -199,7 +196,7 @@ pub async fn anchor(
     let anchor_id = ObjectId::new().to_hex();
     let service_token = state
         .auth
-        .issue_agent_service_token(agent_id, tid, &anchor_id)?;
+        .issue_agent_service_token(spent, agent_id, &anchor_id)?;
     let anchor = ExecAnchor {
         anchored_at: DateTime::now(),
         anchored_by: admin_uid,
@@ -255,7 +252,7 @@ pub async fn renew(
     let service_token =
         state
             .auth
-            .issue_agent_service_token(svc.agent_id, svc.tenant_id, anchor_id)?;
+            .renew_agent_service_token(svc.agent_id, svc.tenant_id, anchor_id)?;
     info!(agent = %svc.agent_id, "fleet-rpc: SYSTEM service renewed its credential");
     Ok(Json(RenewResponse { service_token }))
 }

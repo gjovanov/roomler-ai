@@ -22,7 +22,9 @@ use roomler_ai_mod_fleet::agent::org_accepts_enrollment;
 use roomler_ai_remote_control::models::{
     AgentStatus, DestinationRule, NodeRef, OsKind, PolicySubject, PolicyTarget,
 };
-use roomler_ai_services::dao::base::PaginationParams;
+use roomler_ai_services::auth::SpendPurpose;
+use roomler_ai_services::dao::base::{DaoError, PaginationParams};
+use roomler_ai_services::dao::tunnel_client::ReviveScope;
 use roomler_ai_services::quota;
 use serde::{Deserialize, Serialize};
 
@@ -48,9 +50,11 @@ pub struct TunnelEnrollmentTokenResponse {
 }
 
 /// POST /api/tenant/{tenant_id}/tunnel-client/enroll-token —
-/// admin/member issues a single-use token the operator pastes into
+/// a member issues a single-use token the operator pastes into
 /// `roomler enroll`. Mirrors `issue_enrollment_token` for
-/// agents.
+/// agents. The token acts for the person who minted it: it enrolls a
+/// new machine as theirs, and re-enrolls a known machine id only if
+/// they may (`enroll_tunnel_client`).
 pub async fn issue_tunnel_enrollment_token(
     State(state): State<NetworkState>,
     auth: AuthUser,
@@ -92,27 +96,52 @@ pub struct TunnelEnrollResponse {
     pub tunnel_client_token: String,
 }
 
+/// What a re-enrollment of a LIVE tunnel client answers (409) when the
+/// enrollment token was minted for someone who may not make it (#3328).
+pub const SOMEONE_ELSES_TUNNEL_CLIENT: &str = "This machine is already enrolled as someone \
+     else's tunnel client in this organization. Only its owner, or someone with the Manage \
+     devices permission, can enroll it again. Enroll this machine under a different name, or \
+     ask an organization administrator.";
+
+/// What a re-enrollment of a REMOVED tunnel client answers (409) when the
+/// enrollment token was minted for someone without `MANAGE_AGENTS`, its
+/// owner included (#3328).
+pub const REMOVED_TUNNEL_CLIENT: &str = "This machine's tunnel client was removed from this \
+     organization, and only someone with the Manage devices permission can bring it back. Ask \
+     an organization administrator for an enrollment token.";
+
 /// POST /api/tunnel-client/enroll — public (no user JWT);
 /// authenticates via the tunnel-enrollment token and returns a
 /// long-lived TunnelClient JWT. Rehydrates an existing
 /// `(tenant_id, machine_id)` row if one is found (covers soft-deleted
 /// tombstones too — see [`TunnelClientDao::find_by_tenant_and_machine`]).
 ///
-/// `owner_user_id` is taken from the enrollment claim's `sub` — the
-/// admin who issued the token. v1 limitation: this records the
-/// admin's identity rather than the operator's. v1.1 can extend the
-/// enrollment request with an operator user-id once we have the
-/// admin-UI flow to enter it.
+/// The request carries no user session, so the enrollment acts for the
+/// person the token was minted for (its `sub`): a new row is theirs
+/// (`owner_user_id`), and so is the minted token's owner.
+///
+/// #3328 — the order is the contract:
+/// 1. the token is verified, and comes back unspent;
+/// 2. the archived-org gate (#3042);
+/// 3. a known machine id re-enrolls only for its owner, while the client
+///    is live, or for a holder of `MANAGE_AGENTS` ([`revive_scope`], 409
+///    otherwise); a new one meets the plan's tunnel-client cap (403);
+/// 4. the token is spent on the used-token ledger: 401 if it was spent
+///    before, a retryable 503 if the ledger cannot answer;
+/// 5. the row is written and the client's token minted from the spent token.
+///
+/// Every refusal before step 4 leaves the token unspent and writes nothing.
 pub async fn enroll_tunnel_client(
     State(state): State<NetworkState>,
     Json(body): Json<TunnelEnrollRequest>,
 ) -> Result<Json<TunnelEnrollResponse>, ApiError> {
-    let claims = state
+    let token = state
         .auth
         .verify_tunnel_enrollment_token(&body.enrollment_token)?;
+    let claims = token.claims();
     let tid = ObjectId::parse_str(&claims.tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id claim".to_string()))?;
-    let admin_uid = ObjectId::parse_str(&claims.sub)
+    let enroller = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
     // #3042 — before the row below: this is the door that revives a tombstone.
@@ -122,14 +151,10 @@ pub async fn enroll_tunnel_client(
         .tunnel_clients
         .find_by_tenant_and_machine(tid, &body.machine_id)
         .await?;
-    let client = match existing {
-        Some(c) => {
-            let id =
-                c.id.ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
-            state
-                .tunnel_clients
-                .rehydrate(id, &body.machine_name, body.os, &body.client_version)
-                .await?
+    let revival = match existing {
+        Some(row) => {
+            let scope = revive_scope(&state, tid, enroller, &row).await?;
+            Some((row, scope))
         }
         None => {
             // S5 — plan tunnel-client cap. Mirrors the device cap in
@@ -148,11 +173,39 @@ pub async fn enroll_tunnel_client(
                     d.plan, d.used, d.max
                 )));
             }
+            None
+        }
+    };
+
+    // #3328 — the token's one use, after every refusal above and before every
+    // write below. On BOTH branches: a replay against a known machine id would
+    // still mint a fresh year-long token for that client.
+    let spent = state
+        .used_tokens
+        .spend(token, SpendPurpose::TunnelEnroll)
+        .await?;
+
+    let client = match revival {
+        Some((row, scope)) => {
+            let id = row
+                .id
+                .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
+            // `None`: the row left the scope decided above in the meantime (an
+            // admin removed it, say). The token is spent by now, but bringing
+            // the client back would undo a removal this enrollment may not
+            // undo, so it is refused like any other.
+            state
+                .tunnel_clients
+                .rehydrate(id, &body.machine_name, body.os, &body.client_version, scope)
+                .await?
+                .ok_or_else(|| ApiError::Conflict(REMOVED_TUNNEL_CLIENT.to_string()))?
+        }
+        None => {
             state
                 .tunnel_clients
                 .create(
                     tid,
-                    admin_uid,
+                    enroller,
                     body.machine_name,
                     body.machine_id,
                     body.os,
@@ -166,11 +219,12 @@ pub async fn enroll_tunnel_client(
         .id
         .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
     // FR-103 — at the row's CURRENT generation, so a client revived after a
-    // removal gets a token that is accepted, and its old ones are not.
+    // removal gets a token that is accepted, and its old ones are not. The
+    // mint takes the spent token (#3328), and reads the org and the owner
+    // from it.
     let tunnel_client_token = state.auth.issue_tunnel_client_token(
+        spent,
         client_id,
-        tid,
-        admin_uid,
         client.token_gen,
         Some(state.fleet.settings.rc.agent_token_ttl_secs),
     )?;
@@ -180,6 +234,52 @@ pub async fn enroll_tunnel_client(
         tenant_id: tid.to_hex(),
         tunnel_client_token,
     }))
+}
+
+/// #3328 — may the person an enrollment token was minted for re-enroll a
+/// machine id that already has a tunnel client in the org? Its owner may,
+/// while the client is live. A holder of `MANAGE_AGENTS` may, live or
+/// removed: a removed client comes back only through one, its owner
+/// included. Anyone else is refused 409, here, before the token is spent,
+/// so nothing is written and the token can still enroll a machine of its own.
+///
+/// The answer is also the scope the write holds (`ReviveScope`), so a
+/// removal that lands between this read and that write is not undone.
+///
+/// The permission is read only when it decides something, so an owner
+/// re-enrolling their own live client costs no extra read. A member who has
+/// left the org holds nothing in it. A read that FAILED refuses as the
+/// archived-org gate does (500), and the token stays unspent.
+async fn revive_scope(
+    state: &NetworkState,
+    tid: ObjectId,
+    enroller: ObjectId,
+    row: &roomler_ai_remote_control::models::TunnelClient,
+) -> Result<ReviveScope, ApiError> {
+    let removed = row.deleted_at.is_some();
+    if !removed && row.owner_user_id == enroller {
+        return Ok(ReviveScope::LiveOwnedBy(enroller));
+    }
+    let manages_devices = match state.tenants.get_member_permissions(tid, enroller).await {
+        Ok(held) => permissions::has(held, permissions::MANAGE_AGENTS),
+        Err(DaoError::NotAMember) => false,
+        Err(e) => return Err(e.into()),
+    };
+    if manages_devices {
+        return Ok(ReviveScope::LiveOrRemoved);
+    }
+    tracing::info!(
+        tenant_id = %tid, tunnel_client_id = ?row.id, %enroller, removed,
+        "tunnel-client: re-enrollment refused: not the owner of a live client, and no MANAGE_AGENTS"
+    );
+    Err(ApiError::Conflict(
+        if removed {
+            REMOVED_TUNNEL_CLIENT
+        } else {
+            SOMEONE_ELSES_TUNNEL_CLIENT
+        }
+        .to_string(),
+    ))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -324,7 +424,7 @@ pub async fn renew_tunnel_client(
         .id
         .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
     let ttl = state.fleet.settings.rc.agent_token_ttl_secs;
-    let tunnel_client_token = state.auth.issue_tunnel_client_token(
+    let tunnel_client_token = state.auth.renew_tunnel_client_token(
         client_id,
         client.tenant_id,
         owner,

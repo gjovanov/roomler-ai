@@ -10,6 +10,19 @@ pub struct TunnelClientDao {
     pub base: BaseDao<TunnelClient>,
 }
 
+/// Which tunnel-client row a re-enrollment may write (#3328). The enroll
+/// route decides it, before the enrollment token is spent; the write holds it
+/// again, so a removal that lands between the two is not undone by an
+/// enrollment that was never allowed to undo one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviveScope {
+    /// The owner re-enrolling their own client: the row, only while it is live
+    /// and theirs.
+    LiveOwnedBy(ObjectId),
+    /// A holder of `MANAGE_AGENTS`: the row, live or removed.
+    LiveOrRemoved,
+}
+
 impl TunnelClientDao {
     pub fn new(db: &Database) -> Self {
         Self {
@@ -68,23 +81,38 @@ impl TunnelClientDao {
             .await
     }
 
-    /// Refresh at re-enrollment: clear `deleted_at`, refresh
-    /// os / client_version, bump `updated_at`. Returns the
-    /// updated row so the caller can mint a fresh tunnel-client token.
+    /// Refresh at re-enrollment, within `scope`: clear `deleted_at`, refresh
+    /// os / client_version, bump `updated_at`. Returns the updated row so the
+    /// caller can mint a fresh tunnel-client token, or `None` when the row is
+    /// no longer in `scope` — removed since the route decided, say — and then
+    /// nothing is written (#3328).
     ///
     /// `name` refreshes ONLY while `name_admin_set` is unset — same
-    /// rehydrate-clobber protection as `AgentDao::rehydrate`.
+    /// rehydrate-clobber protection as `AgentDao::rehydrate`. The owner,
+    /// `token_gen` and an admin's name, labels and status are left alone.
     pub async fn rehydrate(
         &self,
         client_id: ObjectId,
         name: &str,
         os: OsKind,
         client_version: &str,
-    ) -> DaoResult<TunnelClient> {
+        scope: ReviveScope,
+    ) -> DaoResult<Option<TunnelClient>> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
-        self.base
-            .update_by_id(
-                client_id,
+        let filter = match scope {
+            // `deleted_at: null` (null OR absent), as every live read here.
+            ReviveScope::LiveOwnedBy(owner) => doc! {
+                "_id": client_id,
+                "deleted_at": null,
+                "owner_user_id": owner,
+            },
+            ReviveScope::LiveOrRemoved => doc! { "_id": client_id },
+        };
+        let matched = self
+            .base
+            .collection()
+            .update_one(
+                filter,
                 doc! {
                     "$set": {
                         "os": os_bson,
@@ -94,14 +122,18 @@ impl TunnelClientDao {
                     }
                 },
             )
-            .await?;
+            .await?
+            .matched_count;
+        if matched == 0 {
+            return Ok(None);
+        }
         self.base
             .update_one(
                 doc! { "_id": client_id, "name_admin_set": { "$ne": true } },
                 doc! { "$set": { "name": name } },
             )
             .await?;
-        self.base.find_by_id(client_id).await
+        self.base.find_by_id(client_id).await.map(Some)
     }
 
     pub async fn list_for_tenant(

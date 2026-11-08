@@ -91,9 +91,9 @@ purestat's `roomler.ai` site (`site_id` from the site's ObjectId), production `h
 | purestat counts every row as a pageview | `count() as pageviews FROM events` with no `event_name` predicate (`crates/services/src/analytics/query.rs:107`) | engagement beacons and goals inflate pageviews |
 | purestat ingest takes the client IP from the **left-most** `X-Forwarded-For` entry; the limiter takes the right-most public one | `crates/api/src/routes/event.rs:50-54` vs `crates/api/src/rate_limit.rs:83-103` | a client can choose its own visitor hash |
 | purestat stores `allowed_hostnames` and reads it nowhere; goals are rows that no query reads | `crates/db/src/mongo/models/site.rs:5-19`; `crates/db/src/mongo/models/goal.rs:4-22` | no hostname filter, and no conversion rate |
-| Enrollment-token issuance is not recorded | `crates/modules/fleet/src/agent.rs:53` mints a 600 s JWT and writes nothing; the burn lives in `used_tokens` for 1 h (`crates/db/src/indexes.rs:261`) | "issued → redeemed" cannot be computed |
+| Enrollment-token issuance is not recorded | `crates/modules/fleet/src/agent.rs:54` mints a 600 s JWT and writes nothing; the burn lives in `used_tokens` for 1 h (`crates/db/src/indexes.rs:261`) | "issued → redeemed" cannot be computed |
 | The installer proxy and the script routes count nothing | `crates/modules/fleet/src/agent_release.rs:244-297`, `setup_release.rs:148, 335, 346` | yet every request carries a telling User-Agent: `roomler-setup/<ver>` (`agents/roomler-setup/src/proxy.rs:21`), curl, PowerShell, a browser, `roomlerd/<ver>` (the updater) |
-| The enroll request is five fields | `crates/modules/fleet/src/agent.rs:82-88`; agent side `crates/agent-core/src/enrollment.rs:17-22` | no install method or scope, on the request or the agent row |
+| The enroll request is five fields | `crates/modules/fleet/src/agent.rs:83-89`; agent side `crates/agent-core/src/enrollment.rs:17-22` | no install method or scope, on the request or the agent row |
 | The wizard reports nothing | steps `welcome → server → token → install → done` (`agents/roomler-setup/src/front/app.js:32`); progress goes to an in-process channel and logs to stderr (`agents/roomler-setup/src/main.rs:47-58`) | a stalled or cancelled install is invisible |
 | No product-event history | org creation leaves a `tracing::info!` (`crates/services/src/dao/tenant.rs:185`); invite acceptance only bumps `use_count` (`crates/api/src/routes/invite.rs:233`) | — |
 | Audit-shaped sources expire at 90 days | `tunnel_audit` (`crates/modules/network/src/lib.rs:719-725`), `ssh_audit`, `exec_audit`, `remote_audit`; `remote_sessions` has **no** TTL (`crates/modules/remote/src/lib.rs:159-161`), `call_sessions` 730 d (`crates/modules/conference/src/lib.rs:208-216`), `stats_events` 730 d (`crates/db/src/indexes.rs:371-375`) | a cohort chart longer than 90 days cannot see tunnel or SSH use. `docs/data-model.md:46, 96, 131-132` state other TTLs and are stale |
@@ -237,7 +237,7 @@ sequenceDiagram
 
 1. **Issuance is recorded**: `enroll_token_issued {_id: jti, tenant_id, issued_by, issued_at, kind:
    standard|key, redeemed_at, agent_id}`, keyed by the jti and never holding the token. It is updated where
-   the jti is already burned (`crates/modules/fleet/src/agent.rs:187-199`) and kept for 90 days. Daily
+   the jti is already burned (`crates/modules/fleet/src/agent.rs:188-200`) and kept for 90 days. Daily
    counts are frozen into `growth_daily`.
 2. **Fetches are counted by client class.** The installer proxy, `latest-release` and the two script routes
    increment `growth_daily {asset, client, os}`, with client one of `wizard` (`roomler-setup/`),

@@ -37,7 +37,7 @@ signup page or says where a token comes from. To get one, a new person must:
 3. log in;
 4. create an org, unless they filled the optional org fields at signup (`auth.rs:227-249`);
 5. find Devices → Enroll device, which mints a **10-minute single-use** token
-   (`crates/modules/fleet/src/agent.rs:25`, `:113-164`, behind `MANAGE_AGENTS`);
+   (`crates/modules/fleet/src/agent.rs:26`, `:114-165`, behind `MANAGE_AGENTS`);
 6. copy it — the dialog says "then paste the token into the wizard"
    (`ui/src/components/enroll/EnrollmentDialog.vue:119`);
 7. get back to the wizard and paste it before the 10 minutes run out.
@@ -81,10 +81,10 @@ it. Do not shift these anchors with code that moved later.*
 
 | Surface | Where | What it does today |
 |---|---|---|
-| token mint | `crates/modules/fleet/src/agent.rs:90-140`; route `crates/modules/fleet/src/lib.rs:389` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:117-127`); FR-104 `anchor` from an optional body (`:52-88`) |
-| token claims | `crates/services/src/auth/mod.rs:82-96`, `:530-563` | `EnrollmentClaims { sub = issuing admin, tenant_id, jti, anchor }`; ten audiences in `TokenType` (`:37-78`) |
-| token redeem | `crates/modules/fleet/src/agent.rs:180-260`; route `fleet/src/lib.rs:480-481`, `:567` | public `POST /api/agent/enroll`: archived org refused (`:195-210`), plan device cap before the single-use claim (`:225-245`), the claim fails closed (`:247-263`) |
-| tunnel token | `crates/modules/network/src/routes/tunnel.rs:53-75`; mint `crates/services/src/auth/mod.rs:731` | any member (`is_member`) mints a `TunnelEnrollment` token |
+| token mint | `crates/modules/fleet/src/agent.rs:91-141`; route `crates/modules/fleet/src/lib.rs:389` | `POST /api/tenant/{tid}/agent/enroll-token`: `AuthUser` + `MANAGE_AGENTS`; 600 s single-use JWT (`:24`); FR-102 issuance recorded (`:117-127`); FR-104 `anchor` from an optional body (`:52-88`) |
+| token claims | `crates/services/src/auth/mod.rs:91-105`, `:578-611` | `EnrollmentClaims { sub = issuing admin, tenant_id, jti, anchor }`; ten audiences in `TokenType` (`:44-85`) |
+| token redeem | `crates/modules/fleet/src/agent.rs:181-268`; route `fleet/src/lib.rs:480-481`, `:567` | public `POST /api/agent/enroll`: archived org refused (`:195-210`), plan device cap before the single-use claim (`:225-245`), the claim fails closed (`:247-263`) |
+| tunnel token | `crates/modules/network/src/routes/tunnel.rs:57-79`; mint `crates/services/src/auth/mod.rs:687` | any member (`is_member`) mints a `TunnelEnrollment` token |
 | registration | `crates/api/src/routes/auth.rs:167-325` | creates the user; the org inline only with `tenant_name` + `tenant_slug` (`:250-255`); production returns no session (`:311-324`) |
 | login gate | `crates/api/src/routes/auth.rs:366-370` | an unactivated account is refused |
 | return path | `ui/src/plugins/router.ts:391-417` | `pending_redirect` in **sessionStorage** — one tab only; same-origin paths only |

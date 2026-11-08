@@ -17,6 +17,7 @@ use mongodb::options::ReturnDocument;
 use roomler_ai_remote_control::models::{EnrollmentKey, EnrollmentKeyUse};
 
 use super::base::{BaseDao, DaoResult};
+use crate::auth::ClaimedKeyUse;
 
 pub struct EnrollmentKeyDao {
     pub base: BaseDao<EnrollmentKey>,
@@ -99,9 +100,10 @@ impl EnrollmentKeyDao {
             .await
     }
 
-    /// Atomically consume one use. `Ok(Some(key))` = the enrollment may
-    /// proceed, and the returned row carries the TTL to stamp on the device.
-    /// `Ok(None)` = refused — resolve why with [`Self::refusal_reason`].
+    /// Atomically consume one use. `Ok(Some(used))` = the enrollment may
+    /// proceed: the claimed use is what the agent mint takes (#3328,
+    /// `crate::auth::single_use`), and its row carries the TTL to stamp on the
+    /// device. `Ok(None)` = refused — resolve why with [`Self::refusal_reason`].
     ///
     /// All three liveness conditions live INSIDE the filter, so there is no
     /// read-then-write window: a concurrent revoke, the expiry instant, or a
@@ -110,7 +112,7 @@ impl EnrollmentKeyDao {
         &self,
         tenant_id: ObjectId,
         jti: &str,
-    ) -> DaoResult<Option<EnrollmentKey>> {
+    ) -> DaoResult<Option<ClaimedKeyUse>> {
         let now = DateTime::now();
         let updated = self
             .base
@@ -132,7 +134,7 @@ impl EnrollmentKeyDao {
             )
             .return_document(ReturnDocument::After)
             .await?;
-        Ok(updated)
+        Ok(updated.map(ClaimedKeyUse::new))
     }
 
     /// Why a [`Self::claim_use`] miss missed — for the audit line and the

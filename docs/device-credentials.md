@@ -9,11 +9,14 @@ Every enrolled device and every `roomler` tunnel client holds a long-lived crede
 | Credential | Issued by | Lives | Renewed by | Ends when | Where it is kept |
 |---|---|---|---|---|---|
 | **Enrollment token** | an admin (`POST /api/tenant/{tid}/agent/enroll-token`) | 10 min, **single use** | — | used, or 10 min pass | pasted once; never stored |
+| **Tunnel enrollment token** | a member (`POST /api/tenant/{tid}/tunnel-client/enroll-token`) | 10 min, **single use** (#3328) | — | used, or 10 min pass | pasted once into `roomler enroll`; never stored |
 | **Agent token** (`aud = agent`) | `POST /api/agent/enroll` | 365 days (`rc.agent_token_ttl_secs`) | **the device** (`POST /api/agent/self/renew`) | the device is removed (generation), or it lapses past the grace | the daemon's `config.toml` (`agent_token`, or `[[orgs]].agent_token`) |
 | **Tunnel-client token** (`aud = tunnel-client`) | `POST /api/tunnel-client/enroll` | 365 days | **the `roomler` CLI** (`POST /api/tunnel-client/renew`) | the client is removed (generation), or it lapses past the grace | the CLI's `config.toml`, `0600` |
 | **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | `%ProgramData%\roomler\roomler\exec-service\anchor.json`, SYSTEM + Administrators only |
 
 FR-104 adds one variation on the first row: an enrollment token minted with `anchor: true` may also anchor the device it enrolled, once ([`fleet-rpc.md`](fleet-rpc.md) § Anchoring).
+
+Both enrollment tokens are spent on the `used_tokens` ledger by the route that redeems them, and the mints that turn one into the long-lived credential take only the spent token ([`security-baseline.md`](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328), #3328). A tunnel enrollment token acts for the member who minted it: it re-enrolls a known machine id only for that client's owner while the client is live, or for a holder of `MANAGE_AGENTS`.
 
 ## 2. The lifecycle of an agent token
 
@@ -77,7 +80,7 @@ sequenceDiagram
 When the server refuses the token at the socket (`signaling.rs:1048`), the loop tries two things before its back-off ladder:
 
 1. **A newer token in the config file**, matched by server, tenant *and* device id. `roomlerd re-enroll` (or the companion's Re-enroll) wrote it while the daemon ran. Before FR-103 the daemon ignored it until a restart.
-2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:107`). On the renew routes only; every other route enforces `exp` as before.
+2. **A renewal**, which the server grants up to **90 days past `exp`** (`RENEWAL_GRACE_SECS`, `crates/services/src/auth/mod.rs:116`). On the renew routes only; every other route enforces `exp` as before.
 
 Either earns one prompt retry. A refusal straight after a recovery waits out the normal ladder, so a server that renews a token its socket then refuses cannot spin the loop.
 
@@ -85,9 +88,9 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 ## 4. A removal ends every earlier token
 
-Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape).
+Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328).
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1148`; tunnel clients `crates/services/src/dao/tunnel_client.rs:297`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1148`; tunnel clients `crates/services/src/dao/tunnel_client.rs:329`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
@@ -96,7 +99,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1567` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2108` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:254` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:354` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.
