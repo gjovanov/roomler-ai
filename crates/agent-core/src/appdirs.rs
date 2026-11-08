@@ -76,6 +76,23 @@ pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from(QUALIFIER, ORG, app_segment())
 }
 
+/// FR-43 P3c — the folder [`project_dirs`]`().config_dir()` is on macOS for
+/// the person whose home is `home`, chosen as that person's own process
+/// chooses it ([`use_old_segment`]): the current segment where it exists,
+/// else the pre-rename one where only that exists. A root process reaches a
+/// person's files through it, since its own `project_dirs` is root's. Pure,
+/// with `exists` as the filesystem, so it tests on every platform.
+pub fn macos_config_dir_in_home(home: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let support = home.join("Library").join("Application Support");
+    let current = support.join(format!("{QUALIFIER}.{ORG}.{NEW_APP}"));
+    let old = support.join(format!("{QUALIFIER}.{ORG}.{OLD_APP}"));
+    if !exists(&current) && exists(&old) {
+        old
+    } else {
+        current
+    }
+}
+
 /// Machine-global data root `%PROGRAMDATA%\roomler\<segment>` (Windows only).
 /// `C:\Windows\System32`, as the kernel knows it: never from `%SystemRoot%` or
 /// `%windir%`, which a limited process can override for its own user in
@@ -576,6 +593,21 @@ fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-43 P3c — a person's folder, as their own process would pick it.
+    #[test]
+    fn a_persons_folder_is_the_one_their_own_process_picks() {
+        let home = Path::new("/Users/someone");
+        let support = home.join("Library").join("Application Support");
+        let current = support.join("live.roomler.roomler");
+        let old = support.join(format!("{QUALIFIER}.{ORG}.{OLD_APP}"));
+        // Neither is there yet: the current one, which a first start creates.
+        assert_eq!(macos_config_dir_in_home(home, |_| false), current);
+        // Only the pre-rename one: that host's enrollment lives there.
+        assert_eq!(macos_config_dir_in_home(home, |p| p == old), old);
+        // Both: the current one, as for the person.
+        assert_eq!(macos_config_dir_in_home(home, |_| true), current);
+    }
 
     /// FR-129 C — what the wizard's Windows path names by full path is there.
     #[cfg(target_os = "windows")]

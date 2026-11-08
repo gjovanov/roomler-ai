@@ -18,28 +18,41 @@
 //! (`peer.rs`), and no audio track is added without `audio_enabled`, so
 //! masking the grant here is enough to make every channel follow.
 
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use roomler_ai_remote_control::models::{ConsentMode, FeaturePolicy, SessionPolicy};
 use roomler_ai_remote_control::permissions::Permissions;
 
 // ── The owner's floor ───────────────────────────────────────────────────────
 
-static DEVICE: Mutex<SessionPolicy> = Mutex::new(SessionPolicy {
-    clipboard: FeaturePolicy::On,
-    files: FeaturePolicy::On,
-    audio: FeaturePolicy::On,
-});
+/// A watch rather than a plain mutex for one reader: FR-43 P3b's worker, which
+/// hands a change to its daemon at once ([`watch_device_policy`]).
+fn device() -> &'static tokio::sync::watch::Sender<SessionPolicy> {
+    static DEVICE: OnceLock<tokio::sync::watch::Sender<SessionPolicy>> = OnceLock::new();
+    DEVICE.get_or_init(|| {
+        tokio::sync::watch::Sender::new(SessionPolicy {
+            clipboard: FeaturePolicy::On,
+            files: FeaturePolicy::On,
+            audio: FeaturePolicy::On,
+        })
+    })
+}
 
 /// Seeded at start and on a LocalAPI `ConfigSet`, never by the server: the
 /// three keys are absent from `DesiredConfig`.
 pub fn set_device_policy(policy: SessionPolicy) {
-    *DEVICE.lock().unwrap_or_else(|e| e.into_inner()) = policy;
+    device().send_replace(policy);
 }
 
 /// The owner's floor as it stands now; read at every session start.
 pub fn device_policy() -> SessionPolicy {
-    *DEVICE.lock().unwrap_or_else(|e| e.into_inner())
+    *device().borrow()
+}
+
+/// FR-43 P3b — told of every [`set_device_policy`]: a one-row Mac's worker
+/// hands the person's new floor to its daemon before the next session asks.
+pub fn watch_device_policy() -> tokio::sync::watch::Receiver<SessionPolicy> {
+    device().subscribe()
 }
 
 /// The floor from a config, the three keys as one value.
@@ -56,6 +69,12 @@ pub fn from_config(cfg: &crate::config::AgentConfig) -> SessionPolicy {
 /// nothing announces nothing new.
 pub fn caps_policy() -> Option<SessionPolicy> {
     report(device_policy())
+}
+
+/// The same for a floor the caller resolved: FR-43 P3b, a one-row Mac's,
+/// with the person's folded in.
+pub fn caps_policy_of(floor: SessionPolicy) -> Option<SessionPolicy> {
+    report(floor)
 }
 
 fn report(p: SessionPolicy) -> Option<SessionPolicy> {

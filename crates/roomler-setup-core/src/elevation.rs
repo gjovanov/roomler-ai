@@ -110,14 +110,59 @@ fn quote_arg(arg: &str) -> String {
 /// call fails only where the caller had no such right to pass on.
 #[cfg(target_os = "windows")]
 pub fn run_elevated(file: &Path, args: &[String]) -> Result<u32, ElevationError> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::GetProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+
+    let process = shell_runas(file, args)?;
+    // SAFETY: a valid handle from SEE_MASK_NOCLOSEPROCESS; it is ours to close.
+    let pid = unsafe { GetProcessId(process) };
+    unsafe { CloseHandle(process) };
+    // SAFETY: takes a process id and touches no memory.
+    unsafe { AllowSetForegroundWindow(pid) };
+    Ok(pid)
+}
+
+/// #3246 — [`run_elevated`] for a step the caller waits for: the same one
+/// prompt, and the process to follow to its exit code. The caller stays, so it
+/// has no foreground to pass on. Blocks until the person answers the prompt.
+#[cfg(target_os = "windows")]
+pub fn run_elevated_and_follow(
+    file: &Path,
+    args: &[String],
+) -> Result<crate::msi_runner::MsiRunner, ElevationError> {
+    use windows_sys::Win32::System::Threading::GetProcessId;
+    let process = shell_runas(file, args)?;
+    // SAFETY: a valid handle from SEE_MASK_NOCLOSEPROCESS, which the runner owns
+    // from here on.
+    let pid = unsafe { GetProcessId(process) };
+    Ok(crate::msi_runner::MsiRunner::from_handle(pid, process))
+}
+
+/// Nothing elevates this way off Windows.
+#[cfg(not(target_os = "windows"))]
+pub fn run_elevated_and_follow(
+    _file: &Path,
+    _args: &[String],
+) -> Result<crate::msi_runner::MsiRunner, ElevationError> {
+    Err(ElevationError::Failed(
+        "Starting a step as administrator is a Windows step.".to_string(),
+    ))
+}
+
+/// The shell's `runas`, and the new process's handle, which is the caller's to
+/// close.
+#[cfg(target_os = "windows")]
+fn shell_runas(
+    file: &Path,
+    args: &[String],
+) -> Result<windows_sys::Win32::Foundation::HANDLE, ElevationError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOZONECHECKS, SHELLEXECUTEINFOW,
         ShellExecuteExW,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
@@ -153,13 +198,7 @@ pub fn run_elevated(file: &Path, args: &[String]) -> Result<u32, ElevationError>
             "Windows reported the administrator start, but no process came of it.".to_string(),
         ));
     }
-    // SAFETY: hProcess is a valid handle from SEE_MASK_NOCLOSEPROCESS; it is
-    // ours to close.
-    let pid = unsafe { GetProcessId(sei.hProcess) };
-    unsafe { CloseHandle(sei.hProcess) };
-    // SAFETY: takes a process id and touches no memory.
-    unsafe { AllowSetForegroundWindow(pid) };
-    Ok(pid)
+    Ok(sei.hProcess)
 }
 
 /// From here on this process loads a DLL named without a path from System32

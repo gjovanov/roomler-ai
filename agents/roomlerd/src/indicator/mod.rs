@@ -380,7 +380,7 @@ mod x11;
 
 /// FR-27 — the macOS consent panel. Prompt only, same split as X11.
 ///
-/// `pub` because `main.rs` calls [`mac::run_main_loop`]: the main thread has
+/// `pub` because `app.rs` calls [`mac::run_main_loop`]: the main thread has
 /// to be handed to AppKit before the daemon starts, and that decision belongs
 /// at the process entry point, not buried in an overlay module.
 #[cfg(all(target_os = "macos", feature = "viewer-indicator-macos"))]
@@ -388,7 +388,7 @@ pub mod mac;
 
 /// FR-93 P6f — the desktop's notifications as the last consent surface, where
 /// neither the native panel nor the companion can show a question. `pub`
-/// because `main.rs` runs its session helper (`portal-helper --notify`).
+/// because `app.rs` runs its session helper (`portal-helper --notify`).
 #[cfg(all(target_os = "linux", feature = "portal-capture"))]
 pub mod notify;
 

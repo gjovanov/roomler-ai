@@ -23,6 +23,7 @@
 pub mod acl;
 pub mod appdirs;
 pub mod apps_config;
+pub mod boot_id;
 /// FR-84 D6 — the companion's login-start registration (Run value, XDG
 /// entry), shared so the daemon and the companion spell it identically.
 pub mod companion_autostart;
@@ -47,9 +48,6 @@ pub mod pairing;
 /// the `Join …? [y/N]` guard on `/dev/tty` or the Windows console, and
 /// `--pair-org` for a terminal that has none.
 pub mod pairing_terminal;
-/// FR-90 P4-5-1b — `knowhow_probe_reach`, where this device's knowhow
-/// probes may go: its syntax, shared by the config surface and the prober.
-pub mod probe_reach;
 pub mod recording_dir;
 /// macOS privacy-permission probes. Here rather than in `roomlerd`
 /// because the desktop companion needs them too and deliberately does NOT

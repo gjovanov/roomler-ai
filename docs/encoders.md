@@ -159,6 +159,130 @@ Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
 The probe's cost grew with the device walk (the dev box 4.3 → 6.1 s, WSL 2.5 →
 5.9 s); the cache pays it once per build, driver and hardware.
 
+## The cell table: the hello's encoder fields from one table (FR-135 R9)
+
+Every cell the agent can advertise is one row of `CELLS`
+(`agents/roomlerd/src/encode/cell_table.rs:574`): codec × backend × chroma, 36 rows, in
+the order the probe opens them. A host's probe adds an overlay of proof, and `derive`
+(`cell_table.rs:982`) writes from the two the six fields a probe answers: `hw_encoders`,
+`codecs`, `transports`, `vp9_chroma`, `hevc_chroma` and `video_cells`.
+
+**It drives nothing.** `compute_caps_with` (`agents/roomlerd/src/encode/caps.rs:3819`)
+makes every open it made before and records what it found in `ProbeFindings`
+(`cell_table.rs:624`). `assemble` (`caps.rs:4397`) writes the real hello from that, with
+the pushes the probe used to make inline, in the same order and on the same conditions.
+The table derives beside it, and `shadow` (`caps.rs:4230`, `cell_table.rs:1286`) compares
+the two once per process and touches nothing. **The evidence is the gate**, which proves the
+two byte-identical on every host class below. The shadow's warning is not evidence: on a real
+probe it runs in the caps-probe child, whose stdout the daemon reads only for its report line
+(`caps.rs:1644`) and whose own log is not a service log, so the warning reaches no uploaded
+log. On a cached probe the daemon's only shadow is its driver-free `compute_caps(false,
+false)` (`caps.rs:3099`), which agrees by construction. No `cell table:` line in
+`agent_logs` therefore says nothing about a host. That is FR-70 M3a's pattern without its
+count. Readers move onto the rows in
+R10 ([FR-135 §6.5](fr/FR-135-one-rc-media-pipeline.md#65-encoder-and-codec-choice-one-source-of-truth)).
+
+```mermaid
+flowchart LR
+    subgraph child["probe child: compute_caps_with"]
+        OP["every open, unchanged"] --> PF["ProbeFindings<br/>what opened, MF's verdicts,<br/>qsv_hw, ALLOW_SW_HEAVY, VP9_CHROMA"]
+    end
+    PF --> AS["caps::assemble"]
+    AS --> HELLO["rc:agent.hello, unchanged"]
+    PF --> PR["proofs: a CellProof per row"]
+    CELLS["CELLS: 36 rows"] --> DV["derive"]
+    PR --> DV
+    DV -. "shadow: compared once, in the probe child" .-> AS
+    DV --> DIV["divergences: FR-135 §5.7's Dv rows"]
+    FIX["tests/fixtures/cell-table.hellos.json<br/>17 hosts"] --> GATE["the gate"]
+    AS --> GATE
+    DV --> GATE
+```
+
+| Column | What it holds | Where the code holds it |
+|---|---|---|
+| `id` | the cell's stable name in the denylist's spelling: `hevc_qsv:yuv420`, `hevc_d3d12va:yuv420`, `h264_mf:yuv420`, `vp9_libvpx:yuv444`, and `h264_openh264:yuv420`, which no list names yet | the cascade tables, `cells::MF_*`, `cells::LIBVPX_VP9` |
+| `codec`, `backend`, `ffmpeg_name`, `chroma` | the cell | `models::VideoBackend::from_ffmpeg_name` |
+| `family` | `mf`, `openh264`, `ffmpeg`, `libvpx` | `bench::BuildCaps`'s build line |
+| `paths` | `Dc`, `Rtp`, `Recording` | `open_for_codec`: H.264 through MF then OpenH264, HEVC through FFmpeg's cascade then MF, AV1 through MF alone; the recorder's FFmpeg H.264 then OpenH264; the DataChannel pumps |
+| `input_forms` | `Cpu` everywhere; `D3d11` on QSV's and NVENC's 4:2:0 (Windows); `IoSurface` on VideoToolbox's 4:2:0 HEVC and H.264 | `gpu_input::gpu_cell`, `vt_input::gpu_cell` |
+| `rate_move` | `InPlace { idr }`, `Rebuild`, `RebuildOrInPlace` (QSV under `encoder_inplace_rate`) | `resolve_rate_mode`, `reconfig_forces_idr_for`, libvpx's `EncoderCaps` |
+| `rate_factor_pct` | the DataChannel pump's maxrate factor, codec × chroma | `codec_rate_factor_pct` × `chroma_rate_factor_pct`, as `rate_plan` multiplies them |
+| `describes` | `Full`, `Partial` (libvpx: matrix and range), `Unwritten`, `Unread` | the reads in FR-130's P1 and P3 |
+| `factors` | the feature, the platforms whose release carries it, a driver floor, a drop-in | the vendored FFmpeg jobs' `--enable-encoder` lists, the NVENC floor, `RADV_PERFTEST` |
+| `hw` | `Hardware`, `Software`, `ByProbe` (Media Foundation), `ByBuild` (QSV: the oneVPL build) | `assemble`, `qsv_is_hardware_by_construction` |
+| `legacy` | how the pre-FR-77 fields spell the row, with every way they differ from its truth: `in_codecs`, `transport`, `hevc_chroma` (P7: 4:4:4 for `hevc_nvenc` alone), `label_on_enumeration` (MF H.264), `hw_from_qsv_build` (FFmpeg's VP9) | `assemble` |
+
+Left out, because nothing in the code holds them yet: the spec's `max_tier`, and in
+`CellProof` the frame counts, the decode check, the GPU and shared-device proofs, the VUI
+reorder read, the last fault and the build id. A fact a row carries that nobody has
+measured says so (`Describes::Unread`, `idr: None`).
+
+### The gate
+
+The composition baseline's pattern: recorded hellos in
+`agents/roomlerd/tests/fixtures/cell-table.hellos.json`, one per host class, read by
+`agents/roomlerd/src/encode/cell_table/tests.rs`.
+
+| Check | Test | Fails on |
+|---|---|---|
+| The agent's assembly writes each recorded hello; so do the `base` and `444` children through `candidates_444` and `merge_444`; the table derives it byte for byte; the divergences are the recorded ones | `the_table_derives_every_recorded_hello_byte_for_byte` (`tests.rs:135`) | any change to what a recorded probe makes the hello say, by either path |
+| The gate can fail | `one_changed_row_fails_the_gate` (`tests.rs:202`) | a row's `hw`, transport, `codecs` entry, P7 column or MF rule, a row removed, two rows swapped: each must be a mismatch on the hosts that carry it |
+| Each column is the code's | `the_ffmpeg_rows_are_the_cascade_tables_in_their_order`, `the_444_rows_are_the_names_the_probe_asks_for_444`, `the_platform_column_is_the_vendored_ffmpeg_builds`, `the_gpu_forms_are_the_cells_that_take_gpu_frames`, `the_rate_factor_column_is_the_rate_plans`, `dv20_…` on an FFmpeg build | a cascade name, a 4:4:4 name, a vendored encoder, a GPU form, a factor or a rate move the table does not hold |
+| The fixtures are the wire's | `probed_fields_serialise_as_the_hello_does`, `every_fixture_proof_is_a_row_of_its_platform` | a field spelt or skipped otherwise than `AgentCaps`; a proof with no row, off its platform, or on its own denylist |
+| The shadow | `the_shadow_says_once_and_leaves_the_hello_alone`, `the_shadow_takes_a_host_outside_the_table` | a second warn line, a changed hello, or a panic on a host the table has never seen |
+
+**Re-record only when a change is intended**, and say why in the commit message:
+`CELL_TABLE_UPDATE=1 cargo test -p roomlerd --lib encode::cell_table`. Each fixture's
+`probe` is written by hand from the record its `source` names; `hello` and
+`divergences` are recorded from the agent's own code.
+
+| Fixture | Host class | From |
+|---|---|---|
+| `windows-nvenc-dgpu` | RTX dGPU beside an AMD iGPU | the dev-box row above, less the two Vulkan cells denied since; MF as FR-130 P1 read it there |
+| `windows-qsv-office-desktop` | Intel iGPU, QSV HEVC, no AV1 | modelled on FR-135 §5.1's QSV rows |
+| `windows-qsv-meteor-lake-laptop` | Intel Meteor Lake, AV1 on QSV, HEVC on D3D12 | the CORPLAP-3 row above |
+| `windows-amf-apu` | AMD APU alone | modelled on the dev box's AMD half |
+| `windows-guest-no-gpu` | Basic Render guest, software only | FR-135 §5.1's MF H.264 software row |
+| `windows-ffmpeg-opted-out` | `ROOMLERD_USE_FFMPEG=0`, MF HEVC on hardware | modelled |
+| `windows-allow-sw-heavy` | the office desktop with `ROOMLERD_ALLOW_SW_HEAVY=1` | modelled |
+| `windows-qsv-444-asked` | the office desktop with `encoder_cells_deny = none` | modelled: no host has opened these 4:4:4 forms |
+| `linux-amd-vaapi-vulkan`, `linux-amd-vaapi` | AMD Raphael with and without `RADV_PERFTEST` | the two AMD rows above |
+| `linux-vp9-only` | no GPU: libvpx and OpenH264 | the GPU-less Linux row above |
+| `linux-nvenc-wsl` | NVENC through WSL's libcuda | the WSL row above |
+| `linux-arm64-nvenc` | NVIDIA GB10, a build with no QSV | the arm64 row above |
+| `linux-arm64-vaapi` | arm64 VAAPI | modelled: VAAPI on arm64 ships unproven |
+| `macos-videotoolbox` | M-series MacBook | the MacBook row above |
+| `headless-no-hardware-probe` | the driver-free answer | `compute_caps(false, false)` |
+| `signalling-only-build` | no encoder backend, a Noop host | the no-feature build |
+
+### What the table reads as a divergence today
+
+FR-135 §5.7's rows, against the table. `divergences` (`cell_table.rs:1062`) reads the
+per-host ones on every fixture, and the gate holds them to the recorded list. The rest are
+tests that read the code against a column.
+
+| Dv | Read as | Where it shows |
+|---|---|---|
+| Dv1 | a DataChannel pick reads the `codecs` union, not its transport: `data-channel-h264` bound to AV1 | `dv1_a_datachannel_pick_reads_the_union_not_the_transport` |
+| Dv2 | `codecs` lists AV1 from an FFmpeg cell that no RTP opener reaches | NVENC hosts (dev box, WSL, arm64), the Meteor Lake laptop |
+| Dv3 | the RTP track's codec is patched by rule: a VP8 placeholder no row carries, a refusal by name | `dv3_the_rtp_track_is_patched_not_derived` |
+| Dv4 | `mf-h264-hw` over a software cell (read on the dev box's own probe too, master built with `media-hw`), `mf-h265-hw` over software HEVC, `hevc_chroma` silent on a QSV winner's 4:4:4 | dev box, AMD APU, guest; `allow-sw-heavy`; `qsv-444-asked` |
+| Dv6 | the VP9 cell's `hw` is the QSV build flag: `vp9_vaapi` reads software on a build with no QSV; the VP9 probe stops at its first opener | `linux-arm64-vaapi`; no recorded host reaches the second |
+| Dv7 | Media Foundation's HEVC cell with no DataChannel transport behind it | `windows-ffmpeg-opted-out` |
+| Dv10 | OpenH264's cell from the build alone, nothing opened; a label from an enumeration whose activation failed | every host with OpenH264 |
+| Dv11 | a denylist entry no gate reads: `h264_openh264:yuv420` changes nothing on the wire | `dv11_a_row_no_gate_reads` |
+| Dv12 | a GPU input form whose proof never reaches the wire | QSV and NVENC on Windows, VideoToolbox |
+| Dv13 | the fps verdict cache keys a class by encoder name: `hevc_nvenc`'s three cells share one verdict | `dv13_the_fps_class_key_cannot_tell_a_cell_from_its_other_forms` |
+| Dv15 | H.264's rows span three paths, each with its own order, plus MF's own cascade inside one row | `dv15_h264_is_four_cascades` |
+| Dv16 | none since #3245: the RTP track binds H.264 first, as the table's RTP column does; the DataChannel rank stays best-of | `dv16_the_rtp_track_binds_h264_first_as_the_table_does` |
+| Dv19 | a cell whose colour is described in part, not at all or unread, under one host-wide `color-described` | every host |
+| Dv20 | `resolve_rate_mode` decides from substrings of the name; the column holds the same answer | `dv20_the_rate_move_column_is_what_resolve_rate_mode_says` (FFmpeg builds) |
+| Dv5, Dv8, Dv9 | not here: the viewer's rank, picker and `legacyCells` | R13 |
+| Dv14 | not here: `encoder_preference` filters at a session's open | R10 |
+| Dv17 | not here: a supervised Mac's worker probe never reaches the root | no source yet |
+| Dv18 | in part: a learned deny's fault rides `unavailable["encoder-cells"]` since #3271; a per-row last open has no source | R10 |
+
 ## The cell resolution — from the matrix to a session
 
 The picker offers two independent dropdowns, **codec** and **chroma format**, and
@@ -172,9 +296,9 @@ A stored pick is held to the device again at connect, because the picker only gr
 what a person is about to choose. A choice also becomes this browser's default for
 every other device, and a per-device override outlives an agent losing a cell. The
 agent answers a `preferred_transport` it does not offer by dropping to the RTP track
-and telling nobody (`agents/roomlerd/src/signaling.rs:3583`), and the viewer ignores
+and telling nobody (`agents/roomlerd/src/signaling.rs:3851`), and the viewer ignores
 that track while it holds a DataChannel transport
-(`ui/src/composables/useRemoteControl.ts:10002`). The session reads connected, with a
+(`ui/src/composables/useRemoteControl.ts:9944`). The session reads connected, with a
 hidden `<video>` playing and a black canvas, and a healthy track keeps the stall
 watchdog quiet. So `transportForSession` (`ui/src/composables/videoCells.ts:437`)
 runs the auto rank for that session and leaves the pick stored (#3167). H.264 keeps
@@ -364,6 +488,83 @@ Implementation notes that keep the child honest:
 - `ROOMLERD_HW_AUTO=0` and `ROOMLERD_ENCODER=software` do **not** skip the probe.
   Those select an encoder; the probe enumerates what to *advertise*.
 
+### The device is online while its first probe runs (#3439)
+
+Until #3439, `signaling::run` awaited the whole first probe before its connect loop (#2551 put
+it there, with the pump gated off), so the control WS opened only after the first answer. On
+#3439's loaded guest, a 4-vCPU Windows 11 VM with 8 High-priority spinners for 150 s, a start
+that missed the cache stayed offline until the load ended: the WS opened 11 ms after
+`caps probe: child reported`, 101–139 s in. Every start that misses the cache pays it, the first
+start of every new build included, which is the start an update ends with.
+
+Now the probe has a thread of its own ([`start_probing`](../agents/roomlerd/src/encode/caps.rs#L2421)),
+and the start waits [`FIRST_ANSWER_WAIT`](../agents/roomlerd/src/encode/caps.rs#L129), 10 s, for its
+first answer. Every healthy host the field has read probed in 0.05–6.8 s (the `probe_ms` reads in
+this file), so its hello still carries the whole answer. Past the wait, the loop connects with the
+interim answer:
+
+```mermaid
+sequenceDiagram
+    participant R as signaling::run
+    participant P as roomlerd-caps-probe thread
+    participant C as probe children
+    participant S as server
+    participant V as viewer
+    R->>P: start_probing
+    P->>C: base, then 444 and gpu, bounds as below
+    Note over R: waits 10 s at most, the pump gated off
+    R->>S: hello with the interim answer, encoder-cells says probing
+    Note over S: the row is online: exec, SSH, tunnels and the overlay work
+    V->>S: rc:session.request
+    S->>R: rc:request
+    Note over R: held in its connection: no answer yet
+    C-->>P: the first answer
+    P->>R: the generation moves, and news wakes every connection
+    R->>S: heartbeat at once, with the answer
+    R->>S: the held request, handled with what is left of its window
+```
+
+| | Before the first answer | Once it lands |
+|---|---|---|
+| The device's row | online, with the interim answer: the cells that need no driver and no encoder open (OpenH264's), no DataChannel transport, `unavailable["encoder-cells"]` code `probing` | the answer, at once rather than within a beat |
+| `rc:request` | held in its connection ([`held_requests`](../agents/roomlerd/src/held_requests.rs)) | handled, its consent windows less the wait, rounded up to whole seconds |
+| A held request whose window runs out | dropped unanswered, and the hub's own consent timer ends it (`ConsentTimeout`) | — |
+| `rc:terminate` for a held request | drops it | — |
+| A connection that drops | its held requests go with it, and the hub pushes a pending request again to the next one | — |
+| exec, SSH, tunnels, the overlay | work: the hello carries every verb | work |
+| The LocalAPI Overview | `not_probed` | the cells |
+
+Why a request waits rather than being served from the interim answer: no driver code runs in the
+daemon until a child has opened that cell, and a session opens Media Foundation in the daemon
+whatever the caps say (`open_default`). Served early, a host whose driver faults there would crash
+on every start with a viewer that reconnects by itself, before its probe could finish: #2551's
+crash loop in a new place. Why not refused: on a host that is only slow, the answer lands inside
+the window, and the session starts a few seconds late.
+
+⚠️ **Nothing the signalling loop reads of the caps may wait for the probe.** It reads
+[`answer_now`](../agents/roomlerd/src/encode/caps.rs#L115), the answer in force or the
+interim one, at the hello, the heartbeat, a request and an offer. A `detect()` there blocks a runtime
+thread on the probe's lock while it runs, and a select loop blocked inside an arm is a pump stall
+that the watchdog ends at 90 s.
+
+⚠️ **The first answer moves the generation too**, once it is stored
+([`detect`](../agents/roomlerd/src/encode/caps.rs#L2390)), and a watch on it
+([`news`](../agents/roomlerd/src/encode/caps.rs#L91)) wakes every connection, whose heartbeat
+then re-announces. Before, only a later try's answer moved it, so a row that said hello with the
+interim answer would have kept it.
+
+**A starved child is not reported as a driver hang.** At a child's bound the parent reads the
+host's idle CPU since the spawn and the child's own CPU time
+([`host_cpu`](../agents/roomlerd/src/encode/host_cpu.rs): `GetSystemTimes` and `GetProcessTimes`
+on Windows, `/proc/stat` and `/proc/<pid>/stat` on Linux), and the host's again over the kill
+wait. With under 5 % idle, and a child that had under a tenth of its bound in CPU, the log says the
+child was most likely starved, with the numbers (`host_idle`, `host_idle_while_dying`,
+`child_cpu_ms`). Otherwise it keeps the driver's wording, with the numbers. On #3439's guest every
+killed child did die, 9–26 s after its kill, with the load still on: a process that is not
+scheduled cannot finish dying either. Nothing the probe decides changes: the bounds, the Media
+Foundation deny and the retry stay as they are. A spawn that took over a second says so
+(`spawn_ms`), so a field read can tell process creation itself from what came before it.
+
 ### A dead child costs the cell it died in
 
 `base` is still one process, and three vendor faults have now landed in it: Intel's
@@ -372,7 +573,7 @@ last one cost a Radeon laptop its RTX 5090's three NVENC cells and all four
 DataChannel transports for 4 h 22 min, and the viewer looked healthy throughout.
 So `base` announces every open (`ROOMLER_CAPS_PROGRESS:<name>:<chroma>`, and
 `ROOMLER_CAPS_PROGRESS:-` once it has ended, its teardown included), and the
-parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L769)).
+parent runs it again ([`run_base`](../agents/roomlerd/src/encode/caps.rs#L838)).
 
 ```mermaid
 sequenceDiagram
@@ -406,7 +607,7 @@ instead of falling to the RTP track, and answers like any host with no hardware
 encoder. It is a child and not an open in the daemon because this is a host whose probes
 have been dying. Only if that child dies as well is the answer the driver-free caps.
 
-A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L391)) is
+A **fault's status** ([`is_fault`](../agents/roomlerd/src/encode/caps.rs#L460)) is
 what a driver leaves when it faults, and not what someone else leaves when they end
 the process. On Windows that is a short list of exception codes a thread raises on
 itself: access violation, illegal instruction, the arithmetic traps, stack overflow,
@@ -454,10 +655,12 @@ bounded at 70 s: the 60 s timeout, then 10 s for the kill to land and its stdout
 (`KILL_WAIT`). The worst case is therefore 90 s plus one child, 160 s against 60 s before;
 with the 4:4:4 and GPU children, 300 s against 180 s. Giving up adds the software child and
 takes those two away, so that path tops out at 230 s. It needs a host whose children each
-take a minute. The probe runs before the worker connects (#2551), with the watchdog's pump
-gated off, so this is time the device is offline, and only on a cache miss. Nothing reads
-that time as a hang: the pump is gated off, a service manager watches for an exit and not
-for a hello, and the crash-loop detector counts unclean exits. Measured on the dev box
+take a minute. The start waits for the probe 10 s at most, with the watchdog's pump gated
+off ([above](#the-device-is-online-while-its-first-probe-runs-3439)), so past that this is time
+the device is online without its hardware and a session waits, and only on a cache miss.
+Nothing reads that time as a hang: the pump is gated off for the wait, the probe runs on its
+own thread, a service manager watches for an exit and not for a hello, and the crash-loop
+detector counts unclean exits. Measured on the dev box
 with AMD's real fault (a debug build, run by hand from Git Bash): two deaths and a report
 in 7.2–7.8 s, against 3.4–3.8 s for the same probe with the cell denied from the start. A
 hung child (suspended, standing in for a driver) cost 63 s, and two of them, which is
@@ -472,7 +675,7 @@ acts on the host. A child stuck in a kernel call does not die until that call re
 a GPU driver hung in a kernel wait is the way to get there. Its stdout stays open while it
 or anything it started holds the write end, and that can outlive a child that exited
 cleanly, which `TIMEOUT` never bounded. So
-[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1670) waits for neither past the
+[`wait_for_child`](../agents/roomlerd/src/encode/caps.rs#L1802) waits for neither past the
 bound above and keeps what arrived by then, and the log says at WARN when it stopped reading
 before the pipe ended (`Run::cut_off`). The child stays behind, on a thread that reaps it if
 the call ever returns, and the log says so at ERROR. At most 4 can stay behind per start
@@ -489,12 +692,12 @@ something holds its pipe is a unit test with a real process on each OS.
   point.
 - **A child that would not die**, in any phase, a `base` child that reported first included
   (#3280), also takes `h264_mf`, `hevc_mf` and `av1_mf` with it
-  ([`media_foundation_denies`](../agents/roomlerd/src/encode/caps.rs#L480)). `encode::open_default` runs Media
+  ([`media_foundation_denies`](../agents/roomlerd/src/encode/caps.rs#L549)). `encode::open_default` runs Media
   Foundation's cascade in the daemon whatever the caps say, on a wait with no bound, so a
   session on that host would run the same vendor's code in-process. With `h264` chosen it
   takes OpenH264 instead. With `av1` chosen it gets no video until #3279 lands: `av1_mf` is
   denied, an FFmpeg AV1 cell that opened still puts `av1` in `codecs`,
-  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L4782) puts it first, and
+  [`pick_best_codec`](../agents/roomlerd/src/encode/caps.rs#L4978) puts it first, and
   `MfEncoder::new_av1` refuses. A report that came before the stuck child stops offering those
   cells, so the hello does not promise what a session is refused. Only a kill that landed
   within its bound keeps Media Foundation: a later kill on a thrashing host reads as "would
@@ -503,7 +706,7 @@ something holds its pipe is a unit test with a real process on each OS.
   the last minute, and the answer in force stops offering them then.
 - **A `444` or `gpu` child** costs those forms and names no cell. Only a fault's death counts
   as an answer about the host, and stays cached as it always was
-  ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L974)). Anything else keeps the answer out of the cache
+  ([`PhaseGaps::note`](../agents/roomlerd/src/encode/caps.rs#L1043)). Anything else keeps the answer out of the cache
   (`why_not_cached`), so the next start asks again: a hang, an answer lost to the bound, an OOM
   kill, an EDR's terminate, a child that could not start. An answer it printed stands however
   it ended afterwards, as `base`'s does. A host where the form really hangs pays that child's
@@ -515,15 +718,18 @@ something holds its pipe is a unit test with a real process on each OS.
 
 ### A host that ran out of time gets another try
 
-The first probe blocks the device, so its bounds cannot grow: a higher bound is a longer
-offline start for a host with a real hang. A host that is merely slow can still hit them (one
+The first probe holds every session until it answers
+([#3439](#the-device-is-online-while-its-first-probe-runs-3439)), so its bounds cannot grow: a
+higher bound is a longer wait for a session on a host with a real hang. A host that is merely
+slow can still hit them (one
 thrashing at boot, an EDR scanning a driver DLL on its first load), and it then loses what that
 child would have said until the next start, which on a server can be months away. So a first
 answer that ran short of time arms one thread that tries again by itself, with more time and
 no restart, never blocking the start or a live session
-([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3395), #3280). A cache hit or a complete answer arms nothing, so a
-healthy host runs none of this. `signaling::run` is what arms it, once per process however
-many organizations it serves, and `roomlerd caps` never does.
+([`arm_retry`](../agents/roomlerd/src/encode/caps.rs#L3587), #3280). A cache hit or a complete answer arms nothing, so a
+healthy host runs none of this. The first probe's own thread arms it once the first answer
+exists (`start_probing`, #3439), once per process however many organizations it serves, and
+`roomlerd caps` never does.
 
 ```mermaid
 sequenceDiagram
@@ -532,8 +738,9 @@ sequenceDiagram
     participant C as probe child
     participant S as server
     W->>C: first probe, base, 60 s
+    W->>S: hello at 10 s, the interim answer, encoder-cells says probing
     C--xW: hung with no cell to blame, twice
-    W->>S: hello, no hardware, encoder-cells says probe-short
+    W->>S: heartbeat at once, no hardware, encoder-cells says probe-short
     W->>T: arm_retry
     Note over T: a minute with nothing live
     T->>C: try 1, base, 2 min
@@ -543,7 +750,7 @@ sequenceDiagram
     W->>S: next heartbeat carries the new caps, same connection
 ```
 
-**What counts as out of time** ([`Shortfall`](../agents/roomlerd/src/encode/caps.rs#L929)):
+**What counts as out of time** ([`Shortfall`](../agents/roomlerd/src/encode/caps.rs#L998)):
 
 | How the probe ended | Reads as | A try? |
 |---|---|---|
@@ -558,20 +765,20 @@ sequenceDiagram
 | A `444` or `gpu` child hung or was cut off | out of time: short by those forms | **yes** |
 | A child that would not die | out of time: short by the Media Foundation cells, whatever else it left | **yes** |
 
-**The table** ([`LADDER`](../agents/roomlerd/src/encode/caps.rs#L2946)). Each try is a whole probe, `base` and then `444`
+**The table** ([`LADDER`](../agents/roomlerd/src/encode/caps.rs#L3138)). Each try is a whole probe, `base` and then `444`
 and `gpu`, because its answer has to stand alone. A later try has an answer in force to fall
 back on, so it runs no software child.
 
 | Try | Waits after the last one ended | Child bound | Read and kill wait | `base` budget |
 |---|---|---|---|---|
-| first probe | at start, blocking | 60 s | 10 s | 90 s |
+| first probe | at start: the start waits 10 s for it, a session all of it | 60 s | 10 s | 90 s |
 | 1 | 1 min | 2 min | 20 s | 3 min |
 | 2 | 10 min | 4 min | 40 s | 6 min |
 | 3 | 1 h | 8 min | 80 s | 12 min |
 | 4 | 6 h | 8 min | 80 s | 12 min |
 | 5 | 24 h | 8 min | 80 s | 12 min |
 
-**What stops it** ([`weigh`](../agents/roomlerd/src/encode/caps.rs#L3059), [`climb`](../agents/roomlerd/src/encode/caps.rs#L3097)): an answer with no
+**What stops it** ([`weigh`](../agents/roomlerd/src/encode/caps.rs#L3251), [`climb`](../agents/roomlerd/src/encode/caps.rs#L3289)): an answer with no
 shortfall, which is the normal end; a try that ends short for a reason other than time; the
 same named cell running out of time again, which is the signature of a real hang, and another
 try could hold the GPU for minutes on a host someone may be using; the end of the table; the
@@ -585,16 +792,16 @@ cut off, twice, which is denied as a death and not for want of time.
 
 **Never stacked, and a learned deny holds.** A child that would not die is counted until the
 call it is stuck in returns, and no try starts while one is, so the table's clock stops
-([`quiet`](../agents/roomlerd/src/encode/caps.rs#L2988)). One that never comes back means no more tries, which is right:
+([`quiet`](../agents/roomlerd/src/encode/caps.rs#L3180)). One that never comes back means no more tries, which is right:
 the driver has not recovered. A try whose own child would not die starts no more children, because
 they could only pile onto the same driver; a first probe has no answer to fall back on, so it goes
 on. Each try hands its children their own list
-([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L2995)): everything learned except what is there only for want of
+([`list_for_a_try`](../agents/roomlerd/src/encode/caps.rs#L3187)): everything learned except what is there only for want of
 time. A fault's deny and a double kill's stay on it. It goes to the child directly, so the
 daemon's list never relaxes while a cell is being tested, and a session keeps honouring the list
 in force. A fault a try confirms joins the daemon's list before that try's next child starts,
 whatever becomes of its answer. The answer in force stops offering that form at the same moment and
-says why, and every row hears of it within a beat ([`withdraw_refused`](../agents/roomlerd/src/encode/caps.rs#L3233)), because a session asking in
+says why, and every row hears of it within a beat ([`withdraw_refused`](../agents/roomlerd/src/encode/caps.rs#L3425)), because a session asking in
 the rest of the probe would otherwise pick a codec its open is refused, and an RTP track binds to
 its codec first. The form a cell opens first takes the cell with it, as the next answer would:
 4:2:0 for an FFmpeg cell, whose 4:4:4 is the `444` child's question, and 4:4:4 for libvpx, whose
@@ -617,7 +824,7 @@ nothing has produced a stuck child in the field.
   a minute of a session asking, and the clock stops for that too.
   Whatever held it back, a try then owes a minute with nothing going on (`after_a_look`), however
   long ago that session asked: it may only just have ended, and its viewer may be reloading the page.
-- **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L2971) runs when `rc:session.request`
+- **A session stops a try.** [`session_asked`](../agents/roomlerd/src/encode/caps.rs#L3163) runs when `rc:session.request`
   arrives, before the consent prompt and ahead of the delegation to a Mac's GUI worker, which is
   earlier than the registry can say: a session enters that only after its peer is built and its
   pump has started. It runs again at the session's offer, because a consent wait can outlast the
@@ -628,15 +835,16 @@ nothing has produced a stuck child in the field.
   rebuild its encoder under another.
 - **A stuck child does not take Media Foundation from under one.** A first probe's child that would
   not die costs those cells at once, with nothing live to touch. A try's waits until no session is
-  live and none has asked in the last minute ([`hold_media_foundation_back`](../agents/roomlerd/src/encode/caps.rs#L3275)): a live session's encoder
+  live and none has asked in the last minute ([`hold_media_foundation_back`](../agents/roomlerd/src/encode/caps.rs#L3467)): a live session's encoder
   may rebuild at the next change of size, one that just asked may have picked such a cell and be
   about to open it, and a refusal there is no video, where the open has so far been fine beside that
   child. It is a level, so a child that came back first costs nothing. When the cells go, the answer
   in force stops offering them, as for a fault. A session starting beside a live one, or within that
   minute, can still open them.
-- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L4803)). A session picks its codec and transport
+- **An offer reads its picks again** ([`picks_at_the_offer`](../agents/roomlerd/src/encode/caps.rs#L4999)). A session picks its codec and transport
   at its request, before consent, and a person can take longer than that minute (`prompt_then_email`
-  waits minutes). So its offer reads both against `detect()`: what has gone is picked again by the
+  waits minutes). So its offer reads both against the answer in force (`answer_now`, which never
+  waits for a probe, #3439): what has gone is picked again by the
   request's own rules, and a pick still offered stays, even beside a better one that has appeared
   since. On the RTP track "still offered" means its opener can open it, and a session that just lost
   its DataChannel picks again (`session_codec`, below). A track bound to a codec its open is refused carries no video, and a DataChannel pump with no
@@ -656,7 +864,7 @@ try when it asks, and a try can start a minute later while it is live. That need
 probe ran out of a minute, on a probe that takes about 120 ms there. The GUI worker climbs too, on
 its own answer and for its own sessions; that answer is not on the wire.
 
-**What adopting changes** ([`adopt`](../agents/roomlerd/src/encode/caps.rs#L3350)). An answer is adopted when it keeps every
+**What adopting changes** ([`adopt`](../agents/roomlerd/src/encode/caps.rs#L3542)). An answer is adopted when it keeps every
 form in force, with hardware still hardware, and has no shortfall or has more forms. So a try
 cannot take a form from a host: what a fault costs has already left the answer in force. A try that
 loses to the answer in force is dropped. It moves the fields a cache hit takes
@@ -669,10 +877,11 @@ in.
 
 **How it reaches the server and the viewer.** The heartbeat re-announces when something changed
 (FR-43 P2c), and the server replaces the row's blob. A generation counter joins that comparison, per
-connection, so every organization's row gets it within a beat, with no wire change. A reconnect's
-hello reads the answer in force. A viewer sees the new matrix at its next page load or 5-minute
-status read. A session starting from an older page still gets the new answer for its codec pick,
-because the agent picks from `detect()`, and a live session is not renegotiated.
+connection, with no wire change, and since #3439 a watch on it wakes every connection, so every
+organization's row gets it at once rather than within a beat. A reconnect's hello reads the answer
+in force. A viewer sees the new matrix at its next page load or 5-minute status read. A session
+starting from an older page still gets the new answer for its codec pick, because the agent picks
+from the answer in force, and a live session is not renegotiated.
 
 **The cache's rules do not change.** A try's answer goes through `why_not_cached` like a first
 probe's, with the key read when the try started, so a short answer is never frozen, and a complete
@@ -696,7 +905,8 @@ denied. `roomlerd caps` prints `learned_deny:`. The hello carries it in
 `scripts/fr97-caps-census.sh` counts it. With no cell to name and an answer short of time, the
 same key says code `probe-short`, so a host with no hardware says why instead of looking like it
 has none. The word goes when a later try answers, and once the table is done with no answer it says
-that the next start is what is left. No viewer asks for that key, so the person at the viewer is
+that the next start is what is left. A row that came online before its first answer says code
+`probing` (#3439) until that answer replaces it. No viewer asks for that key, so the person at the viewer is
 still told nothing.
 
 ## Selection at session time
@@ -837,7 +1047,7 @@ auto-downscale has run. A 5120×1440 screen codes at 3840×1080 at most.
 | Hardware | Behaviour |
 |---|---|
 | NVIDIA RTX 5090 (Blackwell) | `ActivateObject` returns `0x8000FFFF` for the MF H.264/HEVC/AV1 MFTs — FFmpeg NVENC works, MF does not; the cascade lands there. AV1 has no MF alternative and is filtered from caps by the probe |
-| Intel Iris Xe | MF HW MFT is async-only; the async-unlock path handles it. FFmpeg QSV (`hevc_qsv`, `vp9_qsv`, `av1_qsv`, `h264_qsv`) proven in the field; the **packed 4:4:4 (VUYX) open kills the media runtime** (`0xc0000005`, 0.4.84) — `hevc_qsv:yuv444` and `vp9_qsv:yuv444` stay denied until a driver survives it |
+| Intel Iris Xe | MF HW MFT is async-only and stays async after the unlock, so the MF cascade skips it (no async pipeline is built) and falls through to Microsoft's software MFT; under Auto, OpenH264 replaces that (#3257). FFmpeg QSV (`hevc_qsv`, `vp9_qsv`, `av1_qsv`, `h264_qsv`) proven in the field; the **packed 4:4:4 (VUYX) open kills the media runtime** (`0xc0000005`, 0.4.84) — `hevc_qsv:yuv444` and `vp9_qsv:yuv444` stay denied until a driver survives it |
 | AMD Raphael iGPU (VCN 3.1, `radeonsi`) | H.264 + HEVC encode through VAAPI, 4:2:0; **no VP9 or AV1 encode** — `No usable encoding entrypoint found for profile …` is the driver saying so, and the cascade falls through; the unfed-encoder flush above was found here |
 | NVIDIA idle P-states | First seconds of a session encode at ~20 ms/frame until clocks ramp — `gpu_clock.rs` pins graphics clocks via NVML for exactly the session's lifetime. ⚠️ **Above 60 fps an encoder-only load still lets the driver drop to P5, and the memory clock with it** (neo16, RTX 5090 laptop: 810 of 14 001 MHz, NVENC 4.5 → 8.5 ms a frame). FR-119 P2b-16 locks the memory clock too, and engages by itself for an NVENC session above 60 (the default; `ROOMLERD_GPU_CLOCK_PIN=0` turns it off). An SCM worker runs as the person, so it leases the pin from the SYSTEM host (`win_service::gpu_pin_relay`) |
 | NVIDIA GPUs with several NVENC engines | One engine encodes a frame whole: at 2560×1600 4:4:4 HEVC that is 7–8 ms on an RTX 5090 laptop GPU, too slow for a 120 fps period with the conversion in front of it. Above 60 fps, `hevc_nvenc` and `av1_nvenc` open with `split_encode_mode=forced`, which splits each picture into horizontal strips, one per engine, encoded as slices of one picture (FR-119 P2b-10, `throughput_options`). Measured there: 7.05 ms whole, 4.47 ms in the driver's two strips, 3.45 ms in three, at the same size and PSNR. It is a tier of its own above the low-latency one, so a driver that refuses it keeps `delay=0`. `h264_nvenc` has no such mode. Knob `nvenc_split` (`auto` · `off` · 2–4); an explicit count applies only on a GPU with that many engines, and encodes the frame whole otherwise |
@@ -1236,14 +1446,14 @@ colour-manages by primaries and transfer (FR-130 §2.5).
 
 | Family | Where it is written | What the bitstream carries (read on neo16 in P1, and in the field in P3) |
 |---|---|---|
-| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1918`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
+| FFmpeg, every backend | the codec context's four fields in `build_encoder` (`agents/roomlerd/src/encode/ffmpeg/encoder.rs:1922`), before the open, for every cell, rebuild, probe, recording and GPU form | NVENC, D3D12 and Vulkan: set S exactly (H.264, HEVC and AV1; NVENC 4:4:4 too). QSV (AV1, H.264) and VideoToolbox (HEVC, H.264): set S, as Chrome's decoder reads it in the field when it is told nothing. `hevc_amf`: S's values, with the matrix under code 5 (BT.470 BG, the same coefficients). `h264_amf`: matrix 2 (unspecified), AMD's runtime's choice. `vp9_qsv`, `vp9_vaapi`: nothing, because FFmpeg 9.0.1 cannot tag VP9 there. VAAPI: not yet read |
 | Media Foundation | `MF_MT_YUV_MATRIX`, `MF_MT_VIDEO_NOMINAL_RANGE`, `MF_MT_VIDEO_PRIMARIES` and `MF_MT_TRANSFER_FUNCTION` on both media types (`agents/roomlerd/src/encode/mf/sync_pipeline.rs:619`), and again on the renegotiated output type | Microsoft's H.264 and HEVC encoders ignore the attributes and write no description. NVIDIA's and AMD's MF encoders did not open on neo16, so they are unread |
 | openh264, live | the SPS VUI (`agents/roomlerd/src/encode/openh264_backend.rs:116`) | set S |
 | libvpx VP9 | `VP9E_SET_COLOR_SPACE` and `VP9E_SET_COLOR_RANGE` (`agents/roomlerd/src/encode/libvpx.rs:454`) | SMPTE 170M at studio range. VP9's header has no primaries or transfer field, and Chrome's WebCodecs ignores its colour space anyway |
 | openh264, recording | its own VUI and the MP4 `colr` box, unchanged since FR-85 | SMPTE 170M at limited range |
 
 A vendor runtime that refuses the description opens the encoder without it rather than failing the open.
-While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:3611`).
+While the switch is on, the hello says `color-described` (`agents/roomlerd/src/encode/caps.rs:3803`).
 
 **Which lever reaches which path:**
 
@@ -1368,7 +1578,7 @@ What a rate move costs decided the shape of the rate-control code: nine of its
 heuristics exist only to ration that cost
 ([FR-62](fr/FR-62-encoder-rate-changes-without-an-idr.md)). The pump hands every
 AIMD target to `FfmpegEncoder::set_bitrate`
-(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3006`), which snaps it to the
+(`agents/roomlerd/src/encode/ffmpeg/encoder.rs:3011`), which snaps it to the
 ladder first (`encode/aimd.rs:297` — 100 k … 25 M, `coarsen_bitrate` at `:317`)
 and returns when the rung is the one already running. Only a rung crossing reaches
 the backend's arm, resolved once at open by `resolve_rate_mode` (`encoder.rs:869`).
@@ -1397,12 +1607,18 @@ Measured with the sweep described below (20 rate changes 6 M → 200 k → 6 M a
 | `hevc_amf` (Radeon 610M) | rebuild | **20/20** | **41–55 ms** | **0.4.187, 2026-10-29** — the 0.4.187 harness filed every one as periodic (below); the corrected harness reads `total_rate_idr: 20`, `pass: false` |
 | `hevc_d3d12va`, `hevc_vulkan` (the dev box) | rebuild | 20/20 | 42–77 ms | FR-78 P2 |
 | `*_vaapi` | rebuild, by construction | — | unmeasured | — |
-| `hevc_videotoolbox` | rebuild | unmeasured | unmeasured | A3's open decision: patch 0002, or a rebuild at settle |
+| `hevc_videotoolbox` (Apple M5 Pro) | rebuild | **20/20** | **8–12 ms** | **0.4.201, 2026-11-05**; patch 0002 would remove the IDR (A3's open decision) |
 
 So the two rebuild families are not one: QSV's rebuild is a multi-second stall at
-the rates a slow link runs, while AMF, D3D12 and Vulkan rebuild in 40–80 ms and pay
-only the IDR. The rationing a backend needs follows from its row, which is why A4
+the rates a slow link runs, while VideoToolbox (8–12 ms), AMF, D3D12 and Vulkan
+(40–80 ms) rebuild fast and pay only the IDR. The rationing a backend needs follows from its row, which is why A4
 retires heuristics per backend rather than deleting them.
+
+In the field `av1_nvenc` moves the same way. A relayed CORPLAP-2 session on 0.4.201
+crossed 13 rungs in place, down to 550 k and back up to 3 M, with `rebuilds=0`, and
+none of the moves brought an IDR of its own (FR-62 AC2/AC3, 2026-11-05). Patch 0001
+is in `nvenc.c`'s `reconfig_encoder`, which `h264_nvenc`, `hevc_nvenc` and
+`av1_nvenc` share.
 
 ⚠️ **Above the ladder the controller moves nothing.** The top rung is 25 Mbps. A
 direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climbed
@@ -1410,7 +1626,7 @@ direct `av1_nvenc` session at 144 fps on the dev box (0.4.186, 2026-10-29) climb
 coarsened to the top rung and `set_bitrate` returned. Until its first rung crossing the
 encoder runs at the maxrate it opened with, and after that at the rung, never at the target.
 
-**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10031-10064`):
+**What the heartbeat says** (`FFmpeg DC pump heartbeat`, `peer.rs:10350-10383`):
 
 | Field | Meaning |
 |---|---|
@@ -1419,14 +1635,15 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `rebuilds` | synchronous reopens, the inline arm |
 | `swaps` | background-rebuilt encoders adopted. Read it beside the two above: on a direct QSV session every rate move lands here and only here (FR-65) |
 | `dims_swaps` | reopens for a resolution change (FR-70 M2) |
-| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:843`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
+| `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:850`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6326`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6442`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
 roomlerd encoder-smoke --reconfigure-sweep --name hevc_amf --codec hevc --json   # a backend the cascade outranks
+roomlerd encoder-smoke --reconfigure-sweep --name hevc_videotoolbox --codec hevc --json   # a Mac, as root
 ```
 
 Per rung it prints `set_ms`, `rate_idr`, `periodic_idr`, `mean_bytes`, the
@@ -1435,11 +1652,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6587`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6703`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6616`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6732`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst
@@ -1461,7 +1678,7 @@ FFmpeg it links cannot disagree. The macOS builder carries no patch today.
 
 | Switch | Default | What it does | Retires when |
 |---|---|---|---|
-| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:342`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:355`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
+| `encoder_inplace_rate` / `ROOMLERD_ENCODER_INPLACE_RATE` (`encode/mod.rs:350`) | off | ON: QSV applies in place (measured broken on Iris Xe) and NVENC sizes its buffer to the open's window (`inplace_rate_bufsize`, `:363`). OFF is the pre-A1 behaviour, pinned by `encode::tests::inplace_rate_off_writes_the_pre_a1_one_times_window` and `encoder::tests::rate_mode_resolves_per_backend_and_flag` | QSV has an in-place path (patch 0004) or the arm is dropped |
 | `ROOMLERD_ENCODER_NVENC_ASSUME_IDR` (`:371`) | off | reverts NVENC to the IDR-rationing pump path | a release of constrained NVENC heartbeats with `idr_count` flat across `rate_moves` |
 | `bg_rebuild_constrained` (`:515`) | on | a constrained session's rebuild runs off-thread (#1254), adopted at quiet | never while a rebuild backend exists |
 
@@ -1516,11 +1733,11 @@ flowchart LR
 - **Software paths target 60, paced to what they sustain** (P2). `SoftwarePace` (`encode/encode_pressure.rs:242`)
   runs FR-1's `FpsPace` over its own encode EWMA. It is its own EWMA so that `ROOMLERD_ENCODE_PRESSURE=0`, the
   hardware path's switch, cannot turn the software pace off as a side effect. The pace is never below 30
-  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:845`), so a host that cannot sustain 30 runs exactly as it did before.
+  (`SW_PACE_FLOOR_FPS`, `encode/mod.rs:853`), so a host that cannot sustain 30 runs exactly as it did before.
   The RTP pump starts at 60 under the tier (`target_fps_with_tier`, `peer.rs:123`). The auto-fps-cap that drops
   a software encoder to 30 applies only where the tier is off: Windows and macOS by default, where the WGC
   readback it was written for lives.
-  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:829`). On a host whose clock was
+  - ⚠️ **On by default on Linux only** (`sw_fps_60_enabled`, `encode/mod.rs:837`). On a host whose clock was
     never the limit, 60 frames cost twice the CPU of 30, and an attended desktop pays for it, so Windows and
     macOS opt in with `ROOMLERD_SW_FPS_60=1` until the operator decides it per OS on P3's numbers
     ([below](#what-the-numbers-recommend)). `ROOMLERD_SW_FPS_60=0` gives back 30 everywhere.
@@ -1532,7 +1749,7 @@ flowchart LR
     found it, window for window. The hardware pace keeps margin 0 until it is measured on hardware
     ([#2432](https://github.com/gjovanov/roomler-ai/issues/2432)).
 - **The bitrate base follows the rate the pump runs at**, by √(fps/30) (`bitrate_base_for_fps`,
-  `encode/mod.rs:814`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
+  `encode/mod.rs:822`): exactly the old figure at 30, ×1.41 at 60. A linear ×2 bought nothing when it was
   measured.
 
 ### The clock on macOS and Windows (FR-112 P3)
@@ -1741,8 +1958,9 @@ run `cargo clippy … --all-targets -- -D warnings` under WSL before pushing it.
 
 The browser probes per-codec **software and hardware** decode support and exposes
 the render paths documented in [ui.md](ui.md#the-remote-desktop-viewer-useremotecontrolts):
-classic `<video>`, WebCodecs-over-RTP (`RTCRtpScriptTransform`), and the DC worker
-paths (`rc-webcodecs-worker`, `rc-hevc-worker`, `rc-vp9-444-worker`). Per-hop
+classic `<video>`, WebCodecs-over-RTP (`RTCRtpScriptTransform`, decoded in
+`rc-webcodecs-worker`), and the data-channel path, one worker for every codec there
+(`rc-dc-worker`; `rc-hevc-worker` and `rc-vp9-444-worker` until FR-135 R3). Per-hop
 timings (forward / decode / paint) are instrumented by `rc-hop-stats` and shown in
 the opt-in diagnostics HUD. Decoder stats flow back to the agent and close the
 rate-control loop.

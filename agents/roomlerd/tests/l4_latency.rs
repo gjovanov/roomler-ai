@@ -749,6 +749,8 @@ async fn run_cell(cell: Cell) -> Result<Run> {
         // FR-102 P9d — the carrier-ready signal; the L4 harness does not read
         // it, so a throwaway sender is correct.
         mpsc::channel(1).0,
+        // FR-135 §7.1 — neither key set: every built-in default.
+        roomlerd::media_paths::MediaPaths::default(),
     )
     .await
     .context("AgentPeer::new")?;

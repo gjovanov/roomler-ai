@@ -221,6 +221,8 @@ pub enum ErrorCode {
     Download,
     /// The downloaded artifact's SHA-256 did not match.
     Sha256Mismatch,
+    /// The downloaded artifact is not signed by the publisher (#3246).
+    SignatureRefused,
     /// msiexec could not be started.
     MsiSpawn,
     /// Waiting for msiexec failed (never its exit code).
@@ -255,13 +257,14 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 20] = [
+    pub const ALL: [ErrorCode; 21] = [
         ErrorCode::AdvancedOptions,
         ErrorCode::UnsupportedPlatform,
         ErrorCode::Preflight,
         ErrorCode::Resolve,
         ErrorCode::Download,
         ErrorCode::Sha256Mismatch,
+        ErrorCode::SignatureRefused,
         ErrorCode::MsiSpawn,
         ErrorCode::MsiWait,
         ErrorCode::MsiUserCancel,
@@ -286,6 +289,7 @@ impl ErrorCode {
             ErrorCode::Resolve => "resolve",
             ErrorCode::Download => "download",
             ErrorCode::Sha256Mismatch => "sha256_mismatch",
+            ErrorCode::SignatureRefused => "signature_refused",
             ErrorCode::MsiSpawn => "msi_spawn",
             ErrorCode::MsiWait => "msi_wait",
             ErrorCode::MsiUserCancel => "msi_user_cancel",

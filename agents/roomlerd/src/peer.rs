@@ -332,7 +332,7 @@ pub mod l0 {
 }
 
 /// One `rc:session.stats` sample: what this session actually did.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionTelemetry {
     pub bytes_sent: u64,
     pub bytes_recv: u64,
@@ -351,6 +351,9 @@ pub struct SessionTelemetry {
     /// (`session_telemetry::SessionCounters::decode_errors`); `None` = not
     /// counted, never zero.
     pub decode_errors: Option<u32>,
+    /// FR-132 P1d — what the session's video ran on, the pump's newest
+    /// reading; `None` = not reported, never CPU.
+    pub video: Option<roomler_ai_remote_control::models::SessionVideo>,
 }
 
 impl AgentPeer {
@@ -421,6 +424,10 @@ impl AgentPeer {
         // peer's own sender (the seam), which for a delegated session is the
         // delegation channel to the daemon, never the worker's own WS.
         carrier_ready_tx: mpsc::Sender<bson::oid::ObjectId>,
+        // FR-135 §7.1 — which media paths this session runs, old or new,
+        // decided once by the signalling loop from `rc_media_legacy` and
+        // `rc_media_canary` (`RemoteConfigServices::media_paths`).
+        media_paths: crate::media_paths::MediaPaths,
     ) -> Result<Self> {
         let mut engine = MediaEngine::default();
         engine
@@ -1193,6 +1200,9 @@ impl AgentPeer {
         // (FR-102 P9d): a session someone leaves right after a black screen
         // would otherwise end before the next 30 s tick carried it.
         let stats_now_for_dc = carrier_ready_tx.clone();
+        // FR-135 R0 — the control handler keeps the viewer's media numbers
+        // only with `stats` on this session's new path.
+        let stats_new_for_dc = media_paths.is_new(crate::media_paths::MediaPath::Stats);
         let video_bytes_dc_for_callback = video_bytes_dc.clone();
         let control_dc_for_callback = control_dc.clone();
         let cursor_dc_for_callback = cursor_dc_stash.clone();
@@ -1295,6 +1305,7 @@ impl AgentPeer {
                             viewer_report_for_dc,
                             priority_for_dc,
                             stats_now_for_dc,
+                            stats_new_for_dc,
                         )
                     }
                     "cursor" => {
@@ -1524,7 +1535,7 @@ impl AgentPeer {
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tick.tick().await;
-                        if !crate::display_match::owns_mode(sid) {
+                        if !crate::display_match::watch_due(sid) {
                             continue;
                         }
                         if let Ok(Some(answer)) =
@@ -1628,12 +1639,15 @@ impl AgentPeer {
 
         // FR-135 R2 — say what this session is set to send, before any pump
         // runs, so a pump that cannot start still leaves the viewer knowing.
+        // §7.1 — unless `media_plan` is on this session's old path, and with
+        // the session's other key-chosen paths named in the plan.
         crate::media_plan::start(
             session_id,
             negotiated_transport.as_deref(),
             &chosen_codec,
             control_dc.clone(),
             session_end.clone(),
+            &media_paths,
         );
 
         // Start the capture→encode→track pump. The pump is self-regulating:
@@ -1669,6 +1683,8 @@ impl AgentPeer {
             priority,
             rc_sessions,
             no_video.clone(),
+            carrier_ready_tx,
+            media_paths,
         ));
 
         // FR-93 P5h — told when this computer goes to sleep.
@@ -1784,6 +1800,8 @@ impl AgentPeer {
         out.carrier = self.carrier.get().copied();
         // FR-132 P1 — the viewer's decode errors, once it counts them.
         out.decode_errors = c.decode_errors();
+        // FR-132 P1d — and what the video ran on, once the pump has said.
+        out.video = c.video();
         out
     }
 
@@ -2390,7 +2408,21 @@ async fn media_pump(
     // #3245 — set before the RTP pump asks for its session's end with no encoder
     // (`end_no_video`), so the signalling loop names that end.
     no_video: Arc<std::sync::atomic::AtomicBool>,
+    // FR-132 P1d — asks the signalling loop for one `rc:session.stats` now, by
+    // the carrier observation's road (FR-102 P9d). The two DC pumps have a
+    // reading to send (FR-135 R0 gave the VP9 pump its own).
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — which media paths this session runs (`stats` among them),
+    // decided once at the session's open.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
+    // `stats_now` is consumed only by the two DC pumps; keep the other
+    // builds warning-clean.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = &stats_now;
+    // `media_paths` only by the two DC pumps.
+    #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
+    let _ = &media_paths;
     // `viewer_report` is consumed only by the DC video pumps (vp9-444 +
     // ffmpeg-encoder); keep the signalling-only build warning-clean.
     #[cfg(not(any(feature = "vp9-444", feature = "ffmpeg-encoder")))]
@@ -2462,6 +2494,8 @@ async fn media_pump(
                     false,
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
+                    media_paths.clone(),
                 )
                 .await;
             }
@@ -2506,6 +2540,8 @@ async fn media_pump(
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
+                    media_paths.clone(),
                 )
                 .await;
             }
@@ -2547,6 +2583,8 @@ async fn media_pump(
                     matches!(chroma_pref.as_deref(), Some("yuv444")),
                     chunk_framing,
                     rc_sessions,
+                    stats_now,
+                    media_paths.clone(),
                 )
                 .await;
             }
@@ -2626,6 +2664,8 @@ async fn media_pump(
                         wants_444,
                         chunk_framing,
                         rc_sessions,
+                        stats_now,
+                        media_paths.clone(),
                     )
                     .await;
                 }
@@ -2653,6 +2693,8 @@ async fn media_pump(
                 priority,
                 chunk_framing,
                 rc_sessions,
+                stats_now.clone(),
+                media_paths.clone(),
             )
             .await;
         }
@@ -2919,7 +2961,7 @@ async fn media_pump(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc, None) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -3790,6 +3832,10 @@ async fn run_ffmpeg_dc_session(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     // P7 — chroma-discriminated hard-profile label (HEVC only; every other
     // codec ignores the flag).
@@ -3840,6 +3886,8 @@ async fn run_ffmpeg_dc_session(
             chroma444,
             chunk_framing,
             rc_sessions,
+            stats_now,
+            media_paths,
         )
         .await;
     }
@@ -3872,6 +3920,10 @@ async fn run_vp9_444_dc_session(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d, FR-135 R0 — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     loop {
         let sink = crate::media_share::FollowerSink {
@@ -3920,6 +3972,8 @@ async fn run_vp9_444_dc_session(
             priority,
             chunk_framing,
             rc_sessions,
+            stats_now,
+            media_paths,
         )
         .await;
     }
@@ -3977,6 +4031,10 @@ async fn media_pump_vp9_444_dc(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d, FR-135 R0 — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     // See `media_pump`: tracks lock-state transitions so we can
     // request a keyframe on the lock/unlock boundary.
@@ -3993,6 +4051,15 @@ async fn media_pump_vp9_444_dc(
         );
     }
     use crate::encode::libvpx::Vp9Encoder;
+
+    // FR-135 R0 — this pump's window too (see the FFmpeg pump): the session's
+    // summary, and its cell for `rc:session.stats`. Its heartbeat counts
+    // packets rather than time (ledger L02), so nothing here rides it.
+    let mut media_window = media_paths
+        .is_new(crate::media_paths::MediaPath::Stats)
+        .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let pump_started = std::time::Instant::now();
+    let mut first_frame_noted = false;
 
     // rc.33: opt-in 60 fps via env var. Default 30 (the pre-rc.33
     // behaviour). Operators on hosts that can sustain SW VP9 encode at
@@ -4109,6 +4176,12 @@ async fn media_pump_vp9_444_dc(
         },
         session_id,
     );
+    // #3260 — and a capturer that cannot capture tells every viewer of this
+    // pipeline, the ones that join later included. Here rather than beside
+    // this session's own notice above: the pipeline exists only from here.
+    if let Some(reason) = capturer.unavailable() {
+        pipeline.tell_unavailable(reason);
+    }
     let mut last_viewers: usize = 0;
 
     let mut frames_captured: u64 = 0;
@@ -4364,6 +4437,24 @@ async fn media_pump_vp9_444_dc(
         // joiner finding this stale evicts the pipeline (a wedged encode
         // can block this task forever with no way to drop the Pipeline).
         pipeline.beat();
+        // FR-135 R0 (N16) — the summary folds on its own clock, and with it
+        // FR-132 P1d's reading: libvpx has no GPU form, so CPU, `no_gpu_cell`.
+        if let Some(w) = media_window.as_mut()
+            && let Some(f) =
+                w.fold_if_due(std::time::Instant::now(), crate::media_window::FOLD_EVERY)
+        {
+            let counters = crate::session_telemetry::counters(session_id);
+            counters.note_media_fold(f, pipeline.follower_count() as u32);
+            if counters.note_video(crate::session_telemetry::VideoForm {
+                encoder: crate::encode::cells::LIBVPX_VP9,
+                capture: capturer.backend(),
+                input_path: "cpu",
+                input_reason: "no_gpu_cell",
+                chroma: chroma_wire,
+            }) {
+                let _ = stats_now.try_send(session_id);
+            }
+        }
         // Relay-escape — every TRANSPORT_RECHECK_INTERVAL re-read the
         // selected ICE pair: Chrome renominates mid-session (relay→direct
         // once the mDNS-resolved host pair succeeds; direct→relay on a path
@@ -4530,11 +4621,19 @@ async fn media_pump_vp9_444_dc(
         // A local first, so `capturer`'s borrow ends before the idle arm asks
         // it what it waits for (FR-93 P3e).
         let next_frame = capturer.next_frame().await;
+        // FR-135 R0 (N7) — when the pump took this pass's real frame.
+        let mut frame_captured_at: Option<std::time::Instant> = None;
         let frame: std::sync::Arc<crate::capture::Frame> = match next_frame {
             Ok(Some(f)) => {
                 frames_captured += 1;
+                frame_captured_at = Some(std::time::Instant::now());
+                if let Some(w) = media_window.as_mut() {
+                    w.on_real_frame();
+                }
                 last_capture_at = std::time::Instant::now();
                 capture_wait.on_frame();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 let arc = std::sync::Arc::new(f);
                 last_good_frame = Some(arc.clone());
                 // FR-101 P4b-2 — a real capture, never a keepalive: the idle limit's
@@ -4549,7 +4648,12 @@ async fn media_pump_vp9_444_dc(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(
+                    capturer.waits_for(),
+                    session_id,
+                    &control_dc,
+                    Some(&pipeline),
+                ) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -4563,6 +4667,9 @@ async fn media_pump_vp9_444_dc(
                 if last_capture_at.elapsed() >= IDLE_KEEPALIVE {
                     if let Some(ref f) = last_good_frame {
                         last_capture_at = std::time::Instant::now();
+                        if let Some(w) = media_window.as_mut() {
+                            w.on_keepalive();
+                        }
                         // rc.187 (burst-gated) — first keepalive after a real
                         // motion burst settles = keyframe, so a viewer that
                         // dropped frames mid-motion resyncs to the settled
@@ -4608,7 +4715,7 @@ async fn media_pump_vp9_444_dc(
                 capturer = capture::open_default_async(
                     target_fps,
                     downscale,
-                    media_waiting_hook(session_id, control_dc.clone()),
+                    shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
                 encoder = None;
@@ -5007,6 +5114,9 @@ async fn media_pump_vp9_444_dc(
         encode_us += encode_start.elapsed().as_micros() as u64;
         encode_ops += 1;
         frames_encoded += packets.len() as u64;
+        if let Some(w) = media_window.as_mut() {
+            w.on_encoded();
+        }
 
         // P8 Phase 5 — fold the encoder's QP reports into the window.
         for pkt in &packets {
@@ -5188,6 +5298,7 @@ async fn media_pump_vp9_444_dc(
         // the queue drains. A single consumer preserves 16 KiB chunk order for
         // the browser reassembler. (frames_sent / bytes_written / send_errors
         // are incremented by the send task via the shared atomics now.)
+        let mut handed_bytes: u64 = 0;
         for p in packets {
             // FR-1 P7 — process-epoch stamp (see `agent_epoch_us`): the
             // browser maps this onto its own clock via the rc:clock probe.
@@ -5201,13 +5312,22 @@ async fn media_pump_vp9_444_dc(
                 native_dims_packed,
                 encoded_dims_packed,
             );
+            let wire_len = wire.len() as u64;
             match send_tx.try_send(wire) {
                 Ok(()) => {
+                    handed_bytes += wire_len;
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
                     if p.is_keyframe {
                         kf_gate.on_key_frame_queued();
+                        // FR-135 R0 (N12) — and the viewer's ask it answers.
+                        if let Some(w) = media_window.as_mut()
+                            && let Some(waited) =
+                                crate::session_telemetry::counters(session_id).take_keyframe_ask()
+                        {
+                            w.on_key_queued(waited);
+                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -5219,6 +5339,18 @@ async fn media_pump_vp9_444_dc(
                     warn!(%session_id, "VP9-444 DC pump: send task gone — exiting pump");
                     return;
                 }
+            }
+        }
+        // FR-135 R0 (N7, N10, N3) — once per frame that reached the queue.
+        if handed_bytes > 0
+            && let Some(w) = media_window.as_mut()
+        {
+            let now = std::time::Instant::now();
+            w.on_handoff(now, frame_captured_at, handed_bytes);
+            if !first_frame_noted {
+                first_frame_noted = true;
+                crate::session_telemetry::counters(session_id)
+                    .note_first_frame(now.saturating_duration_since(pump_started));
             }
         }
 
@@ -5609,11 +5741,14 @@ fn capture_unavailable_payload(reason: &crate::capture::CaptureUnavailable) -> S
 ///
 /// Bounded: a session that never opens its control DC must not leave a task
 /// spinning for the life of the process.
+///
+/// #3260 — a shared pipeline's followers are told through here too, each
+/// under its own session (`media_share::Pipeline::tell_unavailable`).
 #[cfg_attr(
     not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
     allow(dead_code)
 )]
-fn spawn_capture_unavailable_notice(
+pub(crate) fn spawn_capture_unavailable_notice(
     session_id: bson::oid::ObjectId,
     control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
     reason: crate::capture::CaptureUnavailable,
@@ -5944,12 +6079,14 @@ impl CaptureWait {
 
     /// The pumps' half: on a "no frame", `true` when the capture waits on its
     /// host (told now, earlier, or once the pump has been quiet for
-    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out.
+    /// [`Self::QUIET_BEFORE_TELL`]), so no keepalive goes out. #3423 — `share`
+    /// is the pump's shared pipeline, whose followers are told with its owner.
     fn hold(
         &mut self,
         waits: Option<crate::capture::WaitFor>,
         session_id: bson::oid::ObjectId,
         control_dc: &Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+        share: Option<&crate::media_share::Pipeline>,
     ) -> bool {
         if !media_waiting_enabled() {
             return false;
@@ -5958,10 +6095,14 @@ impl CaptureWait {
             return false;
         };
         if tell {
-            media_waiting_hook(session_id, control_dc.clone())(crate::capture::OpenWait {
+            let wait = crate::capture::OpenWait {
                 gives_up_in: Self::TOLD_FOR,
                 why,
-            });
+            };
+            media_waiting_hook(session_id, control_dc.clone())(wait);
+            if let Some(pipeline) = share {
+                pipeline.tell_waiting(wait);
+            }
         }
         true
     }
@@ -5990,9 +6131,6 @@ fn media_waiting_hook(
     let asking: std::sync::Mutex<Option<crate::rc_sessions::AskingMark>> =
         std::sync::Mutex::new(None);
     Box::new(move |wait| {
-        const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
-        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-        const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
         // FR-93 P6h — while the desktop's own dialog asks the person at the
         // screen, nothing is shared yet, and the companion's "Being viewed"
         // banner would cover the very window that asks (measured on KDE,
@@ -6001,28 +6139,73 @@ fn media_waiting_hook(
         let mark = matches!(wait.why, crate::capture::WaitFor::Dialog { .. })
             .then(|| crate::rc_sessions::AskingMark::new(session_id));
         *asking.lock().unwrap_or_else(|p| p.into_inner()) = mark;
-        let payload = media_waiting_payload(wait);
-        info!(
-            %session_id,
-            gives_up_in_s = wait.gives_up_in.as_secs(),
-            why = ?wait.why,
-            "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
-        );
         // FR-93 P5g — one open can wait twice (the switch, then the unlock).
-        let control_dc = control_dc.clone();
-        runtime.spawn(async move {
-            // Bounded by the wait's own deadline too: past it, the notice
-            // would describe a wait that is already over.
-            let deadline = DEADLINE.min(wait.gives_up_in);
-            if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await
-            {
-                warn!(
-                    %session_id,
-                    "media-waiting notice never reached the controller within its deadline"
-                );
-            }
-        });
+        spawn_media_waiting_notice(&runtime, session_id, control_dc.clone(), wait);
     })
+}
+
+/// #3423 — [`media_waiting_hook`] for an open whose pump already owns a shared
+/// pipeline (`media_share`): the viewers following it are told what the owner's
+/// own viewer is, and so are the ones that join while the open waits. The
+/// FFmpeg pump registers its pipeline before its first open, and both DC pumps
+/// reopen inside their loops.
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+fn shared_media_waiting_hook(
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    pipeline: &crate::media_share::Pipeline,
+) -> crate::capture::OnOpenWait {
+    let own = media_waiting_hook(session_id, control_dc);
+    if !media_waiting_enabled() {
+        return own;
+    }
+    let share = pipeline.wait_teller();
+    Box::new(move |wait| {
+        own(wait);
+        share.tell(wait);
+    })
+}
+
+/// FR-93 P2d-2 — deliver [`media_waiting_payload`] to one controller, retrying
+/// until its control channel takes it. `runtime` spawns the sender, because an
+/// open's hook fires on the blocking pool.
+///
+/// #3423 — a shared pipeline's followers are told through here too, each under
+/// its own session (`media_share::Pipeline::tell_waiting`).
+#[cfg_attr(
+    not(any(feature = "vp9-444", feature = "ffmpeg-encoder")),
+    allow(dead_code)
+)]
+pub(crate) fn spawn_media_waiting_notice(
+    runtime: &tokio::runtime::Handle,
+    session_id: bson::oid::ObjectId,
+    control_dc: Arc<tokio::sync::Mutex<Option<Arc<RTCDataChannel>>>>,
+    wait: crate::capture::OpenWait,
+) {
+    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    const SEND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+    let payload = media_waiting_payload(wait);
+    info!(
+        %session_id,
+        gives_up_in_s = wait.gives_up_in.as_secs(),
+        why = ?wait.why,
+        "capture: waiting on the host (a portal dialog, an unlock, a display waking, a user switch); telling the controller"
+    );
+    runtime.spawn(async move {
+        // Bounded by the wait's own deadline too: past it, the notice
+        // would describe a wait that is already over.
+        let deadline = DEADLINE.min(wait.gives_up_in);
+        if !send_control_notice(&control_dc, &payload, RETRY_EVERY, deadline, SEND_BUDGET).await {
+            warn!(
+                %session_id,
+                "media-waiting notice never reached the controller within its deadline"
+            );
+        }
+    });
 }
 
 /// Retry one control-DC message until it is sent or `deadline` passes. The
@@ -6385,8 +6568,21 @@ async fn media_pump_ffmpeg_dc(
     chunk_framing: bool,
     // FR-93 P6c — see `media_pump`.
     rc_sessions: crate::rc_sessions::RcSessionRegistry,
+    // FR-132 P1d — see `media_pump`.
+    stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — see `media_pump`.
+    media_paths: crate::media_paths::MediaPaths,
 ) {
     use crate::encode::VideoEncoder;
+
+    // FR-135 R0 — this pump's window of media numbers (`crate::media_window`):
+    // the heartbeat's new fields and the session's summary (N16). `None` with
+    // `stats` on the session's old path: today's heartbeat, and no summary.
+    let mut media_window = media_paths
+        .is_new(crate::media_paths::MediaPath::Stats)
+        .then(|| crate::media_window::MediaWindow::new(std::time::Instant::now()));
+    let pump_started = std::time::Instant::now();
+    let mut first_frame_noted = false;
 
     let codec_label = codec.label();
     // P7 — the session's ACTIVE chroma: starts as the request (HEVC only),
@@ -6649,7 +6845,7 @@ async fn media_pump_ffmpeg_dc(
     let mut capturer = capture::open_default_async(
         target_fps,
         downscale,
-        media_waiting_hook(session_id, control_dc.clone()),
+        shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
     )
     .await;
     // FR-80 — a capturer that cannot capture says so, and the controller is
@@ -6657,6 +6853,9 @@ async fn media_pump_ffmpeg_dc(
     // backend answers `None`, so a healthy session sends nothing.
     if let Some(reason) = capturer.unavailable() {
         spawn_capture_unavailable_notice(session_id, control_dc.clone(), reason.clone());
+        // #3260 — and so is every viewer sharing this pipeline: the ones
+        // that joined while the capture opened, and the ones that join later.
+        pipeline.tell_unavailable(reason);
     }
     // FR-93 P6g — and an arm the compositor shows nothing for still says, at
     // the screen, who is viewing it.
@@ -7323,6 +7522,15 @@ async fn media_pump_ffmpeg_dc(
         // because an overrun whose named phases read ~0 is itself the finding.
         // ⚠️ The cost of the first rule: a wedged capture cannot trip this
         // watch — `capture_ms` shows it, nothing alerts on it.
+        // FR-135 R0 (N16) — the session's summary folds on its own clock, never
+        // the heartbeat's, which every `continue` below starves (ledger L03).
+        if let Some(w) = media_window.as_mut()
+            && let Some(f) =
+                w.fold_if_due(std::time::Instant::now(), crate::media_window::FOLD_EVERY)
+        {
+            crate::session_telemetry::counters(session_id)
+                .note_media_fold(f, pipeline.follower_count() as u32);
+        }
         if let Some(pass) = watch.turn_with(|| phase_accum!()) {
             warn!(
                 %session_id,
@@ -7638,7 +7846,11 @@ async fn media_pump_ffmpeg_dc(
                             capturer = capture::open_default_async(
                                 target_fps,
                                 downscale,
-                                media_waiting_hook(session_id, control_dc.clone()),
+                                shared_media_waiting_hook(
+                                    session_id,
+                                    control_dc.clone(),
+                                    &pipeline,
+                                ),
                             )
                             .await;
                             PassWatch::stop(t, &mut recapture_us);
@@ -8115,6 +8327,8 @@ async fn media_pump_ffmpeg_dc(
         // AREA leg already judged at capture time (tracked damage over the
         // floor); the bytes leg skips those (one note per frame).
         let mut is_real_frame = false;
+        // FR-135 R0 (N7) — when the pump took this pass's real frame.
+        let mut frame_captured_at: Option<std::time::Instant> = None;
         let mut area_judged = false;
         // Did EITHER significance leg count this frame as motion? A real
         // frame that stays false is QUIET EVIDENCE and feeds the refine
@@ -8130,9 +8344,15 @@ async fn media_pump_ffmpeg_dc(
                 // screen leg (free unless a live session has a limit).
                 crate::session_idle::note_frame(&arc);
                 last_capture_at = std::time::Instant::now();
+                frame_captured_at = Some(last_capture_at);
                 capture_wait.on_frame();
+                // #3423 — and a viewer that joins from now on hears no stale notice.
+                pipeline.on_frame();
                 frames_captured += 1;
                 is_real_frame = true;
+                if let Some(w) = media_window.as_mut() {
+                    w.on_real_frame();
+                }
                 // Motion continues — the settle gate counts the episode.
                 settle_kf.note_real_frame();
                 // P8a — AREA significance leg, judged at CAPTURE time on
@@ -8176,7 +8396,12 @@ async fn media_pump_ffmpeg_dc(
                 // in the background): the controller is told, and no keepalive
                 // re-encodes the last frame (a decoded frame would clear the
                 // viewer's notice).
-                if capture_wait.hold(capturer.waits_for(), session_id, &control_dc) {
+                if capture_wait.hold(
+                    capturer.waits_for(),
+                    session_id,
+                    &control_dc,
+                    Some(&pipeline),
+                ) {
                     // P5f — and the pump stays abortable. Mutter's frame wait
                     // blocks in place and never yields, so without this the
                     // loop never reached an await that yields: a viewer that
@@ -8193,6 +8418,9 @@ async fn media_pump_ffmpeg_dc(
                     && let Some(ref f) = last_good_frame
                 {
                     last_capture_at = std::time::Instant::now();
+                    if let Some(w) = media_window.as_mut() {
+                        w.on_keepalive();
+                    }
                     // rc.187 (burst-gated) — the FIRST keepalive after a real
                     // motion burst settles is a KEYFRAME. `keyframe_requested`
                     // is consumed by the force block below (which also exempts
@@ -8213,6 +8441,9 @@ async fn media_pump_ffmpeg_dc(
                             settle_kf_suppressed += 1;
                         } else {
                             keyframe_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(w) = media_window.as_mut() {
+                                w.on_force(crate::media_window::IdrCause::Settle);
+                            }
                             tracing::info!(
                                 %session_id,
                                 codec_label,
@@ -8336,7 +8567,7 @@ async fn media_pump_ffmpeg_dc(
                 capturer = capture::open_default_async(
                     target_fps,
                     downscale,
-                    media_waiting_hook(session_id, control_dc.clone()),
+                    shared_media_waiting_hook(session_id, control_dc.clone(), &pipeline),
                 )
                 .await;
                 PassWatch::stop(t, &mut recapture_us);
@@ -8845,7 +9076,7 @@ async fn media_pump_ffmpeg_dc(
             // late first frame.
             //
             // ⚠️ SIZE THE CLAIM HONESTLY. The runtime is `new_multi_thread()`
-            // with no `worker_threads` (main.rs), so it defaults to the core
+            // with no `worker_threads` (app.rs), so it defaults to the core
             // count and blocking one worker is a 1/N capacity hit that
             // work-stealing routes around — severe on a 2-core VM, a cluster
             // node or WSL, modest on a 16-core desktop. It is NOT a whole-
@@ -8921,6 +9152,7 @@ async fn media_pump_ffmpeg_dc(
                         session_id,
                         encoder_name,
                         enc.chroma444(),
+                        fps_state.is_none().then_some(target_fps),
                         capturer.backend(),
                         capture_gpu,
                         &open_trail.take(),
@@ -9034,6 +9266,9 @@ async fn media_pump_ffmpeg_dc(
             enc.request_keyframe().await;
             PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
+            if let Some(w) = media_window.as_mut() {
+                w.on_force(crate::media_window::IdrCause::Lock);
+            }
         }
 
         // Apply browser-requested keyframe (PLI/RTCP equivalent on DC).
@@ -9049,6 +9284,14 @@ async fn media_pump_ffmpeg_dc(
             enc.request_keyframe().await;
             PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
+            if let Some(w) = media_window.as_mut() {
+                if own_kf {
+                    w.on_force(crate::media_window::IdrCause::Asked);
+                }
+                if shared_kf {
+                    w.on_force(crate::media_window::IdrCause::Shared);
+                }
+            }
         }
 
         // Unanswered-force retry — see `kf_policy::KEYFRAME_BACKSTOP`
@@ -9060,6 +9303,9 @@ async fn media_pump_ffmpeg_dc(
             enc.request_keyframe().await;
             PassWatch::stop(t, &mut enc_cmd_us);
             force_keyframe_this_iter = true;
+            if let Some(w) = media_window.as_mut() {
+                w.on_force(crate::media_window::IdrCause::Backstop);
+            }
             if kf_gate.take_backstop_log() {
                 info!(
                     %session_id,
@@ -9572,6 +9818,9 @@ async fn media_pump_ffmpeg_dc(
         let frame_encode_us = encode_start.elapsed().as_micros() as u64;
         encode_us += frame_encode_us;
         frames_encoded += 1;
+        if let Some(w) = media_window.as_mut() {
+            w.on_encoded();
+        }
         // FR-119 P2b-2 — a trial judges every real frame that left the
         // encoder, at its capture time and with its encode time: only an
         // encoder that cannot keep up fails it (a keepalive re-encode is no
@@ -9706,8 +9955,12 @@ async fn media_pump_ffmpeg_dc(
         // whole chunked send (its `if let` scrutinee keeps the guard alive
         // through the body), so this waits out the previous frame's send.
         let t = watch.start();
+        let dc_lock_from = std::time::Instant::now();
         let dc_arc = video_bytes_dc.lock().await.clone();
         PassWatch::stop(t, &mut dc_lock_us);
+        if let Some(w) = media_window.as_mut() {
+            w.on_dc_lock(dc_lock_from.elapsed());
+        }
         let Some(dc) = dc_arc else {
             // rc.97 — DC not open yet (offer/answer/ICE/SCTP still setting
             // up). Force a keyframe so that whenever the DC *does* open, the
@@ -9753,6 +10006,8 @@ async fn media_pump_ffmpeg_dc(
         // cap that rc.85 fixed). A single consumer preserves chunk order for
         // the browser reassembler.
         let send_start = std::time::Instant::now();
+        // FR-135 R0 — what of this frame reached the channel's queue.
+        let mut handed_bytes: u64 = 0;
         for pkt in packets {
             // FR-1 P7 — process-epoch stamp, same clock as the ffmpeg pump
             // and the rc:clock echo (was: the capture backend's own epoch,
@@ -9781,17 +10036,28 @@ async fn media_pump_ffmpeg_dc(
                     // Byte-budget ledger (constrained gate): counted on entry,
                     // released by the send task once the frame leaves.
                     inflight_bytes.fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
+                    handed_bytes += wire_len as u64;
                     // A key frame that actually entered the send queue
                     // answers any pending forced-keyframe request (the
                     // force-ignored fallback and the retry stand down).
                     if pkt.is_keyframe {
                         kf_gate.on_key_frame_queued();
+                        // FR-135 R0 (N12) — and the viewer's ask it answers.
+                        if let Some(w) = media_window.as_mut()
+                            && let Some(waited) =
+                                crate::session_telemetry::counters(session_id).take_keyframe_ask()
+                        {
+                            w.on_key_queued(waited);
+                        }
                     }
                     if kf_gate.take_resync() {
                         // First frame through after a drop burst — make the
                         // NEXT one a keyframe so the browser resyncs the
                         // deltas it missed during congestion.
                         enc.request_keyframe().await;
+                        if let Some(w) = media_window.as_mut() {
+                            w.on_force(crate::media_window::IdrCause::Resync);
+                        }
                     }
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -9828,6 +10094,22 @@ async fn media_pump_ffmpeg_dc(
             }
         }
         send_us += send_start.elapsed().as_micros() as u64;
+        // FR-135 R0 (N7, N10, N3) — once per frame that reached the queue.
+        if handed_bytes > 0
+            && let Some(w) = media_window.as_mut()
+        {
+            let now = std::time::Instant::now();
+            w.on_handoff(
+                now,
+                frame_captured_at.filter(|_| is_real_frame),
+                handed_bytes,
+            );
+            if !first_frame_noted {
+                first_frame_noted = true;
+                crate::session_telemetry::counters(session_id)
+                    .note_first_frame(now.saturating_duration_since(pump_started));
+            }
+        }
 
         // Heartbeat for log-grep observability. rc.88 adds per-stage
         // averages (capture/encode/send ms) so the field can localise
@@ -9932,11 +10214,48 @@ async fn media_pump_ffmpeg_dc(
             // one grep; read `idr_count` against `keyframe_requests` to isolate
             // rate-caused IDRs.
             let rate_stats = enc.rate_stats().await;
-            crate::media_plan::input_form(
-                session_id,
-                rate_stats.input.gpu,
-                rate_stats.input.reason,
-            );
+            // FR-135 R0 — a failed read (`RateStats::default()`: CPU with no
+            // reason) says nothing about the session, since a real CPU form
+            // always names its reason (`SessionCounters::note_video`'s rule).
+            // Passed on, it put a false "gpu → cpu" step and its way back into
+            // the viewer's plan whenever the encoder thread did not answer.
+            if rate_stats.input.gpu || !rate_stats.input.reason.is_empty() {
+                crate::media_plan::input_form(
+                    session_id,
+                    rate_stats.input.gpu,
+                    rate_stats.input.reason,
+                );
+            }
+            // FR-135 R0 — the window, taken whole. `None` with `stats` on the
+            // session's old path, and every field it feeds below reads `None`.
+            let media = media_window
+                .as_mut()
+                .map(|w| w.take(std::time::Instant::now()));
+            let kf_asks = media
+                .as_ref()
+                .map(|_| crate::session_telemetry::counters(session_id).keyframe_asks());
+            // FR-135 R0 — the viewer's windows since the last line, from its
+            // `rc:decodestat`s through `session_telemetry`, never the pump.
+            let viewer = media
+                .as_ref()
+                .and_then(|_| crate::session_telemetry::counters(session_id).take_viewer_window());
+            // FR-132 P1d — what `rc:session.stats` names: the heartbeat's own
+            // words, plus the capture backend the heartbeat does not carry. A
+            // new reading goes at once, by the carrier's road and as
+            // best-effort, so a session someone leaves before the next 30 s
+            // tick is still in a canary week's read.
+            if crate::session_telemetry::counters(session_id).note_video(
+                crate::session_telemetry::VideoForm {
+                    encoder: enc.name(),
+                    capture: capturer.backend(),
+                    input_path: rate_stats.input.path(),
+                    input_reason: rate_stats.input.reason,
+                    // FR-135 R0 — the opened chroma, so the reading names a cell.
+                    chroma: if enc.chroma444() { "yuv444" } else { "yuv420" },
+                },
+            ) {
+                let _ = stats_now.try_send(session_id);
+            }
             // FR-118 P0 — `avg_encode_ms` split into its four steps, and the
             // capture thread's own readback, per frame over this window (0.0
             // when the window had none, like `avg_encode_ms`). The readback runs
@@ -10106,6 +10425,40 @@ async fn media_pump_ffmpeg_dc(
                 shadow_disagree_pct = ?governor.shadow_disagree_pct(),
                 shadow_pauses = governor.shadow_pauses(),
                 shadow_reason = governor.shadow_reason(),
+                // FR-135 R0 (N3, N7, N10, N12, §2.5), appended and never
+                // renamed; each reads `None` with `stats` on the session's old
+                // path. A `_ms` list is twelve log-2 ms buckets, [0,1) up to
+                // [1024,∞) (`crate::media_window`). `window_ms` is the window's
+                // real length, which the "≈2s" above only floors (ledger L03).
+                capture_backend = ?media.as_ref().map(|_| capturer.backend()),
+                window_ms = ?media.as_ref().map(|m| m.window_ms),
+                frames_keepalive = ?media.as_ref().map(|m| m.frames_keepalive),
+                keepalive_bytes = ?media.as_ref().map(|m| m.keepalive_bytes),
+                cap_to_handoff_ms = ?media.as_ref().map(|m| m.cap_to_handoff.counts()),
+                cap_to_handoff_p50_ms = ?media.as_ref().and_then(|m| m.cap_to_handoff_p50_ms),
+                cap_to_handoff_p95_ms = ?media.as_ref().and_then(|m| m.cap_to_handoff_p95_ms),
+                handoff_gap_ms = ?media.as_ref().map(|m| m.handoff_gap.counts()),
+                kf_ask_to_queued_ms = ?media.as_ref().map(|m| m.kf_ask_to_queued.counts()),
+                kf_asks = ?kf_asks.map(|(asks, _)| asks),
+                kf_asks_gapped = ?kf_asks.map(|(_, gapped)| gapped),
+                idr_causes = ?media.as_ref().map(|m| m.idr_causes),
+                dc_lock_ms = ?media.as_ref().map(|m| m.dc_lock.counts()),
+                maxrate_bps = ?media.as_ref().map(|_| enc.current_maxrate_bps()),
+                // FR-135 R0, the viewer's half (N9-N12, N16): its decode
+                // worker's 1 s windows since the last line, `viewer_windows` of
+                // them, summed in the same buckets; its counts are cumulative.
+                // `None` from a viewer that does not count, and with `stats` old.
+                viewer_windows = ?viewer.map(|v| v.windows),
+                viewer_dec_ms = ?viewer.and_then(|v| v.report.dec),
+                viewer_paint_ms = ?viewer.and_then(|v| v.report.paint),
+                viewer_fwd_ms = ?viewer.and_then(|v| v.report.fwd),
+                viewer_backlog_ms = ?viewer.and_then(|v| v.report.backlog),
+                viewer_arr_gap_ms = ?viewer.and_then(|v| v.report.arr_gap),
+                viewer_gate_ms = ?viewer.and_then(|v| v.report.gate),
+                viewer_chunk_gaps = ?viewer.and_then(|v| v.report.chunk_gaps),
+                viewer_freezes = ?viewer.and_then(|v| v.report.freezes),
+                viewer_painted = ?viewer.and_then(|v| v.report.painted),
+                viewer_decoder_hw = ?viewer.and_then(|v| v.report.decoder_hw),
                 "FFmpeg DC pump heartbeat (≈2s window)"
             );
             // Stopped BEFORE the snapshot below, so the rebase carries it.
@@ -10564,6 +10917,25 @@ pub(crate) fn viewer_counts_decode_errors(val: &serde_json::Value) -> bool {
         .is_some_and(|v| v.as_u64() == Some(1) || v.as_bool() == Some(true))
 }
 
+/// FR-135 R0 (N9-N12, N16) — keep a `rc:decodestat`'s viewer numbers
+/// ([`crate::media_window::ViewerReport`]) in the session's counters, for the
+/// FFmpeg heartbeat's `viewer_*` fields and `rc:session.stats`. With `stats` on
+/// the session's old path (`rc_media_legacy=stats`) nothing is kept, so the
+/// heartbeat and the reading are what they were before R0.
+pub(crate) fn note_viewer_decodestat(
+    session_id: bson::oid::ObjectId,
+    val: &serde_json::Value,
+    stats_new: bool,
+) {
+    if !stats_new {
+        return;
+    }
+    let report = crate::media_window::ViewerReport::parse(val);
+    if !report.is_empty() {
+        crate::session_telemetry::counters(session_id).note_viewer_report(report);
+    }
+}
+
 /// `control` data-channel handler. Parses JSON `rc:*` envelopes and
 /// applies them. Today the only message is `rc:quality` (mutating the
 /// shared atomic that the media pump polls before each encode); future
@@ -10585,6 +10957,9 @@ fn attach_control_handler(
     // FR-132 P1 — asks the signalling loop for one `rc:session.stats` for this
     // session now (the FR-102 P9d carrier-ready channel), on a decode error.
     stats_now: mpsc::Sender<bson::oid::ObjectId>,
+    // FR-135 §7.1 — `stats` is on this session's new path: keep the viewer's
+    // media numbers from `rc:decodestat` (`note_viewer_decodestat`).
+    stats_new: bool,
 ) {
     // A handle the on_message closure sends replies through (e.g.
     // rc:logs-fetch.reply) over the same DC. #1740 — WEAK: the closure is
@@ -10982,6 +11357,10 @@ fn attach_control_handler(
                             q.clamp(i16::MIN as i64, i16::MAX as i64) as i16,
                         ));
                     }
+                    // FR-135 R0 (N9-N12, N16) — and the decode worker's window,
+                    // kept for the heartbeat and the session's reading. Record
+                    // only: nothing above reads it.
+                    note_viewer_decodestat(session_id, &val, stats_new);
                 }
                 "rc:display-match" => {
                     // rc.191 — viewer asked the host to switch its display to
@@ -11006,8 +11385,8 @@ fn attach_control_handler(
                                 // P3: only the owning session's toggle-off
                                 // restores; a non-owner disabling its OWN match
                                 // preference must not revert the mode another
-                                // session applied.
-                                if crate::display_match::restore_for(session_id) {
+                                // session applied. Its waiting request goes too.
+                                if crate::display_match::turn_off(session_id) {
                                     tracing::info!("display-match: restored original mode");
                                 } else {
                                     tracing::debug!(
@@ -11080,6 +11459,9 @@ fn attach_control_handler(
                     let allow = guard
                         .map(|t| now.duration_since(t) >= MIN_KF_GAP)
                         .unwrap_or(true);
+                    // FR-135 R0 (N12) — every ask, and whether the gap dropped
+                    // it: R1's slow recoveries pointed here with no counter.
+                    crate::session_telemetry::counters(session_id).note_keyframe_ask(allow);
                     if allow {
                         *guard = Some(now);
                         drop(guard);
@@ -14518,6 +14900,44 @@ mod codec_cap_tests {
         );
     }
 
+    /// #3423 — a capture that waits inside its session (P3e's dark display,
+    /// P5f's user switch) is told to the pump's shared pipeline as it is told
+    /// to the owner's own viewer, so the viewers sharing the capture hear it
+    /// too, and the pipeline keeps it until the next frame. Red without
+    /// `hold`'s `share`.
+    // The pipeline registry's test guard is held across an await on purpose,
+    // as in `media_share`'s own tests: it serializes whole tests.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_held_wait_is_told_to_the_shared_pipeline() {
+        use super::CaptureWait;
+        use crate::capture::WaitFor::DisplayWake;
+        use std::time::Duration;
+        let _serial = crate::media_share::test_serial();
+        let key = crate::media_share::PipelineKey::FfmpegDc("TEST-3423-HOLD");
+        let owner = bson::oid::ObjectId::new();
+        let pipeline = crate::media_share::Pipeline::register(key, owner);
+        let control_dc = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let mut w = CaptureWait::default();
+        assert!(
+            w.hold(Some(DisplayWake), owner, &control_dc, Some(&pipeline)),
+            "held at once"
+        );
+        assert_eq!(pipeline.kept_wait(), None, "not told yet: the quiet spell");
+        tokio::time::sleep(CaptureWait::QUIET_BEFORE_TELL + Duration::from_millis(100)).await;
+        assert!(w.hold(Some(DisplayWake), owner, &control_dc, Some(&pipeline)));
+        let (why, left) = pipeline
+            .kept_wait()
+            .expect("the pipeline was told with the owner's own viewer");
+        assert_eq!(why, DisplayWake);
+        assert!(
+            left > CaptureWait::TOLD_FOR - Duration::from_secs(5),
+            "the owner's whole notice: {left:?}"
+        );
+        pipeline.on_frame();
+        assert_eq!(pipeline.kept_wait(), None, "the next frame ends it");
+    }
+
     #[test]
     fn capture_unavailable_payload_wire_shape() {
         use crate::capture::{CaptureUnavailable, CaptureUnavailableCode};
@@ -14740,6 +15160,43 @@ mod tests {
         ] {
             assert!(!counts(&older), "{older}");
         }
+    }
+
+    /// FR-135 R0 — the control arm keeps a decodestat's viewer numbers only
+    /// with `stats` on the session's new path; with it old, or from an older
+    /// viewer, the session's reading and heartbeat stay as they were.
+    #[test]
+    fn a_decodestat_window_is_kept_only_with_stats_on_its_new_path() {
+        use super::note_viewer_decodestat as note;
+        use crate::session_telemetry::{counters, forget};
+        let sample = serde_json::json!({
+            "t": "rc:decodestat", "fps": 60, "struggling": false, "de": 1,
+            "gate_ms": [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+            "painted": 600, "freezes": 2,
+        });
+        let old = bson::oid::ObjectId::new();
+        note(old, &sample, false);
+        assert_eq!(
+            counters(old).take_viewer_window(),
+            None,
+            "stats on its old path"
+        );
+
+        let new = bson::oid::ObjectId::new();
+        note(
+            new,
+            &serde_json::json!({ "t": "rc:decodestat", "fps": 60, "de": 1 }),
+            true,
+        );
+        assert_eq!(counters(new).take_viewer_window(), None, "an older viewer");
+        note(new, &sample, true);
+        let w = counters(new).take_viewer_window().expect("kept");
+        assert_eq!(w.windows, 1);
+        assert_eq!(w.report.painted, Some(600));
+        assert_eq!(w.report.freezes, Some(2));
+        assert_eq!(w.report.gate.map(|g| g[8]), Some(1));
+        forget(old);
+        forget(new);
     }
 
     /// rc.227 / FR-97 P3e — the `rc:layout` envelope as the viewer's

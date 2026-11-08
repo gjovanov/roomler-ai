@@ -27,6 +27,113 @@ pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// One address's TCP connect; the caller's own timeout bounds the whole dial.
 const PER_ADDR_CONNECT: Duration = Duration::from_secs(10);
 
+/// FR-28 — the flat redials one outage may spend on one socket before the ladder
+/// takes over. This spends 15 to 30 s of waiting, and the slowest of the 14 rolls
+/// read had a median socket back at 26 s. A 502 that outlasts them is not a roll.
+const FLAT_REDIALS_PER_OUTAGE: u32 = 30;
+
+/// FR-28 — the wait before one flat redial, drawn per dial. At most 1 s, so a
+/// socket is back within a second of its pod listening; drawn, because a roll
+/// ends a whole fleet's sockets in the same millisecond.
+const FLAT_REDIAL_WAIT_MS: std::ops::RangeInclusive<u64> = 500..=1000;
+
+/// FR-28 — redial at a flat pace while the front load balancer answers 502.
+///
+/// The front pins a tenant to one pod with no failover (`max_fails=0`,
+/// `proxy_next_upstream off`), so through a roll it answers 502 until the
+/// replacement listens, and a socket on the ladder then waits out whichever step
+/// comes next: the medians of 14 rolls sat on 7.5, 15 and 26 s.
+///
+/// ⚠️ #2221's rule binds: a server that accepts and drops must climb, or a fleet
+/// reconnects to it every second. So only a 502 at the upgrade is flat, and an
+/// accepted socket that does not last refills nothing: [`Self::connection_ended`]
+/// keeps #2221's bar.
+///
+/// ⚠️ A 502 can also come from a corporate proxy, for hours. The allowance is what
+/// bounds that: one outage costs one socket at most [`FLAT_REDIALS_PER_OUTAGE`]
+/// extra dials, and then the ordinary ladder runs from the step it had reached.
+///
+/// A flat redial never moves the ladder, in either direction. [`Self::off`] spends
+/// nothing and always answers `None`, so a loop that holds it runs exactly as it
+/// did before this existed.
+#[derive(Clone, Debug)]
+pub struct FlatRedial {
+    allowance: u32,
+    left: u32,
+    proven_after: Duration,
+}
+
+impl FlatRedial {
+    /// The ladder, untouched: the default, and every regional relay.
+    pub fn off() -> Self {
+        Self::with_limits(0, crate::signaling::LADDER_PROVEN_AFTER)
+    }
+
+    pub fn on() -> Self {
+        Self::with_limits(
+            FLAT_REDIALS_PER_OUTAGE,
+            crate::signaling::LADDER_PROVEN_AFTER,
+        )
+    }
+
+    /// The switch: `ws_flat_redial` in the config, or `ROOMLERD_WS_FLAT_REDIAL`,
+    /// read as every opt-in gate is: `1`, `true`, `yes` or `on`, and anything
+    /// else, a typo included, leaves the ladder.
+    pub fn from_config() -> Self {
+        if tunnel_core::env::flag("WS_FLAT_REDIAL", false) {
+            Self::on()
+        } else {
+            Self::off()
+        }
+    }
+
+    /// A test's own allowance and bar, since the real bar is 30 s of waiting.
+    #[doc(hidden)]
+    pub fn with_limits(allowance: u32, proven_after: Duration) -> Self {
+        Self {
+            allowance,
+            left: allowance,
+            proven_after,
+        }
+    }
+
+    /// The wait in place of the ladder's after a failed dial, spending one redial.
+    /// `None` means the ladder decides: not a 502, or nothing left to spend.
+    pub fn step(&mut self, lb_502: bool) -> Option<Duration> {
+        if !lb_502 || self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        Some(Duration::from_millis(rand::random_range(
+            FLAT_REDIAL_WAIT_MS,
+        )))
+    }
+
+    /// Flat redials this outage has left, for the log line.
+    pub fn left(&self) -> u32 {
+        self.left
+    }
+
+    /// An accepted connection ended after `lasted`. Only one past #2221's bar
+    /// earns the next outage its redials back.
+    pub fn connection_ended(&mut self, lasted: Duration) {
+        if lasted >= self.proven_after {
+            self.restart();
+        }
+    }
+
+    /// The network moved, so the outage this allowance belonged to is over.
+    pub fn restart(&mut self) {
+        self.left = self.allowance;
+    }
+}
+
+/// FR-28 — the answer [`FlatRedial`] is about: the load balancer has no process
+/// behind this tenant's pin. Our own routes never answer 502 on these upgrades.
+pub fn is_lb_502(e: &tungstenite::Error) -> bool {
+    matches!(e, tungstenite::Error::Http(resp) if resp.status().as_u16() == 502)
+}
+
 /// `connect_async`, with the host's address from `ctl_dns`. An address literal,
 /// or a name nothing knows, takes `connect_async`'s own path unchanged.
 pub async fn connect(url: &str) -> Result<(Ws, Response), tungstenite::Error> {
@@ -87,6 +194,77 @@ mod tests {
     use super::*;
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+
+    /// FR-28 — only a 502 spends a redial, and the wait stays inside the bound
+    /// that puts a socket back within a second of its pod listening.
+    #[test]
+    fn a_502_gets_a_wait_of_at_most_a_second_and_nothing_else_does() {
+        let mut flat = FlatRedial::on();
+        for _ in 0..FLAT_REDIALS_PER_OUTAGE {
+            assert_eq!(flat.step(false), None);
+            let wait = flat.step(true).expect("the allowance is not spent");
+            assert!(
+                wait >= Duration::from_millis(500) && wait <= Duration::from_secs(1),
+                "{wait:?}"
+            );
+        }
+    }
+
+    /// FR-28 — the allowance is the bound on a 502 that never ends.
+    #[test]
+    fn the_allowance_runs_out_and_then_the_ladder_decides() {
+        let mut flat = FlatRedial::with_limits(2, Duration::from_secs(30));
+        assert!(flat.step(true).is_some());
+        assert_eq!(flat.left(), 1);
+        assert!(flat.step(true).is_some());
+        assert_eq!(flat.left(), 0);
+        assert_eq!(flat.step(true), None);
+        assert_eq!(flat.left(), 0, "nothing below zero");
+    }
+
+    /// FR-28 and #2221 — a connection refills the allowance only past the bar:
+    /// a server that accepts and drops at once must never earn more flat redials.
+    #[test]
+    fn only_a_connection_that_lived_refills_the_allowance() {
+        let bar = Duration::from_secs(30);
+        let mut flat = FlatRedial::with_limits(1, bar);
+        assert!(flat.step(true).is_some());
+        flat.connection_ended(bar - Duration::from_millis(1));
+        assert_eq!(flat.step(true), None, "under the bar refills nothing");
+        flat.connection_ended(bar);
+        assert!(flat.step(true).is_some(), "at the bar it does");
+    }
+
+    /// FR-28 — off is off whatever happens to it: this is what makes a default
+    /// build run the ladder it always ran.
+    #[test]
+    fn off_never_answers_a_502_however_it_is_restarted() {
+        let mut flat = FlatRedial::off();
+        assert_eq!(flat.step(true), None);
+        flat.restart();
+        flat.connection_ended(Duration::from_secs(3600));
+        assert_eq!(flat.step(true), None);
+    }
+
+    fn http_answer(status: u16) -> tungstenite::Error {
+        tungstenite::Error::Http(Box::new(
+            tungstenite::http::Response::builder()
+                .status(status)
+                .body(None)
+                .unwrap(),
+        ))
+    }
+
+    /// FR-28 — only the load balancer's own answer. `/derp` answers 401 for any
+    /// lookup error, a Mongo blip is a 500, and an unmounted module is a 503.
+    #[test]
+    fn only_a_502_reads_as_the_load_balancer_having_no_pod() {
+        assert!(is_lb_502(&http_answer(502)));
+        for other in [200, 401, 403, 404, 429, 500, 503, 504] {
+            assert!(!is_lb_502(&http_answer(other)), "{other}");
+        }
+        assert!(!is_lb_502(&tungstenite::Error::ConnectionClosed));
+    }
 
     #[test]
     fn host_port_reads_the_url() {

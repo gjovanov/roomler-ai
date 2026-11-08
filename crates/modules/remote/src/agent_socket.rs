@@ -50,6 +50,7 @@ impl AgentMsgHandler for RemoteAgentSocket {
                 transfers,
                 carrier,
                 decode_errors,
+                video,
             } => {
                 let sid = ObjectId::parse_str(&session_id).ok();
                 // FR-101 P3 — an audit, not a statistic: kept whether or not
@@ -80,10 +81,14 @@ impl AgentMsgHandler for RemoteAgentSocket {
                     let carrier = carrier
                         .as_deref()
                         .and_then(roomler_ai_remote_control::models::session_carrier_label);
+                    // FR-132 P1d — likewise: a reading that is not short
+                    // lowercase names is dropped, and the row keeps its last.
+                    let video =
+                        video.and_then(roomler_ai_remote_control::models::SessionVideo::checked);
                     if let Err(e) = self
                         .state
                         .remote_sessions
-                        .merge_live_stats(sid, ctx.agent_id, &stats, carrier)
+                        .merge_live_stats(sid, ctx.agent_id, &stats, carrier, video.as_ref())
                         .await
                     {
                         debug!(agent = %ctx.agent_id, %e, "session stats merge failed");

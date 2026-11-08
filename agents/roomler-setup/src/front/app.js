@@ -44,17 +44,17 @@ const ROLE_COPY = {
   windows: {
     "daemon-system": {
       title: "Be accessed — background service (pre-logon, recommended)",
-      desc: "perMachine install + SystemContext: remote control works on the lock screen, UAC dialogs, and admin apps. Requires admin (UAC prompt).",
+      desc: "Installed for the whole computer as a Windows service, so remote control works on the lock screen, on UAC prompts and in administrator apps too. Needs an administrator's approval (a UAC prompt).",
       label: "Background service (pre-logon)",
     },
     "daemon-machine": {
       title: "Be accessed — attended service",
-      desc: "perMachine install for all users on this PC, without the SystemContext swap. Requires admin (UAC prompt) during install.",
+      desc: "Installed for everyone on this computer. Remote control reaches the desktop of whoever is signed in, not the lock screen or UAC prompts. Needs an administrator's approval (a UAC prompt) to install.",
       label: "Attended service",
     },
     "daemon-user": {
       title: "Be accessed — this user only",
-      desc: "perUser install under my account. No admin password needed.",
+      desc: "Installed for your account only, and runs while you are signed in. No administrator needed.",
       label: "This user only",
     },
   },
@@ -462,9 +462,10 @@ function roleLabel(role) {
 }
 
 function flavourLabel(flavour) {
-  if (flavour === "peruser") return "perUser";
-  if (flavour === "permachine") return "perMachine";
-  if (flavour === "permachine-system-context") return "perMachine + SystemContext";
+  // #3247: a person's words, on Done's Mode line and the install step's.
+  if (flavour === "peruser") return "for this user only";
+  if (flavour === "permachine") return "for everyone on this computer";
+  if (flavour === "permachine-system-context") return "for the whole computer, as a Windows service";
   // FR-129 B1: the Linux/macOS scopes, as the install trace spells them.
   if (flavour === "per-user") return "per-user";
   if (flavour === "system") return "system (root)";
@@ -586,20 +587,20 @@ function renderWelcome() {
 
   // Daemon detection summary. On Linux and macOS "perUser" is the person's
   // own enrollment and "perMachine" the system (root) daemon's.
-  const perUserWord = unix ? "per-user" : "perUser";
-  const perMachineWord = unix ? "system (root)" : "perMachine";
+  const perUserWord = unix ? "existing per-user install" : "installed for this user only";
+  const perMachineWord = unix ? "existing system (root) install" : "installed for the whole computer";
   if (a.kind === "clean") {
     agentSummary.textContent = unix && !a.supported
       ? "Daemon: no existing install detected."
       : "Daemon: no existing install detected.";
   } else if (a.kind === "peruser") {
-    agentSummary.textContent = `Daemon: existing ${perUserWord} install (version ${a.peruserVersion ?? "unknown"}).`;
+    agentSummary.textContent = `Daemon: ${perUserWord} (version ${a.peruserVersion ?? "unknown"}).`;
   } else if (a.kind === "permachine") {
-    agentSummary.textContent = `Daemon: existing ${perMachineWord} install (version ${a.permachineVersion ?? "unknown"}).`;
+    agentSummary.textContent = `Daemon: ${perMachineWord} (version ${a.permachineVersion ?? "unknown"}).`;
   } else if (a.kind === "ambiguous") {
     agentSummary.textContent = unix
       ? `Daemon: enrolled both per-user and as a system daemon (version ${a.peruserVersion ?? a.permachineVersion ?? "?"}) — two daemons on this machine.`
-      : `Daemon: both flavours installed (perUser ${a.peruserVersion ?? "?"} + perMachine ${a.permachineVersion ?? "?"}).`;
+      : `Daemon: installed twice, for this user only (${a.peruserVersion ?? "?"}) and for the whole computer (${a.permachineVersion ?? "?"}).`;
   }
   ambiguous.hidden = a.kind !== "ambiguous" || unix;
 
@@ -672,6 +673,9 @@ function renderWelcome() {
   // the enroll has spent the token.
   const needsElevation = needsElevatedWizard(state.role);
   document.getElementById("elevation-note").hidden = !needsElevation;
+  // #3247 item 11 — the folder outlives the service (`install.ps1 -Uninstall`
+  // leaves it hardened), so its first sentence follows what detection found.
+  document.getElementById("elevation-note-lead").textContent = elevationNoteLead(a.kind);
   // FR-129 C3 — the note's own way out: the button sits inside the note, so
   // it shows exactly when the note does; its line says how the last try went.
   document.getElementById("elevation-relaunch").disabled = state.relaunchBusy;
@@ -698,6 +702,15 @@ function renderWelcome() {
 // reinstall finds. A fresh install still works from a double-click.
 function needsElevatedWizard(role) {
   return role === "daemon-system" && state.systemContextNeedsElevation === true;
+}
+
+// #3247 item 11 — the elevation note's first sentence. The note shows because
+// the folder refuses this wizard, and the folder can outlive the service, so
+// "already has the background service" is said only when detection found one.
+function elevationNoteLead(kind) {
+  return kind === "permachine" || kind === "ambiguous"
+    ? "This device already has the background service, and its settings are in a folder only administrators may open."
+    : "An earlier background service left its settings on this device, in a folder only administrators may open.";
 }
 
 // FR-129 C1 — may `role` be preselected on this page? A role the SPA knows,
@@ -768,13 +781,13 @@ function crossFlavourWarning(agentDetect, flavour) {
   const wantsPerMachine = flavour.startsWith("permachine");
   const wantsPerUser = flavour === "peruser";
   if (agentDetect.kind === "peruser" && wantsPerMachine) {
-    return "Switching from perUser → perMachine. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
+    return "Switching from an install for this user only to one for the whole computer. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
   }
   if (agentDetect.kind === "permachine" && wantsPerUser) {
-    return "Switching from perMachine → perUser. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
+    return "Switching from an install for the whole computer to one for this user only. Your existing enrollment will be lost; you'll need a fresh enrollment token from your administrator.";
   }
   if (agentDetect.kind === "ambiguous") {
-    return "Both perUser and perMachine installs detected. The MSI's cleanup custom action will remove the one not selected.";
+    return "Roomler is installed twice here, for this user only and for the whole computer. The install removes the one you did not pick.";
   }
   return null;
 }
@@ -1467,6 +1480,7 @@ const STEP_LABELS = {
   AssetResolved: "Download URL resolved",
   DownloadStarted: "Downloading",
   DownloadVerified: "Download verified (SHA256)",
+  PublisherVerified: "Publisher verified",
   MsiSpawned: "Running MSI installer",
   MsiCompleted: "MSI installer finished",
   ExtractStarted: "Extracting archive",
@@ -1475,6 +1489,10 @@ const STEP_LABELS = {
   IntegrationDone: "PATH integration finished",
   EnrollStarted: "Enrolling with Roomler",
   EnrollOk: "Enrolled",
+  // #3174: whoever placed it, this is what the machine has.
+  CompanionWaiting: "Waiting for the Roomler service to add roomler-desktop",
+  CompanionPresent: "roomler-desktop is in place",
+  CompanionAbsent: "roomler-desktop is not there yet",
   AnchorStarted: "Anchoring for SYSTEM exec (administrator prompt)",
   AnchorOk: "Anchored for SYSTEM exec",
   AnchorSkipped: "Not anchored",
@@ -1489,7 +1507,7 @@ const STEP_LABELS = {
   ElevationUnavailable: "No administrator prompt — run the command below",
   Done: "Done",
   Error: "Error",
-  SystemContextError: "SystemContext step failed",
+  SystemContextError: "Turning on lock-screen access failed",
 };
 
 // FR-129 B1 — the halves' rows are keyed by half, so the privileged and the
@@ -1733,10 +1751,10 @@ function handleProgress(event, live) {
 
   if (type === "SystemContextError") {
     const stageLabel = {
-      env_var_write: "Writing the service env-var failed",
+      env_var_write: "Saving the service's lock-screen setting failed",
       service_restart: "Restarting the service failed",
-      unknown: "SystemContext step failed",
-    }[data.stage] ?? `SystemContext (${data.stage}) failed`;
+      unknown: "Turning on lock-screen access failed",
+    }[data.stage] ?? `Turning on lock-screen access (${data.stage}) failed`;
     document.getElementById("systemcontext-error-stage").textContent = stageLabel;
     document.getElementById("systemcontext-error-message").textContent = data.message ?? "";
     document.getElementById("systemcontext-error-hint").textContent = data.hint ?? "";
@@ -1771,8 +1789,11 @@ function renderInstall() {
 
   // Progress bar visible only while a download is active.
   const downloadStarted = installRows.has("DownloadStarted");
-  const downloadVerified = installRows.has("DownloadVerified");
-  document.getElementById("install-progress").hidden = !(downloadStarted && !downloadVerified);
+  // #3246 — a release with no digest sends only the publisher's row, and a
+  // refused download sends neither: the bar must not outlive the refusal.
+  const downloadVerified = installRows.has("DownloadVerified") || installRows.has("PublisherVerified");
+  document.getElementById("install-progress").hidden =
+    !(downloadStarted && !downloadVerified) || !!state.installError;
 
   // FR-129 B1: the halves' output, and the terminal fallback.
   renderScriptOutput();
@@ -1822,17 +1843,18 @@ function checklistClass(event) {
   if (t === "ScriptHalfDone" && d.code !== 0) return "error";
   if (
     t === "PreflightWarning" || t === "AnchorSkipped" || t === "ElevationUnavailable" ||
-    t === "DaemonRestartSkipped"
+    t === "DaemonRestartSkipped" || t === "CompanionAbsent"
   ) {
     return "warning";
   }
   if (
     t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "DaemonRestartOk" || t === "MsiCompleted" ||
     t === "ExtractDone" || t === "IntegrationDone" || t === "ScriptHalfDone" ||
-    t === "DownloadVerified" || t === "PreflightOk" || t === "AssetResolved"
+    t === "PublisherVerified" || t === "PreflightOk" || t === "AssetResolved" || t === "CompanionPresent"
   ) {
     return "ok";
   }
+  if (t === "DownloadVerified") return d.sha256Match ? "ok" : "error";
   return "running";
 }
 
@@ -1852,6 +1874,8 @@ function checklistLabel(event) {
   if (t === "PreflightWarning") return `${base}: ${d.message}`;
   if (t === "AssetResolving") return `Resolving download URL (${d.artifact})`;
   if (t === "AssetResolved") return `Resolved ${releaseLabel(d.tag)} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
+  if (t === "DownloadVerified") return d.sha256Match ? base : "The download does not match its checksum";
+  if (t === "PublisherVerified") return `Signed by ${d.signer}`;
   if (t === "MsiSpawned") return `Running MSI installer (PID ${d.pid})`;
   if (t === "MsiCompleted") return `MSI installer finished (exit ${d.code}, ${d.decoded})`;
   if (t === "ExtractDone") return `Extracted. Binary at ${d.tunnelBinary}`;
@@ -1861,16 +1885,17 @@ function checklistLabel(event) {
     return `Enrolled the private network's root half (device ${d.principalId})`;
   }
   if (t === "EnrollOk") return `Enrolled (${principalKindLabel(d.principalKind)} ${d.principalId})`;
+  if (t === "CompanionAbsent") return `${base}. ${d.message}`;
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
   if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
   if (t === "Error") return `Error at ${d.step}: ${d.message}`;
   if (t === "SystemContextError") {
     const stageLabel = {
-      env_var_write: "Writing service env-var",
-      service_restart: "Restarting service",
-      unknown: "SystemContext step",
-    }[d.stage] ?? `SystemContext (${d.stage})`;
+      env_var_write: "Saving the service's lock-screen setting",
+      service_restart: "Restarting the service",
+      unknown: "Turning on lock-screen access",
+    }[d.stage] ?? `Turning on lock-screen access (${d.stage})`;
     return `${stageLabel} failed: ${d.message}${d.hint ? " — " + d.hint : ""}`;
   }
   return base;

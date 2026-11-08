@@ -45,9 +45,9 @@ rather than to the org.
 | role | mask | carries | notes |
 |---|---|---|---|
 | `owner` | `permissions::ALL` | everything, incl. `ADMINISTRATOR` | the tenant creator |
-| `admin` | `DEFAULT_ADMIN` | channels, roles, members, fleet management, all three audit views, changing the map (`KNOWHOW_EDIT`) | ⚠️ **not** `MANAGE_TENANT` |
+| `admin` | `DEFAULT_ADMIN` | channels, roles, members, fleet management, all three audit views | ⚠️ **not** `MANAGE_TENANT` |
 | `moderator` | member + moderation + `REMOTE_CONTROL` | | |
-| `member` | `DEFAULT_MEMBER` | read/write in channels, join calls, reading the map (`KNOWHOW_VIEW`) | `is_default` — the invite path resolves it **by name** |
+| `member` | `DEFAULT_MEMBER` | read/write in channels, join calls | `is_default` — the invite path resolves it **by name** |
 | `guest` | `VIEW_CHANNELS \| READ_HISTORY` | | |
 
 ⚠️ **`EXEC_DEVICE` and `SSH_DEVICE` are in no row below the `ADMINISTRATOR`
@@ -67,38 +67,47 @@ but a recording outlives both. The same test checks it, and
 `DEFAULT_ADMIN`. The session bit it gates, and the other gates in the chain, are
 in [recording.md](recording.md) §10.
 
-⚠️ **`HIVE_RUN` (bit 32, FR-90) follows it too — the first bit above 31.** It
-starts and drives agent sessions on a device: remote code execution, even
-though a session runs as the local account the DEVICE maps the starter to and
-never as SYSTEM/root. The same two tests pin it, and the UI catalogue lists it
-under *Fleet access* as `2 ** 32` (a shift cannot express it in JS). The rest of
-its chain — the module switch, the ceiling, and the device's own
-`hive_enabled` / `hive_accounts` / `hive_roots` — is in
-[FR-90](fr/FR-90-hive-agent-sessions.md) and the
-[design](roomler-hive-design.md) §3.4.
-
 ⚠️ `owner` holds these bits, as part of `ALL`. That is not an exception to the
 rule so much as outside it: the row carries `ADMINISTRATOR`, so `has()` already
 answers true for every bit, and the two bits confer nothing there. The test
 skips any row with the bypass for exactly that reason — a check that fails on
 `owner` is failing for a reason that says nothing about the risk.
 
-⚠️ **`KNOWHOW_VIEW` (bit 33) and `KNOWHOW_EDIT` (bit 34, FR-90 P4) are the
-opposite case: they ARE in the managed rows, on purpose.** Knowhow, the
-organization's map, grants nothing: the vault, the network and the device still
-decide every reach. So reading where things are is a member's, and changing it is
-an administrator's (decisions 37 and 36). `KNOWHOW_VIEW` is in `DEFAULT_MEMBER`, so
-`member`, `moderator` and `admin` hold it and `guest` does not; `KNOWHOW_EDIT` is in
-`DEFAULT_ADMIN`, and the routes read it as including the view. The reconcile in §3
-hands both to every existing organization at the first boot that carries them;
-with `[modules] knowhow` off they open nothing.
-`the_map_is_read_from_member_up_and_changed_by_admins` pins the rows, and
-[knowhow.md](knowhow.md) §5 has the rest.
-
 ⚠️ **`MANAGE_TENANT` is deliberately absent from `DEFAULT_ADMIN`.** Configuring
 the organisation — including the `exec`, `ssh` and ephemeral-key org switches —
 is the owner's job. This is policy, not an oversight, and it is why an org's
 admins do not see the Devices page's enrollment-keys card.
+
+### Reserved bits 32-34 (FR-137)
+
+⚠️ **Bits 32–34 are reserved and never reused.** They were parked FR-90's
+`HIVE_RUN` (bit 32, starting and driving an agent session), `KNOWHOW_VIEW` (33)
+and `KNOWHOW_EDIT` (34). Nothing grants or checks them now, but stored roles
+still hold them:
+
+- `owner` holds all three, as part of `ALL`;
+- every managed `member`, `moderator` and `admin` row holds bit 33, and every
+  `admin` row bit 34, because FR-90's presets carried them and §3's reconcile
+  handed them to every organization at the first boot that did;
+- any role an owner granted `HIVE_RUN` holds bit 32.
+
+§3's reconcile only adds (`stored | definition`,
+`crates/services/src/dao/tenant.rs:427`), so nothing takes them out. A new
+permission on one of these bits would reach every role that ever held the old
+one at the next boot, with no migration to review. Deleting a name opens the
+same door: `all_contains_every_named_permission` and
+`every_named_permission_is_a_distinct_single_bit`
+(`crates/db/src/models/role.rs:554`, `:569`) read the name table, so a new
+permission on an unnamed bit 33 would pass both.
+
+So the bits keep their consts (`crates/db/src/models/role.rs:116-122`), their
+names (`:224-226`), which `names()` and the escalation guard's 403 still print,
+and their place in `ALL` (`:183`). No managed row below the owner seeds them,
+and the UI catalogue lists none of them (`ui/src/utils/permissions.ts:196-198`).
+`the_reserved_bits_stay_named_and_seeded_by_no_row_below_the_owner` (`:472`)
+fails on a rename, a deletion or a reuse. The other surfaces FR-90 left
+reserved are listed in
+[retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
 ## 3 · A managed role is reconciled, not frozen (FR-82)
 
@@ -312,8 +321,6 @@ The catalogue splits powers that look adjacent, and each split was paid for:
 | `VIEW_EXEC_AUDIT` | `EXEC_DEVICE` | an admin should see every command the fleet ran without silently gaining the power to run one |
 | `VIEW_SSH_AUDIT` | `SSH_DEVICE` | same asymmetry, and `VIEW_SSH_AUDIT` *is* in `DEFAULT_ADMIN` while `SSH_DEVICE` is not |
 | `REMOTE_CONTROL` | `RECORD_REMOTE_SCREEN` | watching a screen ends with the session; a recording is a copy that outlives it (FR-85) |
-| `KNOWHOW_VIEW` | `KNOWHOW_EDIT` | reading where things are is not changing what every member and every session is told is there (FR-90 P4; the edit bit does include the view) |
-| `EXEC_DEVICE` / `SSH_DEVICE` | `HIVE_RUN` | running a command yourself is not handing a model a shell on the box to run its own — and a session runs as the device-mapped account, not SYSTEM/root, so neither power contains the other (FR-90) |
 | `ADMINISTRATOR` under break-glass | recording | break-glass skips the host's consent, so a recording made under it would be covert — the hub strips `RECORD` whatever the mask says |
 | `ADMINISTRATOR` under break-glass | privacy mode | the same session never covers the device's screen: a curtain would hide it from the one person who could object — the hub strips the session's `PRIVACY` bit (FR-99) |
 | any bit below `ADMINISTRATOR` | `MANAGE_TENANT` | configuring the org is the owner's job — nothing in `DEFAULT_ADMIN` reaches it, only the bypass does |

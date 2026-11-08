@@ -280,6 +280,53 @@ pub async fn ensure_running() -> bool {
 /// One attempt per this interval, process-wide.
 const ENSURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Whether the desktop companion can show a consent question, and a
+/// recording's banner. A remote recording asks through it, and so does an SSH
+/// session (#3442), so a test can hold the companion's start open while the
+/// question is already on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Companion {
+    /// Ask the system: start the companion if it is installed and not
+    /// running ([`ensure_running`], bounded).
+    System,
+    /// A fixed answer — for tests, which must never launch the real app.
+    Fixed(bool),
+    /// Up, and waited for as [`Self::System`] is, on a test's own clock.
+    Timed {
+        poll: std::time::Duration,
+        ceiling: std::time::Duration,
+    },
+    /// Up once this long has passed: a companion that had to be started, which
+    /// [`Self::System`] waits for (up to its start budget). For tests, which
+    /// need that wait while the question is already on the screen.
+    Starting(std::time::Duration),
+}
+
+impl Companion {
+    /// Is the companion up to show the question? [`Self::System`] waits for
+    /// a start at most [`crate::signaling::COMPANION_START_BUDGET`].
+    ///
+    /// Compiled where something asks through it: a remote recording, and an
+    /// SSH session. Built without either, it is dead code, and every
+    /// `-D warnings` lane on such a build fails.
+    #[cfg(any(feature = "recording", feature = "ssh-server"))]
+    pub(crate) async fn up(self) -> bool {
+        match self {
+            Self::System => {
+                tokio::time::timeout(crate::signaling::COMPANION_START_BUDGET, ensure_running())
+                    .await
+                    .unwrap_or(false)
+            }
+            Self::Fixed(up) => up,
+            Self::Timed { .. } => true,
+            Self::Starting(after) => {
+                tokio::time::sleep(after).await;
+                true
+            }
+        }
+    }
+}
+
 /// FR-27 — the version of the companion INSTALLED on this host, for the
 /// heartbeat, or `None` when there is none / it cannot be read.
 ///
@@ -442,7 +489,10 @@ mod version_tests {
 /// print. Pure, so every platform's test build runs them.
 #[cfg(test)]
 mod console_tests {
-    use super::{console_owner_person, seat0_active_session, session_person, show_field};
+    use super::{
+        console_owner_person, seat0_active_session, seat0_person_uid, session_person,
+        session_person_uid, show_field,
+    };
 
     /// `key=value` lines, the whole key and nothing but it: `NameX=` is not
     /// `Name`, and an empty value is no value.
@@ -485,6 +535,63 @@ mod console_tests {
         let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
         let e = session_person("3", unnamed).unwrap_err().to_string();
         assert!(e.contains("names no account"), "{e}");
+    }
+
+    /// #2871 (review) — whom a root daemon's person socket is made for:
+    /// seat0's person, and never a remote desktop's session (xrdp, GNOME
+    /// Remote Login: no seat, `Remote=yes`, and active, as logind calls every
+    /// seatless session), whatever order logind lists it in. The first active
+    /// graphical session anywhere, which the socket took before this, was
+    /// the remote one whenever logind listed it first.
+    #[test]
+    fn a_seatless_remote_session_is_never_at_the_seat() {
+        // bob (1001) in an xrdp session logind lists FIRST; ana (1000) at
+        // seat0's screen; GDM's greeter on seat0 when nobody is signed in.
+        let xrdp = "Id=1\nUser=1001\nName=bob\nType=x11\nClass=user\nActive=yes\nState=active\n\
+                    Remote=yes\nRemoteHost=192.0.2.9\nService=xrdp-sesman\n";
+        let ana = "Id=2\nUser=1000\nName=ana\nSeat=seat0\nType=wayland\nClass=user\nActive=yes\n\
+                   Remote=no\n";
+        let gdm = "Id=c1\nUser=120\nName=gdm\nSeat=seat0\nType=wayland\nClass=greeter\n\
+                   Active=yes\nRemote=no\n";
+        let read = std::cell::RefCell::new(Vec::<String>::new());
+        let show = |id: &str| -> anyhow::Result<String> {
+            read.borrow_mut().push(id.to_string());
+            Ok(match id {
+                "1" => xrdp,
+                "2" => ana,
+                "c1" => gdm,
+                other => anyhow::bail!("no session {other}"),
+            }
+            .to_string())
+        };
+        // seat0 shows ana: she is at the seat.
+        let seat = "Id=seat0\nActiveSession=2\nCanGraphical=yes\nSessions=2 c1\n";
+        assert_eq!(seat0_person_uid(seat, show).unwrap(), 1000);
+        // seat0 shows the login screen: nobody is at the seat — not bob,
+        // although his is the only person's session on the machine.
+        let seat = "Id=seat0\nActiveSession=c1\nCanGraphical=yes\nSessions=c1\n";
+        let e = seat0_person_uid(seat, show).unwrap_err().to_string();
+        assert!(e.contains("the login screen is showing"), "{e}");
+        // A headless box whose only sessions are remote: nobody.
+        let seat = "Id=seat0\nActiveSession=\nCanGraphical=no\nSessions=\n";
+        assert!(seat0_person_uid(seat, show).is_err());
+        // The remote session was never even read.
+        assert_eq!(*read.borrow(), ["2", "c1"]);
+        // Were seat0 ever to name a remote or a seatless session, it is
+        // refused by name, not served.
+        let e = session_person_uid("1", xrdp).unwrap_err().to_string();
+        assert!(e.contains("remote login"), "{e}");
+        let seatless = "Id=3\nUser=1002\nName=carol\nType=x11\nClass=user\nActive=yes\nRemote=no\n";
+        let e = session_person_uid("3", seatless).unwrap_err().to_string();
+        assert!(e.contains("not on seat0"), "{e}");
+        // The uid is logind's, from the session the name comes from; a text
+        // console at seat0 is the person at the device too (`seat0_user`).
+        assert_eq!(session_person_uid("2", ana).unwrap(), 1000);
+        let tty = "Id=5\nName=ops\nUser=1003\nSeat=seat0\nType=tty\nClass=user\nRemote=no\n";
+        assert_eq!(session_person_uid("5", tty).unwrap(), 1003);
+        let no_uid = "Id=6\nName=x\nSeat=seat0\nType=x11\nClass=user\nRemote=no\n";
+        let e = session_person_uid("6", no_uid).unwrap_err().to_string();
+        assert!(e.contains("names no uid"), "{e}");
     }
 
     /// `/dev/console`'s owner: a person, the login window (root), or a
@@ -537,7 +644,7 @@ async fn ensure_running_inner() -> Result<EnsureOutcome> {
     Ok(EnsureOutcome::Started)
 }
 
-/// Which spawn shape this process needs. Mirrors the probe `main.rs` does for
+/// Which spawn shape this process needs. Mirrors the probe `app.rs` does for
 /// the update path, kept here so the consent path cannot pick a different one.
 #[cfg(target_os = "windows")]
 fn respawn_context_for_self() -> RespawnContext {
@@ -1088,23 +1195,68 @@ fn show_field(text: &str, key: &str) -> Option<String> {
 /// screen.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn seat0_user() -> Result<String> {
-    let loginctl = |args: &[&str]| -> Result<String> {
-        let out = std::process::Command::new("loginctl")
-            .args(args)
-            .arg("--no-pager")
-            .output()
-            .context("spawning loginctl (is systemd-logind running?)")?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "loginctl {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    };
-    let id = seat0_active_session(&loginctl(&["show-seat", "seat0"])?)?;
-    session_person(&id, &loginctl(&["show-session", &id])?)
+    let id = seat0_active_session(&loginctl_show(&["show-seat", "seat0"])?)?;
+    session_person(&id, &loginctl_show(&["show-session", &id])?)
+}
+
+/// #2871 (review) — the uid of the person signed in at seat0, by
+/// [`seat0_user`]'s rule: whom a root daemon's person-at-the-device socket is
+/// made for, and who must still be there when a config change arrives on it.
+/// Never [`graphical_session_matching`]'s first active graphical session
+/// anywhere, which is whoever's remote login logind happens to list first.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn seat0_uid() -> Result<u32> {
+    seat0_person_uid(&loginctl_show(&["show-seat", "seat0"])?, |id| {
+        loginctl_show(&["show-session", id])
+    })
+}
+
+/// `loginctl <args> --no-pager`'s output, or why there is none.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn loginctl_show(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("loginctl")
+        .args(args)
+        .arg("--no-pager")
+        .output()
+        .context("spawning loginctl (is systemd-logind running?)")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "loginctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The pure half of [`seat0_uid`]: seat0's active session out of `show-seat
+/// seat0`, then that one session's person out of `show_session(id)`. No other
+/// session is read, so a seatless one — a remote desktop's, which logind
+/// calls active — is never "at the seat", whatever order logind lists it in.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn seat0_person_uid(seat: &str, show_session: impl FnOnce(&str) -> Result<String>) -> Result<u32> {
+    let id = seat0_active_session(seat)?;
+    session_person_uid(&id, &show_session(&id)?)
+}
+
+/// The pure half of [`seat0_uid`] for the session seat0 shows:
+/// [`session_person`]'s rule (a person's session that names an account), on
+/// seat0 and not a remote login, and the uid logind recorded for it. logind
+/// never makes a remote or seatless session seat0's active one, so the last
+/// two refuse only a state it does not produce, by name rather than by serving
+/// it.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn session_person_uid(id: &str, session: &str) -> Result<u32> {
+    session_person(id, session)?;
+    if show_field(session, "Remote").as_deref() == Some("yes") {
+        anyhow::bail!("session {id} is a remote login, not the person at this machine's screen");
+    }
+    if show_field(session, "Seat").as_deref() != Some("seat0") {
+        anyhow::bail!("session {id} is not on seat0, so not this machine's own screen");
+    }
+    show_field(session, "User")
+        .and_then(|u| u.parse::<u32>().ok())
+        .ok_or_else(|| anyhow::anyhow!("seat0's session {id} names no uid"))
 }
 
 /// The pure half of [`seat0_user`]: the active session out of `loginctl

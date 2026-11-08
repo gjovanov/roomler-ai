@@ -398,8 +398,11 @@ impl HostLedger {
 /// SYSTEM daemon acts on what the ledger says at boot. A standard user who
 /// planted one would choose which adapter SYSTEM switches forwarding off on.
 /// Only SYSTEM and Administrators may write below `HKLM\SOFTWARE`.
+///
+/// #3440 — the exit-DNS purge's handoff record lives in the same key, for the
+/// same reason (`overlay::dns`, `purge_exit_dns_before_exit`).
 #[cfg(windows)]
-mod store {
+pub(super) mod store {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
@@ -416,7 +419,13 @@ mod store {
     }
 
     pub(super) fn read() -> Option<Vec<u8>> {
-        let (key, value) = (wide(SUBKEY), wide(VALUE));
+        read_value(VALUE)
+    }
+
+    /// #3440 — one value of this key by name: the ledger's, or another record
+    /// of this daemon's that must be as safe from a planted copy.
+    pub(crate) fn read_value(name: &str) -> Option<Vec<u8>> {
+        let (key, value) = (wide(SUBKEY), wide(name));
         let mut len: u32 = 0;
         // SAFETY: NUL-terminated names that outlive the call; a null buffer
         // asks only for the size, in bytes.
@@ -462,6 +471,11 @@ mod store {
     }
 
     pub(super) fn write(body: &str) {
+        write_value(VALUE, body);
+    }
+
+    /// #3440 — [`read_value`]'s writer. Whether the value was written.
+    pub(crate) fn write_value(name: &str, body: &str) -> bool {
         let key = wide(SUBKEY);
         let mut hkey: HKEY = std::ptr::null_mut();
         // SAFETY: a NUL-terminated subkey; `hkey` is a valid out-pointer and
@@ -481,14 +495,14 @@ mod store {
             )
         };
         if rc != ERROR_SUCCESS || hkey.is_null() {
-            return;
+            return false;
         }
         let data = wide(body);
-        let value = wide(VALUE);
+        let value = wide(name);
         // SAFETY: a live key opened for KEY_SET_VALUE; `data` is the REG_SZ
         // with its NUL, sized in bytes.
-        unsafe {
-            RegSetValueExW(
+        let rc = unsafe {
+            let rc = RegSetValueExW(
                 hkey,
                 value.as_ptr(),
                 0,
@@ -497,11 +511,18 @@ mod store {
                 (data.len() * 2) as u32,
             );
             RegCloseKey(hkey);
-        }
+            rc
+        };
+        rc == ERROR_SUCCESS
     }
 
     pub(super) fn remove() {
-        let (key, value) = (wide(SUBKEY), wide(VALUE));
+        remove_value(VALUE);
+    }
+
+    /// #3440 — [`read_value`]'s remover.
+    pub(crate) fn remove_value(name: &str) {
+        let (key, value) = (wide(SUBKEY), wide(name));
         // SAFETY: NUL-terminated names that outlive the call. A missing key
         // or value is the normal case and is ignored.
         unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr()) };

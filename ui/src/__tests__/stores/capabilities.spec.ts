@@ -13,7 +13,13 @@ vi.mock('@/api/client', () => ({
 }))
 
 import { useCapabilitiesStore } from '@/stores/capabilities'
-import { ALL_MODULES, parseBuiltModules, withDependencies } from '@/modules/registry'
+import {
+  ALL_MODULES,
+  BUILT_MODULES,
+  DEFAULT_OFF,
+  parseBuiltModules,
+  withDependencies,
+} from '@/modules/registry'
 import { api } from '@/api/client'
 
 const mockApi = vi.mocked(api)
@@ -76,26 +82,15 @@ describe('useCapabilitiesStore', () => {
     expect(store.version).toBe('0.4.70')
   })
 
-  /** FR-90 — a default-OFF module fails CLOSED: before the answer, and when
-   *  the request fails, a server that probably does not run it shows no link
-   *  to it. Present only once the server names it. */
-  it('keeps a default-off module hidden until the server names it', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  /** FR-137 S-A8 — FR-90's `hive` was the one default-OFF module, and it is
+   *  parked. The mechanism stays with no member, so before the server
+   *  answers every module this bundle carries fails OPEN. The next
+   *  default-off module fails this test, and brings back the fail-CLOSED one
+   *  (before the answer, and after a failed request, it shows no link). */
+  it('has no default-off module, so every built module fails open', () => {
     const store = useCapabilitiesStore()
-    expect(store.has('hive')).toBe(false)
-    expect(store.has('chat')).toBe(true)
-
-    mockApi.get.mockRejectedValueOnce(new Error('503'))
-    await store.load()
-    expect(store.failed).toBe(true)
-    // A failed answer is not a yes.
-    expect(store.has('hive')).toBe(false)
-
-    store.reset()
-    mockApi.get.mockResolvedValueOnce({ version: 'x', modules: ['chat', 'fleet', 'hive'] })
-    await store.load()
-    expect(store.has('hive')).toBe(true)
-    warn.mockRestore()
+    expect(DEFAULT_OFF).toEqual([])
+    for (const m of BUILT_MODULES) expect(store.has(m)).toBe(true)
   })
 
   /** FR-102 P9b — a feature is something the client OFFERS, so it fails

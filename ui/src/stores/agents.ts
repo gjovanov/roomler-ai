@@ -420,11 +420,11 @@ export type ExecMode = 'off' | 'on'
  *
  *  Deliberately separate from {@link AccessPolicy}: that grants screen-view,
  *  and "may watch your screen" must never be the same checkbox as "may run a
- *  root shell". Commands inherit the daemon's identity — root under
- *  systemd; on Windows the console-session worker's: the signed-in user on an
- *  attended install, SYSTEM in SystemContext mode (FR-94 makes SYSTEM the
- *  default) — so turning `mode` on is
- *  granting root on that device, which the dialog says in those words. */
+ *  root shell". A command runs as root under systemd; on Windows as SYSTEM
+ *  through the device's service once it is anchored (FR-94), and otherwise as
+ *  the console-session worker: the signed-in user on an attended install,
+ *  SYSTEM in SystemContext mode. So turning `mode` on is granting that identity
+ *  on that device, which the dialog says in those words. */
 export interface ExecPolicy {
   mode: ExecMode
   /** May this device ORIGINATE commands against others (`roomler exec` from
@@ -454,8 +454,8 @@ export type SshMode = 'off' | 'on'
  *  `SshAccountMode`. `daemon` means root under systemd. On Windows it means
  *  the console-session worker — the signed-in user on an attended install,
  *  SYSTEM in SystemContext mode — and `console_user` is refused on an
- *  attended install (it needs SYSTEM's `WTSQueryUserToken`). The SSH dialog
- *  still says "SYSTEM"; correcting it is FR-94's SSH follow-up (§8). On
+ *  attended install (it needs SYSTEM's `WTSQueryUserToken`), unless the device
+ *  serves SSH through its SYSTEM service (FR-105), as the SSH dialog says. On
  *  Linux and macOS `console_user` is the person at the device's screen
  *  (FR-97 P5a), for an agent that says `console-user`. */
 export type SshAccountMode = 'daemon' | 'console_user' | 'named'
@@ -603,6 +603,12 @@ export interface DesiredConfig {
    *  to clear the device's key (deny nothing). `zero_copy` itself is never
    *  pushable (FR-132 decision 1). */
   zero_copy_deny?: string
+  /** FR-135 §7.1 — the media paths a session runs on their OLD code (path
+   *  names such as `media_plan`, or `none`), every FR-135 phase's kill switch;
+   *  MANAGE_AGENTS only, live from the device's next session. `''` is a request
+   *  to clear the device's key. `rc_media_canary`, which turns new code on
+   *  early, is never pushable. */
+  rc_media_legacy?: string
   updated_by?: string
   updated_at?: string
 }

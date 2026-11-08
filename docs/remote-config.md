@@ -146,11 +146,16 @@ save can push something newer, and the older read then goes out second and puts
 the device back on a config the operator replaced. Never send this frame any
 other way.
 
-Two races remain, and neither is reachable at a person's speed in the dialog.
-Reports are written by separate tasks, so two answers milliseconds apart can land
-out of order, and the row reads `pending`. Two PUTs inside the window between
-reading the row and writing it take the same revision, so the device can hold the
-document the row did not keep. The next connect heals both.
+Two races remain, and what each costs differs. Reports are written by separate
+tasks, so two answers milliseconds apart can land out of order. One save landing
+right after a connect's push is enough, most likely during a pod roll, and it fails
+safe: the row reads `pending`. The other takes two PUTs inside the window between
+reading the row and writing it, so a script or two operators, not one person in the
+dialog. They take the same revision and the hub sends only the first, so the device
+can hold the document the row did not keep, and the row still reads as confirmed,
+because the report's revision matches. A later save or the next connect heals both,
+and on a stable link the next connect can be days away. After scripted saves, read
+the device, not only the row.
 
 **Wire.** A new `ServerMsg` variant carrying the desired keys.
 
@@ -199,6 +204,28 @@ compromised, possibly lying, possibly just old — says happened afterwards.
 Stored on the agent row rather than folded into the audit trail so a reader can
 always tell which is which.
 
+⚠️ **`needs_restart` means this process does not run the value yet, whatever the
+file holds** ([FR-132](fr/FR-132-zero-copy-by-default.md) P1c). `apply` compares
+the desired value with the file, so once a value was written, every later frame
+found the file matching and answered `noop`. A report is last-write-wins, so any
+reconnect turned the row to `applied` while the daemon still ran the old value,
+and a pod roll did that to every such device at once. The server cannot tell a
+reconnect from a restart, so the device does it: the daemon records what it started
+on (`running_on`, `agents/roomlerd/src/remote_config.rs:332`), and a key the pushed
+document manages stays in `needs_restart` until this process runs it. A reconnect
+still writes nothing to disk. A local edit waiting on a restart is left out,
+because this report is about the push. A save back to the value this process runs
+leaves nothing waiting, so it reads `applied` at once, and a restart would change
+nothing.
+
+Two limits. A build before P1c, which shipped in 0.4.199, still turns the row to
+`applied` at a reconnect, and no capability word marks the difference, so read the
+row's `agent_version`. And an environment variable beats the file
+for the encoder keys (`crates/tunnel-core/src/env.rs:30`), so a key set in the
+daemon's environment reads `applied` after a restart while the environment's value
+is in force, and no restart changes that. A supervised Mac worker gets the root's
+value that way (`agents/roomlerd/src/macos_supervisor.rs:303`).
+
 ⚠️ **`config-report` is a SEPARATE capability verb from `config`**, and this is
 the `ssh` / `ssh-consent` split recurring exactly as that doc predicted it
 would. Agents rc.457 and rc.458 shipped `config`: they apply a pushed config
@@ -224,11 +251,11 @@ owner's: gate 3 of cross-org access, and the password record behind it. `Desired
 cannot hold one, under a prefix test, so the key that matters is also the one added
 after the test was written. The route says so instead of answering 200 for a key it
 dropped: a body naming one is refused with a 403 and audited as `device_owned_key`
-(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:172`). That
+(`names_a_device_owned_key`, `crates/modules/fleet/src/remote_config.rs:186`). That
 refusal is a courtesy to the admin who asked. What stops a compromised server is the
 device, whose frame type drops the key whatever a frame carries
 (`a_pushed_external_key_never_reaches_the_device`,
-`agents/roomlerd/src/remote_config.rs:567`).
+`agents/roomlerd/src/remote_config.rs:827`).
 
 **A non-security key on the same surface (FR-77 P3).** `encoder_cells_deny`
 — the cell matrix's denylist, comma-separated `name:chroma` entries or `none`
@@ -274,13 +301,13 @@ Unlike the two denylists, the server reads the word. It takes the words
 `roomler config set` takes (`true`/`false`, `1`/`0`, `yes`/`no`, in any case),
 stores the spelling above, and refuses anything else with a 400 that names the
 key, recording nothing (`pushed_tribool`,
-`crates/modules/fleet/src/remote_config.rs:183`). A tribool has no entries a
+`crates/modules/fleet/src/remote_config.rs:197`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:3118`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2931`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
-keys beside it (`agents/roomlerd/src/remote_config.rs:340`).
+keys beside it (`agents/roomlerd/src/remote_config.rs:557`).
 
 ⚠️ **Not managed is not a revert.** A device keeps what it was pushed last, so
 an `off` is undone by pushing the default, and only then stopping management:
@@ -298,8 +325,8 @@ on the terms of the two other denylists. It needs `MANAGE_AGENTS` alone, because
 it only ever *removes* a GPU form a device would otherwise open. It reports
 `needs_restart`, because the probe reads it once per process and the encoders
 read it through the config fallbacks
-(`agents/roomlerd/src/remote_config.rs:354`). The server passes it on unread
-(`crates/modules/fleet/src/remote_config.rs:283`): an entry the gate cannot read
+(`agents/roomlerd/src/remote_config.rs:571`). The server passes it on unread
+(`crates/modules/fleet/src/remote_config.rs:304`): an entry the gate cannot read
 denies nothing, because `gpu_hint::is_denied` matches only an exact `name:gpu`.
 It exists so that a GPU-input cell can be turned off from the server before any
 cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
@@ -315,7 +342,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9779`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9557`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -329,6 +356,80 @@ only delivers the push, and it takes a second restart. The same holds for every
 `roomler restart` at the device does it, with no `roomler exec` and no elevation.
 Taking a deny off costs the same: `none` arrives the same way, and the deny holds
 until the restart after it ([FR-132](fr/FR-132-zero-copy-by-default.md) §8).
+
+**A fifth (FR-135 §7.1), and the first that is live.** `rc_media_legacy` sends a
+device's remote-desktop sessions back to a media path's OLD code: comma-separated
+path names, one per [FR-135](fr/FR-135-one-rc-media-pipeline.md) phase
+(`media_plan` today, `stats` and the rest as their phases land), or `none`. It is
+every FR-135 phase's kill switch. It needs `MANAGE_AGENTS` alone: a push sends
+sessions back to code the device already ran, or clears the list back to the
+built-in defaults, and never further, because nothing pushed can turn a path's new
+code on ahead of its default. The server checks the value's shape and refuses a
+spelling no device could read with a 400 (`check_media_path_list`,
+`crates/remote_control/src/models.rs:2955`, called at
+`crates/modules/fleet/src/remote_config.rs:279`), so `media-plan` or `Media_Plan`
+never reads as applied while doing nothing. It does not check the names, which
+belong to the device's build: it stores the value as given
+(`crates/modules/fleet/src/remote_config.rs:305`), and a device ignores a name its
+build does not know. A newer phase's name therefore reaches an older agent as
+nothing, and still sits in its file for the release that knows it.
+
+It is **live**, unlike the four before it. Its one read site is each session's
+open (`RemoteConfigServices::media_paths_with`,
+`agents/roomlerd/src/remote_config.rs:278`), so a push applies from the device's
+next session with no restart, and the device reports it under `live`, never
+`needs_restart` (`agents/roomlerd/src/remote_config.rs:598`). A session never
+changes path mid-flight.
+
+| pushed `rc_media_legacy` | what the device's key becomes |
+|---|---|
+| absent | not managed: left as it is |
+| `""` | cleared: no entries |
+| `none` | `none`: no entries, still managed |
+| `media_plan` | that list: the next session sends no `rc:media-plan` |
+
+⚠️ **Pushed and local values share the one key**, as `zero_copy_deny`'s do. A
+push of `none`, or a clear, also removes an entry the owner set on the device,
+and the next session runs that path's new code again. That stays within the
+opt-in's bargain (§2), and it is why the owner's lasting remedy is the opt-in.
+
+**On a supervised Mac** the GUI worker builds each session from its own file,
+which a push to the root's row never reaches. So the daemon sends its entries
+along with each session (`SessionParams::media_legacy`,
+`agents/roomlerd/src/delegate.rs:363`, from `media_legacy_for_delegate`,
+`agents/roomlerd/src/remote_config.rs:310`). The worker adds them to its own
+before it decides the session's paths. Adding legacy entries can only send a path
+back, so this never turns code on, and a daemon older than the field sends
+nothing.
+
+Entries match whole names by equality, never by prefix, and an old path forces
+the paths that stand on it onto the old path too (§7.1's second table, in
+`agents/roomlerd/src/media_paths.rs`). The session's `rc:media-plan` names both,
+in `legacy`, so a reader sees what the key did. `ROOMLERD_MEDIA_PLAN=0`, R2's
+first switch, still works and reads as a `media_plan` entry. Alone it adds no log
+line, so a host that set it before the keys existed logs nothing new.
+
+⚠️ **An agent that predates the key ignores it and reports the push applied**, as
+it does any key it predates. Until a device runs a release with R0a, its row reads
+`applied` while its sessions are unchanged. The release that carries R0a is named
+in [FR-135](fr/FR-135-one-rc-media-pipeline.md)'s step log.
+
+⚠️ **`rc_media_canary`, the key that turns a path's new code on before its
+default does, is NOT pushable**, for `zero_copy`'s reason (FR-132 decision 1):
+turning new code on stays the device's decision, or a release's. A body naming it
+is refused with a 403 and audited as `device_owned_switch`, by whole name
+(`crates/modules/fleet/src/remote_config.rs:317`), so a push never answers 200 as
+if it had taken. It is set on the device
+(`roomler config set rc_media_canary <names>`), is live the same way, and loses to
+`rc_media_legacy`. The model test that guards it compares whole keys
+(`the_device_owned_refusals_are_not_pushable`). A canary entry this build has no
+new code for, or whose requirement is on the old path, is refused and named in
+the plan's `refused`.
+
+⚠️ **The reach is the opt-in's.** A device that has not set
+`remote_config_enabled` refuses every push, this one included (§2), and most
+devices have not ([FR-135](fr/FR-135-one-rc-media-pipeline.md) §7.1 measured 4
+of 37). On those the kill switch is a person at the device or a forward release.
 
 ## 7. What this does not do
 
@@ -446,7 +547,7 @@ flowchart TD
 
 **A second caller: the daemon itself (FR-96 P2b, 2026-10-13).** A per-user Linux
 daemon whose binary was replaced restarts through the same door once nothing it
-serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:335-394`).
+serves would be cut (`RestartHandle::arm_from_within`, `localapi_state.rs:342-401`).
 It runs the same supervisor proof, record and systemd read-back, but not
 `local_restart_enabled`, because no local client is asking. It is not a server
 lever: what sets it off is a file replaced ON the device, by the root update
@@ -514,32 +615,40 @@ which the daemon still refuses on the same terms as a local request.
    the same moment a pushed one would. See §7b — option C created that
    asymmetry, and leaving it would have made gate 4 the slower of the two.
 
-   ⚠️ **On a root-mode Mac the pane edits the GUI worker, not the daemon
-   (#2871).** The companion's LocalAPI client reaches the per-user half, which
-   under FR-43 (through P2) is a second enrollment with a file of its own, so
-   `exec_enabled` / `ssh_enabled` flipped there never reach the root daemon
-   that `roomler exec` and `roomler ssh` talk to — measured on 0.4.169, the
-   worker's file read `ssh_enabled = false` while the root half served SSH.
-   The root daemon's socket is root-only and its person socket refuses every
-   config verb (`localapi::person_may`, `crates/localapi/src/lib.rs:3129`), so
-   gate 4 on that daemon is an administrator's: `sudo roomler config set
-   exec_enabled true`. The pane now says which file it edits and gives that
-   command (`cmd_config_target`, `agents/roomler-desktop/src/commands.rs:828`;
-   [installation.md](installation.md), "Two configurations") instead of
-   showing a switch that changes nothing. Letting the console user flip the
-   root daemon's gate 4 from the app would be a **new authorization path on the
-   person socket** — Linux system installs included — and that decision is
-   open on #2871, not taken here.
-
-   ⚠️ **On a Linux system install the pane reaches the root daemon over its
-   person socket (#2891)**, which refuses `ConfigGet` / `ConfigSet` outright,
-   so there was no switch to flip at all — the pane said "Could not load the
-   configuration" after falling back to a per-user file a system install does
-   not have. It now says whose configuration it is and gives the same command,
-   `sudo roomler config set exec_enabled true`, in place of rows
-   (`root_daemon_only`, `agents/roomler-desktop/src/commands.rs:726`). Gate 4 on a
-   root daemon is an administrator's on both OSes; nothing was admitted on the
-   person socket for it.
+   ⚠️ **On a root-mode install the pane reaches the root daemon over its
+   person socket (#2871, design A).** Through FR-43 P2 a supervised Mac is two
+   enrollments with two files, and the companion's LocalAPI client reaches the
+   per-user half, so `exec_enabled` / `ssh_enabled` flipped in the pane changed
+   a file the root daemon — the one `roomler exec` and `roomler ssh` talk to —
+   never reads (measured on 0.4.169: the worker's file read `ssh_enabled =
+   false` while the root half served SSH). The root daemon's own socket is
+   root-only, and its person socket admitted no config verb at all, on a Mac's
+   root half and on a Linux system install alike (#2891: there the pane read
+   "Could not load the configuration" and fell back to a per-user file a system
+   install does not have). Design A (the operator, 2026-10-25) admits two: the
+   listing, and `ConfigSet` of exactly the keys that are the console person's
+   own call — the table `localapi::CONSOLE_PERSON_KEYS`
+   (`crates/localapi/src/lib.rs:3156`): where incoming files land, whether a
+   controller may record, keep busy, privacy mode, lock on end, display match,
+   the browser check, what a session may use, external access. Where
+   recordings are saved stays root's on a root-mode install, pending a check
+   of the folder each time a recording starts. **Gate 4 is not among them.**
+   `exec_enabled`, `ssh_enabled` and `remote_config_enabled` are served
+   read-only there (`ConfigEntry::read_only = "root_only"`, `person_view`,
+   `:3443`), and a `ConfigSet` of them is refused by name with the
+   administrator's command (`not_on_the_person_socket_for_key`, `:3487`): on a
+   root-mode install gate 4 stays `sudo roomler config set exec_enabled true`,
+   on both OSes. The pane shows the root daemon's value of the switch, marked,
+   instead of another daemon's — on a two-half Mac the machine-side rows come
+   from the root half and the session rows from the worker
+   (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`;
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:635`; the table
+   in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
+   than design A, which still refuses the listing, gets the administrator's
+   path in place of rows (`root_daemon_only`,
+   `agents/roomler-desktop/src/commands.rs:1053`). Whether the person at the
+   seat may switch gate 4 on a root-mode install — Windows' pipe lets every
+   interactive user — is the policy call still open on #2871.
 
 ## 9. Not built, on purpose
 

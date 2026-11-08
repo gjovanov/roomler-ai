@@ -33,7 +33,7 @@ fn spawn_agent_signaling(
 /// Multi-org P1 — like [`spawn_agent_signaling`] but with an explicit
 /// [`signaling::OrgCtx`], so a test can drive a SECONDARY enrollment's loop
 /// exactly the way `run_cmd`'s org supervisors do.
-fn spawn_agent_signaling_as(
+pub(crate) fn spawn_agent_signaling_as(
     ctx: signaling::OrgCtx,
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
@@ -83,9 +83,18 @@ async fn run_agent_signaling_on(
         std::env::temp_dir().join(format!("roomler-test-consent-{}", cfg.agent_id)),
     )
     .expect("consent broker init");
-    // Read before `cfg` is moved into the call below.
-    let exec_enabled = cfg.exec_enabled;
-    let remote_config_enabled = cfg.remote_config_enabled;
+    // Remote config: built before `cfg` is moved into the call below. The live
+    // `exec_enabled` must be SEEDED from the config this agent was handed, and
+    // the keys it started on recorded (FR-132 P1c), which is exactly what
+    // `main.rs` does. See agent_exec_tests for the failure hardcoding `false`
+    // produced.
+    let remote_cfg = roomlerd::remote_config::RemoteConfigServices::new(
+        config_path.unwrap_or_else(|| std::path::PathBuf::from("unused-in-tests.toml")),
+        std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        cfg.exec_enabled,
+        cfg.remote_config_enabled,
+    )
+    .running_on(&cfg);
     signaling::run(
         ctx,
         // FR-43 P2b — no GUI-worker delegation in tests: `Off` is not a
@@ -102,16 +111,7 @@ async fn run_agent_signaling_on(
         Default::default(),
         broker,
         roomlerd::tunnel::client_mgr::TunnelClientHub::new("test".into()),
-        // Remote config: tests never PUSH one, but the live `exec_enabled`
-        // must still be SEEDED from the config this agent was handed —
-        // which is exactly what `main.rs` does. See agent_exec_tests for
-        // the failure hardcoding `false` produced.
-        roomlerd::remote_config::RemoteConfigServices::new(
-            config_path.unwrap_or_else(|| std::path::PathBuf::from("unused-in-tests.toml")),
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            exec_enabled,
-            remote_config_enabled,
-        ),
+        remote_cfg,
         // FR-27 — the live remote-control session registry. Tests never
         // read it back, but the signalling loop registers into it, so a
         // fresh one per harness is the honest value (not a shared global
@@ -1526,6 +1526,70 @@ impl ConnectedDevice {
         let _ = self.stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), self.sig_task).await;
     }
+}
+
+/// FR-132 P1c — a reconnect does not make a waiting device read as converged.
+/// The save reaches the connected device, which writes the key and waits on a
+/// restart. Then the socket drops, as in a pod roll, and the connect path
+/// delivers the same document to the same process. The file already matches,
+/// and that used to answer `noop`, so the row read `applied` while the daemon
+/// still ran the old value. Nothing here restarts the daemon, so the row must
+/// stay on `needs_restart`, until a save puts the file back on what it runs.
+#[tokio::test]
+async fn a_reconnect_leaves_a_waiting_device_on_needs_restart() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("rcfgwait").await;
+    let device = ConnectedDevice::on(&app, &seeded, "rcfgwait", true).await;
+
+    let row = device
+        .save(&app, &seeded, json!({ "zero_copy_deny": "hevc_qsv:gpu" }))
+        .await;
+    assert_eq!(
+        row["remote_config"]["state"].as_str(),
+        Some("needs_restart"),
+        "{row}"
+    );
+    let delivered = row["remote_config"]["report"]["reported_at"].clone();
+    let written = std::fs::read(&device.path).unwrap();
+
+    app.state.fleet().rc_hub.cancel_all_agents();
+    let mut row = Value::Null;
+    for _ in 0..200 {
+        row = agent_row(&app, &seeded, &device.cfg.agent_id).await;
+        if row["remote_config"]["report"]["reported_at"] != delivered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let rc = &row["remote_config"];
+    assert_ne!(
+        rc["report"]["reported_at"], delivered,
+        "the device never reported again: did it reconnect? {rc}"
+    );
+    assert_eq!(rc["report"]["needs_restart"], json!(["zero_copy_deny"]));
+    assert_eq!(rc["state"].as_str(), Some("needs_restart"), "{rc}");
+    assert_eq!(
+        std::fs::read(&device.path).unwrap(),
+        written,
+        "and a reconnect writes nothing"
+    );
+
+    // A blank clears the key, which is the value this process started on, so
+    // the file changes and nothing is left to restart for.
+    let row = device
+        .save(&app, &seeded, json!({ "zero_copy_deny": "" }))
+        .await;
+    let rc = &row["remote_config"];
+    assert_eq!(rc["report"]["outcome"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(rc["report"]["needs_restart"], json!([]), "{rc}");
+    assert_eq!(rc["state"].as_str(), Some("applied"), "{rc}");
+    assert_eq!(
+        roomlerd::config::load(&device.path).unwrap().zero_copy_deny,
+        None,
+        "the file is back on what the daemon runs"
+    );
+
+    device.stop().await;
 }
 
 /// FR-132 P1b — a saved config reaches a device that is already connected.
