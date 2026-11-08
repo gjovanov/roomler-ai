@@ -116,6 +116,11 @@ are.
 - [~] Field: the FR-1 age pill on a relayed pair no longer shows multi-second
       excursions. **Partial (2026-11-03):** rare, not gone. 6 of 24 153 constrained windows
       in the week reached 2 s, in 3 of 176 sessions, one of them on `derp` (field log).
+      **Re-checked 2026-11-08 against #3566,** which found every age off by a page↔worker
+      clock drift that is fixed for a session's life: "not gone" holds, since the `derp`
+      windows read 2 161 and 3 364 ms in a session whose learned floor read 49-51 ms, and
+      the drift can't exceed the floor. The counts are a floor: a tab whose ages all read
+      negative sends none.
 - [x] Docs: the carrier's queue discipline (the age bound, the send-buffer cap
       and its per-OS read-back, the counter, and what each log line means) is in
       `docs/overlay-communication.md` §6, with a diagram, and indexed in the
