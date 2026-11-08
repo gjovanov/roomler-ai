@@ -236,6 +236,12 @@ sequenceDiagram
   membership gone and closes itself before the client hears anything.
 - The routes answer the membership change whatever the hook says, since it has happened; a
   failure to withdraw is logged as an error with the org, room and person.
+- After the seats, `chat` (the record owner, later in `HOOK_ORDER`) drops the person's room
+  memberships of the org they left (`crates/modules/chat/src/membership.rs`). Every room
+  fan-out (messages, reactions, pins, typing, mentions) is addressed to those rows, so the
+  org's rooms stop reaching the person with the org membership. Rows of people no longer in
+  the org are ended by `POST /api/admin/room-members/prune`, an operator step (a dry run
+  by default, bounded, idempotent).
 
 **Tests.** `conference_gate_tests`: a member removed from the org, one who leaves it and one
 who leaves the room each lose the seat at once (their client hears the call ended, the host

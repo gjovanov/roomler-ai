@@ -337,6 +337,14 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   room kick, a deleted account) calls the hook too, after the row is gone, or the seats it
   admitted outlive it. A room deleted mid-call does not call it yet: that call runs on
   until its people hang up. `docs/real-time.md` has the flow.
+- **A room membership ends with the org membership.** Every room fan-out (messages,
+  edits, reactions, pins, typing, mentions) reaches the people holding a row in
+  `room_members`, so the same hook, run after the org membership row is gone, drops the
+  person's rows in that org's rooms: `chat`'s `MembershipLifecycle`
+  (`crates/modules/chat/src/membership.rs`), after `conference` has ended the call seats
+  those rows held. Room memberships of people no longer in the org are ended by the
+  operator step `POST /api/admin/room-members/prune`: platform operators only, a dry run
+  by default, bounded per call, and idempotent.
 
 `GET /api/cluster/status` lists every live meeting room on a pod, so it is a platform
 admin's route (`require_platform_admin`, 404 otherwise), like `/api/admin/*`.

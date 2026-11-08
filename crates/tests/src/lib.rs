@@ -29,6 +29,10 @@ mod conference_view_tests;
 mod export_tests;
 #[cfg(test)]
 mod file_tests;
+/// An org membership takes its room memberships with it; an operator step
+/// ends the rows an org membership left before that.
+#[cfg(test)]
+mod membership_end_tests;
 #[cfg(test)]
 mod message_tests;
 #[cfg(test)]

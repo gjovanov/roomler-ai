@@ -145,6 +145,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/room-members/prune",
+      "methods": "POST"
+    },
+    {
       "path": "/api/admin/stats/attribution",
       "methods": "GET,HEAD"
     },
