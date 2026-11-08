@@ -518,16 +518,16 @@ must never write the device's config as a side effect of being run.
 | File | Owns |
 |---|---|
 | `agents/roomlerd/src/apps/mod.rs` | the wire types (`Coverage` `:139`, `MissingTool` `:164`, `Unavailable` `:189` with `code` `:229` and `reason` `:242`), the `WindowManager` trait (`:288`), the env floor (`APPS_ENV` `:338`, `permitted` `:355`), `availability` (`:389`) and `availability_for` (`:396`), `has_backend` (`:434`), `backend` (`:448`), `handle_control_message` (`:475`) and the pure `dispatch` seam (`:492`), the three reply builders (`:515`, `:553`, `:571`), `unavailable_reply` (`:603`), `resolve_app` (`:618`), the `wmctrl`/tmux parsers and `classify_title` (`:732`), the macOS listing (`QuartzWindow` `:764`, `quartz_listing` `:800`) and the Terminal script (`terminal_script` `:865`) |
-| `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:228`), `coverage` (`:254`), `list` (`:274`), `focus` (`:337`), `launch` (`:368`), `discover` (`:480`) and its test seam `discover_with` (`:497`), `refused` (`:579`), `Probe` (`:589`) and `probe` (`:605`), `find_xauthority` (`:648`) |
+| `agents/roomlerd/src/apps/linux.rs` | `Target` (`:56`), `LinuxWm::cmd` and the privilege drop (`:102`), `on_path` (`:209`) and `HELPERS` (`:239`), `coverage` (`:291`), `list` (`:295`), `focus` (`:358`), `launch` (`:389`), `discover` (`:500`) and its test seam `discover_with` (`:529`), `refused` (`:611`), `Probe` (`:621`) and `probe` (`:637`), `find_xauthority` (`:680`) |
 | `agents/roomlerd/src/apps/windows.rs` | `EnumWindows` (`:49`), `coverage` (`:88`), `list` (`:100`), `focus` (`:120`), `launch` (`:149`) |
 | `agents/roomlerd/src/apps/macos.rs` | FR-97 P2c: the window server's list (`quartz_windows`), the AX focus (`ax_window`, `MacWm::focus`), the launcher (`run_launcher`) and the Terminal script (`write_script`, `person_temp_dir`), `availability` (a window-server session or `no_session`). Its pure halves are in `mod.rs`: `QuartzWindow`, `quartz_listing`, `quartz_title`, `parse_quartz_window_id`, `terminal_script`, `terminal_script_name`, and the env floor (`APPS_ENV`, `apps_switched_off`, `permitted`) |
 | `agents/roomlerd/src/delegate.rs` · `signaling.rs` · `macos_supervisor.rs` | FR-97 P2c on a supervised Mac: `effective_apps` (the worker's words), the hello and heartbeat that carry them, and `WORKER_ENV_FORWARD`'s `APPS` |
-| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:4497`, `:4503`), assigned by `with_config_lists` (`:2944`) from `detect` (`:2388`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:4542`, `:4549`); `CACHED_CAPS` (`:39`) — why the hello is a snapshot; `cached_or_probed` (`:2956`) — why the child's struct must carry no `apps` |
-| `agents/roomlerd/src/peer.rs` | the control-DC arm (`:8654`) |
-| `agents/roomlerd/src/companion.rs` | `graphical_session` (`:461`) |
-| `agents/roomlerd/src/app.rs` | `apps-probe` (`:4739`) — reads the device config through `read_if_present`, never `load` |
-| `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:203`) |
-| `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1250`, `:792`) |
-| `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1105`, `parseAppsUnavailable` `:1181`), the request path (`:5474`, `refreshApps` `:5512`), the reply arm (`:8515`), the no-reason wording (`:890`) |
-| `ui/src/views/remote/RemoteControl.vue` | the *Remote apps* entry (`:1255`, gate `:3610`) and the dialog (`:1295`) |
-| `ui/src/__tests__/composables/useRemoteControl.spec.ts` | the wire-format locks, including the `missing_tools` test that is red on the pre-P6 parser (`:2184`) |
+| `agents/roomlerd/src/encode/caps.rs` | `apps_caps` / `apps_caps_for` (`:4628`, `:4634`), assigned by `with_config_lists` (`:2946`) from `detect` (`:2390`) beside `rpc` and `files` (`files_caps` / `files_caps_for`, `:4673`, `:4680`); `CACHED_CAPS` (`:41`) — why the hello is a snapshot; `cached_or_probed` (`:2958`) — why the child's struct must carry no `apps` |
+| `agents/roomlerd/src/peer.rs` | the control-DC arm (`:11502`) |
+| `agents/roomlerd/src/companion.rs` | `graphical_session` (`:1081`) |
+| `agents/roomlerd/src/app.rs` | `apps-probe` (`:6764`) — reads the device config through `read_if_present`, never `load` |
+| `crates/remote_control/src/models.rs` | `AgentCaps.apps` and its known values (`:412`) |
+| `crates/agent-core/src/apps_config.rs` · `config_surface.rs` | the `[virtual_desktop_apps]` shapes (`:21`); the config-surface keys (`:1882`, `:1203`) |
+| `ui/src/composables/useRemoteControl.ts` | the parsers (`parseAppsListReply` `:1909`, `parseAppsUnavailable` `:1985`), the request path (`:7543`, `refreshApps` `:7581`), the reply arm (`:11077`), the no-reason wording (`:1572`) |
+| `ui/src/views/remote/RemoteControl.vue` | the *Remote apps* entry (`:2142`, gate `:5301`) and the dialog (`:2182`) |
+| `ui/src/__tests__/composables/useRemoteControl.spec.ts` | the wire-format locks, including the `missing_tools` test that is red on the pre-P6 parser (`:2490`) |
