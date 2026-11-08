@@ -9606,7 +9606,7 @@ export function useRemoteControl(
    * reload that resumes it costs the person about the page's load time, and
    * the host no consent the redial would not have asked for. `holdRedial`
    * stops the pending retry so no request leaves a page that is unloading;
-   * `releaseRedial` gives it back when the reload does not happen.
+   * `releaseRedial` re-arms the ladder, its backoff kept, if no reload came.
    */
   let redialHeldForReload = false
   const reloadSurface: RcReloadSurface = {
@@ -9634,7 +9634,7 @@ export function useRemoteControl(
     releaseRedial: () => {
       if (!redialHeldForReload) return
       redialHeldForReload = false
-      if (phase.value === 'reconnecting' && reconnectTimer === null && lastConnectArgs) fireReconnectAttempt()
+      if (phase.value === 'reconnecting' && reconnectTimer === null && lastConnectArgs) scheduleReconnect({ notifyServer: false })
     },
   }
 
