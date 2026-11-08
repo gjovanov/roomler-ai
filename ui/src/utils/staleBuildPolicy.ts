@@ -12,14 +12,19 @@
  * | nothing live, nothing typed, no dialog             | `reload`                 |
  * | a remote session cut and waiting on its redial     | `reload-and-resume`      |
  * | a live remote session, an external one (FR-52), a  | `banner`, and the reload |
- * | call, typed input, an open dialog                  | waits for a quiet moment |
+ * | call, typed input, an open dialog, a hold          | waits for a quiet moment |
+ *
+ * A hold is what a reload would lose for good and what no amount of idle time
+ * gives up: an element marked `data-unsaved` (a key shown once), an upload in
+ * flight, a remote session that ended a moment ago (its notice, its error, the
+ * rating prompt).
  *
  * Four guards, each one a way the page could be left worse than today:
  * - **Two reads, 30 s apart** (`trackServedBuild`): during a roll one pod
  *   serves the old build and one the new, so a single read proves nothing.
  * - **A settled socket** (`settled`): until this page's own `/ws` has been
- *   steady for 30 s the server may be mid-roll, and a reload then can take its
- *   shell from one build and its chunks from the other: a blank page.
+ *   connected for 30 s the server may be mid-roll, and a reload then can take
+ *   its shell from one build and its chunks from the other: a blank page.
  * - **One automatic reload in 10 minutes**, claimed in sessionStorage
  *   (`utils/staleBuild.ts`); where storage cannot be written, none at all.
  * - **Offline, nothing.**
@@ -36,7 +41,7 @@
 
 /** A mismatch counts once the same id is read again at least this much later. */
 export const CONFIRM_GAP_MS = 30_000
-/** The page's own socket has been steady this long: no roll is cutting it. */
+/** The page's own socket has been connected this long: no roll is cutting it. */
 export const SETTLE_MS = 30_000
 /** The automatic reload's own record (the chunk-failure one is `staleBuild.ts`'s). */
 export const NEW_BUILD_RELOAD_KEY = 'roomler.newBuildReloadAt'
@@ -97,6 +102,10 @@ export interface RcReloadState {
   external: boolean
   /** Work the redial would carry on and a reload would drop: a file transfer, a recording's download. */
   work: boolean
+  /** A session that ended a moment ago: its notice, its error or the rating prompt is still on the page. */
+  hold: boolean
+  /** The device asked someone to allow this session (`consent_asks`): a new session asks again. */
+  asksConsent: boolean
 }
 
 /** What a viewer offers the watch; registered by `views/remote/RemoteControl.vue`. */
@@ -108,6 +117,8 @@ export interface RcReloadSurface {
   holdRedial(): RcResumeArgs | null
   /** Give back a redial `holdRedial` stopped, when the reload did not happen. */
   releaseRedial(): void
+  /** The signed-in person the session is theirs: the resume is for them alone. */
+  userId(): string | null
 }
 
 export interface StaleBuildSituation {
@@ -115,14 +126,18 @@ export interface StaleBuildSituation {
   online: boolean
   /** The served build differs from this page's, read the same twice `CONFIRM_GAP_MS` apart. */
   confirmed: boolean
-  /** This page's own `/ws` has been steady `SETTLE_MS`, or the page has none. */
+  /** This page's own `/ws` has been connected `SETTLE_MS`, or the page has none. */
   settled: boolean
   rc: RcSessionState
   rcExternal: boolean
   rcWork: boolean
-  /** In a call (the conference store's `isInCall`), on any page. */
+  /** The session's device asks someone to allow a new one: the banner says so. */
+  rcAsksConsent: boolean
+  /** In a call: the conference store's `isInCall`, or on the call page at all (a rejoin, a call just ended). */
   meetingLive: boolean
-  /** Text the person typed and has not sent or saved, or an element marked `data-unsaved`. */
+  /** What a reload would lose for good, and no idle time gives up: `data-unsaved`, an upload in flight, a remote session that just ended. */
+  held: boolean
+  /** Text the person typed and has not sent or saved. */
   unsavedInput: boolean
   /** A Vuetify dialog is open. */
   dialogOpen: boolean
@@ -148,6 +163,9 @@ export function decideStaleBuildAction(s: StaleBuildSituation): StaleBuildAction
   if (s.rcExternal && s.rc !== 'none') return 'banner'
   if (s.meetingLive) return 'banner'
   if (s.rc === 'live') return 'banner'
+  // A key shown once, an upload, a session's last words: lost for good, so
+  // they wait however long the page sits hidden.
+  if (s.held) return 'banner'
   if (s.rc === 'redialing') {
     // The session is already cut and its redial would open the next one: a
     // reload that resumes it costs the person about the page's load time, and
@@ -162,12 +180,17 @@ export function decideStaleBuildAction(s: StaleBuildSituation): StaleBuildAction
 }
 
 /** The line under the banner's title: what Reload does to what is live. */
-export type NewBuildHint = 'rcResume' | 'rcExternal' | 'call' | null
+export type NewBuildHint = 'rcResume' | 'rcResumeAsks' | 'rcExternal' | 'call' | null
 
-export function bannerHint(s: Pick<StaleBuildSituation, 'rc' | 'rcExternal' | 'meetingLive'>): NewBuildHint {
+export function bannerHint(
+  s: Pick<StaleBuildSituation, 'rc' | 'rcExternal' | 'rcAsksConsent' | 'meetingLive'>,
+): NewBuildHint {
   if (s.rc !== 'none' && s.rcExternal) return 'rcExternal'
   if (s.meetingLive) return 'call'
-  if (s.rc !== 'none') return 'rcResume'
+  // A Reload on a live session opens a new one: where the device asks someone
+  // to allow each session, it asks again, and the banner must not promise a
+  // seamless pick-up.
+  if (s.rc !== 'none') return s.rcAsksConsent ? 'rcResumeAsks' : 'rcResume'
   return null
 }
 
@@ -186,6 +209,8 @@ export interface RcResumeIntent extends RcResumeArgs {
   at: number
   /** `location.pathname` of the page that reloaded: the next load must be that page. */
   path: string
+  /** The person whose session it was: someone else signed in on this tab resumes nothing. */
+  userId: string
 }
 
 type IntentStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -210,20 +235,38 @@ function argsOf(a: RcResumeArgs): RcResumeArgs {
   return a.orgId ? { agentId: a.agentId, permissions: a.permissions, orgId: a.orgId } : { agentId: a.agentId, permissions: a.permissions }
 }
 
-/** Record the resume for the next page load; false when storage cannot hold it (then nothing reloads). */
+/**
+ * Record the resume for the next page load; false when storage cannot hold it,
+ * or when there is no signed-in person to tie it to (then nothing reloads).
+ */
 export function writeRcResumeIntent(
   storage: IntentStorage | undefined,
   args: RcResumeArgs,
   now: number,
   path: string,
+  userId: string | null,
 ): boolean {
   if (!storage || !validArgs(args) || typeof path !== 'string' || !path.startsWith('/')) return false
-  const intent: RcResumeIntent = { v: 1, ...argsOf(args), at: now, path }
+  if (typeof userId !== 'string' || !OBJECT_ID.test(userId)) return false
+  const intent: RcResumeIntent = { v: 1, ...argsOf(args), at: now, path, userId }
   try {
     storage.setItem(RC_RESUME_KEY, JSON.stringify(intent))
     return true
   } catch {
     return false
+  }
+}
+
+/**
+ * Drop a recorded resume: the reload it was written for did not happen, and
+ * the session's own redial has it back. Left there, a later reload of this tab
+ * inside the minute would open the session a second time.
+ */
+export function clearRcResumeIntent(storage: Pick<Storage, 'removeItem'> | undefined): void {
+  try {
+    storage?.removeItem(RC_RESUME_KEY)
+  } catch {
+    /* nothing more to do: the claim on the next load still checks its age */
   }
 }
 
@@ -248,11 +291,12 @@ export function takeRcResumeIntent(storage: IntentStorage | undefined): RcResume
   try {
     const v: unknown = JSON.parse(raw)
     if (!v || typeof v !== 'object') return null
-    const { v: version, at, path } = v as Record<string, unknown>
+    const { v: version, at, path, userId } = v as Record<string, unknown>
     if (version !== 1 || typeof at !== 'number' || !Number.isFinite(at)) return null
     if (typeof path !== 'string' || !path.startsWith('/')) return null
+    if (typeof userId !== 'string' || !OBJECT_ID.test(userId)) return null
     if (!validArgs(v)) return null
-    return { v: 1, ...argsOf(v), at, path }
+    return { v: 1, ...argsOf(v), at, path, userId }
   } catch {
     return null
   }
@@ -261,18 +305,19 @@ export function takeRcResumeIntent(storage: IntentStorage | undefined): RcResume
 /**
  * The args the page now rendering may resume with: the intent is under a
  * minute old, this is the first page the load rendered (a sign-in in between
- * means the person is starting over), and it is the same device's viewer in
- * the same organization at the same path.
+ * means the person is starting over), the same person is signed in, and it is
+ * the same device's viewer in the same organization at the same path.
  */
 export function resumeArgsFor(
   intent: RcResumeIntent | null,
-  here: { agentId: string; tenantId: string | null; path: string; firstRoute: boolean },
+  here: { agentId: string; tenantId: string | null; path: string; userId: string | null; firstRoute: boolean },
   now: number,
 ): RcResumeArgs | null {
   if (!intent || !here.firstRoute) return null
   const age = now - intent.at
   // A small negative age is a clock step across the reload; a large one is not this reload.
   if (!(age > -5_000 && age < RC_RESUME_MAX_AGE_MS)) return null
+  if (intent.userId !== here.userId) return null
   if (intent.agentId !== here.agentId || intent.path !== here.path) return null
   if (intent.orgId !== undefined && intent.orgId !== here.tenantId) return null
   return argsOf(intent)

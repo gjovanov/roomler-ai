@@ -162,7 +162,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7916`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:7928`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -236,16 +236,18 @@ pre-November build through three promotes, so viewer fixes never reached the peo
 keep a remote-control tab open all day. The page now learns of a new build itself and
 reloads at a moment that loses nothing.
 
-**Which build.** The build names itself once (`buildIdPlugin`, `ui/buildIdPlugin.ts:41`):
-a hash of the names of the files it emits (`buildIdOf`, `buildIdPlugin.ts:34`), each one
-content-hashed by Vite, so the id changes exactly when a byte the app serves does. The same
-value goes into `/version.json` beside the bundle (`buildIdPlugin.ts:52`) and into the
-shell as `<meta name="roomler-build">` (`buildIdPlugin.ts:62`). nginx serves the file from
+**Which build.** The build names itself once (`buildIdPlugin`, `ui/buildIdPlugin.ts:43`):
+a hash of the names of the files it emits (`buildIdOf`, `buildIdPlugin.ts:36`), each one
+content-hashed by Vite, so the id changes whenever the bundle's code, styles or assets do. A
+file copied as it is from `ui/public/` and an edit to index.html alone do not change it; the
+viewer's code is in neither. The same
+value goes into `/version.json` beside the bundle (`buildIdPlugin.ts:54`) and into the
+shell as `<meta name="roomler-build">` (`buildIdPlugin.ts:64`). nginx serves the file from
 `location /` as a real file, `Cache-Control: no-cache`, security headers kept
 (`files/nginx-pod.conf:162-164`); the year-long asset rule does not match `.json`
 (`nginx-pod.conf:46`). An image older than this has no such file and answers the SPA shell
 (200, `text/html`), which the reader ignores (`readServedBuild`,
-`ui/src/utils/buildId.ts:70`). `scripts/public-site-smoke.sh:347` checks all three on every
+`ui/src/utils/buildId.ts:71`). `scripts/public-site-smoke.sh:347` checks all three on every
 image.
 
 ⚠️ **It is not the git commit, on purpose.** The image's UI stage has none (`GIT_SHA`
@@ -253,11 +255,14 @@ reaches only the runtime stage, and `.dockerignore` drops `.git`), and an id tha
 with every commit would reload every open tab after a server-only promote and rename every
 chunk with it.
 
-**When the page reads** (`createStaleBuildWatch`, `ui/src/utils/staleBuildWatch.ts:139`):
-at every `/ws` (re)connect, which the shell binds (`AppLayout.vue:762`); every 10 minutes
+**When the page reads** (`createStaleBuildWatch`, `ui/src/utils/staleBuildWatch.ts:148`):
+at every `/ws` (re)connect, which the shell binds (`AppLayout.vue:770`); every 10 minutes
 while visible, and on becoming visible after that long; and once more 31 s after a first
-mismatch (`armConfirm`, `staleBuildWatch.ts:318`), so the second read does not wait 10
-minutes.
+mismatch (`armConfirm`, `staleBuildWatch.ts:362`), so the second read does not wait 10
+minutes. A confirming read that teaches nothing (a 5xx mid-roll, a captive portal, a
+rolled-back image that answers the SPA shell for the file) doubles that wait, from 30 s up to
+10 minutes, rather than asking again at once; and reads closer than 5 s fold into one, so a
+socket that flaps asks once (`requestRead`, `staleBuildWatch.ts:373`).
 
 ```mermaid
 flowchart TB
@@ -273,44 +278,62 @@ flowchart TB
     B --> D
 ```
 
-**What it does** (`decideStaleBuildAction`, `ui/src/utils/staleBuildPolicy.ts:144`):
+**What it does** (`decideStaleBuildAction`, `ui/src/utils/staleBuildPolicy.ts:159`):
 
 | The page, once a new build is confirmed | What it does |
 |---|---|
 | nothing live, nothing typed, no dialog | reloads |
-| a remote session already cut and waiting on its redial, on a socket steady for 30 s | reloads, and the next load resumes the session |
-| a live remote session, an external one (FR-52), a call, typed text, an open dialog, anything marked `data-unsaved` | shows "A new version of Roomler is ready" with Reload, and reloads by itself at the next quiet moment |
-| typed text or a dialog, in a page hidden with no input for 30 minutes | reloads |
+| a remote session already cut and waiting on its redial, on a socket connected for 30 s | reloads, and the next load resumes the session |
+| a live remote session, an external one (FR-52), a call or the call page, typed text, an open dialog, a hold | shows "A new version of Roomler is ready" with Reload, and reloads by itself at the next quiet moment |
+| typed text or a dialog (never a hold), in a page hidden with no input for 30 minutes | reloads |
 
-A quiet moment is the session or the call ending, the text sent, the dialog closed, or, for
-a remote session, its next cut on a settled socket. The banner's Reload resumes a remote
-session; for an external session it says the device's password is needed again, and for a
-call that reloading leaves it (`components/layout/NewBuildBanner.vue`, rendered by
-`App.vue:19` inside a fullscreen viewer too).
+A **hold** is what a reload would lose for good, so no amount of hidden, idle time gives it
+up: an element marked `data-unsaved` (the machine key `GrowthChannels.vue:222` and the
+ephemeral enrollment key `EnrollKeysSection.vue:179`, each shown once), an upload in flight
+anywhere on the page (`uploadsInProgress`, `api/client.ts:251`), and a remote session that
+ended within 5 minutes, or whose rating prompt is still up (`RC_ENDED_HOLD_MS`,
+`useRemoteControl.ts:465`). The call page counts as a call whatever the store says
+(`AppLayout.vue:772`): it leaves and rejoins on a pod roll and stays after the call ends, and a
+reload there asks "Reload site?".
+
+A quiet moment is the session or the call ending, the text sent, the dialog closed, a hold
+gone, or, for a remote session, its next cut on a settled socket. The banner's Reload resumes
+a remote session, and where the device asks someone to allow each session (`consent_asks`),
+it says the device asks again; for an external session it says the device's password is
+needed again, and for a call that reloading leaves it (`bannerHint`,
+`staleBuildPolicy.ts:185`; `components/layout/NewBuildBanner.vue`, rendered by `App.vue:19`
+inside a fullscreen viewer too).
 
 **The guards**, each one a way the page could be left worse than before:
 
 | Guard | Why | Where |
 |---|---|---|
-| a mismatch reads the same twice, 30 s apart | during a roll one pod serves the old build and one the new | `trackServedBuild`, `staleBuildPolicy.ts:64` |
-| this page's own `/ws` steady for 30 s | a roll that just cut it may still serve both builds, and a reload then can take its shell from one and its chunks from the other: a blank page | `settled`, `staleBuildWatch.ts:207` |
-| one automatic reload in 10 minutes, claimed in sessionStorage | never a loop. Where storage cannot be written, no automatic reload at all: the banner only | `NEW_BUILD_RELOAD_KEY`, `staleBuildPolicy.ts:42`; `claimReload` in `utils/staleBuild.ts` |
-| offline, nothing | a reload would trade the app for the browser's error page | `readNow`, `staleBuildWatch.ts:327` |
-| the person's hands | a plain reload waits until no key, click or wheel for 5 s | `BUSY_MS`, `staleBuildWatch.ts:67` |
+| a mismatch reads the same twice, 30 s apart | during a roll one pod serves the old build and one the new | `trackServedBuild`, `staleBuildPolicy.ts:69` |
+| this page's own `/ws` connected for 30 s (down, or retrying, is never steady) | a roll that just cut it may still serve both builds, and a reload then can take its shell from one and its chunks from the other: a blank page | `settled`, `staleBuildWatch.ts:224` |
+| one automatic reload in 10 minutes, claimed in sessionStorage | never a loop. Where storage cannot be written, no automatic reload at all: the banner only | `NEW_BUILD_RELOAD_KEY`, `staleBuildPolicy.ts:47`; `claimReload` in `utils/staleBuild.ts` |
+| offline, nothing | a reload would trade the app for the browser's error page | `readNow`, `staleBuildWatch.ts:386` |
+| the person's hands | a plain reload waits until no key, click or wheel for 5 s | `BUSY_MS`, `staleBuildWatch.ts:72` |
 
 **The resume.** A remote session that a cut put on its redial (`scheduleReconnect`) is handed
-over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9627`), the args its
-redial would have used are written to sessionStorage with the time and the path
-(`writeRcResumeIntent`, `staleBuildPolicy.ts:214`), and the page reloads. The next load takes
-the record out of storage before any page renders (`installStaleBuildWatch`,
-`staleBuildWatch.ts:450`, called before the router at `main.ts:46`). The viewer claims it once
-it has its device (`resumeAfterNewBuild`, `RemoteControl.vue:5477`): once, under a minute
-old, on the first page that load rendered, for the same device, organization and path
-(`resumeArgsFor`, `staleBuildPolicy.ts:267`). It connects through the same `connect()` its
-Connect button and its redial use ([remote-control.md §11.15](remote-control.md#1115-a-new-build-takes-over-a-redial-3582)).
+over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9647`), the args its
+redial would have used are written to sessionStorage with the time, the path and the
+signed-in person (`writeRcResumeIntent`, `staleBuildPolicy.ts:242`), and the page reloads. A
+reload that has not happened 20 s later gives the redial back and deletes the record
+(`startReload`, `staleBuildWatch.ts:284`; `clearRcResumeIntent`, `staleBuildPolicy.ts:265`),
+or an F5 inside the minute would open the session a second time beside the redial. The next
+load takes the record out of storage before any page renders (`installStaleBuildWatch`,
+`staleBuildWatch.ts:515`, called before the router at `main.ts:46`). The viewer claims it once
+it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5500`): once,
+under a minute old, on the first page that load rendered, for the same person, device,
+organization and path (`resumeArgsFor`, `staleBuildPolicy.ts:311`). It resumes through the
+redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9672`), never as a first
+connect: a first connect starts the ladder at 0, and `rc:error` retries `agent_offline` only
+past it, so a tab that reloaded while its device restarted for an update would have stopped
+there, where the redial keeps trying. Its record is `after_drop`, out of FR-22's
+first-attempt numbers ([remote-control.md §11.15](remote-control.md#1115-a-new-build-takes-over-a-redial-3582)).
 
 - ⚠️ **Only on the redial path.** A request or a consent prompt in flight reads `live`
-  (`rcReloadState`, `useRemoteControl.ts:439`). A reload then would abandon a question the
+  (`rcReloadState`, `useRemoteControl.ts:440`). A reload then would abandon a question the
   host may be reading, and the resume would ask it again. On the redial path the device
   decides consent as it would have for the redial, so a resume asks the host nothing more.
 - ⚠️ **Never an external session.** Its login opened one session, and another costs the
@@ -321,17 +344,19 @@ Connect button and its redial use ([remote-control.md §11.15](remote-control.md
   banner shows, and the reload happens at the session's next cut on a settled socket (the
   device restarting for an update, a network change on either end), at its end, or at a
   click on Reload.
-- A file transfer the redial would resume (rc.19) and a recording's download hold the
-  reload too: they live in this page's memory only.
+- A file transfer the redial would resume (rc.19) and a recording's download keep the
+  redial too: they live in this page's memory only.
 
 **The instrument.** Every `rc.connect` record names the page's build (`fields.build`,
 `rcConnectTimingUpload.ts:182`; the record is `v` 2), so a field read can tell a stale
 viewer from a bug directly
 ([remote-control.md §12.1.5](remote-control.md#1215-persisted-marks-part-4--where-a-stalls-phase-outlives-the-tab)).
 
-Tests: `staleBuildPolicy.spec.ts` (the table and the guards), `staleBuildWatch.spec.ts`
-(the reads, the reload, the hand-over and the claim, on fake timers), `buildId.spec.ts`
-(the plugin's file and shell agree), `rcReloadState.spec.ts`.
+Tests: `staleBuildPolicy.spec.ts` (the table, the guards, the holds, the record),
+`staleBuildWatch.spec.ts` (the reads and their backoff, the reload, the hand-over and the
+claim, on fake timers), `rcResumeAfterReload.spec.ts` (the resume on the real composable:
+on the ladder, held, given back), `buildId.spec.ts` (the plugin's file and shell agree),
+`rcReloadState.spec.ts`, and `api/client.spec.ts` (uploads in flight).
 
 ## Observability components
 
@@ -599,7 +624,7 @@ its desktop height** for the same data.
 | **A tab window over wide content takes `:touch="false"`; a tab row that can overflow takes `show-arrows`** | `GrowthView.vue`, `AnalyticsView.vue`, the viewer's Settings tabs | a sideways swipe across a wide table switched the **tab**; and below 1280 px Vuetify hides the arrows unless asked, so tabs past the edge gave no sign of themselves |
 | **A number or caption that must be read never sits at the end of a card title** on a phone — it moves into the card's text | `GrowthView.vue` (the weekly-active-orgs north star) | a title never wraps: at 360 px the caption pushed the number off the card |
 | **While a session runs, the remote viewer's toolbar holds only Back, the device's name, Disconnect and Fullscreen**, at every width; the session's state chips and every tool ride their own row under it (`#rc-tb-strip`, one `<Teleport>`: one instance of each control, moved, never copied), state first, scrolling sideways; from 960 px the stats readout comes last, in whole pills only, so it never pushes a tool out of view. Connect's phases keep the one row (below 960 px its items in flex `order`). The stage's alerts overlay the stage | `RemoteControl.vue` (`rc-tb-*`, `sessionToolsOnStrip`, `.rc-stage-alerts`) | the title went to 0 px and Disconnect started off-screen; with every tool still in that one row, the row overflowed and the name was held at its 96 px minimum on a phone ("FR-…" at 360 px) and at 0 px on a 1300 px desktop, with the state chips past the edge or squeezed to stubs (FR-116 P5c); each alert's coming and going resized the frame, re-sent `rc:resolution` and rebuilt the agent's encoder |
-| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:414`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2780`; the pull-tab, `:949`; `.rc-immersive`, `:5863`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
+| **On a phone held sideways, a running session takes the whole screen** (FR-125): with a coarse pointer, a page wider than tall and under 500 px tall (`isPhoneSideways`, `composables/useImmersiveViewer.ts:31`), the app bar hides (`AppLayout.vue:414`), the viewer's toolbar and tools strip become an overlay out of view (still mounted: the strip is the session tools' Teleport target), and the stage card loses its margin, border and corners. A pull-tab at the stage's top edge slides the bars back down **over** the stage; they hide again after 4 s without a touch, or on a tap on the stage. A per-browser setting in Settings → Display turns the mode off | `useImmersiveViewer.ts`, `RemoteControl.vue` (`immersive`, `:2781`; the pull-tab, `:949`; `.rc-immersive`, `:5897`) | the bars took 149 of a 340–412 px page, leaving the remote desktop 146–254 px, and every built-in touch preset ran off the stage's top (measured on production at six sizes, FR-125 §2) |
 | **Text that cannot break still wraps** (`overflow-wrap: anywhere`) | message content (`MessageBubble.vue`), stacked table values | one long URL or email widened a whole list past the screen |
 | **Sign-in fields say what they are**: `autocapitalize="none"`, `autocorrect="off"`, `spellcheck="false"` on the username, `autocomplete` on every credential | `LoginView.vue`, `RegisterView.vue` | iOS capitalised the username, and the server matches it exactly |
 | **The public landing page's sections are a ☰ menu below 960 px**, and its wordmark never shrinks (`flex-0-0` on the title) | `LandingView.vue` | the links were hidden below 600 px with no other way to them, and the wordmark was clipped to "Roo" |

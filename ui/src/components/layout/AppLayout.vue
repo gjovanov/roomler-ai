@@ -718,7 +718,7 @@ import {
 import { useRoomStore, type Room } from '@/stores/rooms'
 import { useAgentStore } from '@/stores/agents'
 import { useCappedSearchList } from '@/composables/useCappedSearchList'
-import { api, ApiError } from '@/api/client'
+import { api, ApiError, uploadsInProgress } from '@/api/client'
 import { useNotificationStore } from '@/stores/notification'
 import { useOrgBadgesStore } from '@/stores/orgBadges'
 import { useConferenceStore } from '@/stores/conference'
@@ -756,20 +756,23 @@ const orgBadges = useOrgBadgesStore()
 const conferenceStore = useConferenceStore()
 const { returnToCall, hangUp } = useCallControls()
 const wsStore = useWsStore()
-// #3582 — the shell owns the socket and sees the call: every (re)connect is a
-// moment to compare builds, and a call is a reason never to reload
-// (utils/staleBuildWatch.ts).
-const unbindStaleBuildWatch = bindStaleBuildWatch({
-  wsStatus: () => wsStore.status,
-  meetingLive: () => conferenceStore.isInCall,
-})
-onUnmounted(unbindStaleBuildWatch)
 // FR-69 P9 — which pillars THIS server mounts. Every nav item below that
 // belongs to a module reads `caps.has(...)`: one predicate for navigation
 // and routes (the router guard reads the same store), fail-open until the
 // server has answered.
 const caps = useCapabilitiesStore()
 const route = useRoute()
+// #3582 — the shell owns the socket and sees the call: every (re)connect is a
+// moment to compare builds, and a call is a reason never to reload
+// (utils/staleBuildWatch.ts). The call page counts whatever `isInCall` says:
+// it leaves and rejoins on a pod roll (`handleMediaRoomClosed`) and stays
+// after a call ends, and a reload there asks "Reload site?" mid-call.
+const unbindStaleBuildWatch = bindStaleBuildWatch({
+  wsStatus: () => wsStore.status,
+  meetingLive: () => conferenceStore.isInCall || route.name === 'room-call',
+  uploading: () => uploadsInProgress() > 0,
+})
+onUnmounted(unbindStaleBuildWatch)
 // FR-12 P2 — `?tour=<id>` starts a spotlight tour on arrival. The param is
 // stripped immediately: a tour is a one-time nudge, and leaving it in the URL
 // would replay on every refresh and follow a shared link to someone who never

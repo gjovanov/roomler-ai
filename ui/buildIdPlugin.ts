@@ -5,8 +5,10 @@
  *
  * The id is a hash of the names of the files the build emits. Vite names every
  * chunk, worker and asset after a hash of its own content, so the set of names
- * changes exactly when a byte the app serves does: a comment, a test or a
- * server-only change leaves it alone, and no tab reloads for those.
+ * changes whenever the bundle's code, styles or assets do: a comment, a test or
+ * a server-only change leaves it alone, and no tab reloads for those. Not seen:
+ * a file copied as it is from `ui/public/`, and an edit to index.html alone;
+ * the viewer's code is in neither.
  *
  * One value, computed once per build from the bundle (`idOf`), goes to:
  * - `version.json` beside the bundle (`generateBundle`), which nginx serves

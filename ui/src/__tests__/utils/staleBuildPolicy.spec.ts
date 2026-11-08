@@ -11,6 +11,7 @@ import {
   RC_RESUME_KEY,
   RC_RESUME_MAX_AGE_MS,
   bannerHint,
+  clearRcResumeIntent,
   decideStaleBuildAction,
   resumeArgsFor,
   takeRcResumeIntent,
@@ -26,6 +27,7 @@ const NEW = 'bbbbbbbbbbbbbbbb'
 const NEWER = 'cccccccccccccccc'
 const AGENT = '69f0000000000000000000c3'
 const TENANT = '69f0000000000000000000a1'
+const USER = '69f0000000000000000000b7'
 const PATH = `/tenant/${TENANT}/agent/${AGENT}/remote`
 const PERMS = 'VIEW | INPUT | CLIPBOARD | FILES | RECORD'
 
@@ -97,7 +99,9 @@ function quiet(over: Partial<StaleBuildSituation> = {}): StaleBuildSituation {
     rc: 'none',
     rcExternal: false,
     rcWork: false,
+    rcAsksConsent: false,
     meetingLive: false,
+    held: false,
     unsavedInput: false,
     dialogOpen: false,
     hiddenIdle: false,
@@ -143,7 +147,13 @@ describe('decideStaleBuildAction — the decision table', () => {
     expect(decideStaleBuildAction(quiet({ rc: 'redialing', dialogOpen: true }))).toBe('banner')
   })
 
-  it("never on a socket a roll may still be cutting: the page's own /ws must have been steady 30 s", () => {
+  it('a hold (a key shown once, an upload, a session that just ended) is never given up, however long the page sits hidden', () => {
+    expect(decideStaleBuildAction(quiet({ held: true }))).toBe('banner')
+    expect(decideStaleBuildAction(quiet({ held: true, hiddenIdle: true }))).toBe('banner')
+    expect(decideStaleBuildAction(quiet({ held: true, rc: 'redialing' }))).toBe('banner')
+  })
+
+  it("never on a socket a roll may still be cutting: the page's own /ws must have been connected 30 s", () => {
     expect(decideStaleBuildAction(quiet({ settled: false }))).toBe('banner')
     expect(decideStaleBuildAction(quiet({ rc: 'redialing', settled: false }))).toBe('banner')
   })
@@ -171,12 +181,21 @@ describe('decideStaleBuildAction — the decision table', () => {
 })
 
 describe('bannerHint — what Reload does to what is live', () => {
+  const h = (over: Partial<StaleBuildSituation>) =>
+    bannerHint({ rc: 'none', rcExternal: false, rcAsksConsent: false, meetingLive: false, ...over })
+
   it('names the session it resumes, the external one it ends, the call it leaves', () => {
-    expect(bannerHint({ rc: 'live', rcExternal: false, meetingLive: false })).toBe('rcResume')
-    expect(bannerHint({ rc: 'redialing', rcExternal: false, meetingLive: false })).toBe('rcResume')
-    expect(bannerHint({ rc: 'live', rcExternal: true, meetingLive: false })).toBe('rcExternal')
-    expect(bannerHint({ rc: 'none', rcExternal: false, meetingLive: true })).toBe('call')
-    expect(bannerHint({ rc: 'none', rcExternal: false, meetingLive: false })).toBeNull()
+    expect(h({ rc: 'live' })).toBe('rcResume')
+    expect(h({ rc: 'redialing' })).toBe('rcResume')
+    expect(h({ rc: 'live', rcExternal: true })).toBe('rcExternal')
+    expect(h({ meetingLive: true })).toBe('call')
+    expect(h({})).toBeNull()
+  })
+
+  it('never promises a seamless pick-up where the device asks someone to allow each session', () => {
+    expect(h({ rc: 'live', rcAsksConsent: true })).toBe('rcResumeAsks')
+    // An external session's own words win: it ends, whatever the device asks.
+    expect(h({ rc: 'live', rcExternal: true, rcAsksConsent: true })).toBe('rcExternal')
   })
 })
 
@@ -185,15 +204,22 @@ describe('the resume a reload hands to the next page load', () => {
 
   it('round-trips, and is taken out of storage as it is read', () => {
     const s = memoryStorage()
-    expect(writeRcResumeIntent(s, args, 1_000, PATH)).toBe(true)
+    expect(writeRcResumeIntent(s, args, 1_000, PATH, USER)).toBe(true)
     const intent = takeRcResumeIntent(s)
-    expect(intent).toEqual({ v: 1, ...args, at: 1_000, path: PATH })
+    expect(intent).toEqual({ v: 1, ...args, at: 1_000, path: PATH, userId: USER })
     expect(s.has(RC_RESUME_KEY)).toBe(false)
     expect(takeRcResumeIntent(s)).toBeNull()
   })
 
   it('is removed even when it is not well formed', () => {
-    for (const raw of ['{', '[]', JSON.stringify({ v: 2, ...args, at: 1, path: PATH }), JSON.stringify({ v: 1, ...args, at: 1, path: 'x' })]) {
+    for (const raw of [
+      '{',
+      '[]',
+      JSON.stringify({ v: 2, ...args, at: 1, path: PATH, userId: USER }),
+      JSON.stringify({ v: 1, ...args, at: 1, path: 'x', userId: USER }),
+      // A record from before the person was named in it: not this person's, by construction.
+      JSON.stringify({ v: 1, ...args, at: 1, path: PATH }),
+    ]) {
       const s = memoryStorage({ [RC_RESUME_KEY]: raw })
       expect(takeRcResumeIntent(s)).toBeNull()
       expect(s.has(RC_RESUME_KEY)).toBe(false)
@@ -202,25 +228,41 @@ describe('the resume a reload hands to the next page load', () => {
 
   it('holds ids and permissions by shape only', () => {
     const s = memoryStorage()
-    expect(writeRcResumeIntent(s, { ...args, agentId: 'not-an-id' }, 1, PATH)).toBe(false)
-    expect(writeRcResumeIntent(s, { ...args, orgId: '../x' }, 1, PATH)).toBe(false)
-    expect(writeRcResumeIntent(s, { ...args, permissions: 'VIEW; DROP' }, 1, PATH)).toBe(false)
+    expect(writeRcResumeIntent(s, { ...args, agentId: 'not-an-id' }, 1, PATH, USER)).toBe(false)
+    expect(writeRcResumeIntent(s, { ...args, orgId: '../x' }, 1, PATH, USER)).toBe(false)
+    expect(writeRcResumeIntent(s, { ...args, permissions: 'VIEW; DROP' }, 1, PATH, USER)).toBe(false)
     expect(s.has(RC_RESUME_KEY)).toBe(false)
     // Without an org it is still a resume: connect() falls back to the URL's.
-    expect(writeRcResumeIntent(s, { agentId: AGENT, permissions: 'VIEW' }, 1, PATH)).toBe(true)
-    expect(takeRcResumeIntent(s)).toEqual({ v: 1, agentId: AGENT, permissions: 'VIEW', at: 1, path: PATH })
+    expect(writeRcResumeIntent(s, { agentId: AGENT, permissions: 'VIEW' }, 1, PATH, USER)).toBe(true)
+    expect(takeRcResumeIntent(s)).toEqual({ v: 1, agentId: AGENT, permissions: 'VIEW', at: 1, path: PATH, userId: USER })
+  })
+
+  it('is tied to the signed-in person: with nobody signed in, there is no resume to write', () => {
+    const s = memoryStorage()
+    expect(writeRcResumeIntent(s, args, 1, PATH, null)).toBe(false)
+    expect(writeRcResumeIntent(s, args, 1, PATH, 'someone')).toBe(false)
+    expect(s.has(RC_RESUME_KEY)).toBe(false)
   })
 
   it('where storage cannot hold it, says so (and then nothing reloads)', () => {
     const full = { getItem: () => null, setItem: () => { throw new Error('QuotaExceededError') }, removeItem: () => {} }
-    expect(writeRcResumeIntent(full, args, 1, PATH)).toBe(false)
-    expect(writeRcResumeIntent(undefined, args, 1, PATH)).toBe(false)
+    expect(writeRcResumeIntent(full, args, 1, PATH, USER)).toBe(false)
+    expect(writeRcResumeIntent(undefined, args, 1, PATH, USER)).toBe(false)
     const refused = { getItem: () => { throw new Error('SecurityError') }, setItem: () => {}, removeItem: () => {} }
     expect(takeRcResumeIntent(refused)).toBeNull()
   })
 
-  const intent: RcResumeIntent = { v: 1, ...args, at: 100_000, path: PATH }
-  const here = { agentId: AGENT, tenantId: TENANT, path: PATH, firstRoute: true }
+  it('can be dropped, for a reload that did not happen', () => {
+    const s = memoryStorage()
+    writeRcResumeIntent(s, args, 1, PATH, USER)
+    clearRcResumeIntent(s)
+    expect(s.has(RC_RESUME_KEY)).toBe(false)
+    expect(() => clearRcResumeIntent(undefined)).not.toThrow()
+    expect(() => clearRcResumeIntent({ removeItem: () => { throw new Error('SecurityError') } })).not.toThrow()
+  })
+
+  const intent: RcResumeIntent = { v: 1, ...args, at: 100_000, path: PATH, userId: USER }
+  const here = { agentId: AGENT, tenantId: TENANT, path: PATH, userId: USER, firstRoute: true }
 
   it('resumes the same device, in the same org, at the same path, under a minute later', () => {
     expect(resumeArgsFor(intent, here, 100_000 + 2_000)).toEqual(args)
@@ -237,6 +279,11 @@ describe('the resume a reload hands to the next page load', () => {
     expect(resumeArgsFor(intent, { ...here, agentId: '69f0000000000000000000ff' }, 101_000)).toBeNull()
     expect(resumeArgsFor(intent, { ...here, tenantId: '69f0000000000000000000ee' }, 101_000)).toBeNull()
     expect(resumeArgsFor(intent, { ...here, path: '/tenant/x/devices' }, 101_000)).toBeNull()
+  })
+
+  it('another person signed in on this tab, or nobody yet: nothing', () => {
+    expect(resumeArgsFor(intent, { ...here, userId: '69f0000000000000000000dd' }, 101_000)).toBeNull()
+    expect(resumeArgsFor(intent, { ...here, userId: null }, 101_000)).toBeNull()
   })
 
   it('only on the first page the load rendered: a sign-in in between starts over', () => {

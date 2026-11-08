@@ -176,7 +176,8 @@
           {{ mintError }}
         </v-alert>
       </v-card-text>
-      <v-card-text v-else>
+      <v-card-text v-else data-unsaved>
+        <!-- `data-unsaved`: a reload for a new build waits while the key shows, however long the tab sits hidden (#3582). -->
         <v-alert type="warning" variant="tonal" density="compact" class="mb-3">
           Copy it now — the key is <strong>not stored</strong> and cannot be
           shown again. Losing it means minting a new key.

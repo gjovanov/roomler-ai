@@ -5,8 +5,9 @@
  *
  * Each build names itself ONCE (`ui/buildIdPlugin.ts`): a hash of the names of
  * the files it emits, every one of them content-hashed by Vite, so the id
- * changes exactly when a byte the app serves does. That one value lands in two
- * places:
+ * changes whenever the bundle's code, styles or assets do (not for a file
+ * copied from `ui/public/`, nor for an edit to index.html alone). That one value
+ * lands in two places:
  *
  * - `<meta name="roomler-build">` in the page shell: what a tab carries for as
  *   long as it lives;

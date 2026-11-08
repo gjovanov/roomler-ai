@@ -16,7 +16,9 @@
  * - every 10 minutes while the page is visible, and on becoming visible after
  *   that long;
  * - once more 31 s after a first mismatch, so the second read the policy needs
- *   does not wait 10 minutes.
+ *   does not wait 10 minutes. A read that teaches nothing (a 5xx, a captive
+ *   portal, an image with no such file) doubles that wait, 30 s up to 10 min;
+ * - never two within 5 s: the reads a flapping socket asks for fold into one.
  *
  * Decisions (`decideStaleBuildAction`): after every read, every 15 s while a new
  * build is confirmed, and at once when a remote-control viewer's phase moves
@@ -25,13 +27,15 @@
  *
  * The resume: a session already cut and waiting on its redial is handed over.
  * Its redial is stopped (`holdRedial`), the args it would have used are written
- * to sessionStorage with the time and the path, and the page reloads. The next
- * load takes that record out of storage before anything renders, and the
- * viewer claims it once it has its device (`claimRcResume`): once, under a
- * minute old, on the first page that load rendered, for the same device in the
- * same organization. It then connects through the same `connect()` its Connect
- * button and its redial use, so the device decides consent exactly as it would
- * have for the redial.
+ * to sessionStorage with the time, the path and the signed-in person, and the
+ * page reloads. A reload that does not happen within 20 s gives the redial back
+ * and deletes the record. The next load takes that record out of storage before
+ * anything renders, and the viewer claims it once it has its device and its
+ * person (`claimRcResume`): once, under a minute old, on the first page that
+ * load rendered, for the same person, device and organization. It resumes
+ * through the redial's own ladder (`resumeAfterReload` in `useRemoteControl`),
+ * so a device that is still restarting is retried as the redial would have,
+ * and the device decides consent exactly as it would have for the redial.
  */
 import { reactive, watch } from 'vue'
 import type { Router } from 'vue-router'
@@ -44,6 +48,7 @@ import {
   NO_TRACK,
   SETTLE_MS,
   bannerHint,
+  clearRcResumeIntent,
   decideStaleBuildAction,
   resumeArgsFor,
   takeRcResumeIntent,
@@ -69,6 +74,8 @@ export const BUSY_MS = 5_000
 export const HIDDEN_IDLE_MS = 30 * 60_000
 /** A reload that has not taken the page away by now did not happen. */
 export const RELOAD_GIVE_UP_MS = 20_000
+/** Reads closer together than this are folded into one: a socket that flaps asks once. */
+export const MIN_READ_GAP_MS = 5_000
 
 const TEXT_INPUT_TYPES = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number'])
 /** The remote host's keyboard surfaces: what is typed there is forwarded, never kept. */
@@ -86,8 +93,10 @@ export interface NewBuildBanner {
 export interface StaleBuildSources {
   /** The `/ws` store's status: `disconnected` | `connecting` | `connected`. */
   wsStatus: () => string
-  /** In a call (the conference store's `isInCall`). */
+  /** In a call, or on the call page at all (it leaves and rejoins on a pod roll, and lingers after a call ends). */
   meetingLive: () => boolean
+  /** An upload in flight anywhere on the page (`api.upload`). */
+  uploading: () => boolean
 }
 
 export interface StaleBuildWatchDeps {
@@ -110,7 +119,7 @@ export interface StaleBuildWatch {
   bind(src: StaleBuildSources): () => void
   registerSurface(surface: RcReloadSurface): () => void
   surfaceChanged(): void
-  claimRcResume(here: { agentId: string; tenantId: string | null; path: string }): RcResumeArgs | null
+  claimRcResume(here: { agentId: string; tenantId: string | null; path: string; userId: string | null }): RcResumeArgs | null
   navigationCompleted(): void
   reloadNow(): void
   dismiss(): void
@@ -160,8 +169,16 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
   let track: ServedBuildTrack = NO_TRACK
   let reading = false
   let reloading = false
+  /** The 10-minute clock's base: the page's load counts as a read. */
   let lastReadAt = monoNow()
+  /** The last read actually sent, for the 5 s fold. */
+  let lastAttemptAt = Number.NEGATIVE_INFINITY
   let confirmTimer: ReturnType<typeof setTimeout> | null = null
+  let deferredRead: ReturnType<typeof setTimeout> | null = null
+  /** Reads in a row that taught nothing: each one doubles the wait before the next confirming read. */
+  let failedReads = 0
+  /** A resume this page recorded for a reload that has not happened yet. */
+  let resumeRecorded = false
   let lastAction: StaleBuildAction = 'none'
   let dismissedFor: string | null = null
   let sources: StaleBuildSources | null = null
@@ -187,21 +204,21 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
       return
     }
     hiddenSince = null
-    if (now - lastReadAt >= READ_EVERY_MS) void readNow()
+    if (now - lastReadAt >= READ_EVERY_MS) requestRead()
     else evaluate()
   }
 
   function tick(): void {
     if (doc.visibilityState !== 'hidden' && monoNow() - lastReadAt >= READ_EVERY_MS) {
-      void readNow()
+      requestRead()
       return
     }
     if (track.confirmed) evaluate()
   }
 
-  function hasUnsavedInput(): boolean {
+  function hasTypedText(): boolean {
     for (const el of typed) if (!el.isConnected || !holdsText(el)) typed.delete(el)
-    return typed.size > 0 || doc.querySelector(UNSAVED_SELECTOR) !== null
+    return typed.size > 0
   }
 
   function settled(now: number): boolean {
@@ -213,15 +230,18 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
     } catch {
       return false
     }
-    return status !== 'connecting' && now - lastWsChangeAt >= SETTLE_MS
+    // Connected, and for a while: a socket that is down, or retrying (a hidden
+    // tab stretches its 3 s reconnect), is no sign the roll is over.
+    return status === 'connected' && now - lastWsChangeAt >= SETTLE_MS
   }
 
-  function meetingLive(): boolean {
+  /** Read a source; one that throws counts as `fallback`, the side that never reloads. */
+  function ask(get: ((s: StaleBuildSources) => boolean) | null, fallback: boolean): boolean {
+    if (!sources || !get) return false
     try {
-      return sources?.meetingLive() === true
+      return get(sources) === true
     } catch {
-      // Unknown is treated as live: the banner, never a reload out of a call.
-      return true
+      return fallback
     }
   }
 
@@ -240,8 +260,14 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
       rc,
       rcExternal: states.some((r) => r.external && r.session !== 'none'),
       rcWork: states.some((r) => r.work),
-      meetingLive: meetingLive(),
-      unsavedInput: hasUnsavedInput(),
+      rcAsksConsent: states.some((r) => r.session !== 'none' && r.asksConsent),
+      // Unknown is treated as live: the banner, never a reload out of a call.
+      meetingLive: ask((s) => s.meetingLive(), true),
+      held:
+        doc.querySelector(UNSAVED_SELECTOR) !== null ||
+        states.some((r) => r.hold) ||
+        ask((s) => s.uploading(), true),
+      unsavedInput: hasTypedText(),
       dialogOpen: doc.querySelector(OPEN_DIALOG_SELECTOR) !== null,
       hiddenIdle:
         hiddenSince !== null && now - hiddenSince >= HIDDEN_IDLE_MS && now - lastInputAt >= HIDDEN_IDLE_MS,
@@ -260,13 +286,26 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
     banner.visible = false
     // A reload a page-leave prompt cancelled, or one that never started: the
     // redial goes on, and the page looks again (its claim is spent, so it
-    // shows the banner rather than trying again).
+    // shows the banner rather than trying again). The resume recorded for it
+    // goes too, or a later reload of this tab inside the minute would open
+    // the session a second time beside the redial, and on a device that asks
+    // its user, ask twice.
     setTimeout(() => {
       reloading = false
+      if (resumeRecorded) {
+        clearRcResumeIntent(storage())
+        resumeRecorded = false
+      }
       held?.releaseRedial()
       evaluate()
     }, RELOAD_GIVE_UP_MS)
     deps.location.reload()
+  }
+
+  /** Record the resume for the next load; false when it cannot be (no storage, nobody signed in). */
+  function recordResume(surface: RcReloadSurface, args: RcResumeArgs): boolean {
+    resumeRecorded = writeRcResumeIntent(storage(), args, wallNow(), deps.location.pathname, surface.userId())
+    return resumeRecorded
   }
 
   function reloadQuiet(): void {
@@ -285,11 +324,9 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
       showBanner(true, 'rcResume')
       return
     }
-    const st = storage()
-    const now = wallNow()
     if (
-      !claimReload(st, now, NEW_BUILD_RELOAD_KEY, NEW_BUILD_RELOAD_WINDOW_MS) ||
-      !writeRcResumeIntent(st, args, now, deps.location.pathname)
+      !claimReload(storage(), wallNow(), NEW_BUILD_RELOAD_KEY, NEW_BUILD_RELOAD_WINDOW_MS) ||
+      !recordResume(surface, args)
     ) {
       surface.releaseRedial()
       showBanner(true, 'rcResume')
@@ -315,20 +352,42 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
     showBanner(action === 'banner', bannerHint(s))
   }
 
+  /**
+   * The confirming read: 31 s after the first mismatch, and never sooner than
+   * the backoff after a read that taught nothing. Without that floor, a pending
+   * mismatch whose 31 s had passed re-read at once after each failure, forever
+   * where the server answers no file (a 5xx mid-roll, a captive portal, a
+   * rolled-back image that serves the SPA shell for it).
+   */
   function armConfirm(): void {
     if (confirmTimer !== null || !track.pending || track.confirmed) return
-    const wait = Math.max(0, track.pending.since + CONFIRM_GAP_MS + 1_000 - monoNow())
+    const backoff = failedReads > 0 ? Math.min(READ_EVERY_MS, CONFIRM_GAP_MS * 2 ** (failedReads - 1)) : 0
+    const wait = Math.max(track.pending.since + CONFIRM_GAP_MS + 1_000 - monoNow(), backoff, 0)
     confirmTimer = setTimeout(() => {
       confirmTimer = null
       void readNow()
     }, wait)
   }
 
+  /** A read for an event (the socket, the clock, the tab shown): reads closer than `MIN_READ_GAP_MS` fold into one. */
+  function requestRead(): void {
+    if (own === null || reading || deferredRead !== null) return
+    const since = monoNow() - lastAttemptAt
+    if (since >= MIN_READ_GAP_MS) {
+      void readNow()
+      return
+    }
+    deferredRead = setTimeout(() => {
+      deferredRead = null
+      void readNow()
+    }, MIN_READ_GAP_MS - since)
+  }
+
   async function readNow(): Promise<void> {
     if (own === null || reading || reloading) return
     if (deps.navigator?.onLine === false) return
     reading = true
-    lastReadAt = monoNow()
+    lastReadAt = lastAttemptAt = monoNow()
     let served: string | null = null
     try {
       served = await read()
@@ -337,6 +396,7 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
     } finally {
       reading = false
     }
+    failedReads = served === null ? failedReads + 1 : 0
     const before = track
     track = trackServedBuild(track, own, served, monoNow())
     if (track !== before) {
@@ -357,10 +417,10 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
     lastWsChangeAt = monoNow()
     const stop = watch(src.wsStatus, (status) => {
       lastWsChangeAt = monoNow()
-      if (status === 'connected') void readNow()
+      if (status === 'connected') requestRead()
       else evaluate()
     })
-    if (src.wsStatus() === 'connected') void readNow()
+    if (src.wsStatus() === 'connected') requestRead()
     return () => {
       stop()
       if (sources === src) sources = null
@@ -375,7 +435,12 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
     }
   }
 
-  function claimRcResume(here: { agentId: string; tenantId: string | null; path: string }): RcResumeArgs | null {
+  function claimRcResume(here: {
+    agentId: string
+    tenantId: string | null
+    path: string
+    userId: string | null
+  }): RcResumeArgs | null {
     const intent = pendingResume
     pendingResume = null
     if (!intent) return null
@@ -398,7 +463,7 @@ export function createStaleBuildWatch(deps: StaleBuildWatchDeps): StaleBuildWatc
       if (st.session === 'redialing' && args) held = surface
       // The person's own click: no claim (it cannot loop), and the session
       // resumes after the load as the banner said it would.
-      if (args) writeRcResumeIntent(storage(), args, wallNow(), deps.location.pathname)
+      if (args) recordResume(surface, args)
       break
     }
     startReload(held)
@@ -477,7 +542,12 @@ export function notifyRcReloadSurface(): void {
 }
 
 /** The viewer, once it has its device: the session to resume, if this load is a reload that handed one over. */
-export function claimRcResume(here: { agentId: string; tenantId: string | null; path: string }): RcResumeArgs | null {
+export function claimRcResume(here: {
+  agentId: string
+  tenantId: string | null
+  path: string
+  userId: string | null
+}): RcResumeArgs | null {
   return active ? active.claimRcResume(here) : null
 }
 
