@@ -73,6 +73,15 @@ import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-
 import { createDecodeRecovery } from './rc-decode-recovery'
 import { createViewerMediaRecorder } from './rc-media-window'
 import { createDeliveryGapClock, type VideoChannelMessage } from './rc-video-channel'
+import {
+  clockCalPong,
+  fwdHopMs,
+  normalizeSkewMs,
+  toPageEpochMs,
+  workerAgentOffsetUs,
+  type ClockCalMessage,
+  type ClockCalPing,
+} from './rc-clock-cal'
 
 type InitCanvasMessage = {
   type: 'init-canvas'
@@ -138,7 +147,8 @@ type ChunkMessage = {
   type: 'chunk'
   bytes: ArrayBuffer
   /** P1 — main-thread epoch timestamp (timeOrigin + now) stamped at the DC
-   *  `onmessage` → measures the main→worker forwarding hop. */
+   *  `onmessage` → measures the main→worker forwarding hop. On the page's
+   *  clock, so it is read through `pageSkewMs` (#3566). */
   sentAt?: number
 }
 /** P7 — the canvas element's CSS box + devicePixelRatio (composable
@@ -147,7 +157,8 @@ type ChunkMessage = {
 type ViewportMessage = { type: 'viewport'; cssW: number; cssH: number; dpr: number }
 /** P7 — live sharpen-mode/sharpness change from the settings UI. */
 type RenderModeMessage = { type: 'render-mode'; sharpen?: string; sharpness?: number }
-/** FR-1 P7 — agent-clock offset from the main thread's rc:clock probe. */
+/** FR-1 P7 — agent-clock offset from the main thread's rc:clock probe: the
+ *  agent's clock against the page's, read here through `pageSkewMs` (#3566). */
 type ClockOffsetMessage = { type: 'clock-offset'; offsetUs: number | null }
 /** FR-16 L4 — the main thread just sent bench probe `seq`. */
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
@@ -161,6 +172,8 @@ type IncomingMessage =
   | ViewportMessage
   | RenderModeMessage
   | ClockOffsetMessage
+  | ClockCalPing
+  | ClockCalMessage
   | BenchArmMessage
   | MediaHoldMessage
   | CloseMessage
@@ -351,6 +364,14 @@ const queueDrift = new QueueDrift()
 // and FR-63's B2 chooses between them.
 const arrivalQueueDrift = new QueueDrift()
 let clockOffsetUs: number | null = null
+// #3566 — this worker's clock less the page's, ms, as the page measured it when
+// it started the worker (`clock-cal`, `rc-clock-cal.ts`). Each context fixes its
+// epoch from the wall clock when it starts, so a worker made after its page
+// reads a constant apart from it. Every time the page stamped (`sentAt`, the
+// agent offset above, a bench probe's send) is read through it. 0 until it
+// arrives, and for a session that measures none: the reading of before, bit for
+// bit. The worker's own differences (`queueMs`, `viewer`, `decode`) need none.
+let pageSkewMs = 0
 let outGapMaxMs = 0
 // Decode-submission times keyed by chunk timestamp, matched in the output
 // callback → submit→output latency, and (FR-119 P2b-7) the decode backlog the
@@ -485,7 +506,11 @@ const framingState = createChunkFraming()
 workerScope.onmessage = (e) => {
   const msg = e.data
   if (!msg) return
-  if (msg.type === 'init-canvas') {
+  if (msg.type === 'clock-cal-ping') {
+    // #3566 — answered first, and stamped on arrival: the page measures this
+    // worker's clock against its own from the stamp.
+    workerScope.postMessage(clockCalPong(msg.seq, epochNowMs()))
+  } else if (msg.type === 'init-canvas') {
     if (typeof msg.chunkFraming === 'boolean') chunkFraming = msg.chunkFraming
     canvas = msg.canvas
     // P1 — ctx mode sticks across the idempotent visible-canvas re-init
@@ -521,6 +546,9 @@ workerScope.onmessage = (e) => {
     viewport = { cssW: msg.cssW, cssH: msg.cssH, dpr: msg.dpr }
   } else if (msg.type === 'clock-offset') {
     clockOffsetUs = typeof msg.offsetUs === 'number' ? msg.offsetUs : null
+  } else if (msg.type === 'clock-cal') {
+    // #3566 — the skew the page measured, once, when it started this worker.
+    pageSkewMs = normalizeSkewMs(msg.skewMs)
   } else if (msg.type === 'media-hold') {
     // FR-135 R0c — the agent announced a capture hold: its gap is no freeze.
     mediaWindow.onHold()
@@ -555,7 +583,8 @@ workerScope.onmessageerror = () => {
 function onChunk(bytes: ArrayBuffer, sentAt: number | undefined): void {
   framesReceived++
   if (typeof sentAt === 'number') {
-    const fwdMs = epochNowMs() - sentAt
+    // #3566 — `sentAt` is on the page's clock: read through the skew.
+    const fwdMs = fwdHopMs(epochNowMs(), sentAt, pageSkewMs)
     fwdStats.add(fwdMs)
     mediaWindow.onForward(fwdMs)
   }
@@ -800,25 +829,30 @@ function initDecoder() {
       paintStats.add(paintT1 - paintT0)
       // FR-135 R0 (N9, N11, N12, N16) — a frame on the canvas.
       if (drew) mediaWindow.onPainted(paintT1, paintT1 - paintT0, wireTsUs)
-      if (benchClone) bench.settle(benchClone, epochNowMs())
+      // #3566 — the page times the probe from its own clock, so the paint
+      // stamp goes back on it.
+      if (benchClone) bench.settle(benchClone, toPageEpochMs(epochNowMs(), pageSkewMs))
       // FR-135 R1 — this paint ends an outage, if one is open.
       const recovered = decodeRecovery.onOutput(performance.now())
       if (recovered) {
         workerScope.postMessage({ type: 'decode-recovered', ms: Math.round(recovered.ms), attempts: recovered.attempts })
       }
       // Age at paint on the agent's clock (mapped via the rc:clock probe):
-      // framing → send queue → network → decode → paint, end to end.
+      // framing → send queue → network → decode → paint, end to end. #3566 —
+      // the page measured that offset against its own clock, so it is read
+      // here through the skew.
       const paintedUs = epochNowUs()
-      if (clockOffsetUs !== null) {
-        ageStats.add(frameAgeMs(wireTsUs, clockOffsetUs, paintedUs))
+      const agentOffsetUs = clockOffsetUs === null ? null : workerAgentOffsetUs(clockOffsetUs, pageSkewMs)
+      if (agentOffsetUs !== null) {
+        ageStats.add(frameAgeMs(wireTsUs, agentOffsetUs, paintedUs))
       }
       // FR-70 M0 — the same age at the moment the frame ARRIVED, and the
       // local arrival→paint time; see `arrivalStats`.
       const arrivedUs = pendingArrivalUs.get(wireTsUs)
       if (arrivedUs !== undefined) {
         pendingArrivalUs.delete(wireTsUs)
-        if (clockOffsetUs !== null) {
-          arrivalStats.add(frameAgeMs(wireTsUs, clockOffsetUs, arrivedUs))
+        if (agentOffsetUs !== null) {
+          arrivalStats.add(frameAgeMs(wireTsUs, agentOffsetUs, arrivedUs))
         }
         viewerStats.add((paintedUs - arrivedUs) / 1000)
       }
@@ -1151,6 +1185,7 @@ function teardown(): void {
   arrivalQueueDrift.snapshotAndReset()
   arrivalQueueDrift.reset()
   clockOffsetUs = null
+  pageSkewMs = 0
   outGapMaxMs = 0
   mediaWindow.reset()
   // P7 — release the GL renderer; a fresh session re-creates lazily and

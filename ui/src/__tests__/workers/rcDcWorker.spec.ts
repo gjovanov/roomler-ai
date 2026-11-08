@@ -63,6 +63,10 @@ class FakeFrame {
     this.visibleRect = visible
   }
   readonly colorSpace = { toJSON: () => ({}) }
+  /** The bench's copy, taken only while a probe is armed. */
+  clone(): FakeFrame {
+    return new FakeFrame(this.timestamp, this.codedWidth, this.codedHeight, this.visibleRect)
+  }
   close(): void {
     this.closed = true
   }
@@ -459,5 +463,110 @@ describe.each(DC_CODECS)('FR-135 R3 — the video channel moved into the worker,
     send({ type: 'chunk', bytes: bare(false, 2).slice(0, 5) })
     expect(ofType('stats')[0]!.queueArrMs).toBe(20)
     expect(ofType('stats')[0]!.queueMs, 'nothing painted').toBeNull()
+  })
+})
+
+// ── #3566 — the page's timestamps, read through the skew the page measured ────
+
+/** The worker's clock less the page's: a worker made 162 s after its page, as
+ *  measured on the Windows dev box. */
+const SKEW = -7.25
+
+describe.each(DC_CODECS)("#3566 — the page's timestamps through the measured skew, on $name", ({ codec }) => {
+  /** The page's clock at this moment: the worker's less the skew. */
+  const pageNow = () => performance.timeOrigin + clock - SKEW
+  const flush = async () => {
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0))
+  }
+
+  it('answers a ping at once, with its own clock', async () => {
+    const { send } = await boot({ codec })
+    send({ type: 'clock-cal-ping', seq: 5 })
+    expect(ofType('clock-cal-pong')).toEqual([{ type: 'clock-cal-pong', seq: 5, tw: performance.timeOrigin + clock }])
+  })
+
+  it('times every relayed hop once the skew arrives, where a short one read negative and was dropped', async () => {
+    const { send } = await boot({ codec })
+    const out = FakeDecoder.instances[0]!.init.output
+    // Each chunk left the page 2 ms before it arrives: −5.25 ms on the worker's clock.
+    send({ type: 'chunk', bytes: bare(true, 1), sentAt: pageNow() - 2 })
+    out(new FakeFrame(1, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 2), sentAt: pageNow() - 2 })
+    send({ type: 'clock-cal', skewMs: SKEW })
+    send({ type: 'chunk', bytes: bare(false, 3), sentAt: pageNow() - 2 })
+    out(new FakeFrame(3, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 4), sentAt: pageNow() - 2 })
+    const [before, after] = ofType('stats')
+    expect((before!.fwd as { n: number }).n, 'before the skew: none timed').toBe(0)
+    expect(sum((before!.media as Record<string, unknown>).fwd)).toBe(0)
+    expect(after!.fwd).toMatchObject({ n: 2, avgMs: 2, minMs: 2, maxMs: 2 })
+    expect(sum((after!.media as Record<string, unknown>).fwd)).toBe(2)
+  })
+
+  /** A frame framed now, whole at the worker 12 ms later and painted 18 ms after
+   *  that, with the agent's clock 50 s into its process. Returns the window. */
+  async function oneFrame(skewMs: number | null) {
+    const { send } = await boot({ codec })
+    const p0 = pageNow()
+    const agentUs = (pageMs: number) => 50_000_000 + (pageMs - p0) * 1000
+    // The page's rc:clock probe: the agent's clock against the page's.
+    send({ type: 'clock-offset', offsetUs: agentUs(p0) - p0 * 1000 })
+    if (skewMs !== null) send({ type: 'clock-cal', skewMs })
+    const wire = Math.round(agentUs(pageNow()))
+    clock += 12
+    send({ type: 'chunk', bytes: bare(true, wire) })
+    clock += 18
+    FakeDecoder.instances[0]!.init.output(new FakeFrame(wire, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, wire + 1_230_000) })
+    return ofType('stats')[0]!
+  }
+
+  it("reads the age and the age at arrival on the page's clock once the skew arrives", async () => {
+    const s = await oneFrame(SKEW)
+    expect(s.age).toMatchObject({ n: 1, avgMs: 30 })
+    expect(s.arrival).toMatchObject({ n: 1, avgMs: 12 })
+    expect(s.viewer, 'local, so no skew').toMatchObject({ n: 1, avgMs: 18 })
+  })
+
+  it('reads them on its own clock without one, as before: the skew short', async () => {
+    const s = await oneFrame(null)
+    expect((s.age as { avgMs: number }).avgMs).toBeCloseTo(30 + SKEW, 0)
+    expect((s.arrival as { avgMs: number }).avgMs).toBeCloseTo(12 + SKEW, 0)
+    expect(s.viewer).toMatchObject({ n: 1, avgMs: 18 })
+  })
+
+  describe('the bench', () => {
+    afterEach(() => {
+      vi.doUnmock('@/workers/rc-bench-sampler')
+    })
+
+    it("stamps a paint on its own clock until the skew arrives, then on the page's", async () => {
+      // Every probe read answers probe 7: the paint stamp is what is under test.
+      vi.doMock('@/workers/rc-bench-sampler', async (importOriginal) => {
+        const mod = await importOriginal<typeof import('@/workers/rc-bench-sampler')>()
+        return {
+          ...mod,
+          createBenchSampler: (deps: Parameters<typeof mod.createBenchSampler>[0]) =>
+            mod.createBenchSampler({ ...deps, read: async () => 7 }),
+        }
+      })
+      const { send } = await boot({ codec, bench: true })
+      const out = FakeDecoder.instances[0]!.init.output
+      send({ type: 'chunk', bytes: bare(true, 1) })
+      send({ type: 'bench-arm', seq: 7 })
+      out(new FakeFrame(1, 1920, 1080, rect(1920, 1080)))
+      await flush()
+      send({ type: 'clock-cal', skewMs: SKEW })
+      send({ type: 'bench-arm', seq: 7 })
+      out(new FakeFrame(2, 1920, 1080, rect(1920, 1080)))
+      await flush()
+      const painted = ofType('bench-probe').map((m) => m.paintedAt as number)
+      expect(painted).toHaveLength(2)
+      expect(painted[0], 'as before').toBe(performance.timeOrigin + clock)
+      expect(painted[1]).toBeCloseTo(pageNow(), 3)
+    })
   })
 })

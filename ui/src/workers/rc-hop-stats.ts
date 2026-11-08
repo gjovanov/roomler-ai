@@ -10,13 +10,13 @@
  * costs nothing at steady state.
  *
  * Hops measured:
- *  - `fwd`    — main-thread DC `onmessage` → worker `chunk` arrival
- *               (epoch-absolute clocks via `epochNowMs`, valid across
- *               contexts because both sides use timeOrigin + now(), to
- *               about the clocks' coarsening: a hop shorter than the two
- *               contexts' skew reads negative and is dropped). The relay
- *               only: a channel moved into the worker (FR-135 R3) has no
- *               page hop, and no `fwd`.
+ *  - `fwd`    — main-thread DC `onmessage` → worker `chunk` arrival, on
+ *               one clock: the page's `sentAt` is read through the skew
+ *               the page measured when it started the worker (#3566,
+ *               `rc-clock-cal.ts`), since `epochNowMs` is not one clock
+ *               across contexts. Before it, a hop shorter than the skew
+ *               read negative and was dropped. The relay only: a channel
+ *               moved into the worker (FR-135 R3) has no page hop, no `fwd`.
  *  - `decode` — `decoder.decode(chunk)` submission → `output` callback
  *               (queue + decoder latency; indicts the decoder itself).
  *  - `paint`  — the `paintFrame` body (canvas blit cost).
@@ -152,9 +152,9 @@ export class QueueDrift {
   }
 }
 
-/** Epoch-absolute milliseconds, comparable across window/worker contexts
- *  (each context's `performance.now()` is relative to its own
- *  `timeOrigin`; adding them re-bases onto the shared epoch). */
+/** Epoch milliseconds, `timeOrigin + now()`. Not one clock across contexts:
+ *  each fixes its `timeOrigin` from the wall clock when it starts, so a worker
+ *  reads a page's stamps through the measured skew (#3566, `rc-clock-cal.ts`). */
 export function epochNowMs(): number {
   return performance.timeOrigin + performance.now()
 }
@@ -212,8 +212,8 @@ export function bestClockSample(samples: ClockSample[]): ClockSample | null {
   return best
 }
 
-/** Age of a frame at `epochUs` on the browser clock, given the frame's
- *  agent-clock wire timestamp and the probe offset. Covers everything from
+/** Age of a frame at `epochUs`, given its agent-clock wire timestamp and the
+ *  probe offset on `epochUs`'s clock (#3566). Covers everything from
  *  the agent's framing point (encode output + send queue + network + decode
  *  + paint queue); agent-side capture+encode (~10–15 ms) sits BEFORE the
  *  stamp and is not included. */
