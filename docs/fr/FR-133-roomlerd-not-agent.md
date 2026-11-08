@@ -86,8 +86,8 @@ and needs those lookups to accept both names.
       (asserted by tests, then by P4's guard).
 - [ ] **AC6** — The docs site's pages say `roomlerd`.
 - [x] **AC7** — Docs: `docs/installation.md` and the `ship-it` skill updated, with a
-      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:473` and
-      `.claude/skills/ship-it/SKILL.md:59`. No doc was added, so no row.
+      `docs/README.md` row if a doc is added. **Met:** `docs/installation.md:550` and
+      `.claude/skills/ship-it/SKILL.md:66`. No doc was added, so no row.
 
 ## Open decisions
 
