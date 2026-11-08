@@ -329,6 +329,14 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   `room_id` alone is the cross-tenant IDOR above, on a socket.
 - A refusal is one answer for every reason, so it says neither whether a room exists nor
   whose it is.
+- **A seat ends with the membership that admitted it.** Removed from the org or leaving
+  it, or leaving the room, ends any seat the person holds in a call there at once, on the
+  pod that holds it, through core's `MembershipLifecycle` hook run after the membership
+  row is gone (`crates/modules/conference/src/revoke.rs`). A join on its way at that
+  moment asks the gate again once its seat exists. ⚠️ A new way to lose a membership (a
+  room kick, a deleted account) calls the hook too, after the row is gone, or the seats it
+  admitted outlive it. A room deleted mid-call does not call it yet: that call runs on
+  until its people hang up. `docs/real-time.md` has the flow.
 
 `GET /api/cluster/status` lists every live meeting room on a pod, so it is a platform
 admin's route (`require_platform_admin`, 404 otherwise), like `/api/admin/*`.

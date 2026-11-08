@@ -155,11 +155,47 @@ pub trait FleetLifecycle: Send + Sync {
     }
 }
 
+/// Hooks the owner of a membership invokes when someone stops being a member.
+///
+/// The host owns org membership (`DELETE …/member/{user_id}`: removed by an
+/// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`).
+/// A module that admitted something on a membership withdraws it here:
+/// `conference` ends the call seats the person holds, because `media:join`
+/// admitted them as a member.
+///
+/// Invoked AFTER the membership is gone, so nothing can be admitted on it
+/// again while a holder withdraws what it admitted. Idempotent, like every
+/// hook: a second call finds nothing left to withdraw.
+#[async_trait]
+pub trait MembershipLifecycle: Send + Sync {
+    /// `user_id` is no longer a member of the org `tenant_id`.
+    async fn org_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, user_id);
+        Ok(())
+    }
+
+    /// `user_id` is no longer a member of the room `room_id` of `tenant_id`.
+    async fn room_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, room_id, user_id);
+        Ok(())
+    }
+}
+
 /// What one module registers: the hook traits it implements.
 #[derive(Clone, Default)]
 pub struct Hooks {
     pub tenant: Option<Arc<dyn TenantLifecycle>>,
     pub fleet: Option<Arc<dyn FleetLifecycle>>,
+    pub membership: Option<Arc<dyn MembershipLifecycle>>,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -167,6 +203,7 @@ impl std::fmt::Debug for Hooks {
         f.debug_struct("Hooks")
             .field("tenant", &self.tenant.is_some())
             .field("fleet", &self.fleet.is_some())
+            .field("membership", &self.membership.is_some())
             .finish()
     }
 }
@@ -235,6 +272,52 @@ impl HookRegistry {
                     .map(|h| (*id, h))
             })
             .collect()
+    }
+
+    /// The registered [`MembershipLifecycle`] hooks, in [`HOOK_ORDER`].
+    pub fn membership_lifecycles(&self) -> Vec<(&'static str, Arc<dyn MembershipLifecycle>)> {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        HOOK_ORDER
+            .iter()
+            .filter_map(|id| {
+                inner
+                    .iter()
+                    .find(|(m, _)| m == id)
+                    .and_then(|(_, h)| h.membership.clone())
+                    .map(|h| (*id, h))
+            })
+            .collect()
+    }
+
+    /// Run every `org_member_removed` hook in order, once the membership is
+    /// gone. A failing holder stops the cascade, and the caller reports it.
+    pub async fn org_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.membership_lifecycles() {
+            hook.org_member_removed(tenant_id, user_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: org_member_removed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Run every `room_member_removed` hook in order, once the membership is
+    /// gone. A failing holder stops the cascade, and the caller reports it.
+    pub async fn room_member_removed(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user_id: ObjectId,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.membership_lifecycles() {
+            hook.room_member_removed(tenant_id, room_id, user_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: room_member_removed: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Run every `agent_removed` hook in order. The first lease a holder
@@ -460,6 +543,78 @@ mod tests {
             None,
             "FR-128: no holder means not measured"
         );
+    }
+
+    /// Records what a membership holder was told.
+    #[derive(Default)]
+    struct Withdraws(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl MembershipLifecycle for Withdraws {
+        async fn org_member_removed(&self, t: ObjectId, u: ObjectId) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("org {t} {u}"));
+            Ok(())
+        }
+
+        async fn room_member_removed(
+            &self,
+            t: ObjectId,
+            r: ObjectId,
+            u: ObjectId,
+        ) -> anyhow::Result<()> {
+            self.0.lock().unwrap().push(format!("room {t} {r} {u}"));
+            Ok(())
+        }
+    }
+
+    struct FailsToWithdraw;
+
+    #[async_trait]
+    impl MembershipLifecycle for FailsToWithdraw {
+        async fn room_member_removed(
+            &self,
+            _t: ObjectId,
+            _r: ObjectId,
+            _u: ObjectId,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("owner pod unreachable")
+        }
+    }
+
+    /// The membership cascade reaches the holder with the ids it needs, a
+    /// failing holder is named in the error, and a module that registers no
+    /// membership hook (fleet's tenant-only `Hooks`) is skipped.
+    #[tokio::test]
+    async fn a_lost_membership_reaches_its_holders() {
+        let reg = HookRegistry::default();
+        let holder = Arc::new(Withdraws::default());
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(holder.clone()),
+                ..Default::default()
+            },
+        );
+        reg.register("fleet", Hooks::default());
+        let (t, r, u) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        reg.org_member_removed(t, u).await.unwrap();
+        reg.room_member_removed(t, r, u).await.unwrap();
+        assert_eq!(
+            *holder.0.lock().unwrap(),
+            vec![format!("org {t} {u}"), format!("room {t} {r} {u}")]
+        );
+
+        reg.register(
+            "conference",
+            Hooks {
+                membership: Some(Arc::new(FailsToWithdraw)),
+                ..Default::default()
+            },
+        );
+        let err = reg.room_member_removed(t, r, u).await.unwrap_err();
+        assert!(err.to_string().contains("conference: room_member_removed"));
+        // The default body withdraws nothing and succeeds.
+        reg.org_member_removed(t, u).await.unwrap();
     }
 
     struct FarTurn(Option<bool>);

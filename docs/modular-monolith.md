@@ -80,7 +80,7 @@ flowchart LR
         R["routes() → Router<()><br/>unlimited_routes() (outside the governor)"]
         W["ws() → WsRegistration<br/>handlers (typing:*, media:*) · upgrades (/derp)"]
         I["indexes_for(multi_block)<br/>the module's index sets"]
-        J["jobs() · shutdown()<br/>hooks() → FleetLifecycle · TenantLifecycle"]
+        J["jobs() · shutdown()<br/>hooks() → FleetLifecycle · TenantLifecycle · MembershipLifecycle"]
         D["type Deps<br/>() or another module's STATE"]
     end
     subgraph host["crates/api/src/compose.rs — Modules"]
@@ -362,7 +362,7 @@ sequenceDiagram
     Note over C,F: the overlay lease releases BEFORE the row delete and BEFORE the kick — written once, in removal.rs
 ```
 
-Two more shapes the registry carries:
+Three more shapes the registry carries:
 
 - **A query hook with a reason.** fleet's `rc.agent_nudge` asks `core.hooks.agent_busy(id)`; network
   answers with `Option<&'static str>` (`origin_busy` / `tunnel_busy`) — a bool would lose the
@@ -370,6 +370,10 @@ Two more shapes the registry carries:
 - **A tenant archive** is a `TenantLifecycle` run: `core.hooks.tenant_archived` sums the results
   in `HOOK_ORDER` (fleet revokes every device; network releases every node and quarantines the
   block).
+- **A lost membership** is a `MembershipLifecycle` run, AFTER the row is gone: the host's member
+  route calls `core.hooks.org_member_removed`, chat's room leave `room_member_removed`, and
+  conference ends the call seats that membership admitted, on whichever pod holds them
+  (`crates/modules/conference/src/revoke.rs`, the flow in `docs/real-time.md`).
 
 ---
 

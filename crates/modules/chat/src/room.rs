@@ -231,7 +231,18 @@ pub async fn leave(
 
     crate::guards::require_room_in_tenant(&state, tid, rid, auth.user_id).await?;
 
-    state.rooms.leave(tid, rid, auth.user_id).await?;
+    // What the membership admitted ends with it: a seat in the room's call is
+    // `conference`'s to end, told once the row is gone. The leave itself has
+    // happened whatever the hook says, so a failure there is logged, not
+    // answered.
+    if state.rooms.leave(tid, rid, auth.user_id).await?
+        && let Err(e) = state
+            .hooks
+            .room_member_removed(tid, rid, auth.user_id)
+            .await
+    {
+        tracing::error!(tenant = %tid, room = %rid, user = %auth.user_id, %e, "room leave: ending what the membership admitted failed");
+    }
 
     Ok(Json(serde_json::json!({ "left": true })))
 }
