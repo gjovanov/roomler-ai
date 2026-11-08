@@ -2184,8 +2184,8 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
 
 - **Windows**: uninstall **Roomler** (per-user) or **Roomler (per-Machine)** from
   Apps (the names [above](#windows)), or run
-  `install.ps1 -Uninstall`; the daemon's version sweep also removes older
-  same-flavour MSIs after upgrades. `roomlerd service uninstall` removes a
+  `install.ps1 -Uninstall`; `roomlerd sweep-old-versions` removes older
+  same-flavour MSIs when run (nothing runs it after an upgrade). `roomlerd service uninstall` removes a
   manually-installed service/task.
   From a PowerShell started as administrator, `install.ps1 -Uninstall` removes
   either flavour and the companion it placed in `C:\Program Files\Roomler`
