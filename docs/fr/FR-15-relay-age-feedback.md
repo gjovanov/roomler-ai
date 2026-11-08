@@ -106,10 +106,14 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
 ## Acceptance criteria
 
 - [ ] neo16 → CORPLAP-3: age plateaus ≤ ~90 ms during sustained drag (was: climbs to 120);
-      no felt sluggishness onset.
+      no felt sluggishness onset. *An age read for this is possible only from sessions
+      whose page loaded after 2026-11-08 15:56Z, when #3566's fix went live: an older tab
+      reconnects in place after a roll and keeps the old arithmetic until it reloads. Not
+      read yet.*
 - [ ] CORPLAP-1 → CORPLAP-3: no >1000 ms age excursions; sustained age within ~2× that pair's
       floor; heartbeats show `target_bps` stepping DOWN during the viewer's age spikes
-      (the loop visibly reacting).
+      (the loop visibly reacting). *The same cut applies: only sessions whose page loaded
+      after 2026-11-08 15:56Z. Not read yet.*
 - [ ] A struggling/absent-age viewer (old web) leaves relay behaviour byte-identical
       to 0.4.7.
 - [x] Direct transports untouched (loop gated `constrained`). **Met (2026-11-03):** no
@@ -117,7 +121,7 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
       **Re-grounded 2026-11-08 on the gate itself,** because that read can't tell the gate
       from a session that sent no age: #3566 found a tab's ages off by its page↔worker
       clock drift, and a session whose ages all read negative sent none (the fix, #3568,
-      merged the same day and waits for a promote). On master the
+      went live at 15:56Z that day). On master the
       loop fires only with `constrained` (`agents/roomlerd/src/encode/governor.rs:1287`),
       and `age_loop_is_constrained_only_and_respects_the_kill_switch` (`:3619`, in CI's
       `roomlerd` lib lane) drives a direct session through an age history that would cut a
