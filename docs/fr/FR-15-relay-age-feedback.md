@@ -116,7 +116,8 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
       `age_over` line in a week's logs fired on a direct transport (field log).
       **Re-grounded 2026-11-08 on the gate itself,** because that read can't tell the gate
       from a session that sent no age: #3566 found a tab's ages off by its page↔worker
-      clock drift, and a session whose ages all read negative sends none. On master the
+      clock drift, and a session whose ages all read negative sent none (the fix, #3568,
+      merged the same day and waits for a promote). On master the
       loop fires only with `constrained` (`agents/roomlerd/src/encode/governor.rs:1287`),
       and `age_loop_is_constrained_only_and_respects_the_kill_switch` (`:3619`, in CI's
       `roomlerd` lib lane) drives a direct session through an age history that would cut a
