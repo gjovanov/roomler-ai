@@ -120,7 +120,7 @@ are.
       clock drift that is fixed for a session's life: "not gone" holds, since the `derp`
       windows read 2 161 and 3 364 ms in a session whose learned floor read 49-51 ms, and
       the drift can't exceed the floor. The counts are a floor: a tab whose ages all read
-      negative sent none. The fix, #3568, merged the same day and waits for a promote.
+      negative sent none. The fix, #3568, went live at 15:56Z that day.
 - [x] Docs: the carrier's queue discipline (the age bound, the send-buffer cap
       and its per-OS read-back, the counter, and what each log line means) is in
       `docs/overlay-communication.md` §6, with a diagram, and indexed in the

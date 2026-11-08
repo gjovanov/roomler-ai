@@ -236,7 +236,7 @@ encodes at that geometry.
 - **WGC drop ratio** (`wgc_backend.rs:790`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
-### End-to-end age (AC8) — **partial**, held for #3566
+### End-to-end age (AC8) — **met** (held for #3566, then met on 2026-11-08)
 
 | Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
 |---|---|---|---|---|
@@ -297,6 +297,16 @@ message (`useRemoteControl.ts:7749`, `:8397`, `RemoteControl.vue:4844`). The fle
 tables above carry the error, and a window whose ages all read negative sent none,
 since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
 is on production and its owed GREEN read is in.
+
+**2026-11-08 16:16Z, met.** #3568 went live at 15:56Z in `hosted-20261108-4297002`, and
+its GREEN read on production is on #3566 (comment 6723890517). One page made three
+connects. With the fix on, the page measured each new worker's skew, 4.20 ms at 225.5 s
+and 9.75 ms at 531.6 s after the page loaded, within 0.1 ms of an independent probe, and
+sent it before the first chunk. `fwd` then timed 95 % and 81 % of the relayed chunks;
+with the switch off, the same page timed 1 chunk in 591. The age reads through the same
+skew (`workerAgentOffsetUs`, pinned by `rcClockCal.spec.ts`), though that read didn't
+measure the age by itself. With the 2026-11-02 read of the pill beside the wire above,
+AC8 is met. A tab loaded before 15:56Z keeps the old arithmetic until it reloads.
 
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 
