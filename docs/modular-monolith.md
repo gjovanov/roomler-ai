@@ -373,7 +373,9 @@ Three more shapes the registry carries:
 - **A lost membership** is a `MembershipLifecycle` run, AFTER the row is gone: the host's member
   route calls `core.hooks.org_member_removed`, chat's room leave `room_member_removed`, and
   conference ends the call seats that membership admitted, on whichever pod holds them
-  (`crates/modules/conference/src/revoke.rs`, the flow in `docs/real-time.md`).
+  (`crates/modules/conference/src/revoke.rs`, the flow in `docs/real-time.md`). Then chat, the
+  record owner and so later in `HOOK_ORDER`, drops the person's room memberships of an org they
+  left (`crates/modules/chat/src/membership.rs`).
 
 ---
 
