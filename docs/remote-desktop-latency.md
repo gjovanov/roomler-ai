@@ -226,7 +226,7 @@ encodes at that geometry.
 - **WGC drop ratio** (`wgc_backend.rs:790`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
-### End-to-end age (AC8) — **met**
+### End-to-end age (AC8) — **partial**, held for #3566
 
 | Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
 |---|---|---|---|---|
@@ -273,6 +273,18 @@ That is all this read shows. The session was VP9 software on a loaded host, unde
 software compositing, with `carrier=direct`, so its ages say nothing about how low
 the number gets on real hardware. The comparison with RustDesk's own Delay readout
 is the operator's A/B (AC9).
+
+**2026-11-08, held for #3566.** That issue found the decode worker applying a clock
+offset the page measured on the page's own clock (pushed at `useRemoteControl.ts:7034`,
+applied by `frameAgeMs` at `rc-dc-worker.ts:813`). Two browsing contexts started at
+different times disagree by the wall-clock slew between their starts, so every age
+reads off by that much, low on some hosts and high on others: 7 ms after 162 s on one
+host, near 160 ms after an hour. The read above started each session right after
+loading its page, so it stands, and on master the pill and the wire still take one
+worker `stats` message (`useRemoteControl.ts:7710`, `:8349`, `RemoteControl.vue:4844`).
+The fleet tables above carry the error, and a window whose ages all read negative
+sends none, since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). The HUD
+shows the end-to-end age once #3566's fix ships, and AC8 waits for that.
 
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 
