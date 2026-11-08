@@ -6,7 +6,7 @@ use roomler_ai_db::models::{
     AuthorType, ContentType, Mentions, Message, MessageAttachment, MessageType, ReactionSummary,
 };
 
-use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
+use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct MessageDao {
     pub base: BaseDao<Message>,
@@ -58,6 +58,13 @@ impl MessageDao {
         mentions: Option<Mentions>,
         attachments: Vec<MessageAttachment>,
     ) -> DaoResult<Message> {
+        // The thread a reply joins and the message it quotes are live messages
+        // of this same room. Any other id answers `NotFound`, as an id that
+        // names nothing does, before anything is written.
+        for named in [thread_id, referenced_message_id].into_iter().flatten() {
+            self.find_live_in_room(tenant_id, room_id, named).await?;
+        }
+
         let now = DateTime::now();
         let message_type = if referenced_message_id.is_some() {
             MessageType::Reply
@@ -98,10 +105,32 @@ impl MessageDao {
 
         // Update thread metadata on parent message when a thread reply is created
         if let Some(parent_id) = thread_id {
-            let _ = self.update_thread_metadata(parent_id, author_id).await;
+            let _ = self
+                .update_thread_metadata(tenant_id, room_id, parent_id, author_id)
+                .await;
         }
 
         self.base.find_by_id(id).await
+    }
+
+    /// The live message `id` of `room_id` in `tenant_id`. A message of another
+    /// room or tenant, a deleted one and an id that names nothing all answer
+    /// the same `NotFound`, so the answer does not say which.
+    pub async fn find_live_in_room(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        id: ObjectId,
+    ) -> DaoResult<Message> {
+        self.base
+            .find_one(doc! {
+                "_id": id,
+                "tenant_id": tenant_id,
+                "room_id": room_id,
+                "deleted_at": null,
+            })
+            .await?
+            .ok_or(DaoError::NotFound)
     }
 
     /// FR-32 — live messages in the tenant, for **reporting only**.
@@ -144,14 +173,23 @@ impl MessageDao {
             .await
     }
 
+    /// The live replies of the thread rooted at `thread_id`, from the root's
+    /// own room: pass the root's tenant and room.
     pub async fn find_thread_replies(
         &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
         thread_id: ObjectId,
         params: &PaginationParams,
     ) -> DaoResult<PaginatedResult<Message>> {
         self.base
             .find_paginated(
-                doc! { "thread_id": thread_id, "deleted_at": null },
+                doc! {
+                    "thread_id": thread_id,
+                    "tenant_id": tenant_id,
+                    "room_id": room_id,
+                    "deleted_at": null,
+                },
                 Some(doc! { "created_at": 1 }),
                 params,
             )
@@ -207,19 +245,31 @@ impl MessageDao {
             .await
     }
 
-    /// Atomically update thread metadata on the parent message when a reply is created.
+    /// Atomically update thread metadata on the parent message when a reply is
+    /// created. Only a live parent in the reply's own tenant and room is
+    /// written.
     pub async fn update_thread_metadata(
         &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
         parent_id: ObjectId,
         reply_author_id: ObjectId,
     ) -> DaoResult<bool> {
         let now = DateTime::now();
+        let parent = doc! {
+            "_id": parent_id,
+            "tenant_id": tenant_id,
+            "room_id": room_id,
+            "deleted_at": null,
+        };
+        let mut parent_without_metadata = parent.clone();
+        parent_without_metadata.insert("thread_metadata", bson::Bson::Null);
         // First, ensure thread_metadata is not null (MongoDB $inc/$addToSet fail on null subdocs)
         let _ = self
             .base
             .collection()
             .update_one(
-                doc! { "_id": parent_id, "thread_metadata": null },
+                parent_without_metadata,
                 doc! { "$set": {
                     "thread_metadata": {
                         "reply_count": 0_i32,
@@ -233,7 +283,7 @@ impl MessageDao {
         // Now safely increment/update the nested fields
         self.base
             .update_one(
-                doc! { "_id": parent_id },
+                parent,
                 doc! {
                     "$set": {
                         "is_thread_root": true,
@@ -249,6 +299,70 @@ impl MessageDao {
                 },
             )
             .await
+    }
+
+    /// Recount every thread root's metadata from its stored replies. The host
+    /// runs it at boot: it was written to repair roots whose `reply_count` was
+    /// never set (MongoDB `$inc` fails on a null subdocument), and it rewrites
+    /// every root's metadata each time. A reply counts toward the root it
+    /// names only when both are in the same tenant and room. Returns how many
+    /// roots were rewritten.
+    pub async fn rebuild_thread_metadata(&self) -> DaoResult<u64> {
+        use futures::TryStreamExt;
+        let msgs_coll = self.base.collection().clone_with_type::<bson::Document>();
+        let pipeline = vec![
+            doc! { "$match": { "thread_id": { "$ne": null } } },
+            doc! { "$group": {
+                "_id": {
+                    "thread_id": "$thread_id",
+                    "tenant_id": "$tenant_id",
+                    "room_id": "$room_id",
+                },
+                "reply_count": { "$sum": 1 },
+                "last_reply_at": { "$max": "$created_at" },
+                "last_reply_user_id": { "$last": "$author_id" },
+                "participant_ids": { "$addToSet": "$author_id" },
+            }},
+        ];
+        let mut fixed = 0u64;
+        let mut cursor = msgs_coll.aggregate(pipeline).await?;
+        while let Ok(Some(group)) = cursor.try_next().await {
+            let Ok(key) = group.get_document("_id") else {
+                continue;
+            };
+            let (Ok(parent_id), Ok(tenant_id), Ok(room_id), Ok(count)) = (
+                key.get_object_id("thread_id"),
+                key.get_object_id("tenant_id"),
+                key.get_object_id("room_id"),
+                group.get_i32("reply_count"),
+            ) else {
+                continue;
+            };
+            let update = doc! {
+                "$set": {
+                    "is_thread_root": true,
+                    "thread_metadata": {
+                        "reply_count": count,
+                        "last_reply_at": group.get("last_reply_at"),
+                        "last_reply_user_id": group.get("last_reply_user_id"),
+                        "participant_ids": group.get("participant_ids"),
+                    },
+                },
+            };
+            // The root in the replies' own tenant and room; replies grouped
+            // under any other tenant or room match no root.
+            if let Ok(written) = msgs_coll
+                .update_one(
+                    doc! { "_id": parent_id, "tenant_id": tenant_id, "room_id": room_id },
+                    update,
+                )
+                .await
+                && written.matched_count > 0
+            {
+                fixed += 1;
+            }
+        }
+        Ok(fixed)
     }
 
     /// Mark messages in a room as read by a user
