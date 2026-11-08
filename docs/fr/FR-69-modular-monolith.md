@@ -226,7 +226,7 @@ Considered: one `AppState` with `Option<…>` fields under cfg · **per-module s
   change is small because `AuthUser`, `OptionalAuthUser` and `TenantId` are already generic over
   `S` (only the bound moves from `AppState` to `Core`); `AuthAgent` moves to `fleet` because it
   loads the agent row; the membership guards in `routes/helpers.rs` split the same way
-  (`is_member` → core, `require_room_in_tenant` / `require_message_in_tenant` → chat).
+  (`is_member` → core, `require_room_in_tenant` / `require_message_in_tenant` → chat; the message guard is `require_message_in_room` since #3577).
 - *Cons*: mechanical churn across 216 + 206 sites (pure signature work, the bulk of P1);
   helpers that took `&AppState` to reach two pillars at once must be rewritten as hooks (D6).
 - *Why*: `Option` fields keep every handler compiling against everything and turn every
