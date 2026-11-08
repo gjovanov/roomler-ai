@@ -348,6 +348,8 @@ replies of its own room, and `mentions.users` notifies members of the room only.
 | POST | `…/export/conversation` | XLSX export |
 | POST | `…/export/conversation-pdf` | PDF export |
 
+Both exports take `{room_id}`: a room of the path org that the caller may read. They resolve it as the room routes do, before a task is made. Another org's room answers 404, the same as a room that does not exist. A Secret room the caller is not in answers 404, and a Private one 403.
+
 ### Fleet — agents & remote sessions
 
 | Method | Path | Purpose |
