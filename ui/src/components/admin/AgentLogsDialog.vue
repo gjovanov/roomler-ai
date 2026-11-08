@@ -32,7 +32,7 @@
            the per-flow throughput lines in one click. -->
       <!-- A plain block, not a v-card-subtitle: a subtitle dims its content, so
            the filters looked disabled. (`gap-2` was no class at all — ga-2.) -->
-      <div class="px-4">
+      <div v-if="!refused" class="px-4">
         <div class="d-flex align-center flex-wrap ga-2 py-2">
           <v-select
             v-model="minLevel"
@@ -70,8 +70,21 @@
       </div>
 
       <v-card-text :style="fullscreen ? undefined : 'max-height: 70vh'">
+        <!-- A refusal is an answer, not an error (FR-82): reading a device's
+             uploaded logs needs MANAGE_AGENTS, and the dialog says so. -->
         <v-alert
-          v-if="error"
+          v-if="refused"
+          type="info"
+          variant="tonal"
+          density="compact"
+          data-testid="agent-logs-refused"
+        >
+          Device logs are shown to people who can manage this organization's
+          devices (the Manage devices permission).
+        </v-alert>
+
+        <v-alert
+          v-else-if="error"
           type="error"
           variant="tonal"
           density="compact"
@@ -85,7 +98,7 @@
         </div>
 
         <div
-          v-else-if="!loading && allLines.length === 0 && !error"
+          v-else-if="!loading && allLines.length === 0 && !error && !refused"
           class="text-center pa-6 text-medium-emphasis"
         >
           <v-icon size="48" color="grey-lighten-1" class="mb-2">mdi-text-box-remove-outline</v-icon>
@@ -104,7 +117,7 @@
           <p>No lines match the current filter.</p>
         </div>
 
-        <div v-else class="log-view">
+        <div v-else-if="!refused" class="log-view">
           <div
             v-for="(line, i) in shownLines"
             :key="i"
@@ -125,11 +138,11 @@
       </v-card-text>
 
       <v-card-actions class="flex-wrap">
-        <span class="text-caption text-medium-emphasis ml-2">
+        <span v-if="!refused" class="text-caption text-medium-emphasis ml-2">
           {{ batches.length }} batch(es) · newest {{ newestBatchAge }}
         </span>
         <v-spacer />
-        <v-btn variant="text" @click="copyVisible">Copy visible</v-btn>
+        <v-btn v-if="!refused" variant="text" @click="copyVisible">Copy visible</v-btn>
         <v-btn variant="text" @click="close">Close</v-btn>
       </v-card-actions>
     </v-card>
@@ -163,6 +176,9 @@ const agentStore = useAgentStore()
 const batches = ref<AgentLogBatch[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
+/** The caller may not read this device's logs (`null` from the store):
+ *  explained, never shown as an error or as "no logs yet". */
+const refused = ref(false)
 
 const minLevel = ref<'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'>('INFO')
 const targetFilter = ref<string>('')
@@ -222,8 +238,11 @@ async function load() {
   loading.value = true
   error.value = null
   try {
-    batches.value = await agentStore.fetchLogs(props.tenantId, props.agentId, 100)
+    const got = await agentStore.fetchLogs(props.tenantId, props.agentId, 100)
+    refused.value = got === null
+    batches.value = got ?? []
   } catch (e) {
+    refused.value = false
     error.value = (e as Error).message
     batches.value = []
   } finally {

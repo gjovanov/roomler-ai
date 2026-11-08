@@ -103,7 +103,7 @@ permission on an unnamed bit 33 would pass both.
 So the bits keep their consts (`crates/db/src/models/role.rs:116-122`), their
 names (`:224-226`), which `names()` and the escalation guard's 403 still print,
 and their place in `ALL` (`:183`). No managed row below the owner seeds them,
-and the UI catalogue lists none of them (`ui/src/utils/permissions.ts:196-198`).
+and the UI catalogue lists none of them (`ui/src/utils/permissions.ts:197-199`).
 `the_reserved_bits_stay_named_and_seeded_by_no_row_below_the_owner` (`:472`)
 fails on a rename, a deletion or a reuse. The other surfaces FR-90 left
 reserved are listed in
@@ -307,6 +307,16 @@ gate at all, because the page that mounts the card never had one to forget.
 AppLayout's `/member/me` is in flight while the page mounts, so a synchronous
 read is a coin-flip between "hidden from the owner" and "fires anyway".
 
+A device's diagnostics are gated there too: its crash reports and uploaded logs
+(`…/agent/{id}/crash`, `…/agent/{id}/logs`) need `MANAGE_AGENTS`
+([security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub)).
+`fetchCrashes` and `fetchLogs` answer `null` for a caller who may not read them,
+whether the mask said so or the server's 403 did, and the two dialogs explain
+that rather than show an error. Their predicate, `canReadDeviceDiagnostics`, fails
+**open** while the mask is unknown, unlike the org-settings one: the device menu
+renders before `/member/me` lands, and a refusal it lets through costs one
+explained dialog, not a broken page.
+
 ⚠️ The client gate is never the enforcement. Every route re-checks server-side;
 the UI only avoids offering what it already knows will be refused.
 
@@ -342,4 +352,4 @@ needs only `MANAGE_AGENTS` — revocation is not a grant.
 | error → wire | `crates/core/src/error.rs` |
 | client contract | `ui/src/api/client.ts` |
 | UI mirror + predicates | `ui/src/utils/permissions.ts` |
-| tests | `crates/tests/src/role_reconcile_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts` |
+| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts` |

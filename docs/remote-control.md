@@ -3774,8 +3774,8 @@ that costs: every server-visible stall in 90 d of `remote_audit` had aged past
 the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
-(`crates/modules/fleet/src/agent_log.rs:170`, mounted at
-`crates/modules/fleet/src/lib.rs:518`) had existed since rc.58 without a caller.
+(`crates/modules/fleet/src/agent_log.rs:171`, mounted at
+`crates/modules/fleet/src/lib.rs:519`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
@@ -3843,12 +3843,12 @@ dropped; `error_code` must match the server's snake_case vocabulary or it is
 recorded as `other`; `msg` is mark names and millisecond deltas. No URL, token,
 message text or hostname can enter the record — locked by
 `rcConnectTimingUpload.spec.ts`, and the exact JSON is locked to parse on the
-route by `browser_connect_timing_record_parses` (`agent_log.rs:445`), because a
+route by `browser_connect_timing_record_parses` (`agent_log.rs:459`), because a
 422 is swallowed like every other failure and would look like nobody connecting.
 
 **Mining it** (`roomler2`, in the `mongodb-0` pod — credentials from the
 `mongodb-secret`, never on a transcript). Retention is the collection's **7 d
-TTL** (`lib.rs:475`, `crates/db/src/models/agent_log.rs:115`) — the same window
+TTL** (`crates/modules/fleet/src/lib.rs:845`, `crates/db/src/models/agent_log.rs:115`) — the same window
 as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.
 

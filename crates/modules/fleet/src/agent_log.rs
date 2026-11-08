@@ -11,12 +11,13 @@
 //! [`AgentLogDao::record_batch`].
 //!
 //! Listing endpoint (admin UI): `GET
-//! /api/tenant/{tenant_id}/agent/{agent_id}/logs?limit=N` — standard
-//! `AuthUser` + tenant-membership check.
+//! /api/tenant/{tenant_id}/agent/{agent_id}/logs?limit=N` — `AuthUser` +
+//! `MANAGE_AGENTS` in the path tenant ([`crate::diagnostics::require_reader`]).
 //!
-//! Server-side scrub: defense-in-depth strip of JWT-shaped tokens from
-//! every `msg` field at ingest time. The agent should never leak a
-//! token (per ed69c6c rc.53 PII rules) but this re-scrubs.
+//! Server-side scrub: defence in depth over EVERY string a line carries
+//! (`msg`, `target`, each string in `fields`), at ingest time
+//! ([`crate::diagnostics`]). The agent should never log a credential (per
+//! ed69c6c rc.53 PII rules); this is the second line.
 
 use axum::{
     Json,
@@ -31,7 +32,7 @@ use serde_json::json;
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
-use crate::{FleetState, auth_agent::AuthAgent};
+use crate::{FleetState, auth_agent::AuthAgent, diagnostics};
 
 /// Body shape POSTed by an uploader. `source` must NOT be `Browser`
 /// on the agent-authed route; route handler enforces this.
@@ -206,8 +207,9 @@ pub struct BrowserLogBatchPayload {
 }
 
 /// GET `/api/tenant/{tenant_id}/agent/{agent_id}/logs?limit=N` —
-/// list the most-recent N batches. Auth: standard user JWT + tenant
-/// membership. Default limit: 50.
+/// list the most-recent N batches. Auth: user JWT and `MANAGE_AGENTS` in
+/// the path tenant, then the device resolved within it (removed devices
+/// included): [`crate::diagnostics::require_reader`]. Default limit: 50.
 pub async fn list_for_agent(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -219,9 +221,7 @@ pub async fn list_for_agent(
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    diagnostics::require_reader(&state, tid, aid, auth.user_id).await?;
 
     let limit = q.limit.clamp(1, 500);
     let records = state
@@ -255,10 +255,14 @@ fn build_batch(
             )));
         }
     }
-    // Defense-in-depth scrub for JWT-shaped tokens (agent SHOULD have
-    // already scrubbed at source; this catches accidental regressions).
+    // Defence in depth: the agent SHOULD have scrubbed at source, but a
+    // device that predates a device-side fix sends what it had, in any
+    // field. So every string a line carries is scrubbed: `msg`, `target`,
+    // and each string in `fields`.
     for line in payload.lines.iter_mut() {
-        line.msg = scrub_tokens(&line.msg);
+        diagnostics::scrub_string(&mut line.msg);
+        diagnostics::scrub_string(&mut line.target);
+        diagnostics::scrub_document(&mut line.fields);
     }
     Ok(AgentLogBatch {
         id: None,
@@ -273,75 +277,6 @@ fn build_batch(
         created_at: DateTime::now(),
         lines: payload.lines,
     })
-}
-
-/// Strip JWT-shaped substrings (`xxx.yyy.zzz`) and `Bearer <token>`
-/// patterns from a string. Returns a NEW String; if no match, returns
-/// the original.
-fn scrub_tokens(s: &str) -> String {
-    // Cheap path: most lines don't look like JWTs. Skip the regex for
-    // the 99.9% case.
-    if !s.contains("eyJ") && !s.contains("Bearer ") && !s.contains("bearer ") {
-        return s.to_string();
-    }
-    let mut out = s.to_string();
-    // JWT: three base64url-ish segments separated by dots, starting
-    // with "eyJ" (the magic byte for a JSON-encoded header).
-    // Conservative: only replace tokens at least 64 chars total (real
-    // JWTs are 200+ chars; below 64 is likely a false positive).
-    let bytes = out.as_bytes();
-    let mut i = 0;
-    let mut replacements: Vec<(usize, usize)> = Vec::new();
-    while i + 3 <= bytes.len() {
-        if &bytes[i..i + 3] == b"eyJ" {
-            // Find run end: chars in [A-Za-z0-9._-].
-            let mut j = i + 3;
-            let mut dots = 0;
-            while j < bytes.len() {
-                let c = bytes[j];
-                if c == b'.' {
-                    dots += 1;
-                } else if !c.is_ascii_alphanumeric() && c != b'_' && c != b'-' {
-                    break;
-                }
-                j += 1;
-            }
-            if dots >= 2 && j - i >= 64 {
-                replacements.push((i, j));
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    // Apply in reverse to keep indices valid.
-    for (start, end) in replacements.iter().rev() {
-        out.replace_range(*start..*end, "[REDACTED_JWT]");
-    }
-    // Handle Bearer + bearer prefixes followed by long-ish tokens.
-    for prefix in &["Bearer ", "bearer "] {
-        while let Some(pos) = out.find(prefix) {
-            let after = pos + prefix.len();
-            let bytes = out.as_bytes();
-            let mut j = after;
-            while j < bytes.len() {
-                let c = bytes[j];
-                if !c.is_ascii_alphanumeric() && c != b'.' && c != b'_' && c != b'-' {
-                    break;
-                }
-                j += 1;
-            }
-            if j - after >= 8 {
-                out.replace_range(pos..j, "[REDACTED_BEARER]");
-            } else {
-                // Short suffix; advance past prefix to avoid infinite loop.
-                let mut tmp = out;
-                tmp.replace_range(pos..pos + prefix.len() - 1, "_");
-                out = tmp;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -432,6 +367,85 @@ mod tests {
         let batch = build_batch(tid, None, None, payload).expect("build_batch");
         assert!(batch.lines[0].msg.contains("[REDACTED_BEARER]"));
         assert!(!batch.lines[0].msg.contains("somelongtokenvaluehere"));
+    }
+
+    /// The bytes 0x00..=0x1f in standard base64: a WireGuard key's shape.
+    const WG_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    const JWT: &str = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMiLCJpYXQiOjE1MTYyMzkwMjJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+    /// Every string a line carries is scrubbed, `fields` at any depth included:
+    /// a structured field holds whatever the code logged there (a parser's
+    /// error, say), and a browser batch can nest documents and arrays.
+    #[test]
+    fn build_batch_scrubs_every_string_a_line_carries() {
+        let toml_error = format!(
+            "parse /etc/roomler/config.toml: TOML parse error at line 7, column 71\n  |\n7 | overlay_wg_secret_key = \"{WG_KEY}\"x\n  |{}^\nexpected newline, `#`\n",
+            " ".repeat(71)
+        );
+        let mut line = sample_line(&format!("overlay key {WG_KEY} refused"));
+        line.target = format!("roomlerd::{JWT}");
+        line.fields = bson::doc! {
+            "error": toml_error,
+            "token": JWT,
+            "nested": { "auth": format!("Bearer {JWT}"), "keys": [WG_KEY, "kept"] },
+            "n": 3_i64,
+        };
+        let batch = build_batch(
+            ObjectId::new(),
+            None,
+            None,
+            sample_payload(LogSource::Agent, vec![line]),
+        )
+        .expect("build_batch");
+        let stored = format!("{:?}", batch.lines[0]);
+        assert!(!stored.contains(WG_KEY), "{stored}");
+        assert!(!stored.contains(JWT), "{stored}");
+        assert!(!stored.contains("overlay_wg_secret_key"), "{stored}");
+        let line = &batch.lines[0];
+        assert_eq!(line.msg, "overlay key [REDACTED_KEY] refused");
+        let error = line.fields.get_str("error").expect("error");
+        assert!(
+            error.contains("TOML parse error at line 7, column 71\n"),
+            "{error}"
+        );
+        assert!(error.contains("expected newline, `#`"), "{error}");
+        let keys = line
+            .fields
+            .get_document("nested")
+            .and_then(|n| n.get_array("keys"))
+            .expect("nested keys");
+        assert_eq!(keys[1].as_str(), Some("kept"));
+        assert_eq!(line.fields.get_i64("n"), Ok(3));
+    }
+
+    /// The scrub is tight: ordinary lines, ids, hex digests, addresses and the
+    /// word "Bearer" without a credential after it included, are stored exactly
+    /// as they came.
+    #[test]
+    fn build_batch_leaves_ordinary_lines_alone() {
+        let mut relay = sample_line("overlay relay: allocated (srflx 203.0.113.7:41641)");
+        relay.target = "roomlerd::overlay::relay_link".to_string();
+        relay.fields = bson::doc! {
+            "peer": "6a1f0c2e9b3d4a5f6e7d8c9b",
+            "own": "203.0.113.7:41641",
+            "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "why": "missing Bearer token",
+            "ok": true,
+        };
+        let refused = sample_line("upload refused: missing Bearer token, retrying");
+        let before = vec![relay.clone(), refused.clone()];
+        let batch = build_batch(
+            ObjectId::new(),
+            None,
+            None,
+            sample_payload(LogSource::Agent, vec![relay, refused]),
+        )
+        .expect("build_batch");
+        for (stored, sent) in batch.lines.iter().zip(&before) {
+            assert_eq!(stored.msg, sent.msg);
+            assert_eq!(stored.target, sent.target);
+            assert_eq!(stored.fields, sent.fields);
+        }
     }
 
     /// FR-22 part 4 — the RC viewer's connect-timing record, in exactly the
@@ -587,20 +601,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scrub_tokens_passes_through_non_jwt() {
-        let s = "just a normal log line with no secrets";
-        assert_eq!(scrub_tokens(s), s);
-    }
-
-    #[test]
-    fn scrub_tokens_ignores_short_eyj_prefix() {
-        // "eyJ" appears in non-JWT contexts too (e.g. base64-encoded
-        // text that happens to start with these chars). Don't scrub
-        // unless the full JWT shape (>=64 chars + 2 dots) is present.
-        let s = "saw eyJabc not a real jwt";
-        assert_eq!(scrub_tokens(s), s);
-    }
+    // The scrub's own rules, and what each leaves alone, are tested where
+    // they live: `crate::diagnostics::tests`.
 
     // The bearer-parsing test moved with the behaviour, to
     // `crate::extractors::agent` — this route no longer parses the header

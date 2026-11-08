@@ -422,7 +422,7 @@ Readers that keep the tombstone, and why:
 | Reader | Why it must see one |
 |---|---|
 | `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
-| `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash`, the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
+| `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash` (both read under `MANAGE_AGENTS`, [below](#device-diagnostics-manage_agents-and-a-second-scrub)), the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
 | `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone |
 | `overlay_nodes` by id after a release | the release's own `removes` frame goes to the tombstone's address (`docs/overlay-communication.md` §1). The lease order is not changed by any of this: a node is tombstoned first, then its host goes back to the pool, and pooling first would lock the next joiner out permanently |
 
@@ -752,6 +752,45 @@ its Redis, or a TLS-inspecting box on a signalling leg could otherwise stand in 
 - ⚠️ **The verdict on `session_started` is the device's word**, kept on the server's row on purpose (§11.4a):
   the hub checks the word, never the judgement behind it.
 
+### Device diagnostics: `MANAGE_AGENTS`, and a second scrub
+
+A device's crash reports (`GET …/agent/{aid}/crash`, the last 50) and its uploaded logs
+(`GET …/agent/{aid}/logs`, up to 500 batches of the last 7 days, every structured field
+included) are the least-filtered view of a device. The ordinary device list needs only
+membership. These two need **`MANAGE_AGENTS` in the path org**, the bit the connect code is
+read under (`require_reader`, `crates/modules/fleet/src/diagnostics.rs`):
+
+- **The bit is decided before the device is looked up.** A caller without it gets one 403
+  `forbidden` whatever the id names, so the refusal says nothing about which devices exist.
+  It is never `not_a_member`, the one 403 the web app leaves the org on; someone outside the
+  org is still told `not_a_member`.
+- **Then the device resolves within the org, ANY rather than live.** Another org's id, or one
+  that names nothing, is a 404. A removed device still reads: both are audit views (the table
+  above).
+- **The web app asks the mask first.** It sends neither request for a caller without the bit,
+  the device menu leaves both views out, and a dialog that meets a refusal anyway explains it
+  instead of showing an error (`canReadDeviceDiagnostics`, `ui/src/utils/permissions.ts`).
+
+**What a device uploads is scrubbed again on the way in.** The device scrubs first: the crash
+recorder before it writes a report, and a config file's parse error names where the file
+broke, never what it held (§8). The server scrubs again, because a device that predates a
+device-side fix sends what it had. The pass covers **every string a log line carries**
+(`msg`, `target`, each string in `fields` at any depth) and every string of a crash report,
+on the agent and the browser ingest alike. It knows four shapes:
+
+| Shape | Recognised as | Stored as |
+|---|---|---|
+| the source line a `toml` parse error quotes | the `N \| …` line under its own `TOML parse error at line N` header, its newlines escaped or not | `N \| [REDACTED_TOML_LINE]` |
+| a JWT | `eyJ…` with two dots, 64 characters or more | `[REDACTED_JWT]` |
+| a bearer credential | `Bearer ` (or `bearer `) and 8 or more RFC 6750 token characters | `[REDACTED_BEARER]` |
+| a WireGuard key, public or private | exactly 32 bytes of standard base64 standing alone: 43 characters, the last one a character that can end 32 bytes, then one `=` | `[REDACTED_KEY]` |
+
+⚠️ Each rule is tight on purpose, and the tests pin what each one leaves alone: a hex digest,
+an ObjectId, an address, a base64 value of any other length, `==` padding, a run inside a
+longer one, the word "Bearer" with no credential after it. A public key is redacted with a
+private one, because the shape cannot tell them apart, and the server holds the public keys
+anyway.
+
 ---
 
 ## 5 · Network-facing surfaces
@@ -954,7 +993,8 @@ The actual fix for the account is GitHub Settings → Emails.
   server, on the wizard's page and in the terminal. The parser's error ends where it
   happens, so no chain holds it for a `{:#}` or `{:?}` to print:
   [`docs/installation.md`](installation.md). Rows uploaded before the fix were not
-  rewritten.
+  rewritten. The server's ingest scrub redacts such a quoted line wherever a log line
+  or a crash report carries it (§4, [device diagnostics](#device-diagnostics-manage_agents-and-a-second-scrub)).
 
 ### Dependency-uplift pass (2026-07-29)
 

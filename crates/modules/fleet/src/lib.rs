@@ -73,6 +73,7 @@ pub mod auth_agent;
 pub mod consent;
 pub mod consent_consumer;
 pub mod ctrl;
+pub mod diagnostics;
 pub mod enroll_key;
 pub mod exec_service;
 pub mod external_access;

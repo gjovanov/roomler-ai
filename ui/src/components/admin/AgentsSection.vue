@@ -170,6 +170,7 @@
                 :client="clientFor(item)"
                 :node="nodeFor(item)"
                 :network-mounted="caps.has('network')"
+                :may-read-diagnostics="mayReadDiagnostics"
                 :update-busy="updateBusy === item.id"
                 :rotate-key-busy="rotateKeyBusy === item.id"
                 :update-blocked="updateBlockedText(agentFor(item))"
@@ -628,6 +629,7 @@
                     :client="clientFor(item)"
                     :node="nodeFor(item)"
                     :network-mounted="caps.has('network')"
+                    :may-read-diagnostics="mayReadDiagnostics"
                     :update-busy="updateBusy === item.id"
                     :rotate-key-busy="rotateKeyBusy === item.id"
                     :update-blocked="updateBlockedText(agentFor(item))"
@@ -906,6 +908,7 @@
                   :client="clientFor(item)"
                   :node="nodeFor(item)"
                   :network-mounted="caps.has('network')"
+                  :may-read-diagnostics="mayReadDiagnostics"
                   :update-busy="updateBusy === item.id"
                   :rotate-key-busy="rotateKeyBusy === item.id"
                   :update-blocked="updateBlockedText(agentFor(item))"
@@ -1482,6 +1485,8 @@ import {
 import { useDeviceStore, type DeviceRow } from '@/stores/devices'
 import { presenceColor, presenceIcon, presenceLabel, presenceTitle } from '@/utils/devicePresence'
 import { useAuthStore } from '@/stores/auth'
+import { useTenantStore } from '@/stores/tenant'
+import { canReadDeviceDiagnostics } from '@/utils/permissions'
 import { useGridColumns } from '@/composables/useGridColumns'
 import { useResponsiveDialog } from '@/composables/useResponsiveDialog'
 import { useOpenRows } from '@/composables/useOpenRows'
@@ -1508,6 +1513,12 @@ const deviceStore = useDeviceStore()
 // module, and a menu item that leads to a 404 is worse than none.
 const caps = useCapabilitiesStore()
 const auth = useAuthStore()
+// A device's crash reports and uploaded logs are MANAGE_AGENTS on the server;
+// the menu leaves both out for a caller the mask says may not read them.
+const tenantStore = useTenantStore()
+const mayReadDiagnostics = computed(() =>
+  canReadDeviceDiagnostics(tenantStore.myPermissions, tenantStore.isOwner),
+)
 // Declared before the grid state below — gridKind's initializer reads
 // route.query.
 const route = useRoute()
