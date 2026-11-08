@@ -124,15 +124,15 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:7067`
-`INPUT_MOVE_GAP_MS`, `:7080` `schedulePendingMove`): send immediately when the
+P6 drives sends from a timer instead (`useRemoteControl.ts:7106`
+`INPUT_MOVE_GAP_MS`, `:7119` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12592`). The gap is a per-browser knob,
-0 to 16 ms (`roomler-rc-input-gap`, `:2726` `storedInputGapMs`, from FR-98 C3); the
-same timer drives the relative-pointer path (`:7179`).
+always queued (`useRemoteControl.ts:12653`). The gap is a per-browser knob,
+0 to 16 ms (`roomler-rc-input-gap`, `:2727` `storedInputGapMs`, from FR-98 C3); the
+same timer drives the relative-pointer path (`:7218`).
 
 The point of the design is that `setTimeout` cadence is **independent of rAF**:
 under a compositor load that drops rAF to 20 fps, pointer sends still leave at
@@ -150,13 +150,23 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3716` `clock_echo_json`, handled at
   `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:7016` `CLOCK_RING`, `:7020`
+  sample of the last 8 (`useRemoteControl.ts:7027` `CLOCK_RING`, `:7031`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:220` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
   (`RemoteControl.vue:4843` `statsAgeLabel`, rendered at `:289`).
+- **On one clock.** The probe runs on the page, so the offset maps the agent's
+  clock onto the page's, and a decode worker's `epochNow` is not the page's:
+  each context fixes its epoch from the wall clock when it starts, and a worker
+  made after its page reads a constant apart from it (7.25 ms, 162 s after the
+  page, on the Windows dev box). So the page measures that skew when it starts
+  the worker, and the worker reads the offset through it
+  (`workerAgentOffsetUs`, `ui/src/workers/rc-clock-cal.ts:153`; #3566,
+  [remote-control.md §11.14.3](remote-control.md#11143-one-clock-for-the-page-and-its-worker-3566)).
+  Before that, a session whose worker started late read every age off by the
+  skew.
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,
