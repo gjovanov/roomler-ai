@@ -252,7 +252,7 @@ The brief asks for a per-stage budget that sums to the frame time. That holds fo
 | Mode at 60 fps | Hours | Target p50 / p95 | Today | Who can read it |
 |---|---|---|---|---|
 | Sparse update | 45.9 | 37 / 50 | 40.1 / 49.1 on `av1_qsv` GPU; `hevc_qsv` direct unknown | L4 on the office-desktop class needs a person (D8) |
-| Moving | 23.3 | reasoned, no reading | unknown | N1, in R0 |
+| Moving | 23.3 | reasoned, no reading | 24.2 / 33.8 at 1080p and 33.9 / 47.4 at 2560×1600, `av1_nvenc` CPU form, in a session to the same host [M §13 2026-11-08] | N1, in R0; read 2026-11-08 on the dev box |
 
 The rows below are L4 p50 / p95, hardware decode. A row with a reading names its mode, and those are all sparse today. The p95 is read outside bursts a ping monitor names, with the raw p95 beside it: 49.1 and 90.1 in the one LAN baseline. **WAN direct** = LAN + RTT at p50, LAN + 1.5×RTT at p95. **Relay** = RTT + 45 at p50, RTT + 90 at p95 (baseline at RTT 80: 131 / 206, outside bursts 130 / 144-149). A cell whose encode does not fit a tier does not get that tier's SLO: its `max_tier` in the cell table says so, and that session's SLO is the tier below (§6.5). 4K above 60 is not committed (D6): no panel in the fleet reads it.
 
@@ -272,22 +272,22 @@ Codes. **B** a real baseline in this cell. **b** partial: a proxy, the host half
 | 60 | 1080p | LAN | 37 / 50 | **40.1 / 49.1** outside bursts, 40.0 / 90.1 raw, near-static [M FR-98 §9 cell 3] | **B** | b | b | b | I | **B** | b |
 | 60 | 1080p | WAN direct | +RTT / +1.5×RTT | unknown; 56.2 fps at 2048×1080 [M FR-112] | Iw | b | b | I | I | I | I / X |
 | 60 | 1080p | Relay | none, see D12 | refused on hardware | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) |
-| 60 | 1440p, 1600p | LAN | 37 / 50 | unknown; 57-58 fps at 2560×1600 [M FR-118 §9.7] | Iw | b | b | I | I | **B** | I / X |
+| 60 | 1440p, 1600p | LAN | 37 / 50 | **33.9 / 47.4** in motion, a session to the same host, CPU form [M §13 2026-11-08]; 57-58 fps at 2560×1600 [M FR-118 §9.7] | b | b | b | I | I | **B** | I / X |
 | 60 | 1440p, 1600p | WAN direct | +RTT / +1.5×RTT | unknown | Iw | I | I | I | I | I | I / X |
 | 60 | 1440p, 1600p | Relay | none, see D12 | refused on hardware | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) |
 | 60 | 4K | LAN | 37 / 50 | unknown; no hardware encoder has a 4K row [R docs] | Iw | I | b | I | I | I | I / X |
 | 60 | 4K | WAN direct | +RTT / +1.5×RTT | unknown | Iw | I | I | I | I | I | I / X |
 | 60 | 4K | Relay | none, see D12 | refused on hardware | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) | R(hw) |
-| 120 | 1080p | LAN | 25 / 35 | unknown; 119.8-120.1 fps viewer-read at 1662×1078 [M FR-119 AC4] | Iw | b | **B** | I | **B** | I | I / X |
+| 120 | 1080p | LAN | 25 / 35 | **21.3 / 29.6** in motion, a session to the same host, `av1_nvenc` CPU form [M §13 2026-11-08]; 119.8-120.1 fps viewer-read at 1662×1078 [M FR-119 AC4] | b | b | **B** | I | **B** | I | I / X |
 | 120 | 1080p | WAN direct | +RTT / +1.5×RTT | unknown | Iw | I | I | I | I | I | I / X |
 | 120 | 1080p | Relay | refused | refused | R | R | R | R | R | R | R |
-| 120 | 1440p, 1600p | LAN | 25 / 35 | unknown; trial 112.4-117.0 fps [M FR-119 §8] | Iw | b | b | I | b | b | I / X |
+| 120 | 1440p, 1600p | LAN | 25 / 35 | unknown; on the AMD panel + NVIDIA class's CPU form it cannot run: trial failed at 58.1 fps, p90 encode 17.6 ms [M §13 2026-11-08]; trial 112.4-117.0 fps [M FR-119 §8] | Iw | b | b | I | b | b | I / X |
 | 120 | 1440p, 1600p | WAN direct | +RTT / +1.5×RTT | unknown | Iw | I | I | I | I | I | I / X |
 | 120 | 1440p, 1600p | Relay | refused | refused | R | R | R | R | R | R | R |
 | 120 | 4K | LAN | not committed | unknown; needs a 120 Hz 4K host panel | Iw | I | I | I | I | I | I / X |
 | 120 | 4K | WAN direct | not committed | unknown | Iw | I | I | I | I | I | I / X |
 | 120 | 4K | Relay | refused | refused | R | R | R | R | R | R | R |
-| 144 | 1080p | LAN | 23 / 32 | unknown; no row at 144 in any doc | Iw | I | I | I | I | I | I / X |
+| 144 | 1080p | LAN | 23 / 32 | **21.5 / 38.1** in motion, a session to the same host, `av1_nvenc` CPU form; trial 148.3 fps [M §13 2026-11-08] | b | b | I | I | I | I | I / X |
 | 144 | 1080p | WAN direct | +RTT / +1.5×RTT | unknown | Iw | I | I | I | I | I | I / X |
 | 144 | 1080p | Relay | refused | refused | R | R | R | R | R | R | R |
 | 144 | 1440p, 1600p | LAN | 23 / 32 | unknown; trial 141.4 fps on AV1 [M FR-119 §8] | Iw | b | b | I | b | I | I / X |
@@ -297,7 +297,7 @@ Codes. **B** a real baseline in this cell. **b** partial: a proxy, the host half
 | 144 | 4K | WAN direct | not committed | unknown | Iw | I | I | I | I | I | I / X |
 | 144 | 4K | Relay | refused | refused | R | R | R | R | R | R | R |
 
-**The count.** 36 cells: 9 refused on the hardware path, 27 live. I2P has a baseline in **2 of 27**, none above 60, none on WAN direct. Jitter has a full baseline in 1 of 27, colour in 2, and text a partial one in 1. Motion text has no instrument. The hidden axes are all unknown for I2P: both real-host L4 cells are Windows QSV laptops; the network is home Wi-Fi and one forced relay, with no CGNAT, symmetric NAT or VPN path; no Linux or macOS host on a release build; signed-in desktop only; one Chrome on one Wi-Fi; no sustained motion.
+**The count.** 36 cells: 9 refused on the hardware path, 27 live. I2P has a baseline in **2 of 27**, none above 60, none on WAN direct. Partial readings in motion now cover 3 more cells, 2 of them above 60: a session to the same host on the dev box, with no network in the path (§13, 2026-11-08). Jitter has a full baseline in 1 of 27, colour in 2, and text a partial one in 1. Motion text has no instrument. The hidden axes are all unknown for I2P: both real-host L4 cells are Windows QSV laptops; the network is home Wi-Fi and one forced relay, with no CGNAT, symmetric NAT or VPN path; no Linux or macOS host on a release build; signed-in desktop only; one Chrome on one Wi-Fi; no sustained motion.
 
 ### 3.5 Everything else that "flawless" means
 
@@ -1489,7 +1489,7 @@ I ran each spike that was cheap and could change the design, with one miss: the 
 - [ ] **AC10 (one table):** probe, hello, pick and open derive from `CellTable`. Dv1-Dv20 each closed or named. A generated hello is byte-identical except where a PR names the change.
 - [ ] **AC11 (a session proves a cell):** §5's statuses come from one bounded query over N16. No cell reads `S` without a painted count on a named build on the loop then shipping.
 - [ ] **AC12 (the SLOs):** each row of §3.4 and §3.5 on a reachable cell reads within its target, or a move the operator signed, with its measurement and never below today's baseline. A miss with no signed move stays open. Rows owned elsewhere close with their owner: FR-22, FR-38, the endings FR. Unreachable cells name who owes them (§12).
-- [ ] **AC13 (above 60):** R12's GREEN on neo16 and the MacBook, and the first L4 at 120 and at 144.
+- [~] **AC13 (above 60):** R12's GREEN on neo16 and the MacBook, and the first L4 at 120 and at 144. **The first L4 at 120 and at 144, read 2026-11-08** (§13, N1): on the dev box at 1080p in motion, 120 at p50 21.3 / p95 29.6 ms and 144 at 21.5 / 38.1 ms, in a session to the same host. At 2560×1600 its CPU form cannot run 120 (58.1 fps). R12's GREEN on neo16 and the MacBook is not read.
 - [ ] **AC14 (relays):** R14's GREEN or S5's recorded reason. D12 answered.
 - [ ] **AC15 (the code shrinks):** the media path, counted by §4.4's method, is at most 68,220 non-test lines (today's 74,163 less the weakest reading, −5,940), and `peer.rs` at most 7,500. Measured in the closing PR.
 - [ ] **AC16 (the debt):** every ledger row is retired by a named PR or marked `stays` with its reason. §4.3's end state holds: ≤ 40 env knobs, 0 read per frame, 1 table, 1 message.
@@ -1599,3 +1599,5 @@ A row that names a phase is that phase's read. Every other row is a read the pla
 | 2026-11-07 | **R2 on a real GPU**: production's viewer (`hosted-20261107-00d2a3d`) in Chrome on the Windows dev box, in a session to that same host. The Radeon 610M drives its 2560×1600 panel, and the RTX 5090 encodes. Agent 0.4.205 under the SYSTEM service, AV1 (`av1_nvenc`) over the data channel, direct | GPU form to CPU form: `gpu → cpu: adapter_mismatch` in `ladder` and on the stats pill, on every session, because capture runs on the panel's adapter and the encoder on the other. Asked to granted, forced with `fps_deny = av1_nvenc:120`: `120 fps → 60 fps: denied` in `ladder`, and the pill's title lists both arrows. The next-cell arrows were read on a Linux lab desktop the same day, so each kind of arrow R2 ships has now been seen on a real GPU | #3293 |
 | 2026-11-07 | **R0 (N2) RED on the FFmpeg DC pump**: the same session, an L4 bench in `target` mode (`roomlerd probe-target` on the host). `fps_high` was switched off for the read and back on after | With `fps_high` on: 31 of 31 `rc.l4` records carry all 8 join fields (`target_fps` 120 on the grant, 60 under the deny). With it off: 3 of 3 lack `target_fps`, and the other 7 are present. The GREEN is owed on a release that carries #3554 | #3293 |
 | 2026-11-07 | A rate granted above the panel's own: the same host, its panel at 60 Hz (it supports 240) | The viewer asked for 120, and the agent granted it as a trial: `frame rate decided … asked=Some(120) … refused=None … backend="system-context"`. The SYSTEM-context capture arm never read the display's rate, so FR-119's `refresh` refusal could not fire there. A 120 trial on a 60 Hz panel never concludes: frames 16.7 ms apart count as motion at 120 and reach half the rate, so it is not proven, and the encoder keeps up, so it does not fail either. Input to paint, direct, pooled: granted 120, p50 45.9 ms and p95 61.8 ms (960 round trips); granted 60, p50 43.7 ms and p95 61.3 ms (207). N1 at 120 and 144 cannot be read on this host until its panel runs above 60. The PR that adds this row has the arm read its refresh rate | #3293 |
+| 2026-11-08 | **N1**, input to paint in motion: the Windows dev box as its own target again. Its panel ran at 240 Hz for the read, the operator agreeing; the RTX 5090 encoded. Agent 0.4.205 under the SYSTEM service, AV1 (`av1_nvenc`, CPU form) over the data channel, direct. An L4 bench in `target` mode, beside a topmost window repainting at 240 Hz | At 1080p, 120 was proven (118.3 fps, p90 encode 10.1 ms) and read p50 21.3 ms, p95 29.6 ms over 400 round trips. 144 was proven (148.3 fps, 7.4 ms) and read p50 21.5 ms, p95 38.1 ms over 360. 60 on the same pair read p50 24.2 ms, p95 33.8 ms, though it encoded a median 124 fps, because an unpaced SYSTEM-context capture delivers at the rate the desktop changes. At 2560×1600 the 120 trial failed with the host as the limit (58.1 fps, p90 encode 17.6 ms), which reads R4b's RED, and 60 read p50 33.9 ms, p95 47.4 ms. One machine is both ends, so no network is in the path | #3293 |
+| 2026-11-08 | **SPC-46 GREEN and R0 (N2) GREEN** on agent-v0.4.206, the same host with its panel back at 60 Hz | With `fps_high` on and the viewer asking 120: `refresh_hz=Some(60)`, then `refused=Some((120, Refresh))`, and the page shows `120 fps → 60 fps: refresh`. With `fps_high` off: 8 of 8 `rc.l4` records carry `target_fps` (60), against 0 of 3 on 0.4.205 | #3293 |
