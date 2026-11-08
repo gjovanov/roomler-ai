@@ -2303,8 +2303,8 @@ host** — `roomler config set auto_grant_session <true|false>` — then restart
 daemon (the config surface notes changes apply on the next start). Making a
 device auto-grant is a device-owner decision the server cannot make for it.
 
-**Prompt surfaces.** A chain, probed per prompt and logged per prompt
-(`native`, `notified` and `have_surface` on one line):
+**Prompt surfaces.** A chain, logged per prompt (`native`, `notified` and `have_surface` on one line). The X11
+panel connects to its display once, when the daemon starts, and keeps that connection for the process's life (#2029):
 
 1. **native** — the daemon draws the panel itself. Windows
    (`viewer-indicator`, and `WDA_EXCLUDEFROMCAPTURE` so the requester cannot
@@ -4794,8 +4794,8 @@ after `kill -9`. Only `run` gates on the lock — `enroll`,
 rs`): process-singleton via `OnceLock<Arc<Watchdog>>`; pumps tick
 via global `watchdog::tick("name")` free helpers (no parameter
 threading). Per-pump thresholds — signaling: 90s (keepalive cadence
-25s × 3 grace); encoder + capture: 30s (gated on session-active so
-they ignore quiet idle periods between sessions). Async `run()`
+25s × 3 grace), gated on while its connection is up; encoder + capture
+are registered at 30s but nothing gates them on, so the scan skips them. Async `run()`
 loop wakes every 5s, scans, force-exits via `std::process::exit(2)`
 (sentinel code distinct from 0 + 1) on stall — relies on the OS
 supervisor to relaunch a healthy copy. Suspend handling: if a loop
