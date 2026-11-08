@@ -3529,8 +3529,12 @@ the give-up, a late or garbled answer, the stop), the switch, and the RTP transf
 arrival and the bench stamp, before and after the skew arrives. The e2e harness (`ui/e2e-harness/dcworker.ts`)
 builds its own relay and measures no skew, so its `fwd` hop still reads raw and it asserts the relay by its own
 count. RED, in #3566's measurement on 2026-11-08: the session above, whose `fwd_ms` timed 1 hop in a second.
-GREEN is owed after a promote: a session started minutes after its page loaded names its skew on the console,
-`fwd_ms` times every relayed chunk, and its ages hold across the measurement.
+GREEN, on production's `hosted-20261108-4297002` the same day: three connects from one page to a Linux lab
+desktop. Workers made 225 s and 532 s after the page named their skew on the console, 4.20 and 9.75 ms behind,
+within 0.1 ms of an independent probe, and `fwd_ms` timed 790 of 831 relayed chunks and 500 of 621. With the
+switch at `0`, a worker 7.5 ms behind timed 1 of 591. The chunks it still misses are hops shorter than the error
+above: on an idle page a relay hop takes about 0.1 ms, and every 1 s window timed 10 to 15 of its 15. The ages
+were not read separately; they go through the same skew.
 
 ## 12. Performance targets & budget
 
