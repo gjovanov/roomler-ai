@@ -2193,12 +2193,12 @@ live viewer to the consent page, and the device hung its session up.
 The mapping is `ConsentMode::asks`
 ([`models.rs:1358`](../crates/remote_control/src/models.rs#L1358)), sent at
 [`hub.rs:1911`](../crates/modules/fleet/src/hub.rs#L1911). A duplicate request
-coalesced onto a live session gets the same value (`:1422`).
+coalesced onto a live session gets the same value (`:1645`).
 
 The viewer words two things for the person actually asked:
 - its wait (`awaitingConsentLabel`,
   [`useRemoteControl.ts:886`](../ui/src/composables/useRemoteControl.ts#L886));
-- a `consent_timeout` or `user_denied` end (`friendlyEndReason`, `:824`).
+- a `consent_timeout` or `user_denied` end (`friendlyEndReason`, `:917`).
 
 Before this, an `email` session nobody answered ended with "Nobody answered the
 prompt on that device… ask the person there". Nobody at the device had been
