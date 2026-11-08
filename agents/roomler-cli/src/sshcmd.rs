@@ -284,8 +284,7 @@ impl PrivateDir {
         Self::named("roomler-ssh")
     }
 
-    /// FR-90 P3-9-2b — one whose name starts `prefix-`, for `roomler
-    /// connect`'s files too.
+    /// One whose name starts `prefix-` ([`Self::new`] names it `roomler-ssh`).
     pub(crate) fn named(prefix: &str) -> Result<Self> {
         // Name from the OS CSPRNG, not the pid or the clock: a predictable
         // name in a shared /tmp is how someone pre-creates the path.

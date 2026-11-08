@@ -8,6 +8,11 @@ enough to read from one release (§8.1); every artifact is 3.2–7.8 % smaller, 
 FR-90 P8 for Hive's crate) · **Anchors:** master `4e26a5b0c` (2026-10-26) unless a row says otherwise ·
 **Parent:** [FR-6](FR-6-ci-release-build-speed-slo.md) (#773), whose residual lever this is
 
+> FR-90 is parked off master since 2026-11-04 ([FR-137](FR-137-hive-leaves-master.md), branch
+> `park/hive-fr90`): every Hive item below is moot. That covers §3.1's `roomler-hive-node` and
+> Hive's-crate nodes, `cfg(hive_host)`, `encode::caps`' Hive switches, §3.7's Hive line, §3.8's
+> no-move rule, P5, decision 6 and §7's line. §2 and §8 stay as measured.
+
 ## 1. Goal
 
 A release build of the daemon stops being one serial, single-core compile. Today `agents/roomlerd` is one
@@ -585,7 +590,7 @@ and its base tree on the **same runner, back to back**, with the lane's seeds re
 | **P2** | the former bin as one unit (§3.6, option A, decided 2026-10-27): `src/main.rs` → `src/app.rs`, `pub mod app`, the bin one call; its tests run for the first time; the anchor pass | same-runner A/B against 0.4.178's tree (§2.4 v3); the field proof is 0.4.180's rehearsal build steps (AC1) and its MSI size notice (AC2) | **merged** 2026-10-27, #2999 → master `de813b504`; **measured −14.3 % / −30.5 % time, −5.6 % / −11.6 % size**; **released in 0.4.180** (§8.1): the bin's 132–303 s are gone on all four lanes, the daemon's compile is −19 % / −12 % on the steady Linux lanes, every artifact 3.2–7.8 % smaller; its post-roll check passed on 2026-10-28 (AC3's half); owed: AC1's three releases |
 | **P3** | `roomler-node-media` (§3.5), in a merge window FR-118/119 agree to | same-runner A/B, sibling by sibling | **parked** 2026-10-30 (decision 9), not started |
 | **P4** | `roomler-node-host` (§3.7) | same-runner A/B | **parked** with P3 (decision 9), not started |
-| **P5** | Hive's crate — FR-90 P8-1, with the dependency property of §3.1 | FR-90's | FR-90's schedule |
+| **P5** | Hive's crate — FR-90 P8-1, with the dependency property of §3.1 | FR-90's | **moot**: FR-90 parked off master (FR-137) |
 | **P6** | docs: the crate layout in `docs/architecture.md` (workspace map + a daemon section with §3.2's rules), `CLAUDE.md`'s Architecture tree, a row in `docs/README.md`'s index, this spec's status | — | the map and the tree carry P1 since #2944; the section and the row with P2; owed before a close, which the park (decision 9) is not |
 
 ## 5. Acceptance criteria

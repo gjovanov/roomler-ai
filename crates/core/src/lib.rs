@@ -83,8 +83,7 @@ pub use agent_socket::{
 pub use capabilities::{Capabilities, TenantCtx};
 pub use error::ApiError;
 pub use hooks::{
-    FleetLifecycle, HookRegistry, Hooks, ReleasedLease, RenamePropagation, RoleAsk, RoleVerdict,
-    SessionGate, TenantLifecycle,
+    FleetLifecycle, HookRegistry, Hooks, ReleasedLease, RenamePropagation, TenantLifecycle,
 };
 pub use job::{Cadence, Job, JobFuture};
 pub use module::Module;

@@ -288,7 +288,10 @@
     const value = raw === '' ? null : raw;
     const status = cfgRowStatus(row);
     try {
-      const entry = await invoke('cmd_config_set', { key, value });
+      /* #2871: the group the row was LISTED with, so on a two-half Mac the
+       * change goes to the half the row came from (`is_machine_side`). */
+      const group = row.dataset.group || null;
+      const entry = await invoke('cmd_config_set', { key, value, group });
       // The daemon says per key whether the change is in force already
       // (the gate-4 flags it re-seeds from the file it just wrote,
       // docs/remote-config.md §7b) or waits for a restart. Saying "restart"
@@ -329,6 +332,7 @@
     row.className = 'cfg-row';
     row.style.margin = '10px 0 0';
     row.dataset.key = entry.key;
+    row.dataset.group = entry.group || '';
     // What the search box matches against: the key and the description.
     row.dataset.search = (entry.key + ' ' + (entry.description || '')).toLowerCase();
 
@@ -353,6 +357,33 @@
     const controls = document.createElement('div');
     controls.className = 'actions';
     const val = entry.value == null ? '' : entry.value;
+
+    /* #2871: a key the daemon serves READ-ONLY on the connection this page
+     * has — its `read_only` is the daemon's own word (`root_only`: the key is
+     * the root daemon's to set, and this listing came over its
+     * person-at-the-device socket). The value is shown as text, no control,
+     * and the status line gives the administrator's command. The daemon
+     * decides per key; this file keeps no list of its own. */
+    if (entry.read_only) {
+      const shown = document.createElement('span');
+      shown.className = 'mono small';
+      shown.textContent = val === '' ? '(default)' : val;
+      controls.appendChild(shown);
+      const lock = document.createElement('span');
+      lock.className = 'chip chip-muted';
+      lock.textContent = "administrator's";
+      lock.title = 'Set by an administrator in a terminal';
+      controls.appendChild(lock);
+      row.appendChild(controls);
+      const status = document.createElement('p');
+      status.className = 'muted small cfg-row-status';
+      status.style.margin = '2px 0 0';
+      status.textContent =
+        'Changed by an administrator in a terminal: sudo roomler config set ' +
+        entry.key + ' <value>';
+      row.appendChild(status);
+      return row;
+    }
 
     if (entry.kind === 'bool') {
       const sel = makeSelect(
@@ -573,31 +604,45 @@
     );
   }
 
-  /* #2871: on a Mac running both halves (FR-43) the rows above come from the
-   * per-user half — the GUI worker's own file — while the Overview shows the
-   * root half's network. Say which file this page changes, and how the root
-   * half's switches are changed. The text is the daemon-side `note`
-   * (commands.rs `two_halves_note`), rendered as text; hidden on every other
-   * layout, and on any failure (the rows stand on their own).
+  /* #2871: on a Mac running both halves (FR-43) the rows come from BOTH —
+   * session settings from the per-user half (the GUI worker's own file),
+   * machine settings from the root half over its person-at-the-device socket,
+   * which serves the keys that are the person's own call and marks the rest
+   * `read_only` (design A on #2871). Say so, and which file each half reads.
+   * The text is the daemon-side `note` (commands.rs `two_halves_note` /
+   * `root_only_note`), rendered as text; hidden on every other layout, and on
+   * any failure (the rows stand on their own).
    * #2891: on a Linux system install (and a Mac with a root half alone) the
-   * daemon the page reaches runs as root and refuses the config verbs on its
-   * person socket; `root_only` then carries the explanation the card shows in
-   * place of rows (`renderRootOnly`). Returns the target, so loadCfg's failure
-   * path can read it. */
-  async function paintConfigTarget() {
+   * daemon the page reaches runs as root; its person socket now serves the
+   * listing (`root_only` + rows, some marked), and — from a daemon older than
+   * design A, which refuses the config verbs there — `legacy_note` carries the
+   * explanation the card shows in place of rows (`renderRootOnly`).
+   * `listing` is what loadCfg got (or null when it failed): with the root
+   * half's rows merged in, or served by the root daemon itself, the banner
+   * says what changes here; without them, what the administrator does.
+   * Returns the target, so loadCfg's failure path can read it. */
+  async function paintConfigTarget(listing) {
     const banner = $('cfg-target-banner');
     if (!banner) return null;
     try {
       const t = await invoke('cmd_config_target');
-      if (t && t.note && (t.two_halves || t.root_only)) {
-        setText(
-          'cfg-target-title',
-          t.two_halves
-            ? 'This page edits the per-user half of this Mac'
-            : 'This computer’s settings are an administrator’s',
+      if (t && (t.two_halves || t.root_only)) {
+        const rootRowsHere = Boolean(
+          listing && (t.root_only || (t.two_halves && listing.machine_merged)),
         );
-        setText('cfg-target-text', t.note);
-        show(banner);
+        const text = rootRowsHere ? t.note : t.legacy_note;
+        if (text) {
+          setText(
+            'cfg-target-title',
+            t.two_halves
+              ? 'This Mac runs two Roomler daemons'
+              : 'This computer’s Roomler service runs as root',
+          );
+          setText('cfg-target-text', text);
+          show(banner);
+        } else {
+          hide(banner);
+        }
       } else {
         hide(banner);
       }
@@ -644,17 +689,20 @@
     const container = $('cfg-rows');
     if (!container) return;
     try {
-      const entries = await invoke('cmd_config_entries');
-      renderCfg(entries);
+      // #2871 — `entries`, and whether the root half's rows were merged in
+      // (a two-half Mac whose root half serves its person socket's listing).
+      const listing = await invoke('cmd_config_entries');
+      renderCfg(listing.entries);
       cfgLoaded = true;
-      void paintConfigTarget();
+      void paintConfigTarget(listing);
     } catch (e) {
       // #2891 — before showing an error, ask whose configuration this is: a
-      // root daemon's refusal is the expected answer on a system install, and
-      // the card explains it instead. Left unloaded, so the next visit asks
-      // again (the daemon may have been restarted or reinstalled meanwhile).
-      const target = await paintConfigTarget();
-      if (target && target.root_only && target.note) {
+      // root daemon's refusal is the expected answer on a system install
+      // whose daemon predates design A (#2871), and the card explains it
+      // instead. Left unloaded, so the next visit asks again (the daemon may
+      // have been restarted or updated meanwhile).
+      const target = await paintConfigTarget(null);
+      if (target && target.root_only && target.legacy_note) {
         renderRootOnly(container, target);
         return;
       }

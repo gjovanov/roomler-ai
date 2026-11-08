@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use super::cells::{cell_denied, denied_cells, ffmpeg_444_capable};
+// FR-135 R9 — what the probe found, and the six fields the hello takes from it.
+use super::cell_table::{ProbeFindings, ProbedFields};
 
 static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
 /// #3280 — a later try's answer, once one is adopted ([`adopt`]). [`CACHED_CAPS`]
@@ -51,6 +53,12 @@ static FIRST_SHORT: Mutex<Option<child::Shortfall>> = Mutex::new(None);
 static LAST_ASK: Mutex<Option<Instant>> = Mutex::new(None);
 /// #3280 — the GPU-input forms of the answer in force, for [`weigh`].
 static GPU_IN_FORCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// #3439 — what the async path answers before the first probe has ([`answer_now`]).
+static INTERIM_CAPS: OnceLock<AgentCaps> = OnceLock::new();
+/// #3439 — the first answer is news, once ([`detect`]).
+static FIRST_IS_NEWS: std::sync::Once = std::sync::Once::new();
+/// #3439 — wakes every connection when [`generation`] moves ([`news`]).
+static NEWS: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
 
 fn late_caps() -> Option<AgentCaps> {
     LATE_CAPS.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -62,17 +70,76 @@ fn late_caps() -> Option<AgentCaps> {
 /// LocalAPI serves this on every Overview poll, and the first `detect()` in a
 /// process spawns the probe children (vendor driver code, the reason the
 /// probe is out-of-process at all); a control-surface read must never be what
-/// launches that. The probe runs at the first `rc:agent.hello`, so before a
-/// daemon has reached its server this is `None`, and the Overview says
-/// "not probed yet" and asks again later.
+/// launches that. The probe starts with the daemon's signalling loop
+/// ([`start_probing`]), so until its first answer this is `None`, and the
+/// Overview says "not probed yet" and asks again later.
 pub fn cached() -> Option<AgentCaps> {
     late_caps().or_else(|| CACHED_CAPS.get().cloned())
 }
 
 /// #3280 — a number that changes when the answer [`detect`] gives does. Read it
 /// BEFORE reading the answer: a change in between then reads as news next time.
+/// #3439 — the first answer moves it too: a connection that said hello with the
+/// interim answer has to hear of the real one.
 pub fn generation() -> u64 {
     CAPS_GENERATION.load(Ordering::SeqCst)
+}
+
+/// #3439 — wakes when [`generation`] moves. Each connection holds one, so a new
+/// answer reaches its row at once rather than within a heartbeat. Subscribe
+/// before reading the generation, so a change in between wakes it.
+pub fn news() -> tokio::sync::watch::Receiver<u64> {
+    news_sender().subscribe()
+}
+
+fn news_sender() -> &'static tokio::sync::watch::Sender<u64> {
+    NEWS.get_or_init(|| tokio::sync::watch::channel(generation()).0)
+}
+
+/// The answer [`detect`] gives has changed. Called once the new answer is stored:
+/// the generation, then the wake, so whoever wakes finds the new answer.
+fn answer_moved() {
+    let now = CAPS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    news_sender().send_replace(now);
+}
+
+/// #3439 — whether the first probe has answered. Before it has, a session request
+/// waits for it (`crate::held_requests`).
+pub fn answered() -> bool {
+    CACHED_CAPS.get().is_some()
+}
+
+/// #3439 — the answer in force, or before the first probe has answered, the
+/// interim one ([`interim`]). It never waits for a probe: this is what the
+/// signalling loop reads, where a wait on the probe is a stalled pump.
+pub fn answer_now() -> AgentCaps {
+    cached().unwrap_or_else(|| INTERIM_CAPS.get_or_init(interim_answer).clone())
+}
+
+/// #3439 — build the interim answer, on a blocking thread: it reads the host the
+/// way a cache hit does. `signaling::run` builds it before it connects with it.
+pub fn interim() {
+    let _ = INTERIM_CAPS.get_or_init(interim_answer);
+}
+
+/// #3439 — how long a start waits for the first answer before it connects with
+/// the interim one. Above every healthy host the field has read (`probe_ms` 50
+/// to 6811, `docs/encoders.md`), so such a host's hello carries its whole answer,
+/// as it always did. A starved host is online after this, while its children run.
+pub const FIRST_ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+/// #3439 — wait for the first answer, `within` at most. Whether it came.
+pub async fn first_answer_within(within: Duration) -> bool {
+    let mut news = news();
+    let came = async {
+        while !answered() {
+            if news.changed().await.is_err() {
+                return;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(within, came).await;
+    answered()
 }
 
 /// Whether this build carries ANY video encoder. A signalling-only build
@@ -275,6 +342,8 @@ mod child {
     /// until the next start. So it is long for a scheduler, and short for a
     /// device waiting to come online.
     const KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// #3439 — a child that took longer than this to start is said so in the log.
+    const SLOW_SPAWN: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// What the child hands back: the caps, plus the per-host verdicts the
     /// probe measured that are NOT wire capabilities.
@@ -1318,28 +1387,59 @@ mod child {
                 return None;
             }
         };
+        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
+        let phase = phase.map(|(_, v)| v.as_str());
+        // #3439 — on #3439's loaded guest the first child started 5 to 8 s after
+        // the cache miss. Said only when slow, so a field read can tell process
+        // creation itself from what came before it.
+        let spawn_took = started.elapsed();
+        if spawn_took > SLOW_SPAWN {
+            tracing::warn!(
+                spawn_ms = spawn_took.as_millis() as u64,
+                ?phase,
+                "caps probe: starting the probe child was slow; this host is busy"
+            );
+        }
+        // #3439 — the host's CPU from here, so a child that runs out of time can
+        // say whether it was starved or stuck.
+        let host_at_spawn = crate::encode::host_cpu::HostTimes::now();
         // #2717 — the child ends with this process: a worker told to stop
         // mid-probe leaves without waiting it out (`signaling::run`).
         #[cfg(windows)]
         let _ends_with_us = tie_to_this_process(&childp);
 
         let bounds = this.bounds;
+        let mut at_bound = None;
         let (waited, output) =
             wait_for_child(childp, bounds.child, bounds.kill_wait, this.stop, |c| {
+                at_bound = Some((
+                    crate::encode::host_cpu::HostTimes::now(),
+                    crate::encode::host_cpu::of_child(c),
+                ));
                 let _ = c.kill();
             });
+        let (host_at_bound, child_cpu) = at_bound.unwrap_or((None, None));
+        let ran = crate::encode::host_cpu::Ran::of(
+            host_at_spawn,
+            host_at_bound,
+            crate::encode::host_cpu::HostTimes::now(),
+            child_cpu,
+            bounds.child,
+        );
+        let idle_running = crate::encode::host_cpu::pct(ran.idle_running);
+        let idle_dying = crate::encode::host_cpu::pct(ran.idle_dying);
+        let child_cpu_ms = crate::encode::host_cpu::ms(ran.child_cpu);
         let Output {
             text: stdout,
             cut_off,
         } = output;
-        let phase = extra.iter().find(|(k, _)| *k == PHASE_ENV);
-        let phase = phase.map(|(_, v)| v.as_str());
         let last_open = last_progress(&stdout).unwrap_or_default();
         if cut_off {
             tracing::warn!(
                 kill_wait_s = bounds.kill_wait.as_secs(),
                 ?phase,
                 %last_open,
+                host_idle = %idle_running,
                 "caps probe: the child's stdout had not ended at the bound, so anything it wrote \
                  after that is lost, a report included. Something it started may hold the pipe, \
                  or this host is too busy to read it in time."
@@ -1348,21 +1448,53 @@ mod child {
         let status = match waited {
             Waited::Exited(status) => status,
             Waited::Hung { gone } => {
-                // A hung driver. Carry on without this phase.
-                if gone {
+                // A hung driver, or a host with no CPU to give it (#3439). Carry
+                // on without this phase.
+                if gone && ran.starved_running() {
                     tracing::warn!(
                         timeout_s = bounds.child.as_secs(),
                         ?phase,
                         %last_open,
+                        host_idle = %idle_running,
+                        child_cpu_ms = %child_cpu_ms,
+                        "caps probe: the probe child ran out of time on a host with no idle CPU, \
+                         so it was most likely starved rather than hung — the daemon is \
+                         unaffected."
+                    );
+                } else if gone {
+                    tracing::warn!(
+                        timeout_s = bounds.child.as_secs(),
+                        ?phase,
+                        %last_open,
+                        host_idle = %idle_running,
+                        child_cpu_ms = %child_cpu_ms,
                         "caps probe: the probe child hung — the daemon is unaffected; this is \
                          the process boundary doing its job."
                     );
+                } else if ran.starved_dying() {
+                    tracing::error!(
+                        timeout_s = bounds.child.as_secs(),
+                        kill_wait_s = bounds.kill_wait.as_secs(),
+                        ?phase,
+                        %last_open,
+                        host_idle = %idle_running,
+                        host_idle_while_dying = %idle_dying,
+                        child_cpu_ms = %child_cpu_ms,
+                        "caps probe: the probe child ran out of time and had not died by the end \
+                         of its kill wait, on a host with no idle CPU: most likely it was never \
+                         scheduled to finish, not stuck in a driver. Going on without it; the \
+                         daemon is unaffected."
+                    );
+                    stuck_reaches_the_daemon(this);
                 } else {
                     tracing::error!(
                         timeout_s = bounds.child.as_secs(),
                         kill_wait_s = bounds.kill_wait.as_secs(),
                         ?phase,
                         %last_open,
+                        host_idle = %idle_running,
+                        host_idle_while_dying = %idle_dying,
+                        child_cpu_ms = %child_cpu_ms,
                         "caps probe: the probe child hung and did not die when killed. It is \
                          most likely stuck in a kernel call in a driver, and stays until that \
                          call returns. Going on without it; the daemon is unaffected."
@@ -2252,6 +2384,9 @@ pub(crate) fn in_probe_child() -> bool {
 /// <10ms on boxes with no HW encoder); subsequent calls return the
 /// cached result, or a later try's if one was adopted (#3280). This never waits
 /// for a try.
+///
+/// ⚠️ The first call blocks until the probe answers, and so does every call made
+/// while it runs. The signalling loop reads [`answer_now`] instead (#3439).
 pub fn detect() -> AgentCaps {
     let first = CACHED_CAPS.get_or_init(|| {
         let caps = cached_or_probed();
@@ -2267,7 +2402,41 @@ pub fn detect() -> AgentCaps {
             short.as_ref(),
         )
     });
+    // #3439 — after the store, so a connection woken by it finds the answer.
+    FIRST_IS_NEWS.call_once(answer_moved);
     late_caps().unwrap_or_else(|| first.clone())
+}
+
+/// #3439 — the first probe, on a thread of its own, so the start does not wait
+/// for it: `signaling::run` waits [`FIRST_ANSWER_WAIT`] at most, then connects with
+/// the interim answer. Once per process, so a second organization's loop finds it
+/// running. Once the first answer exists, the same thread arms #3280's retry with
+/// `live`.
+///
+/// A thread and not `spawn_blocking`, for [`arm_retry`]'s reason: a runtime's
+/// shutdown waits on those, and `signaling::run` must be able to leave. A child
+/// still running then ends with the process (`child::tie_to_this_process`).
+///
+/// `false` when no thread could start: the caller probes in place, as before.
+pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return true;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("roomlerd-caps-probe".into())
+        .spawn(move || {
+            let _ = detect();
+            arm_retry(live);
+        });
+    match spawned {
+        Ok(_) => true,
+        Err(e) => {
+            STARTED.store(false, Ordering::SeqCst);
+            tracing::warn!(%e, "caps probe: no thread for the probe; the start waits for it");
+            false
+        }
+    }
 }
 
 /// What the daemon says over whatever `cached_or_probed` answered, on every
@@ -2294,6 +2463,29 @@ pub const LEARNED_CODE: &str = "learned-deny";
 /// #3280 — the same key's code on a host short of time with no cell to name, so
 /// that one with no hardware says why instead of looking like it has none.
 pub const SHORT_CODE: &str = "probe-short";
+/// #3439 — and on a host whose first probe has not answered yet, so a row that
+/// came online early says it is still probing rather than that it has no hardware.
+pub const PROBING_CODE: &str = "probing";
+
+/// #3439 — what a host says before its first probe has answered: what it says
+/// when no probe child comes back ([`cached_or_probed`]), everything that needs no
+/// driver, with the daemon's own words over it, and why the rest is missing.
+fn interim_answer() -> AgentCaps {
+    let caps = assigned_by_the_daemon(compute_caps(false, false), &HostFacts::here(), &[], None);
+    with_probing_word(caps)
+}
+
+fn with_probing_word(mut caps: AgentCaps) -> AgentCaps {
+    caps.unavailable.insert(
+        LEARNED_WORD.into(),
+        roomler_ai_remote_control::models::Unavailable::new(
+            PROBING_CODE,
+            "The capability probe is still running on this host, so this answer has only the \
+             encoders that need no driver. The hardware ones follow when it answers",
+        ),
+    );
+    caps
+}
 
 /// #3267 — a host that lost a cell to a driver fault says so: which cell, and
 /// how its probe child ended. The collapse this replaces went unnoticed for
@@ -2480,7 +2672,7 @@ fn watches_clipboard_images() -> bool {
 }
 
 /// FR-97 P3e-2 — see [`HostFacts::display_switchable`]. A virtual desktop is
-/// up before the hello (`main.rs` starts it before connecting).
+/// up before the hello (`app.rs` starts it before connecting).
 fn display_switchable() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -3261,7 +3453,7 @@ fn offered_forms(caps: &AgentCaps) -> std::collections::BTreeMap<String, bool> {
 /// finds the new answer.
 fn install_late(answer: AgentCaps) {
     *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
-    CAPS_GENERATION.fetch_add(1, Ordering::SeqCst);
+    answer_moved();
 }
 
 /// #3280 — a later try's child that would not die costs Media Foundation as a first
@@ -3625,41 +3817,30 @@ fn compute_caps(run_hw_probes: bool, attempt_444: bool) -> AgentCaps {
 /// build probes nothing and legitimately never reads them.
 #[allow(unused_variables)]
 fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -> AgentCaps {
-    // `mut` is only consumed inside the cfg-gated push blocks below
-    // (openh264-encoder / mf-encoder). Default-feature builds skip
-    // both blocks and the vecs stay empty; silence the unused-mut
-    // lint to keep the CI `cargo clippy --workspace -- -D warnings`
+    // FR-135 R9 — what the opens below find, kept apart from what the hello
+    // says about it: [`assemble`] writes the probed fields from this, and the
+    // cell table derives the same fields beside them (`cell_table::shadow`).
+    // `mut` is only consumed inside the cfg-gated blocks below. A
+    // default-feature build skips them all and finds nothing; silence the
+    // unused-mut lint to keep the CI `cargo clippy --workspace -- -D warnings`
     // build green on Linux.
     #[allow(unused_mut)]
-    let mut codecs: Vec<String> = Vec::new();
-    #[allow(unused_mut)]
-    let mut hw_encoders: Vec<String> = Vec::new();
-    // FR-77 — every cell (codec × chroma) this host OPENED, one entry per
-    // encoder (codec × backend). Filled next to the legacy fields, which keep
-    // their exact pre-FR-77 meaning; the cells carry the whole matrix.
-    #[allow(unused_mut)]
-    let mut video_cells: Vec<VideoCell> = Vec::new();
+    let mut found = ProbeFindings::default();
 
     #[cfg(feature = "openh264-encoder")]
     {
-        codecs.push("h264".into());
-        hw_encoders.push("openh264-sw".into());
         // Software by definition — needs no driver, so it is a cell even when
         // the hardware probes are not run.
-        video_cells.push(VideoCell::new(
-            VideoCodec::H264,
-            VideoBackend::Openh264,
-            &[ChromaFormat::Yuv420],
-            false,
-        ));
+        found.openh264 = true;
     }
 
     #[cfg(all(target_os = "windows", feature = "mf-encoder"))]
     if run_hw_probes {
         // #3267 — a denied MF cell is not opened, and its legacy label goes
-        // with it (the H.264 label below is enumeration-gated, so an open that
-        // is refused would not take it away).
+        // with it (the H.264 label is enumeration-gated, so an open that is
+        // refused would not take it away).
         let mf_deny = denied_cells();
+        let mut mf = super::cell_table::MfFindings::default();
         // H.264: enumeration is sufficient. If any H.264 MFT
         // enumerates the cascade always succeeds (at worst it falls
         // through to the default-adapter SW MFT via
@@ -3670,26 +3851,13 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
             && let Ok(adapters) = super::mf::probe_adapter_count()
             && adapters > 0
         {
-            hw_encoders.push("mf-h264-hw".into());
             // FR-77 — the cell must say whether the cascade lands on
-            // silicon, and only an activation knows (the legacy label above
-            // is enumeration-only and says `-hw` even for the SW MFT).
-            let probe = activates(CodecProbe::H264);
-            if !matches!(probe, ProbeResult::Failed) {
-                video_cells.push(VideoCell::new(
-                    VideoCodec::H264,
-                    VideoBackend::MediaFoundation,
-                    &[ChromaFormat::Yuv420],
-                    matches!(probe, ProbeResult::Hardware),
-                ));
-            }
+            // silicon, and only an activation knows (the legacy label is
+            // enumeration-only and says `-hw` even for the SW MFT).
+            mf.h264 = Some(activates(CodecProbe::H264).into());
         }
 
-        let allow_sw = allow_sw_heavy_override();
-        let advertise = |r: ProbeResult| -> bool {
-            matches!(r, ProbeResult::Hardware)
-                || (allow_sw && matches!(r, ProbeResult::SoftwareOnly))
-        };
+        mf.allow_sw_heavy = allow_sw_heavy_override();
 
         // HEVC: enumeration + real activation probe. MFTs that
         // enumerate but fail ActivateObject (driver/adapter
@@ -3698,22 +3866,13 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // before the encoder opens, so failure means black video not
         // fallback-decode. Gate advertising on a successful HW probe;
         // SW-only paths are dropped so H.264 wins negotiation
-        // (mediasoup-screenshare-grade quality on iGPU hosts).
+        // (mediasoup-screenshare-grade quality on iGPU hosts). The gate is
+        // `assemble`'s, on the verdict recorded here.
         if !cell_denied(&mf_deny, super::cells::MF_HEVC, ChromaFormat::Yuv420)
             && let Ok(adapters) = super::mf::probe_hevc_adapter_count()
             && adapters > 0
         {
-            let probe = activates(CodecProbe::Hevc);
-            if advertise(probe) {
-                codecs.push("h265".into());
-                hw_encoders.push("mf-h265-hw".into());
-                video_cells.push(VideoCell::new(
-                    VideoCodec::Hevc,
-                    VideoBackend::MediaFoundation,
-                    &[ChromaFormat::Yuv420],
-                    matches!(probe, ProbeResult::Hardware),
-                ));
-            }
+            mf.hevc = Some(activates(CodecProbe::Hevc).into());
         }
 
         // AV1: same reasoning as HEVC, with sharper impact — the
@@ -3726,27 +3885,10 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
             && let Ok(adapters) = super::mf::probe_av1_adapter_count()
             && adapters > 0
         {
-            let probe = activates(CodecProbe::Av1);
-            if advertise(probe) {
-                codecs.push("av1".into());
-                hw_encoders.push("mf-av1-hw".into());
-                video_cells.push(VideoCell::new(
-                    VideoCodec::Av1,
-                    VideoBackend::MediaFoundation,
-                    &[ChromaFormat::Yuv420],
-                    matches!(probe, ProbeResult::Hardware),
-                ));
-            }
+            mf.av1 = Some(activates(CodecProbe::Av1).into());
         }
+        found.mf = Some(mf);
     }
-
-    #[allow(unused_mut)]
-    let mut transports: Vec<String> = Vec::new();
-    // P7 — chroma formats the HEVC DC transport can emit (see the probe's
-    // Ok arm below + AgentCaps::hevc_chroma). Stays empty when the ffmpeg
-    // HEVC probe fails or the feature is off.
-    #[allow(unused_mut)]
-    let mut hevc_chroma: Vec<String> = Vec::new();
 
     // rc.77 — FFmpeg HEVC over DataChannel.
     //
@@ -3781,6 +3923,10 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         if !deny.is_empty() {
             tracing::info!(denied = ?deny, "caps probe: cells on the denylist are not opened");
         }
+        let mut ff = super::cell_table::FfmpegFindings {
+            qsv_hw,
+            ..Default::default()
+        };
 
         // rc.83 — probe vp9_qsv to surface in caps + heartbeat whether
         // this host can use Intel HW VP9. The transport advertisement
@@ -3812,7 +3958,6 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                         elapsed_ms = start_vp9.elapsed().as_millis(),
                         "caps probe: ffmpeg VP9 (vp9_qsv) encoder activates — runtime peer dispatch will prefer it over libvpx SW on data-channel-vp9-444 sessions"
                     );
-                    hw_encoders.push(format!("ffmpeg-{name}"));
                     // FR-77 — the VP9 cell. 4:4:4 (profile 1) is attempted
                     // when the FFmpeg source matrix allows it for this name
                     // and the cell is not denylisted; today the open asks for
@@ -3821,28 +3966,25 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                     // that format. The session pump keeps vp9_qsv 4:2:0-only
                     // regardless (`peer.rs`).
                     let mut chroma = vec![ChromaFormat::Yuv420];
-                    if let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) {
-                        if attempt_444
-                            && ffmpeg_444_capable(name)
-                            && !cell_denied(&deny, name, ChromaFormat::Yuv444)
-                        {
-                            match announced_open(name, ChromaFormat::Yuv444, || {
-                                FfmpegEncoder::new_named_probe(
-                                    name,
-                                    PROBE_WIDTH,
-                                    PROBE_HEIGHT,
-                                    true,
-                                )
+                    if VideoBackend::from_ffmpeg_name(name).is_some()
+                        && attempt_444
+                        && ffmpeg_444_capable(name)
+                        && !cell_denied(&deny, name, ChromaFormat::Yuv444)
+                    {
+                        match announced_open(name, ChromaFormat::Yuv444, || {
+                            FfmpegEncoder::new_named_probe(name, PROBE_WIDTH, PROBE_HEIGHT, true)
                                 .map(drop)
-                            }) {
-                                Ok(()) => chroma.push(ChromaFormat::Yuv444),
-                                Err(e) => {
-                                    tracing::debug!(encoder = name, %e, "caps probe: 4:4:4 cell did not open")
-                                }
+                        }) {
+                            Ok(()) => chroma.push(ChromaFormat::Yuv444),
+                            Err(e) => {
+                                tracing::debug!(encoder = name, %e, "caps probe: 4:4:4 cell did not open")
                             }
                         }
-                        video_cells.push(VideoCell::new(cell_codec, backend, &chroma, qsv_hw));
                     }
+                    ff.vp9 = Some(super::cell_table::Opened {
+                        name: name.to_string(),
+                        chroma,
+                    });
                     // P4 — measure whether THIS host's vp9_qsv honours
                     // runtime forced IDRs, per low_power mode. Hosts that
                     // do get GOP 64800 + on-demand-only keys (kills the
@@ -3912,12 +4054,12 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
             }
             let start = std::time::Instant::now();
             let mut winner: Option<&'static str> = None;
-            let mut winner_has_444 = false;
+            let mut opened: Vec<super::cell_table::Opened> = Vec::new();
             for name in FfmpegEncoder::cascade_names(codec) {
                 // A table name outside the vocabulary would open and then
                 // advertise nothing; `every_cascade_name_is_in_the_cell_vocabulary`
                 // makes that a test failure rather than a silent hole.
-                let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(name) else {
+                let Some((_, backend)) = VideoBackend::from_ffmpeg_name(name) else {
                     continue;
                 };
                 // FR-77 P4 — the denylist is the kill switch for BOTH chroma
@@ -3972,9 +4114,11 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                         );
                         if winner.is_none() {
                             winner = Some(name);
-                            winner_has_444 = chroma.contains(&ChromaFormat::Yuv444);
                         }
-                        video_cells.push(VideoCell::new(cell_codec, backend, &chroma, hw));
+                        opened.push(super::cell_table::Opened {
+                            name: name.to_string(),
+                            chroma,
+                        });
                     }
                     Err(e) => {
                         // A backend the host lacks failing is the matrix doing
@@ -3984,62 +4128,41 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                 }
             }
             let elapsed_ms = start.elapsed().as_millis();
+            // What each winner advertises is `assemble`'s.
             match (codec, winner) {
-                (VideoCodec::Hevc, Some(name)) => {
-                    tracing::info!(
-                        encoder = name,
-                        elapsed_ms,
-                        "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
-                    );
-                    if !codecs.iter().any(|c| c == "h265") {
-                        codecs.push("h265".into());
-                    }
-                    transports.push("data-channel-hevc".into());
-                    hw_encoders.push(format!("ffmpeg-{name}"));
-                    // P7 — the session's 4:4:4 (Rext) path tries `hevc_nvenc`
-                    // only, so the legacy field says 4:4:4 only when THAT
-                    // backend won AND its 4:4:4 open succeeded just now.
-                    hevc_chroma.push("yuv420".into());
-                    if name == "hevc_nvenc" && winner_has_444 {
-                        hevc_chroma.push("yuv444".into());
-                    }
-                }
+                (VideoCodec::Hevc, Some(name)) => tracing::info!(
+                    encoder = name,
+                    elapsed_ms,
+                    "caps probe: ffmpeg HEVC encoder activates — advertising h265 + data-channel-hevc"
+                ),
                 (VideoCodec::Hevc, None) => tracing::warn!(
                     elapsed_ms,
                     "caps probe: ffmpeg HEVC encoder failed to init — NOT advertising data-channel-hevc"
                 ),
-                (VideoCodec::Av1, Some(name)) => {
-                    tracing::info!(
-                        encoder = name,
-                        elapsed_ms,
-                        "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
-                    );
-                    if !codecs.iter().any(|c| c == "av1") {
-                        codecs.push("av1".into());
-                    }
-                    transports.push("data-channel-av1".into());
-                    hw_encoders.push(format!("ffmpeg-{name}"));
-                }
+                (VideoCodec::Av1, Some(name)) => tracing::info!(
+                    encoder = name,
+                    elapsed_ms,
+                    "caps probe: ffmpeg AV1 encoder activates — advertising av1 + data-channel-av1"
+                ),
                 (VideoCodec::Av1, None) => tracing::info!(
                     elapsed_ms,
                     "caps probe: ffmpeg AV1 encoder not available (no AV1 encode silicon on this host) — NOT advertising data-channel-av1"
                 ),
-                (VideoCodec::H264, Some(name)) => {
-                    tracing::info!(
-                        encoder = name,
-                        elapsed_ms,
-                        "caps probe: ffmpeg H.264 encoder activates — advertising data-channel-h264"
-                    );
-                    transports.push("data-channel-h264".into());
-                    hw_encoders.push(format!("ffmpeg-{name}"));
-                }
+                (VideoCodec::H264, Some(name)) => tracing::info!(
+                    encoder = name,
+                    elapsed_ms,
+                    "caps probe: ffmpeg H.264 encoder activates — advertising data-channel-h264"
+                ),
                 (VideoCodec::H264, None) => tracing::info!(
                     elapsed_ms,
                     "caps probe: ffmpeg H.264 HW encoder not available — H.264 sessions stay on the RTP track"
                 ),
                 (VideoCodec::Vp9, _) => {}
             }
+            ff.matrix
+                .push(super::cell_table::CodecOpened { codec, opened });
         }
+        found.ffmpeg = Some(ff);
     }
 
     #[cfg(feature = "vp9-444")]
@@ -4059,30 +4182,32 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
                     elapsed_ms = start.elapsed().as_millis(),
                     "caps probe: vp9-444 libvpx encoder activates — advertising data-channel-vp9-444 transport"
                 );
-                transports.push("data-channel-vp9-444".into());
-                hw_encoders.push("libvpx-vp9-444-sw".into());
                 // FR-77 — the libvpx cell: profile 0 (4:2:0) is opened for
                 // real too, so the cell claims only what opened.
-                let mut chroma = Vec::new();
-                match announced_open(super::cells::LIBVPX_VP9, ChromaFormat::Yuv420, || {
-                    crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
-                        PROBE_WIDTH,
-                        PROBE_HEIGHT,
-                        30,
-                        crate::encode::libvpx::Vp9Chroma::Yuv420,
-                    )
-                    .map(drop)
-                }) {
-                    Ok(()) => chroma.push(ChromaFormat::Yuv420),
-                    Err(e) => tracing::debug!(%e, "caps probe: libvpx 4:2:0 cell did not open"),
-                }
-                chroma.push(ChromaFormat::Yuv444);
-                video_cells.push(VideoCell::new(
-                    VideoCodec::Vp9,
-                    VideoBackend::Libvpx,
-                    &chroma,
-                    false,
-                ));
+                let yuv420 =
+                    match announced_open(super::cells::LIBVPX_VP9, ChromaFormat::Yuv420, || {
+                        crate::encode::libvpx::Vp9Encoder::new_with_fps_chroma(
+                            PROBE_WIDTH,
+                            PROBE_HEIGHT,
+                            30,
+                            crate::encode::libvpx::Vp9Chroma::Yuv420,
+                        )
+                        .map(drop)
+                    }) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::debug!(%e, "caps probe: libvpx 4:2:0 cell did not open");
+                            false
+                        }
+                    };
+                found.libvpx = Some(super::cell_table::LibvpxFindings {
+                    yuv420,
+                    // rc.61 — the chroma the transport emits (`assemble` puts
+                    // it in `vp9_chroma`).
+                    vp9_chroma: crate::encode::libvpx::vp9_chroma_from_env()
+                        .as_str()
+                        .to_string(),
+                });
             }
             Err(e) => {
                 tracing::warn!(
@@ -4098,24 +4223,11 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
     // from `files_caps()` in the daemon — `browse` follows a config flag the
     // caps-probe child never loads (#1672); see that function.
 
-    // rc.61 — surface VP9 chroma format in caps so the browser worker
-    // picks the right codec string for VideoDecoder.configure(). Empty
-    // when vp9-444 transport isn't advertised (so we don't lie to the
-    // client about a format we don't emit).
-    let vp9_chroma: String = if transports.iter().any(|t| t == "data-channel-vp9-444") {
-        #[cfg(feature = "vp9-444")]
-        {
-            crate::encode::libvpx::vp9_chroma_from_env()
-                .as_str()
-                .to_string()
-        }
-        #[cfg(not(feature = "vp9-444"))]
-        {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
+    // FR-135 R9 — the probed fields, from what the opens above found; and the
+    // cell table's derivation of the same fields beside them, which says so
+    // in the log if the two ever differ and does nothing else.
+    let probed = assemble(&found);
+    super::cell_table::shadow(&found, &probed);
 
     // Audio track advertisement. Only when the `audio` feature is
     // compiled in do we offer a WebRTC Opus track (system/desktop
@@ -4204,8 +4316,8 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
     }
 
     AgentCaps {
-        hw_encoders,
-        codecs,
+        hw_encoders: probed.hw_encoders,
+        codecs: probed.codecs,
         // Was `cfg!(feature = "enigo-input")` — a COMPILE-TIME constant, so a
         // Mac with Accessibility denied still advertised working input while
         // silently dropping every event. The feature must be compiled in AND
@@ -4217,7 +4329,7 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         supports_clipboard: cfg!(feature = "clipboard"),
         supports_file_transfer: true,
         max_simultaneous_sessions: rc_max_sessions(),
-        transports,
+        transports: probed.transports,
         // FR-17 — this build frames every DataChannel message, so a
         // receiver can reassemble without relying on the channel being
         // ordered. Advertised unconditionally: it is a property of the
@@ -4226,15 +4338,15 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // Empty in the child's struct BY DESIGN; `detect()` fills it in the
         // daemon (`files_caps`). A test locks this.
         files: Vec::new(),
-        vp9_chroma,
-        hevc_chroma,
+        vp9_chroma: probed.vp9_chroma,
+        hevc_chroma: probed.hevc_chroma,
         audio,
         // Empty in the child's struct BY DESIGN; `detect()` fills it in the
         // daemon (`apps_caps`). A test locks this.
         apps: Vec::new(),
         clipboard,
         layout,
-        video_cells,
+        video_cells: probed.video_cells,
         // Stamped by the PARENT after the child reports (`child::probe`);
         // the driver-free fallback has no probe to time.
         probe_ms: None,
@@ -4276,6 +4388,215 @@ fn compute_caps_with(run_hw_probes: bool, attempt_444: bool, run_libvpx: bool) -
         // (`with_honest_words`), like the config lists above.
         unavailable: Default::default(),
     }
+}
+
+/// FR-135 R9 — the probed fields from what [`compute_caps_with`]'s opens found:
+/// the pushes it used to make inline, in the same order and on the same
+/// conditions, so a fixture can be handed to the code that writes the real
+/// hello (`cell_table`'s gate). Each block is the probe's block of the same name.
+pub(crate) fn assemble(found: &ProbeFindings) -> ProbedFields {
+    use super::cell_table::{Activation, Opened};
+
+    let mut codecs: Vec<String> = Vec::new();
+    let mut hw_encoders: Vec<String> = Vec::new();
+    // FR-77 — every cell (codec × chroma) this host OPENED, one entry per
+    // encoder (codec × backend). Filled next to the legacy fields, which keep
+    // their exact pre-FR-77 meaning; the cells carry the whole matrix.
+    let mut video_cells: Vec<VideoCell> = Vec::new();
+    let mut transports: Vec<String> = Vec::new();
+    // P7 — chroma formats the HEVC DC transport can emit (see the HEVC arm
+    // below + AgentCaps::hevc_chroma). Stays empty when the ffmpeg HEVC probe
+    // fails or the feature is off.
+    let mut hevc_chroma: Vec<String> = Vec::new();
+
+    if found.openh264 {
+        codecs.push("h264".into());
+        hw_encoders.push("openh264-sw".into());
+        video_cells.push(VideoCell::new(
+            VideoCodec::H264,
+            VideoBackend::Openh264,
+            &[ChromaFormat::Yuv420],
+            false,
+        ));
+    }
+
+    if let Some(mf) = &found.mf {
+        // H.264: the label is enumeration's, so it stands even when the
+        // activation failed; the cell is the activation's.
+        if let Some(probe) = mf.h264 {
+            hw_encoders.push("mf-h264-hw".into());
+            if probe != Activation::Failed {
+                video_cells.push(VideoCell::new(
+                    VideoCodec::H264,
+                    VideoBackend::MediaFoundation,
+                    &[ChromaFormat::Yuv420],
+                    probe == Activation::Hardware,
+                ));
+            }
+        }
+        // HEVC and AV1: advertised on a hardware activation, or on a software
+        // one under `ROOMLERD_ALLOW_SW_HEAVY` (the probe block says why).
+        let advertise = |r: Activation| -> bool {
+            r == Activation::Hardware || (mf.allow_sw_heavy && r == Activation::SoftwareOnly)
+        };
+        if let Some(probe) = mf.hevc
+            && advertise(probe)
+        {
+            codecs.push("h265".into());
+            hw_encoders.push("mf-h265-hw".into());
+            video_cells.push(VideoCell::new(
+                VideoCodec::Hevc,
+                VideoBackend::MediaFoundation,
+                &[ChromaFormat::Yuv420],
+                probe == Activation::Hardware,
+            ));
+        }
+        if let Some(probe) = mf.av1
+            && advertise(probe)
+        {
+            codecs.push("av1".into());
+            hw_encoders.push("mf-av1-hw".into());
+            video_cells.push(VideoCell::new(
+                VideoCodec::Av1,
+                VideoBackend::MediaFoundation,
+                &[ChromaFormat::Yuv420],
+                probe == Activation::Hardware,
+            ));
+        }
+    }
+
+    if let Some(ff) = &found.ffmpeg {
+        // rc.83 — the first FFmpeg VP9 encoder that opened. Its cell takes
+        // `hw` from the QSV check whatever its backend (ledger enc:I185).
+        if let Some(vp9) = &ff.vp9 {
+            hw_encoders.push(format!("ffmpeg-{}", vp9.name));
+            if let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(&vp9.name) {
+                video_cells.push(VideoCell::new(cell_codec, backend, &vp9.chroma, ff.qsv_hw));
+            }
+        }
+        // FR-77 — the MATRIX: every encoder that opened is a cell, and the
+        // legacy fields keep their pre-FR-77 meaning, the FIRST backend in
+        // cascade order that opened.
+        for probed in &ff.matrix {
+            let mut winner: Option<&Opened> = None;
+            for opened in &probed.opened {
+                let Some((cell_codec, backend)) = VideoBackend::from_ffmpeg_name(&opened.name)
+                else {
+                    continue;
+                };
+                let hw = match backend {
+                    VideoBackend::Qsv => ff.qsv_hw,
+                    _ => true,
+                };
+                if winner.is_none() {
+                    winner = Some(opened);
+                }
+                video_cells.push(VideoCell::new(cell_codec, backend, &opened.chroma, hw));
+            }
+            let Some(winner) = winner else {
+                continue;
+            };
+            let name = winner.name.as_str();
+            match probed.codec {
+                VideoCodec::Hevc => {
+                    if !codecs.iter().any(|c| c == "h265") {
+                        codecs.push("h265".into());
+                    }
+                    transports.push("data-channel-hevc".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                    // P7 — the session's 4:4:4 (Rext) path tries `hevc_nvenc`
+                    // only, so the legacy field says 4:4:4 only when THAT
+                    // backend won AND its 4:4:4 open succeeded.
+                    hevc_chroma.push("yuv420".into());
+                    if name == "hevc_nvenc" && winner.chroma.contains(&ChromaFormat::Yuv444) {
+                        hevc_chroma.push("yuv444".into());
+                    }
+                }
+                VideoCodec::Av1 => {
+                    if !codecs.iter().any(|c| c == "av1") {
+                        codecs.push("av1".into());
+                    }
+                    transports.push("data-channel-av1".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                VideoCodec::H264 => {
+                    transports.push("data-channel-h264".into());
+                    hw_encoders.push(format!("ffmpeg-{name}"));
+                }
+                VideoCodec::Vp9 => {}
+            }
+        }
+    }
+
+    // Phase Y.4 — libvpx: the transport and its label on the 4:4:4 open, and
+    // the cell with whichever forms opened.
+    if let Some(vpx) = &found.libvpx {
+        transports.push("data-channel-vp9-444".into());
+        hw_encoders.push("libvpx-vp9-444-sw".into());
+        let mut chroma = Vec::new();
+        if vpx.yuv420 {
+            chroma.push(ChromaFormat::Yuv420);
+        }
+        chroma.push(ChromaFormat::Yuv444);
+        video_cells.push(VideoCell::new(
+            VideoCodec::Vp9,
+            VideoBackend::Libvpx,
+            &chroma,
+            false,
+        ));
+    }
+
+    // rc.61 — surface VP9 chroma format in caps so the browser worker
+    // picks the right codec string for VideoDecoder.configure(). Empty
+    // when vp9-444 transport isn't advertised (so we don't lie to the
+    // client about a format we don't emit).
+    let vp9_chroma = if transports.iter().any(|t| t == "data-channel-vp9-444") {
+        found
+            .libvpx
+            .as_ref()
+            .map(|v| v.vp9_chroma.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    ProbedFields {
+        hw_encoders,
+        codecs,
+        transports,
+        vp9_chroma,
+        hevc_chroma,
+        video_cells,
+    }
+}
+
+/// FR-135 R9 — the production path's two children, for the cell table's gate:
+/// `base` answers the 4:2:0 matrix, the `444` child opens what
+/// [`child::candidates_444`] asks of it, and [`child::merge_444`] folds that
+/// in. `found` stands for what each child would have opened.
+#[cfg(test)]
+pub(crate) fn assemble_in_two_children(found: &ProbeFindings, deny: &[String]) -> ProbedFields {
+    let base = assemble(&found.base_phase());
+    let mut report = child::ProbeReport {
+        caps: AgentCaps {
+            hw_encoders: base.hw_encoders,
+            codecs: base.codecs,
+            transports: base.transports,
+            vp9_chroma: base.vp9_chroma,
+            hevc_chroma: base.hevc_chroma,
+            video_cells: base.video_cells,
+            ..AgentCaps::default()
+        },
+        vp9_qsv_idr: None,
+        gpu_input: Vec::new(),
+    };
+    let opened = found.opened_444();
+    let ok: Vec<String> = child::candidates_444(&report.caps, deny)
+        .into_iter()
+        .filter(|name| opened.contains(name))
+        .collect();
+    child::merge_444(&mut report, &ok);
+    ProbedFields::of(&report.caps)
 }
 
 /// FR-56 — the Remote Apps verbs, assigned by [`detect`] in the DAEMON and
@@ -4345,7 +4666,7 @@ fn apps_caps_for(cfg: &crate::apps::VirtualDesktopAppsConfig) -> Vec<String> {
 /// which is why the daemon must fill the list and not merely append to it.
 ///
 /// A boot-time snapshot in `detect()` is the honest home: the flag is stored
-/// once by `main.rs::run_cmd` before the signalling loop starts and is not
+/// once by `app.rs::run_cmd` before the signalling loop starts and is not
 /// live (`config_surface.rs` says so; no LocalAPI `ConfigSet` re-seeds it) —
 /// unlike `record`, whose gate IS live and is therefore filled at every
 /// announcement by `signaling::stub_caps`.
@@ -4456,13 +4777,6 @@ fn rpc_caps() -> Vec<String> {
         // hold the caller for it. A property of the BUILD, like `ssh`: the
         // ack is sent even when the device refuses — that is the point.
         caps.push(RpcCap::SshGrantAck);
-        // FR-90 P3-8-2a. This build's SSH server holds an agent session's
-        // grant (`one_command`) to ONE `exec` and nothing else. Distinct from
-        // `ssh`, its prefix, because every build before it would read past
-        // the field and serve that session's key a shell: the server sends a
-        // session's grant only to a device that says this. A property of the
-        // BUILD; the SYSTEM service says it for itself, when it publishes.
-        caps.push(RpcCap::SshOneCommand);
     }
     // FR-52 P4 — this build can ADMIT an external session: bind it to a
     // verified login, check its offer's MAC, seal its answer. The server opens
@@ -4493,136 +4807,6 @@ fn rpc_caps() -> Vec<String> {
     // refuse (`overlay_key_rotation=false`), and says so in its report.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     caps.push(RpcCap::KeyRotate);
-    // FR-90 — a build that runs agent sessions answers `rc:hive.start` and
-    // reports with `rc:hive.state`. A property of the BUILD, like `ssh`: the
-    // device still refuses unless its owner switched `hive_enabled` on, and
-    // says so in the ack. Every `hive_host` build: Linux, macOS, Windows.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::Hive);
-    // FR-90 P0d-2 — and serves a session's transcript to a browser over a
-    // viewer peer: answers `rc:hive.view.grant` before the browser dials.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveView);
-    // FR-90 P1e — and understands a session's core memory (`rc:hive.memory`).
-    // A property of the BUILD: whether a session ever sees it is the device's
-    // own `hive_core_memory`, default off.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveMemory);
-    // FR-90 P1j — and mirrors terminal sessions its people adopted. NOT a
-    // property of the build alone: advertised only while the device's owner
-    // allows it (`hive_adopt`), and the server honours an offer only from a
-    // connection that advertises it.
-    #[cfg(hive_host)]
-    if crate::hive::adopt_enabled() {
-        caps.push(RpcCap::HiveAdopt);
-    }
-    // FR-90 P2c-3 — and holds copies of its owner's sessions run elsewhere:
-    // answers `rc:hive.replica.join`. Not a property of the build alone:
-    // only while the owner's `hive_replica` is on and the store is open, and
-    // on the primary enrollment's connection only (the hello strips both
-    // words from any other). `hive-archive` only ever with it.
-    #[cfg(hive_host)]
-    if crate::hive::replica_enabled() {
-        caps.push(RpcCap::HiveReplica);
-    }
-    #[cfg(hive_host)]
-    if crate::hive::archive_enabled() {
-        caps.push(RpcCap::HiveArchive);
-    }
-    // FR-90 P2i-1 — and answers a search over those copies, as an archive
-    // replica: `hive-search`, only with `hive-archive` and `hive-replica`,
-    // which the device's own gate asks again at each grant.
-    #[cfg(hive_host)]
-    if crate::hive::archive_enabled() && crate::hive::replica_enabled() {
-        caps.push(RpcCap::HiveSearch);
-    }
-    // FR-90 P2d-3b — and carries the replica stream: serves a member's grant
-    // as a source and follows a dial as a member. While its store is open,
-    // whatever its owner says of holding copies: a primary serves its own
-    // sessions' members. Stripped from any connection but the primary
-    // enrollment's (the hello), like every Hive word.
-    #[cfg(hive_host)]
-    if crate::hive::stream_enabled() {
-        caps.push(RpcCap::HiveStream);
-    }
-    // FR-90 P2e-2 — and holds a leased session to the server's word on each
-    // connection (`rc:hive.lease`): after a restart or a reconnect it runs
-    // one only once the server has said so there. A property of the BUILD,
-    // like `hive`, and kept on a secondary org's connection like it: that
-    // org's Hive frames are refused there either way.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveLease);
-    // FR-90 P2e-5c — and takes part in a promotion at either end: as the
-    // primary it drains (`rc:hive.drain`), as the member it prepares
-    // (`rc:hive.prepare`) and takes the session over from its copy at the
-    // move (`rc:hive.move`), and its joins take where each superseded fence
-    // ended (P2e-5b). A property of the BUILD, like `hive-lease`: the device
-    // still refuses a drain or a prepare its own gates do not pass, in its
-    // own words, and a secondary org's connection refuses both.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePromote);
-    // FR-90 P2f-1a — and takes part in a teleport, a move to a device that
-    // holds no copy yet: as the target, a teleport's prepare passes every
-    // start gate but the copy and admits that one session's join, whatever
-    // `hive_replica` says; as the primary, a join in the primary's role
-    // checkpoints at once when no turn runs and says where its copy ends. A
-    // property of the BUILD, like `hive-promote`, and kept on a secondary
-    // org's connection like it: no placement chooses a teleport's target, and
-    // that org's prepare and join are refused there either way.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveTeleport);
-    // FR-90 P2f-3a — and starts a fork of a session it holds a copy of: a
-    // start carrying `fork_of` takes the parent's last checkpoint under the
-    // fork's ids and launches `--resume <parent> --fork-session --session-id
-    // <fork>`. A property of the BUILD; a build before it would start the
-    // fork empty.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HiveFork);
-    // FR-90 P2f-4a — and makes a terminal session it adopted, whose terminal
-    // ended here, a managed one: a start carrying `from_terminal` puts the
-    // terminal's own history in place as the account it ran as, by this
-    // device's record of whose terminal it was, and resumes it. A property of
-    // the BUILD, Unix only: Windows adopts since FR-97 P4c, but putting a
-    // terminal's history in place runs as the account through Unix tools. The
-    // device's start gates still decide, `hive_enabled` first.
-    #[cfg(all(hive_host, unix))]
-    caps.push(RpcCap::HiveManage);
-    // FR-90 P2g-1 — and purges a session on `rc:hive.purge`, answering per
-    // part: its own copy, then as the session's account its state directory
-    // and its checkpoints' refs. A property of the BUILD, on every platform
-    // that runs sessions.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurge);
-    // FR-90 P2g-4a — and purges every session it holds on
-    // `rc:hive.purge_all`, which its enrollment's removal sends. A property
-    // of the BUILD, as `hive-purge` is.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurgeAll);
-    // #2294 — and finishes that purge before it exits on the removal's
-    // goodbye (`hive::finish_removal_purge`), so the server's kick may tell
-    // it. A property of the BUILD, as `hive-purge-all` is.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::HivePurgeDrain);
-    // FR-90 P4-3b-1 — and scans the roots its owner lists on
-    // `rc:knowhow.scan`, each as the account that owns it. A property of the
-    // BUILD, as `hive-purge` is: an empty `knowhow_scan_roots` is an answer
-    // (`no_roots`), never a reason to stay silent. Linux and macOS; Windows
-    // advertises it from P4-3b-4.
-    #[cfg(all(hive_host, unix))]
-    caps.push(RpcCap::KnowhowScan);
-    // FR-90 P4-4-1b — and its sessions can ask the organization's map, so
-    // its server tells it at each hello whether the map is there for them
-    // (`rc:knowhow.served`, decision 49). A property of the BUILD: every OS
-    // that runs sessions, the toolbelt's tools apart from the scanner.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::KnowhowTools);
-    // FR-90 P4-5-1b — and probes, on `rc:knowhow.probe`, what the map says
-    // within what its owner lists in `knowhow_probe_reach`. A property of the
-    // BUILD, as `knowhow-scan` is: an empty list is an answer
-    // (`not_allowed`), never a reason to stay silent. Every OS that runs
-    // sessions.
-    #[cfg(hive_host)]
-    caps.push(RpcCap::KnowhowProbe);
     // ⚠️ FR-99's `privacy-*` words are NOT here: this list is memoized at boot
     // (`detect()`), and those follow the owner's live gate and the overlay
     // coming up. `signaling::stub_caps` adds them at every announcement.
@@ -4697,6 +4881,18 @@ enum ProbeResult {
     SoftwareOnly,
     /// No working encoder found at all. Caller MUST drop from caps.
     Failed,
+}
+
+/// FR-135 R9 — the verdict as the probe's findings record it.
+#[cfg(all(target_os = "windows", feature = "mf-encoder"))]
+impl From<ProbeResult> for super::cell_table::Activation {
+    fn from(r: ProbeResult) -> Self {
+        match r {
+            ProbeResult::Hardware => Self::Hardware,
+            ProbeResult::SoftwareOnly => Self::SoftwareOnly,
+            ProbeResult::Failed => Self::Failed,
+        }
+    }
 }
 
 /// How long [`activates`] waits for an MF encoder's worker to finish its
@@ -5012,14 +5208,6 @@ mod tests {
             advertised.iter().any(|v| v == RpcCap::SshGrantAck.wire()),
             cfg!(feature = "ssh-server"),
             "ssh-grant-ack must be advertised exactly when the SSH server is built"
-        );
-        // FR-90 P3-8-2a — and so does one command: the server sends an agent
-        // session's grant only where this is said, and the SSH server is what
-        // holds it there.
-        assert_eq!(
-            advertised.iter().any(|v| v == RpcCap::SshOneCommand.wire()),
-            cfg!(feature = "ssh-server"),
-            "ssh-one-command must be advertised exactly when the SSH server is built"
         );
         // FR-97 P5a — `console-user` on every Unix build and never on
         // Windows, whose `console_user` is its SYSTEM service's: a Windows
@@ -9681,5 +9869,61 @@ mod tests {
         let answered = assigned_by_the_daemon(p0c_caps(), &facts, &[], None);
         let over = word_after_the_climb(answered, &[]);
         assert!(!over.unavailable.contains_key(LEARNED_WORD));
+    }
+
+    /// #3439 — a host that came online before its first answer says it is still
+    /// probing, and offers nothing that needs a driver or an encoder open: no
+    /// hardware cell, no DataChannel transport.
+    #[test]
+    fn the_interim_answer_says_the_probe_is_still_running() {
+        let _fixture = probe_fixture();
+        let caps = interim_answer();
+        let word = &caps.unavailable[LEARNED_WORD];
+        assert_eq!(word.code, PROBING_CODE);
+        assert!(word.reason.contains("still running"), "{}", word.reason);
+        assert!(
+            caps.video_cells.iter().all(|c| !c.hw),
+            "{:?}",
+            caps.video_cells
+        );
+        assert!(caps.transports.is_empty(), "{:?}", caps.transports);
+        assert_eq!(caps.probe_ms, None);
+        assert!(!caps.probe_cached);
+        // The daemon's own lists, as on every other path.
+        assert_eq!(caps.files, files_caps());
+    }
+
+    /// #3439 — an answer that moves wakes every connection, with the generation
+    /// already moved, so whoever wakes reads the new one.
+    #[test]
+    fn a_moved_answer_wakes_every_connection() {
+        let _fixture = probe_fixture();
+        let (mut one, mut two) = (news(), news());
+        let before = generation();
+        answer_moved();
+        assert_eq!(generation(), before + 1);
+        for news in [&mut one, &mut two] {
+            assert!(
+                news.has_changed()
+                    .expect("the sender lives as long as the process")
+            );
+            assert_eq!(*news.borrow_and_update(), before + 1);
+        }
+    }
+
+    /// #3439 — the start's wait for a first answer is a bound, not a wait for the
+    /// probe. No test in this binary runs the probe, so nothing answers here.
+    #[test]
+    fn the_wait_for_a_first_answer_ends_at_its_bound() {
+        if answered() {
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let started = Instant::now();
+        assert!(!rt.block_on(first_answer_within(Duration::from_millis(50))));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

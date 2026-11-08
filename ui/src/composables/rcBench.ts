@@ -361,11 +361,34 @@ export function readVideoProbe(video: HTMLVideoElement): number | null {
 
 // ── the `rc.l4` record ──────────────────────────────────────────────────────
 
+/** FR-135 R0 (N2) — what a batch measured, on the record itself: the agent's
+ *  logs keep seven days, so a record that needs a join to say which cell it
+ *  timed soon says nothing. Each is absent when the viewer did not know it. */
+export interface RcL4Join {
+  /** The rate the stream runs at: `rc:video-info`'s `fps`, else the grant in
+   *  the media plan. */
+  targetFps?: number | null
+  /** The decoded frame's size. */
+  width?: number | null
+  height?: number | null
+  /** `rc:video-info`'s `codec` (`h265`, `vp9`, `av1`, `h264`) and `chroma`. */
+  codec?: string | null
+  chroma?: string | null
+  /** `direct` or `relay`: `rc:video-info`'s `transport`, the agent's verdict on
+   *  whether the path is constrained. Coarser than the session row's carrier. */
+  carrier?: string | null
+  /** A decode worker's renderer: `2d`, `fsr` or `rcas`. */
+  render?: string | null
+  /** Whether the browser says the decode worker's decoder is hardware. */
+  decoderHw?: boolean | null
+}
+
 export interface RcL4UploadContext {
   tenantId: string | null
   agentOrgId?: string | null
   agentId: string | null
   sessionId: string | null
+  join?: RcL4Join | null
 }
 
 export interface RcL4RecordFields {
@@ -381,6 +404,15 @@ export interface RcL4RecordFields {
   rtt_ms: number[]
   agent_id: string | null
   agent_org_id?: string
+  /** FR-135 R0 (N2) — the join (`RcL4Join`), each absent when not known. */
+  target_fps?: number
+  width?: number
+  height?: number
+  codec?: string
+  chroma?: string
+  carrier?: string
+  render?: string
+  decoder_hw?: boolean
 }
 
 export interface RcL4UploadBody {
@@ -400,6 +432,8 @@ export interface RcL4UploadBody {
 
 const OBJECT_ID_HEX = /^[0-9a-f]{24}$/
 const hexOrNull = (v: string | null | undefined) => (v && OBJECT_ID_HEX.test(v) ? v : null)
+/** A name the record may carry: the agent's and the worker's own words. */
+const RECORD_NAME = /^[a-z0-9][a-z0-9_.-]{0,31}$/
 const tenth = (v: number | null) => (v === null ? null : Math.round(v * 10) / 10)
 
 export function formatBenchLine(s: BenchStats, paths: readonly BenchPath[]): string {
@@ -431,6 +465,31 @@ export function buildL4Upload(
   }
   const agentOrg = hexOrNull(ctx.agentOrgId)
   if (agentOrg && agentOrg !== tenantId) fields.agent_org_id = agentOrg
+  // FR-135 R0 (N2) — the join. Still timing metadata only: whole numbers and
+  // short lowercase names, and anything else is left out.
+  const j = ctx.join
+  if (j) {
+    const whole = (v: unknown) =>
+      typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 100_000 ? Math.round(v) : null
+    const name = (v: unknown) => (typeof v === 'string' && RECORD_NAME.test(v) ? v : null)
+    const targetFps = whole(j.targetFps)
+    if (targetFps !== null) fields.target_fps = targetFps
+    const width = whole(j.width)
+    const height = whole(j.height)
+    if (width !== null && height !== null) {
+      fields.width = width
+      fields.height = height
+    }
+    const codec = name(j.codec)
+    if (codec) fields.codec = codec
+    const chroma = name(j.chroma)
+    if (chroma) fields.chroma = chroma
+    const carrier = name(j.carrier)
+    if (carrier) fields.carrier = carrier
+    const render = name(j.render)
+    if (render) fields.render = render
+    if (typeof j.decoderHw === 'boolean') fields.decoder_hw = j.decoderHw
+  }
   const sessionId = hexOrNull(ctx.sessionId)
   return {
     tenant_id: tenantId,

@@ -122,7 +122,9 @@ pub struct Hello {
 pub struct ConsentAsk {
     /// Matches the answer to the question; per connection.
     pub id: u32,
-    /// The grant id, which the person's decision is filed under.
+    /// The question's id, which the person's decision is filed under: an
+    /// object id of its own, never the grant's (#3442). An older service sent
+    /// the grant id, which is an object id too.
     pub sentinel: String,
     /// Who asks, from the server's grant.
     pub caller: String,
@@ -606,10 +608,6 @@ struct ClaimedSshGrant {
     session_secs: u64,
     #[serde(default)]
     consent_mode: Option<roomler_ai_remote_control::models::ConsentMode>,
-    /// FR-90 P3-8-2a — an agent session's grant, held to one command by this
-    /// service's server. Absent from every other grant's claim.
-    #[serde(default)]
-    one_command: bool,
 }
 
 /// A grant's claim must beat the server's window for it
@@ -627,31 +625,6 @@ fn http(total: Duration) -> Result<reqwest::Client, String> {
         .timeout(total)
         .build()
         .map_err(|e| format!("building the HTTP client: {e}"))
-}
-
-/// Where the service claims `grant_id`. FR-90 P3-8-2a — `one_command=true`:
-/// this build holds an agent session's grant to one command. The server hands
-/// such a grant to no claim that does not say so, so a service older than its
-/// worker cannot take one.
-#[cfg(all(windows, feature = "ssh-server"))]
-fn claim_url(server: &str, grant_id: &str, tenant_id: &str) -> String {
-    format!("{server}/api/agent/service/ssh/{grant_id}/claim?tid={tenant_id}&one_command=true")
-}
-
-/// What the service publishes of its SSH endpoint. FR-90 P3-8-2a — with
-/// `one_command`: this build holds an agent session's grant to one command,
-/// so the server may route one here. A service before it says nothing, and
-/// the worker serves those.
-#[cfg(all(windows, feature = "ssh-server"))]
-fn endpoint_body(
-    host_pubkey: &str,
-    ceiling: roomler_ai_remote_control::models::SshServiceCeiling,
-) -> serde_json::Value {
-    serde_json::json!({
-        "host_pubkey": host_pubkey,
-        "ceiling": ceiling,
-        "one_command": true,
-    })
 }
 
 /// Claim `grant_id` from the server with the service's own credential and hold
@@ -675,7 +648,10 @@ pub(crate) async fn claim_grant(
         return Err("the SYSTEM service's SSH pipe is not up".into());
     }
     let resp = http(CLAIM_TIMEOUT)?
-        .post(claim_url(&anchor.server, grant_id, &anchor.tenant_id))
+        .post(format!(
+            "{}/api/agent/service/ssh/{grant_id}/claim?tid={}",
+            anchor.server, anchor.tenant_id
+        ))
         .bearer_auth(&anchor.service_token)
         .send()
         .await
@@ -697,10 +673,9 @@ pub(crate) async fn claim_grant(
                 expires_at_ms,
                 session_secs,
                 consent_mode,
-                one_command,
             } = claimed;
             tracing::info!(
-                %grant_id, %caller, %account_mode, one_command,
+                %grant_id, %caller, %account_mode,
                 "ssh-service: claimed a grant for the SYSTEM service's SSH"
             );
             // No named account: the service never serves one.
@@ -713,7 +688,6 @@ pub(crate) async fn claim_grant(
                 consent_mode,
                 expires_at_ms,
                 session_secs,
-                one_command,
             )
             .map_err(|e| e.to_string())
         }
@@ -863,13 +837,21 @@ pub(crate) mod svc {
         if unchanged {
             return Ok(());
         }
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            host_pubkey: &'a str,
+            ceiling: SshServiceCeiling,
+        }
         let resp = super::http(super::PUBLISH_TIMEOUT)?
             .put(format!(
                 "{}/api/agent/service/ssh-host-key?tid={}",
                 anchor.server, anchor.tenant_id
             ))
             .bearer_auth(&anchor.service_token)
-            .json(&super::endpoint_body(&host_pubkey, anchor.ssh))
+            .json(&Body {
+                host_pubkey: &host_pubkey,
+                ceiling: anchor.ssh,
+            })
             .send()
             .await
             .map_err(|e| format!("could not reach the server: {e}"))?;
@@ -941,16 +923,22 @@ where
 async fn answer_here(ask: ConsentAsk, asker: &crate::ssh::Asker) -> ConsentAnswer {
     let id = ask.id;
     let verdict = match asker {
-        // The grant id is a file name in the broker's directory: never let
-        // anything else become one.
+        // The question's id is a file name in the broker's directory: never
+        // let anything else become one.
         _ if !crate::exec_service::valid_object_id(&ask.sentinel) => {
-            Err("the SYSTEM service asked about a malformed grant".to_string())
+            Err("the SYSTEM service asked under a malformed id".to_string())
         }
-        crate::ssh::Asker::Here { broker, indicator } => {
+        crate::ssh::Asker::Here {
+            broker,
+            indicator,
+            companion,
+        } => {
             crate::ssh::ask_here(
                 broker,
                 indicator,
+                *companion,
                 &clean_reason(&ask.caller),
+                None,
                 &ask.sentinel,
                 &clean_reason(&ask.what),
                 crate::consent::DEFAULT_PROMPT_TIMEOUT,
@@ -1261,39 +1249,5 @@ mod tests {
         assert_eq!(rpc, ["ssh", "ssh-consent", "ssh-system"]);
         apply_word(&mut rpc, false);
         assert_eq!(rpc, ["ssh", "ssh-consent"], "`ssh` stays");
-    }
-
-    /// FR-90 P3-8-2a — the SYSTEM service says it holds one command, on its
-    /// claim and when it publishes, since the worker's `ssh-one-command`
-    /// speaks only for the worker; and a claimed grant carries the field into
-    /// the service's table, false in every claim but an agent session's.
-    #[cfg(all(windows, feature = "ssh-server"))]
-    #[test]
-    fn the_service_says_it_holds_one_command_and_a_claimed_grant_carries_it() {
-        let url = claim_url("https://roomler.example", "g1", "t1");
-        assert_eq!(
-            url,
-            "https://roomler.example/api/agent/service/ssh/g1/claim?tid=t1&one_command=true"
-        );
-        let body = endpoint_body(
-            "a host key",
-            roomler_ai_remote_control::models::SshServiceCeiling::System,
-        );
-        assert_eq!(body["one_command"], serde_json::json!(true), "{body}");
-        assert_eq!(body["ceiling"], serde_json::json!("system"), "{body}");
-
-        let mut answer = serde_json::json!({
-            "grant_id": "g1",
-            "public_key": "k",
-            "caller": "agent session 0 of someone (via a device)",
-            "account_mode": "daemon",
-            "expires_at_ms": 1,
-            "session_secs": 60,
-        });
-        let person: ClaimedSshGrant = serde_json::from_value(answer.clone()).unwrap();
-        assert!(!person.one_command, "absent from every other grant");
-        answer["one_command"] = serde_json::json!(true);
-        let session: ClaimedSshGrant = serde_json::from_value(answer).unwrap();
-        assert!(session.one_command);
     }
 }

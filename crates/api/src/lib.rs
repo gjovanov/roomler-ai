@@ -340,7 +340,8 @@ pub fn build_router(state: AppState) -> Router {
         // FR-69 — what this server is composed of; the module list one UI
         // build and one daemon read before offering a pillar.
         .route("/capabilities", get(routes::capabilities::get))
-        // C-6 — per-pod cluster status (identity, counters, gauges).
+        // C-6 — per-pod cluster status (identity, counters, gauges), for
+        // platform admins only (404 otherwise, like `/admin/*`).
         .route("/cluster/status", get(routes::cluster::status))
         .nest("/auth", auth_routes)
         .nest("/user", user_routes)

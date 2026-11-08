@@ -1,0 +1,103 @@
+# The compose files' coturn, started from the file and driven with a real TURN client (#3287).
+#
+# A fresh install's coturn crash-looped, and then, with the flag gone, refused every relay
+# to the public address, and no lane starts coturn, so nothing noticed. This runs the check
+# a self-hoster runs, with the file's own image and command. coturn runs in the server's
+# network namespace, so that brings up the stack the file defines: the published server
+# image is pulled, and nothing here compiles anything.
+#
+# ⚠️ ROOMLER_PUBLIC_IP is a documentation address (RFC 5737), not this runner's. A permission
+# to it needs no route, and it stays out of every deny range, so a refusal can only come
+# from what coturn does with its own public address.
+name: selfhost-coturn
+
+on:
+  pull_request:
+    paths:
+      - 'docker-compose.selfhost.yml'
+      - 'docker-compose.yml'
+      - 'turnserver.conf'
+      - '.env.selfhost.example'
+      - 'scripts/selfhost-coturn-check.sh'
+      - '.github/workflows/selfhost-coturn.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'docker-compose.selfhost.yml'
+      - 'docker-compose.yml'
+      - 'turnserver.conf'
+      - '.env.selfhost.example'
+      - 'scripts/selfhost-coturn-check.sh'
+      - '.github/workflows/selfhost-coturn.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  coturn:
+    name: coturn stays up and relays
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: An env file, made the way the docs make one
+        run: |
+          env="$RUNNER_TEMP/selfhost.env"
+          cp .env.selfhost.example "$env"
+          sed -i "s|^ROOMLER_JWT_SECRET=.*|ROOMLER_JWT_SECRET=$(openssl rand -hex 32)|" "$env"
+          sed -i "s|^ROOMLER_TURN_SECRET=.*|ROOMLER_TURN_SECRET=$(openssl rand -hex 32)|" "$env"
+          sed -i "s|^MONGO_ROOT_PASSWORD=.*|MONGO_ROOT_PASSWORD=$(openssl rand -hex 24)|" "$env"
+          sed -i "s|^MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)|" "$env"
+          sed "s|^ROOMLER_PUBLIC_IP=.*|ROOMLER_PUBLIC_IP=203.0.113.10|" "$env" > "$RUNNER_TEMP/selfhost-public.env"
+
+      # The Quickstart's own pull. `up` alone would build the server from source.
+      - name: The images docker-compose.selfhost.yml names
+        run: |
+          docker version --format 'engine {{.Server.Version}}'
+          docker compose version
+          docker compose -f docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env" pull --quiet
+
+      # Every step below runs however the one before it ended: each file's answer is its own.
+      - name: docker-compose.selfhost.yml, with a public address
+        run: bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"
+
+      # The client leaves what it allocates over UDP behind for 13 minutes, so a check that
+      # costs too many relay ports fails on its own leftovers the third time it runs.
+      - name: The check, twice more in a row
+        if: ${{ !cancelled() }}
+        run: |
+          for _ in 1 2; do
+            bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"
+          done
+
+      # coturn's way back into the namespace is a healthcheck, and nothing else would notice
+      # if an image or an engine stopped honouring it.
+      - name: The server crashes, and coturn comes back into its namespace
+        if: ${{ !cancelled() }}
+        run: |
+          dc=(docker compose -f docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env")
+          sudo kill -9 "$(docker inspect -f '{{.State.Pid}}' "$("${dc[@]}" ps -q roomler)")"
+          for _ in $(seq 1 30); do
+            sleep 2
+            s="$("${dc[@]}" ps -q roomler)"; c="$("${dc[@]}" ps -q coturn)"
+            [ -n "$s" ] && [ -n "$c" ] || continue
+            # A coturn its healthcheck is restarting is still listed, and its exec fails: under
+            # the step's `bash -e` a failed assignment ended the step with no output.
+            a="$(docker exec "$c" readlink /proc/self/ns/net 2>/dev/null || true)"
+            [ -n "$a" ] && [ "$a" = "$(docker exec "$s" readlink /proc/self/ns/net 2>/dev/null)" ] && break
+          done
+          bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost-public.env"
+
+      - name: docker-compose.selfhost.yml, with the example's defaults
+        if: ${{ !cancelled() }}
+        run: |
+          docker compose -f docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env" down -v --remove-orphans
+          bash scripts/selfhost-coturn-check.sh --file docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env"
+
+      - name: docker-compose.yml, the development stack
+        if: ${{ !cancelled() }}
+        run: |
+          docker compose -f docker-compose.selfhost.yml --env-file "$RUNNER_TEMP/selfhost.env" down -v --remove-orphans
+          bash scripts/selfhost-coturn-check.sh --file docker-compose.yml
