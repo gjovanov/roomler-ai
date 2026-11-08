@@ -285,16 +285,18 @@ the number gets on real hardware. The comparison with RustDesk's own Delay reado
 is the operator's A/B (AC9).
 
 **2026-11-08, held for #3566.** That issue found the decode worker applying a clock
-offset the page measured on the page's own clock (pushed at `useRemoteControl.ts:7034`,
-applied by `frameAgeMs` at `rc-dc-worker.ts:813`). Two browsing contexts started at
+offset the page measured on the page's own clock. Two browsing contexts started at
 different times disagree by the wall-clock slew between their starts, so every age
-reads off by that much, low on some hosts and high on others: 7 ms after 162 s on one
-host, near 160 ms after an hour. The read above started each session right after
-loading its page, so it stands, and on master the pill and the wire still take one
-worker `stats` message (`useRemoteControl.ts:7710`, `:8349`, `RemoteControl.vue:4844`).
-The fleet tables above carry the error, and a window whose ages all read negative
-sends none, since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). The HUD
-shows the end-to-end age once #3566's fix ships, and AC8 waits for that.
+read off by that much, low on some hosts and high on others: 7 ms after 162 s on one
+host, near 160 ms after an hour (§5, "On one clock"). The fix, #3568, merged the same
+day: the worker now reads the offset through a skew the page measures when it starts
+the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:845`). Production runs the old
+arithmetic until a promote. The read above started each session right after loading
+its page, so it stands, and the pill and the wire still take one worker `stats`
+message (`useRemoteControl.ts:7749`, `:8397`, `RemoteControl.vue:4844`). The fleet
+tables above carry the error, and a window whose ages all read negative sent none,
+since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
+is on production and its owed GREEN read is in.
 
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 
