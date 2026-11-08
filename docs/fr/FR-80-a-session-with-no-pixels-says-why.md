@@ -53,9 +53,9 @@ operator's to restore; the product's job is to say so.
 ## Key design
 
 1. **The reason survives the fallback.** `capture::open_default`
-   (`agents/roomlerd/src/capture/mod.rs:655`) currently drops the backend's
+   (`agents/roomlerd/src/capture/mod.rs:2653`) currently drops the backend's
    error on the floor and returns `Box::new(NoopCapture)`
-   (`mod.rs:683`). `NoopCapture` carries a `CaptureUnavailable { code, detail }`
+   (`mod.rs:3378`). `NoopCapture` carries a `CaptureUnavailable { code, detail }`
    instead, exposed through one new `ScreenCapture` trait method defaulting to
    `None`, so no call site changes shape and every pump can ask.
 2. **The code is derived, never guessed.** `code` is a small closed set —

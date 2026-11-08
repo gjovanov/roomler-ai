@@ -548,11 +548,15 @@ pub trait ScreenCapture: Send {
 
     /// FR-119 P2b-3 — the captured display's refresh rate in Hz, read once at
     /// the open (`capture::refresh`). A screen cannot produce frames faster
-    /// than it refreshes, so the grant refuses a rate above it. `None` from
-    /// every backend that cannot read it, which decides nothing.
-    fn refresh_hz(&self) -> Option<u16> {
-        None
-    }
+    /// than it refreshes, so the grant refuses a rate above it. `None` from a
+    /// backend that cannot read it, which decides nothing.
+    ///
+    /// ⚠️ Required, with no default, so that no backend can decide nothing
+    /// silently: each one answers, and a `None` says beside it why there is no
+    /// rate to read. A default once let the SYSTEM-context arm, which every
+    /// Windows SYSTEM-service install captures through, answer `None` without a
+    /// word, and a 120 was granted on a 60 Hz panel (FR-135 §13, 2026-11-07).
+    fn refresh_hz(&self) -> Option<u16>;
 
     /// FR-29 — cumulative frames the backend declined to produce because it
     /// PROVED the screen was unchanged.
@@ -2511,6 +2515,10 @@ impl ScreenCapture for NoopCapture {
     }
     fn backend(&self) -> &'static str {
         "none"
+    }
+    // Nothing is captured, so there is no display to read.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
     }
 }
 

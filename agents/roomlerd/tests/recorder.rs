@@ -168,6 +168,11 @@ impl ScreenCapture for CounterCapture {
         1
     }
 
+    // A test double: no display.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
+    }
+
     fn recorded_pointer(&mut self) -> RecordedPointer {
         match self.pointer.take() {
             Some(p) => RecordedPointer::Drawn(p),
