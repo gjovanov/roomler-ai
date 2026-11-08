@@ -4223,4 +4223,32 @@ mod tests {
         assert_eq!(g.blocked_send_bps(t1), None, "and nothing for the clamp");
         assert_eq!(g.evidence_rejected()[5], 1, "rejected as a keyframe burst");
     }
+
+    /// #3472 — RED on master. The VP9-444 pump calls this hook when it builds
+    /// a fresh libvpx encoder (`peer.rs`, the rebuild for dims), and a fresh
+    /// encoder starts at libvpx's boot target (`DEFAULT_BITRATE_BPS`, 8 Mbps),
+    /// not the session's. The hook zeroes the mirror only, so on a pump whose
+    /// AIMD sits still (a relay held at its ceiling) nothing tells the new
+    /// encoder its target. Field, 2026-11-04: display match rebuilt a 3 Mbps
+    /// relay session's encoder 0.1 s in, and it ran 6 min 18 s at 8.8 Mbps
+    /// with `target_bps=0` in every heartbeat, until the first decrease.
+    /// `rebuild_forces_a_reapply_of_the_current_target` is the FFmpeg pump's
+    /// hook doing it right. Un-ignore this with the fix (FR-62's A4 row 3).
+    #[test]
+    #[ignore = "#3472: red on master until a VP9 rebuild re-applies the target"]
+    fn a_vp9_rebuild_hands_the_fresh_encoder_its_target() {
+        let now = Instant::now();
+        let mut g = gov(now);
+        let relay_cap = 3_000_000;
+        let floor = crate::encode::MIN_BITRATE_BPS;
+        let first = g
+            .pre_encode_tick(relay_cap, floor, true, DEPTH, now)
+            .expect("the first tick applies the ceiling");
+        assert_eq!(first.bps, relay_cap);
+        g.on_encoder_rebuilt_mirror_only();
+        let applied = g
+            .pre_encode_tick(relay_cap, floor, true, DEPTH, now)
+            .expect("the fresh encoder is told its target on the next tick");
+        assert_eq!(applied.bps, relay_cap);
+    }
 }

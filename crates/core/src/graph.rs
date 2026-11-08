@@ -7,47 +7,19 @@
 //! topological order of this graph; the hook order is its reverse.
 
 /// Every module, in the order the host composes them (dependencies first).
-pub const MODULES: &[&str] = &[
-    "saas",
-    "chat",
-    "conference",
-    "fleet",
-    "remote",
-    "network",
-    "hive",
-    "vault",
-    "knowhow",
-];
+///
+/// FR-137 — FR-90's `hive`, `vault` and `knowhow` left with their wire
+/// owners. Their ids are retired, never reused
+/// (`roomler_ai_remote_control::models::RETIRED_MODULE_IDS`).
+pub const MODULES: &[&str] = &["saas", "chat", "conference", "fleet", "remote", "network"];
 
 /// The allowed **module → module** call edges. Every module may call core;
 /// core calls no module. Anything not listed here is forbidden — in particular
 /// `chat ↔ remote`, `chat ↔ network` and `remote ↔ network`.
-///
-/// FR-90 — `hive → fleet`: a session lives on a device and its frames ride
-/// the agent socket, so hive needs the Hub. `hive → chat` (P0d): a session is
-/// a room, and its turns are messages in it. Hive never calls `remote` or
-/// `network`: it reaches a device over the control WS like exec does, and
-/// session content travels device-to-browser, never through a module.
-///
-/// FR-90 P3 — `vault → hive` (P3-3b): a lease is believed only from the
-/// device a session's record places it on, at its fence, read through hive's
-/// own DAO. `vault → fleet` (the Hub, to push a revocation) comes with P3-3c.
-/// Hive never calls the vault: it asks through core's `SessionGate` hook.
-///
-/// FR-90 P4 — `knowhow → hive` (P4-4-1): a session's question about the map
-/// is believed only from the device its record places it on, at its fence,
-/// read through hive's own DAO, as a lease is. P4-2 hears of devices from
-/// core and reads fleet's and network's rows through shared DAOs, and P4-3a
-/// answers a device on its connection's own sender, so no `knowhow → fleet`.
-/// No module calls knowhow.
 pub const EDGES: &[(&str, &str)] = &[
     ("conference", "chat"),
     ("remote", "fleet"),
     ("network", "fleet"),
-    ("hive", "fleet"),
-    ("hive", "chat"),
-    ("vault", "hive"),
-    ("knowhow", "hive"),
 ];
 
 /// The modules `id` may call, besides core.
@@ -66,6 +38,17 @@ pub fn is_allowed_edge(from: &str, to: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-137 — FR-90's retired module ids never come back: no module, no
+    /// hook position, no edge.
+    #[test]
+    fn no_retired_module_id_is_in_the_graph() {
+        for id in roomler_ai_remote_control::models::RETIRED_MODULE_IDS {
+            assert!(!MODULES.contains(&id), "{id} is retired");
+            assert!(!crate::hooks::HOOK_ORDER.contains(&id), "{id} is retired");
+            assert!(EDGES.iter().all(|(a, b)| *a != id && *b != id), "{id}");
+        }
+    }
 
     #[test]
     fn every_edge_names_known_modules() {
@@ -106,10 +89,6 @@ mod tests {
             ("chat", "remote"),
             ("chat", "network"),
             ("remote", "network"),
-            // FR-90 — a session's content never flows through another
-            // module, and its device path is the control WS (fleet's).
-            ("hive", "remote"),
-            ("hive", "network"),
         ] {
             assert!(!is_allowed_edge(a, b), "{a} -> {b} must not be allowed");
             assert!(!is_allowed_edge(b, a), "{b} -> {a} must not be allowed");

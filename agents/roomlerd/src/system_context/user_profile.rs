@@ -110,7 +110,7 @@ fn config_candidates_under(root: &Path) -> [PathBuf; 2] {
 /// Returns `None` if any of the discovery steps fail (no logged-in
 /// user, FFI failure, profile not at standard location).
 ///
-/// Caller (typically main.rs's config_path resolution) uses this as
+/// Caller (typically app.rs's config_path resolution) uses this as
 /// a fallback when the default `ProjectDirs::config_dir()` lookup
 /// returns a path that doesn't exist. That caller then filters on
 /// `exists()`, so returning only ONE segment silently drops the rung

@@ -50,9 +50,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 bson = { workspace = true }
 tokio = { workspace = true }
-# FR-90 P4-5-1b — `knowhow_probe_reach`'s address ranges, read into the
-# `forward_acl` rule shape (already in the lockfile, through remote_control).
-ipnet = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -66,6 +63,8 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Console",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",

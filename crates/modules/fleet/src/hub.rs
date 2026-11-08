@@ -17,6 +17,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
@@ -159,6 +160,89 @@ fn rc_overlay_auto_wire(
 
 // ────────────────────────────────────────────────────────────────────────────
 
+/// #3517 — which of the Hub's four triggers fired a connection's cancel. The
+/// read loop names it on the disconnect line (`by=`), because "the Hub
+/// cancelled it" is four events with four different fixes: a second install
+/// displacing the first, an idle nudge re-hashing through the LB, an overlay
+/// renumber, a pod going down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CancelReason {
+    /// A newer connection registered for the same agent
+    /// ([`Hub::register_agent`]).
+    Replaced = 1,
+    /// C-2's idle nudge, so the reconnect re-hashes through the LB
+    /// ([`Hub::nudge_agent_if_idle`]).
+    IdleNudge = 2,
+    /// Multi-org P2b's overlay renumber ([`Hub::cycle_agent_ws`]).
+    Renumber = 3,
+    /// The pod's graceful shutdown ([`Hub::cancel_all_agents`]).
+    Shutdown = 4,
+}
+
+impl CancelReason {
+    /// The `by=` value on the disconnect line.
+    pub fn label(self) -> &'static str {
+        match self {
+            CancelReason::Replaced => "replaced",
+            CancelReason::IdleNudge => "idle_nudge",
+            CancelReason::Renumber => "renumber",
+            CancelReason::Shutdown => "shutdown",
+        }
+    }
+
+    fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(CancelReason::Replaced),
+            2 => Some(CancelReason::IdleNudge),
+            3 => Some(CancelReason::Renumber),
+            4 => Some(CancelReason::Shutdown),
+            _ => None,
+        }
+    }
+}
+
+/// rc.53's displacement cancel, and since #3517 why it fired. The read loop
+/// `select!`s on [`Self::notified`]. Each trigger records its
+/// [`CancelReason`] just before it notifies, and the loop reads it once the
+/// notification lands.
+///
+/// The reason is an atomic beside the `Notify` rather than a value sent
+/// through it, so every trigger keeps the notify call it had: `notify_one`
+/// latches a permit for a loop that is mid-dispatch, and `cancel_all_agents`'
+/// `notify_waiters` does not. With two triggers on one connection the later
+/// write wins. A notification with nothing recorded reads `None`
+/// (`by=unknown`), never a panic.
+#[derive(Default)]
+pub struct AgentCancel {
+    notify: Notify,
+    reason: AtomicU8,
+}
+
+impl AgentCancel {
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    pub fn notify_one(&self) {
+        self.notify.notify_one();
+    }
+
+    pub fn notify_waiters(&self) {
+        self.notify.notify_waiters();
+    }
+
+    /// Record why the next notification fires. Called BEFORE the notify, so
+    /// the loop it wakes reads it.
+    pub fn set_reason(&self, reason: CancelReason) {
+        self.reason.store(reason as u8, Ordering::Release);
+    }
+
+    pub fn reason(&self) -> Option<CancelReason> {
+        CancelReason::from_u8(self.reason.load(Ordering::Acquire))
+    }
+}
+
 pub struct ConnectedAgent {
     pub agent_id: ObjectId,
     pub tenant_id: ObjectId,
@@ -178,8 +262,10 @@ pub struct ConnectedAgent {
     /// `select!`s on `socket_rx.next()` AND `cancel.notified()`, so
     /// the displaced socket exits cleanly within milliseconds of the
     /// displacement Goodbye landing — instead of lingering up to one
-    /// 25 s keepalive interval waiting for a ping-send to fail.
-    pub cancel: Arc<Notify>,
+    /// 25 s keepalive interval waiting for a ping-send to fail. The idle
+    /// nudge, the overlay renumber and the shutdown sweep fire it too, and
+    /// each records which it was (#3517).
+    pub cancel: Arc<AgentCancel>,
     /// The agent's nearest relay region (`relay_regions` id), used to pick the
     /// per-session TURN config. Seeded from the DB row at registration and
     /// refreshed live when a probe report lands ([`Hub::set_agent_relay_home`]);
@@ -280,91 +366,6 @@ pub struct ConnectedAgent {
     /// connection, and the reason a stale one is never sent after it
     /// ([`Hub::push_desired_config`]).
     pub config_revision_sent: Option<u64>,
-    /// FR-90 — the agent advertises `hive`: it answers `rc:hive.start` with
-    /// `rc:hive.start_ack` and reports sessions with `rc:hive.state`. Per
-    /// CONNECTION, for [`Self::supports_ssh_grant_ack`]'s reason — a stored
-    /// row outlives a rollback, and a start pushed to an agent that drops it
-    /// would leave the caller waiting on silence.
-    pub supports_hive: bool,
-    /// FR-90 P0d-2 — the agent advertises `hive-view`: it answers a view
-    /// grant with `rc:hive.view.grant_ack` and serves a viewer peer. Per
-    /// connection, for the same reason; `hive` does NOT imply it.
-    pub supports_hive_view: bool,
-    /// FR-90 P1e — the agent advertises `hive-memory`: it understands a
-    /// session's core-memory snapshot (`rc:hive.memory`). Per connection, for
-    /// the same reason; `hive` does NOT imply it.
-    pub supports_hive_memory: bool,
-    /// FR-90 P1j — the agent advertises `hive-adopt`: it mirrors terminal
-    /// sessions its accounts adopted, and its owner allowed it (`hive_adopt`).
-    /// An `rc:hive.adopt` from a connection without it is refused unread. Per
-    /// connection, for the same reason; `hive` does NOT imply it.
-    pub supports_hive_adopt: bool,
-    /// FR-90 P2c-3 — the agent advertises `hive-replica`: it answers
-    /// `rc:hive.replica.join`, and its owner lets it hold copies
-    /// (`hive_replica`). Per connection, for the same reason; `hive` does NOT
-    /// imply it.
-    pub supports_hive_replica: bool,
-    /// FR-90 P2d — the agent advertises `hive-stream`: it serves a session it
-    /// holds to a member over QUIC, and asks for and dials one as a member.
-    /// A grant goes only to a connection with it. Per connection, for the same
-    /// reason; neither `hive` nor `hive-replica` implies it.
-    pub supports_hive_stream: bool,
-    /// FR-90 P2e-2 — the agent advertises `hive-lease`: it holds a leased
-    /// session to the server's word on each connection (`rc:hive.lease`).
-    /// The word, and a start that asks for it, go only to a connection with
-    /// it. Per connection, for the same reason; `hive` does NOT imply it.
-    pub supports_hive_lease: bool,
-    /// FR-90 P2e-3 — the agent advertises `hive-promote`: it answers a
-    /// promotion's prepare and drain, and runs its move. The server promotes
-    /// only between two connections with it. Per connection, for the same
-    /// reason; neither `hive` nor `hive-lease` implies it.
-    pub supports_hive_promote: bool,
-    /// FR-90 P2f-1 — the agent advertises `hive-teleport`: as a teleport's
-    /// target it answers a prepare that asks no copy and takes the join that
-    /// prepare admits; as its primary it says where its copy ends at a join.
-    /// The server teleports only between two connections with it. Per
-    /// connection, for the same reason; `hive-promote` does NOT imply it.
-    pub supports_hive_teleport: bool,
-    /// FR-90 P2f-3 — the agent advertises `hive-fork`: a start that names
-    /// the session it forks starts from its parent's copy there. A build
-    /// before it would start the fork EMPTY, so a fork's every start goes
-    /// only to a connection with it. Per connection, for the same reason;
-    /// `hive` does NOT imply it.
-    pub supports_hive_fork: bool,
-    /// FR-90 P2f-4b — the agent advertises `hive-manage`: a start carrying
-    /// `from_terminal` makes a terminal session it adopted a managed one.
-    /// A build before it would start the conversation afresh, so such a
-    /// start goes only to a connection with it. Per connection; `hive` does
-    /// NOT imply it.
-    pub supports_hive_manage: bool,
-    /// FR-90 P2g-2 — the agent advertises `hive-purge`: it deletes a session
-    /// on `rc:hive.purge` and answers per part. A build before it has no
-    /// such frame, so a purge goes only to a connection with it, and waits
-    /// for one. Per connection; `hive` does NOT imply it.
-    pub supports_hive_purge: bool,
-    /// FR-90 P2g-4a — the agent advertises `hive-purge-all`: it purges every
-    /// session it holds on `rc:hive.purge_all`, sent at its removal. A build
-    /// of P2g-1 to P2g-3d purges a session and cannot decode this frame, so
-    /// it is sent only to a connection with it. Per connection; neither `hive`
-    /// nor `hive-purge` implies it.
-    pub supports_hive_purge_all: bool,
-    /// FR-90 P2i-2 — the agent advertises `hive-search`: an archive replica
-    /// that answers a search over the copies it holds
-    /// (`rc:hive.search.grant`). A search grant goes only to a connection
-    /// with it and with `hive-view`, whose frames carry the search's peer.
-    /// Per connection; neither `hive`, `hive-replica` nor `hive-archive`
-    /// implies it.
-    pub supports_hive_search: bool,
-    /// #2267 — `rc:hive.purge_all` was queued to this connection, which
-    /// happens only at its removal. Unless the connection drains (below), the
-    /// removal's kick then leaves the socket open instead of telling the
-    /// device: such a daemon exits at once on `rc:goodbye AgentDeleted`, which
-    /// would cut its purge short.
-    pub removal_purge_pushed: bool,
-    /// #2294 — the agent advertises `hive-purge-drain`: on the goodbye it
-    /// finishes a removal purge before it exits, so a purged connection is
-    /// told like any other. Per connection; `hive-purge-all` does NOT imply it.
-    pub supports_hive_purge_drain: bool,
     /// FR-121 — the device's loopback-TURN relay as it last reported it
     /// (`rc:agent.local_relay`): handed to a browser on this device whose
     /// session request names it (`local_relay_from`). In memory only, and it
@@ -385,10 +386,6 @@ pub enum KickOutcome {
     /// Taken out of the hub and not told: the caller asked not to (the device
     /// is leaving by itself, or `rc.removal_goodbye` is off).
     NotTold,
-    /// Taken out of the hub and not told, because this removal queued it
-    /// `rc:hive.purge_all` and its build exits at once on the goodbye (no
-    /// `hive-purge-drain`). Its socket stays open, as before #2267.
-    KeptForPurge,
     /// Taken out of the hub; the goodbye could not be queued (the channel is
     /// full or closed). The socket ends as it did before #2267.
     GoodbyeLost,
@@ -905,7 +902,7 @@ impl Hub {
     ///     and avoid evicting a NEWER displacing connection's entry
     ///     (rc.53 race fix; the pre-rc.53 unregister unconditionally
     ///     removed by `agent_id`).
-    ///   * `cancel` — `Arc<Notify>` the WS handler `select!`s on so a
+    ///   * `cancel` — `Arc<AgentCancel>` the WS handler `select!`s on so a
     ///     displacement triggers an immediate read-loop exit, NOT a 25 s
     ///     wait for the agent's own keepalive ping to fail.
     ///   * `rx` — pump source for `pump_server_messages`.
@@ -927,9 +924,9 @@ impl Hub {
         // Fleet RPC — whether the agent's caps advertise `rpc: ["exec", …]`
         // (see [`ConnectedAgent::supports_exec`]).
         supports_exec: bool,
-    ) -> (ClientTx, Arc<Notify>, mpsc::Receiver<ServerMsg>) {
+    ) -> (ClientTx, Arc<AgentCancel>, mpsc::Receiver<ServerMsg>) {
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
-        let cancel = Arc::new(Notify::new());
+        let cancel = Arc::new(AgentCancel::default());
         let entry = ConnectedAgent {
             agent_id,
             tenant_id,
@@ -990,53 +987,6 @@ impl Hub {
             // FR-132 P1b — nothing sent yet, so a new connection takes
             // whichever revision the connect path reads.
             config_revision_sent: None,
-            // FR-90 — set by `set_agent_hive_support`; `false` = no session
-            // frame is ever pushed to this connection.
-            supports_hive: false,
-            // FR-90 P0d-2 — set by `set_agent_hive_view_support`; `false` = no
-            // view grant is ever pushed to this connection.
-            supports_hive_view: false,
-            // FR-90 P1e — set by `set_agent_hive_memory_support`; `false` = no
-            // core memory is ever pushed to this connection.
-            supports_hive_memory: false,
-            // FR-90 P1j — set by `set_agent_hive_adopt_support`; `false` = an
-            // adopt offer from this connection is never honoured.
-            supports_hive_adopt: false,
-            // FR-90 P2c-3 — set by `set_agent_hive_replica_support`; `false` = no
-            // join is ever pushed to this connection.
-            supports_hive_replica: false,
-            // FR-90 P2d — set by `set_agent_hive_stream_support`; `false` = no
-            // stream grant is ever pushed to this connection.
-            supports_hive_stream: false,
-            // FR-90 P2e-2 — set by `set_agent_hive_lease_support`; `false` = no
-            // lease word, and no leased start, is ever sent to this connection.
-            supports_hive_lease: false,
-            // FR-90 P2e-3 — set by `set_agent_hive_promote_support`; `false` =
-            // no promotion starts on, or moves away from, this connection.
-            supports_hive_promote: false,
-            // FR-90 P2f-1 — set by `set_agent_hive_teleport_support`; `false` =
-            // no teleport moves a session to, or away from, this connection.
-            supports_hive_teleport: false,
-            // FR-90 P2f-3 — set by `set_agent_hive_fork_support`; `false` = no
-            // fork's start is ever sent to this connection.
-            supports_hive_fork: false,
-            // FR-90 P2f-4b — set by `set_agent_hive_manage_support`; `false` =
-            // no start that makes a terminal session managed is sent here.
-            supports_hive_manage: false,
-            // FR-90 P2g-2 — set by `set_agent_hive_purge_support`; `false` = no
-            // purge is ever sent to this connection.
-            supports_hive_purge: false,
-            // FR-90 P2g-4a — set by `set_agent_hive_purge_all_support`; `false`
-            // = no removal's purge is ever sent to this connection.
-            supports_hive_purge_all: false,
-            // FR-90 P2i-2 — set by `set_agent_hive_search_support`; `false` =
-            // no search grant is ever pushed to this connection.
-            supports_hive_search: false,
-            // #2267 — set by `push_hive_purge_all` once the frame is queued.
-            removal_purge_pushed: false,
-            // #2294 — set by `set_agent_hive_purge_drain_support`; `false` =
-            // a purged connection is not told at its removal, as before.
-            supports_hive_purge_drain: false,
             // FR-121 — set by `set_agent_local_relay` when the device reports
             // one; until then a browser naming it is told `device_offline`.
             local_relay: None,
@@ -1090,6 +1040,7 @@ impl Hub {
             // notify_waiters would lose the signal and the old socket
             // would linger waiting on its 25 s keepalive. notify_one's
             // permit storage closes that hole.
+            prev.cancel.set_reason(CancelReason::Replaced);
             prev.cancel.notify_one();
             drop(prev);
         }
@@ -1224,17 +1175,11 @@ impl Hub {
     /// sessions end. Then, when `goodbye`, `rc:goodbye AgentDeleted` is queued
     /// on the connection the entry held. The channel is FIFO and the socket's
     /// handler keeps its own sender, so the pump still delivers what was
-    /// queued before (P2g-4a's purge) and then the goodbye. The daemon stops
+    /// queued before and then the goodbye. The daemon stops
     /// on it exactly as it does at a refused connection (exit 7), and closes
     /// the socket itself, so no cancel is needed. Before #2267 the kick ended
     /// here without the goodbye, and the device kept its socket until
     /// something else dropped it.
-    ///
-    /// ⚠️ An entry that this removal pushed `rc:hive.purge_all` is told only
-    /// when its build drains (`hive-purge-drain`, #2294): that daemon finishes
-    /// the purge before it exits on the goodbye. One of `agent-v0.4.137` or
-    /// `0.4.138` would exit at once and cut its purge short, so its socket
-    /// stays open as before, which P2g-4a relies on.
     pub fn kick_removed_agent(&self, agent_id: ObjectId, goodbye: bool) -> KickOutcome {
         let Some((_, entry)) = self.inner.agents.remove(&agent_id) else {
             return KickOutcome::NotRegistered;
@@ -1243,13 +1188,6 @@ impl Hub {
         self.end_agent_sessions(agent_id);
         if !goodbye {
             return KickOutcome::NotTold;
-        }
-        if entry.removal_purge_pushed && !entry.supports_hive_purge_drain {
-            info!(
-                %agent_id,
-                "removed device not told: it was sent its purge, which the goodbye's exit would cut short; its socket stays open"
-            );
-            return KickOutcome::KeptForPurge;
         }
         let msg = ServerMsg::Goodbye {
             reason: AgentCloseReason::AgentDeleted,
@@ -1298,6 +1236,7 @@ impl Hub {
         // write) still fires on the next `cancel.notified()`. The old
         // notify_waiters here silently LOST exactly those nudges while
         // still reporting success to the requesting pod.
+        agent.cancel.set_reason(CancelReason::IdleNudge);
         agent.cancel.notify_one();
         NudgeOutcome::Nudged
     }
@@ -1325,6 +1264,7 @@ impl Hub {
         // notify_one, not notify_waiters — same latching rationale as the
         // nudge path: a cycle landing while the read loop is mid-dispatch
         // must still fire on the next `cancel.notified()`.
+        agent.cancel.set_reason(CancelReason::Renumber);
         agent.cancel.notify_one();
         true
     }
@@ -1339,6 +1279,7 @@ impl Hub {
     pub fn cancel_all_agents(&self) -> Vec<ObjectId> {
         let ids: Vec<ObjectId> = self.inner.agents.iter().map(|a| *a.key()).collect();
         for entry in self.inner.agents.iter() {
+            entry.value().cancel.set_reason(CancelReason::Shutdown);
             entry.value().cancel.notify_waiters();
         }
         ids
@@ -2555,6 +2496,28 @@ impl Hub {
         principal: ObjectId,
         tenant_id: ObjectId,
     ) -> usize {
+        self.terminate_external(tenant_id, |s| {
+            s.agent_id == agent_id && s.controller_user_id == principal
+        })
+    }
+
+    /// FR-52 decision 16 — the same for everyone on one device: its approval was
+    /// cleared (gate 2), so nobody's session there has any standing left.
+    pub fn terminate_external_on(&self, agent_id: ObjectId, tenant_id: ObjectId) -> usize {
+        self.terminate_external(tenant_id, |s| s.agent_id == agent_id)
+    }
+
+    /// FR-52 decision 16 — the same for everyone in one org: its switch went off
+    /// (gate 1).
+    pub fn terminate_external_in(&self, tenant_id: ObjectId) -> usize {
+        self.terminate_external(tenant_id, |_| true)
+    }
+
+    fn terminate_external(
+        &self,
+        tenant_id: ObjectId,
+        covers: impl Fn(&LiveSession) -> bool,
+    ) -> usize {
         // Collected first: `terminate` writes to the map this iterates.
         let ended: Vec<ObjectId> = self
             .inner
@@ -2562,11 +2525,7 @@ impl Hub {
             .iter()
             .filter_map(|e| {
                 let s = e.value().lock();
-                (s.external
-                    && s.agent_id == agent_id
-                    && s.controller_user_id == principal
-                    && s.tenant_id == tenant_id)
-                    .then_some(*e.key())
+                (s.external && s.tenant_id == tenant_id && covers(&s)).then_some(*e.key())
             })
             .collect();
         for session_id in &ended {
@@ -2949,610 +2908,6 @@ impl Hub {
         Ok(())
     }
 
-    /// FR-90 — record whether this connection runs Hive sessions (`hive`),
-    /// right after registration, like [`Self::set_agent_ssh_support`].
-    pub fn set_agent_hive_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive = supports;
-        }
-    }
-
-    /// FR-90 — whether a connected agent advertises `hive`. `None` = not
-    /// online on this pod.
-    pub fn agent_supports_hive(&self, agent_id: ObjectId) -> Option<bool> {
-        self.inner.agents.get(&agent_id).map(|a| a.supports_hive)
-    }
-
-    /// FR-90 — whether THIS connection advertises `hive`. `tx` is the sender
-    /// [`Self::register_agent`] returned to it, matched as
-    /// [`Self::unregister_agent`] matches a displaced handler's. `None` = not
-    /// online on this pod, or a newer connection holds the slot. A newer
-    /// entry is never an older connection's word, least of all while it is
-    /// half-registered: it reads `false` until its caps are recorded.
-    pub fn agent_supports_hive_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive)
-    }
-
-    /// FR-90 — push a Hive frame (`rc:hive.start` / `rc:hive.stop` /
-    /// `rc:hive.demote`) to a device, checked in the lookup that sends it so a
-    /// reconnect cannot fall between the check and the push: offline (or
-    /// another tenant's — reported identically, so org A cannot tell org B's
-    /// devices from absent ones) is [`Error::AgentOffline`]; a connection that
-    /// did not advertise `hive` is [`Error::ExecUnsupported`] and receives
-    /// nothing.
-    pub fn push_hive(&self, agent_id: ObjectId, tenant_id: ObjectId, msg: ServerMsg) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P0d-2 — record whether this connection serves viewer peers
-    /// (`hive-view`), right after registration.
-    pub fn set_agent_hive_view_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_view = supports;
-        }
-    }
-
-    /// FR-90 P0d-2 — whether a connected agent advertises `hive-view`.
-    /// `None` = not online on this pod.
-    pub fn agent_supports_hive_view(&self, agent_id: ObjectId) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .map(|a| a.supports_hive_view)
-    }
-
-    /// FR-90 P1e — record whether this connection understands core memory
-    /// (`hive-memory`), right after registration.
-    pub fn set_agent_hive_memory_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_memory = supports;
-        }
-    }
-
-    /// FR-90 P1j — record whether this connection mirrors adopted terminal
-    /// sessions (`hive-adopt`), right after registration.
-    pub fn set_agent_hive_adopt_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_adopt = supports;
-        }
-    }
-
-    /// FR-90 P1j — whether a connected agent advertises `hive-adopt`.
-    /// `None` = not online on this pod.
-    pub fn agent_supports_hive_adopt(&self, agent_id: ObjectId) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .map(|a| a.supports_hive_adopt)
-    }
-
-    /// FR-90 P1j — answer an adopt offer (`rc:hive.adopt_ack`), checked in the
-    /// lookup that sends it, as [`Self::push_hive`]: offline or another
-    /// tenant's is [`Error::AgentOffline`]; a connection without `hive-adopt`
-    /// is [`Error::ExecUnsupported`] and receives nothing.
-    pub fn push_hive_adopt(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_adopt {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2d-5 — whether the device's CURRENT connection on this pod may
-    /// serve a viewer from a copy it holds: it advertises `hive-view` and
-    /// `hive-replica` both, in `tenant_id`. Not online here, or another
-    /// tenant's, is `false`, as [`Self::push_hive_view`] would answer it.
-    pub fn agent_serves_copies(&self, agent_id: ObjectId, tenant_id: ObjectId) -> bool {
-        self.inner.agents.get(&agent_id).is_some_and(|a| {
-            a.tenant_id == tenant_id && a.supports_hive_view && a.supports_hive_replica
-        })
-    }
-
-    /// FR-90 P2c-3 — record whether this connection holds copies
-    /// (`hive-replica`), right after registration.
-    pub fn set_agent_hive_replica_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_replica = supports;
-        }
-    }
-
-    /// FR-90 P2c-3 — whether THIS connection advertises `hive-replica`, as
-    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or a
-    /// newer connection holds the slot.
-    pub fn agent_supports_hive_replica_on(
-        &self,
-        agent_id: ObjectId,
-        tx: &ClientTx,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive_replica)
-    }
-
-    /// FR-90 P2c-3 — push a join (`rc:hive.replica.join`), checked in the
-    /// lookup that sends it, as [`Self::push_hive`]: offline or another
-    /// tenant's is [`Error::AgentOffline`]; a connection without
-    /// `hive-replica` is [`Error::ExecUnsupported`] and receives nothing — the
-    /// join stays pending until a connection that holds copies asks.
-    pub fn push_hive_replica(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_replica {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2e-2 — record whether this connection holds leased sessions to
-    /// the server's word (`hive-lease`), right after registration.
-    pub fn set_agent_hive_lease_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_lease = supports;
-        }
-    }
-
-    /// FR-90 P2e-2 — whether THIS connection advertises `hive-lease`, as
-    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or a
-    /// newer connection holds the slot.
-    pub fn agent_supports_hive_lease_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive_lease)
-    }
-
-    /// FR-90 P2e-2 — whether the device's CURRENT connection on this pod
-    /// advertises `hive-lease`: `None` = not online here, or another
-    /// tenant's (answered alike, as [`Self::push_hive`] answers).
-    pub fn agent_supports_hive_lease(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| a.supports_hive_lease)
-    }
-
-    /// FR-90 P2e-2 — push the lease word (`rc:hive.lease`) to the device's
-    /// CURRENT connection, checked in the lookup that sends it, as
-    /// [`Self::push_hive`]: offline or another tenant's is
-    /// [`Error::AgentOffline`]; a connection without `hive-lease` is
-    /// [`Error::ExecUnsupported`] and receives nothing.
-    pub fn push_hive_lease(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_lease {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2e-2 — push the lease word (`rc:hive.lease`) to THIS connection
-    /// only, checked in the lookup that sends it: a connection that is not
-    /// the one in the slot (a newer one displaced it), or another tenant's,
-    /// is [`Error::AgentOffline`]; one without `hive-lease` is
-    /// [`Error::ExecUnsupported`] and receives nothing. A word is worth
-    /// something only on the connection it names, so it never falls through
-    /// to a newer one.
-    pub fn push_hive_lease_on(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        tx: &ClientTx,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id || !ptr_eq(&entry.tx, tx) {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_lease {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        // On `tx` itself, never through the slot: should a newer connection
-        // take the slot meanwhile, the word does not move to it.
-        tx.try_send(msg).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => Error::SendFailed,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                Error::AgentOffline(agent_id.to_hex())
-            }
-        })
-    }
-
-    /// FR-90 P2g-3c — push `msg` on `tx`, this agent's own connection, as the
-    /// answer to what that connection asked (`rc:hive.retain`): only while it
-    /// is the current one, of `tenant_id`, and runs Hive. As
-    /// [`Self::push_hive_lease_on`], never through the slot, so an answer
-    /// does not move to a newer connection.
-    pub fn push_hive_on(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        tx: &ClientTx,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id || !ptr_eq(&entry.tx, tx) {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        tx.try_send(msg).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => Error::SendFailed,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                Error::AgentOffline(agent_id.to_hex())
-            }
-        })
-    }
-
-    /// FR-90 P2e-3 — record whether this connection takes part in a
-    /// promotion (`hive-promote`), right after registration.
-    pub fn set_agent_hive_promote_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_promote = supports;
-        }
-    }
-
-    /// FR-90 P2e-3 — whether the device's CURRENT connection on this pod
-    /// advertises everything a promotion asks of either end: `hive`,
-    /// `hive-lease` and `hive-promote`. `None` = not online here, or another
-    /// tenant's (answered alike, as [`Self::push_hive`] answers).
-    pub fn agent_supports_hive_promote(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| a.supports_hive && a.supports_hive_lease && a.supports_hive_promote)
-    }
-
-    /// FR-90 P2e-3 — push a promotion frame (`rc:hive.prepare`, `drain`,
-    /// `move`), checked in the lookup that sends it, as [`Self::push_hive`]:
-    /// offline or another tenant's is [`Error::AgentOffline`]; a connection
-    /// without `hive-promote` is [`Error::ExecUnsupported`] and receives
-    /// nothing.
-    pub fn push_hive_promote(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_promote {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2f-1 — record whether this connection takes part in a teleport
-    /// (`hive-teleport`), right after registration.
-    pub fn set_agent_hive_teleport_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_teleport = supports;
-        }
-    }
-
-    /// FR-90 P2f-1 — whether the device's CURRENT connection on this pod
-    /// advertises everything a teleport asks of either end: what a promotion
-    /// asks ([`Self::agent_supports_hive_promote`]) and `hive-teleport`.
-    /// `None` = not online here, or another tenant's (answered alike, as
-    /// [`Self::push_hive`] answers).
-    pub fn agent_supports_hive_teleport(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| {
-                a.supports_hive
-                    && a.supports_hive_lease
-                    && a.supports_hive_promote
-                    && a.supports_hive_teleport
-            })
-    }
-
-    /// FR-90 P2f-1 — whether THIS connection advertises `hive-teleport`, as
-    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or
-    /// a newer connection holds the slot.
-    pub fn agent_supports_hive_teleport_on(
-        &self,
-        agent_id: ObjectId,
-        tx: &ClientTx,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive_teleport)
-    }
-
-    /// FR-90 P2f-1 — push a teleport's frame (its prepare, and its target's
-    /// join), checked in the lookup that sends it, as [`Self::push_hive`]:
-    /// offline or another tenant's is [`Error::AgentOffline`]; a connection
-    /// without `hive-teleport` is [`Error::ExecUnsupported`] and receives
-    /// nothing. A target's join goes here, not through
-    /// [`Self::push_hive_replica`]: its owner need not let it hold copies.
-    pub fn push_hive_teleport(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_teleport {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2f-3 — record whether this connection starts a fork from its
-    /// parent's copy (`hive-fork`), right after registration.
-    pub fn set_agent_hive_fork_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_fork = supports;
-        }
-    }
-
-    /// FR-90 P2f-3 — whether the device's CURRENT connection on this pod
-    /// runs sessions and starts a fork: `hive` and `hive-fork`. `None` = not
-    /// online here, or another tenant's (answered alike, as
-    /// [`Self::push_hive`] answers).
-    pub fn agent_supports_hive_fork(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| a.supports_hive && a.supports_hive_fork)
-    }
-
-    /// FR-90 P2f-3 — whether THIS connection advertises `hive-fork`, as
-    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or
-    /// a newer connection holds the slot.
-    pub fn agent_supports_hive_fork_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive && a.supports_hive_fork)
-    }
-
-    /// FR-90 P2f-3 — push a fork's start, checked in the lookup that sends
-    /// it, as [`Self::push_hive`]: offline or another tenant's is
-    /// [`Error::AgentOffline`]; a connection without `hive` and `hive-fork`
-    /// is [`Error::ExecUnsupported`] and receives nothing. A fork's start
-    /// never goes through [`Self::push_hive`]: a build that ignores
-    /// `fork_of` would start the fork empty.
-    pub fn push_hive_fork(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !(entry.supports_hive && entry.supports_hive_fork) {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2f-4b — record whether this connection makes a terminal
-    /// session it adopted a managed one (`hive-manage`), right after
-    /// registration.
-    pub fn set_agent_hive_manage_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_manage = supports;
-        }
-    }
-
-    /// FR-90 P2f-4b — whether the device's CURRENT connection on this pod
-    /// runs sessions and makes a terminal session managed: `hive` and
-    /// `hive-manage`. `None` = not online here, or another tenant's.
-    pub fn agent_supports_hive_manage(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| a.supports_hive && a.supports_hive_manage)
-    }
-
-    /// FR-90 P2f-4b — push a start that makes a terminal session managed,
-    /// checked in the lookup that sends it, as [`Self::push_hive_fork`]:
-    /// offline or another tenant's is [`Error::AgentOffline`]; a connection
-    /// without `hive` and `hive-manage` is [`Error::ExecUnsupported`] and
-    /// receives nothing. Never through [`Self::push_hive`]: a build that
-    /// ignores `from_terminal` would start the conversation afresh.
-    pub fn push_hive_manage(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !(entry.supports_hive && entry.supports_hive_manage) {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2g-2 — record whether this connection purges a session on
-    /// `rc:hive.purge` (`hive-purge`), right after registration.
-    pub fn set_agent_hive_purge_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_purge = supports;
-        }
-    }
-
-    /// FR-90 P2g-2 — whether THIS connection runs sessions and purges one
-    /// (`hive` and `hive-purge`), as [`Self::agent_supports_hive_on`]: `None`
-    /// = not online on this pod, or a newer connection holds the slot.
-    pub fn agent_supports_hive_purge_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive && a.supports_hive_purge)
-    }
-
-    /// FR-90 P2g-2 — push `rc:hive.purge`, checked in the lookup that sends
-    /// it, as [`Self::push_hive_fork`]: offline or another tenant's is
-    /// [`Error::AgentOffline`]; a connection without `hive` and `hive-purge`
-    /// is [`Error::ExecUnsupported`] and receives nothing. A build before it
-    /// does not know the frame, so the purge waits for one that does.
-    pub fn push_hive_purge(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !(entry.supports_hive && entry.supports_hive_purge) {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// #2294 — record whether this connection finishes a removal purge before
-    /// it exits on the goodbye (`hive-purge-drain`), right after registration.
-    pub fn set_agent_hive_purge_drain_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_purge_drain = supports;
-        }
-    }
-
     /// FR-121 — record the device's loopback-TURN relay as it reported it
     /// (`rc:agent.local_relay`), or that it has none. In memory with the
     /// connection only; a report from a connection this hub does not hold is
@@ -3608,219 +2963,6 @@ impl Hub {
             return Err(LocalRelayRefusal::RcOverlayOff);
         }
         relay.ok_or(LocalRelayRefusal::DeviceOffline)
-    }
-
-    /// FR-90 P2g-4a — record whether this connection purges every session it
-    /// holds on `rc:hive.purge_all` (`hive-purge-all`), right after
-    /// registration.
-    pub fn set_agent_hive_purge_all_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_purge_all = supports;
-        }
-    }
-
-    /// FR-90 P2g-4a — push `rc:hive.purge_all {purge_id}` to a device being
-    /// removed, checked in the lookup that sends it, as
-    /// [`Self::push_hive_purge`]: offline or another tenant's is
-    /// [`Error::AgentOffline`]; a connection without `hive` and
-    /// `hive-purge-all` is [`Error::ExecUnsupported`] and receives nothing. A
-    /// build of P2g-1 to P2g-3d says `hive-purge` and cannot decode the frame.
-    pub fn push_hive_purge_all(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        purge_id: ObjectId,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !(entry.supports_hive && entry.supports_hive_purge_all) {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, ServerMsg::HivePurgeAll { purge_id })?;
-        // #2267 — the removal's kick, right after, must not tell this
-        // connection: the goodbye's exit would cut the purge short.
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.removal_purge_pushed = true;
-        }
-        Ok(())
-    }
-
-    /// FR-90 P2i-2 — record whether this connection answers a search over
-    /// the copies it holds (`hive-search`), right after registration.
-    pub fn set_agent_hive_search_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_search = supports;
-        }
-    }
-
-    /// FR-90 P2i-2 — whether the device's CURRENT connection on this pod
-    /// answers a search over its copies: it advertises `hive-search` and
-    /// `hive-view` both (the search's peer rides the view's frames), in
-    /// `tenant_id`. Not online here, or another tenant's, is `false`, as
-    /// [`Self::push_hive_search`] would answer it.
-    pub fn agent_searches(&self, agent_id: ObjectId, tenant_id: ObjectId) -> bool {
-        self.inner.agents.get(&agent_id).is_some_and(|a| {
-            a.tenant_id == tenant_id && a.supports_hive_view && a.supports_hive_search
-        })
-    }
-
-    /// FR-90 P2i-2 — push a search grant (`rc:hive.search.grant`), checked in
-    /// the lookup that sends it, as [`Self::push_hive_view`]: offline or
-    /// another tenant's is [`Error::AgentOffline`]; a connection without
-    /// `hive-view` and `hive-search` is [`Error::ExecUnsupported`] and receives
-    /// nothing. A build before P2i-1 drops the frame unread, and its searcher
-    /// would wait for an answer that never comes.
-    pub fn push_hive_search(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !(entry.supports_hive_view && entry.supports_hive_search) {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P2d — record whether this connection carries replica streams
-    /// (`hive-stream`), right after registration.
-    pub fn set_agent_hive_stream_support(&self, agent_id: ObjectId, supports: bool) {
-        if let Some(mut entry) = self.inner.agents.get_mut(&agent_id) {
-            entry.supports_hive_stream = supports;
-        }
-    }
-
-    /// FR-90 P2d — whether THIS connection advertises `hive-stream`, as
-    /// [`Self::agent_supports_hive_on`]: `None` = not online on this pod, or a
-    /// newer connection holds the slot.
-    pub fn agent_supports_hive_stream_on(&self, agent_id: ObjectId, tx: &ClientTx) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| ptr_eq(&a.tx, tx))
-            .map(|a| a.supports_hive_stream)
-    }
-
-    /// FR-90 P2d — whether the device's CURRENT connection on this pod
-    /// advertises `hive-stream`: `None` = not online here, or another
-    /// tenant's (answered alike, as [`Self::push_hive`] answers).
-    pub fn agent_supports_hive_stream(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-    ) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .filter(|a| a.tenant_id == tenant_id)
-            .map(|a| a.supports_hive_stream)
-    }
-
-    /// FR-90 P2d — push a stream frame (`rc:hive.replica.grant`, `dial`,
-    /// `candidate`, `refused`, `close`), checked in the lookup that sends it,
-    /// as [`Self::push_hive`]: offline or another tenant's is
-    /// [`Error::AgentOffline`]; a connection without `hive-stream` is
-    /// [`Error::ExecUnsupported`] and receives nothing.
-    pub fn push_hive_stream(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_stream {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P1e — whether a connected agent advertises `hive-memory`.
-    /// `None` = not online on this pod.
-    pub fn agent_supports_hive_memory(&self, agent_id: ObjectId) -> Option<bool> {
-        self.inner
-            .agents
-            .get(&agent_id)
-            .map(|a| a.supports_hive_memory)
-    }
-
-    /// FR-90 P1e — push a session's core memory (`rc:hive.memory`), checked
-    /// in the lookup that sends it, as [`Self::push_hive`]: offline or another
-    /// tenant's is [`Error::AgentOffline`]; a connection without `hive-memory`
-    /// is [`Error::ExecUnsupported`] and receives nothing — its session runs
-    /// without core memory, which is never a reason to refuse the start.
-    pub fn push_hive_memory(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_memory {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
-    }
-
-    /// FR-90 P0d-2 — push a viewer-peer frame (`rc:hive.view.*`), checked in
-    /// the lookup that sends it, as [`Self::push_hive`]: offline or another
-    /// tenant's is [`Error::AgentOffline`]; a connection without `hive-view`
-    /// is [`Error::ExecUnsupported`] and receives nothing.
-    pub fn push_hive_view(
-        &self,
-        agent_id: ObjectId,
-        tenant_id: ObjectId,
-        msg: ServerMsg,
-    ) -> Result<()> {
-        {
-            let entry = self
-                .inner
-                .agents
-                .get(&agent_id)
-                .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if entry.tenant_id != tenant_id {
-                return Err(Error::AgentOffline(agent_id.to_hex()));
-            }
-            if !entry.supports_hive_view {
-                return Err(Error::ExecUnsupported(agent_id.to_hex()));
-            }
-        }
-        self.send_to_agent(agent_id, msg)
     }
 
     /// FR-85 P3 — a LIVE session's `(agent_id, controller_user_id,
@@ -8125,6 +7267,56 @@ mod tests {
             );
     }
 
+    /// #3517 — each of the four triggers records which it was before it
+    /// notifies, and the read loop's classification carries it to the
+    /// disconnect line as `by=`. The loop builds its end exactly this way:
+    /// `SocketEnd::Cancelled(cancel.reason())`.
+    #[tokio::test]
+    async fn each_cancel_trigger_reaches_the_disconnect_line() {
+        use crate::socket_end::SocketEnd;
+        let by = |cancel: &Arc<AgentCancel>| SocketEnd::Cancelled(cancel.reason()).by();
+        let hub = test_hub().await;
+        let agent_id = ObjectId::new();
+        let register = || {
+            hub.register_agent(
+                agent_id,
+                ObjectId::new(),
+                ObjectId::new(),
+                OsKind::Linux,
+                3,
+                false,
+                false,
+            )
+        };
+
+        let (_tx1, cancel1, _rx1) = register();
+        assert_eq!(by(&cancel1), Some("unknown"), "nothing has fired yet");
+        let (_tx2, cancel2, _rx2) = register();
+        assert_eq!(by(&cancel1), Some("replaced"));
+        assert_eq!(by(&cancel2), Some("unknown"), "the newer connection stays");
+
+        assert_eq!(
+            hub.nudge_agent_if_idle(agent_id, false),
+            NudgeOutcome::Nudged
+        );
+        assert_eq!(by(&cancel2), Some("idle_nudge"));
+        // The nudge still latches its permit, as before.
+        tokio::time::timeout(Duration::from_millis(50), cancel2.notified())
+            .await
+            .expect("the nudge's notify_one latches");
+
+        let (_tx3, cancel3, _rx3) = register();
+        assert!(hub.cycle_agent_ws(agent_id));
+        assert_eq!(by(&cancel3), Some("renumber"));
+        tokio::time::timeout(Duration::from_millis(50), cancel3.notified())
+            .await
+            .expect("the renumber's notify_one latches");
+
+        let (_tx4, cancel4, _rx4) = register();
+        assert_eq!(hub.cancel_all_agents(), vec![agent_id]);
+        assert_eq!(by(&cancel4), Some("shutdown"));
+    }
+
     #[tokio::test]
     async fn unregister_agent_with_stale_tx_is_noop() {
         // rc.53 race fix: the displaced `handle_agent_socket`
@@ -8276,130 +7468,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_removal_kick_keeps_a_purging_device_open() {
-        // FR-90 P2g-4a: the device purges after its frame lands, and the
-        // goodbye's exit is immediate, so the purge's connection is not told.
-        let hub = test_hub().await;
-        let (agent_id, tenant_id, purge) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        let mut rx = register_linux(&hub, agent_id, tenant_id);
-        hub.set_agent_hive_support(agent_id, true);
-        hub.set_agent_hive_purge_all_support(agent_id, true);
-        hub.push_hive_purge_all(agent_id, tenant_id, purge)
-            .expect("pushed");
-
-        assert_eq!(
-            hub.kick_removed_agent(agent_id, true),
-            KickOutcome::KeptForPurge
-        );
-
-        assert!(!hub.is_agent_online(agent_id));
-        assert!(
-            matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge)
-        );
-        assert!(rx.try_recv().is_err(), "no goodbye behind the purge");
-    }
-
-    #[tokio::test]
-    async fn a_draining_device_is_told_after_its_purge() {
-        // #2294: a build that finishes its removal purge before its goodbye
-        // exit (`hive-purge-drain`) is told, and the goodbye follows the
-        // purge's frame on the same channel.
-        let hub = test_hub().await;
-        let (agent_id, tenant_id, purge) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        let mut rx = register_linux(&hub, agent_id, tenant_id);
-        hub.set_agent_hive_support(agent_id, true);
-        hub.set_agent_hive_purge_all_support(agent_id, true);
-        hub.set_agent_hive_purge_drain_support(agent_id, true);
-        hub.push_hive_purge_all(agent_id, tenant_id, purge)
-            .expect("pushed");
-
-        assert_eq!(hub.kick_removed_agent(agent_id, true), KickOutcome::Told);
-
-        assert!(
-            matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge)
-        );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(ServerMsg::Goodbye {
-                reason: AgentCloseReason::AgentDeleted,
-                ..
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_refused_purge_push_does_not_keep_the_device_open() {
-        // Only a frame that was queued holds the goodbye back: a connection
-        // without `hive-purge-all` is sent no purge, so it is told.
-        let hub = test_hub().await;
-        let (agent_id, tenant_id) = (ObjectId::new(), ObjectId::new());
-        let mut rx = register_linux(&hub, agent_id, tenant_id);
-        hub.set_agent_hive_support(agent_id, true);
-        assert!(
-            hub.push_hive_purge_all(agent_id, tenant_id, ObjectId::new())
-                .is_err()
-        );
-
-        assert_eq!(hub.kick_removed_agent(agent_id, true), KickOutcome::Told);
-        assert!(matches!(rx.try_recv(), Ok(ServerMsg::Goodbye { .. })));
-    }
-
-    #[tokio::test]
-    async fn a_search_grant_goes_only_to_a_connection_that_searches() {
-        // FR-90 P2i-2 — `hive-search` and `hive-view` both: the search's peer
-        // rides the view's frames, and a build before P2i-1 drops the grant.
-        let hub = test_hub().await;
-        let (agent_id, tenant_id) = (ObjectId::new(), ObjectId::new());
-        let grant = |grant_id| ServerMsg::HiveSearchGrant {
-            grant_id,
-            user_id: ObjectId::new(),
-            sessions: vec![ObjectId::new()],
-            ttl_secs: 600,
-        };
-        assert!(
-            matches!(
-                hub.push_hive_search(agent_id, tenant_id, grant(ObjectId::new())),
-                Err(Error::AgentOffline(_))
-            ),
-            "not online here"
-        );
-        let mut rx = register_linux(&hub, agent_id, tenant_id);
-        for (view, search) in [(false, false), (true, false), (false, true)] {
-            hub.set_agent_hive_view_support(agent_id, view);
-            hub.set_agent_hive_search_support(agent_id, search);
-            assert!(
-                !hub.agent_searches(agent_id, tenant_id),
-                "view {view}, search {search}"
-            );
-            assert!(
-                matches!(
-                    hub.push_hive_search(agent_id, tenant_id, grant(ObjectId::new())),
-                    Err(Error::ExecUnsupported(_))
-                ),
-                "view {view}, search {search}"
-            );
-        }
-        assert!(rx.try_recv().is_err(), "nothing was sent");
-
-        hub.set_agent_hive_view_support(agent_id, true);
-        hub.set_agent_hive_search_support(agent_id, true);
-        let other = ObjectId::new();
-        assert!(!hub.agent_searches(agent_id, other), "another tenant's");
-        assert!(matches!(
-            hub.push_hive_search(agent_id, other, grant(ObjectId::new())),
-            Err(Error::AgentOffline(_))
-        ));
-        assert!(hub.agent_searches(agent_id, tenant_id));
-        let gid = ObjectId::new();
-        hub.push_hive_search(agent_id, tenant_id, grant(gid))
-            .expect("pushed");
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(ServerMsg::HiveSearchGrant { grant_id, .. }) if grant_id == gid
-        ));
-    }
-
-    #[tokio::test]
     async fn the_kick_control_event_tells_the_device_only_when_it_says_so() {
         // The pod holding the socket applies the removing pod's decision. An
         // envelope without `goodbye` comes from a pod before #2267 and keeps
@@ -8437,283 +7505,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[tokio::test]
-    async fn hive_support_is_the_word_of_the_connection_that_holds_the_slot() {
-        // FR-90: an agent socket's hello reconciles the device's agent
-        // sessions on what ITS connection advertised. A displaced connection
-        // reading the newer entry instead, half-registered with the `false`
-        // placeholder, would end the sessions of a device that runs them.
-        let hub = test_hub().await;
-        let agent_id = ObjectId::new();
-        let (tenant, owner) = (ObjectId::new(), ObjectId::new());
-        let (old, _cancel1, _rx1) =
-            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
-        assert_eq!(
-            hub.agent_supports_hive_on(agent_id, &old),
-            Some(false),
-            "a registration reads `false` until its caps are recorded"
-        );
-        hub.set_agent_hive_support(agent_id, true);
-        assert_eq!(hub.agent_supports_hive_on(agent_id, &old), Some(true));
-
-        // A newer connection takes the slot: whatever its entry says, from
-        // the placeholder on, the old connection has no word.
-        let (new, _cancel2, _rx2) =
-            hub.register_agent(agent_id, tenant, owner, OsKind::Linux, 3, false, false);
-        assert_eq!(
-            hub.agent_supports_hive_on(agent_id, &old),
-            None,
-            "a half-registered newer entry read as the displaced connection's `false`"
-        );
-        assert_eq!(hub.agent_supports_hive_on(agent_id, &new), Some(false));
-        for supports in [true, false] {
-            hub.set_agent_hive_support(agent_id, supports);
-            assert_eq!(
-                hub.agent_supports_hive_on(agent_id, &old),
-                None,
-                "the newer entry ({supports}) read as the displaced connection's word"
-            );
-            assert_eq!(hub.agent_supports_hive_on(agent_id, &new), Some(supports));
-        }
-
-        // Once nobody holds the slot, nobody has a word.
-        assert!(hub.unregister_agent(agent_id, Some(&new)));
-        assert_eq!(hub.agent_supports_hive_on(agent_id, &new), None);
-        assert_eq!(hub.agent_supports_hive_on(agent_id, &old), None);
-    }
-
-    /// FR-90 P2f-1 — a teleport's frames reach only a connection that
-    /// advertises `hive-teleport`: one that holds copies and runs sessions
-    /// takes no teleport, and another org's is not reachable at all. The
-    /// route's gate and the join's re-send read the same word first; this is
-    /// the gate in the lookup that sends.
-    #[tokio::test]
-    async fn a_teleports_frame_reaches_only_a_connection_that_takes_a_teleport() {
-        let hub = test_hub().await;
-        let agent_id = ObjectId::new();
-        let tenant = ObjectId::new();
-        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        let join = || ServerMsg::HiveReplicaJoin {
-            session_id: ObjectId::new(),
-            fence: 1,
-            role: Some(roomler_ai_remote_control::hive::HiveReplicaRole::Teleport),
-            fences: Vec::new(),
-        };
-        hub.set_agent_hive_support(agent_id, true);
-        hub.set_agent_hive_replica_support(agent_id, true);
-        let err = hub
-            .push_hive_teleport(agent_id, tenant, join())
-            .expect_err("a connection without hive-teleport");
-        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        hub.set_agent_hive_teleport_support(agent_id, true);
-        let err = hub
-            .push_hive_teleport(agent_id, ObjectId::new(), join())
-            .expect_err("another org's connection");
-        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        hub.push_hive_teleport(agent_id, tenant, join())
-            .expect("a connection that takes a teleport");
-        assert!(
-            matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveReplicaJoin { .. })),
-            "the frame reached it"
-        );
-    }
-
-    /// FR-90 P2f-3 — a fork's start reaches only a connection that runs
-    /// sessions and advertises `hive-fork`: one that runs sessions and takes
-    /// teleports would start the fork empty, and another org's is not
-    /// reachable at all.
-    #[tokio::test]
-    async fn a_forks_start_reaches_only_a_connection_that_starts_forks() {
-        let hub = test_hub().await;
-        let agent_id = ObjectId::new();
-        let tenant = ObjectId::new();
-        let (tx, _cancel, mut agent_rx) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        let stop = || ServerMsg::HiveStop {
-            session_id: ObjectId::new(),
-            fence: 1,
-            reason: "owner".into(),
-        };
-        hub.set_agent_hive_support(agent_id, true);
-        hub.set_agent_hive_teleport_support(agent_id, true);
-        assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(false));
-        assert_eq!(hub.agent_supports_hive_fork_on(agent_id, &tx), Some(false));
-        let err = hub
-            .push_hive_fork(agent_id, tenant, stop())
-            .expect_err("a connection without hive-fork");
-        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        hub.set_agent_hive_fork_support(agent_id, true);
-        assert_eq!(
-            hub.agent_supports_hive_fork(agent_id, ObjectId::new()),
-            None
-        );
-        let err = hub
-            .push_hive_fork(agent_id, ObjectId::new(), stop())
-            .expect_err("another org's connection");
-        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(true));
-        assert_eq!(hub.agent_supports_hive_fork_on(agent_id, &tx), Some(true));
-        hub.push_hive_fork(agent_id, tenant, stop())
-            .expect("a connection that starts forks");
-        assert!(
-            matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveStop { .. })),
-            "it reached the connection"
-        );
-        // `hive-fork` without `hive` starts nothing.
-        hub.set_agent_hive_support(agent_id, false);
-        assert_eq!(hub.agent_supports_hive_fork(agent_id, tenant), Some(false));
-        assert!(hub.push_hive_fork(agent_id, tenant, stop()).is_err());
-    }
-
-    /// FR-90 P2f-4b — a start that makes a terminal session managed reaches
-    /// only a connection that runs sessions and advertises `hive-manage`:
-    /// one that adopts and starts forks would start the conversation afresh,
-    /// and another org's is not reachable at all.
-    #[tokio::test]
-    async fn a_made_managed_start_reaches_only_a_connection_that_makes_one() {
-        let hub = test_hub().await;
-        let agent_id = ObjectId::new();
-        let tenant = ObjectId::new();
-        let (_tx, _cancel, mut agent_rx) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        let stop = || ServerMsg::HiveStop {
-            session_id: ObjectId::new(),
-            fence: 1,
-            reason: "owner".into(),
-        };
-        hub.set_agent_hive_support(agent_id, true);
-        hub.set_agent_hive_fork_support(agent_id, true);
-        assert_eq!(
-            hub.agent_supports_hive_manage(agent_id, tenant),
-            Some(false)
-        );
-        let err = hub
-            .push_hive_manage(agent_id, tenant, stop())
-            .expect_err("a connection without hive-manage");
-        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        hub.set_agent_hive_manage_support(agent_id, true);
-        assert_eq!(
-            hub.agent_supports_hive_manage(agent_id, ObjectId::new()),
-            None
-        );
-        let err = hub
-            .push_hive_manage(agent_id, ObjectId::new(), stop())
-            .expect_err("another org's connection");
-        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        assert_eq!(hub.agent_supports_hive_manage(agent_id, tenant), Some(true));
-        hub.push_hive_manage(agent_id, tenant, stop())
-            .expect("a connection that makes one");
-        assert!(
-            matches!(agent_rx.try_recv(), Ok(ServerMsg::HiveStop { .. })),
-            "it reached the connection"
-        );
-        // `hive-manage` without `hive` makes nothing.
-        hub.set_agent_hive_support(agent_id, false);
-        assert_eq!(
-            hub.agent_supports_hive_manage(agent_id, tenant),
-            Some(false)
-        );
-        assert!(hub.push_hive_manage(agent_id, tenant, stop()).is_err());
-    }
-
-    /// FR-90 P2g-2 — a purge reaches only a connection that purges: a build
-    /// before `hive-purge` does not know the frame, another org's connection
-    /// is not reachable, and a connection a newer one displaced is asked
-    /// nothing about what it advertised.
-    #[tokio::test]
-    async fn a_purge_reaches_only_a_connection_that_purges() {
-        let hub = test_hub().await;
-        let agent_id = ObjectId::new();
-        let tenant = ObjectId::new();
-        let (tx, _cancel, mut agent_rx) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        let purge = || ServerMsg::HivePurge {
-            purge_id: ObjectId::new(),
-            session_id: ObjectId::new(),
-            leaving: false,
-        };
-        hub.set_agent_hive_support(agent_id, true);
-        hub.set_agent_hive_manage_support(agent_id, true);
-        assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), Some(false));
-        let err = hub
-            .push_hive_purge(agent_id, tenant, purge())
-            .expect_err("a connection without hive-purge");
-        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        hub.set_agent_hive_purge_support(agent_id, true);
-        let err = hub
-            .push_hive_purge(agent_id, ObjectId::new(), purge())
-            .expect_err("another org's connection");
-        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
-        assert!(agent_rx.try_recv().is_err(), "nothing reached it");
-
-        assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), Some(true));
-        hub.push_hive_purge(agent_id, tenant, purge())
-            .expect("a connection that purges");
-        assert!(
-            matches!(agent_rx.try_recv(), Ok(ServerMsg::HivePurge { .. })),
-            "it reached the connection"
-        );
-        // `hive-purge` without `hive` purges nothing.
-        hub.set_agent_hive_support(agent_id, false);
-        assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), Some(false));
-        assert!(hub.push_hive_purge(agent_id, tenant, purge()).is_err());
-
-        // A newer connection holds the slot: the old one decides nothing.
-        let (_tx2, _cancel2, _rx2) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        assert_eq!(hub.agent_supports_hive_purge_on(agent_id, &tx), None);
     }
 
     /// FR-132 P1b — the document a test pushes: a managed key at `revision`,
@@ -8903,177 +7694,6 @@ mod tests {
         assert!(
             config_frames(&mut rx).is_empty(),
             "a late envelope cannot undo a newer revision"
-        );
-    }
-
-    /// FR-90 P2g-3b — fleet's `hive_purge` control event, as every pod
-    /// applies it: pushed to each connection it names that this hub holds, of
-    /// the envelope's tenant; nothing for another tenant's, and nothing past
-    /// the envelope's cap. P2g-4a — and `hive_purge_all`, a removed device's:
-    /// to its connection, of its tenant, advertising `hive-purge-all`.
-    #[tokio::test]
-    async fn a_hive_purge_from_another_pod_reaches_only_its_tenants_connection() {
-        let hub = test_hub().await;
-        let tenant = ObjectId::new();
-        let (agent_id, other) = (ObjectId::new(), ObjectId::new());
-        let (_tx, _cancel, mut rx) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        let (_tx2, _cancel2, mut other_rx) = hub.register_agent(
-            other,
-            ObjectId::new(),
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        for a in [agent_id, other] {
-            hub.set_agent_hive_support(a, true);
-            hub.set_agent_hive_purge_support(a, true);
-        }
-        let (purge, session) = (ObjectId::new(), ObjectId::new());
-        let envelope = |tid: ObjectId, agents: &[ObjectId]| {
-            serde_json::json!({
-                "class": "rc",
-                "evt": "hive_purge",
-                "tenant_id": tid.to_hex(),
-                "purge_id": purge.to_hex(),
-                "session_id": session.to_hex(),
-                "agent_ids": agents.iter().map(|a| a.to_hex()).collect::<Vec<_>>(),
-            })
-        };
-
-        crate::ctrl::apply_rc_ctrl(&hub, &envelope(ObjectId::new(), &[agent_id]));
-        assert!(
-            rx.try_recv().is_err(),
-            "another tenant's envelope pushes nothing"
-        );
-
-        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &[other, agent_id]));
-        match rx.try_recv() {
-            Ok(ServerMsg::HivePurge {
-                purge_id,
-                session_id,
-                leaving,
-            }) => assert_eq!(
-                (purge_id, session_id, leaving),
-                (purge, session, false),
-                "an envelope with no word, from a pod before P2k-3: a whole session's"
-            ),
-            got => panic!("the purge reached its connection: {got:?}"),
-        }
-        // FR-90 P2k-3 — a leaving member's copy alone, from another pod: the
-        // pod that holds the socket says so too.
-        let mut leaving_envelope = envelope(tenant, &[agent_id]);
-        leaving_envelope["leaving"] = serde_json::json!(true);
-        crate::ctrl::apply_rc_ctrl(&hub, &leaving_envelope);
-        match rx.try_recv() {
-            Ok(ServerMsg::HivePurge { leaving, .. }) => {
-                assert!(leaving, "a leaving member's purge says so on the device")
-            }
-            got => panic!("the leaving purge reached its connection: {got:?}"),
-        }
-        assert!(
-            other_rx.try_recv().is_err(),
-            "another tenant's connection the envelope names hears nothing"
-        );
-
-        let mut many = vec![ObjectId::new(); crate::ctrl::MAX_HIVE_PURGE_AGENTS];
-        many.push(agent_id);
-        crate::ctrl::apply_rc_ctrl(&hub, &envelope(tenant, &many));
-        assert!(
-            rx.try_recv().is_err(),
-            "an id past the envelope's cap is not applied"
-        );
-
-        // P2g-4a — a removed device's purge of everything, from another pod.
-        let all = |tid: ObjectId| {
-            serde_json::json!({
-                "class": "rc",
-                "evt": "hive_purge_all",
-                "tenant_id": tid.to_hex(),
-                "agent_id": agent_id.to_hex(),
-                "purge_id": purge.to_hex(),
-            })
-        };
-        crate::ctrl::apply_rc_ctrl(&hub, &all(tenant));
-        assert!(
-            rx.try_recv().is_err(),
-            "a build that purges a session but predates the frame is sent none"
-        );
-        hub.set_agent_hive_purge_all_support(agent_id, true);
-        crate::ctrl::apply_rc_ctrl(&hub, &all(ObjectId::new()));
-        assert!(
-            rx.try_recv().is_err(),
-            "another tenant's purge of everything pushes nothing"
-        );
-        crate::ctrl::apply_rc_ctrl(&hub, &all(tenant));
-        assert!(
-            matches!(rx.try_recv(), Ok(ServerMsg::HivePurgeAll { purge_id }) if purge_id == purge),
-            "a removed device's purge of everything reached its connection"
-        );
-    }
-
-    /// FR-90 P2g-3c — an answer goes on the connection that asked, while it
-    /// is the current one, of its tenant, running Hive: never another
-    /// tenant's, never a build without Hive, never a newer connection's.
-    #[tokio::test]
-    async fn an_answer_goes_only_on_the_connection_that_asked() {
-        let hub = test_hub().await;
-        let (agent_id, tenant) = (ObjectId::new(), ObjectId::new());
-        let (tx, _cancel, mut rx) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        let answer = || ServerMsg::HiveRetain { words: Vec::new() };
-        let err = hub
-            .push_hive_on(agent_id, tenant, &tx, answer())
-            .expect_err("a build without Hive");
-        assert!(matches!(err, Error::ExecUnsupported(_)), "got {err:?}");
-        hub.set_agent_hive_support(agent_id, true);
-        let err = hub
-            .push_hive_on(agent_id, ObjectId::new(), &tx, answer())
-            .expect_err("another tenant's");
-        assert!(matches!(err, Error::AgentOffline(_)), "got {err:?}");
-        assert!(rx.try_recv().is_err(), "nothing reached it");
-        hub.push_hive_on(agent_id, tenant, &tx, answer())
-            .expect("its own connection");
-        assert!(
-            matches!(rx.try_recv(), Ok(ServerMsg::HiveRetain { .. })),
-            "the answer reached the connection that asked"
-        );
-
-        // A newer connection holds the slot: the old one is answered nothing,
-        // and nothing moves to the new one.
-        let (_tx2, _cancel2, mut rx2) = hub.register_agent(
-            agent_id,
-            tenant,
-            ObjectId::new(),
-            OsKind::Linux,
-            3,
-            false,
-            true,
-        );
-        hub.set_agent_hive_support(agent_id, true);
-        assert!(
-            hub.push_hive_on(agent_id, tenant, &tx, answer()).is_err(),
-            "a connection a newer one displaced is answered nothing"
-        );
-        assert!(
-            rx2.try_recv().is_err(),
-            "an answer to the old connection never reaches the new one"
         );
     }
 

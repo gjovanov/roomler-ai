@@ -1194,6 +1194,18 @@ mod tests {
         ffmpeg: true,
         libvpx: true,
     };
+
+    /// FR-135 R9 (ledger enc:I284) — the build line names the encoder families
+    /// as the cell table's family column does, in its order, until the bench
+    /// opens through the table (R10).
+    #[test]
+    fn the_build_line_names_the_cell_tables_families() {
+        let families: Vec<&str> = crate::encode::cell_table::Family::ALL
+            .iter()
+            .map(|f| f.wire())
+            .collect();
+        assert_eq!(ALL.label(), families.join(","));
+    }
     /// A Linux or macOS release build: no Media Foundation.
     const RELEASE_LINUX: BuildCaps = BuildCaps {
         mf: false,

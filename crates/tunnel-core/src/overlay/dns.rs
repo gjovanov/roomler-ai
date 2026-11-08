@@ -586,9 +586,19 @@ impl Drop for DnsOsGuard {
 }
 
 /// Run an OS command off the reactor; `true` on exit 0, else logs stderr.
+///
+/// #3291 — every DNS change goes through here, and each waits first for an
+/// exit-DNS purge that is still running ([`purge_exit_dns_within`]): a purge
+/// that ended after a steer would delete the steer.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 async fn run_cmd(args: Vec<String>) -> bool {
     tokio::task::spawn_blocking(move || {
+        if let Some(waited) = EXIT_DNS_PURGES.wait_idle() {
+            info!(
+                waited_ms = waited.as_millis() as u64,
+                "dns: the exit-DNS purge has ended; this DNS change goes on (#3291)"
+            );
+        }
         let prog = args[0].clone();
         match std::process::Command::new(&prog).args(&args[1..]).output() {
             Ok(o) if o.status.success() => true,
@@ -789,29 +799,514 @@ pub async fn unsteer_default_dns(_magic_domain: Option<&str>) -> bool {
 /// `purge_exit_routes` at every pre-`process::exit` site AND at boot. Context-free
 /// (no `self_v4`/domain in hand) — hence the blanket revert on Linux. No-op off
 /// Windows/Linux.
+///
+/// #3291 — the child's stdio is null: nothing reads its output, and a child left
+/// running past [`purge_exit_dns_within`]'s bound must not depend on pipes to a
+/// process that may have gone.
 pub fn purge_exit_dns() {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
-        let _ = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{EXIT_DNS_NRPT_TAG}' }} | \
-                     Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
-                ),
-            ])
-            .output();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("resolvectl")
-            .args(["revert", DNS_IF_NAME])
-            .output();
+        if let Some(mut child) = spawn_exit_dns_purge() {
+            let _ = child.wait();
+        }
     }
     // macOS (FR-97 P1c): nothing to purge. Every key is a TEMPORARY value of
     // this process's session, so configd removes it when the process ends,
     // whatever the exit — and a new process starts with none of ours.
+}
+
+/// #3440 — the purge's child, with null stdio (#3291). `None` when it cannot
+/// be started, which [`purge_exit_dns`] has always ignored.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn spawn_exit_dns_purge() -> Option<std::process::Child> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{EXIT_DNS_NRPT_TAG}' }} | \
+                 Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue"
+            ),
+        ]);
+        cmd
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new("resolvectl");
+        cmd.args(["revert", DNS_IF_NAME]);
+        cmd
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// #3291 — [`purge_exit_dns`] for a start, which waits for it for at most
+/// `wait`. Returns whether the purge ended within it.
+///
+/// On Windows the purge is a `powershell` child, and its cmdlets go through
+/// WMI. Both run at Normal priority, so a host kept busy by higher-priority work
+/// holds the purge for as long as the load lasts. A start that waited for it
+/// stayed offline that whole time, minutes on a starved 4-vCPU guest.
+///
+/// Past `wait` the caller goes on and the purge keeps running on a thread of
+/// its own until it ends, however long that takes: a stale `.`-root rule still
+/// goes. Until then every DNS change made through [`run_cmd`] waits for it, so a
+/// late purge can never delete a steer made after it began.
+pub fn purge_exit_dns_within(wait: Duration) -> bool {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        EXIT_DNS_PURGES.run_within(wait, purge_exit_dns)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = wait;
+        purge_exit_dns();
+        true
+    }
+}
+
+/// #3440 — [`purge_exit_dns`] for an exit a replacement follows (a watchdog's),
+/// which waits for it for at most `wait`. Returns
+/// `false` when it handed a purge that is still running to the next start,
+/// and `true` once the purge has ended.
+///
+/// A stalled worker exits so that a healthy one replaces it. While that exit
+/// waited for a starved purge with no bound, the supervisor could not start
+/// the replacement, and the host stayed offline for as long as the load lasted.
+///
+/// On Windows a purge still running at the bound is left running, never
+/// killed, and recorded where only SYSTEM and Administrators may write
+/// ([`handoff`]). The next start counts it in flight until it ends
+/// ([`adopt_handed_over_purges`]), so none of that start's DNS changes can come
+/// before it, and it cannot delete a steer that start makes. If nothing comes
+/// back on the host, it still runs to its end. If the record cannot be written,
+/// the exit waits for the purge with no bound, as before: the bound is only
+/// safe with the handoff.
+///
+/// Linux waits as before. A daemon outside systemd (a container, a hand run)
+/// would leave `resolvectl revert` running beside its replacement's steer, and
+/// the link config dies with `roomler0` anyway.
+pub fn purge_exit_dns_before_exit(wait: Duration) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let Some(mut child) = spawn_exit_dns_purge() else {
+            return true;
+        };
+        if handoff::ended_within(&child, wait) {
+            return true;
+        }
+        if handoff::hand_over(&child) {
+            return false;
+        }
+        let _ = child.wait();
+        true
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = wait;
+        purge_exit_dns();
+        true
+    }
+}
+
+/// #3440 — at a start, before its own purge: count the purges an earlier exit
+/// handed over ([`purge_exit_dns_before_exit`]) in flight until their
+/// processes end, so every DNS change this start makes waits for them as it
+/// waits for its own. Returns their pids.
+///
+/// An entry whose process has ended, or whose pid now names a process created
+/// at another time, is dropped from the record. The live ones stay in it, so an
+/// exit of this process before they end hands them over again.
+pub fn adopt_handed_over_purges() -> Vec<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        let live = handoff::live();
+        handoff::keep(&live.iter().map(|(e, _)| *e).collect::<Vec<_>>());
+        live.into_iter()
+            .map(|(entry, process)| {
+                EXIT_DNS_PURGES.run_within(Duration::ZERO, move || process.wait());
+                entry.pid
+            })
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    Vec::new()
+}
+
+/// #3440 — the purges an exit left running, for the next start to wait for.
+///
+/// Each entry names a process by its pid and its creation time, which together
+/// tell it from a later process that reuses the pid. The record lives beside
+/// the host ledger, below `HKLM\SOFTWARE`, which only SYSTEM and Administrators
+/// may write (`host_ledger::store`). A record anyone else could plant would let
+/// them hold the SYSTEM daemon's DNS changes for as long as a process of
+/// theirs runs.
+#[cfg(target_os = "windows")]
+mod handoff {
+    use std::os::windows::io::AsRawHandle;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    use super::super::host_ledger::store;
+
+    /// The record's value name, beside the ledger's.
+    const VALUE: &str = "ExitDnsPurge";
+    /// More purges left running at once than this is not one host's exits.
+    const MAX_ENTRIES: usize = 16;
+
+    #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Entry {
+        pub(super) pid: u32,
+        /// In 100 ns units since 1601, as `GetProcessTimes` gives it.
+        pub(super) created: u64,
+    }
+
+    /// A process handle opened here, closed when dropped.
+    pub(super) struct Process(HANDLE);
+
+    // SAFETY: a process handle may be waited on and closed from any thread.
+    unsafe impl Send for Process {}
+
+    impl Process {
+        /// Until the process ends.
+        pub(super) fn wait(&self) {
+            // SAFETY: a live handle opened with SYNCHRONIZE.
+            unsafe { WaitForSingleObject(self.0, INFINITE) };
+        }
+    }
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            // SAFETY: the handle opened in `open_running`, closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// When the process behind `handle` was created.
+    fn created(handle: HANDLE) -> Option<u64> {
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: a live handle with query rights; four valid out-params.
+        let ok =
+            unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }
+                != 0;
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    /// `entry`'s process, if it still runs and was created when the entry says.
+    /// A process that ended stays openable while anything holds a handle to
+    /// it, so a dead one must not read as the live one.
+    pub(super) fn open_running(entry: Entry) -> Option<Process> {
+        // 0 is the idle process and 4 the kernel's; neither is a purge.
+        if entry.pid <= 4 {
+            return None;
+        }
+        // SAFETY: a plain open; `Process` closes the handle.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                entry.pid,
+            )
+        };
+        if handle.is_null() {
+            return None;
+        }
+        let process = Process(handle);
+        // SAFETY: a live handle opened with SYNCHRONIZE; a 0 ms wait only asks.
+        let running = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+        (running && created(handle) == Some(entry.created)).then_some(process)
+    }
+
+    /// Whether `child` ended within `wait`.
+    pub(super) fn ended_within(child: &std::process::Child, wait: Duration) -> bool {
+        // One below INFINITE, which would never return.
+        let ms = u32::try_from(wait.as_millis()).unwrap_or(INFINITE - 1);
+        // SAFETY: the child's own handle, live while `child` is.
+        unsafe { WaitForSingleObject(child.as_raw_handle() as HANDLE, ms) == WAIT_OBJECT_0 }
+    }
+
+    /// Record `child` with the entries still running. Whether it was written.
+    pub(super) fn hand_over(child: &std::process::Child) -> bool {
+        let Some(created) = created(child.as_raw_handle() as HANDLE) else {
+            return false;
+        };
+        let still = live().into_iter().map(|(e, _)| e).collect();
+        let own = Entry {
+            pid: child.id(),
+            created,
+        };
+        store_entries(&with(still, own))
+    }
+
+    /// The entries to record: those still running, then `own`, the newest
+    /// [`MAX_ENTRIES`] of them.
+    fn with(mut entries: Vec<Entry>, own: Entry) -> Vec<Entry> {
+        entries.push(own);
+        let start = entries.len().saturating_sub(MAX_ENTRIES);
+        entries.split_off(start)
+    }
+
+    /// The record's entries whose processes still run, each with a handle.
+    pub(super) fn live() -> Vec<(Entry, Process)> {
+        parse(store::read_value(VALUE).as_deref())
+            .into_iter()
+            .filter_map(|e| open_running(e).map(|p| (e, p)))
+            .collect()
+    }
+
+    /// Write `entries` as the record, or remove it when there are none.
+    pub(super) fn keep(entries: &[Entry]) {
+        store_entries(entries);
+    }
+
+    fn store_entries(entries: &[Entry]) -> bool {
+        if entries.is_empty() {
+            store::remove_value(VALUE);
+            return true;
+        }
+        serde_json::to_string(entries).is_ok_and(|body| store::write_value(VALUE, &body))
+    }
+
+    /// The record's entries; none for an absent or unreadable one.
+    pub(super) fn parse(body: Option<&[u8]>) -> Vec<Entry> {
+        body.and_then(|b| serde_json::from_slice(b).ok())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::PurgeGate;
+        use super::*;
+        use std::process::{Child, Command, Stdio};
+        use std::time::Instant;
+
+        /// A child that runs for about `secs` seconds and asks for nothing.
+        fn sleeper(secs: u32) -> Child {
+            Command::new("ping")
+                .args(["-n", &(secs + 1).to_string(), "127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("ping starts")
+        }
+
+        fn entry_of(child: &Child) -> Entry {
+            Entry {
+                pid: child.id(),
+                created: created(child.as_raw_handle() as HANDLE).expect("its creation time"),
+            }
+        }
+
+        #[test]
+        fn a_record_reads_back_and_a_bad_one_reads_as_none() {
+            let entries = vec![
+                Entry {
+                    pid: 4242,
+                    created: 133_000_000_000_000_000,
+                },
+                Entry { pid: 7, created: 1 },
+            ];
+            let body = serde_json::to_vec(&entries).unwrap();
+            assert_eq!(parse(Some(&body)), entries);
+            assert!(parse(None).is_empty());
+            assert!(parse(Some(b"{not json")).is_empty());
+        }
+
+        #[test]
+        fn a_record_keeps_the_newest_entries_and_its_own_last() {
+            let old: Vec<Entry> = (10..10 + MAX_ENTRIES as u32)
+                .map(|pid| Entry { pid, created: 1 })
+                .collect();
+            let own = Entry {
+                pid: 99,
+                created: 2,
+            };
+            let kept = with(old.clone(), own);
+            assert_eq!(kept.len(), MAX_ENTRIES);
+            assert_eq!(
+                kept.last(),
+                Some(&own),
+                "the exit's own purge is always kept"
+            );
+            assert_eq!(kept[0], old[1], "the oldest entry is the one that goes");
+            assert_eq!(with(Vec::new(), own), vec![own]);
+        }
+
+        #[test]
+        fn a_running_purge_is_known_by_its_pid_and_its_creation_time() {
+            let mut child = sleeper(5);
+            let entry = entry_of(&child);
+            assert!(open_running(entry).is_some(), "the live child, as recorded");
+            let reused = Entry {
+                created: entry.created + 1,
+                ..entry
+            };
+            assert!(
+                open_running(reused).is_none(),
+                "the same pid created at another time is another process"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            // Our `Child` still holds a handle, so the ended process stays openable.
+            assert!(
+                open_running(entry).is_none(),
+                "an ended purge is not running"
+            );
+            assert!(open_running(Entry { pid: 4, created: 0 }).is_none());
+        }
+
+        #[test]
+        fn a_short_purge_ends_within_its_bound_and_a_long_one_does_not() {
+            let mut quick = Command::new("cmd")
+                .args(["/c", "exit", "0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("cmd starts");
+            assert!(ended_within(&quick, Duration::from_secs(30)));
+            let _ = quick.wait();
+
+            let mut slow = sleeper(10);
+            let from = Instant::now();
+            assert!(!ended_within(&slow, Duration::from_millis(300)));
+            assert!(from.elapsed() < Duration::from_secs(5), "the bound held");
+            let _ = slow.kill();
+            let _ = slow.wait();
+        }
+
+        #[test]
+        fn an_adopted_purge_holds_the_gate_until_its_process_ends() {
+            static GATE: PurgeGate = PurgeGate::new();
+            let mut child = sleeper(2);
+            let process = open_running(entry_of(&child)).expect("the live child");
+            assert!(
+                !GATE.run_within(Duration::ZERO, move || process.wait()),
+                "adopting it does not wait for it"
+            );
+            let waited = GATE.wait_idle().expect("the adopted purge is in flight");
+            assert!(
+                waited >= Duration::from_millis(500),
+                "a DNS change waits until the process ends ({waited:?})"
+            );
+            assert!(
+                child.try_wait().expect("try_wait").is_some(),
+                "it has ended"
+            );
+            assert_eq!(GATE.wait_idle(), None, "nothing is left in flight");
+        }
+    }
+}
+
+/// #3291 — the exit-DNS purges still running on a thread of their own. Every
+/// DNS change made through [`run_cmd`] waits for them.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+static EXIT_DNS_PURGES: PurgeGate = PurgeGate::new();
+
+/// #3291 — how many purges are in flight, and the condition their ends signal.
+/// A purge counts from before its thread starts until it ends, so no DNS change
+/// can slip in between.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+struct PurgeGate {
+    in_flight: std::sync::Mutex<u32>,
+    ended: std::sync::Condvar,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+impl PurgeGate {
+    const fn new() -> Self {
+        Self {
+            in_flight: std::sync::Mutex::new(0),
+            ended: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Run `purge` on a thread of its own and wait for it for up to `wait`.
+    /// Returns whether it ended within `wait`. A purge that panics still ends.
+    fn run_within(&'static self, wait: Duration, purge: impl FnOnce() + Send + 'static) -> bool {
+        /// Counts the purge out when it ends, however it ends.
+        struct Ends(&'static PurgeGate);
+        impl Drop for Ends {
+            fn drop(&mut self) {
+                self.0.end();
+            }
+        }
+
+        *self.lock() += 1;
+        let purge = Arc::new(std::sync::Mutex::new(Some(purge)));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let theirs = Arc::clone(&purge);
+        let spawned = std::thread::Builder::new()
+            .name("exit-dns-purge".into())
+            .spawn(move || {
+                let ends = Ends(self);
+                let purge = theirs.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(purge) = purge {
+                    purge();
+                }
+                drop(ends);
+                let _ = done_tx.send(());
+            });
+        if spawned.is_err() {
+            // No thread to run it on: run it here, unbounded, as before. The
+            // purge is load-bearing and the bound is not.
+            let _ends = Ends(self);
+            let purge = purge.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(purge) = purge {
+                purge();
+            }
+            return true;
+        }
+        !matches!(
+            done_rx.recv_timeout(wait),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+
+    /// Wait until no purge is in flight. Returns how long that took, or
+    /// `None` when none was.
+    fn wait_idle(&self) -> Option<Duration> {
+        let mut in_flight = self.lock();
+        if *in_flight == 0 {
+            return None;
+        }
+        info!("dns: an exit-DNS purge is still running; DNS changes wait for it (#3291)");
+        let from = std::time::Instant::now();
+        while *in_flight > 0 {
+            in_flight = self
+                .ended
+                .wait(in_flight)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        Some(from.elapsed())
+    }
+
+    fn end(&self) {
+        let mut in_flight = self.lock();
+        *in_flight = in_flight.saturating_sub(1);
+        self.ended.notify_all();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, u32> {
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// FR-97 P1c — macOS DNS through the SCDynamicStore, the way a VPN client
@@ -1296,6 +1791,65 @@ mod tests {
              frees — otherwise one momentary conflict is permanent"
         );
         loser.abort();
+    }
+
+    /// #3291 — a purge past its bound: the start goes on, the purge still runs
+    /// to its end, and a DNS change made meanwhile waits for that end.
+    #[test]
+    fn a_purge_past_its_bound_still_ends_and_dns_changes_wait_for_it() {
+        static GATE: PurgeGate = PurgeGate::new();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&str>::new()));
+
+        let purge_order = Arc::clone(&order);
+        let ended_in_time = GATE.run_within(Duration::from_millis(50), move || {
+            held.recv().unwrap();
+            purge_order.lock().unwrap().push("the purge ended");
+        });
+        assert!(!ended_in_time, "past its bound, the caller goes on");
+
+        let change_order = Arc::clone(&order);
+        let change = std::thread::spawn(move || {
+            let waited = GATE.wait_idle();
+            change_order.lock().unwrap().push("the DNS change");
+            waited
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "a DNS change waits while the purge runs"
+        );
+
+        release.send(()).unwrap();
+        assert!(change.join().unwrap().is_some(), "the change waited");
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["the purge ended", "the DNS change"]
+        );
+        assert_eq!(GATE.wait_idle(), None, "nothing is left in flight");
+    }
+
+    /// #3291 — a purge that ends within its bound is waited for, as before the
+    /// bound, and leaves nothing for a DNS change to wait on.
+    #[test]
+    fn a_purge_within_its_bound_is_waited_for() {
+        static GATE: PurgeGate = PurgeGate::new();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let purge_ran = Arc::clone(&ran);
+        assert!(GATE.run_within(Duration::from_secs(10), move || {
+            purge_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(GATE.wait_idle(), None);
+    }
+
+    /// #3291 — a purge that panics still counts out, so no DNS change waits on
+    /// it forever.
+    #[test]
+    fn a_purge_that_panics_holds_no_dns_change() {
+        static GATE: PurgeGate = PurgeGate::new();
+        assert!(GATE.run_within(Duration::from_secs(10), || { panic!("the purge failed") }));
+        assert_eq!(GATE.wait_idle(), None);
     }
 }
 

@@ -5619,7 +5619,8 @@ mod system {
         }
     }
 
-    /// Boot reconciler for STALE PEER/SUBNET ROUTES on a persisted TUN.
+    /// Purge every PEER/SUBNET ROUTE on the overlay's TUN (all but its own
+    /// connected prefixes), and return the ones it found, each purged best-effort.
     ///
     /// `install_subnets` writes an OS route **and** the crypto-router entry in
     /// one call, so within a single runtime generation the two cannot diverge.
@@ -5636,33 +5637,37 @@ mod system {
     /// with a healthy carrier while every connection timed out; a daemon
     /// restart (which re-ran `install_peers`) fixed it instantly.
     ///
-    /// Called at TUN bring-up, BEFORE any peer is installed. At that instant the
-    /// router is empty by construction, so every route on the device except its
-    /// own connected prefixes is a leftover — which is why this needs no
-    /// keep-set and cannot race a legitimate install. `install_peers` then
-    /// re-adds exactly what the current netmap says.
+    /// Both ends of a generation call it. At a start no router exists yet, and
+    /// at an exit the router is gone or goes with the process, so every route
+    /// `enumerate_if_routes` finds, bar the device's connected prefixes, goes, with no keep-set:
+    ///
+    /// - a **start** (`roomlerd::purge_exit_routes_at_start`), BEFORE any peer
+    ///   is installed. The router is empty by construction, so whatever this
+    ///   finds is a previous generation's, and it cannot race a legitimate install.
+    ///   `install_peers` then re-adds exactly what the current netmap says.
+    /// - an **exit** (`roomlerd::purge_exit_routes` and
+    ///   `purge_exit_routes_before_restart`): the routes the process leaves,
+    ///   dropped so none outlives its router to black-hole while no daemon
+    ///   runs.
+    ///
+    /// It logs nothing, because only the caller knows which end it is: routes
+    /// found at a start mean the previous process ended without its exit
+    /// purge, and at an exit they are routine.
     ///
     /// Best-effort and sync, like [`purge_split_default`]: a failure just leaves
     /// the pre-existing (broken) state, never a worse one.
     ///
     /// Multi-org v2 — `if_name` scopes the reconcile to ONE adapter; legacy
     /// callers pass [`IF_NAME`] (the historical singleton).
-    pub fn purge_stale_peer_routes(if_name: &str) {
+    pub fn purge_stale_peer_routes(if_name: &str) -> Vec<String> {
         let stale: Vec<String> = enumerate_if_routes(if_name)
             .into_iter()
             .filter(|c| !is_derived_prefix(c))
             .collect();
-        if stale.is_empty() {
-            return;
-        }
         for cidr in &stale {
             purge_one(if_name, cidr);
         }
-        tracing::info!(
-            count = stale.len(), routes = ?stale,
-            "overlay: boot reconcile — dropped stale routes left by a previous generation \
-             on a persisted TUN (their crypto-router entries are gone, so they black-hole)"
-        );
+        stale
     }
 
     /// FR-97 N14 — is `ifref` one of this process's live adapters? `ifref` is
@@ -5843,8 +5848,8 @@ mod system {
 
     /// macOS: empty, and correctly so — there is nothing to reconcile.
     ///
-    /// This reconciler exists for a PERSISTED device: Wintun adapters (and a
-    /// cached Linux tun) outlive the process, so a previous generation's
+    /// This reconciler exists for a PERSISTED device: a Wintun adapter
+    /// outlives the process (a Linux tun does not), so a previous generation's
     /// routes can still be installed at the next boot with no crypto-router
     /// entries behind them. A utun is bound to the file descriptor that
     /// created it — when the process dies the interface goes, and the kernel
@@ -5860,6 +5865,12 @@ mod system {
         Vec::new()
     }
 
+    /// Linux: the device's prefix routes. iproute2 prints a host route without
+    /// its `/32`, so no per-peer route is listed, and none needs to be: the
+    /// overlay TUN is not persistent (`ip -d link`: `persist off`), so the
+    /// kernel removes it, and every route on it, when its last descriptor
+    /// closes. Either end therefore drops, and logs, prefix routes only, such
+    /// as a subnet route (0.4.204, #3533's field read). `ip route show` is IPv4.
     #[cfg(target_os = "linux")]
     fn enumerate_if_routes(if_name: &str) -> Vec<String> {
         let out = std::process::Command::new("ip")

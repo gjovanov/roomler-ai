@@ -49,11 +49,11 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use super::WinSize;
@@ -242,8 +242,25 @@ impl PtyProcess {
 
         // Everything the child started dies with the job. Windows has no
         // process group to signal, so this IS the `killpg` equivalent — and it
-        // must be set up before anything can escape.
-        let job = Arc::new(make_job(pi.hProcess)?);
+        // must be set up before anything can escape: the shell was created
+        // suspended, and runs only from here on. One that cannot run is ended.
+        let job = match make_job(pi.hProcess) {
+            Ok(job) => job,
+            Err(e) => {
+                // SAFETY: a process handle this function owns.
+                unsafe { TerminateProcess(pi.hProcess, 1) };
+                return Err(e);
+            }
+        };
+        // SAFETY: the primary thread's handle, which CreateProcess opened with
+        // THREAD_SUSPEND_RESUME among its rights.
+        if unsafe { ResumeThread(pi.hThread) } == u32::MAX {
+            let e = last_error("ResumeThread");
+            // SAFETY: a process handle this function owns.
+            unsafe { TerminateProcess(pi.hProcess, 1) };
+            return Err(e);
+        }
+        let job = Arc::new(job);
 
         // THE WAITER. Without this the session never ends: the console host
         // holds the output pipe's write end for as long as the pseudoconsole
@@ -660,7 +677,8 @@ fn spawn_attached(
             // CONSOLE's (`CreatePseudoConsole` owns them), and what ends the
             // output stream is `ClosePseudoConsole`, not the child's copies.
             1,
-            EXTENDED_STARTUPINFO_PRESENT,
+            // Suspended until it is in its job (`PtyProcess::spawn`).
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
             std::ptr::null(),
             std::ptr::null(),
             &si.StartupInfo,
@@ -763,8 +781,8 @@ fn spawn_attached_as_console_user(
             1,
             // No `CREATE_NO_WINDOW`: the pseudoconsole IS this child's console,
             // and suppressing console creation fights the attribute that just
-            // gave it one.
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            // gave it one. Suspended until it is in its job (`PtyProcess::spawn`).
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             env.raw,
             profile.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
             &startup.si.StartupInfo,
@@ -911,5 +929,45 @@ mod tests {
             .expect("resizing a live pseudoconsole");
         pty.kill_group();
         let _ = pty.wait().await;
+    }
+
+    /// Not a test by itself: a copy of the test binary runs it to play the
+    /// daemon. An ordinary run has no stand-in to play, and passes.
+    #[test]
+    fn the_stand_in_daemon() {
+        use crate::exec::session_lifetime::{exit_when_told, stand_in_args, starts_a_child_then};
+
+        let Some((_, dir)) = stand_in_args() else {
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _in_the_runtime = rt.enter();
+        let pty = PtyProcess::spawn(
+            Some(&starts_a_child_then(&dir, "Start-Sleep -Seconds 300")),
+            "xterm",
+            WinSize { cols: 80, rows: 24 },
+            &crate::exec::RunAs::Daemon,
+        )
+        .expect("a conpty session");
+        std::mem::forget(pty);
+        exit_when_told(&dir);
+    }
+
+    /// #3303 — the daemon goes, running no code of its own, and the shell and
+    /// what it started end. The job's promise on the path that has always had
+    /// one; `exec::session_lifetime` holds the one-shot's.
+    #[test]
+    fn a_shell_and_what_it_started_end_with_the_daemon() {
+        use crate::exec::session_lifetime::{GONE_WITHIN, StandIn};
+
+        let daemon = StandIn::start("pty::windows::tests::the_stand_in_daemon", "pty");
+        let processes = daemon.wait_for_its_processes();
+        daemon.exit();
+        for (what, p) in ["the shell", "what it started"].iter().zip(&processes) {
+            assert!(p.gone_within(GONE_WITHIN), "{what} outlived the daemon");
+        }
     }
 }

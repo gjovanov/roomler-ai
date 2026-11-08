@@ -56,9 +56,14 @@ pub struct LaunchArgs {
 }
 
 impl LaunchArgs {
-    /// This process's own arguments.
+    /// This process's own arguments. A "Run as administrator" by hand has no
+    /// limited copy to name the session's folder, so it is looked for (#3229).
     pub fn from_env() -> LaunchArgs {
-        LaunchArgs::parse(std::env::args().skip(1))
+        let mut args = LaunchArgs::parse(std::env::args().skip(1));
+        if args.session_data.is_none() {
+            args.session_data = session_data_of_another_account();
+        }
+        args
     }
 
     /// Parse `args` (without the program name): `--flag value` or
@@ -144,6 +149,63 @@ pub fn safe_folder(value: &str) -> Option<&str> {
             .any(|c| c.is_control() || "\"<>|?*:/".contains(c))
         && !rest.split('\\').any(|part| part == "..");
     fit.then_some(value)
+}
+
+/// #3229 — the local app-data folder of the person at this screen, when this is
+/// an elevated wizard running as another account. The limited user can write that
+/// folder whichever way it is learned, which is why [`make_elevated_folder`]
+/// follows no link in it.
+fn session_data_of_another_account() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        use roomlerd::win_identity::{SessionAccount, process_is_elevated, session_account};
+        if !process_is_elevated() {
+            return None;
+        }
+        let SessionAccount::Another { profile } = session_account() else {
+            return None;
+        };
+        local_app_data_under(&profile?)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+/// A profile's local app-data folder, when it is there and fit to use.
+#[cfg(any(target_os = "windows", test))]
+fn local_app_data_under(profile: &str) -> Option<String> {
+    let folder = std::path::Path::new(profile).join("AppData").join("Local");
+    let folder = folder.to_str()?;
+    safe_folder(folder)
+        .filter(|f| std::path::Path::new(f).is_dir())
+        .map(str::to_string)
+}
+
+/// #3229 — stop before any webview when nothing it could use was found. WebView2's
+/// browser runs as the person at the screen, who cannot open this account's
+/// profile, so the only other outcome is a white window that goes away after about
+/// a minute. A sentence and a way on are better.
+pub fn refuse_if_no_session_folder(args: &LaunchArgs) {
+    #[cfg(target_os = "windows")]
+    {
+        use roomlerd::win_identity::{SessionAccount, process_is_elevated, session_account};
+        if args.session_data.is_none()
+            && process_is_elevated()
+            && matches!(session_account(), SessionAccount::Another { .. })
+        {
+            wizard_shared::elevation::show_fatal(
+                "Roomler Setup cannot open its window this way: it is running as another \
+                 account, and cannot find a folder the person signed in here can use. Start it \
+                 normally, without Run as administrator, and choose Restart as administrator \
+                 inside it.",
+            );
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = args;
 }
 
 /// The arguments the limited copy hands the elevated one: the role, the
@@ -245,7 +307,8 @@ fn names_another_profile(session_data: Option<&str>, own: Option<&std::path::Pat
 /// FR-129 C — is this an elevated wizard running as ANOTHER account than the
 /// person at the screen? Over-the-shoulder credentials: a standard user started
 /// it and an administrator typed their password. The limited copy named its own
-/// local app-data folder (`--session-data`), so a different one here says so.
+/// local app-data folder (`--session-data`), or [`LaunchArgs::from_env`] found it
+/// (#3229), so a different one here says so.
 /// Only the machine-wide service is right then: the other roles would install
 /// into that administrator's profile and report Done
 /// ([`crate::role::roles_open_here`]).
@@ -292,8 +355,8 @@ pub fn open_through_the_shell(url: &str) -> std::io::Result<()> {
 /// elevated host joining a limited browser process is the cross-integrity
 /// failure.
 ///
-/// Under `session_data`, the limited copy's `%LOCALAPPDATA%`, when the
-/// relaunch carried it and the folder is there, because WebView2's browser
+/// Under `session_data`, the limited copy's `%LOCALAPPDATA%`, when the relaunch
+/// carried it or it was found (#3229) and the folder is there, because WebView2's browser
 /// process de-elevates to the user of the SESSION, whoever the host runs as.
 /// Under over-the-shoulder credentials the host is the administrator who typed
 /// the password and the browser is the standard user, who cannot open the
@@ -302,8 +365,7 @@ pub fn open_through_the_shell(url: &str) -> std::io::Result<()> {
 /// copy's folder is one that user can write, and for an administrator approving
 /// their own prompt it is the same folder as this process's.
 ///
-/// Without it, this process's own: "Run as administrator" by hand has no limited
-/// copy to ask, so over-the-shoulder credentials still fail that way there.
+/// Without it, this process's own: a person elevating themselves.
 /// `None` when there is no local app-data folder to put it in.
 pub fn elevated_webview_folder(session_data: Option<&str>) -> Option<std::path::PathBuf> {
     session_data
@@ -617,6 +679,35 @@ mod tests {
 
     /// The elevated folder sits under Tauri's own, and the identifier it is
     /// named from is the one `tauri.conf.json` carries.
+    /// #3229 — a folder found for the person on a start by hand has to exist and
+    /// be fit for the command line and WebView2, like one handed over.
+    #[test]
+    fn a_found_folder_must_be_there_and_fit() {
+        let profile = tempfile::tempdir().unwrap();
+        let profile_path = profile.path().to_str().unwrap();
+        assert_eq!(local_app_data_under(profile_path), None, "no AppData yet");
+        let local = profile.path().join("AppData").join("Local");
+        std::fs::create_dir_all(&local).unwrap();
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            local_app_data_under(profile_path).as_deref(),
+            local.to_str()
+        );
+        for unfit in [r"\\host\share\Users\a", r"relative\a", r"C:\Users\..\a", ""] {
+            assert_eq!(local_app_data_under(unfit), None, "{unfit}");
+        }
+    }
+
+    /// #3229 — a start that cannot open a window says so before anything tries.
+    #[test]
+    fn main_refuses_a_start_with_no_folder_before_any_window() {
+        let calls = crate::spawn_gate::called_names(include_str!("main.rs"));
+        let at = |name: &str| calls.iter().position(|c| c == name).expect(name);
+        assert!(at("from_env") < at("refuse_if_no_session_folder"));
+        assert!(at("wait_for_parent") < at("refuse_if_no_session_folder"));
+        assert!(at("refuse_if_no_session_folder") < at("run"));
+    }
+
     #[test]
     fn the_elevated_webview_folder_is_beside_the_limited_one() {
         let conf: serde_json::Value =

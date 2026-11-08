@@ -94,6 +94,8 @@ async fn agent(track_codec: String) -> Result<(AgentPeer, mpsc::Receiver<ClientM
         // carrier observation never fires; a throwaway sender is the honest
         // value.
         mpsc::channel(1).0,
+        // FR-135 §7.1 — neither key set: every built-in default.
+        roomlerd::media_paths::MediaPaths::default(),
     )
     .await
     .context("AgentPeer::new")?;

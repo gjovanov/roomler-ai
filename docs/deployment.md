@@ -70,7 +70,7 @@ flowchart LR
         GE --> B --> L --> S --> P
     end
     G[("ghcr.io/gjovanov/roomler-ai<br/>public · no pull secret")]
-    PR["promote.yml (dispatch)<br/>resolve the tag · refuse non-hosted<br/>bump newTag in the deploy repo"]
+    PR["promote.yml (dispatch)<br/>resolve the tag · refuse non-hosted<br/>pre-pull on the nodes, wait 30 s<br/>bump newTag in the deploy repo"]
     D["deploy repo · k8s/overlays/prod<br/>newName: ghcr.io/gjovanov/roomler-ai<br/>newTag: hosted-…"]
     A["ArgoCD (webhook, automated + selfHeal)"]
     K["cluster: RollingUpdate<br/>maxSurge 0 / maxUnavailable 1<br/>pull ≈ 3 s per node (81 MB)"]
@@ -89,6 +89,46 @@ flowchart LR
 | promote | a human, `gh workflow run promote.yml -f tag=…` (empty tag = the `hosted` pointer) | runs in the `release` environment, whose secret `DEPLOY_REPO_TOKEN` it uses after proving write access with a dry-run push (verified 2026-09-06); without the secret the job prints the exact bump |
 | roll | ArgoCD, one pod at a time | 20 s from the deploy-repo push to both pods on the new image; pulls 3.3 s / 2.7 s per node |
 | verify | from the fleet, after every roll | the workflow only proves the public `/health` kept answering |
+
+### The pre-pull: the image lands before the roll (FR-28)
+
+A replacement pod cannot exist until the old one is gone (`hostNetwork`, `maxSurge: 0`), so
+every second it takes to start is a second its tenants' sockets have no pod. The pull was the
+largest part of that: 3–4 s of each wave's 5.3–6.3 s on the roll read live on 2026-10-31
+([FR-28](fr/FR-28-derp-drain-on-pod-roll.md)). So a promote is two commits in the deploy repo,
+30 s apart (`.github/workflows/promote.yml:155-181`):
+
+```mermaid
+sequenceDiagram
+    participant P as promote.yml
+    participant D as deploy repo
+    participant A as ArgoCD
+    participant N as Both nodes
+    participant R as roomler2
+    P->>D: move the DaemonSet's image line
+    D->>A: webhook
+    A->>N: roomler2-prepull rolls and pulls the image
+    Note over R: no pod of the app is touched
+    P->>P: wait 30 s
+    P->>D: bump newTag
+    D->>A: webhook
+    A->>R: the roll, and each replacement finds the image on its node
+```
+
+| | |
+|---|---|
+| What holds the image | `roomler2-prepull` in the deploy repo's `k8s/overlays/prod`: a DaemonSet of `sleep`, on the nodes `roomler2` is pinned to, reading no config and no secret. `roomler2`'s `imagePullPolicy: IfNotPresent` does the rest |
+| The kill switch | Delete that file and its line in `kustomization.yaml`. The promote skips the step and pushes its one commit, and a roll pulls as it did before |
+| A pull that fails or outlasts the wait | Today's roll: the pod pulls for itself. The runner cannot see the cluster, so nothing waits on the pull |
+| A manual bump, or the break-glass path | Moves `newTag` only, so it rolls without a pre-pull |
+| Reading it | The replacement pod's events say `Container image already present on machine`, and the promote's summary says `pre-pull: pushed` |
+
+⚠️ **It is not an ArgoCD sync wave, on purpose.** A wave would wait for the pull exactly, in
+one commit. But a DaemonSet that cannot get healthy, on a node that is down, would leave the
+sync running, with every later promote and self-heal stuck behind it until someone terminates
+the operation. The fixed wait can only ever fall back to today's roll.
+
+⚠️ During those 30 s the deploy repo's `newTag` still reads the old tag and nothing has rolled.
 
 Two things the lane never does: it never writes `latest` (that is the self-host `full` image
 without `saas`, owned by `publish-selfhost-image.yml`), and it never deploys — a roll re-homes
@@ -151,7 +191,7 @@ flowchart LR
 | Both image lanes | `hosted-image.yml:128`, `publish-selfhost-image.yml:151` | Run the fetch before `docker build`, into the build context, as a step with `continue-on-error` and an 8-minute timeout, so nothing in it can fail a build. Nothing in the Dockerfile downloads, so the layer is keyed by the file's content and a failed fetch can never be cached as an empty layer |
 | Bake + default | `Dockerfile:149` (`COPY`), `Dockerfile:155` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
-| Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:259` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
+| Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
 | Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
 | Credit | `ui/src/utils/geoipCredit.ts:35`, `ObservabilityView.vue:369` | "IP Geolocation by DB-IP" linking <https://db-ip.com> under the Countries table, shown only when the server reports a DB-IP database |
 
@@ -197,10 +237,10 @@ docker compose up -d
 
 | Service | Port | Purpose |
 |---|---|---|
-| `mongo:7` | 27019→27017 | database (dev credentials in the compose file) |
-| `redis:7-alpine` | 6379 | pub/sub + presence |
+| `mongo:7.0.45`, pinned by digest | 27019→27017 | database (dev credentials in the compose file) |
+| `redis:7.4.12-alpine`, pinned by digest | 6379 | pub/sub + presence |
 | `ghcr.io/gjovanov/minio` | 9000 (API) / 9001 (console) | S3-compatible file storage: Chainguard's MinIO build, mirrored and pinned by digest, since `minio/minio` is gone from Docker Hub (#2034) |
-| `coturn/coturn` | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
+| `coturn/coturn:4.18.0-r0`, pinned by digest | host network | TURN relay (`turnserver.conf` — rotate the shared secret!) |
 
 Then `cargo run --bin roomler-ai-api` (API :3000) and `cd ui && bun run dev`
 (SPA :5000, proxying `/api` + `/ws` to :5001).
