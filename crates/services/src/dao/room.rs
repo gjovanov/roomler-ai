@@ -1071,6 +1071,40 @@ impl RoomDao {
             .map_err(DaoError::Mongo)
     }
 
+    /// Does this user hold an OPEN call session in this room that
+    /// `connection_id` may use: the one `call/join` opened naming this
+    /// connection, or one it opened naming none (an older client, or a page
+    /// whose socket had no id yet, #3416)?
+    ///
+    /// What `media:join` requires on top of the room guard, so the socket
+    /// path admits only someone the REST path admitted. A session opened for
+    /// ANOTHER connection does not count: that connection joined, not this one.
+    pub async fn has_open_call_session(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        user_id: ObjectId,
+        connection_id: &str,
+    ) -> DaoResult<bool> {
+        let found = self
+            .members
+            .collection()
+            .find_one(doc! {
+                "tenant_id": tenant_id,
+                "room_id": room_id,
+                "user_id": user_id,
+                // A query's `null` matches an absent field too, and a session
+                // with no connection id has none (`skip_serializing_if`).
+                "sessions": { "$elemMatch": {
+                    "left_at": null,
+                    "connection_id": { "$in": [connection_id, null] },
+                } },
+            })
+            .await
+            .map_err(DaoError::Mongo)?;
+        Ok(found.is_some())
+    }
+
     /// Room in which the given WS connection still holds an OPEN call session.
     /// Disconnect-path fallback for when the in-memory media maps have no
     /// entry (HTTP call/join succeeded but `media:join` never happened).

@@ -304,6 +304,29 @@ distinguish "agent exists" (200 + refusal) from "no such agent" (404) across
 tenants, write attacker-timed rows into another org's `ssh_audit`, and read
 whether that org had `remote_ssh_enabled`.
 
+### The media socket admits only the call's participants
+
+A `media:*` command on the user socket names a room by id, so it gets the same
+object-level check a REST route does, on the path that carries the media. A connection
+may use `media:*` for a room only while it is a participant of that room's call, which
+is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.rs`):
+
+- **`media:join`** needs a member of the **room's** tenant (read from the room, never from
+  the frame), the room's visibility, and an open call session for this connection, or one
+  with no connection id (an older client). The socket path admits only someone the REST
+  path admitted. The join is admitted before placement, so a refused one claims no room.
+- **Every other command** needs this connection's seat in the room's media, as this user,
+  which only an admitted join creates. It is checked on the pod that holds the seat, so a
+  command forwarded to the owner pod is checked there.
+- The handlers take the gate's proof, a `JoinPass` or a `Seat`, never a bare room, user or
+  connection id. ⚠️ A new `media:*` handler takes one too: a handler keyed by the frame's
+  `room_id` alone is the cross-tenant IDOR above, on a socket.
+- A refusal is one answer for every reason, so it says neither whether a room exists nor
+  whose it is.
+
+`GET /api/cluster/status` lists every live meeting room on a pod, so it is a platform
+admin's route (`require_platform_admin`, 404 otherwise), like `/api/admin/*`.
+
 ---
 
 ## 4 · The device plane

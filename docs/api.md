@@ -168,7 +168,7 @@ capability URLs, webhook signatures).
 | GET | `/api/turn/credentials` | Ephemeral TURN credentials (user-scoped) |
 | GET | `/api/relay/regions` | Multi-region relay PoP topology (read-only) |
 | POST | `/api/log/browser` | Browser console-log batch ingest (user JWT + explicit `tenant_id`) |
-| GET | `/api/cluster/status` | Per-pod identity, counters, gauges |
+| GET | `/api/cluster/status` | Per-pod identity, counters, gauges. Platform admins only (`require_platform_admin`, the 404 every `/api/admin/*` route gives): it names every live meeting room on the pod and the pods' ids |
 | POST | `/api/stats/pageview` | SPA route-change beacon (authed, paths normalized) |
 | GET | `/health` | Liveness — cheap process-alive 200 |
 | GET | `/health/ready` | Readiness — Mongo ping + Redis round-trip + live subscription |

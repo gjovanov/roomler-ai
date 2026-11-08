@@ -6,7 +6,9 @@
 //! socket, so ownership is a **SET-NX claim** (`roomler:own:media:<room>`)
 //! — creation itself is mutually exclusive, which kills the S6 belt's
 //! split-brain class (two pods silently building rival router islands
-//! for one room). Every `media:*` command resolves placement first:
+//! for one room). Every `media:*` command resolves placement first — a
+//! `media:join` only once the participation gate (`media_gate`) admitted it,
+//! so a refused join never claims a room:
 //!
 //! - local room → serve with the local `RoomManager` (unchanged path);
 //! - foreign claim → forward the command to the owning pod over the
@@ -650,7 +652,10 @@ pub fn wire_media_cluster(state: &ConferenceState) {
 /// (the claim may have moved since the caller looked): still ours →
 /// dispatch against the local handlers, whose replies/pushes ride the
 /// conn-addressed channel back; moved → structured NACK naming the new
-/// owner so the caller can retry once.
+/// owner so the caller can retry once. The participation gate runs here,
+/// where the seats live: a join is admitted before placement and before this
+/// pod seats the connection, and every other command needs its seat
+/// (`dispatch_media_local`).
 async fn handle_media_cmd_rpc(
     state: ConferenceState,
     body: serde_json::Value,
@@ -674,18 +679,41 @@ async fn handle_media_cmd_rpc(
         .and_then(|s| ObjectId::parse_str(s).ok())
         .ok_or_else(|| "missing room_id".to_string())?;
 
-    match resolve_media_route(&state, &rid, msg_type == "media:join").await {
+    // A forwarded join is admitted here as well, and before placement, so
+    // one this pod refuses (a pod that did not gate it forwarded it) claims
+    // nothing. The refusal reaches the viewer conn-addressed, and the RPC
+    // still answers ok: the viewer's pod adds no error of its own.
+    let pass = if msg_type == "media:join" {
+        match crate::media_gate::admit_join(&state, uid, &conn, rid).await {
+            Ok(pass) => Some(pass),
+            Err(refusal) => {
+                crate::ws_media::refuse_join(&state, &uid, &conn, rid, &refusal).await;
+                return Ok(serde_json::json!({ "ok": true }));
+            }
+        }
+    } else {
+        None
+    };
+
+    match resolve_media_route(&state, &rid, pass.is_some()).await {
         MediaRoute::Remote(pod) => Err(format!("not_owner:{pod}")),
         MediaRoute::Local { create } => {
-            crate::ws_media::dispatch_media_local(
-                &state,
-                &uid,
-                &conn,
-                &msg_type,
-                data.as_ref(),
-                create,
-            )
-            .await;
+            match (&pass, data.as_ref()) {
+                (Some(pass), Some(frame)) => {
+                    crate::ws_media::handle_media_join(&state, pass, frame, create).await;
+                }
+                _ => {
+                    crate::ws_media::dispatch_media_local(
+                        &state,
+                        &uid,
+                        &conn,
+                        &msg_type,
+                        data.as_ref(),
+                        create,
+                    )
+                    .await;
+                }
+            }
             Ok(serde_json::json!({ "ok": true }))
         }
     }
