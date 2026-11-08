@@ -124,15 +124,15 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:7067`
-`INPUT_MOVE_GAP_MS`, `:7080` `schedulePendingMove`): send immediately when the
+P6 drives sends from a timer instead (`useRemoteControl.ts:7106`
+`INPUT_MOVE_GAP_MS`, `:7119` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12592`). The gap is a per-browser knob,
-0 to 16 ms (`roomler-rc-input-gap`, `:2726` `storedInputGapMs`, from FR-98 C3); the
-same timer drives the relative-pointer path (`:7179`).
+always queued (`useRemoteControl.ts:12653`). The gap is a per-browser knob,
+0 to 16 ms (`roomler-rc-input-gap`, `:2727` `storedInputGapMs`, from FR-98 C3); the
+same timer drives the relative-pointer path (`:7218`).
 
 The point of the design is that `setTimeout` cadence is **independent of rAF**:
 under a compositor load that drops rAF to 20 fps, pointer sends still leave at
@@ -150,13 +150,23 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3716` `clock_echo_json`, handled at
   `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:7016` `CLOCK_RING`, `:7020`
+  sample of the last 8 (`useRemoteControl.ts:7027` `CLOCK_RING`, `:7031`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
   `age = epochNow + offset − wireTs` (`rc-hop-stats.ts:220` `frameAgeMs`). The
   pill is the window average, `~${Math.round(age.avgMs)} ms`
   (`RemoteControl.vue:4843` `statsAgeLabel`, rendered at `:289`).
+- **On one clock.** The probe runs on the page, so the offset maps the agent's
+  clock onto the page's, and a decode worker's `epochNow` is not the page's:
+  each context fixes its epoch from the wall clock when it starts, and a worker
+  made after its page reads a constant apart from it (7.25 ms, 162 s after the
+  page, on the Windows dev box). So the page measures that skew when it starts
+  the worker, and the worker reads the offset through it
+  (`workerAgentOffsetUs`, `ui/src/workers/rc-clock-cal.ts:153`; #3566,
+  [remote-control.md §11.14.3](remote-control.md#11143-one-clock-for-the-page-and-its-worker-3566)).
+  Before that, a session whose worker started late read every age off by the
+  skew.
 
 It covers **encode-output → send queue → network → decode → paint**. The
 agent-side capture + encode (~10–15 ms) sits *before* the stamp and is excluded,
@@ -226,7 +236,7 @@ encodes at that geometry.
 - **WGC drop ratio** (`wgc_backend.rs:790`): median 2 %, p90 2, max 42, over 2 571
   samples on the one WGC-capture host in the week, again NVENC and not Iris-Xe.
 
-### End-to-end age (AC8) — **partial**
+### End-to-end age (AC8) — **partial**, held for #3566
 
 | Transport | age_ms med / p90 / p99 | floor med | windows | sessions / hosts |
 |---|---|---|---|---|
@@ -253,6 +263,41 @@ two DataChannel pumps, with 6 sentinels and no `viewer_age_implausible`.
 The direct tail the 10-26 read showed (p90 1108, p99 1194) is not in this week's
 numbers. This read does not say why.
 
+**2026-11-02, the pill beside the wire.** A headed Chromium 151 on the production
+viewer, with the page visible and focused, held two sessions to a throwaway Linux
+device on 0.4.197. A script read the `~N ms` pill about once a second, 164 samples
+from 36 to 2 865 ms. The agent's `agent_logs` for those two sessions hold 66
+heartbeats with a `viewer_age_ms`.
+
+| Session | Heartbeats with an age | Equal to a pill value within 5 s | Of those at 300 ms or more | Equal to a value from the *other* session (chance control) |
+|---|---|---|---|---|
+| 1 | 52 | 50 | 18 of 18 | 0 |
+| 2 | 14 | 13 | 10 of 11 | 1 |
+
+So the wire carries the number the person reads. Each window's `age` goes to the
+pill and to `sendDecodeStat` from one worker `stats` message
+(`useRemoteControl.ts:7578`, `:8224`, `RemoteControl.vue:4878`). A once-a-second
+read can skip a window, which fits the three misses, though this read can't prove it.
+
+That is all this read shows. The session was VP9 software on a loaded host, under
+software compositing, with `carrier=direct`, so its ages say nothing about how low
+the number gets on real hardware. The comparison with RustDesk's own Delay readout
+is the operator's A/B (AC9).
+
+**2026-11-08, held for #3566.** That issue found the decode worker applying a clock
+offset the page measured on the page's own clock. Two browsing contexts started at
+different times disagree by the wall-clock slew between their starts, so every age
+read off by that much, low on some hosts and high on others: 7 ms after 162 s on one
+host, near 160 ms after an hour (§5, "On one clock"). The fix, #3568, merged the same
+day: the worker now reads the offset through a skew the page measures when it starts
+the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:845`). Production runs the old
+arithmetic until a promote. The read above started each session right after loading
+its page, so it stands, and the pill and the wire still take one worker `stats`
+message (`useRemoteControl.ts:7749`, `:8397`, `RemoteControl.vue:4844`). The fleet
+tables above carry the error, and a window whose ages all read negative sent none,
+since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
+is on production and its owed GREEN read is in.
+
 ### Pointer cadence (AC7) — mechanism confirmed, field read owed
 
 The decoupling is in the source (§4): sends run off a `setTimeout` floor, never
@@ -261,6 +306,36 @@ flat while the viewer's rAF is tanked by compositor load — needs a **foregroun
 browser with forced control to measure, which a relay-only, background-throttled
 automation tab cannot do (a background tab throttles `setTimeout` too). It is owed
 on the operator's own browser or a dedicated idle host.
+
+**2026-11-03, a real pointer: two tries, no result yet.** A headed Chromium on the
+production viewer, page visible and focused, under software compositing, with an X
+pointer moved by `xdotool` at 234 moves/s. Earlier runs through the DevTools protocol
+read nothing useful, because its acks arrive at renderer pace, so the driver itself
+followed rAF. The second try on 0.4.197:
+
+| Arm | rAF/s | Sends/s | Sends/s while input flowed | Raw events/s | Send gap p50 / p95 ms | Host load |
+|---|---|---|---|---|---|---|
+| A1, no load | 48.5 | 99.2 | 126.4 | 186.5 | 7.8 / 9.1 | 2.4-3.6 |
+| B1, compositor load | 31.7 | 94.4 | 127.3 | 176.4 | 7.8 / 9.4 | 5.2-6.7 |
+| A2, no load | 44.0 | 93.0 | 128.6 | 174.6 | 7.7 / 9.0 | 7.2-7.6 |
+| B2, compositor load | 29.6 | 100.4 | 127.0 | 186.9 | 7.8 / 9.2 | 7.4-8.9 |
+| B_heavy, compositor nearly dead | 5.1 | 90.1 | 125.2 | 166.9 | 7.7 / 8.7 | 9.0-9.6 |
+
+"While input flowed" leaves out gaps over 30 ms. Main-thread stalls, 230-380 ms each,
+took about a quarter of every arm, loaded or not, and their cause isn't known.
+
+While input flowed, sends sat at the 8 ms coalescer's ceiling of 125/s, from rAF 48
+down to rAF 5. That is what P6 claims, but **it isn't a result**, because a read counts
+only with its controls:
+
+- The second try stopped on a host-pressure limit before its controls ran. That host
+  is shared, and the pressure fell as soon as the rig stopped.
+- The first try ran every arm, on a larger window with more paint. Its busy-frame
+  control behaved: 14 sends/s, gap p50 86 ms. Its 16 ms control missed the 55-62 sends/s
+  it had to reach, at 34.7/s, though its gap p50 read 16.0 ms, so the counter does
+  follow the coalescer.
+
+AC7 stays owed. It needs an idle host, where this rig is a 5-minute run.
 
 ## 7. Config & kill-switch reference
 
