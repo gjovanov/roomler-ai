@@ -605,6 +605,20 @@ pub fn wire_media_cluster(state: &ConferenceState) {
             })
         });
 
+        // media.withdraw_seats — a membership ended, served on another pod:
+        // close the person's seats in this pod's room (`revoke`). Replies
+        // with the connections it closed.
+        let st = state.clone();
+        bus.register(crate::revoke::WITHDRAW_SEATS, move |body| {
+            let st = st.clone();
+            Box::pin(async move {
+                let rid = parse_oid(&body, "room_id")?;
+                let uid = parse_oid(&body, "user_id")?;
+                let closed = crate::revoke::withdraw_seats_here(&st, rid, uid).await;
+                Ok(serde_json::json!({ "closed": closed }))
+            })
+        });
+
         // media.close_room — call_end/auto-end served on a non-owner pod.
         let st = state.clone();
         bus.register("media.close_room", move |body| {

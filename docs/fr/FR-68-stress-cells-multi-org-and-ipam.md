@@ -2,7 +2,7 @@
 
 **Status**: **every AC met except AC2**, which is deliberately deferred and is
 the operator's call to build or drop (see "Is AC2 worth its cost?"). The P1 tail
-(AC3, AC4, AC9's emitted WARN) is in review as
+(AC3, AC4, AC9's emitted WARN) merged on 2026-10-29 as
 [#3097](https://github.com/gjovanov/roomler-ai/pull/3097), each test shown RED on
 the shipped behaviour and GREEN on the fix (field log 2026-10-29);
 AC6 was re-read 2026-10-29 on two two-org hosts running the released 0.4.185.

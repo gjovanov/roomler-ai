@@ -454,6 +454,19 @@ pub(crate) async fn handle_media_join(
         }
     };
 
+    // The gate again, now that the seat exists. A membership that ended
+    // while this join was on its way withdrew the seats it could find
+    // (`revoke`), and this one did not exist yet; asking again here closes
+    // that gap: the seat is either seen by the withdrawal, or sees the
+    // membership gone and goes itself, before the client hears anything.
+    if let Err(refusal) = media_gate::admit_join(state, user_id, connection_id, rid).await {
+        state
+            .room_manager
+            .close_participant_of_user(&rid, connection_id, &user_id);
+        refuse_join(state, &user_id, connection_id, rid, &refusal).await;
+        return;
+    }
+
     // FR-127 P1.1 — read the capabilities and release the rooms guard BEFORE
     // the send: a guard held across an await parks every thread that wants its
     // shard (`room_manager.rs` `tests`).

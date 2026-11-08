@@ -229,6 +229,12 @@ not the path room.
 ⚠️ **Never re-fetch with a bare `find_by_id` after a tenant-scoped write**:
 `message::update` did, and returned another tenant's content in the response even
 though the write itself was correctly scoped.
+⚠️ **An id in a request body is resolved like one in the path.** A reply's
+`thread_id` and `referenced_message_id` must name a live message of the reply's own
+room (`MessageDao::find_live_in_room`), or the send answers the 404 a nonexistent
+message gets, before anything is written. The thread-metadata write, the thread
+listing, the root's re-read and the boot-time thread repair are scoped to that
+tenant and room, and a mention notifies members of the room only.
 ⚠️ `room::join` additionally requires `is_open` — it previously had **no checks at
 all**, so anyone could join any private room in any org and receive its WS
 fan-out. `room::update`/`delete` now require `MANAGE_CHANNELS` (they were
@@ -323,6 +329,14 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   `room_id` alone is the cross-tenant IDOR above, on a socket.
 - A refusal is one answer for every reason, so it says neither whether a room exists nor
   whose it is.
+- **A seat ends with the membership that admitted it.** Removed from the org or leaving
+  it, or leaving the room, ends any seat the person holds in a call there at once, on the
+  pod that holds it, through core's `MembershipLifecycle` hook run after the membership
+  row is gone (`crates/modules/conference/src/revoke.rs`). A join on its way at that
+  moment asks the gate again once its seat exists. ⚠️ A new way to lose a membership (a
+  room kick, a deleted account) calls the hook too, after the row is gone, or the seats it
+  admitted outlive it. A room deleted mid-call does not call it yet: that call runs on
+  until its people hang up. `docs/real-time.md` has the flow.
 - **Each socket's `media:*` frames are limited** by a token bucket
   (`crates/modules/conference/src/frame_limit.rs`, `[meetings] media_frame_burst` /
   `media_frame_rate`), checked before the gate: a frame over it is answered

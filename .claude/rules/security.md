@@ -33,6 +33,7 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   existence. ⚠️ A handler keyed by `message_id` must use the **message** guard — the
   two ids are decoupled. ⚠️ Never re-fetch with a bare `find_by_id` after a
   tenant-scoped write.
+- **Call media is authorized by the caller's call seat (`call/join`), never by org membership.** Every `media:*` frame checks the seat, and losing the membership revokes it.
 - **A 403 is an answer, not an expired credential.** It never ends a session, on any
   method. The only 403 with a navigation is `not_a_member`, matched on a
   **server-sent code**, never a message-string sniff — chat's

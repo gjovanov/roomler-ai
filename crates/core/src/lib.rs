@@ -31,8 +31,8 @@
 //!   belongs to a module.
 //! * **A DAG, not peers.** Any module may call core; `conference → chat`,
 //!   `remote → fleet`, `network → fleet`. Core never calls a module: the inverse
-//!   flows (tenant archive, agent removal) are [`hooks`] that core invokes in a
-//!   fixed order ([`hooks::HOOK_ORDER`]).
+//!   flows (tenant archive, agent removal, a lost membership) are [`hooks`] that
+//!   core invokes in a fixed order ([`hooks::HOOK_ORDER`]).
 //! * **Static composition.** The host composes concrete module types under
 //!   feature cfgs — no `Vec<Box<dyn Module>>`, no link-time registry. A module
 //!   that forgets its indexes, jobs or hooks does not compile.
@@ -83,7 +83,8 @@ pub use agent_socket::{
 pub use capabilities::{Capabilities, TenantCtx};
 pub use error::ApiError;
 pub use hooks::{
-    FleetLifecycle, HookRegistry, Hooks, ReleasedLease, RenamePropagation, TenantLifecycle,
+    FleetLifecycle, HookRegistry, Hooks, MembershipLifecycle, ReleasedLease, RenamePropagation,
+    TenantLifecycle,
 };
 pub use job::{Cadence, Job, JobFuture};
 pub use module::Module;

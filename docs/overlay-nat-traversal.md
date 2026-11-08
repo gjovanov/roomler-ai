@@ -124,6 +124,18 @@ Switch: `ROOMLERD_OVERLAY_LAN_ROUTE_REPAIR` / config `overlay_lan_route_repair`
 (Windows; default on; off removes the halves). Each install is one WARN line
 naming the prefix, the interface and the dead next hop.
 
+### Remote desktop is not on this cascade by default
+
+This cascade carries the overlay. A remote-desktop session is WebRTC with its
+own ICE, and unless the device allows it, that ICE stays off the overlay:
+`AccessPolicy.rc_overlay` is off by default, so the overlay's blocks and the
+derived-v6 ULA are kept out of a session's host candidates, remote candidates
+and ICE servers (`agents/roomlerd/src/rc_overlay.rs`, FR-64, #1882). With `on`,
+or `auto` when the session decides so (FR-128), a pair over the overlay is
+carried by whichever tier this page picked, and the session has no view of
+that tier. The rule, and its one gap (#3359), are in
+[remote-control.md §4.4](remote-control.md#44-whether-a-session-may-ride-the-overlay-1882).
+
 ## Phase C: the hole-punch, precisely
 
 Two facts about this codebase's WireGuard make the punch simpler than a generic

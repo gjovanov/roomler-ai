@@ -1,6 +1,7 @@
 # FR-15: Relay age feedback — close the rate loop with the viewer's own clock
 
-Status: **proposed** (evidence collected 2026-08-27, first field session of the FR-1 P7
+Status: **shipped** in 0.4.9 (#796), P2 in 0.4.11 (#804); AC4 met 2026-11-03, the other
+criteria open (evidence collected 2026-08-27, first field session of the FR-1 P7
 age pill). Tracking issue: `FR-15` in gjovanov/roomler-ai/issues. Child of FR-1; the
 successor to FR-10's open decision ("relay drainage needs a signal SCTP doesn't give us").
 
@@ -111,7 +112,16 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
       (the loop visibly reacting).
 - [ ] A struggling/absent-age viewer (old web) leaves relay behaviour byte-identical
       to 0.4.7.
-- [ ] Direct transports untouched (loop gated `constrained`).
+- [x] Direct transports untouched (loop gated `constrained`). **Met (2026-11-03):** no
+      `age_over` line in a week's logs fired on a direct transport (field log).
+      **Re-grounded 2026-11-08 on the gate itself,** because that read can't tell the gate
+      from a session that sent no age: #3566 found a tab's ages off by its page↔worker
+      clock drift, and a session whose ages all read negative sent none (the fix, #3568,
+      merged the same day and waits for a promote). On master the
+      loop fires only with `constrained` (`agents/roomlerd/src/encode/governor.rs:1287`),
+      and `age_loop_is_constrained_only_and_respects_the_kill_switch` (`:3619`, in CI's
+      `roomlerd` lib lane) drives a direct session through an age history that would cut a
+      constrained one and asserts `age_over` stays false and the target never moves.
 
 ## Field log
 
@@ -120,3 +130,4 @@ trigger on constrained. See FR-17 (#799) for why those numbers get so large.
 | 2026-08-27 | 0.4.7 | Baseline: the two readings above; FR filed. |
 | 2026-08-27 | 0.4.8 (#796) | Implemented. Field gate pending: read `viewer_age_ms` / `viewer_age_floor_ms` in the pump heartbeats, and expect `target_bps` to step DOWN while the viewer's age is spiking — that pairing IS the loop working. Agent half needs 0.4.8 on the TARGET (CORPLAP-3), viewer half needs the web deploy. |
 | 2026-08-28 | 0.4.11 (#804) | **P2 shipped, both halves live.** Agent `agent-v0.4.11` on CORPLAP-1 + CORPLAP-3; viewer half deployed (`probe_rtt_ms` verified present in the served RC chunk). The floor is now bounded by half the viewer's own probe round trip: sub-physical samples are rejected rather than learned (counted as `viewer_age_implausible`), and an age ≥3× one-way fires regardless of the learned floor. Field gate: `viewer_age_floor_ms` should never again read below ~RTT/2, and `viewer_age_implausible` climbing is the clock-bias signature rather than a slow path. |
+| 2026-11-03 | 0.4.177 to 0.4.197, natural traffic | **AC4 met.** `agent_logs`, the week: 538 *viewer-rate fps cap* lines with `age_over=true`, in 30 sessions. The FFmpeg DC pump wrote 343, each beside a `constrained=true` heartbeat, and none beside `constrained=false`, in a week with 92 919 such windows. That includes the one session that held both values, where all 220 lines sit beside `true` (CORPLAP-1, 10-31). The VP9-444 pump wrote 195, and its heartbeat has no `constrained` field, so those read by carrier: 193 on `turn` and 2 on sessions recorded `direct`. Those 2 fired on the relay pair the session opened on, before the path moved to direct: 11-02 22:15:36Z with the path change at 22:15:39Z, and 11-03 00:51:16Z with the change at 00:51:18Z. The carrier is recorded after a settle, so it names where the session ended up. The code requires it: `age_over` takes `constrained` (`agents/roomlerd/src/encode/governor.rs:1287`), and `age_loop_is_constrained_only_and_respects_the_kill_switch` (`:3619`) holds that on a direct session. |

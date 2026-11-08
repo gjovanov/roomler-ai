@@ -42,6 +42,10 @@ mod multi_tenancy_tests;
 mod reaction_tests;
 #[cfg(test)]
 mod recording_tests;
+/// A reply's thread and quote are live messages of its own room, a thread
+/// lists its own room's replies, and a mention reaches the room's members.
+#[cfg(test)]
+mod thread_reply_tests;
 
 /// Tests of the fixture itself, not of the product — see the module docs.
 #[cfg(test)]

@@ -943,9 +943,12 @@ impl RoomManager {
         removed
     }
 
-    /// Removes ALL participant entries for a given user_id from a room.
-    /// Used by HTTP leave endpoint which doesn't have a connection_id.
-    pub fn close_participant_by_user(&self, room_id: &ObjectId, user_id: &ObjectId) {
+    /// Removes ALL participant entries for a given user_id from a room, and
+    /// returns the connections it closed. Used by the HTTP leave endpoint,
+    /// which doesn't have a connection_id, and by a membership's end
+    /// (`revoke`), which closes every connection of the person.
+    pub fn close_participant_by_user(&self, room_id: &ObjectId, user_id: &ObjectId) -> Vec<String> {
+        let mut closed = Vec::new();
         if let Some(room) = self.rooms.get(room_id) {
             let conn_ids: Vec<String> = room
                 .participants
@@ -954,11 +957,36 @@ impl RoomManager {
                 .map(|e| e.key().clone())
                 .collect();
             for cid in conn_ids {
-                room.participants.remove(&cid);
-                self.connection_rooms.remove(&cid);
+                if room.participants.remove(&cid).is_some() {
+                    self.connection_rooms.remove(&cid);
+                    closed.push(cid);
+                }
             }
         }
-        debug!(?room_id, ?user_id, "participant media closed (by user_id)");
+        debug!(
+            ?room_id,
+            ?user_id,
+            closed = closed.len(),
+            "participant media closed (by user_id)"
+        );
+        closed
+    }
+
+    /// Every connection in a room's media.
+    pub fn connection_ids(&self, room_id: &ObjectId) -> Vec<String> {
+        self.rooms
+            .get(room_id)
+            .map(|room| room.participants.iter().map(|e| e.key().clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The rooms on this pod in whose media `user_id` holds a connection.
+    pub fn rooms_with_user(&self, user_id: &ObjectId) -> Vec<ObjectId> {
+        self.rooms
+            .iter()
+            .filter(|room| room.participants.iter().any(|p| &p.user_id == user_id))
+            .map(|room| *room.key())
+            .collect()
     }
 
     /// Returns all producer IDs in a room except those belonging to the given connection.
