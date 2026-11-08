@@ -171,9 +171,13 @@ impl FileDao {
             .await
     }
 
+    /// The tenant's live files in `rooms` (the rooms a listing may show), and
+    /// the files outside any room. A file whose room is not in `rooms` is left
+    /// out of the page and of the total alike.
     pub async fn find_by_tenant(
         &self,
         tenant_id: ObjectId,
+        rooms: &[ObjectId],
         params: &PaginationParams,
         q: Option<&str>,
         sort: Option<&str>,
@@ -185,6 +189,10 @@ impl FileDao {
                     doc! {
                         "tenant_id": tenant_id,
                         "deleted_at": null,
+                        "$and": [ { "$or": [
+                            { "context.room_id": { "$in": rooms } },
+                            { "context.room_id": null },
+                        ] } ],
                     },
                     q,
                 ),
@@ -192,6 +200,26 @@ impl FileDao {
                 params,
             )
             .await
+    }
+
+    /// The live file `file_id` of `room_id` in `tenant_id`: `NotFound` alike
+    /// for a file of another room or tenant, a deleted one and an id that
+    /// names nothing.
+    pub async fn find_live_in_room(
+        &self,
+        tenant_id: ObjectId,
+        room_id: ObjectId,
+        file_id: ObjectId,
+    ) -> DaoResult<models::File> {
+        self.base
+            .find_one(doc! {
+                "_id": file_id,
+                "tenant_id": tenant_id,
+                "context.room_id": room_id,
+                "deleted_at": null,
+            })
+            .await?
+            .ok_or(super::base::DaoError::NotFound)
     }
 
     pub async fn soft_delete(&self, tenant_id: ObjectId, file_id: ObjectId) -> DaoResult<bool> {

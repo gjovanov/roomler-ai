@@ -218,14 +218,31 @@ and live call state to any authenticated account, and allowed injecting
 `@everyone` messages into another org's channel.
 
 **The invariant now: resolve the object WITHIN the tenant before touching it** —
-`helpers::require_room_in_tenant` / `require_message_in_tenant`. They check
-membership *and* `find_by_id_in_tenant`, so a foreign id 404s and leaks neither
-content nor existence.
+`guards::require_room_in_tenant` / `require_message_in_room` / `require_file`
+(chat's `guards.rs`). They check membership *and* resolve the object in the
+tenant, so a foreign id 404s and leaks neither content nor existence.
 
 ⚠️ A handler keyed by `message_id` **must** use the message guard, not the room
 one — the two ids are decoupled, so a caller can pass their own room with a
-foreign message. This is why `reaction::add/remove` fan out to `message.room_id`,
-not the path room.
+foreign message. `guards::require_message_in_room` binds them: the path room
+passes the room guard, and the message is a live message of that room. The path
+room is then the message's own, and every message route fans out to it.
+⚠️ **One guard per id kind, room visibility included** (`crates/modules/chat/src/guards.rs`):
+
+| Id | Guard |
+|---|---|
+| room | `require_room_in_tenant` |
+| message | `require_message_in_room`: the path room, then a live message of it |
+| file | `require_file`: a live file of the path tenant, then its own room through the same visibility gate |
+
+A listing that spans rooms (the org's files, search) keeps to `room_reach`, the
+same rule over every room of the org at once: content only from rooms the caller
+may read, and a Secret room listed to its members only. An upload names a room
+through the room guard, an edit is the author's (404 otherwise), and a file
+delete is the uploader's (403 otherwise, as a message delete is the author's).
+`room_access_tests::every_message_and_file_route_answers_only_for_a_room_the_caller_can_read`
+walks every route with a message or file id in its path, as the composition
+baseline lists them, so a new one cannot skip its guard unnoticed.
 ⚠️ **Never re-fetch with a bare `find_by_id` after a tenant-scoped write**:
 `message::update` did, and returned another tenant's content in the response even
 though the write itself was correctly scoped.

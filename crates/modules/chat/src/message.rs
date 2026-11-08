@@ -178,12 +178,13 @@ pub async fn create(
         here: mention_req.here,
     });
 
-    // Fetch file records for attachments (tenant-scoped to prevent cross-tenant access)
+    // Fetch file records for attachments: live files of this same room, as a
+    // file is shared in the room it was uploaded to. Any other id is left out.
     let attachments = if !body.attachment_ids.is_empty() {
         let mut att = Vec::new();
         for file_id_str in &body.attachment_ids {
             if let Ok(fid) = ObjectId::parse_str(file_id_str)
-                && let Ok(file) = state.files.base.find_by_id_in_tenant(tid, fid).await
+                && let Ok(file) = state.files.find_live_in_room(tid, rid, fid).await
             {
                 att.push(MessageAttachment {
                     file_id: file.id.unwrap(),
@@ -331,18 +332,23 @@ pub async fn update(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    let (_room, message) =
+        crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
-    state
-        .messages
-        .update_content(tid, mid, auth.user_id, body.content.clone())
-        .await?;
+    // Only the author edits a message, and anyone else gets the answer a
+    // missing message gets: nothing is written, re-read or sent.
+    if message.author_id != auth.user_id
+        || !state
+            .messages
+            .update_content(tid, rid, mid, auth.user_id, body.content.clone())
+            .await?
+    {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
-    // Re-fetch the updated message for the full response. MUST be
-    // tenant-scoped: a bare `find_by_id(mid)` here returned ANY tenant's
-    // message content in the response even though `update_content` is
-    // tenant-scoped and modified nothing (cross-tenant read via edit).
-    let updated = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
+    // Re-fetch the updated message for the full response, as the live message
+    // of this room it was resolved as (never by bare id or by org alone).
+    let updated = state.messages.find_live_in_room(tid, rid, mid).await?;
     let names = state
         .users
         .find_display_names(&[updated.author_id])
@@ -380,12 +386,10 @@ pub async fn delete(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
-
-    // Verify ownership: only the author can delete their message (tenant-scoped)
-    let message = state.messages.base.find_by_id_in_tenant(tid, mid).await?;
+    // Verify ownership: only the author can delete their message, a live
+    // message of the path room that the caller may read.
+    let (_room, message) =
+        crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
     if message.author_id != auth.user_id {
         return Err(ApiError::Forbidden(
             "Only the author can delete this message".to_string(),
@@ -460,11 +464,12 @@ pub async fn toggle_pin(
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
-    state.messages.toggle_pin(tid, mid, body.pinned).await?;
+    state
+        .messages
+        .toggle_pin(tid, rid, mid, body.pinned)
+        .await?;
 
     let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({
@@ -489,20 +494,23 @@ pub async fn toggle_pin(
 pub async fn thread_replies(
     State(state): State<ChatState>,
     auth: AuthUser,
-    Path((tenant_id, _room_id, message_id)): Path<(String, String, String)>,
+    Path((tenant_id, room_id, message_id)): Path<(String, String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let tid = ObjectId::parse_str(&tenant_id)
         .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let rid = ObjectId::parse_str(&room_id)
+        .map_err(|_| ApiError::BadRequest("Invalid room_id".to_string()))?;
     let mid = ObjectId::parse_str(&message_id)
         .map_err(|_| ApiError::BadRequest("Invalid message_id".to_string()))?;
 
-    let root = crate::guards::require_message_in_tenant(&state, tid, mid, auth.user_id).await?;
+    // The root is a live message of the path room, which the caller may read.
+    crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
     // The replies from the root's own room.
     let result = state
         .messages
-        .find_thread_replies(tid, root.room_id, mid, &params)
+        .find_thread_replies(tid, rid, mid, &params)
         .await?;
 
     let author_ids = collect_author_ids(&result.items);
