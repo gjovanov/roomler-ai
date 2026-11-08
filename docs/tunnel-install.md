@@ -163,7 +163,7 @@ sudo dpkg -i /tmp/roomler-cli.deb
 > `linux-deb-aarch64` and `linux-aarch64`. A release built before P7b has no
 > aarch64 CLI, and the proxy answers 404 for it rather than hand over the
 > x86_64 one. `install.sh --role tunnel` picks the arch by itself
-> (`scripts/install.sh:1037-1041`), and the aarch64 wizard asks for
+> (`scripts/install.sh:1195-1199`), and the aarch64 wizard asks for
 > `linux-aarch64`. The arm64 build is made on Ubuntu 22.04, so it needs glibc
 > 2.35 or later, as the x86_64 agent does.
 
@@ -250,7 +250,7 @@ For an "ops team reaches the prod Postgres" policy:
 |---|---|
 | Name | `ops-prod-postgres` |
 | Subjects | `Role ID` → `<your ops role hex>`, plus optionally `User ID` for specific users |
-| Targets | `Agent ID` → `<AGENT-CORP hex from Admin → Agents>` |
+| Targets | `Agent ID` → `<AGENT-CORP hex from Devices>` |
 | Allowlist | `Exact` `db.intranet.corp` ports `5432–5432`<br>(or `Wildcard` `*.intranet.corp` ports `5432–5432`<br>or `CIDR` `10.0.0.0/24` ports `1–65535`) |
 | Max concurrent flows | leave blank, or `64` for tight JDBC-pool bounds |
 | Max bytes / session | leave blank, or e.g. `10737418240` for 10 GiB cap |
@@ -275,7 +275,7 @@ In a regular (non-elevated) PowerShell on `OPERATOR-LAPTOP`:
 
 ```powershell
 roomler forward `
-  --agent <AGENT-CORP-hex from Admin → Agents> `
+  --agent <AGENT-CORP-hex from Devices> `
   --local 5432 `
   --remote db.intranet.corp:5432
 ```
@@ -407,7 +407,7 @@ roomler forward --agent … --local 5432 --remote db.intranet:5432
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `forward request timed out` after 10 s | agent offline, or no matching ACL policy | Check `Admin → Agents` shows agent online; check `Admin → Tunnel ACL` has a matching policy |
+| `forward request timed out` after 10 s | agent offline, or no matching ACL policy | Check **Devices** shows the device online; check **Network → ACL** has a matching policy |
 | `acl_denied` from the server | policy gate rejected the (subject × target × destination) tuple | Edit the policy to include the destination, or add subject/target |
 | `dial_failed` from the agent | destination unreachable from inside corp | Check from the agent host directly: `Test-NetConnection db.intranet -Port 5432` |
 | `cross_tenant` | tunnel-client and agent belong to different tenants | Re-enroll one of them in the correct tenant |

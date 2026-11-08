@@ -288,9 +288,9 @@ impl PathShadow {
 
 /// #26 — WHY a sweep is arming forced revalidation pokes, which is also what
 /// decides the conviction window of the pokes it arms. The two net-change
-/// causes are deliberately NOT one flag: their rate limits differ by 40x (one
-/// Major per 120 s vs one addr/iface wave per 3 s) and so does what they imply
-/// about the carriers being judged.
+/// causes are deliberately NOT one flag: their rate limits differ (one Major
+/// per 120 s vs [`lifecycle::netchange_action`]'s addr/iface rules) and so does
+/// what they imply about the carriers being judged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ForcedPoke {
     /// No forced arming this sweep — only the silence / stale-proof / re-init
@@ -299,10 +299,11 @@ pub(super) enum ForcedPoke {
     /// An addr/iface signal that did NOT rise to a netstate Major: a virtual
     /// adapter appearing (Docker, WSL, Hyper-V, a VPN client's TAP), a lease
     /// renewal, an interface renumber. Worth revalidating — that is why this
-    /// path exists — but NOT worth the tight window. These fire up to once per
-    /// `netstate::ROUTE_WAVE_MIN_INTERVAL` (3 s) against carriers that are
-    /// usually perfectly healthy, and a one-round-trip verdict would demote
-    /// every direct pair on the box each time an adapter blinked. Judged on the
+    /// path exists — but NOT worth the tight window. A burst with no snapshot
+    /// delta fires once per [`lifecycle::NETCHANGE_POKE_QUIET`] and a real move
+    /// whenever it lands, against carriers that are usually perfectly healthy,
+    /// and a one-round-trip verdict would demote every direct pair on the box
+    /// each time an adapter blinked. Judged on the
     /// tier deadline, exactly as before #26 — an answered poke costs one
     /// handshake round and nothing else, which is the property that makes
     /// arming here harmless in the first place.
@@ -1335,6 +1336,12 @@ pub struct OverlayRuntime {
     /// attach it to the peer view. Measurement only: nothing in the selector
     /// reads this.
     disco_paths: std::sync::Mutex<Vec<super::disco::PathSample>>,
+    /// #3530 — how late the last sweep tick came past [`FALLBACK_TICK`], in
+    /// ms: for that long the whole process did not run (a freeze, a host sleep
+    /// `Instant` counts). Stored by the tick, read by `sweep_carrier_health`
+    /// only to word a carrier's rx-stale line, direct or relay.
+    /// ⚠️ Log only: no verdict and no carrier action reads it.
+    tick_late_ms: std::sync::atomic::AtomicU64,
 }
 
 /// Opens the node's `/derp` WS (the agent owns `server_url` + the token +
@@ -1546,6 +1553,7 @@ impl OverlayRuntime {
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
             disco_paths: std::sync::Mutex::new(Vec::new()),
+            tick_late_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1581,6 +1589,7 @@ impl OverlayRuntime {
             carrier_plane: None,
             disco_rounds: std::sync::atomic::AtomicU64::new(0),
             disco_paths: std::sync::Mutex::new(Vec::new()),
+            tick_late_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2532,6 +2541,9 @@ impl OverlayRuntime {
         // deadline (~seconds) instead of waiting out `POKE_SILENCE_AFTER` +
         // the passive rx-stale race (~90 s observed, winhost-a 2026-08-15).
         let mut netchange_poke_due = false;
+        // FR-65 P3 — when a net-change last forced the pokes above. Kept apart
+        // from `last_netcheck` on purpose: see `lifecycle::netchange_action`.
+        let mut last_netchange_poke: Option<Instant> = None;
         // rc.146 — re-assert per-peer /32 routes so a full-tunnel VPN can't
         // keep its competing capture routes installed. First tick fires
         // immediately; skip it (routes are freshly installed by
@@ -3065,6 +3077,13 @@ impl OverlayRuntime {
                         .duration_since(prev_wall)
                         .unwrap_or_default();
                     let mono_elapsed = prev_mono.elapsed();
+                    // #3530 — log only: how late this tick came, for the relay
+                    // carrier's rx-stale line in the sweep below.
+                    self.tick_late_ms.store(
+                        u64::try_from(mono_elapsed.saturating_sub(FALLBACK_TICK).as_millis())
+                            .unwrap_or(u64::MAX),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     resume_probe = (Instant::now(), SystemTime::now());
                     if resumed_from_suspend(mono_elapsed, wall_elapsed) {
                         warn!(
@@ -3393,10 +3412,14 @@ impl OverlayRuntime {
                             // filter-only VPN changes no addresses, and the
                             // Major fast lane below owns that class.
                             if delta.saw_addr_signal || delta.saw_iface_signal {
-                                let check_due = last_netcheck.is_none_or(|t| {
-                                    t.elapsed() >= super::netstate::ROUTE_WAVE_MIN_INTERVAL
-                                });
-                                if check_due && pending_rebuild.is_none() {
+                                let action = super::lifecycle::netchange_action(
+                                    delta.material,
+                                    last_netcheck.map(|t| t.elapsed()),
+                                    last_netchange_poke.map(|t| t.elapsed()),
+                                    super::netstate::ROUTE_WAVE_MIN_INTERVAL,
+                                    direct::netchange_poke_quiet(),
+                                );
+                                if action.check && pending_rebuild.is_none() {
                                     last_netcheck = Some(Instant::now());
                                     // W5(c) — poke the plane srflx task
                                     // UNCONDITIONALLY: a corp-VPN connect
@@ -3408,8 +3431,9 @@ impl OverlayRuntime {
                                     if let Some(plane) = &self.carrier_plane {
                                         plane.notify_regather();
                                     }
-                                    if direct::netchange_poke_enabled() {
+                                    if action.poke && direct::netchange_poke_enabled() {
                                         netchange_poke_due = true;
+                                        last_netchange_poke = Some(Instant::now());
                                     }
                                     let mut now_ips = direct::gather_lan_ips();
                                     now_ips.sort_unstable();
@@ -3474,6 +3498,7 @@ impl OverlayRuntime {
                                 }
                                 self.shadow(|s| s.mon.on_network_changed());
                                 netchange_poke_due = false; // consumed inline
+                                last_netchange_poke = Some(Instant::now());
                                 let t0 = Instant::now();
                                 self.sweep_carrier_health(
                                     &mut wg, &mut by_node, &mut relay, &tun,

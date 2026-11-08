@@ -10,6 +10,7 @@
 > | P1b | a locked host switches once unlocked with nobody at it; a person coming back gets their mode back | shipped (0.4.140); field-verified on Windows |
 > | P2 | Linux virtual desktops: the desktop runs on Xorg with the dummy driver, which takes any mode, so the viewer's stage size becomes the mode exactly; restored at the end | shipped in 0.4.143 and field-verified on its released binary (FR-108 §8 row 14; the operator settled decision 4 on 2026-10-17) |
 > | FR-97 P3e-2 | a person's own X11 display (a per-user install in an X11 session): the one active output switched to a mode it lists, presence from the X idle clock, a restore guard a crash cannot strand | shipped in 0.4.148 (#2623); its release check's pointer-clamp hand-back fixed (#2644) |
+> | P1c | a recording holds the display ([#3467](https://github.com/gjovanov/roomler-ai/issues/3467)): a mode switched before it starts goes back first, and every request while it runs is refused `recording`, then decided again at its end | shipped in 0.4.201 and field-verified on its released binary on an X11 host (FR-108 §8 row 16; the operator settled decision 7 on 2026-11-05) ([below](#a-recording-holds-the-display-3467)) |
 > | P3–P4 | modes no monitor offers, several displays | not built |
 
 ## Why it exists, and what went wrong with it
@@ -37,6 +38,8 @@ sequenceDiagram
     A->>A: the owner's display_match
     alt never
         A-->>V: rc:display-match.state {on:false, refused:"disabled_on_device"}
+    else a recording holds the display (P1c)
+        A-->>V: {on:false, refused:"recording"} (decided again at its end)
     else always
         A->>A: switch to the largest mode inside the stage
         A-->>V: {on:true, mode:{w,h}}  or  {on:false, refused:"no_fitting_mode" | "switch_failed"}
@@ -54,21 +57,22 @@ sequenceDiagram
     Note over V,A: the session's end, or {enable:false}, restores the mode (only the session that applied it)
 ```
 
-[`display_match.rs:1297`](../agents/roomlerd/src/display_match.rs#L1297) `may_switch` is the decision, pure and
-unit-tested. [`display_match.rs:1322`](../agents/roomlerd/src/display_match.rs#L1322) `request_for` runs it,
+[`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch` is the decision, pure and
+unit-tested. [`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` runs it,
 switches, and logs rc.191's lines ("switched host display mode", "could not switch mode") as before. The
-control-channel arm sends the answer ([`peer.rs:10802`](../agents/roomlerd/src/peer.rs#L10802)).
+control-channel arm sends the answer ([`peer.rs:11177`](../agents/roomlerd/src/peer.rs#L11177)).
 
 ### The answers
 
 Every request gets exactly one `rc:display-match.state`
-([`display_match.rs:1461`](../agents/roomlerd/src/display_match.rs#L1461) `state_json`):
+([`display_match.rs:1691`](../agents/roomlerd/src/display_match.rs#L1691) `state_json`):
 
 | `refused` | It means | The viewer says |
 |---|---|---|
 | — (`on: true`, `mode: {w, h}`) | the host runs at that mode for this session | "the host runs at W×H for this session" |
 | `attended` | someone touched the keyboard or mouse in the last 5 minutes | "someone is using this computer" |
 | `locked` | the secure desktop is up (locked, or the logon screen) | "the computer is locked; it switches once unlocked" (P1b) |
+| `recording` | a recording, local or remote, holds the display: it is made at the display's own mode, so nothing switches under it. Decided again once it has stopped (P1c, [below](#a-recording-holds-the-display-3467)) | "a recording is running on this computer" |
 | `disabled_on_device` | the owner set `display_match = never` | "this device's owner turned display match off" |
 | `no_fitting_mode` | no mode the display offers fits inside the stage | "no display mode fits this window" |
 | `switch_failed` | `ChangeDisplaySettingsExW` refused, or on Linux `xrandr` did | "the display could not be switched" |
@@ -77,12 +81,13 @@ Every request gets exactly one `rc:display-match.state`
 ⚠️ An agent from before FR-108 answers nothing, and the viewer then shows the toggle as it always did. A word
 this viewer does not know, from a newer agent, is shown as it came and never read as success
 ([`displayMatch.ts:39`](../ui/src/composables/displayMatch.ts#L39) `describeDisplayMatchRefusal`). The viewer
-puts the answer under the toggle ([`RemoteControl.vue:4516`](../ui/src/views/remote/RemoteControl.vue#L4516)
+puts the answer under the toggle ([`RemoteControl.vue:4605`](../ui/src/views/remote/RemoteControl.vue#L4605)
 `displayMatchSaid`).
 
 ⚠️ `attended` and `disabled_on_device` hand the screen back: a mode this session applied earlier is restored
-([`display_match.rs:1315`](../agents/roomlerd/src/display_match.rs#L1315) `hands_the_screen_back`). `locked`
-does not, because the worker cannot touch the secure desktop (below).
+([`display_match.rs:1368`](../agents/roomlerd/src/display_match.rs#L1368) `hands_the_screen_back`). `locked`
+does not, because the worker cannot touch the secure desktop (below). `recording` does not either: the
+recording's hold handed the screen back before its recorder launched (P1c).
 
 ## The owner's key
 
@@ -97,13 +102,13 @@ roomler config set display_match auto     # auto (default) | always | never
 | `never` | never |
 
 - **Device-owned:** set over the LocalAPI only by the person at the console
-  ([`lib.rs:3459`](../crates/localapi/src/lib.rs#L3459)), and absent from `DesiredConfig`, so a server cannot
-  push it ([`models.rs:9918`](../crates/remote_control/src/models.rs#L9918)). A server that could set it could
+  ([`lib.rs:3220`](../crates/localapi/src/lib.rs#L3220), the `CONSOLE_PERSON_KEYS` entry since #2871), and absent from `DesiredConfig`, so a server cannot
+  push it ([`models.rs:9635`](../crates/remote_control/src/models.rs#L9635)). A server that could set it could
   take every screen it reaches.
-- **Read live** at every request ([`display_match.rs:1226`](../agents/roomlerd/src/display_match.rs#L1226)
+- **Read live** at every request ([`display_match.rs:1254`](../agents/roomlerd/src/display_match.rs#L1254)
   `set_device_policy`).
 - ⚠️ A value this build does not know reads as `never`, the strictest, and never fails the config file
-  ([`config.rs:2650`](../crates/agent-core/src/config.rs#L2650) `DisplayMatchPolicy`).
+  ([`config.rs:2576`](../crates/agent-core/src/config.rs#L2576) `DisplayMatchPolicy`).
 
 ## Who is at the screen
 
@@ -140,12 +145,12 @@ so a request mid-session still tells the controller's input from a person's.
 
 P0 tried it: on the lock screen the worker's `ChangeDisplaySettingsExW` returns `-1`, and the screen stays as
 it was. So a locked host answers `locked`, and the request waits
-([`display_match.rs:1322`](../agents/roomlerd/src/display_match.rs#L1322) `request_for` keeps it per session).
+([`display_match.rs:1376`](../agents/roomlerd/src/display_match.rs#L1376) `request_for` keeps it per session).
 An unattended office PC is usually locked, so this is the main path, not an edge.
 
 At the session's unlock the device decides again
-([`display_match.rs:1405`](../agents/roomlerd/src/display_match.rs#L1405) `on_unlock`, called from the
-session's lock watcher, [`peer.rs:1425`](../agents/roomlerd/src/peer.rs#L1425)):
+([`display_match.rs:1601`](../agents/roomlerd/src/display_match.rs#L1601) `on_unlock`, called from the
+session's lock watcher, [`peer.rs:1436`](../agents/roomlerd/src/peer.rs#L1436)):
 
 | Who unlocked it | What the clock shows | The answer |
 |---|---|---|
@@ -160,8 +165,8 @@ read as `attended` for four more minutes, and the request would be refused for n
 ## The person comes back (P1b)
 
 While a session holds a mode it applied, a watcher checks four times a second
-([`peer.rs:1523`](../agents/roomlerd/src/peer.rs#L1523), Windows only). It hands the screen back at once
-and tells the viewer ([`display_match.rs:1438`](../agents/roomlerd/src/display_match.rs#L1438)
+([`peer.rs:1534`](../agents/roomlerd/src/peer.rs#L1534), wherever display match runs). It hands the screen
+back at once and tells the viewer ([`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651)
 `on_tick`):
 
 | What changed | The answer | Restored |
@@ -169,16 +174,78 @@ and tells the viewer ([`display_match.rs:1438`](../agents/roomlerd/src/display_m
 | a person's input (under `auto`) | `refused: attended` | yes |
 | the owner set `display_match = never` | `refused: disabled_on_device` | yes |
 | the screen locked | — | no: nobody came back, and the secure desktop cannot be switched anyway |
+| a recording started (P1c) | `refused: recording`, said by this watcher | yes, by the recording's start, before its recorder launched |
 
 The mode is not re-applied until the viewer asks again (toggle off and on): a returning person never fights a
-timer for their own screen ([`display_match.rs:1419`](../agents/roomlerd/src/display_match.rs#L1419)
-`hand_back`).
+timer for their own screen ([`display_match.rs:1630`](../agents/roomlerd/src/display_match.rs#L1630)
+`hand_back`). A recording's end is the exception, because nobody came back: the request it refused is
+decided again, through the whole guard (P1c, below).
+
+## A recording holds the display (#3467)
+
+A recording is made at the display's own mode, by a capturer of its own that opens once
+([`recording.md`](recording.md) §1). Until #3467 nothing asked whether one was running, so on an unattended
+host every viewer that connected switched the display under it. Read on release 0.4.199 on an X11 guest
+(FR-85's field log): a local recording kept its 1920×1080 frames, but everything outside the matched
+800×600 froze for as long as the session held the switch, and a remote recording started in a switched
+session was recorded at 800×600. Where the capturer sees the new size instead, a size change ends the
+recording's file (`display_changed`).
+
+So from just before the recorder launches until it has stopped, the recording holds the display:
+
+```mermaid
+sequenceDiagram
+    participant S as a session's viewer
+    participant D as display match
+    participant M as RecordingManager
+    participant R as roomlerd record
+    Note over S,D: earlier, nobody at the screen: the host runs at S's mode
+    M->>D: hold_for_recording (a local start, or a remote controller's)
+    D->>D: the mode S applied goes back
+    D-->>M: the hold
+    M->>R: launch: its capture opens at the display's own mode
+    D-->>S: (S's watcher) on:false, refused recording
+    S->>D: rc:display-match (another viewer, a resize, the unlock)
+    D-->>S: on:false, refused recording (the request waits)
+    R-->>M: stopped (the file is final)
+    M->>D: the hold is let go
+    D-->>S: (S's watcher) decided again: on:true with the mode, or why not
+```
+
+| When | What happens | Code |
+|---|---|---|
+| a recorder is about to launch: the person's `RecordStart`, or a remote controller's start | the hold is taken after the one-at-a-time check and before the launch. A mode a session switched goes back first, logged `the screen is handed back … why="recording"`, and that session's request then waits for the recording's end | [`manager.rs:575`](../agents/roomlerd/src/recording/manager.rs#L575) (in `start_inner`), [`display_match.rs:1491`](../agents/roomlerd/src/display_match.rs#L1491) `hold_for_recording` |
+| a request while the recording runs: a viewer that connects, a second viewer, an unlock | `refused: recording`, and the request waits | [`display_match.rs:1331`](../agents/roomlerd/src/display_match.rs#L1331) `may_switch`, [`display_match.rs:1389`](../agents/roomlerd/src/display_match.rs#L1389) `waits_for` |
+| the session whose mode went back | its watcher tells its viewer once, within a quarter second | [`display_match.rs:1581`](../agents/roomlerd/src/display_match.rs#L1581) `recording_turn`, [`peer.rs:1538`](../agents/roomlerd/src/peer.rs#L1538) |
+| the recorder stopped: it reported `stopped`, `refused` or `error`, or its output closed | the hold is let go, and each waiting request is decided again within a quarter second through the whole guard, so an attended screen still refuses | [`manager.rs:687`](../agents/roomlerd/src/recording/manager.rs#L687), [`display_match.rs:1651`](../agents/roomlerd/src/display_match.rs#L1651) `on_tick` |
+| a session that ends during the recording | what it waited for is dropped, and its close restores nothing, since the mode went back already | [`display_match.rs:1677`](../agents/roomlerd/src/display_match.rs#L1677) `forget` |
+| the viewer turns display match off | what it waited for is dropped. Before this a `locked` wait survived it, and the unlock switched a screen whose viewer had turned the match off | [`display_match.rs:1685`](../agents/roomlerd/src/display_match.rs#L1685) `turn_off` |
+
+- ⚠️ **A recording wins under `always` too** (FR-108 decision 7, settled by the operator on 2026-11-05). A
+  switch under a recording freezes it or ends its file, and the session's end would change the display under
+  it anyway. Only the owner's `never` answers first, because it outlasts the recording. One function decides
+  it ([`display_match.rs:1356`](../agents/roomlerd/src/display_match.rs#L1356) `a_recording_wins`), so
+  giving `always` its rc.191 meaning back is a one-line change.
+- ⚠️ **One change of the mode at a time.** A decision with its switch, an owner's restore, and the hold
+  with its hand-back take one lock
+  ([`display_match.rs:1467`](../agents/roomlerd/src/display_match.rs#L1467) `DECIDING`). A request that
+  read "no recording" has switched before the hold hands the screen back, never after it, and no restore
+  is still running when the recorder launches.
+- **The hold is a count**, the shape of `recording::manager::is_recording`: each recording's hold adds one
+  and takes it away once, so a recording that ends as the next one starts never lets the display go under
+  the second.
+- **It is let go before the stop answers**: the reader drops it on the recorder's last event, before it
+  marks the recording ended, so `roomler record stop` returns with display match free again.
+- **The display is the primary one**: the one display match switches and the recorder records (FR-108 §7).
+  Several displays wait for P4.
+- **Not seen:** a `roomlerd record` started by hand in a terminal, outside the daemon. The daemon does not
+  supervise it, so display match cannot know it runs.
 
 ## A Linux virtual desktop (P2)
 
 A daemon started with `ROOMLERD_VIRTUAL_DESKTOP=1` runs a desktop of its own: an X server, a window manager
 and the startup apps. Nobody sits at that screen, since it is the daemon's own, so display match switches it
-without asking who is there ([`display_match.rs:1336`](../agents/roomlerd/src/display_match.rs#L1336)). The
+without asking who is there ([`display_match.rs:1405`](../agents/roomlerd/src/display_match.rs#L1405)). The
 owner's `never` still holds.
 
 ```mermaid
@@ -263,8 +330,8 @@ sequenceDiagram
 | The modes | the display's own list | the one active output's list in `xrandr --current`; none is added, this is someone's monitor ([`display_match.rs:370`](../agents/roomlerd/src/display_match.rs#L370) `parse_xrandr_outputs`) |
 | Several displays | the primary only | more than one active output answers `unsupported` |
 | After a crash | `CDS_FULLSCREEN`: Windows reverts the mode itself | a restore guard in `$XDG_RUNTIME_DIR`, written before the switch; the next start puts the start mode back, only while the screen still shows the mode display match set ([`display_match.rs:425`](../agents/roomlerd/src/display_match.rs#L425) `guard_undoes`, [`display_match.rs:605`](../agents/roomlerd/src/display_match.rs#L605) `recover`) |
-| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1470`](../agents/roomlerd/src/peer.rs#L1470)) |
-| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1510`](../agents/roomlerd/src/peer.rs#L1510)) |
+| A locked screen | answers `locked`, decided again at the unlock | the same, the unlock read from logind's hint ([`peer.rs:1481`](../agents/roomlerd/src/peer.rs#L1481)) |
+| The person comes back | the session's watcher, every quarter second | the same watcher ([`peer.rs:1521`](../agents/roomlerd/src/peer.rs#L1521)) |
 | Kill switch | `display_match = never` | `ROOMLERD_X11_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - ⚠️ **The X server says how long ago, not when.** "Now minus the idle time" moves by each read's latency,
@@ -321,7 +388,7 @@ sequenceDiagram
 | Several displays | more than one active output answers `unsupported` | the same, for more than one active display |
 | After a crash | a restore guard in `$XDG_RUNTIME_DIR` | nothing to do: a mode set by `CGDisplaySetDisplayMode` lasts only as long as the process that set it ([`display_match.rs:672`](../agents/roomlerd/src/display_match.rs#L672)) |
 | Our own switch | an idle-clock move inside it is the machine's (`own_switch_explains`) | never seen: the pointer clamp moves the session's combined clock, not the HID one |
-| A supervised Mac | — | the root hands its worker its kill switch and its `display_match`, and the worker keeps the stricter of that policy and its own ([`display_match.rs:1211`](../agents/roomlerd/src/display_match.rs#L1211) `with_root_floor`; FR-43's `WORKER_ENV_FORWARD`) |
+| A supervised Mac | — | the root hands its worker its kill switch and its `display_match`, and the worker keeps the stricter of that policy and its own ([`display_match.rs:1239`](../agents/roomlerd/src/display_match.rs#L1239) `with_root_floor`; FR-43's `WORKER_ENV_FORWARD`) |
 | Kill switch | `ROOMLERD_X11_DISPLAY_MATCH=0` | `ROOMLERD_MAC_DISPLAY_MATCH=0`, and `display_match = never` |
 
 - 🔍 **Measured before it was built** (FR-97 §8, a tart Mac, macOS 15.7.7). A mode set by `CGDisplaySetDisplayMode`
@@ -351,4 +418,6 @@ sequenceDiagram
 - [FR-108](fr/FR-108-display-follows-the-viewer.md): the spec, the field log, the phases.
 - [FR-92](fr/FR-92-keep-busy.md): the idle clock and the no-hooks rule.
 - [Privacy mode](privacy-mode.md): the other thing a session does to the screen of the person at the host.
+- [Screen recording](recording.md): the recorder, its own capture at the display's own mode, and why a
+  recording holds the display (P1c).
 - [`remote-control.md` §18.6.1](remote-control.md): the zoom pill that shows whether the pixels run 1:1.

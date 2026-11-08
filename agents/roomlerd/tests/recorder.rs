@@ -17,6 +17,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -31,7 +32,7 @@ use roomlerd::recording::annexb::length_prefixed_to_annexb;
 use roomlerd::recording::folder::{PARTIAL_DIR, PARTIAL_SUFFIX};
 use roomlerd::recording::mp4::{ProgressiveFile, VIDEO_TRACK_ID};
 use roomlerd::recording::recorder::{
-    self, EncoderFactory, RecordOptions, RecorderEvent, StartError, StartRefusal,
+    self, EncoderFactory, FreeSpace, RecordOptions, RecorderEvent, StartError, StartRefusal,
 };
 use roomlerd::recording::sidecar::{Initiator, Pointer, Sidecar, StopReason};
 use tokio::sync::{mpsc, watch};
@@ -165,6 +166,11 @@ impl ScreenCapture for CounterCapture {
 
     fn monitor_count(&self) -> u8 {
         1
+    }
+
+    // A test double: no display.
+    fn refresh_hz(&self) -> Option<u16> {
+        None
     }
 
     fn recorded_pointer(&mut self) -> RecordedPointer {
@@ -616,6 +622,39 @@ async fn not_enough_disk_refuses_the_start_and_writes_nothing() {
     assert_eq!(se.refusal, StartRefusal::DiskLow);
     assert!(events.is_empty(), "a refused start emits no events");
     assert!(!dir.path().join("test.mp4").exists());
+}
+
+/// FR-85 P7 — a free-space check slower than a tick costs the recording no
+/// tick. Asked inside the paced loop, the real one (a full disk refresh) cost a
+/// Mac one tick every 5 s with nothing else running: 0.64 % late (FR-85's field
+/// log, 2026-11-05). This one takes 120 ms and is asked every 250 ms; inside
+/// the loop that is about 40 late ticks in 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_free_space_check_costs_the_recording_no_tick() {
+    let dir = scratch();
+    let mut opts = options(dir.path());
+    let asked = Arc::new(AtomicU32::new(0));
+    opts.disk_check_every = Duration::from_millis(250);
+    opts.free_space = FreeSpace::new({
+        let asked = asked.clone();
+        move |_| {
+            asked.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(120));
+            Some(u64::MAX)
+        }
+    });
+    let (result, _) = record_for(opts, CounterCapture::new(60), Duration::from_secs(3)).await;
+    let summary = result.expect("the recording finalizes");
+    assert_eq!(summary.reason, StopReason::Requested);
+    let late = summary.sidecar.expect("a sidecar").late_ticks;
+    let asked = asked.load(Ordering::Relaxed);
+    println!("free-space checks {asked}, late ticks {late}");
+    assert!(asked >= 5, "the check ran {asked} times in 3 s");
+    // CI runners are noisy, so a few late ticks pass; inside the loop it is ~40.
+    assert!(
+        late <= 6,
+        "{late} late ticks: the paced loop waited for the free-space check"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1326,6 +1365,9 @@ mod process {
                 .is_some_and(|p| Path::new(p).starts_with(&out))
         );
         assert!(is_recording(), "the updater's defer gate sees it");
+        // #3467 — and the recording holds the display: display match refuses
+        // `recording` while it runs.
+        assert!(roomlerd::display_match::recording_holds());
         assert!(
             matches!(m.start(software()).await, Response::Error { .. }),
             "one recording at a time"
@@ -1337,6 +1379,10 @@ mod process {
             other => panic!("stop: {other:?}"),
         };
         assert!(!st.active && !is_recording());
+        assert!(
+            !roomlerd::display_match::recording_holds(),
+            "a stop answers with the display let go"
+        );
         let last = st.last.expect("how it ended");
         assert_eq!(last.reason, "requested");
         assert!(last.duration_ms >= 1000, "{last:?}");
@@ -1410,6 +1456,8 @@ mod process {
         assert!(!st.active, "a killed recorder started anyway: {st:?}");
         assert!(st.path.is_none(), "it reported `started` after all: {st:?}");
         assert_eq!(st.last.map(|l| l.reason).as_deref(), Some("start_timeout"));
+        // #3467 — and a stopped recorder holds the display no longer.
+        assert!(!roomlerd::display_match::recording_holds());
         // (A killed child may not even have created the folder.)
         let written = std::fs::read_dir(&out)
             .map(|d| {

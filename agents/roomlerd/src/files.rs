@@ -70,7 +70,7 @@ const MAX_TRANSFER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 ///
 /// Default `true` (preserves self-controlled-host auto-grant
 /// semantics from `docs/remote-control.md` §11.2). `set_remote_browse`
-/// is called from `main.rs::Run` after config load; no
+/// is called from `app.rs::Run` after config load; no
 /// initialization race in practice because file-DC handlers can't
 /// fire until a session opens, which is well after main has
 /// settled.
@@ -92,7 +92,7 @@ pub fn is_remote_browse_enabled() -> bool {
 }
 
 /// FR-84 D4 — the configured drop folder (`files_dir`), LIVE: seeded from
-/// the config at startup (`main.rs::run_cmd`) and re-seeded by the daemon's
+/// the config at startup (`app.rs::run_cmd`) and re-seeded by the daemon's
 /// `ConfigSet` (`localapi_state::config_set`); read by every transfer. The
 /// raw config VALUE is kept, not a resolved path: `~` expands against the
 /// ACTIVE user at the moment of the drop, and the placement rule is judged
@@ -740,7 +740,7 @@ fn set_hidden(_path: &std::path::Path) {
 /// than [`PARTIAL_ORPHAN_TTL_SECS`] and registering the survivors in
 /// [`PARTIAL_REGISTRY`]. Returns the count of (kept, swept) pairs.
 ///
-/// Called synchronously from `main.rs::run_cmd` BEFORE the signaling
+/// Called synchronously from `app.rs::run_cmd` BEFORE the signaling
 /// task spawns, so no DC can carry a `files:resume` message until
 /// the registry is populated. This closes the B1 race documented in
 /// the plan.

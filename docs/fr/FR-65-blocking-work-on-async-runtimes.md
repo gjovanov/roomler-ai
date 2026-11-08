@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. Next: the census after-read on the release that carries #3138 (AC7), then P1. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. The census is a fleet-wide server read since 2026-11-03 (#3372). Next: AC7's after-read on or after 2026-11-15, then AC3, AC5 and AC4. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -63,6 +63,11 @@ synchronous at pump start and invisible to `open_ms` because it precedes the
 loop), rather than three wraps.
 
 ### P0 — the stall watch (blocks every other phase)
+
+> **Status 2026-11-03 — the census reads the server.** `scripts/fr65-stall-census.sh`
+> no longer visits hosts: it is a bounded read of `agent_logs`, split by
+> `agent_version`, and it agrees with the host census line for line on a test host
+> (the manual's §7). Its first read holds both sides of #3138, in §6.4.
 
 > **Status 2026-10-30 — the instrument was wrong for every stall longer than its
 > own heartbeat; fixed, six more regions named, and its cost measured (AC1).** A
@@ -136,6 +141,20 @@ speculatively.
 
 ### P1 — dims / chroma / backend rebuilds off-thread
 
+> **Status 2026-11-03 — shipped, as FR-70 M2.** The make-before-break this
+> section designed was built under FR-70 (M2, "make-before-break, as designed
+> and built", 2026-09-05) and field-verified as M2a on 0.4.75 the next day: a
+> dims change opens the replacement off the frame path while the pump serves
+> at the old dims (`peer.rs:8861`, "FR-70 M2: dims change"), adopts it in one
+> pass (`peer.rs:7661`, "dims swap adopted — the picture never froze"), and
+> counts it in the heartbeat's `dims_swaps`. On CORPLAP-3 (`av1_qsv`, direct)
+> both moves adopted in 252–285 ms off-path with an in-path adoption of
+> `apply=15 ms`; on CORPLAP-2 (`av1_nvenc`, relay) four moves, `apply=41–44 ms`,
+> no STALL after the first heartbeat. The design text below is kept as the
+> record; FR-70's spec is where the built shape and its ordering guarantees
+> live now. P1 itself owes nothing more. AC3, its measurement, still lacks one
+> cell (below).
+>
 > **Status 2026-09-04 — HALF done, and the half that shipped is the lesser one.**
 > #1284 wrapped the single encoder-open call site in `spawn_blocking`, which
 > every open flows through (first open *and* every rebuild), so the **runtime
@@ -173,6 +192,19 @@ OLD geometry. The viewer must never see a geometry change before its
 
 ### P2 — the per-frame encode call
 
+> **Status 2026-11-03 — the canary is built; the question it answers changed.**
+> FR-70 M1 moved capture, scale and encode onto their own OS thread
+> (`media_thread`, on since 0.4.70), so the encode call below no longer runs on
+> a tokio worker, and "dedicated encoder thread or not" was settled by that
+> move, not by measurement. What is left of AC4 is the measurement itself: does
+> anything still starve the runtime the pump and the overlay share? The canary
+> this section designed is now `agents/roomlerd/src/runtime_canary.rs`, a
+> 10 ms timer on the daemon's main runtime with a 10-minute lateness summary
+> and a WARN at the stall watch's 100 ms bar (manual §10,
+> [`docs/stall-watch.md`](../stall-watch.md)). It serves FR-70 AC1 as well.
+> Owed: a 7-day fleet read on the release that carries it, beside the STALL
+> census.
+
 **Confirmed mechanism, unquantified harm.** `FfmpegEncoder::encode()` is
 `async fn` in signature only — its body is `self.encode_sync(&frame)` with zero
 `.await`, and `spawn_blocking` appears nowhere in `encode/` except in comments.
@@ -196,6 +228,45 @@ queue hop, so the A/B must show frame **age** does not rise, not merely that the
 stall count fell.
 
 ### P3 — overlay guard cadence and rekey storms
+
+> **Status 2026-11-03 — measured; the poke gate is built and A/B-tested on a
+> lab guest; the 7-day read on a release is owed.**
+> Read from production `agent_logs`, 7 days, every device: the guard waves are
+> bounded (at most 20 a minute, which is their 3 s floor), the forced rekeys
+> are not. 205,892 of them in the week,
+> 112,684 on one Wi-Fi desk, peaking at 150 a minute and 120 on a second host:
+> #1237's ~100/min signature by another road. The cause is not ours. A listener
+> on the three Windows change notifications saw only interface notifications,
+> in pairs (one per address family), `MibParameterNotification`, on the Wi-Fi
+> adapter, with no route or address signal: the snapshot never moves, the
+> delta is `material=false`, and every one of them armed a poke of every direct
+> peer, at the wave's 3 s floor. Worse than the rekeys, each burst re-armed a
+> poke already in flight, which restarts its deadline: on 2026-10-30 a
+> corporate laptop's 11 carriers behind a full-tunnel capture were convicted
+> at +31 s instead of +15 s.
+>
+> The fix is a gate on the net-change arm, `lifecycle::netchange_action`: a
+> material delta checks and pokes at once; a no-delta burst pokes at most once
+> per `overlay_netchange_poke_quiet_secs` (default 60, `0` = the arm as it was).
+> A replay of it over the same week keeps 63,747 of the 205,892 pokes and
+> brings the noisiest host's peak from 150 to 46 a minute. Of 2,136
+> revalidation failures, 56 began on a poke it drops, 37 of those were back on
+> direct within 2 min, and the other 19 fall to the silence trigger, at most
+> 30 s later. The waves are left alone: they carry the P4 erase contract.
+> Manual: [`docs/overlay-nat-traversal.md`](../overlay-nat-traversal.md), "The
+> net-change gate".
+>
+> The A/B ran on a Win11 lab guest, the same storm on both builds: the
+> uplink's interface metric flipped every 3 s for 180 s, which raises the
+> field signature (61 interface notifications and no snapshot delta).
+> 0.4.197 swept its direct peers 30 times in the storm, the gate 4 times:
+> the storm's first burst, the first burst after the quiet window, an
+> address added mid-storm and that address's removal, a Major. The add came
+> 22 s into the quiet window and was poked 2.84 s after it (3.76 s on
+> 0.4.197); the Major was poked in 0.78 s (0.81 s). A deleted peer `/32` came
+> back in 0.79–0.80 s on the gate against 0.79–0.81 s, and no revalidation
+> failed on either build. Owed: the 7-day read on the release that carries
+> it (AC5).
 
 A tax rather than a block, in the same family. #1237 fixed the sibling-adapter
 cause of the ~100 `net-change — revalidating direct carrier` events/min (each
@@ -319,11 +390,34 @@ of each is to produce a number.
       control (**26 `encode::stall` tests**, 2026-10-30).
 - [ ] **AC3** — no pump iteration exceeds 250 ms across a downscale-tier change on
       a constrained QSV session; recorded **before and after** P1.
+      *Before: the 2026-09-04 read in P1's status (the session encoder-less for
+      0.62–0.73 s per rebuild). After, read 2026-11-03 from production
+      `agent_logs` over 7 days, every device: 17 dims swaps in 120,405
+      heartbeats, none over 250 ms (worst pass 196.4 ms, direct `av1_nvenc`);
+      constrained sessions swapped twice, both `av1_nvenc` (worst 61.5 ms). No
+      session swapped on QSV in the window, constrained or direct, so the cell
+      this criterion names is still unread.*
 - [ ] **AC4** — the encode-scheduling question is answered with canary data; if
       starvation is shown it is fixed, and the canary confirms, with frame age
       unchanged or better.
-- [ ] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
+      *2026-11-03: the canary is built (#3381) and not yet read. FR-70 M1
+      already took encode off the tokio workers, so what is left to answer is
+      whether anything still starves the runtime the pump and the overlay
+      share. The read is a 7-day window wholly on the first release that
+      carries the canary, beside the STALL census; no released build has its
+      lines yet.*
+- [~] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
       under a VPN flap, and bounded; no rekey storm.
+      **Measured 2026-11-03, not yet bounded** (production `agent_logs`, 7 days,
+      every device; P3's status block). At idle the waves stay under their 3 s
+      floor and the rekeys do not: peak 150/min on one host. Under a VPN flap,
+      read passively on the three corporate laptops' own full-tunnel VPN (39
+      netstate Majors in the week): at most 49 waves and 142 rekeys in the
+      5 minutes around a Major, the first poke inline (+0.0 s, `from_major`)
+      wherever a direct carrier was up, and the carriers the capture killed
+      convicted inside a minute. The gate's A/B is done (2026-11-03, a Win11
+      lab guest: 30 sweeps in the storm on 0.4.197, 4 on the gate; P3's status
+      block). Open: the 7-day read on the release that carries it.
 - [x] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
       ✅ **Measured 2026-10-30, four hosts** (`scripts/fr65-stall-census.sh
       --probes`, #3138): **0 steady-state probe runs** on CORPLAP-1/-2/-3 over
@@ -340,32 +434,51 @@ of each is to produce a number.
 - [ ] **AC7** — every fix carries a before/after from the **same** instrument on
       this issue. A fix with no measurement does not count as shipped.
       *2026-10-30:* P0's two fixes (#3138: the window-reset rebase and the
-      governor's monotonic stall count) have their **before** —
-      `scripts/fr65-stall-census.sh` over 2026-10-17..30 on CORPLAP-1/-2/-3: 84
-      `reset`-class lines (7/51/26) and 46 `untimed` (4/27/15). The **after** is
-      owed: the same script, the same hosts, a 14-day window on the release that
-      carries #3138. `reset` must read 0 with those long passes attributed
+      governor's monotonic stall count) have their **before** — the host census
+      over 2026-10-17..30 on CORPLAP-1/-2/-3: 84 `reset`-class lines (7/51/26) and
+      46 `untimed` (4/27/15).
+      *2026-11-03:* the census moved to a fleet-wide server read (#3372).
+      `agent_logs` keeps 7 days against that read's 14, so the before that counts
+      is a slice of the new instrument, taken while those lines still existed:
+      the builds before 0.4.192 from 2026-10-27 02:00Z, `reset` 5/26/4 and
+      `untimed` 8/5/0 over 4 541/6 195/4 667 heartbeats (the manual's §6.4). The two
+      instruments agree line for line (§7), so this before is the same read as the
+      after. The **after** is owed on or after 2026-11-15: the same read, the same
+      hosts, a 7-day window wholly on 0.4.192 or later, compared by rate per
+      1 000 heartbeats. `reset` must read 0 with those long passes attributed
       (`open`, `encode`, …), and `untimed` must shrink by what the six newly
-      named phases take.
+      named phases take. The first two days have both at 0 over 23/2 816/1 925
+      heartbeats, which is a reading and not this criterion.
 - [~] **AC8** — Docs: [`docs/stall-watch.md`](../stall-watch.md) in the house
       style (mermaid, tables, `file:line` anchors) for the instrument and for each
       later phase as it ships, and a `docs/README.md` index row.
       *Met for P0, 2026-10-30: the page and its row exist — the phases, the
       verdict's rules, the bookkeeping, what the kill switch does not turn off,
       reading a STALL line, the census, the cost harness and its measurement.
-      Owed: P1–P5, each as it ships.*
+      Owed: P1–P5, each as it ships.* *P1 shipped as FR-70 M2 and is documented
+      there; P4 needed no fix (AC6). P3's gate is documented beside the
+      net-change machinery it changes,
+      [`docs/overlay-nat-traversal.md`](../overlay-nat-traversal.md), "The
+      net-change gate". Still owed: P2, P5.*
 
 ## Open decisions
 
-- Whether the stall watch generalises to a shared crate (decide in P3, from need).
+- ~~Whether the stall watch generalises to a shared crate (decide in P3, from
+  need).~~ **No, 2026-11-03.** P3 measured the overlay from the lines it
+  already logs, read server-side from `agent_logs`, and its fix needed no
+  watch. Nothing else has asked for one.
 - Dedicated encoder thread vs. leaving encode on the worker if the canary shows no
   starvation — P2's measurement decides, not preference.
 - Whether `apply_ms` belongs in the heartbeat permanently or only under the watch.
-- **The send task's DataChannel guard** (2026-10-30). The send task holds the
+- ~~**The send task's DataChannel guard** (2026-10-30).~~ **Decided by FR-135
+  (#3293), 2026-11-02: superseded, not shipped here.** The send task holds the
   video DC's mutex across a frame's whole send (a Rust 2024 `if let` scrutinee
-  temporary, `peer.rs:7205`), so the pump's `dc_lock` waits out the previous
-  frame. Narrowing it is a one-line change; it waits for the `dc_lock` numbers
-  the next release brings, then ships with its before/after (AC7).
+  temporary, `peer.rs:7288` today), so the pump's `dc_lock` waits out the
+  previous frame. The one-line narrowing this bullet planned would re-arm
+  FR-79's 12:15 cut, because `AgentStalled` is partly this wait (FR-135 §2.5).
+  FR-135 R0 reads `dc_lock_ms` first, and R7 (`dc_sink`) replaces the guard
+  with a discriminator and an honest wait (FR-135 §7.2, "FR-65's one-line
+  narrowing: Supersede").
 - **Should the verdict survive its own kill switch?** Since FR-79,
   `pump_stall_watch = false` blinds the governor's `agent_stalled` gate. Either
   the switch keeps counting stalls (one clock read a pass) and drops only the
@@ -376,8 +489,11 @@ of each is to produce a number.
 
 - The instrument perturbs what it measures → AC1 exists precisely for this.
 - Off-thread work adds handoffs → every phase A/Bs **latency**, not just stalls.
-- Debouncing the route guard could delay a legitimate heal → bound it and keep the
-  worst-case reaction time.
+- Debouncing the route guard could delay a legitimate heal → P3 debounces the
+  poke only, never the route wave or the Major lane: a reaped `/32` is re-asserted
+  on the same signal as before, and a real network move pokes at once
+  (`lifecycle::netchange_action`). A no-delta burst inside the quiet falls back to
+  the silence trigger, so the worst-case reaction time stays where it was.
 
 ## Related
 
@@ -387,6 +503,44 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 ## Field-verification log
 
 _(every entry must carry a before/after from the stall watch.)_
+
+- **2026-11-03 — the census reads AC3, AC4 and AC5 too.** `--swaps`, `--canary` and
+  `--rekeys` are modes of the same bounded server read (the manual's §7.1), so
+  each of those criteria has one instrument for its before and its after.
+  - **The two ends agree.** One day on one Windows host, 2026-11-02: `--swaps`
+    reads the same 149 heartbeats and the same dims swap (196.4 ms) from the
+    files and from the server. `--rekeys` reads 14 140 pokes from the files and
+    14 128 from the server, one sweep of 12 lost in a batch the uploader counted
+    nowhere (`dropped=0`), and the gate replay keeps 4 004 at both ends.
+  - **P3's before, every device, 7 days (2026-10-27 04:10Z .. 2026-11-03
+    04:10Z):** 208 210 pokes, 64 138 kept by the gate replay, 33 710 route waves,
+    1 399 direct and 786 relay revalidations failed. The Mongo pod's restart
+    count read 1 before and after.
+  - **The canary has no lines yet**: no released build carries P2. `--canary`
+    reads it from the first release that does.
+
+- **2026-11-03 — the census moves to the server, and its first read splits by
+  build.** One week of `agent_logs` (2026-10-27 02:00Z .. 2026-11-03 01:45Z): 397 029
+  batches, 128 426 lines of interest, 10 s, the Mongo pod's restart count 1 before
+  and after.
+  - **Before and after #3138, every device:** 909 STALL lines over 97 685 heartbeats
+    on builds before 0.4.192 (`reset` 562, `open` 269, `untimed` 60, `encode` 15, 3
+    other), 126 over 25 477 from 0.4.192 on (`reset` 0, `untimed` 0, `open` 86,
+    `dc_lock` 35, `encode` 4, `poll` 1). The three laptops are in the manual's §6.4.
+    Two days is not AC7's window; see the criterion.
+  - **The instrument, proven:** on NEO16 the old PowerShell census, as a plain file
+    over its own log directories, and the server read match on 64 of 64 lines with
+    no class disagreement, 24 of them `reset`, and the server read holds eight more
+    that those directories did not. `--from-logs` matches the same 64. The port
+    takes `reset` at ≤ 5 ms because an uploaded stamp has lost its microseconds.
+  - **`reset` was mostly not long.** 480 of 562 lines are under 200 ms, 456 of them
+    one macOS host at 108 ms. `capture` was among the six the reset zeroed and is
+    idle by rule, so a heartbeat pass with a 100 ms capture wait could read as work.
+    The rebase should have removed those lines, and so a false `agent_stalled` for
+    FR-79's gate. Not shown yet: that host's after is ten heartbeats.
+  - **`dc_lock`'s first number:** 35 lines on four hosts, mean 0.52 s, worst 2.3 s.
+  - **AC6 still holds on the server read**: `--probes` on NEO16, 2026-10-28 .. 11-03:
+    58 probe lines, all within 60 s of a start, 0 at steady state.
 
 - **2026-10-30 — a census of the instrument's own output: it was blind to every
   stall longer than its heartbeat; and its cost, measured (AC1).** The new

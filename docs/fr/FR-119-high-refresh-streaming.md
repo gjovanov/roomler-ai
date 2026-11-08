@@ -403,14 +403,17 @@ refreshes at, lets an admin push the frame-rate denylist, and has the viewer say
 |---|---|---|
 | Windows, WGC | the captured monitor: `GetMonitorInfoW` → `EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)` → `dmDisplayFrequency` | `capture/refresh.rs` `of_monitor` |
 | Windows, scrap (DXGI) | the primary display, the same call | `of_primary` |
+| Windows, SYSTEM context (DXGI, or GDI after a fallback) | the primary display, the same call, on the capture thread once it is bound to the input desktop | `system_context/capture_pump.rs` |
 | macOS, scrap (quartz) | `CGDisplayModeGetRefreshRate` of the main display's current mode | `of_main_display` |
 | Linux, scrap (X11) | the primary RandR output's mode: the dot clock over `htotal × vtotal`, halved when interlaced, doubled when double-scanned | `of_x11_primary`, `of_mode_timings` |
 | Linux, DRM | the CRTC mode's `vrefresh` | `drm_backend.rs`, at the open |
 
 - **Read once, at the open,** like the gate (`ScreenCapture::refresh_hz`). A capture opened again reads it again.
   A reading of 0 or 1 is no rate: Windows reports those for the hardware's default, and macOS reports 0 for some
-  built-in panels. Neither decides anything, and a trial then finds out. The portal, the system context and the
-  synthetic source do not read it.
+  built-in panels. Neither decides anything, and a trial then finds out. The portal and the synthetic source do
+  not read it. The system context did not either until 2026-11-08, and a 120 was granted on a 60 Hz panel
+  ([FR-135](FR-135-one-rc-media-pipeline.md) §13). Since then the trait method has no default, so every backend
+  answers for itself.
 - **Where it goes:** the grant refuses a rate above it (`refresh`), the rate class is keyed on it, and
   `rc:video-info` carries it as `refresh_hz`, beside the frame-rate answer and only with `fps-high` on. The
   viewer's picker disables the rates above it, with the reason.

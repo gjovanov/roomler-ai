@@ -59,6 +59,7 @@ pub mod guards;
 pub mod maintenance;
 pub mod media;
 pub mod media_cluster;
+mod media_gate;
 pub mod media_stats;
 pub mod meeting_cap;
 pub mod recording;

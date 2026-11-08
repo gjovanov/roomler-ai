@@ -62,6 +62,112 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// frames RECEIVED, not frames sent.
 pub(crate) const WS_RX_DEADLINE: Duration = Duration::from_secs(80);
 
+/// The control WS's keepalive Ping period: nginx and K8s ingress commonly
+/// idle-close a WS after 60-120 s of silence.
+const WS_KEEPALIVE_EVERY: Duration = Duration::from_secs(25);
+
+/// #3530 — how quiet the control WS gets while the loop runs: a keepalive
+/// whose pong was not read yet, and the period before it. A silence past the
+/// RX deadline that a late keepalive tick covers but for this slack is the
+/// agent's own pause ([`tunnel_core::frozen::did_not_run_for`]).
+const WS_QUIET_WHILE_RUNNING: Duration = Duration::from_secs(2 * WS_KEEPALIVE_EVERY.as_secs());
+
+/// #3530 — the session ended because this agent did not run: frozen (SIGSTOP,
+/// a cgroup freeze, a VM pause) for most of the silence that tripped
+/// [`WS_RX_DEADLINE`] or before a send or read that failed
+/// ([`session_ended`]), or asleep (the keepalive's wall-vs-monotonic check).
+/// No connect was tried and none failed, so the reconnect line says so.
+#[derive(Debug)]
+struct AgentDidNotRun(String);
+
+impl std::fmt::Display for AgentDidNotRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AgentDidNotRun {}
+
+/// #3530 — the shortest pause a failed send or read is put down to. The
+/// RX-deadline line cannot name a shorter one (its deadline less a running
+/// loop's quiet), and this floor keeps the three exits on the same terms. A
+/// loop that ran but sat in one arm stays under it, such as a send that
+/// wedged for [`WS_SEND_TIMEOUT`] when a corp VPN captured the route, and
+/// keeps today's line.
+const WS_PAUSE_MIN: Duration =
+    Duration::from_secs(WS_RX_DEADLINE.as_secs() - WS_QUIET_WHILE_RUNNING.as_secs());
+
+/// #3530 — the error that ends a session on a failed send or read (`ctx`),
+/// put down to this agent's own pause when the loop's lateness explains it.
+/// After a long freeze the far end has reset the socket, and whichever arm
+/// `select!` runs first at the thaw can hit the reset before the keepalive's
+/// RX deadline does. On a lab guest after a 152 s SIGSTOP that was
+/// `Broken pipe` on the heartbeat, and `Connection reset without closing
+/// handshake` on the read. The reconnect then logged "connect failed",
+/// though no connect was tried.
+///
+/// `silent` is the time since the last frame read, and `since_keepalive` the
+/// time since the keepalive arm last ran, both read as the arm starts. The
+/// part of `since_keepalive` past [`WS_KEEPALIVE_EVERY`] is the lateness the
+/// keepalive tick would report if it ran now. If the keepalive arm already
+/// ran at the thaw, its tick reported that lateness itself, and `pause` kept
+/// it ([`RememberedPause`]). The larger of the two is the loop's lateness. A
+/// running loop has neither, so the error keeps `ctx` alone, as before.
+///
+/// ⚠️ Wording only: the error keeps its own type under the new context, so
+/// the reconnect reads it as before (FR-28's 502 check downcasts it).
+fn session_ended(
+    ctx: &'static str,
+    e: anyhow::Error,
+    silent: Duration,
+    since_keepalive: Duration,
+    pause: RememberedPause,
+) -> anyhow::Error {
+    let late = since_keepalive
+        .saturating_sub(WS_KEEPALIVE_EVERY)
+        .max(pause.late());
+    match tunnel_core::frozen::did_not_run_for(silent, late, WS_QUIET_WHILE_RUNNING)
+        .filter(|paused| *paused >= WS_PAUSE_MIN)
+    {
+        Some(paused) => {
+            let why = format!(
+                "{ctx}: {}: this agent did not run for ~{} s before it (frozen or suspended)",
+                error_chain(e.as_ref()),
+                paused.as_secs()
+            );
+            e.context(AgentDidNotRun(why))
+        }
+        None => e.context(ctx),
+    }
+}
+
+/// #3530 — the keepalive tick's lateness, kept while it reads as a pause (at
+/// least [`WS_PAUSE_MIN`]) until a tick comes on time again. With
+/// `MissedTickBehavior::Delay` that is the next one, about 25 s later.
+///
+/// It is for a send or read that fails after the keepalive arm ran at a
+/// thaw. The far end closed the socket during the freeze, but the frames it
+/// sent before its close sit ahead of the error. Each read of one refreshes
+/// `last_rx`, so the RX deadline does not trip, and gives the keepalive arm
+/// another turn, which restarts `skew_mono`. On a lab guest thawed from a
+/// 152 s SIGSTOP, the read failed 2.6 ms later and logged "connect failed".
+///
+/// One per session, beside `skew_mono`: a new session starts with none.
+#[derive(Debug, Default, Clone, Copy)]
+struct RememberedPause(Option<Duration>);
+
+impl RememberedPause {
+    /// One keepalive tick, `late` past its due instant. A pause is kept, and
+    /// a tick under [`WS_PAUSE_MIN`] clears it.
+    fn tick(&mut self, late: Duration) {
+        self.0 = (late >= WS_PAUSE_MIN).then_some(late);
+    }
+
+    fn late(self) -> Duration {
+        self.0.unwrap_or_default()
+    }
+}
+
 /// Hard bound on a single WS frame WRITE on the established connection.
 /// Every select arm awaits its sends inline, so one wedged `ws.send`
 /// freezes the whole loop: no arm runs, no `watchdog::tick`, and at 90 s
@@ -246,6 +352,10 @@ type SessionMeta = (
     crate::rc_overlay::RcOverlay,
     Option<u32>,
     Option<roomler_ai_remote_control::models::LockOnEnd>,
+    // FR-135 §7.1 — a delegating daemon's `rc_media_legacy` entries
+    // (`SessionParams::media_legacy`); `None` on a session this process
+    // resolved itself.
+    Option<String>,
 );
 
 /// FR-85 P3b — what a session's `record` channel needs, resolved when the
@@ -500,7 +610,7 @@ const UPDATE_RECHECK_AFTER_DOWN: Duration = Duration::from_secs(3600);
 /// the LAST outage left the ladder. The bar is the session's life, not the
 /// handshake: a server that accepts and drops at once must still climb the
 /// ladder, or a fleet would reconnect to it every second.
-const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const LADDER_PROVEN_AFTER: Duration = Duration::from_secs(30);
 
 /// #2221 — the reconnect ladder after a transient drop. `started_outage`: the
 /// attempt that just ended had sent its hello (see [`OrgCtx::note_ws_down`]);
@@ -526,6 +636,11 @@ pub struct OrgCtx {
     /// exit-route purges, and the `process::exit` escalations — a secondary
     /// org's terminal conditions stop ITS loop, never the daemon.
     pub is_primary: bool,
+    /// FR-43 P3a — this process is a GUI worker with no enrollment, on the
+    /// stand-in control plane ([`crate::unenrolled`]). A session reaches it
+    /// through the root's delegation channel and nothing else, so every text
+    /// frame off its own socket is dropped, whoever answers on that port.
+    pub unenrolled: bool,
     /// Watchdog pump name, registered by `run_cmd` before spawn:
     /// `signaling` for the primary (kept verbatim for log/tooling
     /// continuity) and `signaling:<label>` for secondaries — per-org pumps
@@ -554,16 +669,9 @@ pub struct OrgCtx {
     /// FR-103 — rung once the server has ACCEPTED the token on a connect:
     /// the renewal task looks after every connect.
     renewal_connected: Arc<tokio::sync::Notify>,
-    /// FR-90 P4-3b-1 — the device's knowhow scanner, on the primary's context
-    /// alone (decision 43): `None` on a secondary's, and on a daemon with no
-    /// config file to read its roots from.
-    #[cfg(all(hive_host, unix))]
-    pub knowhow: Option<Arc<crate::hive::knowhow::Scanner>>,
-    /// FR-90 P4-5-1b — the device's knowhow prober, on the primary's context
-    /// alone, as the scanner is: `None` on a secondary's, and on a daemon
-    /// with no config file to read `knowhow_probe_reach` from.
-    #[cfg(hive_host)]
-    pub prober: Option<Arc<crate::hive::knowhow_probe::Prober>>,
+    /// FR-28 — the flat redial on a load balancer's 502, for this org's loop.
+    /// As the config says unless a test passes its own ([`Self::with_flat_redial`]).
+    pub flat_redial: crate::ws_connect::FlatRedial,
 }
 
 impl OrgCtx {
@@ -571,16 +679,14 @@ impl OrgCtx {
         Self {
             label: crate::config::PRIMARY_ORG_LABEL.to_string(),
             is_primary: true,
+            unenrolled: false,
             pump: "signaling",
             down_since_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             updates_ignored: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
-            #[cfg(all(hive_host, unix))]
-            knowhow: None,
-            #[cfg(hive_host)]
-            prober: None,
+            flat_redial: crate::ws_connect::FlatRedial::from_config(),
         }
     }
 
@@ -588,6 +694,7 @@ impl OrgCtx {
         Self {
             label: label.to_string(),
             is_primary: false,
+            unenrolled: false,
             // Interned (see the `pump` field doc): the watchdog registry
             // wants `&'static str`; one bounded leak per org per process.
             pump: Box::leak(format!("signaling:{label}").into_boxed_str()),
@@ -596,12 +703,15 @@ impl OrgCtx {
             token,
             renewal: Default::default(),
             renewal_connected: Arc::new(tokio::sync::Notify::new()),
-            // Decision 43: a secondary enrollment never scans, nor probes.
-            #[cfg(all(hive_host, unix))]
-            knowhow: None,
-            #[cfg(hive_host)]
-            prober: None,
+            flat_redial: crate::ws_connect::FlatRedial::from_config(),
         }
+    }
+
+    /// FR-43 P3a — this loop runs on the stand-in control plane
+    /// ([`Self::unenrolled`], the field).
+    pub fn unenrolled(mut self) -> Self {
+        self.unenrolled = true;
+        self
     }
 
     /// FR-103 — replace the renewal knobs (`run_cmd` passes the
@@ -611,20 +721,18 @@ impl OrgCtx {
         self
     }
 
-    /// FR-90 P4-3b-1 — the scanner `rc:knowhow.scan` runs on (`run_cmd`
-    /// passes the daemon's; a test passes one that reads in-process).
-    #[cfg(all(hive_host, unix))]
-    pub fn with_knowhow(mut self, scanner: Arc<crate::hive::knowhow::Scanner>) -> Self {
-        self.knowhow = Some(scanner);
+    /// FR-28 — replace the flat redial the config picked (a test passes its own).
+    pub fn with_flat_redial(mut self, flat_redial: crate::ws_connect::FlatRedial) -> Self {
+        self.flat_redial = flat_redial;
         self
     }
 
-    /// FR-90 P4-5-1b — the prober `rc:knowhow.probe` runs on (`run_cmd`
-    /// passes the daemon's; a test passes one reading its own config).
-    #[cfg(hive_host)]
-    pub fn with_prober(mut self, prober: Arc<crate::hive::knowhow_probe::Prober>) -> Self {
-        self.prober = Some(prober);
-        self
+    /// No outage is stamped: the last attempt sent its hello, or no attempt has
+    /// failed yet. What [`Self::note_ws_down`]'s stamp would answer.
+    fn ws_is_up(&self) -> bool {
+        self.down_since_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
     }
 
     /// Stamp the start of an outage. `true` when this failure STARTED one: the
@@ -711,7 +819,7 @@ fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 /// process start, so the watchdog's 90 s timer ran during initial
 /// exponential backoff against an unreachable server — every cold
 /// start with a flaky network got force-exited at 90 s and the
-/// supervisor crash-looped forever. See `main.rs` register call for
+/// supervisor crash-looped forever. See `app.rs` register call for
 /// the symmetric flip there.
 struct SignalingPumpGuard {
     pump: &'static str,
@@ -809,6 +917,22 @@ struct PendingCodec {
     browser_caps: Option<Vec<String>>,
 }
 
+/// #3468, from review — will the peer a re-offer builds carry the session's
+/// recording? Only with RECORD in its grant AND a record context, both stashed
+/// by a request that came before this offer. A second offer for a session has
+/// neither: the first one took both, and the peer gets the default grant and
+/// no context. The hub never forwards one (`admit_offer`), so today this is
+/// always `false`, and a replaced channel's end is the recording's end.
+#[cfg_attr(not(feature = "recording"), allow(dead_code))]
+fn reoffer_carries_record(
+    permissions: Option<&roomler_ai_remote_control::permissions::Permissions>,
+    meta: Option<&SessionMeta>,
+) -> bool {
+    permissions
+        .is_some_and(|p| p.contains(roomler_ai_remote_control::permissions::Permissions::RECORD))
+        && meta.is_some_and(|m| m.3.is_some())
+}
+
 /// #3280 — the codec and transport a session's offer builds its peer with. The
 /// request's picks, unless the answer in force has since stopped offering them
 /// ([`crate::encode::caps::picks_at_the_offer`]).
@@ -868,10 +992,10 @@ pub async fn run(
     // `AgentConfig` via `AgentConfig::for_org` for secondaries).
     ctx: OrgCtx,
     // FR-43 P2b — this process's part in delegation. Owned so the reconnect
-    // loop can lend it per attempt. Only the PRIMARY org's loop ever acts on it
-    // (`handle_server_msg` gates on `ctx.is_primary`), but it is passed to all
-    // of them so the gate lives in one place rather than at three call sites
-    // that could each forget it.
+    // loop can lend it per attempt. FR-43 P3b — the gates read whether this
+    // loop holds the host, and `run_cmd` decides who does: the primary's loop,
+    // and a secondary's only on a one-row Mac's daemon
+    // (`Delegation::for_secondary`).
     mut delegation: crate::delegate::Delegation,
     // `mut` for exactly one reason: FR-40 key rotation swaps the overlay
     // secret in this snapshot between two connections (see
@@ -910,12 +1034,33 @@ pub async fn run(
     // (no cache yet, a week's age, a driver change) the probe children may
     // take up to 60 s each, and a watchdog kill at 90 s left the cache
     // unwritten, so the restarted worker probed again: a crash loop with the
-    // device offline. Warm it here instead, with the pump gated off and on a
-    // blocking thread.
-    let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
-    // #3280 — a first answer that ran short of time gets more tries, off to one
-    // side. It arms nothing on a healthy host, or in a second organization's loop.
-    crate::encode::caps::arm_retry(live_on_this_host(rc_sessions.clone()));
+    // device offline. Warm it here instead, with the pump gated off.
+    //
+    // #3439 — and wait for it `FIRST_ANSWER_WAIT` at most. Awaited whole, a
+    // starved host stayed offline for as long as its probe ran, which under load
+    // is as long as the load lasts, on every start that misses the cache (the
+    // first of every build). A healthy host answers well inside the wait, so its
+    // hello carries the whole answer as before. Past it, the loop connects with
+    // the interim answer, and the real one is announced the moment it lands.
+    // Everything the loop reads of the caps from here never waits for the probe
+    // (`caps::answer_now`), and a session asked for before the first answer waits
+    // for it in its connection (`crate::held_requests`).
+    let caps_waited = std::time::Instant::now();
+    if crate::encode::caps::start_probing(live_on_this_host(rc_sessions.clone())) {
+        if !crate::encode::caps::first_answer_within(crate::encode::caps::FIRST_ANSWER_WAIT).await {
+            info!(
+                waited_ms = caps_waited.elapsed().as_millis() as u64,
+                "caps probe: no answer yet; connecting with the encoders that need no driver, \
+                 and the hardware follows when the probe answers"
+            );
+            let _ = tokio::task::spawn_blocking(crate::encode::caps::interim).await;
+        }
+    } else {
+        let _ = tokio::task::spawn_blocking(crate::encode::caps::detect).await;
+        // #3280 — a first answer that ran short of time gets more tries, off to one
+        // side. It arms nothing on a healthy host, or in a second organization's loop.
+        crate::encode::caps::arm_retry(live_on_this_host(rc_sessions.clone()));
+    }
     // Overlay "Disconnect" control → this channel → the connect_once
     // loop, which tears the session down (peer close + ClientMsg::Terminate).
     // Created once; the receiver is polled inside connect_once across
@@ -1009,6 +1154,9 @@ pub async fn run(
     // LocalAPI shares the SAME instance and its live `pending` set. Lives across
     // reconnects, so a sentinel dropped while the WS was down is still honoured.
     let mut backoff = Duration::from_secs(1);
+    // FR-28 — off unless the device's config turned it on; off, this loop's
+    // ladder is exactly the one above (`ws_connect::FlatRedial`).
+    let mut flat_redial = ctx.flat_redial.clone();
     // netstate PR-2b — a MAJOR network change during a reconnect backoff
     // cuts the wait and resets the ladder: the transition that killed this
     // WS has ended (or moved again), and an exponential grown to 60 s while
@@ -1104,6 +1252,11 @@ pub async fn run(
         .await;
         if !matches!(attempt, Err(ConnectError::AuthRejected)) {
             recovered_last = false;
+        }
+        // FR-28 — only a connection that lived earns the next outage its flat
+        // redials: #2221's bar, on every way a connection can end.
+        if ctx.ws_is_up() {
+            flat_redial.connection_ended(attempt_started.elapsed());
         }
         match attempt {
             Ok(()) => {
@@ -1241,13 +1394,6 @@ pub async fn run(
                 // no restart will run the boot reconciler, so drop any exit-node
                 // split-default now or the host stays blackholed until reboot.
                 crate::purge_exit_routes();
-                // #2294 — and the removal purge Hive started (FR-90 P2g-4a)
-                // finishes first: the removal's goodbye follows its frame on
-                // this socket, and a pod roll mid-purge ends in this same
-                // goodbye at the reconnect. Bounded; none in flight, no wait.
-                // The build's `hive-purge-drain` is what lets the kick tell it.
-                #[cfg(hive_host)]
-                crate::hive::finish_removal_purge(crate::hive::REMOVAL_PURGE_LIMIT).await;
                 std::process::exit(watchdog::AGENT_DELETED_EXIT_CODE);
             }
             Err(ConnectError::KeyRotated {
@@ -1362,11 +1508,35 @@ pub async fn run(
                 // repro 2026-05-24: a flaky WSS handshake produced
                 // identical-looking `error=ws connect` lines for
                 // every failure mode, blocking root-cause analysis.
-                let cause = error_chain(e.as_ref());
-                warn!(error = %e, %cause, "signaling connect failed; backing off");
+                // #3530 — a session that ended because this agent did not run
+                // (frozen, or asleep) tried no connect, and none failed.
+                if e.downcast_ref::<AgentDidNotRun>().is_some() {
+                    warn!(
+                        why = %e,
+                        "signaling: the session ended while this agent did not run; reconnecting"
+                    );
+                } else {
+                    let cause = error_chain(e.as_ref());
+                    warn!(error = %e, %cause, "signaling connect failed; backing off");
+                }
+                // FR-28 — the load balancer answered 502: this tenant's pod is
+                // rolling. A flat wait, and the ladder stays where it is.
+                let flat_wait = flat_redial.step(
+                    e.downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+                        .is_some_and(crate::ws_connect::is_lb_502),
+                );
+                if let Some(wait) = flat_wait {
+                    info!(
+                        wait_ms = wait.as_millis() as u64,
+                        left = flat_redial.left(),
+                        "signaling: the load balancer has no pod for this org yet; redialling flat (FR-28)"
+                    );
+                }
                 tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {
-                        backoff = (backoff * 2).min(Duration::from_secs(60));
+                    _ = tokio::time::sleep(flat_wait.unwrap_or(backoff)) => {
+                        if flat_wait.is_none() {
+                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                        }
                     },
                     // netstate PR-2b — the network moved: retry NOW with a
                     // reset ladder instead of waiting out a backoff sized
@@ -1374,6 +1544,7 @@ pub async fn run(
                     _ = next_major_netchange(&mut ladder_net_rx) => {
                         info!("network changed during reconnect backoff — retrying immediately");
                         backoff = Duration::from_secs(1);
+                        flat_redial.restart();
                         // New network = new throttle regime: the slowness
                         // treadmill re-earns its verdict from scratch.
                         slowness_cycles = 0;
@@ -1665,20 +1836,12 @@ async fn connect_once(
     }
 
     // Say hello.
+    // #3439 — subscribed before the generation is read, so an answer that lands
+    // after this wakes the loop, which announces it at once.
+    let mut caps_news = crate::encode::caps::news();
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
-    // FR-90 P2c-3 — copies are held for the primary organization only: a
-    // secondary org's connection never offers them, so its placement never
-    // picks this device.
-    if !ctx.is_primary {
-        strip_replica_verbs(&mut hello_caps.rpc);
-    }
-    // FR-90 P3-4a — `vault` exactly where the hello carries the key.
-    crate::vault::apply_word(
-        &mut hello_caps.rpc,
-        crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
-    );
     // FR-94 — `exec-system` on exactly the connection of the device this
     // machine's SYSTEM service is anchored for, and the heartbeat re-announces
     // when that changes (an anchor written or removed while connected).
@@ -1693,10 +1856,9 @@ async fn connect_once(
     // FR-85 P1e-mac — a supervised Mac's hello already knows what its attached
     // worker can record. Saying the root daemon's own list (nothing) would
     // strip RECORD for the 30 s until the first heartbeat corrects it, after
-    // every reconnect. Primary org only, like the heartbeat.
-    if ctx.is_primary
-        && let Some(record) = delegation.host().and_then(|d| d.effective_record())
-    {
+    // every reconnect. Only a loop that holds the host, like the heartbeat:
+    // the primary, and on a one-row Mac every org (FR-43 P3b).
+    if let Some(record) = delegation.host().and_then(|d| d.effective_record()) {
         hello_caps.record = record;
     }
     // FR-97 P2c — and its Remote Apps words, the same way: a delegated
@@ -1705,9 +1867,7 @@ async fn connect_once(
     // root daemon is in none and says `status` alone. Our own words are kept
     // for when no worker is attached (`detect()` memoizes them).
     let own_apps: Vec<String> = hello_caps.apps.clone();
-    if ctx.is_primary
-        && let Some(apps) = delegation.host().and_then(|d| d.effective_apps())
-    {
+    if let Some(apps) = delegation.host().and_then(|d| d.effective_apps()) {
         hello_caps.apps = apps;
     }
     let mut last_announced_apps: Vec<String> = hello_caps.apps.clone();
@@ -1716,9 +1876,7 @@ async fn connect_once(
     // this root daemon says `no-session`. Ours is kept for when no worker is
     // attached.
     let own_audio = crate::encode::caps::AudioWords::of(&hello_caps);
-    if ctx.is_primary
-        && let Some(audio) = delegation.host().and_then(|d| d.effective_audio())
-    {
+    if let Some(audio) = delegation.host().and_then(|d| d.effective_audio()) {
         audio.apply(&mut hello_caps);
     }
     let mut last_announced_audio = crate::encode::caps::AudioWords::of(&hello_caps);
@@ -1763,11 +1921,6 @@ async fn connect_once(
         // it dialled. Empty here is meaningful ("this device cannot prove
         // itself"), never "trust anything".
         ssh_host_pubkey: ssh_host_pubkey_for(cfg),
-        // FR-90 P3-3a — the vault key's public half, made on this first ask
-        // and held in memory for the life of the process: the primary
-        // enrollment's connection only, and only while the owner's
-        // `vault_enabled` is on.
-        vault_key: crate::vault::hello_key(cfg.vault_enabled, ctx.is_primary),
         // FR-100 P1a — THIS enrollment's device key, on every org's
         // connection (one key per org, never shared): made on the first
         // hello, kept beside the config, and offered only once it is on disk.
@@ -1816,29 +1969,6 @@ async fn connect_once(
     // FR-99 P1d — the curtains the previous process died holding, reported as
     // `worker_exit` on the first healthy connection of the org each belonged to.
     crate::privacy::drain_leftovers(&cfg.tenant_id, &outbound_tx);
-    // FR-90 P3-4a — the primary enrollment's connection carries this
-    // device's lease requests: the vault answers each on the connection it
-    // came from. P3-4b — set BEFORE the supervisor below is pointed here, so
-    // a run it launches from now on knows whether its toolbelt offers the
-    // vault tools.
-    #[cfg(feature = "vault")]
-    if ctx.is_primary {
-        crate::vault::on_connected(
-            outbound_tx.clone(),
-            crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
-            cfg.vault_activity_log,
-        );
-    }
-    // FR-90 — and its Hive state reports: point the supervisor at THIS one,
-    // which also replays the latest state of every session a dropped
-    // connection may have lost. P4-4-1b — and its sessions' questions about
-    // the map, whose server's word that the map is there is forgotten until
-    // this connection's knowhow says it again (`rc:knowhow.served`).
-    #[cfg(hive_host)]
-    if ctx.is_primary {
-        crate::hive::knowhow_tools::on_connected(outbound_tx.clone());
-        crate::hive::on_connected(outbound_tx.clone());
-    }
     let _sink_guard = tunnel_hub.publish_sink(outbound_tx.clone());
     // FR-43 P2b — point the delegation channel at THIS connection's outbound
     // queue, so a worker's `SdpAnswer` / `Ice` reach the server.
@@ -1851,11 +1981,16 @@ async fn connect_once(
     // Cloned FIRST so its borrow of `delegation` ends here — the worker's
     // receiver below is borrowed for the whole connection, and a process is
     // one role or the other, so only one of these is ever `Some`.
+    //
+    // FR-43 P3b — each org's loop that holds the host points it at its own WS,
+    // and a worker reply goes back on the WS of the org whose session it is.
+    // A secondary holds the host only on a one-row Mac's daemon.
     let delegate = delegation.host().cloned();
-    if let Some(delegate) = delegate.as_ref()
-        && ctx.is_primary
-    {
-        delegate.set_outbound(outbound_tx.clone());
+    if let Some(delegate) = delegate.as_ref() {
+        delegate.set_outbound(
+            crate::delegate::org_key(ctx.is_primary, &ctx.label),
+            outbound_tx.clone(),
+        );
     }
     // FR-43 P2b-2 — the WORKER's ends. The receiver is borrowed for this
     // connection; the sender is cloned so a delegated session can hold it.
@@ -1891,6 +2026,7 @@ async fn connect_once(
             asker: crate::ssh::Asker::Here {
                 broker: consent_broker.clone(),
                 indicator: indicator.clone(),
+                companion: crate::companion::Companion::System,
             },
             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
         },
@@ -2001,7 +2137,7 @@ async fn connect_once(
     // Keepalive. nginx + K8s ingress commonly idle-close WSes at 60-120s of
     // silence; send an application-level Ping every 25s so the connection
     // survives quiet periods between sessions.
-    let mut keepalive = tokio::time::interval(Duration::from_secs(25));
+    let mut keepalive = tokio::time::interval(WS_KEEPALIVE_EVERY);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // Swallow the immediate first tick.
 
@@ -2019,6 +2155,8 @@ async fn connect_once(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // Swallow the immediate first tick.
     let mut sys_sampler = crate::telemetry::SysSampler::new();
+    // #3439 — session requests that came before the probe's first answer.
+    let mut held = crate::held_requests::HeldRequests::default();
 
     // Receive-liveness stamp: refreshed on EVERY inbound frame (the Pongs the
     // server auto-sends for our keepalive Pings count), checked against
@@ -2037,14 +2175,21 @@ async fn connect_once(
     let mut outstanding_ping: Option<std::time::Instant> = None;
 
     // A5 — resume detection. Every timer here runs on the MONOTONIC clock,
-    // which excludes suspend on Windows/Linux — so after a sleep the RX
-    // deadline picks up where it left off and a socket that died during
-    // the nap stays trusted for up to ~80 more seconds. Wall-vs-monotonic
-    // skew at the keepalive tick catches the nap (the overlay runtime and
-    // the watchdog use the same trick) and cycles the WS immediately: a
-    // fresh connect is cheap, a post-resume zombie socket is not.
+    // which excludes suspend on Linux and macOS (`CLOCK_MONOTONIC`,
+    // `CLOCK_UPTIME_RAW`) — so after a sleep the RX deadline picks up where
+    // it left off and a socket that died during the nap stays trusted for up
+    // to ~80 more seconds. Wall-vs-monotonic skew at the keepalive tick
+    // catches the nap (the overlay runtime uses the same trick) and cycles
+    // the WS immediately: a fresh connect is cheap, a post-resume zombie
+    // socket is not. #3530: Windows' QPC counts the sleep, so there this
+    // check stays quiet and the RX deadline trips at once instead, as it does
+    // after a freeze on any OS (SIGSTOP, a cgroup freeze). The late keepalive
+    // tick then words that line.
     let mut skew_wall = std::time::SystemTime::now();
     let mut skew_mono = std::time::Instant::now();
+    // #3530 — the keepalive tick's pause, for a send or read that fails after
+    // that tick ran at a thaw, which restarts `skew_mono`. Per session.
+    let mut pause = RememberedPause::default();
 
     // netstate PR-2 — probe-then-cycle on Major network changes. `Some` =
     // a probe ping is out: (window start, missed windows so far); verdict
@@ -2115,7 +2260,11 @@ async fn connect_once(
                 let _ = send_frame(&mut ws, Message::Close(None)).await;
                 return Ok(());
             }
-            _ = keepalive.tick() => {
+            due = keepalive.tick() => {
+                // #3530 — how late this tick came: for at least that long the
+                // loop read nothing, whatever the network did.
+                let late = due.elapsed();
+                pause.tick(late);
                 let _stage = watchdog::enter(ctx.pump, "keepalive");
                 // W4(a) — TUN-death self-heal. The overlay runtime EXITS when
                 // its TUN dies (a contract the runtime tests pin), and before
@@ -2144,6 +2293,7 @@ async fn connect_once(
                             asker: crate::ssh::Asker::Here {
                                 broker: consent_broker.clone(),
                                 indicator: indicator.clone(),
+                                companion: crate::companion::Companion::System,
                             },
                             activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
                         },
@@ -2162,24 +2312,46 @@ async fn connect_once(
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(anyhow::anyhow!(
-                        "resume-from-suspend (napped ~{} s)",
-                        (wall_gap - mono_gap).as_secs()
-                    )));
+                    return Err(ConnectError::Transient(anyhow::Error::new(AgentDidNotRun(
+                        format!(
+                            "resume-from-suspend (napped ~{} s)",
+                            (wall_gap - mono_gap).as_secs()
+                        ),
+                    ))));
                 }
                 if last_rx.elapsed() > WS_RX_DEADLINE {
-                    warn!(
-                        silent_s = last_rx.elapsed().as_secs(),
-                        "no inbound WS frames within the RX deadline — half-open socket \
-                         (middlebox still ACKs our pings); reconnecting"
-                    );
+                    let silent = last_rx.elapsed();
+                    // #3530 — after a freeze the silence is the agent's own,
+                    // and blaming a middlebox sends whoever reads it hunting
+                    // for a TLS-inspecting proxy that is not there.
+                    let paused =
+                        tunnel_core::frozen::did_not_run_for(silent, late, WS_QUIET_WHILE_RUNNING);
+                    match paused {
+                        Some(paused) => warn!(
+                            silent_s = silent.as_secs(),
+                            paused_s = paused.as_secs(),
+                            "no inbound WS frames within the RX deadline, but this agent did not \
+                             run for ~{} s of it (frozen or suspended): the silence is its own, \
+                             not the network's; reconnecting",
+                            paused.as_secs()
+                        ),
+                        None => warn!(
+                            silent_s = silent.as_secs(),
+                            "no inbound WS frames within the RX deadline — half-open socket \
+                             (middlebox still ACKs our pings); reconnecting"
+                        ),
+                    }
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(anyhow::anyhow!(
-                        "ws rx deadline: no inbound frames for {} s",
-                        last_rx.elapsed().as_secs()
-                    )));
+                    let why = format!("ws rx deadline: no inbound frames for {} s", silent.as_secs());
+                    return Err(ConnectError::Transient(match paused {
+                        Some(paused) => anyhow::Error::new(AgentDidNotRun(format!(
+                            "{why}: this agent did not run for ~{} s of it (frozen or suspended)",
+                            paused.as_secs()
+                        ))),
+                        None => anyhow::anyhow!(why),
+                    }));
                 }
                 // netstate PR-2 — the net-change probe verdict. Answered =
                 // its pong cleared `outstanding_ping`, or ANY frame arrived
@@ -2324,6 +2496,54 @@ async fn connect_once(
                     keepalive.reset_after(WS_NETCHANGE_PROBE_DEADLINE);
                 }
             }
+            // #3439 — the answer in force moved: the probe's first answer, which
+            // replaces the interim one this connection may have said hello with,
+            // or a later try's (#3280). The heartbeat announces it now, not within
+            // its 30 s, and a session asked for before the first answer is handled
+            // now, as if it had arrived now.
+            Ok(()) = caps_news.changed() => {
+                let _stage = watchdog::enter(ctx.pump, "caps.news");
+                heartbeat.reset_immediately();
+                if crate::encode::caps::answered() && !held.is_empty() {
+                    for request in held.release(std::time::Instant::now()) {
+                        handle_server_msg(
+                            ctx,
+                            &cfg.tenant_id,
+                            &mut ws,
+                            request,
+                            &mut peers,
+                            &mut pending_codecs,
+                            &mut pending_transports,
+                            &mut pending_chroma,
+                            &mut pending_chunk_framing,
+                            &mut pending_audio,
+                            &mut pending_permissions,
+                            &mut pending_session_meta,
+                            &mut tunnel_peers,
+                            &mut tunnel_quic_peers,
+                            &outbound_tx,
+                            tunnel_reap_tx,
+                            &mut pending_quic_setups,
+                            quic_setup_tx,
+                            idle_tx,
+                            encoder_preference,
+                            &indicator,
+                            &consent_broker,
+                            &cfg.forward_acl,
+                            &relay_regions_slot,
+                            &derp_ticket_slot,
+                            cfg,
+                            remote_cfg,
+                            delegate.as_ref(),
+                            // Held off our own control WS: its replies belong here.
+                            None,
+                            carrier_ready_tx,
+                        )
+                        .await?;
+                    }
+                }
+                watchdog::tick(ctx.pump);
+            }
             _ = heartbeat.tick() => {
                 let _stage = watchdog::enter(ctx.pump, "heartbeat");
                 // #2551 — the first named stall froze in this arm, so each
@@ -2379,26 +2599,25 @@ async fn connect_once(
                 //
                 // FR-85 P1e-mac — on a supervised Mac, the WORKER's word: a
                 // delegated session records there, with the person's recorder
-                // and gates, while this root daemon can record nothing. PRIMARY
-                // ORG ONLY, like delegation itself: a secondary org's session is
-                // never handed to the worker, so its row keeps our own caps.
-                let record_now = ctx
-                    .is_primary
-                    .then(|| delegate.as_ref().and_then(|d| d.effective_record()))
-                    .flatten()
+                // and gates, while this root daemon can record nothing. Only a
+                // loop that holds the host, like delegation itself: the
+                // primary, and on a one-row Mac every org (FR-43 P3b). Off one
+                // row a secondary org's session is never handed to the worker,
+                // so its row keeps our own caps.
+                let record_now = delegate
+                    .as_ref()
+                    .and_then(|d| d.effective_record())
                     .unwrap_or_else(record_caps);
                 // FR-97 P2c — and its Remote Apps words, the same way: a
                 // worker that attaches after the hello (or leaves) is news.
-                let apps_now = ctx
-                    .is_primary
-                    .then(|| delegate.as_ref().and_then(|d| d.effective_apps()))
-                    .flatten()
+                let apps_now = delegate
+                    .as_ref()
+                    .and_then(|d| d.effective_apps())
                     .unwrap_or_else(|| own_apps.clone());
                 // FR-97 P2a — and its audio offer, the same way.
-                let audio_now = ctx
-                    .is_primary
-                    .then(|| delegate.as_ref().and_then(|d| d.effective_audio()))
-                    .flatten()
+                let audio_now = delegate
+                    .as_ref()
+                    .and_then(|d| d.effective_audio())
                     .unwrap_or_else(|| own_audio.clone());
                 let keep_busy_now = crate::keep_busy::advertised();
                 let sas_now = sas_advertised();
@@ -2414,7 +2633,15 @@ async fn connect_once(
                     .collect();
                 // FR-101 P2b — the owner's floor is live too: a new `off` must
                 // reach the hub's strip (and its reason) within a beat.
-                let session_policy_now = crate::session_policy::caps_policy();
+                //
+                // FR-43 P3b — on a one-row Mac, with the person's floor folded
+                // in, as the `Request` arm enforces it. Elsewhere this is
+                // `caps_policy()`.
+                let session_policy_now =
+                    crate::session_policy::caps_policy_of(crate::delegate::PersonFloor::session_policy(
+                        delegate.as_ref().and_then(|d| d.person_floor()),
+                        crate::session_policy::device_policy(),
+                    ));
                 // #3280 — a later try's answer replaced the probe's: its cells
                 // reach this row within a beat. Read before `stub_caps` below.
                 let caps_generation_now = crate::encode::caps::generation();
@@ -2452,18 +2679,12 @@ async fn connect_once(
                     // stay OURS, because we are the half that answers
                     // `rc:session.request` (the P2b-3 lesson).
                     let mut c = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
-                    if !ctx.is_primary {
-                        strip_replica_verbs(&mut c.rpc);
-                    }
-                    crate::vault::apply_word(
-                        &mut c.rpc,
-                        crate::vault::takes_leases(cfg.vault_enabled, ctx.is_primary),
-                    );
                     crate::exec_service::apply_word(&mut c.rpc, exec_system_now);
                     crate::ssh_service::apply_word(&mut c.rpc, ssh_system_now);
                     c.record = record_now;
                     c.apps = apps_now;
                     audio_now.apply(&mut c);
+                    c.session_policy = session_policy_now;
                     if let Some((perms, has_input)) = caps_now {
                         c.permissions = Some(perms);
                         c.has_input_permission = has_input;
@@ -2497,12 +2718,21 @@ async fn connect_once(
                     power: crate::power::brief(),
                 };
                 watchdog::stage(ctx.pump, "heartbeat.send");
+                // #3530 — read before the send, which can wedge for
+                // `WS_SEND_TIMEOUT`: the lateness is the loop's, not the send's.
+                let (silent, since_keepalive) = (last_rx.elapsed(), skew_mono.elapsed());
                 if let Err(e) = send_msg(&mut ws, &hb).await {
                     warn!(%e, "heartbeat send failed — will reconnect");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(e.context("heartbeat send")));
+                    return Err(ConnectError::Transient(session_ended(
+                        "heartbeat send",
+                        e,
+                        silent,
+                        since_keepalive,
+                        pause,
+                    )));
                 }
                 // Wave 2 — one `rc:session.stats` per LIVE session, on the
                 // heartbeat's own 30 s tick (no extra timer, and it stops
@@ -2890,6 +3120,10 @@ async fn connect_once(
                                         p.idle_secs,
                                         // FR-99 P3b — and so is the lock ask.
                                         p.lock_on_end,
+                                        // FR-135 §7.1 — the daemon's legacy
+                                        // entries, added to this worker's own
+                                        // at the offer.
+                                        p.media_legacy,
                                     ),
                                 );
                                 info!(session_id = %sid, "delegation: session params received");
@@ -2945,6 +3179,14 @@ async fn connect_once(
                     let _stage = watchdog::enter(ctx.pump, "ws.text");
                     last_rx = std::time::Instant::now();
                     watchdog::tick(ctx.pump);
+                    // FR-43 P3a — the stand-in sends none, so a text frame here
+                    // is something else on its port. This process holds the
+                    // person's capture grants, and it takes a session from the
+                    // root's delegation channel alone.
+                    if ctx.unenrolled {
+                        warn!("a text frame on the stand-in control plane's socket; dropped");
+                        continue;
+                    }
                     match serde_json::from_str::<ServerMsg>(&text) {
                         Ok(parsed) => {
                             // #2551 — which message this arm is handling: the
@@ -2974,6 +3216,20 @@ async fn connect_once(
                             ) {
                                 Some(p) => p,
                                 None => continue,
+                            };
+                            // #3439 — a session asked for before the probe's first
+                            // answer waits for it (the `caps.news` arm hands it on),
+                            // and one that ends meanwhile is forgotten.
+                            if let ServerMsg::Terminate { session_id, .. } = &parsed {
+                                held.forget(*session_id);
+                            }
+                            let parsed = if crate::encode::caps::answered() {
+                                parsed
+                            } else {
+                                match held.hold(parsed, std::time::Instant::now()) {
+                                    None => continue,
+                                    Some(other) => other,
+                                }
                             };
                             handle_server_msg(
                                 ctx,
@@ -3033,10 +3289,7 @@ async fn connect_once(
                         // better than exiting, and an old agent meeting a new
                         // frame family must keep running. It just has to SAY so.
                         Err(e) => {
-                            let tag = serde_json::from_str::<serde_json::Value>(&text)
-                                .ok()
-                                .and_then(|v| v.get("t")?.as_str().map(str::to_string));
-                            match tag {
+                            match undecodable_frame_tag(&text) {
                                 Some(t) if t.starts_with("rc:") => warn!(
                                     %e, %t,
                                     "DROPPED a roomler frame this build cannot decode — the \
@@ -3069,11 +3322,19 @@ async fn connect_once(
                     return Ok(());
                 }
                 Some(Err(e)) => {
+                    // #3530 — read before the closes below await.
+                    let (silent, since_keepalive) = (last_rx.elapsed(), skew_mono.elapsed());
                     let _stage = watchdog::enter(ctx.pump, "ws.error");
                     close_all_peers(&mut peers, &indicator).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
-                    return Err(ConnectError::Transient(anyhow::Error::new(e).context("ws read")));
+                    return Err(ConnectError::Transient(session_ended(
+                        "ws read",
+                        anyhow::Error::new(e),
+                        silent,
+                        since_keepalive,
+                        pause,
+                    )));
                 }
                 Some(Ok(Message::Pong(payload))) => {
                     let _stage = watchdog::enter(ctx.pump, "ws.pong");
@@ -3451,15 +3712,20 @@ async fn handle_server_msg(
     // failing SOFT is still right, because the alternative is a session that
     // vanishes rather than one that fails the way it always has.
     //
-    // ⚠️ PRIMARY ORG ONLY. The GUI worker is host-global — one screen, one
-    // keyboard — while the server models policy per org, so a secondary org's
-    // admin must not be able to drive it. Same rule, and the same reason, as
-    // `rc:agent.update`, exec and the FR-19 relay: a host-global resource
-    // belongs to the enrollment that owns the host.
+    // ⚠️ ONLY A LOOP THAT HOLDS THE HOST. The GUI worker is host-global — one
+    // screen, one keyboard — while the server models policy per org, so off
+    // one row a secondary org's admin must not be able to drive it: only the
+    // primary's loop is given the host. Same rule, and the same reason, as
+    // `rc:agent.update`, exec and the FR-19 relay.
+    //
+    // FR-43 P3b — on a one-row Mac's daemon every org's loop holds it, because
+    // the person's own row, through which a secondary org used to reach the
+    // screen, is gone. Each org's session still asks that org's consent, and
+    // the prompt names the org (`prompt_org`). The host hands a session over
+    // only for the org whose params crossed, so no org reaches into another's.
     if let Some(delegate) = delegate
-        && ctx.is_primary
         && crate::delegate::delegable_inbound(&msg)
-        && delegate.send_to_worker(&msg)
+        && delegate.send_to_worker(crate::delegate::org_key(ctx.is_primary, &ctx.label), &msg)
     {
         tracing::debug!(
             kind = crate::delegate::server_msg_kind(&msg),
@@ -3572,7 +3838,9 @@ async fn handle_server_msg(
                     &ctx.label,
                 )
             };
-            let our_caps = crate::encode::caps::detect();
+            // #3439 — a request reaches here only once the probe has answered
+            // (`crate::held_requests`), so this is that answer, read without a wait.
+            let our_caps = crate::encode::caps::answer_now();
 
             // Phase Y.3: figure out which video transport this
             // session will use. Honour `preferred_transport` only if
@@ -3632,13 +3900,10 @@ async fn handle_server_msg(
             // an ordinary session keeps the historical opt-in unchanged.
             //
             // FR-97 P2a — on a supervised Mac, the GUI worker's offer: it
-            // captures a delegated session's sound (primary org only, like the
-            // delegation that sends it the session), while this root daemon,
-            // in no window-server session, offers none.
-            let audio_offered = match delegate
-                .filter(|_| ctx.is_primary)
-                .and_then(|d| d.effective_audio())
-            {
+            // captures a delegated session's sound (only for a loop that holds
+            // the host, like the delegation that sends it the session), while
+            // this root daemon, in no window-server session, offers none.
+            let audio_offered = match delegate.and_then(|d| d.effective_audio()) {
                 Some(worker) => !worker.audio.is_empty(),
                 None => !our_caps.audio.is_empty(),
             };
@@ -3666,6 +3931,8 @@ async fn handle_server_msg(
                     idle_secs,
                     // FR-99 P3b — `None` from an older server: no ask.
                     lock_on_end,
+                    // FR-135 §7.1 — resolved here, from this process's keys.
+                    None,
                 ),
             );
             info!(
@@ -3747,8 +4014,18 @@ async fn handle_server_msg(
             // the directive simply won — so a device that had set
             // `auto_grant_session = false` was silently overridden by a server
             // `Auto`, inverting the gate-4 property exec and SSH are built on.
-            let effective_mode =
-                crate::consent::strictest_of(directed_mode, consent_broker.mode(), host_window);
+            //
+            // FR-43 P3b — on a one-row Mac the local setting includes the
+            // person's own floor: the row whose broker held their
+            // `auto_grant_session` is gone, so the worker said it to the host,
+            // and the stricter of theirs and the daemon's is the local one.
+            // `None` everywhere else, so the daemon's own stands as before.
+            let person_floor = delegate.and_then(|d| d.person_floor());
+            let effective_mode = crate::consent::strictest_of(
+                directed_mode,
+                crate::delegate::PersonFloor::consent(person_floor, consent_broker.mode()),
+                host_window,
+            );
             // FR-101 P2b — the session policy, the org's (on the request) and
             // the device owner's floor, applied to the grant BEFORE anything
             // below reads it: the stash the channels enforce, the worker's
@@ -3760,7 +4037,12 @@ async fn handle_server_msg(
                 permissions,
                 audio_enabled,
                 session_policy,
-                crate::session_policy::device_policy(),
+                // FR-43 P3b — with the person's `rc_*` floor folded in, the
+                // same way.
+                crate::delegate::PersonFloor::session_policy(
+                    person_floor,
+                    crate::session_policy::device_policy(),
+                ),
                 crate::session_policy::person_asked(
                     consent_mode,
                     matches!(effective_mode, crate::consent::Mode::Prompt { .. }),
@@ -3810,34 +4092,43 @@ async fn handle_server_msg(
             // session's `record` channel refused `unavailable`. Still ahead of
             // the offer that consumes it (the server sends that only after this
             // request is answered), on the same ordered channel.
-            if let Some(delegate) = delegate
-                && ctx.is_primary
-            {
-                let sent = delegate.send_params(crate::delegate::DelegateFrame::SessionParams(
-                    Box::new(crate::delegate::SessionParams {
-                        session_id: session_id.to_hex(),
-                        codec: chosen.clone(),
-                        transport: negotiated_transport.clone(),
-                        chroma: chroma_pref.clone(),
-                        chunk_framing: chunk_framing.unwrap_or(false),
-                        audio: audio_negotiated,
-                        permissions,
-                        controller_name: controller_name.clone(),
-                        input_mode,
-                        asking_org: asking_org.clone(),
-                        record: Some(crate::delegate::DelegatedRecord {
-                            controller_user_id: controller_user_id.to_hex(),
-                            prompt_window_ms: record_prompt_window
-                                .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
-                        }),
-                        rc_overlay: Some(rc_overlay.clone()),
-                        // FR-101 P4b-2 — the worker keeps the idle limit.
-                        idle_secs,
-                        // FR-99 P3b — and takes the lock ask into the lock:
-                        // the session goes live in its process.
-                        lock_on_end,
-                    }),
-                ));
+            //
+            // FR-43 P3b — for the org that asked: the host notes it, and hands
+            // this session's later messages, and returns its replies, for that
+            // org alone.
+            if let Some(delegate) = delegate {
+                let sent = delegate.send_params(
+                    crate::delegate::org_key(ctx.is_primary, &ctx.label),
+                    crate::delegate::DelegateFrame::SessionParams(Box::new(
+                        crate::delegate::SessionParams {
+                            session_id: session_id.to_hex(),
+                            codec: chosen.clone(),
+                            transport: negotiated_transport.clone(),
+                            chroma: chroma_pref.clone(),
+                            chunk_framing: chunk_framing.unwrap_or(false),
+                            audio: audio_negotiated,
+                            permissions,
+                            controller_name: controller_name.clone(),
+                            input_mode,
+                            asking_org: asking_org.clone(),
+                            record: Some(crate::delegate::DelegatedRecord {
+                                controller_user_id: controller_user_id.to_hex(),
+                                prompt_window_ms: record_prompt_window
+                                    .map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
+                            }),
+                            rc_overlay: Some(rc_overlay.clone()),
+                            // FR-101 P4b-2 — the worker keeps the idle limit.
+                            idle_secs,
+                            // FR-99 P3b — and takes the lock ask into the lock:
+                            // the session goes live in its process.
+                            lock_on_end,
+                            // FR-135 §7.1 — and this daemon's legacy entries,
+                            // which a push to its row put in force here but
+                            // not in the worker that builds the peer.
+                            media_legacy: remote_cfg.media_legacy_for_delegate(),
+                        },
+                    )),
+                );
                 if !sent {
                     // No worker, or its queue is full. Not fatal — the daemon
                     // still serves the session itself, which on macOS means a
@@ -3874,6 +4165,21 @@ async fn handle_server_msg(
             // the controller as "nobody could be asked" rather than as a deny.
             let will_prompt = !owner_side_consent
                 && matches!(effective_mode, crate::consent::Mode::Prompt { .. });
+            // ⚠️ Armed before anything shows it (#3442), and here on the WS
+            // loop, not inside the task below (#1632). `request_with_mode`
+            // registers the session as pending synchronously, so an answer
+            // counts from the moment the panel, the marker, a companion this
+            // may have to start (up to 3 s) or a notification shows the
+            // question, and a `Terminate` that is the very next frame this
+            // loop reads finds the prompt whether or not the task has been
+            // polled yet. (A spawned task has no ordering guarantee against
+            // the loop that spawned it.) Armed after the show, an answer given
+            // while the surfaces went up was refused. The window still runs
+            // from the show: the prompt starts its clock at its first look, in
+            // the task. Owner-side consent asks nobody here, and auto-grant
+            // arms nothing: its answer is ready at once.
+            let prompt = (!owner_side_consent)
+                .then(|| consent_broker.request_with_mode(&session_hex, effective_mode));
             let mut have_surface = true;
             if will_prompt {
                 // FR-27 — NATIVE surface first, companion as the fallback.
@@ -4050,21 +4356,9 @@ async fn handle_server_msg(
                     });
                 }
             }
-            if owner_side_consent {
-                info!(
-                    %session_id, ?consent_mode,
-                    "owner-side consent (email/push) — agent waits for the server to resolve"
-                );
-            } else {
+            if let Some(prompt) = prompt {
                 let outbound = outbound_tx.clone();
                 let ind = indicator.clone();
-                // #1632 — armed HERE, on the WS loop, not inside the task:
-                // `request_with_mode` registers the session as pending
-                // synchronously, so a `Terminate` that is the very next frame
-                // this loop reads finds the prompt whether or not the task
-                // below has been polled yet. (A spawned task has no ordering
-                // guarantee against the loop that spawned it.)
-                let prompt = consent_broker.request_with_mode(&session_hex, effective_mode);
                 // FR-52 P4 — only an external session carries the config in.
                 let external_cfg = external_consent.map(|_| remote_cfg.clone());
                 tokio::spawn(async move {
@@ -4123,6 +4417,11 @@ async fn handle_server_msg(
                         tracing::warn!(session = %session_hex, %e, "outbound consent send failed (channel closed)");
                     }
                 });
+            } else {
+                info!(
+                    %session_id, ?consent_mode,
+                    "owner-side consent (email/push) — agent waits for the server to resolve"
+                );
             }
         }
 
@@ -4141,6 +4440,26 @@ async fn handle_server_msg(
             // exists (controller retry?), close it first so the browser sees
             // a clean answer.
             if let Some(old) = peers.remove(&session_id) {
+                // #3451 — said BEFORE the close: the old peer's `record`
+                // channel ending is not the session's end, and a recording
+                // launching for it carries on under the new peer.
+                //
+                // ⚠️ Only when the new peer carries the recording (#3468, from
+                // review). The hub forwards one offer per session
+                // (`admit_offer`), so a second one comes only from an older or
+                // hostile server, and the peer built from it gets the default
+                // grant, without RECORD, and no record context: nothing on it
+                // can pick the recording up. Said for that peer, a recording
+                // launching under the old one waited in the grace past the
+                // host's Disconnect. Not said, the old channel's end is the
+                // session's end for the recording, as on master.
+                #[cfg(feature = "recording")]
+                if reoffer_carries_record(
+                    pending_permissions.get(&session_id),
+                    pending_session_meta.get(&session_id),
+                ) {
+                    crate::recording::remote::peer_replaced(session_id);
+                }
                 // FR-101 P3 — the session goes on under a new peer, and the
                 // old one's drop forgets its counters: carry the transfer
                 // readings across, so the cumulative tallies never go back.
@@ -4160,7 +4479,8 @@ async fn handle_server_msg(
                 pending_codecs,
                 pending_transports,
                 session_id,
-                crate::encode::caps::detect,
+                // #3439 — never a wait on the probe inside this loop.
+                crate::encode::caps::answer_now,
             );
             // #2231 — the RTP video track's codec, read from this offer: on a
             // DataChannel transport it moves to VP8 when the browser cannot
@@ -4201,6 +4521,7 @@ async fn handle_server_msg(
                 rc_overlay,
                 idle_secs,
                 lock_ask,
+                delegated_media_legacy,
             ) = pending_session_meta.remove(&session_id).unwrap_or_else(|| {
                 (
                     "Controller".to_string(),
@@ -4208,6 +4529,7 @@ async fn handle_server_msg(
                     None,
                     None,
                     crate::rc_overlay::RcOverlay::resolve(false),
+                    None,
                     None,
                     None,
                 )
@@ -4251,9 +4573,18 @@ async fn handle_server_msg(
                     },
                 )
                 .await;
+                // #3468, from review — the session ends here, for a recording it held too.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::session_ended(session_id);
                 return Ok(());
             }
 
+            // FR-135 §7.1 — which media paths this session runs, old or new:
+            // the ONE read of `rc_media_legacy` and `rc_media_canary`, so the
+            // session never changes path mid-flight and a push applies from the
+            // next session. One log line when either key spoke, none otherwise.
+            let media_paths = remote_cfg.media_paths_with(delegated_media_legacy.as_deref());
+            media_paths.log(session_id);
             let peer = match AgentPeer::new(
                 session_id,
                 &ice_servers,
@@ -4287,6 +4618,7 @@ async fn handle_server_msg(
                 // FR-102 P9d — so this peer's carrier observation signals the
                 // loop that holds it (the clone drops with the peer).
                 carrier_ready_tx.clone(),
+                media_paths,
             )
             .await
             {
@@ -4303,6 +4635,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4364,6 +4699,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4393,6 +4731,9 @@ async fn handle_server_msg(
                         },
                     )
                     .await;
+                    // #3468, from review — the session ends here, for a recording it held too.
+                    #[cfg(feature = "recording")]
+                    crate::recording::remote::session_ended(session_id);
                     return Ok(());
                 }
             };
@@ -4458,6 +4799,9 @@ async fn handle_server_msg(
                 crate::lock_on_end::session_aborted(session_id);
                 indicator.hide_session(session_id.to_hex());
                 close_within_budget(peer.close(), session_id, "answer_send_failed").await;
+                // #3468, from review — the session ends here, for a recording it held too.
+                #[cfg(feature = "recording")]
+                crate::recording::remote::session_ended(session_id);
                 return Err(ConnectError::Transient(e.context("sending answer")));
             }
             // FR-101 P4b-2 — the session is live: its idle limit runs from
@@ -5196,7 +5540,7 @@ async fn handle_server_msg(
                     if !applied.needs_restart.is_empty() {
                         warn!(
                             keys = ?applied.needs_restart,
-                            "rc:agent.config — saved, but these need a daemon restart \
+                            "rc:agent.config — these need a daemon restart \
                              to take effect"
                         );
                     }
@@ -5350,6 +5694,16 @@ async fn handle_server_msg(
                 consent_broker.mode(),
                 crate::consent::DEFAULT_PROMPT_TIMEOUT,
             );
+            // ⚠️ Armed here on the loop, before anything shows the question
+            // (#3442). It used to be armed inside the task below, so the panel
+            // and the marker were up before it was: a click on the native
+            // panel, which this same loop reads, could come before the task's
+            // first poll, and it was refused and took the panel down with it.
+            // An answer through the companion or the CLI in that gap was
+            // refused too. The window still runs from the show: the prompt
+            // starts its clock at its first look, in the task. Auto-grant arms
+            // nothing: its answer is ready at once.
+            let asking = consent_broker.request_with_mode(&request_id, consent_mode);
 
             // FR-27 — exec has ALWAYS prompted through this broker and NEVER
             // written a marker, so its prompt reached no UI: the only way to
@@ -5419,7 +5773,6 @@ async fn handle_server_msg(
                 }
             }
 
-            let broker = consent_broker.clone();
             let outbound = outbound_tx.clone();
             let req = crate::exec::ExecRequest {
                 request_id: request_id.clone(),
@@ -5436,6 +5789,9 @@ async fn handle_server_msg(
                 run_as,
                 // Where it always started, or its `cwd` (FR-97 P5b is SSH's).
                 start_in_home: false,
+                // A command here may stop this daemon, and must outlive it
+                // (`roomler exec … self-update`, #2718).
+                session_owned: false,
             };
             let ind = indicator.clone();
             tokio::spawn(async move {
@@ -5443,12 +5799,7 @@ async fn handle_server_msg(
                 // closed is withdrawn. Here it matters more, since an Approve
                 // given to a stale panel would run the command for a caller
                 // no longer waiting for it, and twice if that caller retried.
-                let decision = await_prompt_or_socket_end(
-                    broker.request_with_mode(&request_id, consent_mode),
-                    &outbound,
-                    &request_id,
-                )
-                .await;
+                let decision = await_prompt_or_socket_end(asking, &outbound, &request_id).await;
                 // FR-27 — same convergence point as the RC path: take the
                 // native panel down however the question was answered.
                 ind.hide_prompt(&request_id);
@@ -5535,11 +5886,6 @@ async fn handle_server_msg(
             session_secs,
             consent_mode,
             via_service,
-            // FR-90 P3-8-2a — an agent session's grant, held to ONE command by
-            // this device's SSH server (`ssh::Grant::one_command`), whichever
-            // of the two serves it: the worker's below, or the SYSTEM
-            // service's, which takes it from its own claim.
-            one_command,
         } => {
             #[cfg(feature = "ssh-server")]
             if via_service {
@@ -5604,16 +5950,14 @@ async fn handle_server_msg(
                         }
                     });
                 }
-                // The service pulled what it needs from the server, its claim
-                // carrying `one_command` too; nothing here is the worker's to
-                // hold.
+                // The service pulled what it needs from the server; nothing
+                // here is the worker's to hold.
                 let _ = (
                     public_key,
                     account,
                     consent_mode,
                     expires_at_ms,
                     session_secs,
-                    one_command,
                 );
             } else {
                 use roomler_ai_remote_control::models::SshGrantRefusal;
@@ -5633,7 +5977,6 @@ async fn handle_server_msg(
                         consent_mode,
                         expires_at_ms,
                         session_secs,
-                        one_command,
                     ) {
                         Ok(()) => None,
                         Err(e) => {
@@ -5662,607 +6005,12 @@ async fn handle_server_msg(
                     expires_at_ms,
                     session_secs,
                     via_service,
-                    one_command,
                 );
                 warn!(
                     %grant_id, %caller,
                     "rc:ssh.grant ignored — this build lacks the `ssh-server` feature"
                 );
             }
-        }
-
-        // FR-90 — start an agent session. Answered with `rc:hive.start_ack`
-        // on THIS connection, from a task of its own (launching is I/O this
-        // loop must not wait on), after the device's own gates.
-        ServerMsg::HiveStart {
-            session_id,
-            harness,
-            harness_session,
-            fence,
-            folder,
-            user_id,
-            user_email,
-            caller,
-            resume,
-            replicated,
-            lease,
-            fork_of,
-            from_terminal,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_start(
-                crate::hive::StartOrder {
-                    session_id,
-                    harness,
-                    harness_session,
-                    fence,
-                    folder,
-                    user_id,
-                    user_email,
-                    caller,
-                    resume,
-                    // P2c-3 — the server placed members besides this device:
-                    // checkpoint each turn's end (P2b-3b).
-                    replicated,
-                    // P2e-2 — and hold it to the server's word on each
-                    // connection from now on.
-                    lease,
-                    // P2f-3a — a fork: started from its parent's copy here.
-                    fork_of,
-                    // P2f-4a — a terminal session this device adopted, made a
-                    // managed one: started from the terminal's own history.
-                    from_terminal,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // No ack from this build: it does not advertise `hive`, so no
-            // server sends it a start or waits on one.
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    &harness,
-                    &harness_session,
-                    fence,
-                    &folder,
-                    user_id,
-                    &user_email,
-                    resume,
-                    replicated,
-                    lease,
-                    &fork_of,
-                    from_terminal,
-                );
-                warn!(
-                    session = %session_id, %caller,
-                    "rc:hive.start ignored — this build does not run agent sessions"
-                );
-            }
-        }
-
-        // FR-90 — stop an agent session; its `ended` arrives as
-        // `rc:hive.state` once the harness is gone.
-        ServerMsg::HiveStop {
-            session_id,
-            fence,
-            reason,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_stop(session_id, fence, reason, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (fence, &reason);
-                debug!(session = %session_id, "rc:hive.stop ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2g-1 — the session purged from this device, its own copy and
-        // what its account holds of it, answered per part on this connection.
-        ServerMsg::HivePurge {
-            purge_id,
-            session_id,
-            leaving,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_purge(
-                purge_id,
-                session_id,
-                leaving,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (purge_id, leaving);
-                debug!(session = %session_id, "rc:hive.purge ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2g-4a — this device's enrollment is being removed: every
-        // session it holds is purged.
-        ServerMsg::HivePurgeAll { purge_id } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_purge_all(purge_id, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            debug!(purge = %purge_id, "rc:hive.purge_all ignored — this build does not run agent sessions");
-        }
-
-        // FR-90 P2g-3d — what keeps each copy this device asked about: the
-        // device's own clock counts from it.
-        ServerMsg::HiveRetain { words } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_retain(words, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            debug!(
-                words = words.len(),
-                "rc:hive.retain ignored — this build does not run agent sessions"
-            );
-        }
-
-        // FR-90 P2e-2 — the server's word, on THIS connection, that this
-        // device holds the session at that fence: a leased run calls the model
-        // again, and a leased session it hosted launches.
-        ServerMsg::HiveLease { session_id, fence } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_lease(session_id, fence, ctx.is_primary, outbound_tx.clone());
-            #[cfg(not(hive_host))]
-            {
-                let _ = fence;
-                debug!(session = %session_id, "rc:hive.lease ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-1 — the session's lease moved past this device: what runs
-        // here at an older fence ends, and nothing here resumes it.
-        ServerMsg::HiveDemote {
-            session_id,
-            fence,
-            reason,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_demote(session_id, fence, reason, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (fence, &reason);
-                debug!(session = %session_id, "rc:hive.demote ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-4 — the session's lease is about to leave this device: no
-        // new prompt, the running turn ends or is cut, a last checkpoint, and
-        // `rc:hive.drained` back on THIS connection with where the copy ends.
-        // Taken up before the next frame is read, so a lease word right
-        // behind it lifts it.
-        ServerMsg::HiveDrain { session_id, fence } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_drain(session_id, fence, ctx.is_primary, outbound_tx.clone());
-            #[cfg(not(hive_host))]
-            {
-                let _ = fence;
-                debug!(session = %session_id, "rc:hive.drain ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-5 — could this device take the session over? A start's
-        // every gate, as configured now, and none of its side effects; the
-        // answer goes back on THIS connection. P2f-1a — a teleport's asks
-        // every gate but the copy, which the device takes after it.
-        ServerMsg::HivePrepare {
-            session_id,
-            fence,
-            harness,
-            harness_session,
-            folder,
-            user_id,
-            user_email,
-            caller,
-            teleport,
-            have_want,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_prepare(
-                crate::hive::StartOrder {
-                    session_id,
-                    harness,
-                    harness_session,
-                    fence,
-                    folder,
-                    user_id,
-                    user_email,
-                    caller,
-                    resume: true,
-                    replicated: true,
-                    lease: true,
-                    // P2f-3a — a prepare launches nothing; the moved start
-                    // that follows says whether the session is a fork.
-                    fork_of: None,
-                    from_terminal: false,
-                },
-                teleport,
-                have_want,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    fence,
-                    &harness,
-                    &harness_session,
-                    &folder,
-                    user_id,
-                    &user_email,
-                    &caller,
-                    teleport,
-                    have_want,
-                );
-                debug!(session = %session_id, "rc:hive.prepare ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P2e-5 — the record's word for the start right behind it: the
-        // turns the session has had, and where it ran. Kept for that start,
-        // which takes the session over from its copy when it ran elsewhere.
-        ServerMsg::HiveMove {
-            session_id,
-            fence,
-            turns,
-            from_device_id,
-            from_device_name,
-            from_folder,
-            moved_by: _,
-            moved_by_name,
-            moved_at_ms,
-            earlier,
-        } => {
-            info!(
-                session = %session_id, fence, from = %from_device_name,
-                by = %moved_by_name, earlier = earlier.len(), "the session moves to this device"
-            );
-            // P2e-7 — where it came from and who moved it, for the resume
-            // note; P2f-5 — and every place before. A build without Hive keeps
-            // none of it.
-            #[cfg(not(hive_host))]
-            let _ = (&from_folder, moved_at_ms, &earlier);
-            #[cfg(hive_host)]
-            crate::hive::handle_move(
-                crate::hive::Moved {
-                    session_id,
-                    fence,
-                    turns,
-                    from_device_id,
-                    from_device_name,
-                    from_folder,
-                    moved_by_name,
-                    moved_at_ms,
-                    earlier,
-                },
-                ctx.is_primary,
-            );
-            #[cfg(not(hive_host))]
-            let _ = (turns, from_device_id);
-        }
-
-        // FR-90 P1e — a session's core memory, just ahead of its start. Kept
-        // for that start's launch; whether the session sees it is the
-        // device's own `hive_core_memory`.
-        ServerMsg::HiveMemory {
-            session_id,
-            fence,
-            brain_rev,
-            claude_md,
-            memory_md,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_memory(
-                crate::hive::CoreMemory {
-                    session_id,
-                    fence,
-                    brain_rev,
-                    claude_md,
-                    memory_md,
-                },
-                ctx.is_primary,
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (fence, brain_rev, &claude_md, &memory_md);
-                debug!(session = %session_id, "rc:hive.memory ignored — this build does not run agent sessions");
-            }
-        }
-
-        // FR-90 P1j — the server's word on a terminal session this device
-        // offered. Only a build that adopts sends offers.
-        ServerMsg::HiveAdoptAck {
-            adopt_id,
-            session_id,
-            fence,
-            refused,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_adopt_ack(&adopt_id, session_id, fence, refused, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (session_id, fence, refused);
-                debug!(
-                    adopt_id,
-                    "rc:hive.adopt_ack ignored — this build does not adopt"
-                );
-            }
-        }
-
-        // FR-90 P0d-2 — the viewer peer. A grant is answered with
-        // `rc:hive.view.grant_ack` on THIS connection, from a task (it reads
-        // the replica store); the rest feeds the grant's own actor. A build
-        // without `hive` does not advertise `hive-view`, so no server sends
-        // it any of these.
-        ServerMsg::HiveViewGrant {
-            grant_id,
-            session_id,
-            user_id,
-            user_name,
-            may_prompt,
-            user_email,
-            ttl_secs,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_grant(
-                crate::hive::ViewGrant {
-                    grant_id,
-                    session_id,
-                    user_id,
-                    user_name,
-                    may_prompt,
-                    user_email,
-                    driving_refused: None,
-                    copy: false,
-                    ttl_secs,
-                    search: None,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    session_id,
-                    user_id,
-                    &user_name,
-                    may_prompt,
-                    &user_email,
-                    ttl_secs,
-                );
-                debug!(grant = %grant_id, "rc:hive.view.grant ignored — this build does not serve agent sessions");
-            }
-        }
-        // FR-90 P2i-1 — a search over this device's copies: answered as a view
-        // grant is, and served by the same actor, so the rest rides the view's
-        // frames. Only a connection advertising `hive-search` is sent one.
-        ServerMsg::HiveSearchGrant {
-            grant_id,
-            user_id,
-            sessions,
-            ttl_secs,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_search_grant(
-                crate::hive::SearchGrant {
-                    grant_id,
-                    user_id,
-                    sessions,
-                    ttl_secs,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            #[cfg(not(hive_host))]
-            {
-                let _ = (user_id, &sessions, ttl_secs);
-                debug!(grant = %grant_id, "rc:hive.search.grant ignored — this build does not serve agent sessions");
-            }
-        }
-        ServerMsg::HiveViewOffer {
-            grant_id,
-            sdp,
-            ice_servers,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_offer(grant_id, sdp, ice_servers, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = (&sdp, &ice_servers);
-                debug!(grant = %grant_id, "rc:hive.view.offer ignored");
-            }
-        }
-        ServerMsg::HiveViewIce {
-            grant_id,
-            candidate,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_ice(grant_id, candidate, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = &candidate;
-                debug!(grant = %grant_id, "rc:hive.view.ice ignored");
-            }
-        }
-        ServerMsg::HiveViewRenew { grant_id, ttl_secs } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_renew(grant_id, ttl_secs, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = ttl_secs;
-                debug!(grant = %grant_id, "rc:hive.view.renew ignored");
-            }
-        }
-        ServerMsg::HiveViewClose { grant_id, reason } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_view_close(grant_id, reason, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            {
-                let _ = &reason;
-                debug!(grant = %grant_id, "rc:hive.view.close ignored");
-            }
-        }
-        // FR-90 P2c-3 — hold a copy of a session. Answered with
-        // `rc:hive.replica.join_ack` on THIS connection, after the device's
-        // own gates; a secondary org's connection is refused there.
-        ServerMsg::HiveReplicaJoin {
-            session_id,
-            fence,
-            role,
-            fences,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_join(
-                session_id,
-                fence,
-                role,
-                fences,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // No answer from this build: it does not advertise
-            // `hive-replica`, so no server sends it a join.
-            #[cfg(not(hive_host))]
-            {
-                let _ = fences;
-                debug!(
-                    session = %session_id, fence, ?role,
-                    "rc:hive.replica.join ignored — this build holds no copies"
-                );
-            }
-        }
-
-        // FR-90 P2d — serve a stream of a session this device holds to one
-        // of its members. Answered with `rc:hive.replica.ready` on THIS
-        // connection; a secondary org's is refused there.
-        ServerMsg::HiveReplicaGrant {
-            grant_id,
-            session_id,
-            fence,
-            member_id,
-            path,
-            token,
-            ice_servers,
-            ttl_secs,
-            member_derp_pubkey,
-        } => {
-            #[cfg(hive_host)]
-            {
-                crate::hive::handle_replica_grant(
-                    grant_id,
-                    session_id,
-                    fence,
-                    member_id,
-                    path,
-                    token,
-                    ice_servers,
-                    member_derp_pubkey,
-                    ttl_secs,
-                    ctx.is_primary,
-                    outbound_tx.clone(),
-                );
-            }
-            // No answer from this build: it does not advertise
-            // `hive-stream`, so no server grants it a stream to serve.
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    session_id,
-                    fence,
-                    member_id,
-                    path,
-                    token,
-                    ice_servers,
-                    ttl_secs,
-                    member_derp_pubkey,
-                );
-                debug!(grant = %grant_id, "rc:hive.replica.grant ignored — this build carries no streams");
-            }
-        }
-
-        // FR-90 P2d — the source this device asked for is ready: dial it.
-        ServerMsg::HiveReplicaDial {
-            grant_id,
-            session_id,
-            fence,
-            source_id,
-            path,
-            token,
-            cert_fingerprint,
-            addrs,
-            derp_pubkey,
-            ice_servers,
-            ttl_secs,
-        } => {
-            #[cfg(hive_host)]
-            {
-                crate::hive::handle_replica_dial(
-                    grant_id,
-                    session_id,
-                    fence,
-                    source_id,
-                    path,
-                    token,
-                    cert_fingerprint,
-                    addrs,
-                    ice_servers,
-                    derp_pubkey,
-                    ttl_secs,
-                    ctx.is_primary,
-                );
-            }
-            #[cfg(not(hive_host))]
-            {
-                let _ = (
-                    session_id,
-                    fence,
-                    source_id,
-                    path,
-                    token,
-                    cert_fingerprint,
-                    addrs,
-                    derp_pubkey,
-                    ice_servers,
-                    ttl_secs,
-                );
-                debug!(grant = %grant_id, "rc:hive.replica.dial ignored — this build carries no streams");
-            }
-        }
-
-        // FR-90 P2d-2b — the member's relayed address, for the `relay` rung's
-        // TURN permission on this source's allocation; and a want the server
-        // refused, which the member's ladder acts on (P2d-3b).
-        ServerMsg::HiveReplicaCandidate { grant_id, addr } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_candidate(grant_id, addr, ctx.is_primary);
-            #[cfg(not(hive_host))]
-            debug!(grant = %grant_id, %addr, "rc:hive.replica.candidate ignored — this build carries no streams");
-        }
-        ServerMsg::HiveReplicaRefused {
-            session_id,
-            fence,
-            path,
-            reason,
-            detail,
-        } => {
-            info!(
-                session = %session_id, fence, path = ?path, reason = ?reason, detail = ?detail,
-                "rc:hive.replica.refused"
-            );
-            // FR-90 P2d-3b — the answer to this device's ask: the ladder acts
-            // on it.
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_refused(session_id, fence, path, reason, ctx.is_primary);
-        }
-
-        // FR-90 P2d — the server ended a stream this device is a side of.
-        ServerMsg::HiveReplicaClose { grant_id, reason } => {
-            #[cfg(hive_host)]
-            crate::hive::handle_replica_close(grant_id, reason);
-            #[cfg(not(hive_host))]
-            debug!(grant = %grant_id, %reason, "rc:hive.replica.close ignored — this build carries no streams");
         }
 
         // Roomler SSH — the answer to a session THIS device asked for
@@ -6276,9 +6024,6 @@ async fn handle_server_msg(
             host_pubkey,
             expires_at_ms,
             error,
-            // FR-90 P3-8-2b — the echo of an agent session's ticket: its
-            // daemon dials only on an answer that echoes the ticket it sent.
-            ssh_ticket_id,
         } => {
             // The key itself is never logged — only whether one arrived. It is
             // public, but a log line is the wrong place to start treating key
@@ -6288,7 +6033,6 @@ async fn handle_server_msg(
                 %request_id,
                 address = ?address, port = ?port, grant_id = ?grant_id,
                 verifiable = host_pubkey.is_some(), error = ?error,
-                ssh_ticket_id = ?ssh_ticket_id,
                 "rc:ssh.response"
             );
             crate::ssh_origin::deliver(
@@ -6300,7 +6044,6 @@ async fn handle_server_msg(
                     grant_id,
                     expires_at_ms,
                     error,
-                    ssh_ticket_id,
                 },
             );
         }
@@ -6532,159 +6275,6 @@ async fn handle_server_msg(
             });
         }
 
-        // FR-90 P3-4a — the vault's answers to this daemon's lease requests,
-        // and its revocations. Leases are the primary enrollment's only: a
-        // secondary org's connection never asks, so what arrives there is
-        // dropped unopened. Never logged with the frame: `sealed` is a value,
-        // if a sealed one.
-        ServerMsg::VaultLeased {
-            req_id,
-            lease_id,
-            n,
-            sealed,
-            expires_at_ms,
-            provider,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                // P3-6b — with a dynamic secret's provider, if it names one.
-                crate::vault::on_leased(
-                    &req_id,
-                    &lease_id,
-                    n,
-                    &sealed,
-                    expires_at_ms,
-                    provider.as_deref(),
-                );
-            } else {
-                debug!(%lease_id, "rc:vault.leased on a secondary org's connection — dropped unopened");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (req_id, n, sealed, expires_at_ms, provider);
-                debug!(%lease_id, "rc:vault.leased ignored — this build takes no leases");
-            }
-        }
-        ServerMsg::VaultRefused {
-            req_id,
-            reason,
-            approval_id,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_refused(&req_id, &reason, approval_id.as_deref());
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (req_id, reason, approval_id);
-        }
-        // FR-90 P3-4b — a session's listing and description: metadata.
-        ServerMsg::VaultListed {
-            req_id,
-            secrets,
-            more,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_listed(&req_id, secrets, more);
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (req_id, secrets, more);
-        }
-        ServerMsg::VaultDescribed { req_id, secret } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_described(&req_id, secret);
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (req_id, secret);
-        }
-        ServerMsg::VaultRevoke { lease_ids, reason } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_revoke(&lease_ids, &reason);
-            }
-            #[cfg(not(feature = "vault"))]
-            let _ = (lease_ids, reason);
-        }
-        // FR-90 P3-7-3a — the vault's grant of a session's own egress, the
-        // answer to this daemon's `rc:vault.net`: the primary's only, as a
-        // lease is. Never logged with the frame (nor by the catch-all below,
-        // which would): `grant` is a credential until its end.
-        ServerMsg::VaultNetGranted {
-            req_id,
-            grant_id,
-            grant,
-            expires_at_ms,
-            host,
-            port,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_net_granted(
-                    &req_id,
-                    &grant_id,
-                    &grant,
-                    expires_at_ms,
-                    &host,
-                    port,
-                );
-            } else {
-                debug!(%grant_id, "rc:vault.net.granted on a secondary org's connection — dropped");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (req_id, grant, expires_at_ms, host, port);
-                debug!(%grant_id, "rc:vault.net.granted ignored — this build asks for none");
-            }
-        }
-        // FR-90 P3-8-2b — the vault's ticket for a session's command on
-        // another device, the answer to this daemon's `rc:vault.ssh`: the
-        // primary's only, as a lease is. Never logged with the frame (nor by
-        // the catch-all below, which would): `ticket` is a credential until
-        // its end.
-        ServerMsg::VaultSshGranted {
-            req_id,
-            ticket_id,
-            ticket,
-            expires_at_ms,
-            os,
-            account,
-        } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_ssh_granted(
-                    &req_id,
-                    &ticket_id,
-                    &ticket,
-                    expires_at_ms,
-                    &os,
-                    &account,
-                );
-            } else {
-                debug!(%ticket_id, "rc:vault.ssh.granted on a secondary org's connection — dropped");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (req_id, ticket, expires_at_ms, os, account);
-                debug!(%ticket_id, "rc:vault.ssh.granted ignored — this build asks for none");
-            }
-        }
-        // FR-90 P3b-1b-1 — the vault's allow for a session's egress proxy,
-        // the answer to this daemon's `rc:vault.egress`: the primary's only,
-        // as a lease is. No credential in it.
-        ServerMsg::VaultEgressAllowed { req_id, host, port } => {
-            #[cfg(feature = "vault")]
-            if ctx.is_primary {
-                crate::vault::on_egress_allowed(&req_id, &host, port);
-            } else {
-                debug!(%req_id, "rc:vault.egress.allowed on a secondary org's connection — dropped");
-            }
-            #[cfg(not(feature = "vault"))]
-            {
-                let _ = (host, port);
-                debug!(%req_id, "rc:vault.egress.allowed ignored — this build asks for none");
-            }
-        }
         // FR-52 P3c — an outsider's login, relayed by the server. Answered in
         // a task, not inline: the live config read waits on the config lock,
         // which `rc password set` holds across an Argon2 derivation, and the
@@ -6719,150 +6309,6 @@ async fn handle_server_msg(
                         .await;
                 let _ = tx.send(reply).await;
             });
-        }
-
-        // FR-90 P4-3b-1 — the server asks this device to scan the roots its
-        // owner lists. Run off this loop, on the primary's scanner alone,
-        // and always answered: the scan's record waits on it.
-        ServerMsg::KnowhowScan { scan_id } => {
-            #[cfg(all(hive_host, unix))]
-            crate::hive::knowhow::handle_scan(
-                ctx.knowhow.as_ref(),
-                scan_id,
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // A build that does not scan never advertises `knowhow-scan`, so
-            // no server asks it; one that asks anyway is told, not left to
-            // expire.
-            #[cfg(not(all(hive_host, unix)))]
-            {
-                let tx = outbound_tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(ClientMsg::KnowhowScanned {
-                            scan_id,
-                            outcome: roomler_ai_remote_control::knowhow::ScanOutcome::Failed,
-                            detail: Some("this build does not scan".into()),
-                            truncated: false,
-                            findings: Vec::new(),
-                        })
-                        .await;
-                });
-            }
-        }
-
-        // FR-90 P4-5-1b — the server asks this device to probe one place the
-        // map says: within what its owner lists, on the primary's prober
-        // alone, run off this loop and always answered, since the probe's
-        // record waits on it.
-        ServerMsg::KnowhowProbe {
-            probe_id,
-            kind,
-            host,
-            port,
-            sni,
-        } => {
-            #[cfg(hive_host)]
-            crate::hive::knowhow_probe::handle(
-                ctx.prober.as_ref(),
-                crate::hive::knowhow_probe::Asked {
-                    id: probe_id,
-                    kind,
-                    host,
-                    port,
-                    sni,
-                },
-                ctx.is_primary,
-                outbound_tx.clone(),
-            );
-            // A build that does not probe never advertises `knowhow-probe`,
-            // so no server asks it; one that asks anyway is told.
-            #[cfg(not(hive_host))]
-            {
-                let _ = (kind, host, port, sni);
-                let tx = outbound_tx.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(ClientMsg::KnowhowProbed {
-                            probe_id,
-                            outcome: roomler_ai_remote_control::knowhow::ProbeOutcome::Failed,
-                            rtt_ms: None,
-                            address: None,
-                            tls: None,
-                            detail: Some("this build does not probe".into()),
-                        })
-                        .await;
-                });
-            }
-        }
-
-        // FR-90 P4-4-1b — the map is there for this device's sessions, and
-        // the answers to their questions: taken on the primary's connection
-        // alone, the one the questions go out on. A build that runs no
-        // session never advertises `knowhow-tools`, so it is sent none.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowServed { tools } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_served(&tools);
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowFound {
-            req_id,
-            entities,
-            truncated,
-        } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_found(&req_id, entities, truncated);
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowCard { req_id, card } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_card(&req_id, card);
-            }
-        }
-        // P4-4-2b — a proposal, written.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowProposed {
-            req_id,
-            what,
-            id,
-            left,
-        } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_proposed(&req_id, what, id, left);
-            }
-        }
-        // P4-5-2b — a verify's two answers: its probe, asked, and what the
-        // probe measured. The probe itself arrives as `KnowhowProbe`, before
-        // or after the first, and runs as any probe does.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowVerifying { req_id, probe_id } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_verifying(&req_id, probe_id.to_hex());
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowVerified { probe_id, probe } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_verified(&probe_id.to_hex(), probe);
-            }
-        }
-        // P4-6-1b — what reaching an entity takes, for a session's
-        // `roomler_connect`.
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowAccess { req_id, access } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_access(&req_id, access);
-            }
-        }
-        #[cfg(hive_host)]
-        ServerMsg::KnowhowRefused { req_id, reason } => {
-            if ctx.is_primary {
-                crate::hive::knowhow_tools::on_refused(&req_id, reason);
-            }
         }
 
         // Remaining tunnel-flow `ServerMsg` variants
@@ -6937,6 +6383,16 @@ fn server_msg_tag(text: &str) -> Option<&str> {
         t: &'a str,
     }
     serde_json::from_str::<Tag<'_>>(text).ok().map(|tag| tag.t)
+}
+
+/// The `t` of a text frame that did not decode as a [`ServerMsg`]: the
+/// decode-failure arm WARNs for an `rc:` tag (a frame of ours this build
+/// cannot read) and logs anything else at debug. Owned, unlike
+/// [`server_msg_tag`], so an escaped tag still reads.
+fn undecodable_frame_tag(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("t")?.as_str().map(str::to_string))
 }
 
 /// T2.10d: tear down every tunnel peer on WS disconnect. Cheap
@@ -7185,6 +6641,9 @@ fn session_stats_msg(
         // FR-132 P1 — absent until the viewer said it counts decode errors,
         // so a zero on the wire is always a measured one.
         decode_errors: t.decode_errors,
+        // FR-132 P1d — absent until the pump's first heartbeat, and from a
+        // pump with no input form to name.
+        video: t.video.clone(),
     }
 }
 
@@ -7364,7 +6823,10 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
     // resulting AgentCaps populates the rc:agent.hello payload, which
     // the server persists into the agents collection and surfaces in
     // the admin UI (2A.2).
-    let mut caps = crate::encode::caps::detect();
+    // #3439 — never `detect()` here: before the first answer it would block this
+    // loop on the probe. The interim answer goes out instead, and the heartbeat
+    // replaces it the moment the probe answers.
+    let mut caps = crate::encode::caps::answer_now();
     // FR-67 P7 — whether this enrollment acts on a pushed `rc:agent.update`
     // (`self`), ignores it (`primary_org`, a secondary enrollment) or drops it
     // (`off`, auto-update off), so the server refuses the push, and says why,
@@ -7471,21 +6933,6 @@ fn privacy_words_in(rpc: &[String]) -> Vec<String> {
         .filter(|w| *w == RpcCap::PrivacyMode.wire() || *w == RpcCap::PrivacyAvailable.wire())
         .cloned()
         .collect()
-}
-
-/// FR-90 P2c-3 — take the replica words out of a secondary org's caps: a
-/// device holds copies for its primary organization only, so another org's
-/// placement must never see it offer them. Equality, never a prefix: `hive`
-/// is a prefix of each, and stays. P2d: nor does it carry another org's
-/// streams (`hive-stream`). P2i-1: nor does it answer a search over them
-/// (`hive-search`).
-fn strip_replica_verbs(rpc: &mut Vec<String>) {
-    rpc.retain(|v| {
-        v != RpcCap::HiveReplica.wire()
-            && v != RpcCap::HiveArchive.wire()
-            && v != RpcCap::HiveStream.wire()
-            && v != RpcCap::HiveSearch.wire()
-    });
 }
 
 /// FR-85 P3b — `AgentCaps.record` as it stands NOW: the owner's live gate
@@ -7627,6 +7074,40 @@ mod tests {
         );
     }
 
+    /// #3468, from review — a re-offer's peer carries the recording only with
+    /// RECORD in its grant AND a record context. A second offer, the only way
+    /// a re-offer comes, finds neither stashed (the first one took them), so
+    /// the old channel's end stays the recording's end. Red when the grant
+    /// alone, or nothing at all, counts.
+    #[test]
+    fn only_a_reoffer_with_record_and_its_context_carries_the_recording() {
+        use roomler_ai_remote_control::permissions::Permissions;
+        let meta = |record: bool| -> SessionMeta {
+            (
+                "Controller".to_string(),
+                None,
+                None,
+                record.then_some(RecordMeta {
+                    controller_user_id: bson::oid::ObjectId::new(),
+                    prompt_window: None,
+                }),
+                crate::rc_overlay::RcOverlay::resolve(false),
+                None,
+                None,
+                None,
+            )
+        };
+        let record = Permissions::default() | Permissions::RECORD;
+        assert!(!reoffer_carries_record(None, None), "a second offer");
+        assert!(!reoffer_carries_record(
+            Some(&Permissions::default()),
+            Some(&meta(true))
+        ));
+        assert!(!reoffer_carries_record(Some(&record), Some(&meta(false))));
+        assert!(!reoffer_carries_record(Some(&record), None));
+        assert!(reoffer_carries_record(Some(&record), Some(&meta(true))));
+    }
+
     /// #2551 — a `ws.text` stage is refined to the message's wire tag, read
     /// straight from the JSON. Anything without a plain `t` gives `None`, and
     /// the arm then names `?` rather than failing.
@@ -7649,6 +7130,24 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert_eq!(server_msg_tag(&json), Some("rc:goodbye"));
+    }
+
+    /// FR-137 compatibility test 3 — a frame in one of FR-90's retired
+    /// families (an older server's `rc:hive.start`, say) no longer decodes as
+    /// a `ServerMsg`. The decode-failure arm reads its tag, which starts
+    /// `rc:`, so the frame is named in a WARN and dropped; that arm only logs,
+    /// so the socket stays up.
+    #[test]
+    fn a_retired_family_frame_fails_to_decode_and_is_named_by_its_tag() {
+        for text in [
+            r#"{"t":"rc:hive.start","session_id":"s","prompt":"x"}"#,
+            r#"{"t":"rc:vault.leased","req_id":"r"}"#,
+            r#"{"t":"rc:knowhow.scan","scan_id":"k"}"#,
+        ] {
+            assert!(serde_json::from_str::<ServerMsg>(text).is_err(), "{text}");
+            let tag = undecodable_frame_tag(text).expect("a `t`");
+            assert!(tag.starts_with("rc:"), "{tag}: the WARN arm, not debug");
+        }
     }
 
     /// #2221 — a dropped session that lived restarts the reconnect ladder. A
@@ -7697,6 +7196,23 @@ mod tests {
             mixed_dial_seconds: 0,
             carrier: Some(crate::session_carrier::SessionCarrier::OverlayTurn),
             decode_errors: Some(2),
+            video: Some(roomler_ai_remote_control::models::SessionVideo {
+                encoder: "h264_qsv".into(),
+                capture: "system-context".into(),
+                input_path: "cpu".into(),
+                input_reason: Some("denied".into()),
+                // FR-135 R0 — and the summary rides the same reading.
+                chroma: Some("yuv420".into()),
+                moving_s: Some(12),
+                sparse_s: Some(40),
+                frames_encoded: Some(700),
+                frames_keepalive: Some(40),
+                followers: Some(1),
+                first_frame_ms: Some(480),
+                // FR-135 R0 — and the viewer's counts.
+                frames_painted: Some(690),
+                freezes: Some(1),
+            }),
         };
         match session_stats_msg(sid, &t, Default::default()) {
             ClientMsg::SessionStats {
@@ -7708,10 +7224,13 @@ mod tests {
                 input_events,
                 carrier,
                 decode_errors,
+                video,
                 ..
             } => {
                 // FR-132 P1 — the viewer's decode errors ride it too.
                 assert_eq!(decode_errors, Some(2));
+                // FR-132 P1d — and what the video ran on.
+                assert_eq!(video, t.video);
                 assert_eq!(session_id, sid.to_hex());
                 assert_eq!(bytes_sent, 1_234);
                 assert_eq!(bytes_recv, 5_678);
@@ -7775,6 +7294,7 @@ mod tests {
             // The carrier-ready signal: nothing reads it here, the test calls
             // the helper the arm would call.
             mpsc::channel(1).0,
+            crate::media_paths::MediaPaths::default(),
         )
         .await
         .expect("AgentPeer::new")
@@ -7882,28 +7402,6 @@ mod tests {
             ctx.note_ws_down(),
             "after a hello, the next failure starts a new one"
         );
-    }
-
-    /// FR-90 P2c-3 — a secondary org's caps lose the replica words, by
-    /// equality: `hive` and every other `hive-*` word stays. P2d: and
-    /// `hive-stream`, so it carries no other org's streams. P2i-1: and
-    /// `hive-search`, so it answers no other org's search.
-    #[test]
-    fn a_secondary_connection_never_offers_copies() {
-        let mut rpc: Vec<String> = [
-            "exec",
-            "hive",
-            "hive-replica",
-            "hive-archive",
-            "hive-stream",
-            "hive-search",
-            "hive-view",
-            "hive-adopt",
-        ]
-        .map(String::from)
-        .to_vec();
-        strip_replica_verbs(&mut rpc);
-        assert_eq!(rpc, ["exec", "hive", "hive-view", "hive-adopt"]);
     }
 
     /// FR-27 P10 — the host's Disconnect names itself on the wire. The
@@ -8373,7 +7871,7 @@ mod tests {
 
     #[test]
     fn ws_send_timeout_fits_inside_the_watchdog_budget() {
-        // The signaling pump's stall threshold is 90 s (main.rs
+        // The signaling pump's stall threshold is 90 s (app.rs
         // registration). The worst un-ticked dwell in one select arm was
         // TWO bounded sends back-to-back (heartbeat + first session-stats
         // frame). Since FR-102 P9d a session's stats are `try_send`-queued
@@ -8434,6 +7932,173 @@ mod tests {
         let bare = std::io::Error::other("simple");
         let chain = error_chain(&bare);
         assert_eq!(chain, "simple");
+    }
+
+    /// #3530 — the lab guest's 152 s SIGSTOP. The far end reset the control WS
+    /// meanwhile, and the first arm to run at the thaw hit the reset: a read
+    /// in one round, the heartbeat's send in the other. The keepalive arm last
+    /// ran 160 s before (135 s overdue) and the last frame came 170 s before.
+    /// The session ended while the agent did not run, and the reconnect says
+    /// so, with the cause.
+    #[test]
+    fn a_session_reset_during_a_freeze_names_the_pause() {
+        use tokio_tungstenite::tungstenite::{self, error::ProtocolError};
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        let reset = tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake);
+        let e = session_ended("ws read", anyhow::Error::new(reset), s(170), s(160), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        assert_eq!(
+            e.to_string(),
+            "ws read: WebSocket protocol error: Connection reset without closing handshake: \
+             Connection reset without closing handshake: this agent did not run for ~135 s \
+             before it (frozen or suspended)"
+        );
+        // Wording only: the reconnect still downcasts the error it got.
+        assert!(matches!(
+            e.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake
+            ))
+        ));
+        let pipe = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("ws send");
+        let e = session_ended("heartbeat send", pipe, s(170), s(160), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let line = e.to_string();
+        assert!(line.starts_with("heartbeat send: ws send: "), "{line}");
+        assert!(line.ends_with("did not run for ~135 s before it (frozen or suspended)"));
+    }
+
+    /// #3530 — a lab guest thawed from a 152 s SIGSTOP: a read failed 2.6 ms
+    /// later and logged "connect failed", with no RX-deadline line before it.
+    /// So a frame the far end sent before its close had been read first and
+    /// refreshed `last_rx`, and the keepalive arm then ran, late by most of
+    /// the freeze, without tripping it, and restarted `skew_mono`. The read
+    /// that met the close found no lateness in either. The tick's remembered
+    /// pause names it.
+    #[test]
+    fn a_reset_after_the_thaw_tick_names_the_remembered_pause() {
+        use tokio_tungstenite::tungstenite::{self, error::ProtocolError};
+        let ms = Duration::from_millis;
+        let mut pause = RememberedPause::default();
+        pause.tick(Duration::from_secs(145));
+        let reset = tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake);
+        let e = session_ended("ws read", anyhow::Error::new(reset), ms(1), ms(2), pause);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let line = e.to_string();
+        assert!(
+            line.starts_with("ws read: WebSocket protocol error: "),
+            "{line}"
+        );
+        assert!(line.ends_with("did not run for ~145 s before it (frozen or suspended)"));
+        assert!(e.downcast_ref::<tungstenite::Error>().is_some());
+        // The heartbeat's send, after the same tick, the same way.
+        let e = session_ended(
+            "heartbeat send",
+            anyhow::anyhow!("ws send"),
+            ms(1),
+            ms(2),
+            pause,
+        );
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        // The larger lateness wins: a smaller pause kept from an earlier tick
+        // does not shorten a freeze the keepalive arm has not run since.
+        let s = Duration::from_secs;
+        let mut earlier = RememberedPause::default();
+        earlier.tick(s(40));
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(170), s(160), earlier);
+        assert!(e.to_string().contains("~135 s"), "{e}");
+    }
+
+    /// The same read with no pause remembered: the loop ran, and the line is
+    /// today's.
+    #[test]
+    fn a_reset_with_no_remembered_pause_keeps_its_error() {
+        let ms = Duration::from_millis;
+        let none = RememberedPause::default();
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), ms(1), ms(2), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        assert_eq!(e.to_string(), "ws read");
+        assert_eq!(error_chain(e.as_ref()), "ws read: reset");
+    }
+
+    /// A tick on time forgets the pause, about 25 s after the thaw's tick,
+    /// and an error after it keeps today's line. Only a tick at the floor or
+    /// later is kept at all, so a loop held by one wedged send keeps none.
+    #[test]
+    fn an_on_time_tick_forgets_the_pause() {
+        let ms = Duration::from_millis;
+        let mut pause = RememberedPause::default();
+        pause.tick(Duration::from_secs(145));
+        assert_eq!(pause.late(), Duration::from_secs(145));
+        pause.tick(ms(3));
+        assert_eq!(pause.late(), Duration::ZERO);
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), ms(1), ms(2), pause);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        assert_eq!(e.to_string(), "ws read");
+        pause.tick(WS_PAUSE_MIN - ms(1));
+        assert_eq!(pause.late(), Duration::ZERO);
+        pause.tick(WS_SEND_TIMEOUT);
+        assert_eq!(pause.late(), Duration::ZERO);
+        pause.tick(WS_PAUSE_MIN);
+        assert_eq!(pause.late(), WS_PAUSE_MIN);
+    }
+
+    /// Each session starts with no pause remembered, so a reset early in a
+    /// new session, after the reconnect, keeps today's line.
+    #[test]
+    fn a_session_starts_with_no_remembered_pause() {
+        let start = RememberedPause::default();
+        assert_eq!(start.late(), Duration::ZERO);
+        let s = Duration::from_secs;
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(1), s(1), start);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+    }
+
+    /// A send or read that fails while the loop runs keeps today's error, so
+    /// the reconnect still logs "connect failed" with its cause.
+    #[test]
+    fn a_session_reset_while_running_keeps_its_error() {
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        // The keepalive ran 20 s ago: no lateness at all.
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(20), s(20), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        assert_eq!(e.to_string(), "ws read");
+        assert_eq!(error_chain(e.as_ref()), "ws read: reset");
+        // A loop that ran but sat on one send until it wedged (a corp VPN took
+        // the route) holds the keepalive back by up to `WS_SEND_TIMEOUT`.
+        let held = WS_KEEPALIVE_EVERY + WS_SEND_TIMEOUT;
+        let e = session_ended(
+            "heartbeat send",
+            anyhow::anyhow!("ws send"),
+            held,
+            held,
+            none,
+        );
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        // A silence that began long before a pause is not the pause's.
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(300), s(100), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+    }
+
+    /// The floor sits where the RX-deadline line's own does, above a wedged
+    /// send, so all three exits name a pause on the same terms.
+    #[test]
+    fn the_pause_floor_matches_the_rx_deadline_line() {
+        assert_eq!(WS_PAUSE_MIN, WS_RX_DEADLINE - WS_QUIET_WHILE_RUNNING);
+        assert!(WS_PAUSE_MIN > WS_SEND_TIMEOUT);
+        assert!(WS_PAUSE_MIN >= tunnel_core::frozen::LATE_MIN);
+        // Right at the floor it names the pause; just under, it does not.
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        let at = WS_KEEPALIVE_EVERY + WS_PAUSE_MIN;
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(60), at, none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let under = at - Duration::from_millis(1);
+        let e = session_ended("ws read", anyhow::anyhow!("reset"), s(60), under, none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
     }
 
     // #2815 — the exec prompt said "On behalf of primary": its own copy of

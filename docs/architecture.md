@@ -196,8 +196,8 @@ The rules that keep it a monolith rather than a pile of crates:
   namespaces, index specs, jobs, lifecycle hooks, capabilities — and the host composes the
   concrete types under `#[cfg(feature)]`. No dynamic loading, no runtime registry.
 - **A DAG, not peers.** Any module may call core; `conference → chat`, `remote → fleet`,
-  `network → fleet`, `hive → fleet`, `hive → chat`. Core never calls a module: the inverse flows (tenant
-  archive, agent removal, member removal) are hooks that core invokes in a fixed order.
+  `network → fleet`. Core never calls a module: the inverse flows (tenant archive, agent removal)
+  are hooks that core invokes in a fixed order.
 - **Core membership.** Something lives in core only if at least two modules need it **and** it is
   identity, tenancy or infrastructure. Everything else belongs to a module.
 - **Profiles, not switches.** Cargo features select the pillars a build links (`full`, `collab`,
@@ -268,7 +268,7 @@ usage, relay stats) renders with d3. i18n is wired but ships English only today.
 
 ## Deployment shape
 
-- **One Docker image** — `rust:1.88-bookworm` builds the API, `oven/bun` builds the
+- **One Docker image** — `rust:1.95-bookworm` builds the API, `oven/bun` builds the
   SPA, `debian:trixie-slim` runs nginx + the binary ([deployment.md](deployment.md)).
 - **Dev stack** — `docker compose up -d`: MongoDB (:27019), Redis, MinIO, coturn.
 - **Native artifacts** — MSI / `.deb` / `.pkg` / tarballs built by tag-triggered

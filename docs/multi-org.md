@@ -257,30 +257,30 @@ sequenceDiagram
 
 | `reason` | the server sends it when | `roomler status` says |
 |---|---|---|
-| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:436-439`](../crates/modules/network/src/overlay.rs#L436-L439)) | retrying will not help; an operator has to act |
+| `address_space_exhausted` | every ordinal of the block is leased and the pool is empty: `allocate_host` answers `Validation` ([`overlay.rs:526-529`](../crates/modules/network/src/overlay.rs#L526-L529)) | retrying will not help; an operator has to act |
 | `network_unavailable` | the tenant's network row cannot be read or created, or an allocated ordinal falls outside the network's address space | retrying will not help; an operator has to act |
 | `store_unavailable` | any other allocation failure: a store fault | transient — a retry may succeed |
 | `unknown` | a reason this build does not know, from a newer server | retrying will not help; an operator has to act |
 
-Only `store_unavailable` is retryable ([`signaling.rs:503`](../crates/remote_control/src/signaling.rs#L503)).
+Only `store_unavailable` is retryable ([`signaling.rs:491`](../crates/remote_control/src/signaling.rs#L491)).
 An unknown reason takes the conservative arm. The device does not retry on its own in
 either case: its signalling loop reconnects on its own ladder, and a retry at the
 refusal would race it.
 
 - **The wire.** `rc:overlay.join_refused { reason, detail }`
-  ([`signaling.rs:4374-4380`](../crates/remote_control/src/signaling.rs#L4374-L4380)) goes only to a
+  ([`signaling.rs:3344-3350`](../crates/remote_control/src/signaling.rs#L3344-L3350)) goes only to a
   node whose join set `supports_join_refusal`
-  ([`signaling.rs:2524`](../crates/remote_control/src/signaling.rs#L2524)). An older node keeps the
+  ([`signaling.rs:1644`](../crates/remote_control/src/signaling.rs#L1644)). An older node keeps the
   old silence, and the server's ERROR line, `alert = "overlay_join_refused"`
-  ([`overlay.rs:278-295`](../crates/modules/network/src/overlay.rs#L278-L295)), is then the only
+  ([`overlay.rs:281-298`](../crates/modules/network/src/overlay.rs#L281-L298)), is then the only
   trace. The frame is a new top-level variant, which an old agent drops as an unknown
   frame, so it needed no forward-compatible pre-roll.
 - **The device.** The daemon logs `overlay: the server REFUSED our join` at ERROR and
   keeps the refusal in a process-global slot
-  ([`overlay.rs:1060-1070`](../agents/roomlerd/src/overlay.rs#L1060-L1070)). No overlay runtime
+  ([`overlay.rs:1019-1029`](../agents/roomlerd/src/overlay.rs#L1019-L1029)). No overlay runtime
   exists to hold it, because the runtime is exactly what never came up.
 - **`roomler status`** prints it
-  ([`localclient.rs:2596-2618`](../agents/roomler-cli/src/localclient.rs#L2596-L2618)):
+  ([`localclient.rs:2624-2646`](../agents/roomler-cli/src/localclient.rs#L2624-L2646)):
 
   ```
     overlay ip  —
@@ -293,7 +293,7 @@ refusal would race it.
   The line stays for the daemon's lifetime, even after a later join succeeds: "refused
   twenty minutes ago" is the only trace left once the log rotates, and `server` already
   says what is true now. A daemon that predates the field sends no `join_refusal`
-  ([`lib.rs:284`](../crates/localapi/src/lib.rs#L284)), and then nothing is printed, never a
+  ([`lib.rs:280`](../crates/localapi/src/lib.rs#L280)), and then nothing is printed, never a
   false "clear". `roomler status --json` carries it as
   `join_refusal { reason, detail, at_unix, retryable }`.
 
@@ -703,6 +703,12 @@ dropping of delta frames would break reference chains, because the 13-byte DC
 header carries no sequence number. A joiner buffers until the next IDR; a
 viewer that sustainedly needs far less than the shared rate spills to its own
 encoder, bounded at 2 pipelines total. The viewer badge shows `· shared ×N`.
+An owner whose capture has no picture tells every follower why, and every later
+joiner as it joins (FR-80's `rc:media-unavailable`, #3260,
+[`remote-control.md` §5.1a](remote-control.md#51a-when-capture-cannot-open-the-session-says-why-fr-80)).
+An owner whose capture waits on its host tells them that too, a later joiner
+with the time the wait has left, until its next frame (FR-93's
+`rc:media-waiting`, #3423).
 
 ## 7. P6 — InputArbiter (shipped rc.305/306, #329 + #334)
 
@@ -897,7 +903,7 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
   netstack`. FR-49 had made netstack the default for `enroll --overlay`, which
   made this the common case, and #2493 measured it on 0.4.143: no listener on
   the port, no peers, no log line. Now `for_org` turns a netstack secondary on
-  when it has its own port and key (`crates/agent-core/src/config.rs:2232-2234`),
+  when it has its own port and key (`crates/agent-core/src/config.rs:2089-2091`),
   and `derived_netstack` sends it to its stack rather than to the per-org TUN
   that the device-wide `overlay_multi_org` would pick
   (`agents/roomlerd/src/overlay.rs:311`). A port that is unset is **picked**:
@@ -932,10 +938,15 @@ everything it knows.**
 
 1. hidden from the org switcher (`GET /api/tenant`; `?include_archived=true`
    still lists it — this is not erasure);
-2. no new device enrollments;
+2. no new device enrollments — a daemon or a `roomler` tunnel client, into a
+   new row or back into its old one — and no token minted for one (#3042): the
+   three mint routes refuse with the enroll routes' own sentence, so the person
+   hears it where they asked rather than in someone's terminal later;
 3. no new remote-control sessions;
-4. its devices leave its mesh — every enrollment revoked, every overlay
-   node released back to the address pool, its block quarantined;
+4. its devices leave its mesh — every enrollment revoked, tunnel clients
+   included (#3042), every overlay node released back to the address pool, its
+   block quarantined. A join into an archived org is refused whatever its row
+   says, so nothing racing the teardown takes an address on the way out;
 5. everything else — rooms, messages, files, members, roles, audit —
    retained untouched.
 

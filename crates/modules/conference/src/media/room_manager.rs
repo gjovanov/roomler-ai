@@ -1052,6 +1052,14 @@ impl RoomManager {
         self.connection_rooms.get(connection_id).map(|v| *v)
     }
 
+    /// Does `connection_id` hold a participant entry in this room's media, as
+    /// `user_id`? The seat every `media:*` command but the join requires
+    /// (`media_gate::seat`); only a join the gate admitted creates one.
+    pub fn holds_seat(&self, room_id: &ObjectId, connection_id: &str, user_id: &ObjectId) -> bool {
+        self.participant(room_id, connection_id, |p| p.user_id == *user_id)
+            .unwrap_or(false)
+    }
+
     /// Creates a DirectTransport consumer that taps into a producer's RTP stream.
     ///
     /// Returns an mpsc receiver that yields raw RTP packets. The DirectTransport

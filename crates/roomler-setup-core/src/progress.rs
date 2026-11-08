@@ -79,10 +79,14 @@ pub enum ProgressEvent {
     /// into the replay log.
     #[serde(rename_all = "camelCase")]
     DownloadProgress { received_bytes: u64 },
-    /// Download complete; SHA256 verified (or `digest=None` and
-    /// verification was skipped with `sha256_match=true`).
+    /// Download complete, and compared with the digest the release
+    /// published. Not sent when the release published none.
     #[serde(rename_all = "camelCase")]
     DownloadVerified { sha256_match: bool },
+    /// #3246 — the download carries a valid signature from Roomler's
+    /// publisher, and `signer` is the name on it.
+    #[serde(rename_all = "camelCase")]
+    PublisherVerified { signer: String },
 
     /// msiexec launched (daemon roles, Windows). `pid` is the OS PID
     /// for operator diagnostics. SPA relabels Cancel to "Force-kill
@@ -138,6 +142,15 @@ pub enum ProgressEvent {
     /// command. `reason` is for the operator and never carries the token.
     #[serde(rename_all = "camelCase")]
     AnchorSkipped { reason: String },
+
+    /// #3174 — a limited wizard on a machine-wide install leaves the companion
+    /// to the service, and the EXE is not there yet.
+    CompanionWaiting,
+    /// #3174 — `roomler-desktop.exe` is there after the step, whoever placed it.
+    CompanionPresent,
+    /// #3174 — it is not. Never fatal: `message` says what happens next.
+    #[serde(rename_all = "camelCase")]
+    CompanionAbsent { message: String },
 
     /// #3116 — a Windows reinstall: the daemon the installer restarted loaded
     /// the config from before it, so it is asked to restart onto the one this

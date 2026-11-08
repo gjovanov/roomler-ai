@@ -199,6 +199,7 @@ installing it, and is also bound to the release it claims to be: the Windows
 | Artifact | Workflow | Mechanism |
 |---|---|---|
 | `roomlerd.exe`, `roomler.exe` **inside** both MSIs | release-agent | sign-windows, *before* `cargo wix` harvests |
+| `roomler_msi_ca.dll` in the perMachine MSI's Binary table (#3375: msiexec extracts and loads it on every upgrade) | release-agent | sign-windows with the payload; the lane then reads it out of the built MSI and asserts the payload's signer and its imports (`.github/workflows/release-agent.yml:2202`) |
 | perUser + perMachine `.msi` | release-agent | sign-windows, before the size-budget/sha256 steps |
 | `roomler-desktop-<v>….exe` | release-agent | sign-windows |
 | `roomler-agent-<v>-aarch64-apple-darwin.pkg` | release-agent | inline codesign → productbuild → notarytool → staple → **verify** |
@@ -302,7 +303,7 @@ The PowerShell verifier also does an administrative extract of each MSI
 (`msiexec /a`) and Authenticode-checks the **payload**, and asserts
 `wintun.dll` still says WireGuard LLC. On the wizard's own EXE it also reads the file's bytes
 with `scripts/signing/pe-dependent-load-flags.ps1`: `DependentLoadFlags` must be `0x800`, and
-`secur32.dll` must not be in the import table, because it is delay-loaded. That EXE sits in the
+`secur32.dll`, `wintrust.dll` and `wtsapi32.dll` must not be in the import table, because they are delay-loaded. That EXE sits in the
 person's Downloads and goes on to run elevated, so nothing it loads may come from there (FR-129
 C). CI's Windows job runs the same script on the debug EXE, and `release-setup.yml` on the EXE it
 signs. Manual user-level checks:
@@ -362,7 +363,7 @@ installed. Measured on 0.4.143 before the fix: a feed offering `agent-v0.4.999`
 with the signed 0.4.142 `.deb` passed the `.asc` gate and was staged for
 install (FR-97 §8). Each format now states its own version inside the signed
 bytes, and the updater refuses when it disagrees with the tag
-(`updater.rs:1691`):
+(`updater.rs:1519`):
 
 | Format | Where the artifact states its version | Read by | Anchor |
 |---|---|---|---|
@@ -458,6 +459,15 @@ unsigned or mis-signed Windows artifact does not error, it just stops updating
 the fleet. The `require` mode in `.github/actions/sign-windows` is what
 prevents that reaching a release tag — do not weaken it.
 
+**The setup wizard makes the publisher check too, and the version check not**
+(#3246). `code_signature::verify_open_publisher` reads through a handle the
+wizard holds, on the MSI, the desktop companion, and every file but plain text
+in the Windows tunnel zip; [installation.md](installation.md) has what happens on
+each path and why the check that counts runs elevated. The wizard binds no
+version, so a hostile server
+can offer it an older signed MSI under its own tag: the signature says whose, not
+which.
+
 ## 8. Enterprise pilot path (before/without the public cert)
 
 `50-selfsigned-dev-cert.ps1` + `51-trust-dev-cert.ps1` produce a self-signed
@@ -503,7 +513,10 @@ copyright grant to the company is a legal decision, not a packaging one.
 directives would propagate a *second* version resource into the Tauri EXEs
 that depend on these crates). `FILEVERSION` uses the same `MAJOR.MINOR.RC`
 remap as the MSI ProductVersion (`0.3.0-rc.238` → `0.3.238.0`), so file
-version and installer version always agree. The Tauri configs inherit the
+version and installer version always agree. `roomler_msi_ca.dll` (#3375) is a
+`cdylib` with no binary, so its `build.rs` uses `compile_for_everything`
+(`rustc-link-arg`), which reaches the crate's own artifacts only; nothing
+depends on it. The Tauri configs inherit the
 workspace version (the hardcoded `rc.30`/`rc.197` pins are gone).
 
 ## 11. Renewal / rotation
