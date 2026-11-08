@@ -100,6 +100,11 @@ mod billing_tests;
 mod cluster_tests;
 #[cfg(test)]
 mod cors_tests;
+/// A device's crash reports and uploaded logs are read under `MANAGE_AGENTS`
+/// (audit views: a removed device still reads), and what a device uploads is
+/// scrubbed again at ingest, every string field included.
+#[cfg(test)]
+mod device_diagnostics_tests;
 #[cfg(test)]
 mod device_list_tests;
 #[cfg(test)]

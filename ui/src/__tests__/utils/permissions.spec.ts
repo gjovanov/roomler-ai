@@ -21,6 +21,7 @@ import {
   canBarExternalPerson,
   canLetBackExternalPerson,
   canQueryAnalytics,
+  canReadDeviceDiagnostics,
   canSeeFleetNav,
   describePermissions,
   hasPermission,
@@ -260,6 +261,28 @@ describe('canQueryAnalytics (org analytics gating — stats PR-4)', () => {
   it('plain member denied', () => {
     expect(canQueryAnalytics(DEFAULT_MEMBER, false)).toBe(false)
     expect(canQueryAnalytics(0, false)).toBe(false)
+  })
+})
+
+describe('canReadDeviceDiagnostics (crash reports + uploaded logs)', () => {
+  const MANAGE_AGENTS = 1 << 24
+  const REMOTE_CONTROL = 1 << 25
+
+  it('fails OPEN while the mask is unknown: the server decides, the dialog explains', () => {
+    expect(canReadDeviceDiagnostics(null, false)).toBe(true)
+  })
+
+  it('MANAGE_AGENTS, ADMINISTRATOR or the owner may read them', () => {
+    expect(canReadDeviceDiagnostics(MANAGE_AGENTS, false)).toBe(true)
+    expect(canReadDeviceDiagnostics(ADMINISTRATOR, false)).toBe(true)
+    expect(canReadDeviceDiagnostics(DEFAULT_ADMIN, false)).toBe(true)
+    expect(canReadDeviceDiagnostics(0, true)).toBe(true)
+  })
+
+  it('a plain member may not, nor may remote control alone', () => {
+    expect(canReadDeviceDiagnostics(DEFAULT_MEMBER, false)).toBe(false)
+    expect(canReadDeviceDiagnostics(maskUnion(DEFAULT_MEMBER, REMOTE_CONTROL), false)).toBe(false)
+    expect(canReadDeviceDiagnostics(0, false)).toBe(false)
   })
 })
 

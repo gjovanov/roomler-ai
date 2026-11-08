@@ -158,7 +158,7 @@ config push, which drive machine-wide state and are therefore primary-only
 ⚠️ **Immediate and disruptive, by design.** A key that leaked must not wait for the
 holder's session to end, so the rotation ends every remote-control, overlay-SSH and
 tunnel session the device carries on that org and reconnects. The confirm dialog says
-so (`ui/src/components/admin/AgentsSection.vue:1313-1314`). A corp-VPN host may come
+so (`ui/src/components/admin/AgentsSection.vue:1316-1317`). A corp-VPN host may come
 back relay-locked after the cycle (the renumber caveat in `multi-org.md`).
 
 `overlay_wg_secret_key` stays **unwritable over LocalAPI** (`config_surface.rs:13-14`,
@@ -192,7 +192,7 @@ duplicate-delivery race below. Any report about a *different* order, and any
 
 Resolved **once, server-side**, from the order, the claim and the proof
 (`crates/modules/fleet/src/agent.rs:612-696`); the grid only names the states
-(`AgentsSection.vue:2091-2192`). The device row also carries `overlay_public_key` and
+(`AgentsSection.vue:2102-2203`). The device row also carries `overlay_public_key` and
 `overlay_key_epoch` straight from the proof (`agent.rs:1767-1775`), so an operator
 can *see* the key change instead of trusting a chip.
 
@@ -385,7 +385,7 @@ The server cannot see the device switch, so a switched-off device is still order
 
 ## Operating it
 
-1. Device grid → row menu → **Rotate overlay key…** → confirm (`AgentsSection.vue:177`).
+1. Device grid → row menu → **Rotate overlay key…** → confirm (`AgentsSection.vue:178`).
    Online: *"ordered — it mints a new key, re-joins the mesh and reports back within
    seconds."* Offline: *"queued and runs on its next connect."*
 2. Watch the chip and the **overlay public key** column: the key and `e⟨epoch⟩` change
@@ -445,7 +445,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6093-6235`, `:3471-3513`, `:3515-3536`, `:1399-1423` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1075-1080`, `:1812-1817`, `:1942-1944`; `config_surface.rs:1258-1265` |
-| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:177`, `:1287-1314`, `:2089-2190`; `ui/src/stores/agents.ts:1162-1176` |
+| UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1179-1193` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3203`, `:3221`, `:3943`, `:3191`, `:10414`, `:10676`; the node and network fields `:6889`, `:7131` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7312` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:790`, `:811`, `:860` |

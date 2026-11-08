@@ -248,7 +248,7 @@ sequenceDiagram
   session connects on a device that offers the controls
   ([`RemoteControl.vue:3838`](../ui/src/views/remote/RemoteControl.vue#L3838) `orgTouchList`). Any member's
   viewer fetches them
-  ([`agents.ts:1507`](../ui/src/stores/agents.ts#L1507) `fetchOrgTouchPresets`). An older server without
+  ([`agents.ts:1538`](../ui/src/stores/agents.ts#L1538) `fetchOrgTouchPresets`). An older server without
   the route, or any error, means none, and the built-ins are offered as before.
 - **Under their own ids.** An org preset is `org:<its server id>`
   ([`touchControls.ts:230`](../ui/src/composables/touchControls.ts#L230) `ORG_PRESET_PREFIX`), so it can
@@ -289,7 +289,7 @@ layout:
 |---|---|---|
 | **Built-in** | nobody: **Copy** makes it a draft of the member's own | the build |
 | **This browser** | the member, with no permission (decision 6, settled as recommended on 2026-10-18) | `localStorage['roomler-rc-touch-presets:<user id>']`, per user ([`touchPresetEdit.ts:251`](../ui/src/composables/touchPresetEdit.ts#L251) `readMyPresets`) |
-| **Your organization** | an org admin (`MANAGE_TENANT`); anyone else sees it read-only and may copy it ([`TouchPresetEditor.vue:399`](../ui/src/components/remote/TouchPresetEditor.vue#L399) `readOnly`) | the server, P4a's routes ([`agents.ts:1526`](../ui/src/stores/agents.ts#L1526) `saveOrgTouchPreset`) |
+| **Your organization** | an org admin (`MANAGE_TENANT`); anyone else sees it read-only and may copy it ([`TouchPresetEditor.vue:399`](../ui/src/components/remote/TouchPresetEditor.vue#L399) `readOnly`) | the server, P4a's routes ([`agents.ts:1557`](../ui/src/stores/agents.ts#L1557) `saveOrgTouchPreset`) |
 
 - **A draft is checked against the server's own rules before it is saved anywhere**
   ([`touchPresetEdit.ts:104`](../ui/src/composables/touchPresetEdit.ts#L104) `validatePreset`), with the

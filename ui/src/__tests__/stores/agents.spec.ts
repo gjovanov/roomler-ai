@@ -228,23 +228,64 @@ describe('useAgentStore', () => {
         },
       ],
     })
+    asOwner()
     const s = useAgentStore()
     const out = await s.fetchCrashes(TENANT_ID, 'a1')
     expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/crash`)
     expect(out).toHaveLength(1)
-    expect(out[0]!.reason).toBe('panic')
-    expect(out[0]!.summary).toBe('index out of bounds')
+    expect(out![0]!.reason).toBe('panic')
+    expect(out![0]!.summary).toBe('index out of bounds')
   })
 
   it('fetchCrashes propagates errors (callers handle locally, not in store)', async () => {
-    mockApi.get.mockRejectedValueOnce(new Error('403 forbidden'))
+    asOwner()
+    mockApi.get.mockRejectedValueOnce(new Error('500 internal'))
     const s = useAgentStore()
-    await expect(s.fetchCrashes(TENANT_ID, 'a1')).rejects.toThrow('403 forbidden')
+    await expect(s.fetchCrashes(TENANT_ID, 'a1')).rejects.toThrow('500 internal')
     // Store-level state (agents.error/loading) is NOT mutated by
     // fetchCrashes; the modal holds its own local loading + error
     // state.
     expect(s.error).toBeNull()
     expect(s.loading).toBe(false)
+  })
+
+  // ─── Device diagnostics are MANAGE_AGENTS ───────────────────────
+
+  /** A member whose mask is known and lacks MANAGE_AGENTS. */
+  function asPlainMember() {
+    const t = useTenantStore()
+    t.isOwner = false
+    t.myPermissions = 1 << 0 // VIEW_CHANNELS
+    t.myPermissionsTenantId = TENANT_ID
+  }
+
+  it('sends no diagnostics request for a caller the mask says may not read them', async () => {
+    asPlainMember()
+    const s = useAgentStore()
+    expect(await s.fetchCrashes(TENANT_ID, 'a1')).toBeNull()
+    expect(await s.fetchLogs(TENANT_ID, 'a1', 100)).toBeNull()
+    expect(mockApi.get).not.toHaveBeenCalled()
+  })
+
+  it("reads the server's 403 as an answer (null), never as a failure", async () => {
+    asMemberWithoutManageTenant() // holds MANAGE_AGENTS; the server says no anyway
+    const refusal = Object.assign(new Error('Missing MANAGE_AGENTS permission'), { status: 403 })
+    mockApi.get.mockRejectedValueOnce(refusal).mockRejectedValueOnce(refusal)
+    const s = useAgentStore()
+    expect(await s.fetchCrashes(TENANT_ID, 'a1')).toBeNull()
+    expect(await s.fetchLogs(TENANT_ID, 'a1', 100)).toBeNull()
+    expect(s.error).toBeNull()
+  })
+
+  it('fetchLogs GETs the batches for a holder, and a 404 still throws', async () => {
+    asMemberWithoutManageTenant()
+    mockApi.get.mockResolvedValueOnce({ batches: [] })
+    const s = useAgentStore()
+    expect(await s.fetchLogs(TENANT_ID, 'a1', 100)).toEqual([])
+    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/agent/a1/logs?limit=100`)
+    // Another org's device, or one that names nothing: a 404, not a refusal.
+    mockApi.get.mockRejectedValueOnce(Object.assign(new Error('Resource not found'), { status: 404 }))
+    await expect(s.fetchLogs(TENANT_ID, 'b2', 100)).rejects.toThrow('Resource not found')
   })
 
   // ── Fleet RPC ──────────────────────────────────────────────────────

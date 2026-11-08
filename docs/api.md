@@ -155,7 +155,7 @@ capability URLs, webhook signatures).
 | POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
 | GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
-| POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler) |
+| POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler). Every string of the report is scrubbed again on the way in, as a log line's is ([security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub)) |
 | POST | `/api/consent/{token}/approve` · `/deny` | Owner-consent capability URLs (token **is** the auth, single-use) |
 | POST | `/api/tunnel-client/enroll` | Exchange tunnel enrollment token → client credential. 403 for an **archived** org, into a new row or back into an old one, in the daemon route's words |
 | GET | `/api/tunnel-client/agents` | Reachable agents (TunnelClient bearer) |
@@ -167,7 +167,7 @@ capability URLs, webhook signatures).
 | POST | `/api/releases/refresh` | CI cache-bust after a release is published (bearer; fans out to all pods) |
 | GET | `/api/turn/credentials` | Ephemeral TURN credentials (user-scoped) |
 | GET | `/api/relay/regions` | Multi-region relay PoP topology (read-only) |
-| POST | `/api/log/browser` | Browser console-log batch ingest (user JWT + explicit `tenant_id`) |
+| POST | `/api/log/browser` | Browser console-log batch ingest (user JWT + explicit `tenant_id`), scrubbed on the way in as the device's batches are |
 | GET | `/api/cluster/status` | Per-pod identity, counters, gauges. Platform admins only (`require_platform_admin`, the 404 every `/api/admin/*` route gives): it names every live meeting room on the pod and the pods' ids |
 | POST | `/api/stats/pageview` | SPA route-change beacon (authed, paths normalized) |
 | GET | `/health` | Liveness — cheap process-alive 200 |
@@ -369,9 +369,9 @@ Both exports take `{room_id}`: a room of the path org that the caller may read. 
 | POST | `…/agent/enroll-token` | Mint an enrollment token (10 min, single-use). 403 for an **archived** org |
 | POST | `…/agent/update` · `…/agent/{aid}/update` | Operator-forced self-update (fleet / one device), `{pin?, force?}` (+ `agent_ids?` for the fleet). A push that would not be acted on is refused, never sent: FR-2's downgrade guard (`pin_downgrade`, unless `force`), and since FR-67 P7 a device whose caps say it ignores the push (`primary_org`, a secondary enrollment) or drops it (`auto_update_off`). `force` lifts only the first. One device answers **409** with the reason; the fleet route skips the device with a `refused` reason and its `refused_code`, and counts it in `refused` |
 | POST | `…/agent/{aid}/join-org` · GET `…/join-targets` | Add an enrolled device to a second org (multi-org) |
-| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/recording-activity/{aid}`, `…/transfer-activity/{aid}`) still resolve a removed device |
-| GET | `…/agent/{aid}/crash` | Crash reports |
-| POST/GET | `…/agent/{aid}/logs` | Log batch ingest (agent JWT) / admin listing |
+| GET/PUT/DELETE | `…/agent/{aid}` | Device detail / settings / remove (cascades: revoke + mesh release). Removal is final: from then on the device is a **404 on every per-device route** — this GET and PUT, the policies, `desired-config`, `update`, `exec`, `ssh`, `join-org` — and a repeat DELETE is a 404 too, like the listing that no longer shows it. Only the audit views (`…/agent/{aid}/crash`, `…/agent/{aid}/logs`, `…/recording-activity/{aid}`, `…/transfer-activity/{aid}`, `…/privacy-activity/{aid}`) still resolve a removed device |
+| GET | `…/agent/{aid}/crash` | The device's last 50 crash reports, newest first. `MANAGE_AGENTS`, decided before the device is looked up, so a caller without it gets one 403 `forbidden` whatever the id names. For a holder, another org's device or an id that names nothing is a 404, and a removed device still reads (an audit view) — see [security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub) |
+| POST/GET | `…/agent/{aid}/logs` | **POST** — log batch ingest (agent JWT). Every string of every line (`msg`, `target`, each string in `fields`) is scrubbed again on the way in. **GET** `?limit=1..=500` (default 50) — the device's uploaded batches of the last 7 days, newest first, under the same gate as `…/crash` |
 | POST | `…/agent/exec` · `…/agent/{aid}/exec` | Fleet RPC: run a command (fleet sweep / one device) — see [fleet-rpc.md](fleet-rpc.md) |
 | POST | `…/agent/{aid}/exec/{request_id}/cancel` | Cancel a running exec |
 | PUT | `…/agent/{aid}/exec-policy` | Per-device exec gate (a management act, separate from the exec power) |

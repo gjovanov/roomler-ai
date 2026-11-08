@@ -10,11 +10,11 @@
 //! [`AuthAgent`](crate::auth_agent::AuthAgent) extractor — which
 //! verifies the JWT *and* confirms the agent's row is still one we accept,
 //! the same rule `crates/api/src/ws/handler.rs` applies on the WS upgrade —
-//! validates the body shape, and persists via `AgentCrashDao::record`.
+//! validates the body shape, scrubs every string of it again
+//! ([`crate::diagnostics`]), and persists via `AgentCrashDao::record`.
 //!
-//! Admin UI fetches via the protected GET endpoint which goes
-//! through the standard `AuthUser` middleware + tenant-membership
-//! check.
+//! Admin UI fetches via the protected GET endpoint, under `MANAGE_AGENTS`
+//! in the path tenant ([`crate::diagnostics::require_reader`]).
 
 use axum::{
     Json,
@@ -29,7 +29,7 @@ use serde_json::json;
 
 use roomler_core::{ApiError, extractors::auth::AuthUser};
 
-use crate::{FleetState, auth_agent::AuthAgent};
+use crate::{FleetState, auth_agent::AuthAgent, diagnostics};
 
 /// Maximum `log_tail` byte length accepted by the ingest endpoint.
 /// Matches `roomlerd::crash_recorder::MAX_PAYLOAD_BYTES` so a
@@ -61,9 +61,10 @@ const MAX_FUTURE_SECS: i64 = 60 * 60; // 1h tolerance for clock skew
 pub async fn ingest(
     State(state): State<FleetState>,
     agent: AuthAgent,
-    Json(payload): Json<AgentCrashPayload>,
+    Json(mut payload): Json<AgentCrashPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_payload(&payload)?;
+    scrub_payload(&mut payload);
 
     let _id = state
         .agent_crashes
@@ -75,8 +76,9 @@ pub async fn ingest(
 }
 
 /// GET `/api/tenant/{tenant_id}/agent/{agent_id}/crash` — list the
-/// most-recent 50 crash reports for the agent. Auth: standard user
-/// JWT + tenant membership.
+/// most-recent 50 crash reports for the agent. Auth: user JWT and
+/// `MANAGE_AGENTS` in the path tenant, then the device resolved within it
+/// (removed devices included): [`crate::diagnostics::require_reader`].
 pub async fn list_for_agent(
     State(state): State<FleetState>,
     auth: AuthUser,
@@ -87,9 +89,7 @@ pub async fn list_for_agent(
     let aid = ObjectId::parse_str(&agent_id)
         .map_err(|_| ApiError::BadRequest("Invalid agent_id".to_string()))?;
 
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    diagnostics::require_reader(&state, tid, aid, auth.user_id).await?;
 
     let records = state
         .agent_crashes
@@ -127,6 +127,23 @@ impl From<AgentCrashRecord> for AgentCrashView {
             reported_at,
             payload: r.payload,
         }
+    }
+}
+
+/// Scrub every string of a report again before it is stored. The device
+/// scrubs its summary and tail before upload, but a device that predates a
+/// device-side fix sends what it had, and the device's rules are not the
+/// server's: this pass also knows a WireGuard key and the line a `toml`
+/// error quotes ([`crate::diagnostics`]).
+fn scrub_payload(payload: &mut AgentCrashPayload) {
+    for s in [
+        &mut payload.summary,
+        &mut payload.log_tail,
+        &mut payload.agent_version,
+        &mut payload.os,
+        &mut payload.hostname,
+    ] {
+        diagnostics::scrub_string(s);
     }
 }
 

@@ -75,7 +75,8 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     bit: 1 << 24,
     label: 'Manage devices',
     group: 'Remote control',
-    description: 'Enroll, rename, delete, reassign and set policy for remote-control devices.',
+    description:
+      'Enroll, rename, delete, reassign and set policy for remote-control devices, and read their crash reports and uploaded logs.',
   },
   {
     key: 'REMOTE_CONTROL',
@@ -338,6 +339,24 @@ export function canManageOrgSettings(mask: number | null, isOwner: boolean): boo
 export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolean {
   if (isOwner) return true
   if (mask === null) return false
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
+ * May this caller read a device's diagnostics: its crash reports and its
+ * uploaded logs (`…/agent/{id}/crash`, `…/agent/{id}/logs`)? Server gate:
+ * `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass included), the bit the connect
+ * code is read under. The ordinary device list needs only membership; these
+ * are the least-filtered view of a device.
+ *
+ * Deliberately FAIL-OPEN on `mask === null`, unlike {@link canQueryAnalytics}:
+ * the device menu renders before `/member/me` lands, and a holder whose fetch
+ * failed would lose both views for the session. Guessing wrong costs one
+ * refusal, and the dialogs explain a refusal rather than show it as an error.
+ */
+export function canReadDeviceDiagnostics(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
   return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
 }
 
