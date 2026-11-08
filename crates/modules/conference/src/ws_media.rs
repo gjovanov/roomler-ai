@@ -12,7 +12,9 @@
 //! gate. Replies are connection-addressed and routed, so an error raised
 //! while executing a forwarded command still reaches the viewer's pod.
 //!
-//! Every command passes the participation gate (`media_gate`) first: a
+//! A frame is first counted against its socket's budget (`frame_limit`), and
+//! one over it is answered and not run. Every command then passes the
+//! participation gate (`media_gate`): a
 //! `media:join` needs what REST `call/join` checks — the room's tenant, the
 //! room's visibility, and an open call session for this connection — and
 //! every other command needs this connection's seat in that room's media.
@@ -34,6 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::ConferenceState;
+use crate::frame_limit;
 use crate::media_gate::{self, JoinPass, Seat};
 
 /// The one command a connection may send before it holds a seat.
@@ -48,6 +51,11 @@ pub struct Media {
 impl WsHandler for Media {
     async fn handle(&self, ctx: &WsCtx, msg: serde_json::Value) -> anyhow::Result<()> {
         let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // The socket's frame budget first, before anything is looked up for
+        // the frame: one over it is answered there and not run.
+        if frame_limit::refused(&self.state, ctx, msg_type).await {
+            return Ok(());
+        }
         let data = msg.get("data");
         route_and_dispatch_media(
             &self.state,
@@ -61,6 +69,7 @@ impl WsHandler for Media {
     }
 
     async fn closed(&self, ctx: &WsCtx) {
+        frame_limit::socket_closed(&self.state, ctx);
         on_closed(&self.state, &ctx.principal, &ctx.connection_id).await;
     }
 }

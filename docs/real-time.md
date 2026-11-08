@@ -106,10 +106,10 @@ sequenceDiagram
 |---|---|---|
 | Join | `ConferenceView.vue:607`, `stores/rooms.ts:193` `callConnectionId`, `:199` `joinCall`; server `call.rs:133`, `dao/room.rs:723` `join_participant` | The page waits up to `CALL_SOCKET_WAIT_MS` (`rooms.ts:183`, 10 s) for its socket's id (`stores/ws.ts:414` `waitForConnectionId`; the id comes with the `connected` frame, `ws.ts:194`), then starts the call and joins naming it. Past the bound it starts and joins nothing, and says why: "Failed to join call: Not connected to the server…" (`ConferenceView.vue:638`). A join on a connection that already holds a session closes that one first |
 | Leave | `rooms.ts:208` `leaveCall`, `call.rs:206`, `finalize_call_leave_db` (`call.rs:283`), `leave_participant` (`dao/room.rs:925`) | Names the socket's id at leave time and closes that connection's open session. With no body (older clients) it closes every open session of the person in the room |
-| Socket close | `ws_media.rs:74` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:125`), and the same leave runs naming the socket (`:132`) |
+| Socket close | `ws_media.rs:83` `on_closed` | The leave the page never sent. The room comes from the socket's media (`media:join`), else from Mongo by the connection id (`:134`), and the same leave runs naming the socket (`:141`) |
 | A miss | `dao/room.rs:934`, the close itself `close_sessions` (`:1002`) | A leave or a socket close whose connection **never held** a session in that room closes the person's open sessions there that have no connection id: a page whose join went out before its socket had an id, or an older client's. A connection that holds its own session never touches them. Nor does one that held a session and closed it, because it is leaving twice: a repeated leave, a leave racing its socket's close, a leave after the call ended. A closed session keeps its `connection_id`, so the filter can tell (`$ne` on `sessions.connection_id`) |
 | Sweep | `maintenance.rs:63` `close_orphaned_call_state`, every rollup cycle | Closes the open sessions in rooms that are **not** `in_progress`. A room in progress is skipped, so the sweep never reaches a session that keeps its call's count above 0 |
-| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:255`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
+| Boot | `maintenance.rs:21` `stale_call_reset`, at startup under the lease (`lib.rs:263`) | No call outlives a server start: every `in_progress` room is ended, then the sweep runs |
 
 What a leave naming connection C may close:
 
@@ -173,17 +173,17 @@ flowchart LR
 
 | Command | Requires | Checked |
 |---|---|---|
-| `media:join` | What `call/join` checks: a member of the **room's** tenant (read from the room, never from the frame), the room's visibility, and an open call session for **this** connection, or one with no connection id (an older client). A session opened for another socket of the same person does not count | `media_gate.rs:114` `admit_join`, the session by `dao/room.rs:1082` `has_open_call_session`. Before placement (`ws_media.rs:157`), so a refused join claims no room and builds no router, and again on the pod that seats the connection, the owner of a forwarded join (`media_cluster.rs:687`) |
-| every other `media:*` | This connection's seat in the room's media, as this user: a participant entry that only an admitted join creates | `media_gate.rs:151` `seat`, by `room_manager.rs:1058` `holds_seat`, in `dispatch_media_local` (`ws_media.rs:238`) on the pod that runs the command, so a forwarded command is checked at the owner, where the seats are |
+| `media:join` | What `call/join` checks: a member of the **room's** tenant (read from the room, never from the frame), the room's visibility, and an open call session for **this** connection, or one with no connection id (an older client). A session opened for another socket of the same person does not count | `media_gate.rs:114` `admit_join`, the session by `dao/room.rs:1082` `has_open_call_session`. Before placement (`ws_media.rs:166`), so a refused join claims no room and builds no router, and again on the pod that seats the connection, the owner of a forwarded join (`media_cluster.rs:687`) |
+| every other `media:*` | This connection's seat in the room's media, as this user: a participant entry that only an admitted join creates | `media_gate.rs:151` `seat`, by `room_manager.rs:1058` `holds_seat`, in `dispatch_media_local` (`ws_media.rs:247`) on the pod that runs the command, so a forwarded command is checked at the owner, where the seats are |
 
 - The handlers take the gate's proof, a `JoinPass` or a `Seat`, never a bare room, user or
-  connection id (`dispatch_seated`, `ws_media.rs:256`). A new handler has nothing else to
+  connection id (`dispatch_seated`, `ws_media.rs:265`). A new handler has nothing else to
   act on.
 - A refusal says the same for every reason, `Not a participant of this call`
   (`media_gate.rs:35`). Only join, produce and consume answer at all, as they answered
   their failures before; the reason goes to the log.
 - `media:play_audio` plays only a live file of the call's own room, in the room's tenant,
-  and each playback carries its own `playback_id` (`ws_media.rs:989`).
+  and each playback carries its own `playback_id` (`ws_media.rs:998`).
 - `GET /api/cluster/status`, which lists every live meeting room on a pod, is for platform
   admins only (`crates/api/src/routes/cluster.rs:23`).
 
@@ -192,6 +192,40 @@ outside a Private room and a member not in the call each get nothing from any `m
 command, and nothing of theirs reaches the call; the participant path end to end; a
 playback of another room's file, or of a removed one.
 `cluster_tests::cluster_status_is_for_platform_admins_only`.
+
+### A socket's `media:*` frames are limited
+
+Each socket has a token bucket for its `media:*` frames: `[meetings] media_frame_burst`
+frames at once (400), refilled at `media_frame_rate` a second (20)
+(`crates/config/src/settings.rs:280`, `:285`; env `ROOMLER__MEETINGS__MEDIA_FRAME_BURST` and
+`…_RATE`; `0` turns the limit off). A frame is counted on the pod that holds the socket, as it
+arrives and before anything is looked up for it (`ws_media.rs:56`), so a frame forwarded to
+the call's owner pod is counted once, where it came in.
+
+| A frame over the limit | Where |
+|---|---|
+| is not run, and the socket hears `media:error` with `code: "rate_limited"`, `retry_after_ms` (the time until the bucket holds a frame again) and a `message` | `crates/modules/conference/src/frame_limit.rs:48` `refused` |
+| leaves the socket open: a client that overruns loses that frame, never its socket or its call | the same |
+| counts in `media_frames_rate_limited_total` on `GET /api/cluster/status` | `crates/core/src/cluster/metrics.rs:36`, `crates/api/src/cluster/metrics.rs:63` |
+| is logged: the socket's first refusal at warn, and its total at info when it closes | `frame_limit.rs:48`, `:85` `socket_closed` |
+
+**How deep, measured.** The deepest burst a real client sends is a join into a large
+meeting: the join, one `media:consume` for every producer already in the call, back to back
+as fast as the answers come (`consumeChain`, `ui/src/stores/conference.ts`), both
+transports' connects, its own camera and microphone, and the view reports its tiles trigger.
+`conference_rate_tests` builds Business's largest meeting, 100 people with a camera and a
+microphone each, and joins it that way: **212 frames** (1 join, 198 consumes, 2 connects,
+2 produces, 9 view reports) in about 1 s, at most 211 in any one second. The default holds
+that join on the bucket's depth alone, with room for screen shares, people on two devices and
+a rejoin a second later. The refill is twice the fastest steady sender the client has, the
+view report (debounced to 10 a second while the grid scrolls), and holds a flood to 20 frames
+a second after its first 400.
+
+**Tests.** `conference_rate_tests`: the 100-person join passes the shipped limit whole, and a
+flood of 1000 frames on the same socket right after it is refused frame by frame (791
+refused, 209 run, measured), the socket answers a ping and gets on with the call once the
+bucket refills; a refusal's wire and that the frame never reaches the participation gate; a
+zero burst turns the limit off. Unit: the bucket's arithmetic (`frame_limit.rs` `tests`).
 
 ### A meeting receives what is visible (FR-127 P1)
 
@@ -224,9 +258,9 @@ sequenceDiagram
 
 | Message | Change | Where |
 |---|---|---|
-| `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:425` |
-| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:567`, `meeting_levers` at `:776` |
-| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:278`, the handler at `:793`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
+| `media:join` | `caps: ["view"]` declares a client that will report its view. Read only while the lever is on | `crates/modules/conference/src/ws_media.rs:434` |
+| `media:transport_created` | `meeting: { view, audio_dtx, simulcast: null }` — the levers this server runs, so a behaviour the client carries (DTX now, simulcast in P2) keeps a server-side switch | `ws_media.rs:576`, `meeting_levers` at `:785` |
+| `media:view` | `{ room_id, seq, video: [{ producer_id, w, h }] }`, the WHOLE rendered set, never a delta: idempotent, self-healing after a lost message. `seq` only grows, and the server drops a report older than the one it holds. `w`/`h` are device pixels, kept for P2's layer map | the arm at `ws_media.rs:287`, the handler at `:802`, applied by `RoomManager::apply_view` (`media/room_manager.rs:654`) |
 
 It is dispatched where `media:consume` is — through the C-4 placement gate — so a viewer
 whose socket is on the other pod reaches the owner's participant state over `media.cmd`
@@ -355,8 +389,8 @@ more packets than one worker carries without it.
 
 **Reading it.** `GET /api/cluster/status` gains `local.media_video_paused` — the video
 consumers held back by their viewers' views, never the owner's FR-30 pause
-(`crates/api/src/cluster/metrics.rs:86`, from `MediaGauges::video_paused_total`,
-`crates/modules/conference/src/lib.rs:110`) — and each row of `media_rooms_detail` its
+(`crates/api/src/cluster/metrics.rs:88`, from `MediaGauges::video_paused_total`,
+`crates/modules/conference/src/lib.rs:115`) — and each row of `media_rooms_detail` its
 `video_paused`. With `RUST_LOG=roomler_ai_mod_conference=debug` every applied report logs
 `view applied` with `resumed` and `paused` counts. What this lever buys in packets, and the
 two that follow it (simulcast, a room piped across workers), are in the FR's §3.0.

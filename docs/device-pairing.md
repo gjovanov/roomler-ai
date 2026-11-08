@@ -252,9 +252,9 @@ or a `+json` type is refused 415 before it is read (`declares_json`, `parse_body
 | `[setup] wizard_linux_daemon` | `ROOMLER__SETUP__WIZARD_LINUX_DAEMON` | `false` | B1-s2: the same claim for Linux alone, so Linux can go live without macOS (`SetupSettings::linux_daemon`) |
 | `[setup] wizard_macos_daemon` | `ROOMLER__SETUP__WIZARD_MACOS_DAEMON` | `false` | B1-s2: the same for macOS (`SetupSettings::macos_daemon`) |
 
-`PairingSettings` and its defaults: `crates/config/src/settings.rs:118-183`; `SetupSettings`:
-`:91-112`. Both load whole or absent (a file with no `[pairing]` table is the defaults), and a
-test pins every default (`settings.rs:2070-2095`, `:2097-2124`).
+`PairingSettings` and its defaults: `crates/config/src/settings.rs:133-198`; `SetupSettings`:
+`:78-127`. Both load whole or absent (a file with no `[pairing]` table is the defaults), and a
+test pins every default (`settings.rs:1780-1797`, `:1830-1847`).
 
 ## 7 · The audit — `pairing_audit`
 

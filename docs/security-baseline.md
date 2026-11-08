@@ -323,6 +323,13 @@ is what REST `call/join` establishes (`crates/modules/conference/src/media_gate.
   `room_id` alone is the cross-tenant IDOR above, on a socket.
 - A refusal is one answer for every reason, so it says neither whether a room exists nor
   whose it is.
+- **Each socket's `media:*` frames are limited** by a token bucket
+  (`crates/modules/conference/src/frame_limit.rs`, `[meetings] media_frame_burst` /
+  `media_frame_rate`), checked before the gate: a frame over it is answered
+  `media:error {code: "rate_limited"}` and not run, and the socket stays. The HTTP governor
+  never sees socket frames, so this is the socket's own ceiling. ⚠️ Size it from a measured
+  join burst (`conference_rate_tests`), never down by a guess: a consume refused in a join is
+  a tile with no media.
 
 `GET /api/cluster/status` lists every live meeting room on a pod, so it is a platform
 admin's route (`require_platform_admin`, 404 otherwise), like `/api/admin/*`.

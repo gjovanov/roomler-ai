@@ -271,6 +271,18 @@ pub struct MeetingsSettings {
     /// maximum is 49), not a policy. Env: `ROOMLER__MEETINGS__VIEW_MAX`.
     #[serde(default = "meetings_default_view_max")]
     pub view_max: usize,
+    /// The per-socket limit on `media:*` frames, a token bucket: this many
+    /// frames at once. Sized from the deepest legitimate burst, a join into a
+    /// full Business meeting (one `media:consume` per producer already in the
+    /// call, back to back), measured in `conference_rate_tests`. `0` turns the
+    /// limit off. Env: `ROOMLER__MEETINGS__MEDIA_FRAME_BURST`.
+    #[serde(default = "meetings_default_media_frame_burst")]
+    pub media_frame_burst: u32,
+    /// The bucket's refill, in frames a second: what one socket may send for
+    /// as long as it likes. `0` turns the limit off.
+    /// Env: `ROOMLER__MEETINGS__MEDIA_FRAME_RATE`.
+    #[serde(default = "meetings_default_media_frame_rate")]
+    pub media_frame_rate: u32,
 }
 
 fn meetings_default_on() -> bool {
@@ -281,6 +293,14 @@ fn meetings_default_view_max() -> usize {
     49
 }
 
+fn meetings_default_media_frame_burst() -> u32 {
+    400
+}
+
+fn meetings_default_media_frame_rate() -> u32 {
+    20
+}
+
 impl Default for MeetingsSettings {
     fn default() -> Self {
         Self {
@@ -288,6 +308,8 @@ impl Default for MeetingsSettings {
             visible_tiles: meetings_default_on(),
             audio_dtx: meetings_default_on(),
             view_max: meetings_default_view_max(),
+            media_frame_burst: meetings_default_media_frame_burst(),
+            media_frame_rate: meetings_default_media_frame_rate(),
         }
     }
 }

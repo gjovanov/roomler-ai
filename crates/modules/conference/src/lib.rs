@@ -13,9 +13,10 @@
 //! # Shape
 //!
 //! [`ConferenceState`] = [`Core`] + what conference owns: the two DAOs (rooms
-//! for call state, recordings), the [`RoomManager`] over the worker pool, and
-//! the two cluster maps (`media_claim_tokens`, `remote_media_conns`) the C-4
-//! claim-or-route placement keeps per pod. It derefs to `Core`, so the moved
+//! for call state, recordings), the [`RoomManager`] over the worker pool, the
+//! two cluster maps (`media_claim_tokens`, `remote_media_conns`) the C-4
+//! claim-or-route placement keeps per pod, and the per-socket limit on
+//! `media:*` frames ([`frame_limit`]). It derefs to `Core`, so the moved
 //! handlers read `state.ws_storage`, `state.stats`, `state.cluster_bus` as
 //! they did on the host's `AppState`.
 //!
@@ -55,6 +56,7 @@ use roomler_core::{
 use crate::media::{room_manager::RoomManager, worker_pool::WorkerPool};
 
 pub mod call;
+pub mod frame_limit;
 pub mod guards;
 pub mod maintenance;
 pub mod media;
@@ -79,6 +81,9 @@ pub struct ConferenceState {
     /// (`connection_id → room_id`), so the socket close can tell the owner
     /// to drop the transports.
     pub remote_media_conns: Arc<DashMap<String, ObjectId>>,
+    /// The per-socket limit on `media:*` frames, for the sockets this pod
+    /// holds ([`frame_limit`]).
+    pub media_frames: Arc<frame_limit::MediaFrameLimiter>,
 }
 
 impl std::ops::Deref for ConferenceState {
@@ -162,6 +167,9 @@ impl Module for ConferenceState {
             room_manager,
             media_claim_tokens: Arc::new(DashMap::new()),
             remote_media_conns: Arc::new(DashMap::new()),
+            media_frames: Arc::new(frame_limit::MediaFrameLimiter::from_settings(
+                &settings.meetings,
+            )),
             core,
         };
         // C-4 — the owner-side bus handlers + the 10 s claim heartbeat.
