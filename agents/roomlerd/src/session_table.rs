@@ -163,10 +163,28 @@ impl ConnExit {
         ConnExit::KeyRotated,
     ];
 
-    /// RED — the pin's map: every arm called `close_all_peers`, so every exit
-    /// closes every peer. The next commit gives the spec's (§2.2).
+    /// Spec §2.2 and §4.1. A resume from suspend stays terminal: after a nap
+    /// that long the viewer's ICE consent has long failed.
     pub(crate) fn kind(self) -> ExitKind {
-        ExitKind::Terminal
+        match self {
+            ConnExit::Shutdown
+            | ConnExit::Sleep
+            | ConnExit::ResumeFromSuspend
+            | ConnExit::Goodbye
+            | ConnExit::KeyRotated => ExitKind::Terminal,
+            ConnExit::NetChangeProbe
+            | ConnExit::NetChangeReprobe
+            | ConnExit::NetChangePingFailed => ExitKind::NetChange,
+            ConnExit::RxDeadline
+            | ConnExit::KeepaliveUnanswered
+            | ConnExit::KeepaliveSendFailed
+            | ConnExit::HeartbeatSendFailed
+            | ConnExit::OutboundFlushFailed
+            | ConnExit::PongReplyFailed
+            | ConnExit::ServerClosed
+            | ConnExit::ReadError
+            | ConnExit::PongRttDegraded => ExitKind::Transient,
+        }
     }
 
     /// The exit's name in the log lines, and the close's reason when it closes.
@@ -416,7 +434,7 @@ pub(crate) enum TableEvent {
     /// A kept session's deadline passed.
     Deadline,
     /// A kept session's peer said its own end (it failed).
-    Ended(ObjectId, ClientMsg),
+    Ended(ObjectId, Box<ClientMsg>),
     /// Time to look at the peers kept after a net change.
     Look,
 }
@@ -817,7 +835,7 @@ impl<P: TablePeer> SessionTable<P> {
             .filter(|_| self.kept.values().any(|k| k.netchange));
         tokio::select! {
             biased;
-            Some((session_id, msg)) = self.ended_rx.recv() => TableEvent::Ended(session_id, msg),
+            Some((session_id, msg)) = self.ended_rx.recv() => TableEvent::Ended(session_id, Box::new(msg)),
             () = sleep_until(deadline) => TableEvent::Deadline,
             () = sleep_until(look) => TableEvent::Look,
         }
@@ -830,11 +848,11 @@ impl<P: TablePeer> SessionTable<P> {
             TableEvent::Ended(session_id, msg) => {
                 if self.kept.contains_key(&session_id) {
                     self.close_kept(session_id, "failed").await;
-                    self.queue_end(msg);
+                    self.queue_end(*msg);
                 } else if self.attached.contains_key(&session_id) {
                     // Resumed before this was read: say it on this connection,
                     // as an attached peer's own end always went.
-                    self.queue_end(msg);
+                    self.queue_end(*msg);
                 }
             }
             TableEvent::Look => {
@@ -972,10 +990,8 @@ mod tests {
     }
 
     impl TablePeer for Fake {
-        fn close(&self) -> impl Future<Output = ()> + Send + '_ {
-            async move {
-                self.0.closes.fetch_add(1, Ordering::SeqCst);
-            }
+        async fn close(&self) {
+            self.0.closes.fetch_add(1, Ordering::SeqCst);
         }
         fn stop_serving(&self) {
             self.0.stopped.store(true, Ordering::SeqCst);
@@ -983,10 +999,8 @@ mod tests {
         fn is_connected(&self) -> bool {
             self.0.connected.load(Ordering::SeqCst)
         }
-        fn say_on_control(&self, text: String) -> impl Future<Output = ()> + Send + '_ {
-            async move {
-                self.0.said.lock().unwrap().push(text);
-            }
+        async fn say_on_control(&self, text: String) {
+            self.0.said.lock().unwrap().push(text);
         }
     }
 
