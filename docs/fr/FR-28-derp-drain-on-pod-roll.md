@@ -296,7 +296,7 @@ the one freeze cause that can be reproduced on demand.
 The agent learns the `/derp` WS is gone **by failing to send on it**. Nothing tells
 it in advance, so the sequence is: pod dies → agent keeps handing frames to a dead
 socket → a send hard-errors → `DeathReason::HardDead`
-(`crates/tunnel-core/src/overlay/runtime/establish.rs:723-732`) → carrier rebuild →
+(`crates/tunnel-core/src/overlay/runtime/establish.rs:734-754`) → carrier rebuild →
 `MuxEvent::Recovered` opens the fast-walk window
 (`crates/tunnel-core/src/overlay/runtime.rs:2661-2664`).
 
