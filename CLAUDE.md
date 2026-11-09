@@ -164,7 +164,7 @@ cd ui && bun run e2e                   # Playwright
 # Static analysis — what CI runs
 cargo fmt --all -- --check
 cargo clippy --workspace -- -D warnings
-cargo clippy -p roomler-ai-api -p roomler-ai-services -p roomler-ai-tests --all-targets -- -D warnings
+bash scripts/clippy-audited-crates.sh  # --all-targets: api, services, tests, core + every roomler-ai-mod-* crate
 cd ui && vue-tsc --noEmit
 
 # Dependency audit
