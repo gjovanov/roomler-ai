@@ -153,13 +153,13 @@ jobs:
       - name: Install WiX Toolset v3 + cargo-wix
         shell: pwsh
         run: |
-          choco install -y wixtoolset
+          choco install -y wixtoolset; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $wixBin = Get-ChildItem 'C:\Program Files (x86)\WiX Toolset v*\bin' | Select-Object -First 1
           "$($wixBin.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append
           # Idempotent: the seed caches (#488) can restore ~/.cargo/bin with
           # the tool present; a plain install hard-errors on it.
           if (-not (Get-Command cargo-wix -ErrorAction SilentlyContinue)) {
-            cargo install cargo-wix --locked
+            cargo install cargo-wix --locked; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
       - name: Build agent (release, minimal feature set)
@@ -184,7 +184,7 @@ jobs:
           # ~150 KB shim that re-execs `roomlerd cli`; the INSTALLED name is
           # still roomler.exe, which is what the payload assert below checks.
           # Mirrors release-agent.yml's shim build step.
-          cargo build -p roomler-cli-shim --release
+          cargo build -p roomler-cli-shim --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path target\release\roomler-shim.exe)) {
             Write-Host "::error::roomler-shim.exe not produced — TunnelExe harvest would fail (LGHT0103)"
             exit 1
@@ -192,7 +192,7 @@ jobs:
           $kb = [math]::Round((Get-Item target\release\roomler-shim.exe).Length/1KB, 0)
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
           # #3292: the windowless launcher the per-user Scheduled Task runs.
-          cargo build -p roomlerdw --release
+          cargo build -p roomlerdw --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path target\release\roomlerdw.exe)) {
             Write-Host "::error::roomlerdw.exe not produced — LauncherExe harvest would fail (LGHT0103)"
             exit 1
@@ -536,7 +536,7 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Roomler'
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $vsRoot  = & $vswhere -latest -products * -property installationPath; if ($LASTEXITCODE -ne 0) { throw "vswhere exited $LASTEXITCODE" }
           $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
                      Sort-Object FullName | Select-Object -Last 1
           if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
@@ -555,7 +555,7 @@ jobs:
               if (-not (Test-Path $path)) { $found += "$exe missing"; continue }
               $imports = & $dumpbin /dependents $path |
                 Select-String -Pattern '^\s{4}(\S+\.dll)$' |
-                ForEach-Object { $_.Matches[0].Groups[1].Value }
+                ForEach-Object { $_.Matches[0].Groups[1].Value }; if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $path exited $LASTEXITCODE" }
               if (-not $imports) { $found += "$exe : dumpbin listed no imports (parse broke?)"; continue }
               if (-not $Quiet) { Write-Host "$exe imports $($imports.Count) DLLs" }
               foreach ($dll in $imports) {
@@ -830,14 +830,14 @@ jobs:
           $dll = Join-Path $out 'Binary\RoomlerMsiCa'
           if (-not (Test-Path $dll)) { throw "the MSI's Binary table has no RoomlerMsiCa" }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $vsRoot  = & $vswhere -latest -products * -property installationPath; if ($LASTEXITCODE -ne 0) { throw "vswhere exited $LASTEXITCODE" }
           $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
                      Sort-Object FullName | Select-Object -Last 1
           if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
           function Get-Problems([string]$path) {
             $imports = & $dumpbin /dependents $path |
               Select-String -Pattern '^\s{4}(\S+\.dll)$' |
-              ForEach-Object { $_.Matches[0].Groups[1].Value }
+              ForEach-Object { $_.Matches[0].Groups[1].Value }; if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $path exited $LASTEXITCODE" }
             if (-not $imports) { return @('dumpbin listed no imports (parse broke?)') }
             Write-Host "  $(Split-Path -Leaf $path) imports: $($imports -join ', ')"
             @($imports | ForEach-Object {
@@ -851,7 +851,7 @@ jobs:
             $problems | ForEach-Object { Write-Host "::error::roomler_msi_ca.dll: $_" }
             throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
           }
-          $exports = (& $dumpbin /exports $dll) -join "`n"
+          $exports = (& $dumpbin /exports $dll) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports exited $LASTEXITCODE" }
           foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
             if ($exports -notmatch "\b$e\b") { throw "the DLL does not export $e" }
           }

@@ -140,8 +140,8 @@ days. So before every non-tag build, `seed-cache-restore` runs a GC step
 | The four daemon jobs (`.deb` ×2, MSI, `.pkg`) | 4,500 MB | `release-agent.yml:393`, `:1134`, `:1654`, `:2744` |
 | The wizard's macOS universal job (two triples) | 5,000 MB | `release-setup.yml:404` |
 | CI caches in the release-asset store (`ci-seed-restore`), default | 4,000 MB | `ci-seed-restore/action.yml:29` |
-| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1348`, `:1590` |
-| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:501`, `:231`, `:639`; `:1150`, `:1920`, `:2100`, `:2593` |
+| The integration shards, `ci.yml`'s macOS overlay check and its Windows clippy lane | 6,000 MB | `integration-tests.yml:168`, `ci.yml:1354`, `:1607` |
+| `ci.yml`'s Linux lanes (wave 34): unit, lint, agent; recorder-audio, ffmpeg-encoder, recording-ffmpeg, profiles | 16,000, 10,000, 7,000; 5,000 each | `ci.yml:507`, `:237`, `:645`; `:1156`, `:1945`, `:2125`, `:2618` |
 
 **A cold build has to fit under its cap.** If it does not, every restore drops the cache, every
 run builds cold, and each master run publishes the same size again, so the GC never recovers.
@@ -154,9 +154,9 @@ run builds cold, and each master run publishes the same size again, so the GC ne
 it publishes leaves the next run cold as well, and that one is cut off the same way. Wave 34's
 first master run built the unit lane cold (1,795 crates) and hit the 30-minute ceiling at
 30 min 15 s, with the second part of its 2.6 GB archive still uploading. That part landed two
-seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:471`,
+seconds after the cut. The unit and lint lanes now allow 45 and 40 minutes (`ci.yml:477`,
 `:159`), about 1.5 times their measured cold runs (FR-6 wave 36). The macOS overlay check
-allows 35 (`ci.yml:1320`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
+allows 35 (`ci.yml:1326`): its cold run took 22 min 33 s on 2026-10-30, after its cache crossed
 its 6,000 MB cap, against a 25-minute ceiling (FR-6 wave 37). Every other `ci.yml` lane with a
 cold run on record allows about 1.5 times it or more. A forced cold run on 2026-11-01 gave
 Windows sessions and the FR-85 recorder their first: 11.1 min against 40 and 8.9 against 30.

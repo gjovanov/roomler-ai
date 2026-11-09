@@ -1404,12 +1404,12 @@ jobs:
           # downgrade via chocolatey (choco refuses without --allow-downgrade).
           $llvm = "C:\Program Files\LLVM"
           if (-not (Test-Path $llvm)) {
-            choco install -y llvm
+            choco install -y llvm; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             $llvm = "C:\Program Files\LLVM"
           }
           "LIBCLANG_PATH=$llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$llvm\bin"              | Out-File -FilePath $env:GITHUB_PATH -Append
-          & "$llvm\bin\clang.exe" --version
+          & "$llvm\bin\clang.exe" --version; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # pkgconf is ~1 MB of prebuilt tool, but `vcpkg install` spends ~96 s per
       # run (measured on the rc.363 release: the 3rd-costliest step in this
@@ -1517,7 +1517,7 @@ jobs:
           # per tag — same pattern as the vendored FFmpeg below.
           $dl = "$env:RUNNER_TEMP\vpxdl"
           gh release download vendored-libvpx-1.12.0 --repo "${{ github.repository }}" `
-            --pattern 'libvpx-1.12.0-win64-msvc.zip*' --dir $dl
+            --pattern 'libvpx-1.12.0-win64-msvc.zip*' --dir $dl; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $zip = "$dl\libvpx-1.12.0-win64-msvc.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
@@ -1526,7 +1526,7 @@ jobs:
           # the baked .pc paths + the env exports below stay valid.
           $root = 'C:\vpx-pin\installed\x64-windows'
           New-Item -ItemType Directory -Path $root -Force | Out-Null
-          tar -xf $zip -C $root
+          tar -xf $zip -C $root; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path "$root\lib\pkgconfig\vpx.pc")) { Write-Host "::error::vpx.pc missing after extract"; exit 1 }
           # Expose the install dir to subsequent steps.
           "PKG_CONFIG_PATH=C:/vpx-pin/installed/x64-windows/lib/pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -1565,7 +1565,7 @@ jobs:
           # software h264 decoder the recorder's editor needs and the aac
           # encoder for its sound; no new import); rollback = drop that one.
           gh release download vendored-ffmpeg-9.0.1 --repo "${{ github.repository }}" `
-            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip*' --dir $dl
+            --pattern 'ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip*' --dir $dl; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $zip = "$dl\ffmpeg-9.0.1-win64-msvc-static-md-lgpl-minimal-d3d12-vulkan-h264dec-aac.zip"
           $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
@@ -1578,7 +1578,7 @@ jobs:
           # Expand-Archive — the .pc assert below catches it loudly.)
           $root = 'C:\ffmpeg-pin\installed\x64-windows-static-md'
           New-Item -ItemType Directory -Path $root -Force | Out-Null
-          tar -xf $zip -C $root
+          tar -xf $zip -C $root; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($pc in 'libavcodec.pc', 'libavutil.pc') {
             if (-not (Test-Path "$root\lib\pkgconfig\$pc")) { Write-Host "::error::$pc missing after extract"; exit 1 }
           }
@@ -1733,7 +1733,7 @@ jobs:
           # time, so this MUST still run before the two cargo-wix builds below.
           # Tunnel-ONLY hosts are unaffected: release-tunnel.yml keeps building
           # and shipping the real standalone `roomler` binary.
-          cargo build -p roomler-cli-shim --release
+          cargo build -p roomler-cli-shim --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path target\release\roomler-shim.exe)) {
             Write-Host "::error::roomler-shim.exe not produced — the TunnelExe wxs component would fail the MSI harvest (LGHT0103)"
             exit 1
@@ -1742,7 +1742,7 @@ jobs:
           Write-Host "Staged roomler-shim.exe ($kb KB, installs as roomler.exe) for the TunnelExe component"
           # #3292: the windowless launcher the per-user Scheduled Task runs. The
           # per-user wxs references it at harvest time.
-          cargo build -p roomlerdw --release
+          cargo build -p roomlerdw --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path target\release\roomlerdw.exe)) {
             Write-Host "::error::roomlerdw.exe not produced — the LauncherExe wxs component would fail the MSI harvest (LGHT0103)"
             exit 1
@@ -2087,7 +2087,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $vsRoot  = & $vswhere -latest -products * -property installationPath; if ($LASTEXITCODE -ne 0) { throw "vswhere exited $LASTEXITCODE" }
           $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
                      Sort-Object FullName | Select-Object -Last 1
           if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
@@ -2108,7 +2108,7 @@ jobs:
               if (-not (Test-Path $path)) { $found += "$exe missing from the MSI payload"; continue }
               $imports = & $dumpbin /dependents $path |
                 Select-String -Pattern '^\s{4}(\S+\.dll)$' |
-                ForEach-Object { $_.Matches[0].Groups[1].Value }
+                ForEach-Object { $_.Matches[0].Groups[1].Value }; if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $path exited $LASTEXITCODE" }
               if (-not $imports) { $found += "$exe : dumpbin listed no imports (parse broke?)"; continue }
               if (-not $Quiet) { Write-Host "  $exe imports $($imports.Count) DLLs" }
               foreach ($dll in $imports) {
@@ -2216,14 +2216,14 @@ jobs:
           if (-not (Test-Path $dll)) { throw "the per-Machine MSI's Binary table has no RoomlerMsiCa" }
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsRoot  = & $vswhere -latest -products * -property installationPath
+          $vsRoot  = & $vswhere -latest -products * -property installationPath; if ($LASTEXITCODE -ne 0) { throw "vswhere exited $LASTEXITCODE" }
           $dumpbin = Get-ChildItem -Path "$vsRoot\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" |
                      Sort-Object FullName | Select-Object -Last 1
           if (-not $dumpbin) { throw "dumpbin.exe not found under $vsRoot" }
           function Get-Problems([string]$path) {
             $imports = & $dumpbin /dependents $path |
               Select-String -Pattern '^\s{4}(\S+\.dll)$' |
-              ForEach-Object { $_.Matches[0].Groups[1].Value }
+              ForEach-Object { $_.Matches[0].Groups[1].Value }; if ($LASTEXITCODE -ne 0) { throw "dumpbin /dependents $path exited $LASTEXITCODE" }
             if (-not $imports) { return @('dumpbin listed no imports (parse broke?)') }
             Write-Host "  $(Split-Path -Leaf $path) imports: $($imports -join ', ')"
             @($imports | ForEach-Object {
@@ -2237,7 +2237,7 @@ jobs:
             $problems | ForEach-Object { Write-Host "::error::roomler_msi_ca.dll in the per-Machine MSI: $_" }
             throw 'the custom-action DLL needs a DLL that a fresh Windows does not have'
           }
-          $exports = (& $dumpbin /exports $dll) -join "`n"
+          $exports = (& $dumpbin /exports $dll) -join "`n"; if ($LASTEXITCODE -ne 0) { throw "dumpbin /exports exited $LASTEXITCODE" }
           foreach ($e in 'CaptureServiceEnvironment', 'RestoreServiceEnvironment') {
             if ($exports -notmatch "\b$e\b") { throw "the custom-action DLL does not export $e" }
           }
