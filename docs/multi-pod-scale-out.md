@@ -32,7 +32,7 @@
 
 ## C-1 — identity, directory, bus (implemented)
 
-### Pod identity (`crates/api/src/cluster/identity.rs`)
+### Pod identity (`crates/core/src/cluster/identity.rs`)
 
 `pod_id` — stable across restarts: `ROOMLER__APP__POD_ID` override (tests
 inject per-app values) → `ROOMLER__POD_HOST_IP` (hostNetwork ⇒ ≤1 API pod
@@ -47,7 +47,7 @@ The pub/sub **origin** stamped on every envelope is `<pod_id>/<epoch>`
 user-online SREM semantics are unchanged because the epoch differs per
 process).
 
-### Ownership directory (`crates/api/src/cluster/directory.rs`)
+### Ownership directory (`crates/core/src/cluster/directory.rs`)
 
 One Redis STRING per live entity, value = the canonical owner token
 `"<pod_id>/<epoch>/<extra>/<since_ms>"` (`OwnerRecord::parse`). Key
@@ -70,7 +70,7 @@ Three shared operations (Lua where atomicity matters):
 - **release** — compare-and-delete on the full token (a bare GET+DEL races
   a fresh re-home; a stale release must no-op against a newer claim).
 
-### Inter-pod bus (`crates/api/src/cluster/bus.rs`)
+### Inter-pod bus (`crates/core/src/cluster/bus.rs`)
 
 Each pod subscribes to `roomler:pod:<pod_id>` (stable — a restarted
 process re-subscribes and NACKs requests for entities it doesn't hold,
@@ -103,7 +103,7 @@ rejected there is NO data plane crossing pods), keyspace notifications
 
 - **rc (C-2)** — *client redial + idle-agent nudge*. On session-request
   hub-miss with a fresh foreign directory record: reply
-  `rc:session.rehome{tid}`; the browser re-pins its WS
+  `rc:error {code: "agent_on_other_pod"}` (designed as `rc:session.rehome{tid}`); the browser re-pins its WS
   (`setTenantAffinity` + a new `forceRedial` for the parked-socket case)
   and retries ONCE. After topology changes the *agent's* WS may sit on an
   old-hash pod: the owning pod closes it — **only when idle** (no active
@@ -112,7 +112,7 @@ rejected there is NO data plane crossing pods), keyspace notifications
   session frame-relay is rejected permanently** (a `LiveSession` pins its
   `controller_tx` on the creating pod; relaying is a durable bidirectional
   proxy with new failure modes, for a signaling-only channel whose media
-  is P2P). Consent + admin-kick become broadcast control events every pod
+  is P2P). **Reversed since by PR-2:** a session-request miss is now relayed first: the controller's `rc:*` frames cross the per-pod bus to the owning pod's hub (`crates/modules/remote/src/relay.rs`), and media stays P2P. The rehome reply above is the fallback when the relay is unavailable (`crates/modules/remote/src/controller.rs`). Consent + admin-kick become broadcast control events every pod
   applies to its local hub.
 - **tunnel (C-3)** — same pattern: open-path miss ⇒
   `TunnelOpenReject{reason:"rehome"}` ⇒ the headless CLI redials itself
@@ -194,7 +194,7 @@ record within one beat and the fold rule resolves any belt-era splits.
 
 | Stage | Content | Gate |
 |---|---|---|
-| **C-1** | `crates/api/src/cluster/{identity,directory,bus}.rs`, origin swap, A-1 agent keys canonicalized, directory heartbeat, two-pod tests | zero behavior change |
+| **C-1** | `crates/api/src/cluster/{identity,directory,bus}.rs` (in `crates/core/src/cluster/` since FR-69 P1b), origin swap, A-1 agent keys canonicalized, directory heartbeat, two-pod tests | zero behavior change |
 | C-2 | rc rehome + `forceRedial` + idle-agent nudge + consent/kick broadcast | |
 | C-3 | tunnel rehome + CLI redial-retry + session ownership records | |
 | C-4 | media claim-or-route + command shim + conn-addressed events + conflict fold | **THE un-park gate** |
@@ -203,7 +203,7 @@ record within one beat and the fold rule resolves any belt-era splits.
 
 ## Not building (scope honesty)
 
-rc session frame-relay; DERP cross-pod frame forwarding / pod-TCP data
+~~rc session frame-relay~~ (built since by PR-2: the signalling relay, `crates/modules/remote/src/relay.rs`); DERP cross-pod frame forwarding / pod-TCP data
 mesh; live mediasoup room migration (fold-and-rejoin only); PipeTransport
 before the trigger fires; cross-pod piping for the (nonexistent) rc SFU
 bridge; Redis Streams / gRPC / gossip / Redlock; a per-WS-connection
