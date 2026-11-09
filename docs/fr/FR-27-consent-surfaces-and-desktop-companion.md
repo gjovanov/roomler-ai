@@ -33,7 +33,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The agent writes a `.pending` marker and waits; only the companion renders it
    (750 ms LocalAPI poll). Nothing starts the companion, and the daemon never
    checks whether anything can ask. Observable failure: 30 s of nothing, then a
-   deny. — `agents/roomlerd/src/signaling.rs:2205`,
+   deny. — `agents/roomlerd/src/signaling.rs:2208`,
    `agents/roomler-desktop/src/main.rs` (`consent_watch_loop`)
 3. **"Nobody was there" is reported to the controller as "the user denied you".**
    `Decision::Timeout` maps to `granted: false`, and the hub terminates that as
@@ -67,13 +67,13 @@ Every line below was read on `origin/master` at `861d4557`.
    Roomler SSH both prompt through the same broker and write no marker, so an
    `exec_policy` / `SshPolicy` of `prompt` can only be answered by someone who
    greps the daemon log for a request id and runs the CLI within 30 s.
-   — `signaling.rs:5706`, `ssh.rs:2176` vs `git grep write_pending`
+   — `signaling.rs:5709`, `ssh.rs:2176` vs `git grep write_pending`
 5. **`prompt_then_email` is "prompt AND email", with a 300 s on-screen modal.**
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
-   built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:1922` (the per-mode window),
-   `models.rs:1323` (the doc-comment on the `PromptThenEmail` variant at `:1333`),
+   built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:1928` (the per-mode window),
+   `models.rs:1336` (the doc-comment on the `PromptThenEmail` variant at `:1346`),
    `consent_consumer.rs:207` (the email leg; it was `state.rs:1199`)
 
 ### Desktop companion

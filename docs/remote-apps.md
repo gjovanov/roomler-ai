@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock` (`agents/roomlerd/src/encode/caps.rs:41`,
 `:624`, `:655`); both the hello and the FR-43 heartbeat re-announce
-(`agents/roomlerd/src/signaling.rs:1599`, `:2284`)
+(`agents/roomlerd/src/signaling.rs:1599`, `:2287`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:

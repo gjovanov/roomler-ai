@@ -581,6 +581,16 @@ pub enum ClientMsg {
         /// start, so none is offered), or an agent that predates the field.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         peer_auth_key: String,
+        /// FR-138 — the sessions this device kept through the loss of its
+        /// last control socket, which this hello claims back: their peers are
+        /// still open on the device, each until its own deadline. The server
+        /// answers each with `rc:session.resumed` or `rc:terminate` (spec
+        /// §4.4). Sent only by an agent that advertises `rc-resume` and was
+        /// announced a window, never more than the device's capacity, and
+        /// never sent empty. An older server ignores the field, and the kept
+        /// sessions end at the device's deadline.
+        #[serde(default, skip_serializing_if = "Vec::is_empty", with = "vec_oid_hex")]
+        kept_sessions: Vec<ObjectId>,
     },
 
     /// Agent periodic stats.
@@ -1202,6 +1212,19 @@ pub enum ClientMsg {
         /// server ignores it and hands over the first device's relay alone.
         #[serde(default, skip_serializing_if = "Vec::is_empty", with = "vec_oid_hex")]
         local_relay_from_also: Vec<ObjectId>,
+        /// FR-138 — the held session this request replaces: the viewer gave
+        /// it up (its hold ran out, or its peer failed) and redials. The
+        /// server ends that session as `controller_hangup` before its
+        /// capacity gate, when its row names this user and this device, so a
+        /// held session never costs its own viewer the slot (spec §4.4,
+        /// §4.5). Absent from an older viewer. An older server ignores it:
+        /// it never holds a session, so the old one has already ended.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "option_oid_hex"
+        )]
+        replaces: Option<ObjectId>,
     },
 
     /// Controller sends an SDP offer (after consent granted).
@@ -1222,6 +1245,20 @@ pub enum ClientMsg {
         /// the device verbatim.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer_auth: Option<PeerAuthOffer>,
+    },
+
+    /// FR-138 — the viewer claims a held session back once its own socket is
+    /// up again: it kept its peer through the gap, and asks the server to
+    /// route the session to this connection. Answered with
+    /// `rc:session.resumed`, with `rc:session.detached` when the device has
+    /// not claimed it yet (ask again), or with `rc:terminate` and the reason
+    /// (spec §4.5). Sent only for a session the server called resumable
+    /// (`SessionCreated.resume_secs`). An older server drops it, and the
+    /// viewer's own deadline falls back to today's redial.
+    #[serde(rename = "rc:session.rejoin")]
+    SessionRejoin {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
     },
 
     // ─── either side → server ────────────────────────────────────────
@@ -1964,6 +2001,7 @@ impl ClientMsg {
             ClientMsg::ConsentPending { .. } => "rc:consent.pending",
             ClientMsg::SessionRequest { .. } => "rc:session.request",
             ClientMsg::SdpOffer { .. } => "rc:sdp.offer",
+            ClientMsg::SessionRejoin { .. } => "rc:session.rejoin",
             ClientMsg::Ice { .. } => "rc:ice",
             ClientMsg::Terminate { .. } => "rc:terminate",
             ClientMsg::Ping { .. } => "rc:ping",
@@ -2016,6 +2054,8 @@ impl ClientMsg {
             | ClientMsg::Ping { .. } => Owner::Fleet,
             ClientMsg::SessionRequest { .. }
             | ClientMsg::SdpOffer { .. }
+            // FR-138 — the viewer's claim on a held session.
+            | ClientMsg::SessionRejoin { .. }
             | ClientMsg::SdpAnswer { .. }
             | ClientMsg::Ice { .. }
             | ClientMsg::Terminate { .. }
@@ -2094,6 +2134,7 @@ pub const CLIENT_MSG_OWNERS: &[(&str, Owner)] = &[
     ("rc:consent.pending", Owner::Fleet),
     ("rc:session.request", Owner::Remote),
     ("rc:sdp.offer", Owner::Remote),
+    ("rc:session.rejoin", Owner::Remote),
     ("rc:ice", Owner::Remote),
     ("rc:terminate", Owner::Remote),
     ("rc:ping", Owner::Fleet),
@@ -2370,6 +2411,16 @@ pub enum ServerMsg {
         /// Absent otherwise; an older viewer never names more than one.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         local_relay_also: Vec<LocalRelayDescriptor>,
+        /// FR-138 — this session may be held through the loss of the
+        /// device's control socket, or of the viewer's own, for up to this
+        /// many seconds: the window the server announced the device. A viewer
+        /// then keeps its peer through `rc:session.detached` and its own
+        /// socket's loss, and claims the session back with
+        /// `rc:session.rejoin` (spec §4.5). Absent = never held: the window
+        /// is off, the device is outside the resume scope or does not
+        /// advertise `rc-resume`, or the server predates the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_secs: Option<u32>,
     },
 
     /// Sent to the agent when a controller asks for control. The agent prompts
@@ -2596,6 +2647,47 @@ pub enum ServerMsg {
         /// Absent otherwise; older readers ignore it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
+    },
+
+    /// FR-138 — how long this device may keep a live session through the
+    /// loss of its control socket, in seconds; `0` withdraws it. Sent after
+    /// the hello to an agent that advertises `rc-resume` and is in the resume
+    /// scope, and again whenever its scope entry changes, so a change needs
+    /// no roll and reverses at once (spec §4.1). The device keeps a peer only
+    /// while it holds a window from the server it last spoke to, and caps it
+    /// at 120 s whatever this says.
+    ///
+    /// ⚠️ Never sent to an agent without `rc-resume`. An older agent drops
+    /// the unknown tag in its parse-error arm, so a window sent blind would
+    /// read on the server as one the device keeps when it keeps nothing.
+    #[serde(rename = "rc:agent.resume_window")]
+    AgentResumeWindow { secs: u32 },
+
+    /// FR-138 — a claim was accepted: the device's (`kept_sessions` in its
+    /// hello) or the viewer's (`rc:session.rejoin`). The session goes on as
+    /// it was, under its own id. Sent to the agent and to the viewer.
+    #[serde(rename = "rc:session.resumed")]
+    SessionResumed {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+    },
+
+    /// FR-138 — the device's control socket dropped and the session is kept:
+    /// the device holds its peer until `resume_by`. Sent to the session's
+    /// viewer while the viewer's own socket is up, and in answer to a rejoin
+    /// that arrives before the device's claim (spec §4.4, §4.5). An older
+    /// viewer ignores it and redials as today.
+    #[serde(rename = "rc:session.detached")]
+    SessionDetached {
+        #[serde(with = "oid_hex")]
+        session_id: ObjectId,
+        /// Unix ms on the SERVER's clock: when the session ends unless the
+        /// device claims it first (the row's `resume_by`).
+        ///
+        /// ⚠️ Not a deadline a viewer can read off its own wall clock as is:
+        /// #3511 learned that a server's time is not a client's. A viewer
+        /// that bounds its hold by it needs a guard against skew.
+        resume_by: u64,
     },
 
     /// Reply to `Ping`.
@@ -4174,6 +4266,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             peer_auth_key: String::new(),
+            kept_sessions: vec![],
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""t":"rc:agent.hello""#));
@@ -4632,6 +4725,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: KEY.into(),
             peer_auth_key: String::new(),
+            kept_sessions: vec![],
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(
@@ -4674,6 +4768,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             peer_auth_key: String::new(),
+            kept_sessions: vec![],
         };
         assert!(
             !serde_json::to_string(&none)
@@ -4722,6 +4817,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             peer_auth_key,
+            kept_sessions: vec![],
         };
         let g = p256_g_b64();
         let s = serde_json::to_string(&hello(g.clone())).unwrap();
@@ -5077,6 +5173,7 @@ mod tests {
             supports_relay_regions: true,
             ssh_host_pubkey: String::new(),
             peer_auth_key: String::new(),
+            kept_sessions: vec![],
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains(r#""arch":"aarch64""#), "{s}");
@@ -5113,6 +5210,7 @@ mod tests {
             supports_relay_regions: false,
             ssh_host_pubkey: String::new(),
             peer_auth_key: String::new(),
+            kept_sessions: vec![],
         };
         let s = serde_json::to_string(&native).unwrap();
         assert!(
@@ -5302,6 +5400,7 @@ mod tests {
             local_relay_from: from,
             local_relay_also: vec![],
             local_relay_from_also: vec![],
+            replaces: None,
         };
         let s = serde_json::to_string(&request(Some(device))).unwrap();
         assert!(
@@ -5330,6 +5429,7 @@ mod tests {
             local_relay,
             local_relay_refused,
             local_relay_also: vec![],
+            resume_secs: None,
         };
         let s = serde_json::to_string(&created(Some(relay), None)).unwrap();
         assert!(
@@ -5401,6 +5501,7 @@ mod tests {
                 local_relay_from: Some(mine),
                 local_relay_also: also,
                 local_relay_from_also: from_also,
+                replaces: None,
             };
 
         let s = serde_json::to_string(&request(vec![relay(47990)], vec![wsl])).unwrap();
@@ -5447,6 +5548,7 @@ mod tests {
             local_relay: Some(relay(47989)),
             local_relay_refused: None,
             local_relay_also: also,
+            resume_secs: None,
         };
         let s = serde_json::to_string(&created(vec![relay(47990)])).unwrap();
         assert!(
@@ -5475,6 +5577,7 @@ mod tests {
             local_relay: None,
             local_relay_refused: None,
             local_relay_also: vec![],
+            resume_secs: None,
         };
         let s = serde_json::to_string(&created).unwrap();
         assert!(
@@ -5497,6 +5600,7 @@ mod tests {
             local_relay_from: None,
             local_relay_also: vec![],
             local_relay_from_also: vec![],
+            replaces: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert!(!s.contains("$oid"));
@@ -5523,6 +5627,7 @@ mod tests {
             local_relay_from: None,
             local_relay_also: vec![],
             local_relay_from_also: vec![],
+            replaces: None,
         };
         let s = serde_json::to_string(&req_with_t).unwrap();
         assert!(s.contains("\"preferred_transport\":\"data-channel-vp9-444\""));
@@ -5553,6 +5658,7 @@ mod tests {
             local_relay_from: None,
             local_relay_also: vec![],
             local_relay_from_also: vec![],
+            replaces: None,
         };
         let s = serde_json::to_string(&req_lr).unwrap();
         assert!(
@@ -5726,6 +5832,7 @@ mod tests {
             local_relay: None,
             local_relay_refused: None,
             local_relay_also: vec![],
+            resume_secs: None,
         };
         let none = serde_json::to_string(&mk(None)).unwrap();
         assert!(!none.contains("features_refused"), "{none}");
@@ -5800,6 +5907,7 @@ mod tests {
             local_relay: None,
             local_relay_refused: None,
             local_relay_also: vec![],
+            resume_secs: None,
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("idle_secs"), "{none}");
@@ -5854,6 +5962,7 @@ mod tests {
             local_relay: None,
             local_relay_refused: None,
             local_relay_also: vec![],
+            resume_secs: None,
         };
         let none = serde_json::to_string(&created(None)).unwrap();
         assert!(!none.contains("consent_asks"), "{none}");
@@ -9000,6 +9109,251 @@ mod tests {
             }
             .since(earlier),
             Tally::default()
+        );
+    }
+}
+
+/// FR-138 P1a — the session-resume wire, all additive: each new field is
+/// absent unless set, so an older peer never sees one, and an older peer's
+/// message parses with each defaulted. At the end of the file so no anchor
+/// above moves.
+#[cfg(test)]
+mod fr138_wire_tests {
+    use super::*;
+
+    const S1: &str = "507f1f77bcf86cd799439011";
+    const S2: &str = "507f1f77bcf86cd799439012";
+    const AGENT: &str = "507f1f77bcf86cd799439013";
+
+    fn oid(hex: &str) -> ObjectId {
+        ObjectId::parse_str(hex).unwrap()
+    }
+
+    fn hello(kept_sessions: Vec<ObjectId>) -> ClientMsg {
+        ClientMsg::AgentHello {
+            machine_name: "host".into(),
+            os: OsKind::Linux,
+            arch: String::new(),
+            arch_emulated: false,
+            agent_version: "0.4.208".into(),
+            displays: vec![],
+            caps: Box::new(AgentCaps {
+                rpc: vec!["rc-resume".into()],
+                ..Default::default()
+            }),
+            advertised_routes: vec![],
+            supports_relay_regions: true,
+            ssh_host_pubkey: String::new(),
+            peer_auth_key: String::new(),
+            kept_sessions,
+        }
+    }
+
+    fn kept_of(m: ClientMsg) -> Vec<ObjectId> {
+        match m {
+            ClientMsg::AgentHello { kept_sessions, .. } => kept_sessions,
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `kept_sessions` crosses as raw hex and only when it holds something;
+    /// a hello without it (every agent before FR-138) parses with none.
+    #[test]
+    fn the_hello_names_kept_sessions_only_when_it_kept_some() {
+        let none = serde_json::to_value(hello(vec![])).unwrap();
+        assert!(none.get("kept_sessions").is_none(), "{none}");
+        assert!(kept_of(serde_json::from_value(none).unwrap()).is_empty());
+
+        let two = serde_json::to_value(hello(vec![oid(S1), oid(S2)])).unwrap();
+        assert_eq!(two["kept_sessions"], serde_json::json!([S1, S2]));
+        assert_eq!(
+            kept_of(serde_json::from_value(two).unwrap()),
+            vec![oid(S1), oid(S2)]
+        );
+
+        // A hello as an agent before FR-138 sends it.
+        let older = serde_json::json!({
+            "t": "rc:agent.hello",
+            "machine_name": "host",
+            "os": "linux",
+            "agent_version": "0.4.206",
+            "displays": [],
+            "caps": {
+                "hw_encoders": [], "codecs": ["h264"], "has_input_permission": false,
+                "supports_clipboard": false, "supports_file_transfer": false,
+                "max_simultaneous_sessions": 2, "rpc": ["exec", "media-plan"],
+            },
+        });
+        assert!(kept_of(serde_json::from_value(older).unwrap()).is_empty());
+    }
+
+    fn request(replaces: Option<ObjectId>) -> ClientMsg {
+        ClientMsg::SessionRequest {
+            agent_id: oid(AGENT),
+            permissions: Permissions::VIEW,
+            browser_caps: vec![],
+            preferred_transport: None,
+            chroma_pref: None,
+            chunk_framing: None,
+            audio_enabled: false,
+            override_reason: None,
+            local_relay: None,
+            local_relay_from: None,
+            local_relay_also: vec![],
+            local_relay_from_also: vec![],
+            replaces,
+        }
+    }
+
+    fn replaces_of(m: ClientMsg) -> Option<ObjectId> {
+        match m {
+            ClientMsg::SessionRequest { replaces, .. } => replaces,
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `replaces` crosses as raw hex and only on a redial of a held session;
+    /// a request without it (every viewer before FR-138) parses with none.
+    #[test]
+    fn a_request_names_what_it_replaces_only_when_it_replaces_something() {
+        let fresh = serde_json::to_value(request(None)).unwrap();
+        assert!(fresh.get("replaces").is_none(), "{fresh}");
+        assert_eq!(replaces_of(serde_json::from_value(fresh).unwrap()), None);
+
+        let redial = serde_json::to_value(request(Some(oid(S1)))).unwrap();
+        assert_eq!(redial["replaces"], S1);
+        assert_eq!(
+            replaces_of(serde_json::from_value(redial).unwrap()),
+            Some(oid(S1))
+        );
+
+        let older =
+            format!(r#"{{"t":"rc:session.request","agent_id":"{AGENT}","permissions":"VIEW"}}"#);
+        assert_eq!(replaces_of(serde_json::from_str(&older).unwrap()), None);
+    }
+
+    fn created(resume_secs: Option<u32>) -> ServerMsg {
+        ServerMsg::SessionCreated {
+            session_id: oid(S1),
+            agent_id: oid(AGENT),
+            permissions: None,
+            record_refused: None,
+            privacy_refused: None,
+            features_refused: None,
+            idle_secs: None,
+            consent_asks: None,
+            local_relay: None,
+            local_relay_refused: None,
+            local_relay_also: vec![],
+            resume_secs,
+        }
+    }
+
+    fn resume_secs_of(m: ServerMsg) -> Option<u32> {
+        match m {
+            ServerMsg::SessionCreated { resume_secs, .. } => resume_secs,
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// `resume_secs` is on `rc:session.created` only for a session that may
+    /// be held, so a server with the window off sends what it sent before.
+    #[test]
+    fn session_created_says_resume_secs_only_for_a_session_that_may_be_held() {
+        let off = serde_json::to_value(created(None)).unwrap();
+        assert!(off.get("resume_secs").is_none(), "{off}");
+        assert_eq!(resume_secs_of(serde_json::from_value(off).unwrap()), None);
+
+        let held = serde_json::to_value(created(Some(60))).unwrap();
+        assert_eq!(held["resume_secs"], 60);
+        assert_eq!(
+            resume_secs_of(serde_json::from_value(held).unwrap()),
+            Some(60)
+        );
+
+        let older =
+            format!(r#"{{"t":"rc:session.created","session_id":"{S1}","agent_id":"{AGENT}"}}"#);
+        assert_eq!(resume_secs_of(serde_json::from_str(&older).unwrap()), None);
+    }
+
+    /// The four new messages: their tags, their ids as raw hex, and a round
+    /// trip each. A window of 0 is a withdrawal, not an absent window.
+    #[test]
+    fn the_four_new_messages_round_trip_under_their_tags() {
+        let window = serde_json::to_value(ServerMsg::AgentResumeWindow { secs: 60 }).unwrap();
+        assert_eq!(
+            window,
+            serde_json::json!({ "t": "rc:agent.resume_window", "secs": 60 })
+        );
+        let withdraw: ServerMsg =
+            serde_json::from_str(r#"{"t":"rc:agent.resume_window","secs":0}"#).unwrap();
+        assert!(matches!(withdraw, ServerMsg::AgentResumeWindow { secs: 0 }));
+
+        let resumed = serde_json::to_value(ServerMsg::SessionResumed {
+            session_id: oid(S1),
+        })
+        .unwrap();
+        assert_eq!(
+            resumed,
+            serde_json::json!({ "t": "rc:session.resumed", "session_id": S1 })
+        );
+        match serde_json::from_value::<ServerMsg>(resumed).unwrap() {
+            ServerMsg::SessionResumed { session_id } => assert_eq!(session_id, oid(S1)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let detached = serde_json::to_value(ServerMsg::SessionDetached {
+            session_id: oid(S1),
+            resume_by: 1_762_700_060_000,
+        })
+        .unwrap();
+        assert_eq!(
+            detached,
+            serde_json::json!({
+                "t": "rc:session.detached",
+                "session_id": S1,
+                "resume_by": 1_762_700_060_000_u64,
+            })
+        );
+        match serde_json::from_value::<ServerMsg>(detached).unwrap() {
+            ServerMsg::SessionDetached {
+                session_id,
+                resume_by,
+            } => assert_eq!((session_id, resume_by), (oid(S1), 1_762_700_060_000)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let rejoin = ClientMsg::SessionRejoin {
+            session_id: oid(S1),
+        };
+        let v = serde_json::to_value(&rejoin).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "t": "rc:session.rejoin", "session_id": S1 })
+        );
+        assert_eq!(rejoin.wire_tag(), "rc:session.rejoin");
+        match serde_json::from_value::<ClientMsg>(v).unwrap() {
+            ClientMsg::SessionRejoin { session_id } => assert_eq!(session_id, oid(S1)),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The rejoin is a controller's message, so the remote module owns it,
+    /// whatever its `rc:session.*` prefix shares with the stats the agent
+    /// sends.
+    #[test]
+    fn the_rejoin_is_the_remote_modules() {
+        let rejoin = ClientMsg::SessionRejoin {
+            session_id: oid(S1),
+        };
+        assert_eq!(rejoin.namespace(), Owner::Remote);
+        assert_eq!(
+            CLIENT_MSG_OWNERS
+                .iter()
+                .filter(|(t, _)| *t == "rc:session.rejoin")
+                .map(|(_, o)| *o)
+                .collect::<Vec<_>>(),
+            vec![Owner::Remote]
         );
     }
 }

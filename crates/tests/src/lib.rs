@@ -266,6 +266,11 @@ mod rc_idle_limit_tests;
 mod rc_no_common_codec_tests;
 #[cfg(test)]
 mod rc_request_ceiling_tests;
+/// FR-138 P1a — the session-resume wire, row and scope, all inert: the scope
+/// is a platform admin's, an audit listing reads the new kinds and an unknown
+/// one, and at the window's default of 0 the new wire changes nothing.
+#[cfg(test)]
+mod rc_resume_tests;
 #[cfg(test)]
 mod rc_session_limits_tests;
 #[cfg(test)]

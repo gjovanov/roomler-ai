@@ -1029,7 +1029,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 | side | where | what it does |
 |---|---|---|
 | the device | `record_grant` ([`ssh.rs:3004`](../agents/roomlerd/src/ssh.rs#L3004)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3036-3045`), so a skewed clock stays visible |
-| the server | `decide` ([`agent_ssh.rs:435`](../crates/modules/network/src/routes/agent_ssh.rs#L435)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2562`](../crates/remote_control/src/models.rs#L2562)), on `rc:ssh.grant` (`agent_ssh.rs:455`) and in the FR-105 `ssh_pending` row the service claims (`:481`). The caller's copy stays mint + 60 s |
+| the server | `decide` ([`agent_ssh.rs:435`](../crates/modules/network/src/routes/agent_ssh.rs#L435)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2575`](../crates/remote_control/src/models.rs#L2575)), on `rc:ssh.grant` (`agent_ssh.rs:455`) and in the FR-105 `ssh_pending` row the service claims (`:481`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
 `min(expires_at_ms − now, 60 s)`. From the server release that carries it they
@@ -1047,7 +1047,7 @@ server's. These bounds hold whatever the device's clock says:
 
 1. **FR-83.** The caller is told where to dial only once the target's
    `rc:ssh.grant_ack` is back, within `GRANT_ACK_TIMEOUT_SECS` (10 s,
-   `models.rs:2574`). Later than that the answer is `grant_unconfirmed`
+   `models.rs:2587`). Later than that the answer is `grant_unconfirmed`
    (`agent_ssh.rs:589`), never an address.
 2. **FR-105.** The SYSTEM service can claim a via-service grant only before
    `claim_by`, mint + 10 s on the server's clock (`agent_ssh.rs:486`; the claim
@@ -1056,9 +1056,9 @@ server's. These bounds hold whatever the device's clock says:
    session (`agents/roomler-cli/src/sshcmd.rs:46`) and drops it on any refusal
    (`:59-61`), so a grant that lands late admits a key nobody holds.
 4. **A queued grant dies with its connection.** It waits on the connection's
-   own queue (`crates/modules/fleet/src/hub.rs:3104`), so a reconnect drops it,
+   own queue (`crates/modules/fleet/src/hub.rs:3110`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
-   `agents/roomlerd/src/signaling.rs:63`, checked at `:2322`) reconnects. On a
+   `agents/roomlerd/src/signaling.rs:63`, checked at `:2325`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
    (`agents/roomlerd/src/ssh.rs:2951`), and no window longer than 60 s from
@@ -1070,7 +1070,7 @@ One case is left: a caller of the HTTP route who keeps a reusable key after a
 could then be redeemed up to about 165 s after mint, instead of 60 s. That
 matters only if the caller's authorization was revoked in between, and a
 redeemed session already outlives a revocation for its `session_secs` (12 h at
-most, `MAX_SESSION_SECS`, `models.rs:2578`). #3511 records that decision.
+most, `MAX_SESSION_SECS`, `models.rs:2591`). #3511 records that decision.
 
 | | server before #3511 | server with #3511 |
 |---|---|---|
@@ -1130,7 +1130,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4181`](../agents/roomlerd/src/signaling.rs#L4181), [`:5706`](../agents/roomlerd/src/signaling.rs#L5706)), as the recording question does
+first the same way ([`signaling.rs:4184`](../agents/roomlerd/src/signaling.rs#L4184), [`:5709`](../agents/roomlerd/src/signaling.rs#L5709)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
@@ -1623,9 +1623,9 @@ stay, each for a reason that outlives it:
 
 | What stays | Why | Where | It may go when |
 |---|---|---|---|
-| `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:848` | no agent at 0.4.199 or older is left (FR-137 D8) |
+| `ssh_ticket` on `ClientMsg::SshRequest`, parse-only, sent by no build | a 0.4.199 agent still sends it, and `ClientMsg` ignores a field it does not know: dropped from the wire, a ticketed request would parse as the device owner's own | `crates/remote_control/src/signaling.rs:858` | no agent at 0.4.199 or older is left (FR-137 D8) |
 | a request that carries one is refused `TicketRefused` and audited, never served as the owner's | the same | bound to a refused caller at `crates/modules/network/src/agent_arms.rs:193`, refused at `crates/modules/network/src/routes/agent_ssh.rs:338`, and recorded by `dispatch` like any refusal | with the field |
-| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5150-5160` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
+| `SshDenyReason::{TicketRefused, SessionNotAllowed, TargetTooOld}` (`ticket_refused`, `session_not_allowed`, `target_too_old`) | `ssh_audit` keeps its rows for 90 days and the enum is strict, with no `#[serde(other)]`: one unknown word fails a whole listing. No build writes the last two now | `crates/remote_control/src/models.rs:5163-5173` | 90 days after P1's roll of 2026-11-04, so 2027-02-02 at the earliest (FR-137 D7); `ticket_refused` goes with the field |
 
 A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `claim_service_grant` reads no query, so the word is ignored
@@ -1635,7 +1635,7 @@ A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `a_ticketed_ssh_request_is_refused_and_audited`
 (`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
 (`:118`) and `ssh_audit_rows_written_before_p2_still_load`
-(`crates/remote_control/src/models.rs:8860`) lock it. The other surfaces FR-90
+(`crates/remote_control/src/models.rs:8946`) lock it. The other surfaces FR-90
 left reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 

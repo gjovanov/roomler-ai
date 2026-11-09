@@ -96,7 +96,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | Site | Where |
 |---|---|
 | `AuthAgent` (every agent HTTP route) | `generation_refusal`, `crates/modules/fleet/src/auth_agent.rs:96` |
-| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1373` |
+| the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1377` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2108` |
 | the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:354` |

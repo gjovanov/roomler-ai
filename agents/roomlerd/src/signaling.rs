@@ -1925,6 +1925,9 @@ async fn connect_once(
         // connection (one key per org, never shared): made on the first
         // hello, kept beside the config, and offered only once it is on disk.
         peer_auth_key: crate::peer_auth::hello_key(remote_cfg.config_path(), &cfg.tenant_id),
+        // FR-138 — the sessions kept through the last socket's loss, claimed
+        // back. This build keeps none (P2a does), so it claims none.
+        kept_sessions: Vec::new(),
     };
     send_msg(&mut ws, &hello).await.context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't

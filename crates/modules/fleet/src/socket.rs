@@ -70,6 +70,10 @@ pub async fn handle_agent_socket(
             supports_relay_regions,
             ssh_host_pubkey,
             peer_auth_key,
+            // FR-138 — the device's claim on the sessions it kept, read from
+            // P1b. Nothing is announced a window before then, so a device
+            // keeps nothing and claims nothing.
+            kept_sessions: _,
         }) => (
             machine_name,
             os,
