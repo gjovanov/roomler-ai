@@ -75,7 +75,7 @@ run "clippy-workspace"   cargo clippy --workspace -- -D warnings
 # and then failed in CI (#707) — a local script that cannot catch what CI
 # catches just sends you to CI to find out.
 run "clippy-server-crates" \
-  cargo clippy -p roomler-ai-api -p roomler-ai-services --all-targets -- -D warnings
+  bash "$(dirname "$0")/clippy-audited-crates.sh"   # CI's command (#3594): + every module crate
 run "test-api-lib"       cargo test -p roomler-ai-api --lib
 run "test-services-lib"  cargo test -p roomler-ai-services --lib
 run "check-tests-crate"  cargo check -p roomler-ai-tests --all-targets

@@ -1367,6 +1367,166 @@ fn mesh_link_doc(l: &roomler_ai_remote_control::signaling::PeerLink) -> bson::Do
     }
 }
 
+/// The `/ws?role=agent` upgrade (FR-69 P7b, from the host): verify the agent
+/// JWT, the affinity key and the row, say why on refusal, then run the loop.
+/// The host keeps the `/ws` route and the role gate and hands the token here.
+pub async fn ws_upgrade_agent(
+    state: FleetState,
+    token: String,
+    tid: Option<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let claims = match state.auth.verify_agent_token(&token) {
+        Ok(c) => c,
+        Err(_) => {
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (agent)".into())
+                .unwrap();
+        }
+    };
+
+    // S6 — a present affinity key must match the token's tenant.
+    if !tid_matches_claim(&tid, &claims.tenant_id) {
+        return Response::builder()
+            .status(403)
+            .body("tid does not match token tenant".into())
+            .unwrap();
+    }
+
+    let agent_id = match ObjectId::parse_str(&claims.sub) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid agent ID".into())
+                .unwrap();
+        }
+    };
+    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Response::builder()
+                .status(400)
+                .body("Invalid tenant ID".into())
+                .unwrap();
+        }
+    };
+
+    // Verify the agent still exists and isn't quarantined/deleted before we
+    // pump any signalling. One Mongo read per connect is cheap and gives us a
+    // clean revocation story without needing a token blacklist.
+    //
+    // FR-103 — read BEFORE the upgrade, so a token minted before the device
+    // was removed (`generation_refusal`) is answered with the same plain 401
+    // as an expired one, which the daemon already treats as "auth rejected".
+    // Only a LIVE row is judged here: a deleted or quarantined one still
+    // upgrades and hears its typed goodbye below, and a failed read falls
+    // through to the same read inside the upgrade, as before. So this can
+    // only ADD a refusal, never lose one.
+    //
+    // #2463 — and NO row at all is refused here too, with the same plain 401
+    // `auth_agent` gives the HTTP routes for it ("no such device"). FR-51
+    // hard-deletes a reaped ephemeral row, so `NotFound` is Mongo's
+    // authoritative answer, not a wobble. Before this, the read inside the
+    // upgrade failed the same way and dropped the socket with no frame: the
+    // daemon read a network fault and reconnected every minute, forever,
+    // never hearing that its credential is dead. On 401 it recovers its token
+    // once, then waits out its auth ladder (up to an hour) and raises the
+    // re-enrollment sentinel. ⚠️ `NotFound` ONLY: any other error (a Mongo
+    // blip) still falls through, never reads as "gone".
+    let pre_read = match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
+        Ok(row) => Some(row),
+        Err(roomler_ai_services::dao::base::DaoError::NotFound) => {
+            info!(%agent_id, %tenant_id, "refusing agent WS: row gone (a reaped ephemeral device?)");
+            return Response::builder()
+                .status(401)
+                .body("Unauthorized (agent)".into())
+                .unwrap();
+        }
+        Err(_) => None,
+    };
+    if let Some(row) = &pre_read
+        && crate::auth_agent::refusal_reason(row).is_none()
+        && let Some(reason) = crate::auth_agent::generation_refusal(
+            claims.generation,
+            row.token_gen,
+            state.settings.rc.token_generation_check,
+        )
+    {
+        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token predates the device's removal");
+        return Response::builder()
+            .status(401)
+            .body("Unauthorized (agent)".into())
+            .unwrap();
+    }
+    let token_exp = claims.exp;
+
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            // ANY, not live (#1821): the tombstone is what this read is FOR.
+            // A removed device must reach the `refusal_reason` arm below and
+            // get the typed `rc:goodbye AgentDeleted` it exits 7 on; a bare
+            // `NotFound` here drops the socket with no frame, and the daemon
+            // reads that as a network fault and reconnects forever. (#2463: a
+            // row already gone is refused with 401 before the upgrade; this
+            // read meets `NotFound` only when the row went in between.)
+            let agent = match pre_read {
+                Some(a) => a,
+                None => match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(%agent_id, %e, "agent lookup failed on WS connect");
+                        return;
+                    }
+                },
+            };
+            // One definition of "this agent may still act", shared with the
+            // HTTP ingest routes' `AuthAgent` extractor. This path is the
+            // original; the extractor exists because two HTTP routes had
+            // silently never grown the equivalent.
+            if let Some(reason) = crate::auth_agent::refusal_reason(&agent) {
+                // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
+                // text frame + a Close frame BEFORE dropping the socket so
+                // the agent can log a useful "your row was deleted, re-enrol"
+                // line instead of an opaque `ws read` (the failure mode
+                // WINHOST-B wedged on for hours pre-rc.53). The agent's
+                // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
+                // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
+                // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
+                // FIRST exit.
+                info!(%agent_id, reason, "refusing WS with rc:goodbye");
+                let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
+                    reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
+                    message: "This agent's server-side row was deleted (or quarantined). \
+                          Re-enrol with a fresh enrollment token from the admin UI to \
+                          revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
+                        .into(),
+                };
+                send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
+                return;
+            }
+            // FR-103 — what the device list shows as "the credential expires".
+            // Best-effort, like the hello write: a failure loses a date, never
+            // the connection.
+            if let Err(e) = state.agents.stamp_token_exp(agent_id, token_exp).await {
+                warn!(%agent_id, %e, "agent token_exp stamp failed");
+            }
+            // FR-69 P5c — the socket is the fleet module's; the host keeps
+            // the upgrade and the role gate (D7), the module runs the loop.
+            handle_agent_socket(
+                state.clone(),
+                socket,
+                agent_id,
+                tenant_id,
+                agent.owner_user_id,
+                tid,
+            )
+            .await;
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1560,164 +1720,4 @@ mod tests {
             other => panic!("a FIN with no close frame read {other:?}"),
         }
     }
-}
-
-/// The `/ws?role=agent` upgrade (FR-69 P7b, from the host): verify the agent
-/// JWT, the affinity key and the row, say why on refusal, then run the loop.
-/// The host keeps the `/ws` route and the role gate and hands the token here.
-pub async fn ws_upgrade_agent(
-    state: FleetState,
-    token: String,
-    tid: Option<String>,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let claims = match state.auth.verify_agent_token(&token) {
-        Ok(c) => c,
-        Err(_) => {
-            return Response::builder()
-                .status(401)
-                .body("Unauthorized (agent)".into())
-                .unwrap();
-        }
-    };
-
-    // S6 — a present affinity key must match the token's tenant.
-    if !tid_matches_claim(&tid, &claims.tenant_id) {
-        return Response::builder()
-            .status(403)
-            .body("tid does not match token tenant".into())
-            .unwrap();
-    }
-
-    let agent_id = match ObjectId::parse_str(&claims.sub) {
-        Ok(id) => id,
-        Err(_) => {
-            return Response::builder()
-                .status(400)
-                .body("Invalid agent ID".into())
-                .unwrap();
-        }
-    };
-    let tenant_id = match ObjectId::parse_str(&claims.tenant_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return Response::builder()
-                .status(400)
-                .body("Invalid tenant ID".into())
-                .unwrap();
-        }
-    };
-
-    // Verify the agent still exists and isn't quarantined/deleted before we
-    // pump any signalling. One Mongo read per connect is cheap and gives us a
-    // clean revocation story without needing a token blacklist.
-    //
-    // FR-103 — read BEFORE the upgrade, so a token minted before the device
-    // was removed (`generation_refusal`) is answered with the same plain 401
-    // as an expired one, which the daemon already treats as "auth rejected".
-    // Only a LIVE row is judged here: a deleted or quarantined one still
-    // upgrades and hears its typed goodbye below, and a failed read falls
-    // through to the same read inside the upgrade, as before. So this can
-    // only ADD a refusal, never lose one.
-    //
-    // #2463 — and NO row at all is refused here too, with the same plain 401
-    // `auth_agent` gives the HTTP routes for it ("no such device"). FR-51
-    // hard-deletes a reaped ephemeral row, so `NotFound` is Mongo's
-    // authoritative answer, not a wobble. Before this, the read inside the
-    // upgrade failed the same way and dropped the socket with no frame: the
-    // daemon read a network fault and reconnected every minute, forever,
-    // never hearing that its credential is dead. On 401 it recovers its token
-    // once, then waits out its auth ladder (up to an hour) and raises the
-    // re-enrollment sentinel. ⚠️ `NotFound` ONLY: any other error (a Mongo
-    // blip) still falls through, never reads as "gone".
-    let pre_read = match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
-        Ok(row) => Some(row),
-        Err(roomler_ai_services::dao::base::DaoError::NotFound) => {
-            info!(%agent_id, %tenant_id, "refusing agent WS: row gone (a reaped ephemeral device?)");
-            return Response::builder()
-                .status(401)
-                .body("Unauthorized (agent)".into())
-                .unwrap();
-        }
-        Err(_) => None,
-    };
-    if let Some(row) = &pre_read
-        && crate::auth_agent::refusal_reason(row).is_none()
-        && let Some(reason) = crate::auth_agent::generation_refusal(
-            claims.generation,
-            row.token_gen,
-            state.settings.rc.token_generation_check,
-        )
-    {
-        info!(%agent_id, reason, row_gen = row.token_gen, "refusing agent WS: token predates the device's removal");
-        return Response::builder()
-            .status(401)
-            .body("Unauthorized (agent)".into())
-            .unwrap();
-    }
-    let token_exp = claims.exp;
-
-    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
-        .max_frame_size(MAX_WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| async move {
-            // ANY, not live (#1821): the tombstone is what this read is FOR.
-            // A removed device must reach the `refusal_reason` arm below and
-            // get the typed `rc:goodbye AgentDeleted` it exits 7 on; a bare
-            // `NotFound` here drops the socket with no frame, and the daemon
-            // reads that as a network fault and reconnects forever. (#2463: a
-            // row already gone is refused with 401 before the upgrade; this
-            // read meets `NotFound` only when the row went in between.)
-            let agent = match pre_read {
-                Some(a) => a,
-                None => match state.agents.find_any_in_tenant(tenant_id, agent_id).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!(%agent_id, %e, "agent lookup failed on WS connect");
-                        return;
-                    }
-                },
-            };
-            // One definition of "this agent may still act", shared with the
-            // HTTP ingest routes' `AuthAgent` extractor. This path is the
-            // original; the extractor exists because two HTTP routes had
-            // silently never grown the equivalent.
-            if let Some(reason) = crate::auth_agent::refusal_reason(&agent) {
-                // rc.53: push a `ServerMsg::Goodbye { reason: AgentDeleted }`
-                // text frame + a Close frame BEFORE dropping the socket so
-                // the agent can log a useful "your row was deleted, re-enrol"
-                // line instead of an opaque `ws read` (the failure mode
-                // WINHOST-B wedged on for hours pre-rc.53). The agent's
-                // `handle_server_msg::ServerMsg::Goodbye` arm decides this is
-                // fatal + exits with `AGENT_DELETED_EXIT_CODE = 7`, which
-                // the SCM supervisor's rc.53 code-7 fast-alarm fires on the
-                // FIRST exit.
-                info!(%agent_id, reason, "refusing WS with rc:goodbye");
-                let goodbye = roomler_ai_remote_control::signaling::ServerMsg::Goodbye {
-                    reason: roomler_ai_remote_control::signaling::AgentCloseReason::AgentDeleted,
-                    message: "This agent's server-side row was deleted (or quarantined). \
-                          Re-enrol with a fresh enrollment token from the admin UI to \
-                          revive (soft-deleted rows rehydrate by (tenant_id, machine_id))."
-                        .into(),
-                };
-                send_goodbye_and_close(socket, &goodbye, 4003, "agent_deleted").await;
-                return;
-            }
-            // FR-103 — what the device list shows as "the credential expires".
-            // Best-effort, like the hello write: a failure loses a date, never
-            // the connection.
-            if let Err(e) = state.agents.stamp_token_exp(agent_id, token_exp).await {
-                warn!(%agent_id, %e, "agent token_exp stamp failed");
-            }
-            // FR-69 P5c — the socket is the fleet module's; the host keeps
-            // the upgrade and the role gate (D7), the module runs the loop.
-            handle_agent_socket(
-                state.clone(),
-                socket,
-                agent_id,
-                tenant_id,
-                agent.owner_user_id,
-                tid,
-            )
-            .await;
-        })
 }
