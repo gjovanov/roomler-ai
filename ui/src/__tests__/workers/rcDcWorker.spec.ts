@@ -505,6 +505,57 @@ describe.each(DC_CODECS)("#3566 — the page's timestamps through the measured s
     expect(sum((after!.media as Record<string, unknown>).fwd)).toBe(2)
   })
 
+  // #3596 — the skew is off by up to half its round trip plus the clock's
+  // grain, for the worker's whole life, and a relay hop is that size.
+  it("counts a hop that reads just below zero, inside the skew's error, as 0, and drops one far below", async () => {
+    const { send } = await boot({ codec })
+    // Measured on a 0.1 ms round trip: the band is 0.25 ms.
+    send({ type: 'clock-cal', skewMs: SKEW, rttMs: 0.1 })
+    send({ type: 'chunk', bytes: bare(true, 1), sentAt: pageNow() + 0.05 }) // reads −0.05 ms
+    FakeDecoder.instances[0]!.init.output(new FakeFrame(1, 1920, 1080, rect(1920, 1080)))
+    send({ type: 'chunk', bytes: bare(false, 2), sentAt: pageNow() + 5 }) // reads −5 ms
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 3), sentAt: pageNow() - 2 }) // reads 2 ms
+    const stats = ofType('stats')
+    expect(stats).toHaveLength(1)
+    expect(stats[0]!.fwd, 'the −0.05 ms hop as 0 and the 2 ms one; not the −5 ms one').toMatchObject({
+      n: 2,
+      minMs: 0,
+      maxMs: 2,
+      avgMs: 1,
+    })
+    const fwd = (stats[0]!.media as Record<string, unknown>).fwd as number[]
+    expect(fwd[0], "N9's [0,1) bucket, the relay's").toBe(1)
+    expect(sum(fwd)).toBe(2)
+  })
+
+  it('drops a hop that reads just below zero, as before, when the skew comes without its round trip', async () => {
+    const { send } = await boot({ codec })
+    send({ type: 'clock-cal', skewMs: SKEW })
+    send({ type: 'chunk', bytes: bare(true, 1), sentAt: pageNow() + 0.05 }) // reads −0.05 ms
+    FakeDecoder.instances[0]!.init.output(new FakeFrame(1, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 2), sentAt: pageNow() - 2 }) // reads 2 ms
+    const stats = ofType('stats')[0]!
+    expect(stats.fwd).toMatchObject({ n: 1, minMs: 2, maxMs: 2 })
+    const fwd = (stats.media as Record<string, unknown>).fwd as number[]
+    expect(fwd[0]).toBe(0)
+    expect(sum(fwd)).toBe(1)
+  })
+
+  it('forgets the band with the skew when its session closes', async () => {
+    const { send } = await boot({ codec })
+    send({ type: 'clock-cal', skewMs: SKEW, rttMs: 0.1 })
+    send({ type: 'close' })
+    send({ type: 'init-canvas', canvas: fakeCanvas(), codec })
+    // With no skew a stamp is read on the worker's own clock: this one reads −0.05 ms.
+    send({ type: 'chunk', bytes: bare(true, 1), sentAt: performance.timeOrigin + clock + 0.05 })
+    FakeDecoder.instances[1]!.init.output(new FakeFrame(1, 1920, 1080, rect(1920, 1080)))
+    clock += 1_200
+    send({ type: 'chunk', bytes: bare(false, 2), sentAt: performance.timeOrigin + clock - 2 })
+    expect(ofType('stats')[0]!.fwd).toMatchObject({ n: 1, minMs: 2 })
+  })
+
   /** A frame framed now, whole at the worker 12 ms later and painted 18 ms after
    *  that, with the agent's clock 50 s into its process. Returns the window. */
   async function oneFrame(skewMs: number | null) {

@@ -261,7 +261,7 @@ not been measured.
 only behind `roomler-rc-unordered-video=1` (`storedUnorderedVideo`, `:5085`). FR-59's
 criterion for the flip: an airport-class session with the opt-in ON showing
 `chunkStragglers` climbing while `chunkGaps` stays flat and fps holds — both counters are
-in the worker's stats (`rc-dc-worker.ts:443`). Stragglers
+in the worker's stats (`rc-dc-worker.ts:450`). Stragglers
 rising with steady fps is the transport working; gaps rising is real loss costing an IDR
 each. The flip cannot be scoped to constrained paths (the deviation recorded under B), so
 it is a fleet-wide decision — and it should wait on the field read of #3112's repair

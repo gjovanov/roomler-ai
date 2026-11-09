@@ -11,12 +11,12 @@
  *
  * Hops measured:
  *  - `fwd`    — main-thread DC `onmessage` → worker `chunk` arrival, on
- *               one clock: the page's `sentAt` is read through the skew
- *               the page measured when it started the worker (#3566,
- *               `rc-clock-cal.ts`), since `epochNowMs` is not one clock
- *               across contexts. Before it, a hop shorter than the skew
- *               read negative and was dropped. The relay only: a channel
- *               moved into the worker (FR-135 R3) has no page hop, no `fwd`.
+ *               one clock (`epochNowMs` is not one across contexts): the
+ *               page's `sentAt` is read through the skew the page measured
+ *               when it started the worker (#3566, `rc-clock-cal.ts`). A
+ *               reading below zero within the skew's error counts as 0, and
+ *               one further below is dropped (#3596). The relay only: a
+ *               channel moved into the worker (FR-135 R3) has no page hop.
  *  - `decode` — `decoder.decode(chunk)` submission → `output` callback
  *               (queue + decoder latency; indicts the decoder itself).
  *  - `paint`  — the `paintFrame` body (canvas blit cost).

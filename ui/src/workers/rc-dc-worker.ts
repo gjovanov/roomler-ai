@@ -74,8 +74,10 @@ import { createDecodeRecovery } from './rc-decode-recovery'
 import { createViewerMediaRecorder } from './rc-media-window'
 import { createDeliveryGapClock, type VideoChannelMessage } from './rc-video-channel'
 import {
+  calBandMs,
   clockCalPong,
   fwdHopMs,
+  fwdSampleMs,
   normalizeSkewMs,
   toPageEpochMs,
   workerAgentOffsetUs,
@@ -372,6 +374,11 @@ let clockOffsetUs: number | null = null
 // arrives, and for a session that measures none: the reading of before, bit for
 // bit. The worker's own differences (`queueMs`, `viewer`, `decode`) need none.
 let pageSkewMs = 0
+// #3596 — how far below zero a relayed hop read through that skew can fall
+// and still be a real hop: the skew's error, from the round trip the page
+// measured it on (`calBandMs`). 0 until that arrives, and for a session that
+// measures none, so each `fwd` reading is as before.
+let pageSkewBandMs = 0
 let outGapMaxMs = 0
 // Decode-submission times keyed by chunk timestamp, matched in the output
 // callback → submit→output latency, and (FR-119 P2b-7) the decode backlog the
@@ -547,8 +554,10 @@ workerScope.onmessage = (e) => {
   } else if (msg.type === 'clock-offset') {
     clockOffsetUs = typeof msg.offsetUs === 'number' ? msg.offsetUs : null
   } else if (msg.type === 'clock-cal') {
-    // #3566 — the skew the page measured, once, when it started this worker.
+    // #3566 — the skew the page measured, once, when it started this worker,
+    // and (#3596) how far below zero its error lets a real `fwd` hop read.
     pageSkewMs = normalizeSkewMs(msg.skewMs)
+    pageSkewBandMs = calBandMs(msg.rttMs)
   } else if (msg.type === 'media-hold') {
     // FR-135 R0c — the agent announced a capture hold: its gap is no freeze.
     mediaWindow.onHold()
@@ -583,10 +592,13 @@ workerScope.onmessageerror = () => {
 function onChunk(bytes: ArrayBuffer, sentAt: number | undefined): void {
   framesReceived++
   if (typeof sentAt === 'number') {
-    // #3566 — `sentAt` is on the page's clock: read through the skew.
-    const fwdMs = fwdHopMs(epochNowMs(), sentAt, pageSkewMs)
-    fwdStats.add(fwdMs)
-    mediaWindow.onForward(fwdMs)
+    // #3566 — `sentAt` is on the page's clock: read through the skew. #3596 — a
+    // reading below zero by no more than the skew's error is a real hop, as 0.
+    const fwdMs = fwdSampleMs(fwdHopMs(epochNowMs(), sentAt, pageSkewMs), pageSkewBandMs)
+    if (fwdMs !== null) {
+      fwdStats.add(fwdMs)
+      mediaWindow.onForward(fwdMs)
+    }
   }
   const u8 = new Uint8Array(bytes)
   statsBytesInWindow += u8.byteLength
@@ -1186,6 +1198,7 @@ function teardown(): void {
   arrivalQueueDrift.reset()
   clockOffsetUs = null
   pageSkewMs = 0
+  pageSkewBandMs = 0
   outGapMaxMs = 0
   mediaWindow.reset()
   // P7 — release the GL renderer; a fresh session re-creates lazily and
