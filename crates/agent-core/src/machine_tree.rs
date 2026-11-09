@@ -582,6 +582,13 @@ fn key_files(keys: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// An elevated save of the machine config takes the machine folder for
+/// Administrators before it writes. RED: master takes nothing over.
+#[cfg(windows)]
+pub fn adopt_machine_folder(_tree: &MachineTree) -> Result<bool, String> {
+    Ok(false)
+}
+
 /// B: may SYSTEM run the machine config under `tree`? `Ok` when the parent, the
 /// machine folder, the config, the keys folder and each key file the daemon
 /// loads are plain folders and files, owned by SYSTEM or Administrators, and no
@@ -670,6 +677,13 @@ pub fn private_machine_config(tree: &MachineTree, switches: Switches) -> Result<
 #[cfg(windows)]
 pub fn machine_config_opens(tree: &MachineTree, switches: Switches) -> bool {
     private_machine_config(tree, switches).is_ok()
+}
+
+/// Whether an elevated writer may fold a new enrollment into the machine
+/// config under `tree`. RED: master folds whatever is there.
+#[cfg(windows)]
+pub fn may_fold(_tree: &MachineTree, _switches: Switches) -> Result<(), String> {
+    Ok(())
 }
 
 /// Log what a repair changed, once per change, and what it left, once until
@@ -2551,6 +2565,84 @@ mod tests {
                 "the Administrators group names someone"
             );
             assert!(members.iter().all(|m| m.starts_with("S-1-")), "{members:?}");
+        }
+
+        /// A machine folder another account made (a person's daemon stages
+        /// received files below it before the service ever ran) keeps the
+        /// device waiting: the repair never takes it over. An elevated save
+        /// of the machine config does, the owner and nothing else, before it
+        /// writes; then the repair and the check pass, and what that account
+        /// made below the folder keeps its owner.
+        #[test]
+        fn an_elevated_save_takes_the_machine_folder_and_nothing_below_it() {
+            if !elevated_or_skip("the machine folder taken by an elevated save") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            let other = local_guest().unwrap_or_else(|| USERS.to_string());
+            let staging = tree.folder().join("staging");
+            std::fs::create_dir(&staging).unwrap();
+            for dir in [tree.folder(), staging.as_path()] {
+                assert!(icacls(dir, &["/setowner", &format!("*{other}")]));
+            }
+            std::fs::write(tree.config(), "agent_token = \"t\"\n").unwrap();
+            repair(&tree, true);
+            assert!(
+                matches!(
+                    private_machine_config(&tree, Switches::ON),
+                    Err(Refusal::NotPrivate(_))
+                ),
+                "without the save's adoption the device waits"
+            );
+            let before = sddl(tree.folder());
+            let staging_owner = owner(&sddl(&staging));
+            assert_ne!(staging_owner, "BA", "{staging_owner}");
+            assert_eq!(adopt_machine_folder(&tree), Ok(true));
+            let adopted = sddl(tree.folder());
+            assert_eq!(owner(&adopted), "BA", "{adopted}");
+            assert_eq!(aces(&adopted), aces(&before), "the owner only: {adopted}");
+            assert_eq!(protected(&adopted), protected(&before), "{adopted}");
+            repair(&tree, true);
+            assert_eq!(check(&tree), Ok(()));
+            let folder = sddl(tree.folder());
+            assert_eq!(owner(&folder), "BA", "{folder}");
+            assert!(sealed(&folder, true), "{folder}");
+            assert_eq!(
+                owner(&sddl(&staging)),
+                staging_owner,
+                "what that account made below keeps its owner"
+            );
+            assert_eq!(
+                adopt_machine_folder(&tree),
+                Ok(false),
+                "a folder Administrators own is left as it is"
+            );
+        }
+
+        /// The adoption takes a plain folder only: a machine folder that
+        /// leads elsewhere is refused, naming it, and what it leads to keeps
+        /// its owner and DACL.
+        #[test]
+        fn a_machine_folder_that_leads_elsewhere_is_never_taken_over() {
+            if !elevated_or_skip("a machine folder that leads elsewhere, taken over") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            let elsewhere = root.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            let other = local_guest().unwrap_or_else(|| USERS.to_string());
+            assert!(icacls(&elsewhere, &["/setowner", &format!("*{other}")]));
+            std::fs::remove_dir(tree.folder()).unwrap();
+            junction(tree.folder(), &elsewhere);
+            let target = sddl(&elsewhere);
+            let why = adopt_machine_folder(&tree).expect_err("a junction is never taken over");
+            assert!(
+                why.contains(&tree.folder().display().to_string()),
+                "the reason names the entry: {why}"
+            );
+            assert_eq!(sddl(&elsewhere), target);
         }
 
         /// Put this process where the daemon is: SeBackup, SeRestore and

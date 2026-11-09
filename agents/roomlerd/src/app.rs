@@ -2983,6 +2983,7 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
              prompt).",
             config::describe_denied(&target, &reason)
         ),
+        config::MergeBase::NotPrivate { .. } => None,
     };
     let previous = existing.clone();
     let new_agent_id = fresh.agent_id.clone();

@@ -107,6 +107,10 @@ pub fn read_existing(path: &Path) -> Result<Existing, String> {
             tracing::warn!(path = %path.display(), %reason, "the existing config may not be read by this process");
             Err(roomlerd::config::describe_denied(path, &reason))
         }
+        MergeBase::NotPrivate { .. } => Ok(Existing {
+            cfg: None,
+            warning: None,
+        }),
     }
 }
 

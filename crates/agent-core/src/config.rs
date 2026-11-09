@@ -3592,6 +3592,15 @@ pub enum MergeBase {
         /// Why, on one line, for the person.
         reason: String,
     },
+    /// #3609 — Windows, the machine-global config: it is there, and after the
+    /// machine tree's repair it is still not private to the computer's
+    /// administrators. It is never folded into an enrollment: whoever else
+    /// could change it may have chosen what it holds. The caller writes a
+    /// fresh config in its place and says so ([`describe_not_private`]).
+    NotPrivate {
+        /// Why, on one line: the entry and the reason.
+        reason: String,
+    },
 }
 
 impl MergeBase {
@@ -3599,7 +3608,7 @@ impl MergeBase {
     /// none to give; a caller stops on it before it gets here.
     pub fn into_config(self) -> Option<AgentConfig> {
         match self {
-            MergeBase::Absent | MergeBase::Denied { .. } => None,
+            MergeBase::Absent | MergeBase::Denied { .. } | MergeBase::NotPrivate { .. } => None,
             MergeBase::Loaded(cfg) => Some(cfg),
             MergeBase::Unreadable { recovered, .. } => recovered,
         }
@@ -3627,6 +3636,37 @@ impl MergeBase {
 /// config is written, and this device's earlier settings do not carry over")
 /// would be false about a file that is only closed to the reader.
 pub fn read_merge_base(path: &PathBuf) -> MergeBase {
+    #[cfg(windows)]
+    if let Some(tree) = machine_tree_of(path) {
+        return machine_merge_base(path, &tree, crate::machine_tree::Switches::from_env());
+    }
+    merge_base(path, || Ok(()), try_load)
+}
+
+/// #3609 — [`read_merge_base`] at the machine-global location. RED: as
+/// anywhere else.
+#[cfg(windows)]
+fn machine_merge_base(
+    path: &PathBuf,
+    tree: &crate::machine_tree::MachineTree,
+    switches: crate::machine_tree::Switches,
+) -> MergeBase {
+    merge_base(
+        path,
+        || crate::machine_tree::may_fold(tree, switches),
+        try_load,
+    )
+}
+
+/// The merge base at `path`. `private` says, once the file is known to be
+/// there and open to this process, whether it may be folded into at all;
+/// `prev` reads the last good copy that a config which does not load is
+/// recovered from.
+fn merge_base(
+    path: &PathBuf,
+    private: impl FnOnce() -> Result<(), String>,
+    prev: impl FnOnce(&PathBuf) -> Result<AgentConfig>,
+) -> MergeBase {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MergeBase::Absent,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -3636,14 +3676,24 @@ pub fn read_merge_base(path: &PathBuf) -> MergeBase {
         }
         _ => {}
     }
-    match try_load(path) {
-        Ok(cfg) => MergeBase::Loaded(cfg),
-        Err(e) if permission_denied(&e) => MergeBase::Denied {
+    let loaded = try_load(path);
+    if let Err(e) = &loaded
+        && permission_denied(e)
+    {
+        return MergeBase::Denied {
             reason: one_line(&format!("{e:#}")),
-        },
+        };
+    }
+    if let Err(reason) = private() {
+        return MergeBase::NotPrivate {
+            reason: one_line(&reason),
+        };
+    }
+    match loaded {
+        Ok(cfg) => MergeBase::Loaded(cfg),
         Err(e) => MergeBase::Unreadable {
             reason: one_line(&format!("{e:#}")),
-            recovered: try_load(&prev_path(path)).ok(),
+            recovered: prev(&prev_path(path)).ok(),
         },
     }
 }
@@ -6704,6 +6754,157 @@ tenant_id = "tid2"
                 .into_config()
                 .is_some_and(|c| c.overlay_enabled)
         );
+    }
+
+    /// #3609 — the copy of a config that does not load goes into a new file of
+    /// its own. A file left under the copy's name keeps its owner and DACL
+    /// through a copy into it, and the copy can hold a bearer token. A hard
+    /// link to the file left there is the witness: it still reads what it held.
+    #[test]
+    fn the_unreadable_copy_is_never_written_into_a_file_it_did_not_make() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, vec![0u8; 16]).expect("a damaged config");
+        let dest = unreadable_copy_path(&path);
+        std::fs::write(&dest, b"made before").expect("a file left under the name");
+        let witness = dir.path().join("witness");
+        std::fs::hard_link(&dest, &witness).expect("a hard link");
+        let kept = keep_unreadable(&path).expect("kept");
+        assert_eq!(kept, dest);
+        assert_eq!(
+            std::fs::read(&witness).unwrap(),
+            b"made before",
+            "written into"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![0u8; 16]);
+    }
+
+    /// #3609 — what an elevated writer (Setup's machine write, `roomlerd enroll
+    /// --machine-global`, `roomlerd adopt-enrollment`) folds a new enrollment
+    /// into at the machine-global location: only a config that is private to
+    /// the computer's administrators once the machine tree is repaired. On
+    /// trees made by `machine_tree::test_support`, never the computer's own.
+    #[cfg(windows)]
+    mod machine_merge_base {
+        use super::*;
+        use crate::machine_tree::test_support::*;
+        use crate::machine_tree::{MachineTree, Switches};
+
+        fn base(tree: &MachineTree) -> MergeBase {
+            machine_merge_base(&tree.config(), tree, Switches::ON)
+        }
+
+        fn other_account() -> String {
+            local_guest().unwrap_or_else(|| USERS.to_string())
+        }
+
+        /// A config another account owns is never folded into: what it
+        /// holds may be that account's choice. The reason names it.
+        #[test]
+        fn a_machine_config_another_account_owns_is_never_folded() {
+            if !elevated_or_skip("a machine config another account owns, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            assert!(icacls(
+                &tree.config(),
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&format!("{} is owned by", tree.config().display())),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// The same for a config in a machine folder another account owns (a
+        /// person's daemon made it to stage files): that account may have put
+        /// any file there, whoever owns the file.
+        #[test]
+        fn a_machine_config_in_a_folder_another_account_owns_is_never_folded() {
+            if !elevated_or_skip("a machine folder another account owns, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            assert!(icacls(
+                tree.folder(),
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&format!("{} is owned by", tree.folder().display())),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// A config of an administrator's that another account's entry on its
+        /// folder reaches (Explorer's prompt) is repaired first, and then
+        /// folded: the device's settings carry over.
+        #[test]
+        fn a_drifted_machine_config_is_folded_once_repaired() {
+            if !elevated_or_skip("a drifted machine config, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+            ));
+            assert!(
+                names(&sddl(&tree.config()), GUESTS),
+                "it reaches the config"
+            );
+            match base(&tree) {
+                MergeBase::Loaded(cfg) => assert_eq!(cfg.machine_name, "devbox"),
+                other => panic!("{other:?}"),
+            }
+            let config = sddl(&tree.config());
+            assert!(
+                !names(&config, GUESTS),
+                "repaired before the fold: {config}"
+            );
+        }
+
+        /// A config that does not load is recovered from its last good copy
+        /// only when that copy is private too.
+        #[test]
+        fn a_damaged_machine_config_recovers_only_from_a_private_previous_copy() {
+            if !elevated_or_skip("a damaged machine config's recovery") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.config(), "overlay_enabled = ture\n").unwrap();
+            std::fs::write(tree.prev(), minimal_toml()).unwrap();
+            match base(&tree) {
+                MergeBase::Unreadable { recovered, .. } => assert!(
+                    recovered.is_some_and(|c| c.machine_name == "devbox"),
+                    "a private copy is recovered from"
+                ),
+                other => panic!("{other:?}"),
+            }
+            assert!(icacls(
+                &tree.prev(),
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            match base(&tree) {
+                MergeBase::Unreadable { recovered, .. } => assert!(
+                    recovered.is_none(),
+                    "a copy another account owns is never recovered from"
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     /// #3116 — a read this process is refused is `Denied`, never `Unreadable`:
