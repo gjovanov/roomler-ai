@@ -109,12 +109,12 @@ jobs:
       - name: Install bun (the docs dates manifest)
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.12
+          bun-version-file: .bun-version
 
       - name: Docs dates manifest
         run: |
           set -euo pipefail
-          cd ui
+          cd ui && echo "bun $(bun --version)"
           bun docs/dates.ts --write
 
       # #1896: the country database for the user analytics, DB-IP's CC BY 4.0

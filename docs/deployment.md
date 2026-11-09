@@ -45,7 +45,12 @@ One multi-stage `Dockerfile`:
    aggregate the api crate is built with) and `SAAS` (`1` adds the hosted service's
    billing + newsletter module). **The hosted build passes `PROFILE=full SAAS=1`** —
    also the defaults; the self-host publish workflow passes `SAAS=0` and asserts it.
-2. `oven/bun:1` — builds the Vue SPA
+2. `oven/bun:${BUN_VERSION}` — builds the Vue SPA. The build argument defaults to
+   [`.bun-version`](../.bun-version), bun's one record, which every workflow's `setup-bun`
+   step reads too, so the image builds with the bun CI tested and prints `bun --version` in
+   its build log. `scripts/bun-version-check.sh` (in the frontend checks) fails when the
+   default or a workflow drifts from the record (#3400). Until then the stage ran on
+   `oven/bun:1`, whatever 1.x was newest on the day of the build.
 3. `debian:trixie-slim` — runtime: **nginx + the binary in one image**, SPA at
    `/var/www/roomler-ai`, nginx config from `files/nginx-pod.conf` (SPA fallback,
    API/WS proxy, security headers incl. HSTS + CSP), `EXPOSE 80`, and the user
@@ -189,7 +194,7 @@ flowchart LR
 |---|---|---|
 | Fetch + verify | `scripts/fetch-geoip.sh:116` (`fetch`), `:162` (`stage`) | TLS from DB-IP's host; gzip CRC, 1–128 MiB, MaxMind metadata naming `DBIP-Country-Lite`. Writes the file 0644 and a provenance note with its SHA-256. **Every failure exits 0 with a warning**, and every wait is bounded: a host that accepts and then stalls costs 110 s (measured), not the job's timeout |
 | Both image lanes | `hosted-image.yml:128`, `publish-selfhost-image.yml:151` | Run the fetch before `docker build`, into the build context, as a step with `continue-on-error` and an 8-minute timeout, so nothing in it can fail a build. Nothing in the Dockerfile downloads, so the layer is keyed by the file's content and a failed fetch can never be cached as an empty layer |
-| Bake + default | `Dockerfile:149` (`COPY`), `Dockerfile:155` (`ENV`) | The image names its own database; the deployment sets nothing |
+| Bake + default | `Dockerfile:155` (`COPY`), `Dockerfile:161` (`ENV`) | The image names its own database; the deployment sets nothing |
 | Load | `crates/core/src/user_analytics.rs:100` | Logs `geoip database loaded` with the database's type and build date, or warns once and degrades. An **empty** value is an explicit off, with no warning |
 | Smoke | `hosted-image.yml:229`, `publish-selfhost-image.yml:264` | When the fetch staged a database: the server must log `geoip database loaded` for `DBIP-Country-Lite`, and a non-root user must be able to read the file. When it staged none: a warning, never a failure |
 | Payload | `crates/api/src/routes/stats.rs:1296` | `geoip_database`: the loaded database's own `database_type`, or `null` |
