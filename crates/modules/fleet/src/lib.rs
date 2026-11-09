@@ -52,7 +52,7 @@ use roomler_ai_services::dao::{
     enrollment_key::EnrollmentKeyDao, exec_audit::ExecAuditDao, exec_pending::ExecPendingDao,
     external_principal::ExternalPrincipalDao, external_rc_audit::ExternalRcAuditDao,
     keep_busy_event::KeepBusyEventDao, pairing_audit::PairingAuditDao,
-    setup_diagnostics::SetupDiagnosticsDao,
+    rc_resume_scope::RcResumeScopeDao, setup_diagnostics::SetupDiagnosticsDao,
 };
 use roomler_core::{
     Capabilities, Core, Module, TenantCtx,
@@ -87,6 +87,8 @@ pub mod presence;
 pub mod releases;
 pub mod remote_config;
 pub mod removal;
+/// FR-138 — the platform admin's resume scope and its route.
+pub mod resume_scope;
 pub mod setup_diagnostics;
 pub mod setup_release;
 pub mod socket;
@@ -155,6 +157,11 @@ pub struct FleetState {
     /// changes and the devices' reported ons and offs, told apart by
     /// `source`. No TTL (operator, 2026-10-11).
     pub keep_busy_events: Arc<KeepBusyEventDao>,
+    /// FR-138 — the orgs and devices a remote session may outlive its
+    /// device's control socket on: the platform admin's list, read by the hub
+    /// at a device's registration (from P1b). Nothing reads it while
+    /// `rc.session_resume_secs` is 0.
+    pub rc_resume_scope: Arc<RcResumeScopeDao>,
     pub rc_hub: Arc<Hub>,
     /// Phase A-1 — the Redis presence owner-token per locally-registered
     /// agent WS. Written/removed by the agent socket; read by the shutdown
@@ -332,6 +339,7 @@ impl Module for FleetState {
             external_principals: Arc::new(ExternalPrincipalDao::new(db)),
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
+            rc_resume_scope: Arc::new(RcResumeScopeDao::new(db)),
             rc_hub,
             agent_presence_tokens: Arc::new(DashMap::new()),
             presence_fanout: Arc::new(presence::PresenceFanout::default()),
@@ -635,14 +643,20 @@ impl Module for FleetState {
             .nest("/setup", public_setup)
             .nest("/releases", releases)
             .nest("/pair", pair)
+            // FR-138 — the resume scope, for platform admins only (the 404
+            // every `/api/admin/*` route gives anyone else).
+            .route(
+                "/admin/rc-resume-scope",
+                get(resume_scope::get_scope).put(resume_scope::put_scope),
+            )
             .with_state(self.clone())
     }
 
-    /// The fourteen collections this module owns. The first eight specs are
-    /// the ones the db crate's plan held before P5a, unchanged;
-    /// `keep_busy_events` (FR-92 P7), `exec_pending` (FR-94),
-    /// `enroll_token_issued` (FR-102 P3), `setup_diagnostics` (FR-102 P3b),
-    /// `device_pairings` and `pairing_audit` (FR-129 A1) were born here.
+    /// The collections this module owns. Among them `keep_busy_events`
+    /// (FR-92 P7), `exec_pending` (FR-94), `enroll_token_issued` (FR-102 P3),
+    /// `setup_diagnostics` (FR-102 P3b), `device_pairings` and
+    /// `pairing_audit` (FR-129 A1) and `rc_resume_scope` (FR-138) were born
+    /// here.
     fn indexes(&self) -> Vec<IndexSet> {
         vec![
             // FR-129 A1 — device pairings. The hash is the poll's lookup and
@@ -856,6 +870,16 @@ impl Module for FleetState {
                     index(bson::doc! { "tenant_id": 1, "at": -1 }),
                     index(bson::doc! { "tenant_id": 1, "agent_id": 1, "at": -1 }),
                 ],
+            },
+            // FR-138 — the resume scope: one row per target, so the unique
+            // `(kind, id)` keeps a save idempotent (`all` has no id and keys
+            // as null, so there is one at most), and the hub's read at a
+            // device's registration is a lookup on it. No TTL: the platform
+            // admin's list.
+            IndexSet {
+                collection: roomler_ai_services::dao::rc_resume_scope::RC_RESUME_SCOPE,
+                pre_ops: Vec::new(),
+                indexes: vec![index_unique(bson::doc! { "kind": 1, "id": 1 })],
             },
         ]
     }

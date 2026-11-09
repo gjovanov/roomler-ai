@@ -44,6 +44,11 @@ impl RemoteSessionDao {
             stats: SessionStats::default(),
             carrier: None,
             video: None,
+            attach_seq: 0,
+            detached_at: None,
+            resume_by: None,
+            stats_at: None,
+            end_source: None,
         };
         // Insert with explicit _id so the Hub-provided ObjectId remains the canonical key.
         self.base.collection().insert_one(&session).await?;
@@ -116,6 +121,11 @@ impl RemoteSessionDao {
     /// predates this and the value is what the session is doing NOW.
     /// Ended sessions are excluded: a late sample must not resurrect the
     /// numbers `mark_ended` froze.
+    ///
+    /// FR-138 — the same `$set` stamps `stats_at`, the server's time of this
+    /// merge: the row's own clock of being alive, which an end nobody saw is
+    /// dated by (spec §4.4). No query of its own, and only while the row is
+    /// open, like the rest of the merge.
     pub async fn merge_live_stats(
         &self,
         session_id: ObjectId,
@@ -142,6 +152,9 @@ impl RemoteSessionDao {
             // struct to_bson is the safe twin).
             "stats.shared_seconds": stats.shared_seconds as i64,
             "stats.mixed_dial_seconds": stats.mixed_dial_seconds as i64,
+            // FR-138 — beside `stats`, so `mark_ended`'s whole-`stats` write
+            // leaves it.
+            "stats_at": DateTime::now(),
         };
         if let Some(c) = carrier {
             set.insert("carrier", c);

@@ -139,6 +139,14 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
                 carrier: None,
                 // FR-132 P1d — the same merge, on the pump's first reading.
                 video: None,
+                // FR-138 — none is written unset, so this projection writes
+                // the row it wrote before them: fencing number 0 (absent),
+                // nothing detached, no stats merge yet, an end not inferred.
+                attach_seq: 0,
+                detached_at: None,
+                resume_by: None,
+                stats_at: None,
+                end_source: None,
             };
             let doc = match bson::to_document(&row) {
                 Ok(d) => d,
@@ -191,7 +199,9 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
             .await
             .map(|_| ()),
         // Prompted / clipboard / files / keyframe / override events don't
-        // change the session row.
+        // change the session row. Nor, until FR-138 P1b projects them, do
+        // `SessionDetached` and `SessionResumed`, which nothing writes yet;
+        // an `Unknown` kind (a newer build's) never does.
         _ => Ok(()),
     };
     if let Err(e) = res {

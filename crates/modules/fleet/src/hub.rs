@@ -1646,6 +1646,9 @@ impl Hub {
                 local_relay: echo_relay,
                 local_relay_refused: echo_refused,
                 local_relay_also: echo_also,
+                // FR-138 — no window is announced yet (P1b), so no session
+                // may be held.
+                resume_secs: None,
             });
             return Ok(existing_id);
         }
@@ -1912,6 +1915,9 @@ impl Hub {
             local_relay: echo_relay,
             local_relay_refused: echo_refused,
             local_relay_also: echo_also,
+            // FR-138 — no window is announced yet (P1b), so the viewer never
+            // holds this session.
+            resume_secs: None,
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -3303,6 +3309,10 @@ impl Hub {
                     // browser's computer runs more than one agent.
                     local_relay_also,
                     local_relay_from_also,
+                    // FR-138 — read from P1b, which ends the named held
+                    // session before the capacity gate. Nothing holds a
+                    // session yet, so the session it names has already ended.
+                    replaces: _,
                 },
             ) => {
                 // Forward browser codec caps verbatim to the agent in
@@ -3516,6 +3526,17 @@ impl Hub {
                 }
             }
             (_, ClientMsg::Ping { id: _ }) => Ok(()), // pong handled by WS layer
+            // FR-138 — a viewer's claim on a held session. Nothing holds a
+            // session before P1b, which answers it, so it is dropped unanswered,
+            // as a server that predates it drops it: the viewer's own deadline
+            // then falls back to the redial.
+            (Role::Controller, ClientMsg::SessionRejoin { session_id }) => {
+                debug!(
+                    session = %session_id.to_hex(),
+                    "rc:session.rejoin dropped: no session is held"
+                );
+                Ok(())
+            }
             (
                 _,
                 ClientMsg::AgentHello { .. }
@@ -6579,6 +6600,7 @@ mod tests {
             local_relay_from: Some(from),
             local_relay_also: Vec::new(),
             local_relay_from_also: Vec::new(),
+            replaces: None,
         };
 
         hub.dispatch(&ctx_for(Role::Controller, Some(me), None), request(mine))
@@ -6710,6 +6732,7 @@ mod tests {
             local_relay_from: Some(wsl),
             local_relay_also: Vec::new(),
             local_relay_from_also: vec![windows, wsl, gone],
+            replaces: None,
         };
         let created = |msg: ServerMsg| match msg {
             ServerMsg::SessionCreated {
@@ -6804,6 +6827,7 @@ mod tests {
                 local_relay_from: None,
                 local_relay_also,
                 local_relay_from_also,
+                replaces: None,
             }
         };
         let session_and_echo = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| match ctl_rx.try_recv() {
@@ -6915,6 +6939,7 @@ mod tests {
             local_relay_from: Some(from),
             local_relay_also: Vec::new(),
             local_relay_from_also: also,
+            replaces: None,
         };
         let answer = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| match ctl_rx.try_recv() {
             Ok(ServerMsg::SessionCreated {
@@ -7086,6 +7111,7 @@ mod tests {
             local_relay_from: Some(win),
             local_relay_also: Vec::new(),
             local_relay_from_also: vec![wsl],
+            replaces: None,
         };
         // One session: what the browser was told on `rc:session.created`.
         let open = |ctl_rx: &mut mpsc::Receiver<ServerMsg>| {
