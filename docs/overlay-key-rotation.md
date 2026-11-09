@@ -123,19 +123,19 @@ suspect first.
 ## On the device
 
 The handler sits in the WS loop that received the order, next to `ConfigPush`
-(`agents/roomlerd/src/signaling.rs:6096-6238`). Every branch **reports**, refusals
+(`agents/roomlerd/src/signaling.rs:6215-6357`). Every branch **reports**, refusals
 included — the operator is looking at a security action and each refusal has a
 different fix:
 
 | step | what | reports | anchor |
 |---|---|---|---|
-| 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:6099-6114` |
-| 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:3518-3539`, `:6117-6132` |
+| 1 | kill switch `overlay_key_rotation == false` | `refused: disabled` | `signaling.rs:6218-6233` |
+| 2 | the device's **own** 60 s ceiling, per org — "a bound that exists only on the ordering side is not a bound" | `refused: rate_limited` | `signaling.rs:3585-3606`, `:6236-6251` |
 | 3 | mint `WgKeypair::generate()` — the enrollment mint; `None` in a build with no overlay surface | `refused: unsupported` | `agents/roomlerd/src/key_rotation.rs:19-30` |
 | 4 | **persist first**: under the daemon-wide write lock, `config::load` → set the secret on the primary scalar or on the `[[orgs]]` entry whose `tenant_id` is this loop's → bump `overlay_wg_key_epoch` → atomic `config::save` (tmp + fsync + 0600/ACL + `.prev` + rename) | on error: `failed` + detail, **identity unchanged** | `agents/roomlerd/src/remote_config.rs:656-688` |
-| 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:6194-6220` |
-| 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:6224-6236`, `:1687` |
-| 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:1399-1423` |
+| 5 | queue the same report for the *next* session, then send `rc:agent.key_rotated { rotated, old_pub, new_pub, key_epoch }` on this one and give the pump 300 ms | `rotated` | `signaling.rs:6313-6339` |
+| 6 | close every peer, tunnel peer and QUIC peer this org loop carries (the `Goodbye` teardown), return `ConnectError::KeyRotated { secret, epoch }` | — | `signaling.rs:6343-6355`, `:1728` |
+| 7 | the loop adopts the key + epoch into its one config snapshot and re-enters `connect_once` **immediately** — one device re-joining, not a fleet event, so no stagger | — | `signaling.rs:1422-1446` |
 | 8 | `overlay::maybe_start` sees the fingerprint change (it includes the public key), rebuilds the runtime; the join carries the new key and epoch | — | `agents/roomlerd/src/overlay.rs:399` |
 
 ⚠️ **Persist before anything else.** A key that is not written down would be lost at
@@ -369,7 +369,7 @@ holds, and DERP is the floor that connects a node when nothing else does.
 
 | key | where | default | effect |
 |---|---|---|---|
-| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1075-1080`, `config_surface.rs:1258-1265`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
+| `overlay_key_rotation` | device config (tribool), config surface, env `ROOMLERD_OVERLAY_KEY_ROTATION` (`crates/agent-core/src/config.rs:1082-1087`, `config_surface.rs:1266-1273`) | **on** | `false` ⇒ every order is answered `refused: disabled`, key unchanged. Read from the start-time snapshot — **restart required** |
 | `overlay_wg_key_epoch` | persisted next to the key, primary scalar and per `[[orgs]]` entry (`config.rs:1974`, `:2099-2101`) | `0` | bumped per rotation; presented on every join, shown in the grid |
 | server switch for the route | — | — | **none, deliberately**: the route is admin-initiated and permission-gated; a defective push is stopped by the device switch |
 | `retired_key_mode` (P2) | the org's `overlay_networks` row, `GET/PUT /api/tenant/{tid}/overlay-retired-keys` (`MANAGE_AGENTS`; `crates/modules/network/src/routes/overlay_key.rs:353`, `:380`) | **`off`** | `warn` logs what it would refuse; `enforce` refuses a retired key at join and DERP and orders a device with the verb to rotate. Read per join and DERP registration — **no restart**, no live session disturbed. A stored value a build does not know reads `off`; a typo in the `PUT` is a 400 |
@@ -442,9 +442,9 @@ The server cannot see the device switch, so a switched-off device is still order
 | the conditional report write | `crates/services/src/dao/agent.rs:1056-1086` |
 | state resolver + grid view | `crates/modules/fleet/src/agent.rs:774-935`, `:1771-1779` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:825-833` |
-| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6096-6238`, `:3474-3516`, `:3518-3539`, `:1399-1423` |
+| device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6215-6357`, `:3541-3583`, `:3585-3606`, `:1422-1446` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
-| kill switch · epoch | `crates/agent-core/src/config.rs:1075-1080`, `:1812-1817`, `:1942-1944`; `config_surface.rs:1258-1265` |
+| kill switch · epoch | `crates/agent-core/src/config.rs:1082-1087`, `:1819-1824`, `:1949-1951`; `config_surface.rs:1266-1273` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1179-1193` |
 | P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3219`, `:3237`, `:3959`, `:3207`, `:10527`, `:10789`; the node and network fields `:6997`, `:7239` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |

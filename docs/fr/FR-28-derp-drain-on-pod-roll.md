@@ -173,7 +173,7 @@ flowchart TD
 | A major network change (only the control socket listens for one) | Restarts at 1 s | Back to 30 |
 
 The code: `FlatRedial` (`agents/roomlerd/src/ws_connect.rs:60`) with its allowance and wait (`:33`, `:38`), the
-control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1524`, `:1258`), and `/derp`'s
+control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1547`, `:1278`), and `/derp`'s
 (`agents/roomlerd/src/derp.rs:557`, `:551`). Regional relays keep their ladder
 (`agents/roomlerd/src/derp.rs:332`): no pod rolls under one.
 
@@ -216,7 +216,7 @@ this size it is a number to measure first. The flip is a staged rollout and the 
   switch on too: climbing there would slow the floor on any path whose middlebox kills young sockets, on exactly
   the hosts with no other carrier. That change needs its own read.
 - A clean close on the control socket redials with no wait at all (the `Ok(())` arm,
-  `agents/roomlerd/src/signaling.rs:1262`). A roll does not take that arm: 22 of 22 hosts on the 12:43Z roll below
+  `agents/roomlerd/src/signaling.rs:1282`). A roll does not take that arm: 22 of 22 hosts on the 12:43Z roll below
   read `Connection reset without closing handshake`.
 
 ## P3: the pre-pull

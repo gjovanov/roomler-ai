@@ -215,7 +215,7 @@ prevent, and the guard re-asserts it on every tick.
 
 **S2 — exit and subnet serving is offered where nothing NATs, and an approval outlives the offer.** ✔
 
-- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2389-2398`) and independent of NAT setup
+- The `/0` advertisement is unconditional (`crates/agent-core/src/config.rs:2396-2405`) and independent of NAT setup
   (`runtime.rs:2157-2180`; the setup's success only picks a log level, `nat.rs:80-94`). macOS has no NAT arm at all
   (`nat.rs:376-378` returns `false`), and because the guard is armed only on Linux and Windows (`nat.rs:87`), it logs
   nothing. Windows Home fails `New-NetNat` silently and leaves IPv4 forwarding on after the revert (#2077).
@@ -728,7 +728,7 @@ test of the SIGKILL property itself.
   two moments. In a session, every 2 s, as `rc:host_locked` with `input: "unknown"` (`peer.rs:1442-1508`): whether
   the lock screen's password field takes injected keys is not measured, so the chip claims neither way. At a prompt,
   as Windows does, as `rc:consent.pending{host_locked}`: the prompt's probe (`lock_state.rs:301-320`, read at
-  `signaling.rs:4348`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
+  `signaling.rs:4431`) asks the session, because a panel or the companion's prompt is out of sight behind the lock.
   Advisory only, never an input gate (FR-92's rule, `FR-92-keep-busy.md:53`), so the pump's overlay never sees it.
   Another user on the console (fast user switching) counts as locked: this session's screen is out of sight either
   way. The root half has no session to ask and says nothing; `ROOMLERD_LOCK_HINT=0` turns it off, as on Linux. Linux

@@ -832,6 +832,12 @@ why per-roll medians land on 7.5, 15 and 25 s.
 502 is flat, an accepted socket that does not last refills nothing, and the allowance bounds a 502 that never ends,
 such as a corporate proxy's.
 
+**A session that outlives the wait** ([FR-138](fr/FR-138-the-session-outlives-its-control-socket.md) P2a). With
+`rc_sessions_survive_reattach` on (default OFF) and a window announced by the server, the device keeps a live
+remote-control session through the control socket's loss and claims it back in its next hello, for that window,
+capped at 120 s ([remote-control.md §11.16](remote-control.md#1116-a-session-outlives-its-control-socket-the-devices-half-fr-138-p2a)).
+With either off, the table's last row above still holds.
+
 ---
 
 ## 7. What the server can and cannot see

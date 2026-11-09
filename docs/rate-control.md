@@ -405,7 +405,7 @@ target sits at the opener's seed for the whole session, so `stable_bps()` is
 that seed — see the write-back rows below for what that does to the memory.
 Kill switches: `relay_ceiling_learn` (tribool, default on; off ⇒ `hi` = 0 ⇒ the
 plan ceiling verbatim and no memory) and `relay_max_hi_kbps`
-(`crates/agent-core/src/config_surface.rs:1137`, `:1249`; `mod.rs:941`). Direct
+(`crates/agent-core/src/config_surface.rs:1145`, `:1257`; `mod.rs:941`). Direct
 sessions never touch the learner (`governor.rs:572` gates on `constrained`).
 
 ⚠️ **Only the FFmpeg DC pump runs the learner.** `relay_max_hi_bps()` has one

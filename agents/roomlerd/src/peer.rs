@@ -13850,6 +13850,19 @@ pub(crate) fn map_ice_servers_relay_tcp(servers: &[IceServer]) -> Vec<RTCIceServ
     }
 }
 
+/// FR-138 — what the org loop's session table reads of a peer it keeps through
+/// the loss of its control socket (`crate::session_table::TablePeer`).
+impl AgentPeer {
+    /// Whether this peer's connection is `Connected` now. A peer kept after a
+    /// net change closes once it is not: the RC path has no ICE restart.
+    pub(crate) fn is_connected(&self) -> bool {
+        matches!(
+            self.pc.connection_state(),
+            RTCPeerConnectionState::Connected
+        )
+    }
+}
+
 #[cfg(test)]
 mod overlay_iface_filter_tests {
     use super::is_overlay_iface;
