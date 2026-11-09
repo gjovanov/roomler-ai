@@ -152,7 +152,7 @@ sleep would say hello again and erase the reason.
 ### 3.3 The server
 
 - The fleet socket treats `rc:agent.sleeping` as the goodbye
-  ([`socket.rs:661`](../crates/modules/fleet/src/socket.rs#L661)). It records the
+  ([`socket.rs:709`](../crates/modules/fleet/src/socket.rs#L709)). It records the
   notice first, then leaves its loop, so the ordinary teardown runs at once: the
   hub unregistration, the `Offline` write, and the offline transition. Without
   the goodbye the device would read online until the receive deadline reaped a

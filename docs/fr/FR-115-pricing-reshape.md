@@ -59,7 +59,7 @@ Only `max_devices` and `max_tunnel_clients` are **established** — enforced wha
 an org created after 2026-08-30, by standing decision (`crates/db/src/models/tenant.rs:58`), so
 for a new signup MagicDNS and exit nodes already pass. The advertised "1 concurrent session"
 (Free) and "5" (Pro) are enforced **nowhere**: FR-32 withheld the gate because nothing wrote
-`remote_sessions` (`crates/services/src/dao/remote_session.rs:58`). That table is written now —
+`remote_sessions` (`crates/services/src/dao/remote_session.rs:59`). That table is written now —
 projected from the audit stream (`crates/remote_control/src/audit.rs:3`) — but it is
 best-effort: three rows have shown "open" for up to 25 days. **A gate must not count it.**
 
@@ -193,7 +193,7 @@ like the device cap: no org is over it today.
 (`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1661`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1754`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
@@ -208,13 +208,13 @@ session ending or Business. Kill switch `rc.org_session_cap = false`.
 ### P3b, as proposed: a cluster-wide session count that heals itself (O6 + O7 decided 2026-10-20)
 
 **Why P3's count cannot carry it.** P3 counts on the hub that owns the device
-(`crates/modules/fleet/src/hub.rs:1609`). Under tenant affinity, that hub holds every live
+(`crates/modules/fleet/src/hub.rs:1702`). Under tenant affinity, that hub holds every live
 session of the device's org, so the count is complete for a same-org session. A cross-org
 session breaks that assumption: the org that pays is the controller's, and its sessions live
 on whichever pods hold the devices they reach. Today FR-52's external path opens its session
 uncapped (`crates/modules/remote/src/extauth.rs:341`), waiting for this phase. P3's own count
 also has a documented race: the count and the insert are two steps, so two starts in the same
-instant can both pass (`hub.rs:1622`).
+instant can both pass (`hub.rs:1715`).
 
 **The record: session slots in the cluster directory.** C-1's directory
 (`crates/core/src/cluster/directory.rs`) already keeps per-entity records in Redis on exactly
@@ -254,7 +254,7 @@ sequenceDiagram
 **Why this is durable.**
 
 - **One atomic claim.** The Lua claim drops expired members, checks the count and adds the
-  session in one step, so the race at `hub.rs:1622` closes.
+  session in one step, so the race at `hub.rs:1715` closes.
 - **It heals itself.** A lease lives 90 s and is renewed every 30 s by the pod that holds the
   session. A pod that dies stops renewing, and its slots free themselves within 90 s. A Redis
   restart loses the set, but renewal is an upsert, so within one renewal round every live
