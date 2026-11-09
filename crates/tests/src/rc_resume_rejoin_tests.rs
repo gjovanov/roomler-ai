@@ -42,6 +42,37 @@ async fn send(ws: &mut Ws, v: Value) {
         .expect("a frame is sent");
 }
 
+/// One pod with the window `window`, and no org cap: the harness's orgs run
+/// one session at a time (FR-115), and these tests are about the DEVICE's
+/// capacity, or need more than one session in one org.
+async fn one_uncapped(window: u64) -> TestApp {
+    TestApp::spawn_with_settings(move |s| {
+        s.rc.session_resume_secs = window;
+        s.rc.org_session_cap = false;
+    })
+    .await
+}
+
+/// [`one_uncapped`], two pods over one database.
+async fn pair_uncapped(window: u64) -> (TestApp, TestApp) {
+    TestApp::spawn_pair(move |s| {
+        s.rc.session_resume_secs = window;
+        s.rc.org_session_cap = false;
+    })
+    .await
+}
+
+/// One pod with the window `window`, the org cap kept (one session at a time
+/// for the harness's orgs) and counted in cluster-wide slots (FR-115 P3b),
+/// claimed BEFORE the hub's own dispatch. Without Redis the hub counts them.
+async fn one_slotted(window: u64) -> TestApp {
+    TestApp::spawn_with_settings(move |s| {
+        s.rc.session_resume_secs = window;
+        s.rc.session_slots = true;
+    })
+    .await
+}
+
 /// A viewer's socket on `app`, past its `connected` greeting.
 async fn controller(app: &TestApp, token: &str) -> Ws {
     let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
@@ -355,7 +386,7 @@ async fn a_roll_takes_both_sockets_and_the_viewer_rejoins_once_the_device_has_cl
 /// reaps it as today and gets the device too.
 #[tokio::test]
 async fn a_held_session_never_costs_its_own_viewer_the_slot() {
-    let app = one(WINDOW).await;
+    let app = one_uncapped(WINDOW).await;
     let seeded = app.seed_tenant("fr138slot").await;
     scope_all(&app).await;
     give_member(&app, &seeded, "controller", REMOTE_CONTROL).await;
@@ -411,6 +442,59 @@ async fn a_held_session_never_costs_its_own_viewer_the_slot() {
     assert_eq!(
         created["t"], "rc:session.created",
         "the same person's request gets the device: {created}"
+    );
+    let r = wait_row(&app, next, "the held session is reaped", ended).await;
+    assert_eq!(end_reason(&r), Some("controller_hangup"), "{r}");
+}
+
+/// AC9 — and never the org's slot either. The harness's orgs run one session
+/// at a time (FR-115), counted in cluster-wide slots that the request claims
+/// BEFORE the hub's own dispatch. A held session keeps the org's slot against
+/// another person, whose request is refused `org_session_limit`. Its own
+/// person's redial gets the device both with `replaces` and without it: the
+/// held session ends, and its slot is given back, before the slot is claimed.
+#[tokio::test]
+async fn a_held_session_never_costs_its_own_viewer_the_orgs_slot() {
+    let app = one_slotted(WINDOW).await;
+    let seeded = app.seed_tenant("fr138orgslot").await;
+    scope_all(&app).await;
+    give_member(&app, &seeded, "controller", REMOTE_CONTROL).await;
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-orgslot").await;
+    let admin = seeded.admin.access_token.clone();
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    next_of(&mut agent, "rc:agent.resume_window", WITHIN)
+        .await
+        .expect("the window is announced");
+
+    let (ctl, held, _) = live_session(&app, &admin, agent_id, &mut agent).await;
+    drop_socket(ctl).await;
+    tokio::time::sleep(QUIET).await;
+    let mut other = controller(&app, &seeded.member.access_token).await;
+    let refused = request(&mut other, agent_id, None).await;
+    assert_eq!(refused["t"], "rc:error", "{refused}");
+    assert_eq!(refused["code"], "org_session_limit", "{refused}");
+    assert!(app.state.fleet().rc_hub.session_snapshot(held).is_some());
+
+    // With `replaces`.
+    let mut ctl = controller(&app, &admin).await;
+    let created = request(&mut ctl, agent_id, Some(held)).await;
+    assert_eq!(
+        created["t"], "rc:session.created",
+        "its own redial gets the org's slot: {created}"
+    );
+    let next = oid(created["session_id"].as_str().unwrap());
+    let r = wait_row(&app, held, "the replaced session ends", ended).await;
+    assert_eq!(end_reason(&r), Some("controller_hangup"), "{r}");
+
+    // Without `replaces`.
+    drive_live(&mut ctl, &mut agent, next).await;
+    drop_socket(ctl).await;
+    tokio::time::sleep(QUIET).await;
+    let mut ctl = controller(&app, &admin).await;
+    let created = request(&mut ctl, agent_id, None).await;
+    assert_eq!(
+        created["t"], "rc:session.created",
+        "the same person's request gets the org's slot: {created}"
     );
     let r = wait_row(&app, next, "the held session is reaped", ended).await;
     assert_eq!(end_reason(&r), Some("controller_hangup"), "{r}");
@@ -487,7 +571,8 @@ async fn a_controllers_end_during_the_gap_is_enforced_at_the_claim() {
 /// during the gap keeps the admin's end, whatever the device then says.
 #[tokio::test]
 async fn a_device_reported_end_after_its_hello_replaces_the_inferred_one() {
-    let (app1, app2) = pair(WINDOW).await;
+    // Three sessions of one org: no org cap.
+    let (app1, app2) = pair_uncapped(WINDOW).await;
     let seeded = app1.seed_tenant("fr138hostend").await;
     scope_all(&app1).await;
     let (agent_id, token) = enroll(&app1, &seeded, "fr138-hostend").await;
