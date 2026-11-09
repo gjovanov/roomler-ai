@@ -1805,25 +1805,59 @@ pub mod test_support {
     pub fn program_data(root: &Path) -> PathBuf {
         let pd = root.join("ProgramData");
         std::fs::create_dir(&pd).expect("the ProgramData stand-in");
-        assert!(
-            icacls(
-                &pd,
-                &[
-                    "/inheritance:r",
-                    "/grant:r",
-                    "*S-1-5-18:(OI)(CI)F",
-                    "*S-1-5-32-544:(OI)(CI)F",
-                    "*S-1-5-32-545:(OI)(CI)RX",
-                ],
-            ),
-            "the ProgramData stand-in's DACL"
-        );
-        // A second call: one `/grant:r` naming Users twice keeps one entry.
-        assert!(
-            icacls(&pd, &["/grant", "*S-1-5-32-545:(CI)(WD,AD,WEA,WA)"]),
-            "Users' right to add files and folders"
+        // Set whole, not through `icacls /grant`: on CI's runner a new temp
+        // folder comes with a full-control `(OI)(CI)` entry of its own for the
+        // runner's account, which `/inheritance:r` keeps, and the parent made
+        // below would inherit it.
+        set_dacl(
+            &pd,
+            "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)(A;CI;0x116;;;BU)",
         );
         pd
+    }
+
+    /// Give `path` exactly the DACL `sddl` (`D:…`), by name.
+    pub fn set_dacl(path: &Path, sddl: &str) {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        };
+        use windows_sys::Win32::Security::{
+            ACL, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated string; `sd` is LocalAlloc'd, freed below.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "SDDL {sddl}");
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: the descriptor made above; `acl` points into it.
+        let ok = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted) };
+        assert_ne!(ok, 0, "the DACL of {sddl}");
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated path; `acl` lives in `sd` until it is freed.
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl,
+                std::ptr::null(),
+            )
+        };
+        // SAFETY: allocated by ConvertStringSecurityDescriptor…, freed once.
+        unsafe { LocalFree(sd as _) };
+        assert_eq!(rc, 0, "setting {}'s DACL", path.display());
     }
 
     /// `%ProgramData%\roomler` and its machine folder, as a host with the
@@ -1833,11 +1867,17 @@ pub mod test_support {
     pub fn waiting_tree(root: &Path) -> super::MachineTree {
         let parent = program_data(root).join("roomler");
         std::fs::create_dir(&parent).expect("the parent");
+        let folder = parent.join("roomler");
+        std::fs::create_dir(&folder).expect("the machine folder");
+        // Inherited entries only, whatever entry of its own a new folder may
+        // come with on the machine running this (CI's runner adds one).
+        for dir in [&parent, &folder] {
+            assert!(icacls(dir, &["/reset"]), "{} inherits", dir.display());
+        }
         assert!(
             icacls(&parent, &["/setowner", "*S-1-5-32-544"]),
             "the parent to Administrators"
         );
-        std::fs::create_dir(parent.join("roomler")).expect("the machine folder");
         super::MachineTree::under(&parent)
     }
 
