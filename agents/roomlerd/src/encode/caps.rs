@@ -9926,4 +9926,40 @@ mod tests {
         assert!(!rt.block_on(first_answer_within(Duration::from_millis(50))));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
+
+    /// #3548 — the race, forced. In-process signalling-loop tests start
+    /// `start_probing`, whose thread fills the process's first answer at a moment
+    /// no other test controls. Here another thread does the same fill, released
+    /// at the moment the wait begins: `join!` polls the wait first, so it has
+    /// subscribed and found no answer before the filler runs, and it is not
+    /// polled again until the fill is done. The wait test above asserts that a
+    /// wait like this one reports no answer.
+    #[test]
+    fn forcing_3548_a_fill_from_another_thread_lands_inside_the_wait() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (filled, was_filled) = std::sync::mpsc::channel::<()>();
+        let filler = std::thread::spawn(move || {
+            released.recv().expect("released");
+            // What `detect()` does with its answer: the store, then the news.
+            let _ = CACHED_CAPS.set(compute_caps(false, false));
+            FIRST_IS_NEWS.call_once(answer_moved);
+            filled.send(()).expect("told");
+        });
+        let bound = Duration::from_millis(50);
+        let (came, ()) = rt.block_on(async {
+            tokio::join!(first_answer_within(bound), async {
+                release.send(()).expect("release");
+                was_filled.recv().expect("the filler filled");
+            })
+        });
+        filler.join().expect("the filler");
+        assert!(
+            !came,
+            "the wait reported the answer another thread filled while it waited"
+        );
+    }
 }
