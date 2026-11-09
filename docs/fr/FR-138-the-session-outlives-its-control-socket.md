@@ -14,9 +14,10 @@ the peer, the server keeps the row, and both ends claim the same session again o
 server decides at that claim whether the session may go on. A kick or a revoke issued during the gap ends the
 session at the reconnect, and never later than the window.
 
-**What it costs**: three sides change (agent, server, viewer) behind two switches that are off by default, the
-server's window, which the viewer follows, and the agent's own. FR-28's three constraints each get a mechanism (§3). Four decisions: the window (D1), what the session may do
-during the gap (D2), external sessions (D3), and how the agent's default flips (D4).
+**What it costs**: three sides change (agent, server, viewer) behind two switches that are off by default: the
+server's window, with the list of orgs and devices it is announced to, and the agent's own switch. The viewer
+follows the server. FR-28's three constraints each get a mechanism (§3). Four decisions: the window (D1), what the
+session may do during the gap (D2), external sessions (D3), and how the fleet is staged (D4).
 
 ## 1. Goal
 
@@ -120,6 +121,9 @@ ladder runs 250 ms to 8 s and never gives up (`:180`, `:195`). Once the page is 
 - **No instrument sees the gap.** A session that painted and then dropped leaves no viewer record of the drop: the
   `rc.connect` records belong to the redial's attempts, under the new session's id. The `video DC delivery gap`
   warning is console-only, floored at 1500 ms (`ui/src/workers/rc-video-channel.ts:18`), and reset on each new path.
+- **A row a dying pod never ended counts as live until now.** The growth digest reads an open row's end as the
+  present (`crates/api/src/growth/digest.rs:1717`), and no sweep closes such a row (§2.2), so every one a roll
+  leaves open inflates the hour-weighted reads. How many exist is unknown: P0 counts them (§5).
 
 ### 2.4 What the code already has [R]
 
@@ -152,16 +156,20 @@ it to the docs phase.
 | An admin's end shows the viewer no reason, and its audit row names no actor | `useRemoteControl.ts:957-958`; `hub.rs:2473-2481` | The viewer gains a sentence in P1. The actor is not this FR's |
 | A TURN credential lives 600 s and bounds its allocation's whole life, by the code's own comment | `crates/remote_control/src/turn_creds.rs:57-63` | A resume mints nothing and keeps the allocation it had. §6 starts each TURN session shortly before the roll |
 | `docs/multi-pod-scale-out.md` says cross-pod frame relay is rejected permanently, names `rc:session.rehome`, and places the cluster code in `crates/api/src/cluster/`; the relay ships and answers a miss first, the rehome reply is `rc:error agent_on_other_pod` and only the relay's fallback (`crates/modules/remote/src/controller.rs:379`), and the code is in `crates/core/src/cluster/`. Its failure table says an agent socket's loss ends that pod's sessions | `docs/multi-pod-scale-out.md:35`, `:50`, `:73`, `:106`, `:111-115`, `:182`, `:197`, `:206`; `crates/modules/remote/src/relay.rs:3-31` | Corrected in the PR that lands this spec, line for line, where the doc is already wrong: the paths, the rehome reply and the relay. The failure table at `:182` is true until P3, so the docs phase rewrites it |
-| Two comments on the viewer still promise a give-up the ladder no longer has | `useRemoteControl.ts:177-178`, `:9472-9475` | The docs phase, with P1's viewer change |
+| Two comments on the viewer still promise a give-up the ladder no longer has, and a third says a device allows one session by default; the agent advertises `rc_max_sessions`, two unless set (`agents/roomlerd/src/encode/caps.rs:4331`, `:4828-4834`), and the hub takes it as sent (`crates/modules/fleet/src/socket.rs:170`) | `useRemoteControl.ts:177-178`, `:9472-9475`, `:9515-9516` | The docs phase, with P1's viewer change |
+| A redial's hangup goes through `sendRaw`, which drops a message while the socket is not open, and the page then forgets the session's id | `ui/src/stores/ws.ts:443-449`; `useRemoteControl.ts:9521-9528` | The redial names the session it replaces (§4.4, §4.5): a held session must not cost a viewer its slot |
+| `AuditKind` is internally tagged with no `#[serde(other)]`, and the audit listing reads a whole `Vec`, so one unknown kind fails it: the class FR-137 S-B5 hit for `ssh_audit` | `crates/remote_control/src/models.rs:6560-6562`, `:5148-5152`; `crates/modules/remote/src/routes.rs:140` | P1 adds a tolerant variant before any image writes a new kind, and §5 names the rollback floor |
+| A peer's callbacks hold their own clones of the connection's sender, taken at creation | `agents/roomlerd/src/peer.rs:884`, `:943`, `:1081` | P2a routes every sender a session holds through one handle (§4.2) |
+| The stats merge writes no time, and `shared_seconds` counts a shared pipeline's seconds, not the session's, so a row records no clock of its own liveness | `crates/services/src/dao/remote_session.rs:119`; `crates/remote_control/src/models.rs:5897-5900` | P1 adds `stats_at` to the merge, the clock an inferred end reads (§4.4) |
 | Four server comments point at code that no longer exists: `ws/rc_relay.rs`, `Self::run_consent_flow`, `crates/api/src/ws/tunnel.rs`, and `crates/api/src/ws/handler.rs:189` with `crates/remote_control/src/hub.rs` | `crates/modules/fleet/src/hub.rs:815`, `:1393`, `:2553`; `crates/remote_control/src/signaling.rs:2628-2630` | P1, which edits both files |
 
 ## 3. FR-28's three constraints, and what holds each
 
 | Constraint | What holds it in this design |
 |---|---|
-| **1. The Hub is pod-local**, so a socket comes back to a different pod | Nothing in memory has to survive. The row is the session's state between pods: it stays Active, and carries `detached_at` and `resume_by` when the dying pod gets to write them. The agent's claim and the viewer's rejoin carry the session id to whichever pod they reach, that pod rebuilds its hub entry from the row, and the existing cross-pod relay joins a viewer on one pod to an agent on another (§4.4) |
+| **1. The Hub is pod-local**, so a socket comes back to a different pod | Nothing in memory has to survive. The row is the session's state between pods: it stays Active, and carries `detached_at` and `resume_by` when the dying pod gets to write them. The agent's claim and the viewer's rejoin carry the session id to whichever pod they reach, that pod rebuilds its hub entry from the row, and the existing cross-pod relay joins a viewer on one pod to an agent on another. A fencing number on the row, bumped by each resume, keeps a pod that no longer holds the session from undoing one (§4.4) |
 | **2. `close_all_peers` is what stops a peer leaking its sockets** | It stays the close for every terminal exit. A kept peer moves from the connection to the org loop's session table, which closes it on every real end, through the same `close_within_budget` (`signaling.rs:311`), with a hard deadline that no reconnect extends (§4.2). Off is `close_all_peers` at every arm, byte for byte |
-| **3. Consent and kick must still reach the session** | A resumed session is the same session, so its consent stands, decided once at its start. Every server-side end writes the row, which the claim reads, so an end issued during the gap is enforced at the reconnect. The person's Disconnect needs no server: the agent serves it during the gap and reports it at the reconnect (§4.6) |
+| **3. Consent and kick must still reach the session** | A resumed session is the same session, so its consent stands, decided once at its start. Every end someone asks for, an admin's or the controller's own, writes the row when no hub holds the session, and the claim reads it, so an end issued during the gap is enforced at the reconnect. The person's Disconnect needs no server: the agent serves it during the gap and reports it at the reconnect (§4.6) |
 
 ## 4. Design
 
@@ -172,14 +180,23 @@ it to the docs phase.
 | A live session's peer on the agent: the WebRTC connection, its media pumps, its channels, its input registration, its banner, its idle clock, its recording | yes | until it is re-claimed, or the window from the moment it was detached, whichever comes first |
 | A session still waiting for consent or for its offer | no, as today (#2416: `signaling.rs:410` withdraws the prompt) | — |
 | An external session (FR-52) | no, as today (D3) | — |
-| The viewer's peer and its decode worker | yes | until `resume_by` plus 5 s, then today's redial |
-| The row | stays Active, with `detached_at` and `resume_by` | until resumed, ended, or swept past `resume_by` |
+| A session on `derp` | the agent keeps its peer, but the viewer redials as today (§4.5), and its new request ends the old session at once | until the viewer's redial |
+| The viewer's peer and its decode worker | yes | until `resume_by` plus 5 s, then today's redial; a page that never got `resume_by` counts from its own socket's loss (§4.5) |
+| The row | stays Active, with `detached_at`, `resume_by` and its fencing number `attach_seq` | until resumed, ended, or swept past `resume_by` |
 | Anything in the dying pod's memory | no | — |
 
 **The window** is the server's: `ROOMLER__RC__SESSION_RESUME_SECS`, 0 (off) until P3 sets it to what D1 picks (60 s
-recommended), announced to each capable agent on its connection. The agent caps it at 120 s whatever the server says, so a wrong setting cannot keep
-a peer for an hour. A peer is kept only when three things hold: the agent's switch is on, the server it last spoke to
-announced a window, and the session was live.
+recommended). It is announced device by device: the hub announces it to a capable agent only when the device or its
+org is on the **resume scope**, a list a platform admin keeps as data, which reads `all` once P4 is done (D4). The
+hub reads the scope when a device registers, and re-announces the window to a connected device when its entry
+changes, 0 to withdraw it, so a change needs no roll and reverses at once. The setting stays the ceiling and the
+fleet-wide off. The agent caps the window at 120 s whatever the server says, so a wrong setting cannot keep a peer
+for an hour. A peer is kept only when three things hold: the agent's switch is on, the server it last spoke to
+announced it a window, and the session was live.
+
+There is no store for such a list today: no platform setting and no feature flag in `crates/` at the pin. A device's
+`tags` are "free-form admin labels for fleet filtering/search" (`crates/remote_control/src/models.rs:2133-2135`),
+not a platform's switch. P1 adds the list.
 
 **Which exits keep peers.** The twelve transient arms in §2.2 detach. The five terminal arms close as today, and so
 does a refused token on the next dial (`ConnectError::AuthRejected`): the device's credential is gone, so its
@@ -202,6 +219,7 @@ stateDiagram-v2
     Detached --> Closed: the deadline, a terminate on the claim, a terminal exit, a refused token
     Detached --> Closed: a Disconnect at the device or the idle limit, during the gap
     Detached --> Closed: the peer fails on its own
+    Detached --> Closed: ICE leaves Connected after a net-change detach
     Closed --> [*]
 ```
 
@@ -218,11 +236,25 @@ rules:
   channels, which `run` already lends each connection so that they span reconnects (`signaling.rs:1722`, `:1739`).
   It stops serving at once, says `rc:ended` on the session's control channel, closes after the grace, and queues
   `rc:terminate` with the reason for the next connection, the way FR-40 keeps its report (`signaling.rs:3486`).
-- **The sender is re-pointed, not owned.** A kept peer's sender (`AgentPeer::outbound`) is pointed at each new
-  connection, the way FR-43 points the delegation host (`delegate.rs:884`). While detached it points nowhere: the
-  peer's own `Terminate` on `Failed` (`peer.rs:991`) has no socket to reach, so the table closes a failed peer
-  itself and queues the end for the next connection. ⚠️ `await_prompt_or_socket_end` (`signaling.rs:410`) reads the
-  connection's own sender closing to withdraw a pending prompt, so the connection keeps its own sender for that.
+- **Every sender a session holds is one handle, re-pointed and never owned.** Today a peer's sender is the
+  connection's (`AgentPeer::outbound`, `peer.rs:299`), and its callbacks take their own clones of it at creation: the
+  ICE-candidate handler (`peer.rs:884`), the state handler that sends `Terminate` on `Failed` (`:943`, the send at
+  `:991`), and the watchdog (`:1081`). `signaling.rs` takes 19 more `outbound_tx.clone()`s. Re-pointing
+  `AgentPeer::outbound` alone would leave every clone on the dead connection, so a resumed peer that later failed, or
+  that the watchdog ended, would tell the server nothing. P2a gives each session one handle that every sender it
+  holds goes through, and the table points it at each new connection, the way FR-43 points the delegation host
+  (`delegate.rs:884`). ⚠️ `await_prompt_or_socket_end` (`signaling.rs:410`) reads the connection's own sender
+  closing to withdraw a pending prompt, so the connection keeps its own sender for that.
+- **No send by a kept peer blocks during the gap.** The connection's channel is bounded (`PEER_OUTBOUND_CAP`, 64:
+  `signaling.rs:38`, `:1950`), and nobody polls a dead connection's receiver. While detached, the handle drops what
+  it is given (ICE candidates, stats) and never waits. The session's own end is the exception: the table closes the
+  peer itself and queues the end for the next connection.
+- **A peer that cannot recover is closed at once.** The RC path has no ICE restart: no hit for one in `peer.rs`,
+  `signaling.rs` or `useRemoteControl.ts` at the pin. A peer detached by one of the three net-change arms
+  (`signaling.rs:2374`, `:2394`, `:2487`), where the host's addresses just changed, cannot get its path back once
+  its connection leaves `Connected`, so the table closes it then instead of holding it to the watchdog's 20 s
+  (`peer.rs:1084`). After any other arm it keeps today's watchdog, since a path the roll did not touch can come back
+  from a brief loss.
 - **Bounded.** A detached session still counts against the device's capacity (`rc_max_sessions`,
   `agents/roomlerd/src/encode/caps.rs:4830`): in the table, and in the hub's busy gate from the moment of the claim
   (`hub.rs:1711-1712`). A request that would exceed it is refused as busy, never served beside a kept peer.
@@ -239,11 +271,12 @@ rules:
 |---|---|---|---|
 | `rc-resume` in `AgentCaps.rpc` (a `RpcCap` verb, equality-matched) | agent → server, in the hello | "this device keeps its peers across a socket loss" | ignored, as every unknown verb is |
 | `kept_sessions` on `rc:agent.hello` (`crates/remote_control/src/signaling.rs:506`) | agent → server | the ids of the sessions it detached | an older server ignores the field (no `deny_unknown_fields`); its sessions end at the deadline |
-| `rc:agent.resume_window {secs}` | server → agent | the window, sent once after the hello to a capable agent | never sent to one without the verb |
+| `rc:agent.resume_window {secs}` | server → agent | the window, sent after the hello to a capable agent in the resume scope, and again when its entry changes; 0 withdraws it | never sent to one without the verb |
 | `rc:session.resumed {session_id}` | server → agent and viewer | the claim is accepted | — |
 | `rc:terminate` | server → agent and viewer | a claim refused, with the reason; the existing message | as today |
 | `rc:session.detached {session_id, resume_by}` | server → viewer | the device's control socket dropped, the session is kept | an older viewer ignores it and redials as today |
 | `rc:session.rejoin {session_id}` | viewer → server | the viewer claims its session | an older server drops it, and the viewer's own deadline falls back to the redial |
+| `replaces` on `rc:session.request` (`crates/remote_control/src/signaling.rs:1122-1123`) | viewer → server | the session a redial replaces, which the server ends before its capacity gate (§4.4) | an older server ignores the field; it never holds a session, so the old one already ended |
 | `resume_secs` on `rc:session.created` | server → viewer | this session may be held | absent: the viewer never holds |
 | `rc:ended {reason}` on the session's control channel | agent → viewer, peer to peer | the person at the device ended it during the gap | an older viewer reads a drop and redials, as today |
 
@@ -255,19 +288,46 @@ The server keeps nothing in memory across a gap. It keeps the row, and it rebuil
 reaches. That keeps `docs/multi-pod-scale-out.md`'s fourth principle, "No live-state handoff anywhere" (`:29-31`):
 the new pod folds the session back from the row through a join path, the claim and the rejoin.
 
-**At the drop, best effort.** When the socket of an agent that advertised `rc-resume` goes, and the window is on, the
-hub does not call `end_agent_sessions` for its live sessions. It audits a new `SessionDetached` instead, which the
-sink projects onto the row as `detached_at` and `resume_by` (now plus the window), and it tells each session's viewer
-`rc:session.detached` if the viewer's socket is still up. The controller's side is the same: when a viewer's socket
-goes, `unregister_controller`, and the cross-pod relay's `rc.conn_closed`, detach a resumable session instead of ending
-it as `controller_hangup`; the hub that holds it keeps it with no controller until the rejoin or `resume_by`, and
-`create_session`'s orphan reap (`hub.rs:1522-1555`) spares it meanwhile. A session still waiting for consent or for
-its offer ends as today. ⚠️ A dying pod may write none of this (§2.2), so nothing below depends on it.
+**At the drop, best effort.** When an agent that advertised `rc-resume`, and was announced a window, loses its
+socket, the hub does not call `end_agent_sessions` for its live sessions. It audits a new `SessionDetached` instead,
+carrying the `attach_seq` it holds (fencing, below). The sink projects it onto the row as `detached_at` and
+`resume_by` (now plus the window), and the hub tells each session's viewer `rc:session.detached` if the viewer's
+socket is still up. A detach keeps the session's FR-115 slot: only an end releases one (`hub.rs:2444-2446`), and a
+lease that nobody renews frees itself within 90 s. A session still waiting for consent or for its offer ends as
+today. ⚠️ A dying pod may write none of this (§2.2), so nothing below depends on it.
+
+**The controller's side stays in memory.** When a viewer's socket goes, `unregister_controller`, and the cross-pod
+relay's `rc.conn_closed`, detach a resumable session instead of ending it as `controller_hangup`. The hub that holds
+the session keeps it with no controller until that viewer rejoins or the window ends, and writes nothing to the row.
+A late call for an old connection is already fenced: the hub matches the departing connection's sender by identity
+(`hub.rs:1309-1329`), and a rejoined session holds the new connection's sender. If the holding pod dies meanwhile, the
+agent's socket goes with it, and the agent's side above takes over.
+
+**A held session never costs its own viewer the slot.** Today a viewer's socket loss ends its session at once
+(`hub.rs:1334`), so a redial finds the slot free. A held session would keep it. When a viewer's own socket and its
+path die together (a Wi-Fi roam, a VPN connecting), the page's redial hangs up through `sendRaw`, which drops the
+message while the socket is down (`ui/src/stores/ws.ts:443-449`), and then forgets the id
+(`useRemoteControl.ts:9521-9528`). The new request arrives on a new connection, which #1045's coalesce does not
+match (`hub.rs:1557-1582`, keyed on the connection). On a device that allows one session, the busy gate then answers
+`agent_busy` (`hub.rs:1711-1712`) until the agent's watchdog ends the old peer (20 s, `peer.rs:1084`) or `resume_by`
+passes; on a default device, which allows two, the held session takes the second slot. Three rules keep this no
+worse than today:
+
+- The redial's `rc:session.request` names the session it replaces (`replaces`, §4.3), and the page keeps that id
+  until the request is answered (§4.5). Before its capacity gate, the pod that takes the request ends that session
+  as `controller_hangup` when its row names the same user and the same device: on the hub that holds it, else in
+  the row.
+- `create_session`'s orphan reap (`hub.rs:1522-1555`) spares a controller-detached session only against another
+  user's request. A request from the same user, from a page too old to send `replaces` or from the user's other tab,
+  reaps it as today.
+- A controller's own `rc:terminate` for a session no hub holds is written to the row, conditional on Active and on
+  the row naming that user, as an admin's end is (§4.6). Today `Hub::terminate` writes nothing there
+  (`hub.rs:2440-2442`).
 
 **The claim, which decides.** It rides the agent's hello, so it is atomic with registration. For each id in
 `kept_sessions`, the pod that receives it answers `rc:session.resumed` only if all of these hold, and `rc:terminate`
-with the reason otherwise. A row with no `detached_at`, left by a pod that died without a word, is claimable too:
-the agent's own deadline bounds it.
+with the reason otherwise. It commits by bumping the row's `attach_seq` (fencing, below). A row with no `detached_at`,
+left by a pod that died without a word, is claimable too: the agent's own deadline bounds it.
 
 | Check | Fails as |
 |---|---|
@@ -281,10 +341,13 @@ the agent's own deadline bounds it.
 Consent is the one check not re-run: the session is the same one the device already decided on, at its start. Today
 a roll costs the same gate anyway, through the redial's new request, so the re-run takes nothing a roll does not.
 
-**Registration reads the collection, not the pod's memory.** The pod reads the agent's Active rows (an agent holds at
-most its capacity) and ends, as `agent_disconnect`, every one the claim does not name. An agent with no
-`kept_sessions` is therefore reaped as today, and more completely: today's reap reads only the pod's own map
-(`hub.rs:1048-1079`), so after a roll it finds nothing, and a row the dead pod never ended stays open.
+**Registration reads the collection, not the pod's memory, once the window is on.** For a device it announced a
+window to, the pod reads the agent's Active rows created before this registration (an agent holds at most its
+capacity), and ends, as `agent_disconnect`, every one the claim does not name. A row created after the registration
+belongs to the new connection, so the read never ends it. An agent with no `kept_sessions` is therefore reaped as
+today, and more completely: today's reap reads only the pod's own map (`hub.rs:1048-1079`), so after a roll it finds
+nothing, and a row the dead pod never ended stays open. With the window at 0, registration runs today's in-memory reap
+and nothing more.
 
 **What the pod rebuilds** from the row and the claim, on whichever pod it is:
 
@@ -296,20 +359,50 @@ most its capacity) and ends, as `agent_disconnect`, every one the claim does not
   resume. The idle limit lives on the agent, with the peer it keeps.
 - **The capacity count** includes resumed sessions from the moment of the claim, so a new request cannot slip into a
   slot a kept session holds.
-- **The audit**: `SessionResumed`, which the sink projects by clearing `detached_at` and `resume_by` and counting the
-  resume on the row. `SessionEnded` stays the only end, with today's reasons, so every reader of `end_reason` keeps
-  working.
+- **The audit**: `SessionDetached` and `SessionResumed` join the audit kinds. The claim clears `detached_at` and
+  `resume_by` itself, in its fencing update, and the sink only counts the resume on the row. `SessionEnded` stays the
+  only end, with today's reasons, so every reader of `end_reason` keeps working. The new kinds set a rollback floor
+  (§5).
+
+**Fencing: `attach_seq`.** The row carries a fencing number, 0 when the session is created. Every accepted claim
+commits with one conditional update that matches the `attach_seq` it read, bumps it, and clears `detached_at` and
+`resume_by`; a claim whose update matches nothing reads the row again and answers from what it finds. Every write a
+hub makes about a session it holds carries the number it holds and applies only at that number: a detach, and every
+end the hub decides on its own (`agent_disconnect` at a socket loss, `controller_hangup` at an orphan, the length
+limit, the reapers). So a pod that no longer holds the session cannot detach or end one that another pod resumed:
+not one whose half-open socket a TLS-inspecting middlebox kept alive, and not one whose sink flushes late (it batches
+for up to 200 ms, `crates/remote_control/src/audit.rs:40`). An end someone asks for (an admin's, a revoke, the
+controller's own, the person's at the device) applies at any number while the row is Active.
 
 **The sweep.** One pod at a time, as the presence sweep already runs (`crates/modules/fleet/src/presence.rs:13-14`),
-ends Active rows whose `resume_by` has passed, as `agent_disconnect`, through `SessionEnded`. It also ends an Active
-row with no `resume_by` whose device the presence sweep has found offline for longer than the window: the pod that
-died without a word, for a device that has not come back. Nothing in memory has to outlive the pod that saw the drop,
-which is where R3's grace falls short (§2.4).
+it ends Active rows whose `resume_by` has passed, as `agent_disconnect` through `SessionEnded`, each conditional on
+the `attach_seq` and `resume_by` it read. Only a device that was announced a window gets a `resume_by`, so with the
+window at 0 from the start this ends nothing, and a window turned back to 0 still ends what was detached before. It
+also ends an Active row with no `resume_by` whose device is in the scope and which the presence sweep has found
+offline for longer than the window: the pod that died without a word, for a device that has not come back. Outside
+the scope such a row stays as it is today, until the scope reaches its device. Nothing in memory has to outlive the
+pod that saw the drop, which is where R3's grace falls short (§2.4).
+
+**An inferred end is dated honestly, and marked.** The registration read and the sweep end rows whose end nobody
+saw. They write `ended_at` as the best-known real end, never their own clock:
+
+1. the row's `detached_at`;
+2. else its `stats_at`, the time of its last stats merge, which P1 adds to `merge_live_stats`
+   (`crates/services/src/dao/remote_session.rs:119`); stats arrive about every 15 s while a session is live
+   (`crates/remote_control/src/signaling.rs:705-706`);
+3. else its `started_at`, so a row from before P1 adds no hours.
+
+The agent's `last_seen_at` is not used: the hello, the offline paths and the heartbeat all stamp it
+(`crates/services/src/dao/agent.rs:445`, `:533`, `:578`, `:695`), so it dates the agent's last connection, not this
+row's. Each such row also gets `end_source`, `registration` or `sweep`, so an hour-weighted read can leave it out.
+P1 makes the growth digest do so (`digest.rs:1698-1717`); FR-135's R0 and S19 weights need the same filter, which
+P1's PR names for their owner. P0 counts the rows first (§5).
 
 ⚠️ **An end wins over a resume.** Every end writes the row conditionally on its being Active, then publishes today's
-control event. A resume commits with a conditional update on Active and inside `resume_by`, and reads the row once
-more after its hub entry is built. A resume that loses the race answers `rc:terminate`. An end that lands just after
-the commit is found by that re-read, or reaches the hub by the control event, as any kick does today.
+control event. A resume commits with its fencing update, which also requires Active and an unexpired `resume_by`, and
+reads the row once more after its hub entry is built. A resume that loses the race answers `rc:terminate`. An end
+that lands just after the commit is found by that re-read, or reaches the hub by the control event, as any kick does
+today.
 
 ### 4.5 The viewer: hold, then rejoin
 
@@ -328,7 +421,18 @@ and to claim its session back.
   again, and the page asks once a second until `resume_by`.
 - **Fall back.** A transport signal during the hold keeps today's meaning: the peer failed, so the page redials. With
   no answer by `resume_by` plus 5 s the page closes its peer and starts today's ladder. That is the viewer's
-  deadline, and an older server that never answers costs no more than it.
+  deadline, and an older server that never answers costs no more than it. A dying pod may never send
+  `rc:session.detached`, so a page that holds no `resume_by` counts from the moment its own socket dropped: that,
+  plus `resume_secs`, plus 5 s.
+- **A redial names what it replaces.** Whenever the page redials a held session, for any of the reasons above, it
+  keeps that session's id instead of dropping it (`useRemoteControl.ts:9528` today) and sends it as `replaces` on
+  the new `rc:session.request`, so the server ends the old session before its capacity gate (§4.4). Today's
+  best-effort hangup stays, and is no longer the only thing that frees the slot.
+- **A session on `derp` redials as today.** Its pair rides the overlay through the DERP floor
+  (`agents/roomlerd/src/session_carrier.rs:69-70`), and `/derp` is pod-local, so a roll takes that path down until
+  the overlay reattaches. The viewer's peer goes `disconnected` when its connectivity checks stop being answered,
+  and nothing bounds `/derp`'s return under the page's 4 s grace (`useRemoteControl.ts:276`), so the page redials.
+  Its `replaces` frees the old session's slot at once. FR-28 is the work that shortens that outage.
 - **The person's Disconnect during the gap** arrives as `rc:ended` on the control channel, and the page closes as it
   does for `host_disconnect` today: no ladder, the replay arguments dropped (`useRemoteControl.ts:9315-9327`).
 - **A record of its own.** A resumed session writes no `rc.connect` record, because no attempt starts. The page sends
@@ -347,6 +451,7 @@ During a gap no pod holds the session, so an end cannot be pushed to it. It wait
 | An admin ends the session (`routes.rs:68`) | the local terminate and the control event both find no hub, and the end is lost | the pod that takes the request writes the end to the row when no hub holds the session; the claim and the rejoin read it and get `rc:terminate admin_terminated` |
 | The device is removed or quarantined | — | the next upgrade is refused (§4.4); the agent closes at the refusal, or at its deadline |
 | The controller loses the org or the right to control the device | — | the claim's re-run gate refuses it (§4.4) |
+| The controller ends it, or its redial names it in `replaces` | `Hub::terminate` finds no hub and writes nothing (`hub.rs:2440-2442`) | the pod that takes it ends the session on the hub that holds it, else writes the end to the row, conditional on Active and on the row naming that user; the claim then answers `rc:terminate controller_hangup` (§4.4) |
 | The person at the device presses Disconnect | the kill arm runs only inside a connection | the table serves it at once (§4.2): stop serving, `rc:ended` to the viewer peer to peer, close after the grace, and `rc:terminate host_disconnect` sent on the next connection |
 | The session reaches its idle limit | as above | as the Disconnect, with `idle_timeout` |
 | The session passes the org's maximum length | the timer died with its pod | the claim answers `rc:terminate idle_timeout` with `limit: max_duration` |
@@ -367,7 +472,7 @@ sequenceDiagram
     participant V as Viewer
     participant N as Replacement pod
     K->>O: SIGTERM
-    O->>DB: SessionDetached: detached_at and resume_by, no end
+    O->>DB: SessionDetached at attach_seq s, detached_at and resume_by, no end
     O--xA: the control socket is reset
     O--xV: the viewer's socket is reset
     Note over A,V: pixels and input keep flowing peer to peer, direct or over TURN
@@ -375,12 +480,13 @@ sequenceDiagram
     V->>V: hold: the peer is kept, the chip reads server link down
     A->>N: redial (flat on a 502, FR-28), hello with kept_sessions
     N->>DB: same device, Active, inside resume_by, the gate re-run
+    N->>DB: commit at attach_seq s, bump it to s+1, clear detached_at and resume_by
     N->>A: rc:agent.resume_window, then rc:session.resumed
     Note over N: hub entry rebuilt, the maximum-length timer re-armed from started_at
+    O-->>DB: a late write from O carries attach_seq s and matches nothing
     V->>N: rc:session.rejoin
     N->>DB: same person, still a member, still allowed
     N->>V: rc:session.resumed
-    N->>DB: SessionResumed: detached_at and resume_by cleared
 ```
 
 ### 4.8 A revoke during the gap
@@ -423,9 +529,14 @@ sequenceDiagram
    agent's cap.
 3. The table never holds more sessions than the device's capacity.
 4. The viewer closes its `RTCPeerConnection` on every end it closes on today, and at its own hold deadline.
-5. Off is today: with the switch off, or no window announced, every arm calls `close_all_peers` as at the pin.
+5. Off is today: with the switch off, or no window announced, every arm calls `close_all_peers` as at the pin; with
+   the window at 0, the server ends at a socket loss what it ends today, and its registration read and sweep end no
+   row that no detach marked.
 6. The field signature stays readable: the daemon's UDP socket count returns to its baseline after each real end,
    and each `detached` line is followed by one `resumed` or one `closed` line for the same session.
+7. No send by a kept peer blocks while it is detached, and every sender a session holds follows it to the next
+   connection (§4.2).
+8. A held session never holds its own viewer's slot: a redial's `replaces` ends it first (§4.4).
 
 ### 4.10 The commitments
 
@@ -445,17 +556,25 @@ switches sit in the control path, so each carries its retire condition here inst
 
 | Phase | What | Lives in | Kill switch, default | RED | GREEN | Retires |
 |---|---|---|---|---|---|---|
-| **P0** | The roll read (§6) as a script, and the baseline on today's deploy | `scripts/` | none: a read | The §6 roll on the current deploy: every live session ends `agent_disconnect`, the page redials (`after_drop`), a new row, the media gap is the redial's | none: it is the baseline | — |
-| **P1** | The server and the viewer: the wire (§4.3), the durable detach, the claim and the rejoin with the checks re-run, the sweep, the ends of a detached session, the audit kinds, the viewer's hold | hub, remote module, `crates/remote_control`, `useRemoteControl.ts`, the composition baseline | `ROOMLER__RC__SESSION_RESUME_SECS`, **0**: the hub announces no window, ends a session at a socket loss as today, and answers any claim with `rc:terminate`; the viewer never holds | Integration tests on `TestApp::spawn_pair`, written first, fail on the pin: an agent's socket drop ends the row `agent_disconnect` | The same tests pass with a window: the claim on pod 2 resumes, the viewer rejoins through pod 2, a kick on pod 2 during the gap ends it at the claim, an unclaimed session ends at the sweep, an agent without the verb ends as today, a claim for another device's session is refused. In the field, after the promote, the §6 roll with the window at 0 reads as P0, and again at 60 with no agent advertising the verb | Stays: it is the window, and 0 is off |
-| **P2a** | The agent keeps its own sessions: the table in `run`, the twelve detaching arms, the deadline, the person's Disconnect and the idle limit during the gap, `rc:ended`, the queued end, the claim in the hello, the re-pointed sender, the verb advertised only with the switch on, and one log line per detach, resume and close | `signaling.rs`, `peer.rs`, the config | `rc_sessions_survive_reattach`, or `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`: **off**. Device-side and not pushable, as `ws_flat_redial` and `tunnel_peers_survive_reattach` are. Read once per connection; on, it still keeps nothing unless the server announced a window | A unit test per arm, written first, shows each of the seventeen closes every peer at the pin | The twelve detach and the five close; the deadline closes; a Disconnect in the gap closes and queues its end; a refused token closes; the bound holds. In the field, the release with the switch off reads as P0 | Stays as the device's off switch after P4 |
+| **P0** | The roll read (§6) as a script, the baseline on today's deploy, and a bounded count of today's Active rows (capped by `limit` and `maxTimeMS`, with the oldest few by `started_at`, never an unbounded scan), so the backfill's size is known before any sweep runs | `scripts/` | none: a read | The §6 roll on the current deploy: every live session ends `agent_disconnect`, the page redials (`after_drop`), a new row, the media gap is the redial's | none: it is the baseline, and the count | — |
+| **P1** | The server and the viewer: the wire (§4.3), the resume scope, the durable detach, the claim and the rejoin with the checks re-run, `attach_seq`, the sweep, the ends of a detached session, the redial's `replaces` with the same-user orphan rule, the controller's end written to the row, `stats_at` and `end_source` with the growth digest's filter, the audit kinds with a tolerant read, the viewer's hold | hub, remote module, `crates/remote_control`, `crates/services`, the growth digest, `useRemoteControl.ts`, the composition baseline | `ROOMLER__RC__SESSION_RESUME_SECS`, **0**: the hub announces no window, ends a session at a socket loss as today, runs no registration read and no sweep, and answers any claim with `rc:terminate`; the viewer never holds. The resume scope is empty until P3 | Integration tests on `TestApp::spawn_pair`, written first, fail on the pin: an agent's socket drop ends the row `agent_disconnect` | The same tests pass with a window: the claim on pod 2 resumes, the viewer rejoins through pod 2, a kick on pod 2 during the gap ends it at the claim, an unclaimed session ends at the sweep, an agent without the verb ends as today, a claim for another device's session is refused. Also: a viewer's socket drops and the same user's new request, on a device that allows one session, gets no `agent_busy`, with `replaces` and without it; a resume on pod 2, then pod 1's late detach, leaves the row attached, and the sweep leaves it too; with the window at 0, a row a dead pod left Active stays as at the pin; an inferred end takes `detached_at`, else `stats_at`, else `started_at`, and sets `end_source`; an audit listing holding the new kinds reads. In the field, after the promote, the §6 roll with the window at 0 reads as P0, and again at 60 with an empty scope | Stays: it is the window, and 0 is off |
+| **P2a** | The agent keeps its own sessions: the table in `run`, the twelve detaching arms, the deadline, the person's Disconnect and the idle limit during the gap, `rc:ended`, the queued end, the claim in the hello, one re-pointable handle for every sender a session holds, sends that never block while detached, the net-change close, the verb advertised only with the switch on, and one log line per detach, resume and close | `signaling.rs`, `peer.rs`, the config | `rc_sessions_survive_reattach`, or `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`: **off**. Device-side and not pushable, as `ws_flat_redial` and `tunnel_peers_survive_reattach` are. Read once per connection; on, it still keeps nothing unless the server announced a window | A unit test per arm, written first, shows each of the seventeen closes every peer at the pin | The twelve detach and the five close; the deadline closes; a Disconnect in the gap closes and queues its end; a refused token closes; the bound holds. A resumed peer that then fails sends its `Terminate` on the new connection; a detached peer's sends never wait on the bounded channel; after a net-change detach, a peer whose connection leaves `Connected` closes at once. In the field, the release with the switch off reads as P0 | Stays as the device's off switch after P4 |
 | **P2b** | The supervised Mac: the daemon claims a delegated session, the GUI worker keeps and closes its peer, and the claim's answer reaches the worker on the delegation channel | `delegate.rs`, `delegate_worker.rs` | the same switch | P3's read on a supervised Mac: its delegated session ends while P2a's own sessions survive | It survives too | With the switch |
-| **P3** | The field flip: production's window at 60, the switch on for at least two hosts of each OS class, standing-consent devices and test guests only | config | the window back to 0 (it lands with the pods it rolls); the switch off on a device | P0's read | §6's roll reads AC1–AC4 | — |
-| **P4** | The agent's default flips on, staged by class (D4) | an agent release | the switch, per device; the window, for the fleet at once | The P3 hosts against the fleet in one roll | AC7: a week of rolls with no `agent_disconnect` end inside a promote run on hosts with the switch on | — |
+| **P3** | The field flip: production's window at 60, and the resume scope naming at least two hosts of each OS class, standing-consent devices and test guests only, with the agent switch set on there | config, and the scope | a host taken out of the scope, which withdraws its window at once; the window back to 0 for the fleet (it lands with the pods it rolls); the switch off on a device | P0's read | §6's roll reads AC1–AC4 and AC9 | — |
+| **P4** | The fleet, staged server-side (D4): the agent's default flips on in one release, then the scope widens class by class until it reads `all` | an agent release, and the scope | a class taken out of the scope, at once; the switch, per device; the window, for the fleet | The scope's hosts against the rest in one roll | AC7: a week of rolls with no `agent_disconnect` end inside a promote run on hosts in the scope | — |
 | **Docs** | §7's AC8: `docs/remote-control.md`, `docs/multi-pod-scale-out.md`, `docs/deployment.md`, the operator docs for both switches, the index row | docs | none | — | Written with each phase; the field numbers come with P3 | — |
 
-⚠️ **Either half alone is inert, by construction.** The agent keeps nothing unless its server announced a window,
-and the server detaches nothing unless the agent advertised the verb, which it does only with its switch on. The verb
-is the agent's promise and the window is the server's, so whichever half ships first changes nothing. P3 needs both.
+⚠️ **Either half alone is inert, by construction.** The agent keeps nothing unless its server announced it a window,
+which the server does only for a device in the resume scope, and the server detaches nothing unless the agent
+advertised the verb, which it does only with its switch on. The verb is the agent's promise and the window is the
+server's, so whichever half ships first changes nothing. P3 needs both.
+
+⚠️ **The rollback floor.** P1 adds a `#[serde(other)]` variant to `AuditKind` in the same image that can write
+`SessionDetached` and `SessionResumed`, and nothing writes them until P3: the audit listing reads a whole
+`Vec<RemoteAuditEvent>`, so one unknown kind would fail it (§2.5). Once P3 has written the new kinds, no server
+rollback goes to an image older than P1's. The row itself sets no floor: `RemoteSession` denies no unknown field
+(`crates/remote_control/src/models.rs:6032-6033`), so an older image reads a row that carries `attach_seq`,
+`detached_at`, `resume_by`, `stats_at` or `end_source` and ignores them, and no new `EndReason` or phase is added.
 
 ## 6. The field read
 
@@ -464,7 +583,8 @@ The same read for every RED and GREEN, so that they compare.
 1. **Sessions.** One live session on each carrier, `direct`, `turn` and `derp` (FR-102 P9c's `remote_sessions.carrier`),
    to a Windows, a Linux and a macOS host, each started a few minutes before the roll (§2.5's TURN line). Standing-
    consent devices and test guests only, never a corporate laptop without its owner's agreement. Read the open
-   sessions before the roll: a roll ends every one of them today.
+   sessions before the roll: a roll ends every one of them today. The `derp` session is expected to redial even
+   after P3 (§4.5): it is read for its slot, freed at once by `replaces`.
 2. **Before.** On each host, the daemon's UDP socket count, and the `remote_sessions` rows of the hosts.
 3. **The roll.** `kubectl rollout restart deploy/roomler2`, the timestamps of both waves from the pods.
 4. **After.** Per session: the rows (a new one, or the same one with its `detached_at` gone); the viewer's `rc.connect`
@@ -482,9 +602,9 @@ The same read for every RED and GREEN, so that they compare.
   and the 2026-11-09 roll).
 - [ ] **AC2, the picture (FR-28's AC1, moved here).** On `direct` and `turn`, no gap above 500 ms in the frames the
   viewer paints across the roll, read from `rc.resume`'s `gap_ms`; 2436 ms was measured on 2026-08-29, and today a
-  roll costs a new session. On `derp`, the session keeps its row and its gap is no longer than `/derp`'s own reattach
-  plus 1 s. (FR-28's wording named the `video DC delivery gap` line, which is console-only and floored at 1500 ms,
-  so it cannot read 500 ms.)
+  roll costs a new session. A session on `derp` redials as today (§4.5), and its old row ends at its new request,
+  with no `agent_busy`. (FR-28's wording named the `video DC delivery gap` line, which is console-only and floored
+  at 1500 ms, so it cannot read 500 ms.)
 - [ ] **AC3, nothing leaks.** On each OS class the daemon's UDP socket count returns to its step-2 baseline within
   five minutes of each session's real end; every `detached` line is followed by one `resumed` or one `closed` line
   for the same session; no `peer close overran its budget` line names a kept peer.
@@ -494,18 +614,23 @@ The same read for every RED and GREEN, so that they compare.
   session nobody claims ends at the window as `agent_disconnect`. The person's Disconnect during the gap ends it at
   once, and the row records `host_disconnect`.
 - [ ] **AC5, old meets new.** An agent without the verb, an agent with the switch off, a server with the window at 0,
-  an older viewer, and a server rolled back to an older image during a gap each behave as today or end at the
-  window, one test each, and the matrix is in the docs.
+  a device outside the scope, an older viewer, and a server rolled back to an older image during a gap each behave
+  as today or end at the window, one test each, and the matrix is in the docs. The rollback case reads the audit
+  listing of a session that holds the new kinds, on P1's image, and the docs state the floor (§5).
 - [ ] **AC6, everything else still ends.** A shutdown, an update, sleep, a resume from suspend, `rc:goodbye`, a key
   rotation and a refused token each close every peer at once (a unit test per arm). A session not yet live, and an
   external one, end as today.
 - [ ] **AC7, the class reads zero.** A week of production promotes after P4 reads no session ended `agent_disconnect`
-  inside a promote run on a host with the switch on (FR-135 S19's first class). That answers FR-135's AC21 for its
-  owner.
+  inside a promote run on a host in the scope (FR-135 S19's first class). That answers FR-135's AC21 for its owner.
 - [ ] **AC8, docs.** `docs/remote-control.md` gains a section on a session that outlives its control socket, with
   both sequence diagrams, the state diagram and the old-and-new matrix; `docs/multi-pod-scale-out.md` and
-  `docs/deployment.md` say what a roll does to a session now; both switches are in the operator docs; and any page
-  added gets its row in `docs/README.md`'s index.
+  `docs/deployment.md` say what a roll does to a session now; the window, the scope and the agent's switch are in the
+  operator docs; and any page added gets its row in `docs/README.md`'s index.
+- [ ] **AC9, never worse than today.** In integration tests, and once in the field on a test guest: a viewer whose
+  own socket and peer die together gets its new session with no `agent_busy`, on a device that allows one session,
+  and its old session ends at that request. With the window at 0, the server ends at a socket loss what it ends
+  today, and neither the registration read nor the sweep ends a row that no detach marked. A row ended by inference
+  carries `end_source`, and its `ended_at` is never later than its own last clock (§4.4).
 
 ## 8. Open decisions for the operator
 
@@ -514,7 +639,7 @@ The same read for every RED and GREEN, so that they compare.
 | **D1** | How long may a session wait for its control socket? | A: 30 s. B: 60 s. C: 120 s | **B, 60 s** | It covers FR-28's p90 of 8.8 s many times over, and the old ladder's worst landing (+31 s on the control socket). It matches FR-85's re-attach grace, so a recording and its session wait alike. It is also the longest a kick can wait if no pod answers the device. A costs the slow tail of rolls; C doubles the worst case of a missed kick |
 | **D2** | What may the controller do while the socket is down? | A: everything it could, until the server answers or the window ends. B: watch only, input held until the server answers. C: nothing, the picture frozen until then | **A** | On a roll the gap is the reconnect, 3–9 s, and every end the server issued meanwhile lands at the claim. The person at the device can end the session at any moment without the server. B and C make every roll visible to the person working, which is what this FR removes. A gives up up to the window of control after a kick that was issued while no pod could reach the device |
 | **D3** | External sessions (FR-52)? | A: end at a socket loss, as today. B: resume, with the outsider's binding proven again | **A** | The outsider's authority is a login bound by MACs over both DTLS fingerprints; re-proving it on a new pod is a design of its own. The redial does not take an external session over today either (`docs/remote-control.md` §11.15). A costs outsiders a new login at a roll |
-| **D4** | How does the agent's default flip? | A: after P3's GREEN, by class: test guests and standing-consent devices, then Linux and macOS, then Windows, then corporate and office hosts. B: never by default, a device opts in. C: one release, all at once | **A** | The switch keeps a peer the old code closed. A leak on a corporate laptop is the failure CLAUDE.md warns of first (a leaked peer once ate the ephemeral port range and took a host's DNS down), and those hosts have the least margin. A staged flip lets AC3 read on each class before the next. B leaves the fleet where it is; C bets the fleet on one read |
+| **D4** | How is the fleet staged? | A: server-side. After P3's GREEN the agent's default flips on in one release (still capped at 120 s, still a local off), and the hub announces the window only to the resume scope, which widens class by class: test guests and standing-consent devices, then Linux and macOS, then Windows, then corporate and office hosts, then `all`. B: device by device. The agent's switch stays off by default, and a person sets it host by host where the owner agrees, as FR-135's D17-A does for a push. C: at once. The default flips and the scope reads `all` in the same week | **A** | The agent keeps nothing without a window, so the scope reaches every class, including the corporate and office hosts that no push reaches (FR-135 §7.1, D17). It needs no device config, and it reverses at once: a class taken out of the scope has the window withdrawn on its open connections. A release can stage by OS at most, and slowly: a forward release takes hours (D17's C). Staging lets AC3 read on each class before the next, and corporate hosts go last because a leak there is the failure CLAUDE.md warns of first (a leaked peer once ate the ephemeral port range and took a host's DNS down). The cost: a list to keep on the server, and once the default flips every device runs the new connection code, with the window as its only gate. B leaves the corporate and office classes where they are; C bets the fleet on one read |
 
 ## 9. Out of scope
 
@@ -522,8 +647,8 @@ The same read for every RED and GREEN, so that they compare.
   process, so nothing here can keep its session. The shutdown arm stays terminal.
 - **The machine sleeping**, and a resume from suspend.
 - **A session not yet live**: a consent prompt or an offer in flight ends as today (#2416).
-- **`/derp`'s own outage at a roll** (FR-28): a session on `derp` keeps its row here, and its picture waits for
-  `/derp` to come back.
+- **`/derp`'s own outage at a roll** (FR-28): a session on `derp` redials as today, because its viewer reads the
+  outage as a drop (§4.5). `replaces` frees its slot at once.
 - **A cluster-wide hub.** The row and the two claims are enough; moving the hub's state into Redis is a larger change
   and this FR does not need it.
 - **Tunnel, SSH and conference sessions.** Tunnels have R3; a meeting's media runs through the SFU in the pod and
