@@ -193,6 +193,12 @@ jobs:
             exit 1
           fi
 
+      # #3352 — every job on a Windows runner in this file declares `bash` as
+      # its default shell, so a step stops at its first failing command. The
+      # script refuses a planted workflow first, then scans this one.
+      - name: Guard — every Windows job's steps stop at their first failing command (#3352)
+        run: bash scripts/windows-shell-guard.sh
+
       - name: Install Rust toolchain
         # Pinned to the version in rust-toolchain.toml so local dev
         # and CI reject the same lints. Bump both in one commit
@@ -1561,6 +1567,17 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
+    # #3352 — bash, not the runner's pwsh. pwsh's wrapper exits with the LAST
+    # native command's code, so `cargo clippy … -D warnings` followed by
+    # `cargo test` passed whatever clippy found. GitHub runs bash with
+    # `-eo pipefail`: the first failing command fails the step. Set per job (a
+    # workflow-wide bash would add pipefail to every Linux step), and the guard
+    # in rust-lint (scripts/windows-shell-guard.sh) fails a Windows job without
+    # it. A step that needs PowerShell says `shell: pwsh` and checks
+    # $LASTEXITCODE after each native command.
+    defaults:
+      run:
+        shell: bash
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
     permissions:
       contents: write
@@ -1692,6 +1709,10 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 40
+    # #3352 — the first failing command fails the step; see windows-overlay-clippy.
+    defaults:
+      run:
+        shell: bash
     # A master push publishes this job's cargo cache as a release asset
     # (ci-seed-save), which needs `contents: write`.
     permissions:
@@ -1794,6 +1815,10 @@ jobs:
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
     timeout-minutes: 45
+    # #3352 — the first failing command fails the step; see windows-overlay-clippy.
+    defaults:
+      run:
+        shell: bash
     # FR-6 wave 22: the cache publishes as a release asset; see macos-overlay-check.
     permissions:
       contents: write
