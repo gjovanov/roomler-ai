@@ -90,7 +90,7 @@ flowchart TD
 
 - **Where the manifest comes from:** `hosted-image.yml` checks out full history and runs
   `bun docs/dates.ts --write` before the Docker build
-  ([`hosted-image.yml:113`](../.github/workflows/hosted-image.yml)); the build context is a
+  ([`hosted-image.yml:114`](../.github/workflows/hosted-image.yml)); the build context is a
   path, so the untracked file reaches `COPY ui/ .`. The CLI **refuses** to write from a shallow
   clone ([`dates.ts:106`](../ui/docs/dates.ts)): a depth-1 clone's one commit "touches" every
   file, which would stamp HEAD's date everywhere, the same lie one step removed.

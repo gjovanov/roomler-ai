@@ -2442,15 +2442,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #3400 — bun's version has ONE record, .bun-version: every setup-bun
+      # step reads it, and the Dockerfile's BUN_VERSION defaults to it.
+      - name: bun's version has one record (#3400)
+        run: bash scripts/bun-version-check.sh
       - name: Install bun
-        # Pin bun to match local reproducible builds; setup-bun@v2 with
-        # no version input resolves to `latest`, which has silently
-        # shipped regressions that broke `vue-tsc --noEmit` for us in
-        # the past. Local 1.3.12 on Windows + Linux (WSL) passes, so
-        # we pin there and bump intentionally.
+        # Pinned, never `latest`: an unpinned bun shipped vue-tsc regressions.
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.12
+          bun-version-file: .bun-version
 
       - name: Cache bun dependencies
         uses: actions/cache@v4

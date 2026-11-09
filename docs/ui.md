@@ -694,6 +694,11 @@ bun run test:unit      # Vitest (jsdom)
 bun run e2e            # Playwright (32 spec files)
 ```
 
+bun's version is pinned in [`.bun-version`](../.bun-version), its one record: CI's
+`setup-bun` steps read it, and the server image's UI stage defaults its `BUN_VERSION` to it.
+To move bun, change that file and the Dockerfile's `ARG BUN_VERSION` in one commit; the
+frontend checks fail while the two disagree (`scripts/bun-version-check.sh`, #3400).
+
 Test layout: unit specs in `ui/src/__tests__/` (stores, composables — including
 the `rc:*` ws channel and `useRemoteControl` HID/button-mapping locks), E2E specs
 in `ui/e2e/` with fixtures in `ui/e2e/fixtures/test-helpers.ts` — see
