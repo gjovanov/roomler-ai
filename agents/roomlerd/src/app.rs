@@ -8103,24 +8103,59 @@ mod tests {
         assert_eq!(got, default);
     }
 
+    /// #3387 — a SystemContext worker runs the machine's own enrollment, and
+    /// nothing else: whatever exists on the disk, it never takes the config of
+    /// the person signed in at the console. That person's enrollment runs as
+    /// that person, on the service host's user-context arm, until the machine
+    /// has one of its own (`win_service::supervisor::want_system_worker`).
     #[test]
-    fn pick_config_path_system_context_falls_to_active_user() {
-        // Machine-global absent, default (SYSTEM profile) absent —
-        // post-logon SC worker uses the active-user fallback.
+    fn pick_config_path_system_context_never_takes_the_persons_config() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let active = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, Some(active), |p| p == active);
-        assert_eq!(got, active);
+        let person = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
+        // Every combination of what exists: the machine config, the
+        // SYSTEM-profile one, the person's.
+        for bits in 0u8..8 {
+            let on = |p: &Path| {
+                (p == mg && bits & 1 != 0)
+                    || (p == default && bits & 2 != 0)
+                    || (p == person && bits & 4 != 0)
+            };
+            let got = pick_config_path(None, true, Some(mg), default, Some(person), on);
+            assert_ne!(got, person, "exists bits {bits:03b}");
+            assert!(
+                got == mg || got == default,
+                "exists bits {bits:03b}: {got:?}"
+            );
+        }
+        // The case the person's rung served: only the person's config is there.
+        let got = pick_config_path(None, true, Some(mg), default, Some(person), |p| p == person);
+        assert_eq!(got, mg);
     }
 
+    /// #3387 — with nothing on the disk a SystemContext worker names the
+    /// machine path, so its "no config found" says where the machine's
+    /// enrollment belongs, not the SYSTEM profile. Any other worker still
+    /// names its own default.
     #[test]
-    fn pick_config_path_returns_default_when_nothing_exists() {
-        // Nothing on disk → default, so config::load fails with an
-        // honest "not found" naming that path.
+    fn pick_config_path_system_context_names_the_machine_path_when_nothing_exists() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
         let got = pick_config_path(None, true, Some(mg), default, None, |_| false);
+        assert_eq!(got, mg);
+        let user_default = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
+        let got = pick_config_path(None, false, Some(mg), user_default, None, |_| false);
+        assert_eq!(got, user_default);
+    }
+
+    /// The SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
+    /// without `--machine-global`) stays a rung: only SYSTEM and
+    /// Administrators can write it.
+    #[test]
+    fn pick_config_path_system_context_keeps_the_system_profile_rung() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
+        let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
+        let got = pick_config_path(None, true, Some(mg), default, None, |p| p == default);
         assert_eq!(got, default);
     }
 
