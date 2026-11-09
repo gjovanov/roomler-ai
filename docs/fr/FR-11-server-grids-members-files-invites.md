@@ -65,7 +65,7 @@ decision).
   gated on **`KICK_MEMBERS`** (`role.rs:35` — defined, never consumed until
   now). Refusals: the tenant **owner** cannot be removed (409); self-removal
   is allowed (it is "leave"). New `TenantDao::remove_member` =
-  `members.hard_delete` (`TenantMember` has no `deleted_at`; `base.rs:341`).
+  `members.hard_delete` (`TenantMember` has no `deleted_at`; `base.rs:424`).
   Room-membership rows are left in place — tenant `is_member` is the access
   gate everywhere, so a removed user loses access structurally; cascade is a
   noted follow-up.

@@ -147,6 +147,31 @@ describe('useFileStore', () => {
 
       expect(store.files).toHaveLength(1)
     })
+
+    // #3327 — the server resolves a file by id as a live one only, so a delete
+    // of a file already deleted answers 404.
+    it('a 404 is a file already deleted: it leaves the list and nothing is thrown', async () => {
+      mockApi.delete.mockRejectedValueOnce(Object.assign(new Error('Resource not found'), { status: 404 }))
+
+      const store = useFileStore()
+      store.files = [makeFile({ id: 'f1' }), makeFile({ id: 'f2' })]
+
+      await expect(store.deleteFile('t1', 'f1')).resolves.toBeUndefined()
+
+      expect(store.files.map((f) => f.id)).toEqual(['f2'])
+    })
+
+    it('any other refusal is still an error, and the file stays', async () => {
+      mockApi.delete.mockRejectedValueOnce(
+        Object.assign(new Error('Only the uploader can delete this file'), { status: 403 }),
+      )
+
+      const store = useFileStore()
+      store.files = [makeFile({ id: 'f1' })]
+
+      await expect(store.deleteFile('t1', 'f1')).rejects.toThrow('Only the uploader')
+      expect(store.files.map((f) => f.id)).toEqual(['f1'])
+    })
   })
 
   describe('downloadUrl', () => {

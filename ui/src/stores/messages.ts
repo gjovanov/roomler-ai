@@ -3,6 +3,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { alreadyDeleted } from '@/utils/alreadyDeleted'
 import { useAuthStore } from './auth'
 
 interface Reaction {
@@ -146,8 +147,14 @@ export const useMessageStore = defineStore('messages', () => {
   }
 
   async function deleteMessage(tenantId: string, roomId: string, messageId: string) {
-    await api.delete(`/tenant/${tenantId}/room/${roomId}/message/${messageId}`)
-    messages.value = messages.value.filter((m) => m.id !== messageId)
+    try {
+      await api.delete(`/tenant/${tenantId}/room/${roomId}/message/${messageId}`)
+    } catch (e) {
+      // A 404 is a message already deleted (#3327): no `message:delete` will
+      // follow, so it leaves both lists here, and no error is shown.
+      if (!alreadyDeleted(e)) throw e
+    }
+    removeMessageFromWs({ id: messageId, room_id: roomId })
   }
 
   async function addReaction(tenantId: string, roomId: string, messageId: string, emoji: string) {

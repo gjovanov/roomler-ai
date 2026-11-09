@@ -33,6 +33,16 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   existence. ⚠️ A handler keyed by `message_id` must use the **message** guard — the
   two ids are decoupled. ⚠️ Never re-fetch with a bare `find_by_id` after a
   tenant-scoped write.
+- **A removed thing answers nothing** (#3327). `BaseDao::find_by_id_in_tenant`
+  answers live rows only, and a soft delete matches a live row only. The
+  tombstone-inclusive `find_any_by_id_in_tenant` is a `disallowed-methods` entry in
+  the root `clippy.toml`: only a named DAO reader (`find_any_in_tenant`) calls it,
+  under `#[expect(clippy::disallowed_methods, reason = "…")]`, for a refusal that
+  must say why or an audit view of a removed thing. ⚠️ The live predicate is
+  `deleted_at: null`; `{"$type": "null"}` is for partial unique indexes and 404s a
+  live row with no field. ⚠️ A removed device must still be told it was removed:
+  the revocation checks keep the tombstone reader, or the device retries a bare
+  401 forever.
 - **Call media is authorized by the caller's call seat (`call/join`), never by org membership.** Every `media:*` frame checks the seat, and losing the membership revokes it.
 - **A 403 is an answer, not an expired credential.** It never ends a session, on any
   method. The only 403 with a navigation is `not_a_member`, matched on a

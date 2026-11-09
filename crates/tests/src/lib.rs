@@ -12,6 +12,11 @@ mod auth_tests;
 mod channel_crud_tests;
 #[cfg(test)]
 mod channel_tests;
+/// #3327 — a deleted message or file answers nothing: every route keyed by
+/// its id answers 404, a write that raced the delete matches nothing, and a
+/// row that never carried `deleted_at` is live.
+#[cfg(test)]
+mod chat_tombstone_tests;
 /// The `media:*` socket namespace admits only a live participant of the
 /// room's call: org, room visibility and call session for `media:join`, the
 /// connection's seat for every other command, on both sides of the socket.

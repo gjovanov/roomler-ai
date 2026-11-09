@@ -1435,11 +1435,11 @@ pub async fn session_opened(
 /// asking about. An `Err` leaves the session running, as a failed `note_session`
 /// does: what runs behind a session never costs it on a read it could not make.
 ///
-/// The device row is the ANY lookup, tombstone included, on purpose. A removed
-/// device is not this read's to end: its removal kicks it (`removal::kick`), and
-/// the kick ends its sessions (`Hub::kick_removed_agent`). A tombstone answering
-/// here as a live row does keeps a removal that raced the open from reading as a
-/// failed read.
+/// The device row is the ANY lookup, tombstone included, on purpose
+/// (`AgentDao::find_any_in_tenant`). A removed device is not this read's to
+/// end: its removal kicks it (`removal::kick`), and the kick ends its sessions
+/// (`Hub::kick_removed_agent`). A tombstone answering here as a live row does
+/// keeps a removal that raced the open from reading as a failed read.
 async fn org_gates_open(
     state: &RemoteState,
     tenant_id: ObjectId,
@@ -1449,8 +1449,7 @@ async fn org_gates_open(
     let agent = state
         .fleet
         .agents
-        .base
-        .find_by_id_in_tenant(tenant_id, device)
+        .find_any_in_tenant(tenant_id, device)
         .await?;
     let (approval, _) = agent.external_access_policy.split();
     Ok(tenant.settings.external_rc_enabled && approval.is_open_at(bson::DateTime::now()))

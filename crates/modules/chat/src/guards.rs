@@ -178,7 +178,7 @@ pub async fn require_file(
     let file = state
         .files
         .base
-        .find_live_by_id_in_tenant(tenant_id, file_id)
+        .find_by_id_in_tenant(tenant_id, file_id)
         .await?;
     if let Some(room_id) = file.context.room_id {
         let room = state
@@ -194,7 +194,9 @@ pub async fn require_file(
 /// The rooms of one tenant as one caller reaches them: the rule of
 /// [`require_room_in_tenant`] over every room of the tenant at once, for a
 /// listing that spans rooms and must leave out the ones the caller may not
-/// read. Rooms in any state count, as the single-room guard resolves them.
+/// read. Live rooms only, as the single-room guard resolves them (#3327): a
+/// room that still carries a removal date, from before a room's delete
+/// removed it outright, is left out.
 pub struct RoomReach {
     /// Rooms whose content the caller may read: every Public room, and every
     /// Private or Secret room the caller is a member of.
@@ -244,7 +246,7 @@ pub async fn room_reach(
         .base
         .collection()
         .clone_with_type::<Document>()
-        .find(doc! { "tenant_id": tenant_id })
+        .find(doc! { "tenant_id": tenant_id, "deleted_at": null })
         .projection(doc! { "_id": 1, "visibility": 1 })
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;

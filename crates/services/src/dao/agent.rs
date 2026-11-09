@@ -366,9 +366,7 @@ impl AgentDao {
         tenant_id: ObjectId,
         agent_id: ObjectId,
     ) -> DaoResult<Agent> {
-        self.base
-            .find_live_by_id_in_tenant(tenant_id, agent_id)
-            .await
+        self.base.find_by_id_in_tenant(tenant_id, agent_id).await
     }
 
     /// The per-device lookup that also returns a TOMBSTONE — for the readers
@@ -380,16 +378,28 @@ impl AgentDao {
     ///   `NotFound` there would drop the socket and leave the device
     ///   reconnecting forever against what reads as a network fault;
     /// * an audit view of a removed device's history, where "removed" must
-    ///   not mean "unauditable".
+    ///   not mean "unauditable": `recording-`, `transfer-` and
+    ///   `privacy-activity`, the device's `…/logs` and `…/crash`;
+    /// * External access's re-read of its gates as a session opens
+    ///   (`extauth::org_gates_open`). A removed device is its removal's to
+    ///   end (`removal::kick`), not this read's, and a tombstone answering
+    ///   here keeps a removal that raced the open from reading as a failed
+    ///   read.
     ///
     /// Never for a write, never for a session start, never for a GET of the
     /// device itself — those are [`Self::find_live_in_tenant`].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a revocation must say why a removed device is refused, and an audit view reads a removed device"
+    )]
     pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         agent_id: ObjectId,
     ) -> DaoResult<Agent> {
-        self.base.find_by_id_in_tenant(tenant_id, agent_id).await
+        self.base
+            .find_any_by_id_in_tenant(tenant_id, agent_id)
+            .await
     }
 
     /// The filter every ADMIN-driven setter below writes through: this row,

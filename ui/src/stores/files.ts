@@ -3,6 +3,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { api } from '@/api/client'
+import { alreadyDeleted } from '@/utils/alreadyDeleted'
 
 interface FileEntry {
   id: string
@@ -93,7 +94,13 @@ export const useFileStore = defineStore('files', () => {
   }
 
   async function deleteFile(tenantId: string, fileId: string) {
-    await api.delete(`/tenant/${tenantId}/file/${fileId}`)
+    try {
+      await api.delete(`/tenant/${tenantId}/file/${fileId}`)
+    } catch (e) {
+      // A 404 is a file already deleted (#3327): it leaves the list all the
+      // same, and no error is shown.
+      if (!alreadyDeleted(e)) throw e
+    }
     files.value = files.value.filter((f) => f.id !== fileId)
   }
 

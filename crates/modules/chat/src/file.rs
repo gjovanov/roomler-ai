@@ -477,7 +477,12 @@ pub async fn delete(
         ));
     }
 
-    state.files.soft_delete(tid, fid).await?;
+    // The soft delete matches a live file only, so a second delete that passed
+    // the guard before the first one landed finds nothing: it answers as a
+    // missing file does and keeps the first removal time.
+    if !state.files.soft_delete(tid, fid).await? {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
