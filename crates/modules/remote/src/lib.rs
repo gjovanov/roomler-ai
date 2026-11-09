@@ -51,6 +51,9 @@ pub mod controller;
 pub mod extauth;
 pub mod extauth_notice;
 pub mod relay;
+/// FR-138 — the answer to a device's claim on the sessions it kept, and the
+/// registration read.
+pub mod resume;
 pub mod routes;
 pub mod session_policy;
 pub mod slots;
@@ -140,13 +143,17 @@ impl Module for RemoteState {
         relay::wire_rc_relay(&state);
         // The agent socket is fleet's; this module's arm (the session-stats
         // merge) is dispatched to it by `ClientMsg::namespace()` (P5c).
+        // FR-138 — and its lifecycle answers a hello's claims on the sessions
+        // the device kept, and ends what earlier connections left open.
         state.core.agent_socket.register(
             Self::ID,
             AgentSocketHooks {
                 handler: Some(Arc::new(agent_socket::RemoteAgentSocket::new(
                     state.clone(),
                 ))),
-                lifecycle: None,
+                lifecycle: Some(Arc::new(agent_socket::RemoteAgentLifecycle::new(
+                    state.clone(),
+                ))),
             },
         );
         Ok(state)

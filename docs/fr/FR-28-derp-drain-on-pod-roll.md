@@ -49,7 +49,7 @@ sequenceDiagram
 ```
 
 The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3319-3326`)
-and the Hub ends the agent's sessions when it unregisters (`crates/modules/fleet/src/hub.rs:1125-1167`).
+and the Hub ends the agent's sessions when it unregisters (`crates/modules/fleet/src/hub.rs:1199-1259`).
 `docs/multi-pod-scale-out.md:182` records this; the 08-29 spec missed it.
 
 The live roll, read from the pods and the k8s events, as seconds after each SIGTERM:

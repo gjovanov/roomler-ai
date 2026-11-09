@@ -174,7 +174,38 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
             .map(|_| ()),
         AuditKind::ConsentDenied => end_session(sessions, ev, EndReason::UserDenied).await,
         AuditKind::ConsentTimedOut => end_session(sessions, ev, EndReason::ConsentTimeout).await,
-        AuditKind::SessionEnded { reason, .. } => end_session(sessions, ev, *reason).await,
+        // FR-138 — an end someone asked for (no fencing number) is the write
+        // every end made before; an end a hub decided on its own is fenced.
+        AuditKind::SessionEnded {
+            reason,
+            attach_seq: None,
+            ..
+        } => end_session(sessions, ev, *reason).await,
+        AuditKind::SessionEnded {
+            reason,
+            attach_seq: Some(seq),
+            ended_at,
+            end_source,
+            ..
+        } => end_fenced(sessions, ev, *reason, *seq, *ended_at, *end_source).await,
+        // FR-138 — the detach, at the number the detaching hub held: a pod
+        // that no longer holds the session (another resumed it, at a higher
+        // number) writes nothing, and nor does a detach of a row not live.
+        AuditKind::SessionDetached {
+            attach_seq,
+            resume_by,
+        } => sessions
+            .update_one(
+                doc! {
+                    "_id": ev.session_id,
+                    "attach_seq": at_seq(*attach_seq),
+                    "ended_at": bson::Bson::Null,
+                    "phase": bson::to_bson(&SessionPhase::Active).unwrap_or(bson::Bson::Null),
+                },
+                doc! { "$set": { "detached_at": ev.at, "resume_by": *resume_by } },
+            )
+            .await
+            .map(|_| ()),
         AuditKind::PermissionsChanged { permissions } => sessions
             .update_one(
                 doc! { "_id": ev.session_id },
@@ -199,9 +230,11 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
             .await
             .map(|_| ()),
         // Prompted / clipboard / files / keyframe / override events don't
-        // change the session row. Nor, until FR-138 P1b projects them, do
-        // `SessionDetached` and `SessionResumed`, which nothing writes yet;
-        // an `Unknown` kind (a newer build's) never does.
+        // change the session row. Nor does `SessionResumed`: the claim that
+        // resumed the session already wrote it, in the one conditional update
+        // that bumped `attach_seq` (the count of resumes) and cleared the
+        // detach (FR-138 §4.4). An `Unknown` kind (a newer build's) never
+        // does.
         _ => Ok(()),
     };
     if let Err(e) = res {
@@ -236,6 +269,54 @@ async fn end_session(
                 "ended_at": ev.at,
                 "end_reason": bson::to_bson(&reason).unwrap_or(bson::Bson::Null),
             }},
+        )
+        .await
+        .map(|_| ())
+}
+
+/// FR-138 — the filter for a row still at fencing number `seq`. A row stores
+/// no number until a claim bumps it (`RemoteSession::attach_seq` is absent at
+/// 0), so 0 matches a missing field too.
+pub fn at_seq(seq: u32) -> bson::Bson {
+    if seq == 0 {
+        bson::Bson::Document(doc! { "$in": [0, bson::Bson::Null] })
+    } else {
+        bson::Bson::Int64(i64::from(seq))
+    }
+}
+
+/// FR-138 — an end a hub decided on its own: it lands only on a row that is
+/// still open and still at the number the hub held, so a late write from a
+/// pod that lost the session (its sink batches, a half-open socket kept it)
+/// cannot end one another pod resumed. `ended_at` dates an end nobody saw by
+/// the row's own last clock, and `end_source` says so on the row.
+async fn end_fenced(
+    sessions: &Collection<RemoteSession>,
+    ev: &RemoteAuditEvent,
+    reason: EndReason,
+    seq: u32,
+    ended_at: Option<DateTime>,
+    end_source: Option<crate::models::EndSource>,
+) -> Result<(), mongodb::error::Error> {
+    let mut set = doc! {
+        "phase": bson::to_bson(&SessionPhase::Closed).unwrap_or(bson::Bson::Null),
+        "ended_at": ended_at.unwrap_or(ev.at),
+        "end_reason": bson::to_bson(&reason).unwrap_or(bson::Bson::Null),
+    };
+    if let Some(source) = end_source {
+        set.insert(
+            "end_source",
+            bson::to_bson(&source).unwrap_or(bson::Bson::Null),
+        );
+    }
+    sessions
+        .update_one(
+            doc! {
+                "_id": ev.session_id,
+                "attach_seq": at_seq(seq),
+                "ended_at": bson::Bson::Null,
+            },
+            doc! { "$set": set },
         )
         .await
         .map(|_| ())

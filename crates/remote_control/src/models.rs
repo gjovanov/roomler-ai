@@ -6715,6 +6715,25 @@ pub enum AuditKind {
         /// variant, so a pod on an older build can still read the row.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<String>,
+        /// FR-138 — the fencing number the writer held, for an end a hub
+        /// decided on its own (a socket loss, an orphan, the length limit, a
+        /// reaper, an inferred end): the row takes it only while it is open
+        /// and still at that number, so a pod that no longer holds the session
+        /// cannot end one another pod resumed. Absent for an end someone asked
+        /// for (an admin's, the controller's, the person's at the device),
+        /// which applies at any number, as every end did before FR-138.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_seq: Option<u32>,
+        /// FR-138 — an end nobody saw, dated by the row's own last clock
+        /// (`detached_at`, else `stats_at`, else `started_at`), never by the
+        /// reader's. Absent: the session ended when this event was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ended_at: Option<DateTime>,
+        /// FR-138 — who inferred that end (the read at the device's
+        /// registration, or the sweep), written onto the row so an
+        /// hour-weighted read can leave it out. Absent on every end seen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        end_source: Option<EndSource>,
     },
     // FR-101 P3 — the four clipboard and file kinds below are never written.
     // A transfer is something the DEVICE reports (the payload never crosses
@@ -11222,5 +11241,94 @@ mod fr138_resume_tests {
             serde_json::to_value(AuditKind::Unknown).unwrap(),
             serde_json::json!({ "kind": "unknown" })
         );
+    }
+}
+
+/// FR-138 P1b-1 — `SessionEnded`'s fencing and inferred-end fields. At the
+/// end of the file so no anchor above moves.
+#[cfg(test)]
+mod fr138_session_ended_tests {
+    use super::*;
+
+    /// An end with none of the new fields is the end every build before
+    /// FR-138 wrote, byte for byte, and one an older build wrote reads with
+    /// none of them: an end someone asked for, at any fencing number.
+    #[test]
+    fn an_end_without_the_fields_is_the_end_an_older_build_wrote() {
+        let today = AuditKind::SessionEnded {
+            reason: EndReason::AdminTerminated,
+            limit: None,
+            attach_seq: None,
+            ended_at: None,
+            end_source: None,
+        };
+        let doc = bson::to_document(&today).unwrap();
+        assert_eq!(
+            doc,
+            bson::doc! { "kind": "session_ended", "reason": "admin_terminated" }
+        );
+        let older: AuditKind = bson::from_document(bson::doc! {
+            "kind": "session_ended", "reason": "idle_timeout", "limit": "max_duration",
+        })
+        .unwrap();
+        match older {
+            AuditKind::SessionEnded {
+                reason: EndReason::IdleTimeout,
+                limit: Some(l),
+                attach_seq: None,
+                ended_at: None,
+                end_source: None,
+            } => assert_eq!(l, "max_duration"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A fenced, inferred end carries its number, its date and its source
+    /// through BSON (the sink and the listing) and JSON (the listing's
+    /// answer); an older build's reader skips the three fields.
+    #[test]
+    fn a_fenced_inferred_end_round_trips_and_an_older_reader_skips_it() {
+        let at = bson::DateTime::from_millis(1_762_700_000_000);
+        let ev = AuditKind::SessionEnded {
+            reason: EndReason::AgentDisconnect,
+            limit: None,
+            attach_seq: Some(2),
+            ended_at: Some(at),
+            end_source: Some(EndSource::Registration),
+        };
+        let doc = bson::to_document(&ev).unwrap();
+        assert_eq!(doc.get_str("end_source").unwrap(), "registration");
+        assert_eq!(doc.get_datetime("ended_at").unwrap(), &at);
+        match bson::from_document::<AuditKind>(doc.clone()).unwrap() {
+            AuditKind::SessionEnded {
+                attach_seq: Some(2),
+                ended_at: Some(back),
+                end_source: Some(EndSource::Registration),
+                ..
+            } => assert_eq!(back, at),
+            other => panic!("{other:?}"),
+        }
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "session_ended");
+        assert_eq!(json["attach_seq"], 2);
+        assert_eq!(json["end_source"], "registration");
+
+        // The shape a build before FR-138 has: it reads the reason and skips
+        // the rest (no `deny_unknown_fields` on the variant).
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Older {
+            SessionEnded {
+                reason: EndReason,
+                #[serde(default)]
+                limit: Option<String>,
+            },
+        }
+        match bson::from_document::<Older>(doc).unwrap() {
+            Older::SessionEnded { reason, limit } => {
+                assert_eq!(reason, EndReason::AgentDisconnect);
+                assert_eq!(limit, None);
+            }
+        }
     }
 }

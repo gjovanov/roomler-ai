@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
 use bson::{DateTime, doc, oid::ObjectId};
+use futures::TryStreamExt;
 use mongodb::Database;
 use roomler_ai_remote_control::models::{EndReason, RemoteSession, SessionPhase, SessionStats};
 use roomler_ai_remote_control::permissions::Permissions;
@@ -254,5 +255,76 @@ impl RemoteSessionDao {
                 },
             )
             .await
+    }
+
+    /// FR-138 — the claim's commit (spec §4.4, "Fencing"): ONE conditional
+    /// update that resumes the session at the next fencing number. It matches
+    /// only the row the claim read: in the device's tenant, naming the device,
+    /// live, at the number read (`seq`), and either never detached or detached
+    /// with its window still open at `now`. It bumps the number and clears the
+    /// detach. `false` = it matched nothing: someone ended it, another pod
+    /// resumed it, or its window passed, and the caller reads the row again.
+    pub async fn commit_resume(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        session_id: ObjectId,
+        seq: u32,
+        now: DateTime,
+    ) -> DaoResult<bool> {
+        let next = i64::from(seq) + 1;
+        let res = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": session_id,
+                    "tenant_id": tenant_id,
+                    "agent_id": agent_id,
+                    "attach_seq": roomler_ai_remote_control::audit::at_seq(seq),
+                    "phase": bson::to_bson(&SessionPhase::Active)?,
+                    "ended_at": bson::Bson::Null,
+                    "$or": [
+                        { "resume_by": bson::Bson::Null },
+                        { "resume_by": { "$gt": now } },
+                    ],
+                },
+                doc! {
+                    "$set": { "attach_seq": next },
+                    "$unset": { "detached_at": "", "resume_by": "" },
+                },
+            )
+            .await?;
+        Ok(res.matched_count == 1)
+    }
+
+    /// FR-138 — the registration read (spec §4.4): the device's live rows
+    /// created before `before` (its registration), in its tenant, oldest
+    /// first, at most `limit`. A device holds at most its capacity of live
+    /// sessions, so more than a few is rows an earlier connection left open,
+    /// and the next registration reads the rest.
+    pub async fn open_rows_before(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        before: DateTime,
+        limit: i64,
+    ) -> DaoResult<Vec<RemoteSession>> {
+        let rows = self
+            .base
+            .collection()
+            .find(doc! {
+                "tenant_id": tenant_id,
+                "phase": bson::to_bson(&SessionPhase::Active)?,
+                "agent_id": agent_id,
+                "ended_at": bson::Bson::Null,
+                "created_at": { "$lt": before },
+            })
+            .sort(doc! { "created_at": 1 })
+            .limit(limit)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(rows)
     }
 }
