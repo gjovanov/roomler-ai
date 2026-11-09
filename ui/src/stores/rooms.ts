@@ -3,6 +3,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api } from '@/api/client'
+import { alreadyDeleted } from '@/utils/alreadyDeleted'
 import { useWsStore } from './ws'
 
 export interface Room {
@@ -269,7 +270,13 @@ export const useRoomStore = defineStore('rooms', () => {
   }
 
   async function deleteRoomFile(tenantId: string, fileId: string) {
-    await api.delete(`/tenant/${tenantId}/file/${fileId}`)
+    try {
+      await api.delete(`/tenant/${tenantId}/file/${fileId}`)
+    } catch (e) {
+      // A 404 is a file already deleted (#3327): it leaves the room's list
+      // all the same, and no error is shown.
+      if (!alreadyDeleted(e)) throw e
+    }
     roomFiles.value = roomFiles.value.filter((f) => f.id !== fileId)
   }
 

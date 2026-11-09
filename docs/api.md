@@ -351,7 +351,11 @@ they refuse every person on such a message.
 
 Every route with `{mid}` in its path resolves it as a live message of the path room, and that
 room must be one the caller may read: a Secret room answers 404 and a Private one 403, as the
-room routes do. A message attachment is a live file of the message's own room.
+room routes do. A message attachment is a live file of the message's own room. A deleted
+message answers 404 on all of them, a repeat `DELETE`, a pin and an unpin included, and a write
+that raced the delete matches nothing, so the first removal time stays (#3327). A room that
+still carries a removal date, from before a room's `DELETE` removed it outright, answers as a
+missing one.
 
 A send names its thread with `thread_id` and may quote with `referenced_message_id`. Either must be
 a live message of the same room, or the send answers 404 and stores nothing. A thread lists the
@@ -362,7 +366,8 @@ replies of its own room, and `mentions.users` notifies members of the room only.
 A file is reached through the room it was uploaded to. `…/file/{fid}` and its download answer
 only for a live file of a room the caller may read: a Secret room answers 404 and a Private one
 403. A room's file list and both uploads take a room of the org that the caller may read. The
-org's file list (`GET …/file`) lists, and names, only such rooms' files.
+org's file list (`GET …/file`) lists, and names, only such rooms' files. A deleted file answers
+404 on its GET, its download and a repeat `DELETE`, and keeps its first removal time (#3327).
 
 | Method | Path | Purpose |
 |---|---|---|

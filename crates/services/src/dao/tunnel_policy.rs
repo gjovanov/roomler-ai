@@ -101,9 +101,7 @@ impl TunnelPolicyDao {
         tenant_id: ObjectId,
         policy_id: ObjectId,
     ) -> DaoResult<TunnelPolicy> {
-        self.base
-            .find_live_by_id_in_tenant(tenant_id, policy_id)
-            .await
+        self.base.find_by_id_in_tenant(tenant_id, policy_id).await
     }
 
     /// The per-policy lookup that also returns a TOMBSTONE. No caller today:
@@ -114,12 +112,18 @@ impl TunnelPolicyDao {
     /// [`Self::list_active_for_tenant`]. It exists so that a future reader
     /// that genuinely needs the tombstone chooses it BY NAME, with a reason at
     /// the call site, rather than reaching through `base`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "an audit or decision log names a removed policy by id and must still show what it said"
+    )]
     pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         policy_id: ObjectId,
     ) -> DaoResult<TunnelPolicy> {
-        self.base.find_by_id_in_tenant(tenant_id, policy_id).await
+        self.base
+            .find_any_by_id_in_tenant(tenant_id, policy_id)
+            .await
     }
 
     /// The filter every write below goes through: this row, in this tenant,

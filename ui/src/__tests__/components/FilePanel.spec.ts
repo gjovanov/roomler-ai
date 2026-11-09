@@ -223,6 +223,30 @@ describe('FilePanel', () => {
 
       expect(mockApi.delete).toHaveBeenCalledWith('/tenant/t1/file/f1')
     })
+
+    // #3327 — a file deleted elsewhere first answers this delete 404.
+    it('a file the server already deleted (404) leaves the panel with no error', async () => {
+      const files = [
+        makeFileEntry({ id: 'f1', filename: 'gone.txt' }),
+        makeFileEntry({ id: 'f2', filename: 'kept.txt' }),
+      ]
+      mockApi.get.mockResolvedValue({ items: files })
+      mockApi.delete.mockRejectedValueOnce(Object.assign(new Error('Resource not found'), { status: 404 }))
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+      const wrapper = mountFilePanel()
+      await flushPromises()
+      expect(wrapper.text()).toContain('gone.txt')
+
+      await wrapper.find('.mdi-delete-outline').trigger('click')
+      await flushPromises()
+
+      expect(mockApi.delete).toHaveBeenCalledWith('/tenant/t1/file/f1')
+      expect(wrapper.text()).not.toContain('gone.txt')
+      expect(wrapper.text()).toContain('kept.txt')
+      expect(consoleError).not.toHaveBeenCalled()
+      consoleError.mockRestore()
+    })
   })
 
   describe('icon mapping', () => {

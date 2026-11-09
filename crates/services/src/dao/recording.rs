@@ -96,6 +96,10 @@ impl RecordingDao {
             .await
     }
 
+    /// Tombstone a live recording of the tenant. `false` when nothing live
+    /// matched: a recording already deleted keeps its first removal time. The
+    /// recording route resolves the live recording first and answers as it
+    /// always has, whatever this returns.
     pub async fn soft_delete(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, id).await
     }

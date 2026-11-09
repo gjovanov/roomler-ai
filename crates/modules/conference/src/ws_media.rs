@@ -1033,11 +1033,7 @@ async fn handle_play_audio(state: &ConferenceState, seat: &Seat, data: &serde_js
     // FR-69 P3 — `files` is the `chat` module's; a DAO is a stateless handle
     // on the collection, so this playback path builds its own.
     let files = roomler_ai_services::dao::file::FileDao::new(&state.db);
-    let file = match files
-        .base
-        .find_live_by_id_in_tenant(room.tenant_id, fid)
-        .await
-    {
+    let file = match files.base.find_by_id_in_tenant(room.tenant_id, fid).await {
         Ok(f) if f.context.room_id == Some(rid) => f,
         Ok(_) => {
             debug!(room = %rid, file_id = %fid, "playback refused: not one of this room's files");

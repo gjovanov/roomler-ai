@@ -222,6 +222,8 @@ impl FileDao {
             .ok_or(super::base::DaoError::NotFound)
     }
 
+    /// Tombstone a live file of the tenant. `false` when nothing live matched:
+    /// a file already deleted keeps its first removal time (#3327).
     pub async fn soft_delete(&self, tenant_id: ObjectId, file_id: ObjectId) -> DaoResult<bool> {
         self.base.soft_delete_in_tenant(tenant_id, file_id).await
     }

@@ -185,36 +185,42 @@ impl TunnelClientDao {
     /// live listing on this collection uses, so the two views agree by
     /// construction. The `tunnel_clients` unique index is unconditional (same
     /// re-enroll-rehydrates contract as `agents`), so no `$type: "null"`
-    /// partial-index rule binds here; see `BaseDao::find_live_by_id_in_tenant`.
+    /// partial-index rule binds here; see `BaseDao::find_by_id_in_tenant`.
     pub async fn find_live_in_tenant(
         &self,
         tenant_id: ObjectId,
         client_id: ObjectId,
     ) -> DaoResult<TunnelClient> {
-        self.base
-            .find_live_by_id_in_tenant(tenant_id, client_id)
-            .await
+        self.base.find_by_id_in_tenant(tenant_id, client_id).await
     }
 
-    /// The per-client lookup that also returns a TOMBSTONE — for the two
-    /// readers whose job is the tombstone, and nothing else: the tunnel WS
-    /// connect-time check and the 60 s revocation poll (`ws::tunnel`). Both
-    /// read `deleted_at` to send the typed `rc:tunnel.revoked` the CLI logs
-    /// and stops reconnecting on. With a LIVE lookup a removal would reach
-    /// them as `Err(NotFound)` — the poll keeps the socket OPEN on an error
-    /// (a Mongo blip must not revoke a healthy fleet), so a deleted client
-    /// would never be kicked, and the connect path would drop the socket
-    /// with no frame, leaving the CLI reconnecting forever against what
-    /// reads as a network fault.
+    /// The per-client lookup that also returns a TOMBSTONE — for the readers
+    /// whose job is the tombstone, and nothing else: the tunnel WS
+    /// connect-time check and the 60 s revocation poll (`ws::tunnel`), and
+    /// `accepted_tunnel_client`, which refuses a tunnel client's own HTTP
+    /// requests the same way (FR-103). They read `deleted_at` to refuse a
+    /// removed client with its reason: the socket sends the typed
+    /// `rc:tunnel.revoked` the CLI logs and stops reconnecting on. With a LIVE
+    /// lookup a removal would reach them as `Err(NotFound)` — the poll keeps
+    /// the socket OPEN on an error (a Mongo blip must not revoke a healthy
+    /// fleet), so a deleted client would never be kicked, and the connect
+    /// path would drop the socket with no frame, leaving the CLI reconnecting
+    /// forever against what reads as a network fault.
     ///
     /// Never for a write, never for an admin route — those are
     /// [`Self::find_live_in_tenant`].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the tunnel socket and a tunnel client's own requests must tell a removed client it was revoked"
+    )]
     pub async fn find_any_in_tenant(
         &self,
         tenant_id: ObjectId,
         client_id: ObjectId,
     ) -> DaoResult<TunnelClient> {
-        self.base.find_by_id_in_tenant(tenant_id, client_id).await
+        self.base
+            .find_any_by_id_in_tenant(tenant_id, client_id)
+            .await
     }
 
     /// The filter every ADMIN-driven setter below writes through: this row,

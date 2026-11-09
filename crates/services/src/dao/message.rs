@@ -235,7 +235,11 @@ impl MessageDao {
             .await
     }
 
-    /// Pin or unpin a live message of `room_id`.
+    /// Pin or unpin a live message of `room_id`. `false` when no live message
+    /// matched: another room's or tenant's, or a deleted one, which a delete
+    /// that landed after the route's guard leaves (#3327). The route answers
+    /// 404 for it. Matched, not modified: pinning a pinned message is still a
+    /// pin of a live message.
     pub async fn toggle_pin(
         &self,
         tenant_id: ObjectId,
@@ -243,7 +247,9 @@ impl MessageDao {
         message_id: ObjectId,
         pinned: bool,
     ) -> DaoResult<bool> {
-        self.base
+        let written = self
+            .base
+            .collection()
             .update_one(
                 doc! {
                     "_id": message_id,
@@ -251,9 +257,10 @@ impl MessageDao {
                     "room_id": room_id,
                     "deleted_at": null,
                 },
-                doc! { "$set": { "is_pinned": pinned } },
+                doc! { "$set": { "is_pinned": pinned, "updated_at": DateTime::now() } },
             )
-            .await
+            .await?;
+        Ok(written.matched_count > 0)
     }
 
     /// Atomically update thread metadata on the parent message when a reply is
@@ -469,6 +476,9 @@ impl MessageDao {
         Ok(results)
     }
 
+    /// Store a live message's reaction counts. A deleted message is not
+    /// written: a reaction that raced its delete leaves the tombstone as the
+    /// delete left it (#3327).
     pub async fn update_reaction_summary(
         &self,
         message_id: ObjectId,
@@ -481,7 +491,7 @@ impl MessageDao {
 
         self.base
             .update_one(
-                doc! { "_id": message_id },
+                doc! { "_id": message_id, "deleted_at": null },
                 doc! { "$set": { "reaction_summary": summary_bson } },
             )
             .await

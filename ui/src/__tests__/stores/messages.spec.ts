@@ -363,6 +363,44 @@ describe('useMessageStore', () => {
     })
   })
 
+  // #3327 — the server resolves a message by id as a live one only, so a
+  // delete of a message already deleted answers 404.
+  describe('deleteMessage', () => {
+    it('removes the message once the server deletes it', async () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1' }), makeMessage({ id: 'm2' })] as never
+      mockApi.delete.mockResolvedValueOnce({ deleted: true } as never)
+
+      await store.deleteMessage('t1', 'r1', 'm1')
+
+      expect(mockApi.delete).toHaveBeenCalledWith('/tenant/t1/room/r1/message/m1')
+      expect(store.messages.map((m) => m.id)).toEqual(['m2'])
+    })
+
+    it('a 404 is a message already deleted: it leaves both lists and nothing is thrown', async () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1' }), makeMessage({ id: 'm2' })] as never
+      store.threadMessages = [makeMessage({ id: 'm1' })] as never
+      mockApi.delete.mockRejectedValueOnce(Object.assign(new Error('Resource not found'), { status: 404 }))
+
+      await expect(store.deleteMessage('t1', 'r1', 'm1')).resolves.toBeUndefined()
+
+      expect(store.messages.map((m) => m.id)).toEqual(['m2'])
+      expect(store.threadMessages).toHaveLength(0)
+    })
+
+    it('any other refusal is still an error, and the message stays', async () => {
+      const store = useMessageStore()
+      store.messages = [makeMessage({ id: 'm1' })] as never
+      mockApi.delete.mockRejectedValueOnce(
+        Object.assign(new Error('Only the author can delete this message'), { status: 403 }),
+      )
+
+      await expect(store.deleteMessage('t1', 'r1', 'm1')).rejects.toThrow('Only the author')
+      expect(store.messages.map((m) => m.id)).toEqual(['m1'])
+    })
+  })
+
   describe('removeMessageFromWs', () => {
     it('should remove a message by id', () => {
       const store = useMessageStore()

@@ -176,25 +176,14 @@ where
             .ok_or(DaoError::NotFound)
     }
 
-    /// The row by id, in this tenant, **tombstone included**. For a collection
-    /// that soft-deletes (`deleted_at`) this is the ANY lookup: it answers for
-    /// a removed row exactly as for a live one, which is right for the readers
-    /// whose job is the tombstone (a revocation check that must say *why*, an
-    /// audit view of something since removed) and wrong for everything else —
-    /// a GET, a write, a session start want [`Self::find_live_by_id_in_tenant`].
-    /// Reaching for this one on a tombstoned collection is a decision; say why
-    /// at the call site.
-    pub async fn find_by_id_in_tenant(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<T> {
-        self.collection
-            .find_one(doc! { "_id": id, "tenant_id": tenant_id })
-            .await?
-            .ok_or(DaoError::NotFound)
-    }
-
-    /// The row by id, in this tenant, and LIVE — `NotFound` for a tombstone,
-    /// the same answer a bogus or foreign id gets (#1821: the per-id view and
-    /// the listing disagreed, so a removed device was still readable and
-    /// writable by anyone holding its id).
+    /// The row by id, in this tenant, and LIVE: `NotFound` for a tombstone,
+    /// the same answer a bogus or foreign id gets. A removed thing answers
+    /// nothing by default (#3327). The per-id view used to be the ANY lookup,
+    /// so it disagreed with every listing, and each soft-deleting collection
+    /// was closed one DAO at a time: devices (#1821), tunnel clients, tunnel
+    /// policies and overlay ACL policies (#1829), chat files and messages
+    /// (#3327). A collection that never soft-deletes is unaffected: none of
+    /// its rows carries a date there.
     ///
     /// The predicate is `deleted_at: null`, which matches null OR absent: a
     /// row that never carried the field was never tombstoned, and this is the
@@ -205,13 +194,39 @@ where
     /// narrower and the only rows it drops are LIVE ones whose field is
     /// missing, i.e. it would 404 a live device on every per-device route. A
     /// tombstone always carries a `DateTime`, so neither spelling can match one.
-    pub async fn find_live_by_id_in_tenant(
+    ///
+    /// A reader whose job is the tombstone uses
+    /// [`Self::find_any_by_id_in_tenant`], from a named DAO method that says
+    /// why.
+    pub async fn find_by_id_in_tenant(&self, tenant_id: ObjectId, id: ObjectId) -> DaoResult<T> {
+        self.collection
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id, "deleted_at": null })
+            .await?
+            .ok_or(DaoError::NotFound)
+    }
+
+    /// The row by id, in this tenant, **tombstone included**: the ANY lookup.
+    /// It answers for a removed row exactly as for a live one, which is right
+    /// for the readers whose job is the tombstone and wrong for everything
+    /// else: a refusal that must say *why* (a removed device is told it was
+    /// removed, so it stops instead of retrying), and an audit view of a
+    /// removed thing (removing it must not hide what it did). A GET, a write
+    /// and a session start want [`Self::find_by_id_in_tenant`].
+    ///
+    /// ⚠️ Listed under `disallowed-methods` in the root `clippy.toml`, so a
+    /// call fails the clippy gate. Call it only from a named DAO method (the
+    /// `find_any_in_tenant`s) that carries
+    /// `#[expect(clippy::disallowed_methods, reason = "…")]` and a doc comment
+    /// saying why it must see a tombstone. A route that reached through
+    /// `base` for this is how the External access routes reopened #1821
+    /// (#3322).
+    pub async fn find_any_by_id_in_tenant(
         &self,
         tenant_id: ObjectId,
         id: ObjectId,
     ) -> DaoResult<T> {
         self.collection
-            .find_one(doc! { "_id": id, "tenant_id": tenant_id, "deleted_at": null })
+            .find_one(doc! { "_id": id, "tenant_id": tenant_id })
             .await?
             .ok_or(DaoError::NotFound)
     }
@@ -378,21 +393,29 @@ where
         Ok(result.modified_count)
     }
 
+    /// Tombstone a LIVE row: `false` when nothing live matched, a row already
+    /// removed included, whose first removal time then stays as it was.
     pub async fn soft_delete(&self, id: ObjectId) -> DaoResult<bool> {
         self.update_one(
-            doc! { "_id": id },
+            doc! { "_id": id, "deleted_at": null },
             doc! { "$set": { "deleted_at": bson::DateTime::now() } },
         )
         .await
     }
 
+    /// Tombstone a LIVE row of this tenant (#3327). `false` when nothing live
+    /// matched: a foreign or unknown id, or a row already removed, which keeps
+    /// its first removal time. A route resolves the row first and writes
+    /// second, so a second delete that passed its guard before the first one
+    /// landed matches nothing here. The chat routes answer 404 for `false`;
+    /// the recording route answers as it always has.
     pub async fn soft_delete_in_tenant(
         &self,
         tenant_id: ObjectId,
         id: ObjectId,
     ) -> DaoResult<bool> {
         self.update_one(
-            doc! { "_id": id, "tenant_id": tenant_id },
+            doc! { "_id": id, "tenant_id": tenant_id, "deleted_at": null },
             doc! { "$set": { "deleted_at": bson::DateTime::now() } },
         )
         .await

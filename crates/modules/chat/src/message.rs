@@ -396,7 +396,13 @@ pub async fn delete(
         ));
     }
 
-    state.messages.base.soft_delete_in_tenant(tid, mid).await?;
+    // The soft delete matches a live message only, so a second delete that
+    // passed the guard before the first one landed finds nothing: it answers
+    // as a missing message does, keeps the first removal time and sends
+    // nothing.
+    if !state.messages.base.soft_delete_in_tenant(tid, mid).await? {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
     // All members incl. the sender — reaches their other browsers/devices;
     // delete-by-id is idempotent client-side.
@@ -466,10 +472,15 @@ pub async fn toggle_pin(
 
     crate::guards::require_message_in_room(&state, tid, rid, mid, auth.user_id).await?;
 
-    state
+    // A message deleted after the guard read it matches nothing here, and
+    // the pin answers as for a missing message, with nothing sent.
+    if !state
         .messages
         .toggle_pin(tid, rid, mid, body.pinned)
-        .await?;
+        .await?
+    {
+        return Err(ApiError::NotFound("Resource not found".to_string()));
+    }
 
     let member_ids = state.rooms.find_member_user_ids(rid).await?;
     let event = serde_json::json!({

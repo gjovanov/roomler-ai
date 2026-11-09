@@ -623,11 +623,7 @@ pub async fn get_connect_code(
     .await?;
     // Live and tenant-scoped, like the list this stands in for: a foreign id or
     // a removed device 404s. A tombstone still holds its code.
-    let agent = state
-        .agents
-        .base
-        .find_live_by_id_in_tenant(tid, aid)
-        .await?;
+    let agent = state.agents.find_live_in_tenant(tid, aid).await?;
     Ok(Json(DeviceConnectCode {
         connect_code: agent
             .connect_code
