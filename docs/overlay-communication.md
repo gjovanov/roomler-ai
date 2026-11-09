@@ -972,6 +972,115 @@ server. Detail and the negative-control test:
   which AnyConnect tolerates for v4. Nothing opens overlay-v6 sockets today
   (#1405), so that stays unbuilt until something does.
 
+### A peer whose clock stepped back (#3528)
+
+WireGuard refuses a handshake initiation that is not stamped later than the last
+one the responder accepted from that peer. That is its replay guard. boringtun
+keeps the stamp per `Tunn` (`last_handshake_timestamp`, boringtun 0.7.1
+`src/noise/handshake.rs:307`, checked at `:543`). An initiator stamps from the
+wall clock its `Tunn` read when it was built, plus the monotonic time since
+(`handshake.rs:187`). So a clock step while a `Tunn` lives changes nothing on
+the wire. The harm comes when a device's clock steps **back** and the device
+then builds a fresh `Tunn`: a restart, or a carrier rebuild. Every peer that
+kept its own `Tunn` refuses the device (`WrongTai64nTimestamp`) until the
+device's clock passes that peer's mark, which takes up to the size of the step.
+
+Measured before the fix (agent 0.4.203, two lab devices, the issue's AC2):
+
+| Pair | Step back | What happened |
+|---|---|---|
+| LAN | 300 s, 900 s | refused at the first initiation every time, but masked within 0.05 s: the peer demote-follows onto `/derp` with a fresh `Tunn` |
+| DERP-held | 300 s | 2 stalls of 15.5 s, 48 refusals over 234 s |
+| DERP-held | 900 s | 8 stalls of 13.7–15.5 s, the first at +93 s, then every ~104.5 s; 169 refusals over 835 s |
+| either | none, or forward | no refusals (12 controls) |
+
+The stall comes back because the device's own refused initiation keeps
+retrying for 90 s (`REKEY_ATTEMPT_TIME`, boringtun `src/noise/timers.rs:21`).
+Then `clear_all` (`timers.rs:142`) also drops the session that was working.
+Every peer of the stepped device stalls at once. A stall lasts ~15 s when the
+peer has replied since the device's last packet, ~30–35 s when it has sent
+nothing.
+
+**The fix is on the refusing side, and the replay guard stays.** A refused
+initiation has passed both AEAD opens under the peer's static key, so the
+peer's private key made it. It is either the peer, behind the mark, or an old
+initiation arriving again, and only the peer can tell the two apart. So the
+session answers it from a **shadow**: a second `Tunn` built from the same
+recipe, whose mark starts at zero (`HandshakeHeal`,
+`crates/tunnel-core/src/overlay/wg.rs:644`). It has the same keys and the same
+session index, so the carrier plane's index route reaches it. The session's own
+`Tunn` stays as it is. The shadow takes its place only when a data packet or a
+keepalive decrypts under one of the shadow's sessions (`HandshakeHeal::promote`,
+`wg.rs:773`). That needs the ephemeral private key of the initiation the shadow
+answered, so only the peer completing its own handshake can do it.
+
+```mermaid
+sequenceDiagram
+    participant A as Device A (clock stepped back, restarted)
+    participant B as Peer B (kept its Tunn)
+    participant S as B's shadow Tunn (mark 0)
+    A->>B: initiation, stamped below B's mark
+    Note over B: B's Tunn refuses it (WrongTai64nTimestamp)
+    B->>S: the same initiation
+    S-->>A: handshake response
+    Note over A: A's own handshake completes on its first try
+    A->>B: keepalive on the new session
+    Note over B: B's Tunn cannot open it, the shadow can.<br/>The shadow becomes B's Tunn (one INFO line).
+    A->>B: data
+    B->>A: data
+```
+
+What each initiation gets (`process_inbound`, `wg.rs:2710-2770`):
+
+| Initiation | B's `Tunn` | The shadow | The working session |
+|---|---|---|---|
+| stamped above the mark: no step, a forward step, a rekey | accepts it | none | stock WireGuard |
+| an ephemeral key B's `Tunn` already accepted: a duplicate or a replay | dropped before boringtun | none | untouched |
+| refused within 5 s of an accept (`HEAL_REORDER_WINDOW`, `wg.rs:587`): a reordered burst | refuses it | none | untouched |
+| refused otherwise: a stepped-back peer, or a replay | refuses it | answers it, at most once a second (`SHADOW_MIN_INTERVAL`, `wg.rs:592`) | untouched, until the peer completes the shadow's handshake; then the shadow carries it |
+
+* **A replay costs nothing.** The shadow's answer to a replayed initiation is
+  useless to anyone without that initiation's ephemeral private key, and the
+  working session keeps carrying the real peer's data. The unit test measures a
+  blip of zero packets
+  (`replayed_unseen_initiation_never_disturbs_the_working_session`).
+* **A stepped-back peer heals in about one round trip.** It completes its own
+  initiation, so nothing is left outstanding to expire 90 s later
+  (`backward_step_then_rebuild_heals_in_one_round_trip`, with the no-step and
+  forward-step controls beside it).
+* **It heals once the peers run the fix**, whatever the stepping device runs. A
+  peer on an older agent still refuses as above.
+* **The screen keeps the guard after a promotion.** A promoted shadow's mark is
+  the stepped-back peer's stamp, below the initiations the session accepted
+  before the step. The session remembers the ephemeral keys of the last 32
+  initiations its `Tunn` accepted (`HEAL_SEEN`, `wg.rs:606`: about an hour of
+  rekeys, 1 KiB a session) and drops a replay of any of them before boringtun
+  sees it (`already_accepted`, `wg.rs:715`). After a step larger than that, an
+  initiation the peer made more than an hour before the step can still be
+  accepted by the promoted `Tunn` until the peer's clock passes its old mark.
+  Such a replay opens a session nobody can use. Each one takes one of
+  boringtun's 8 session slots, so it takes a handful of them to push out the
+  session in use, and then a new handshake restores it within about 15 s of the
+  next traffic.
+* **A shadow is bounded.** There is one per session. It is rebuilt when it
+  refuses an initiation too and is older than 5 s (`SHADOW_REBUILD_AFTER`,
+  `wg.rs:596`), so a shadow that a replay built cannot lock out a peer that
+  steps back later. It is dropped when nobody completes it within 180 s
+  (`SHADOW_TTL`, `wg.rs:600`). A carrier rebuild or a restart on this side
+  starts over with an empty screen, beside a `Tunn` whose mark is zero anyway,
+  as stock WireGuard does after an interface restart.
+
+**What the logs say.** A promotion is one INFO line on the refusing side,
+naming the peer: `overlay: this peer's handshake was refused as a replay: its
+clock is behind the last handshake this session accepted …`. Refusals that do
+not heal are DEBUG lines, and `WgDevice::peer_replay_counts` reads both
+counters. When boringtun's own handshake expiry marks a carrier dead, the
+rebuild WARN now says so (`overlay: relay carrier's WireGuard handshake expired
+(its own initiation went unanswered for 90 s …)`), where it used to blame a
+`/derp` WS that never closed
+(`crates/tunnel-core/src/overlay/runtime/establish.rs:634`, `:750`, and the
+direct carrier's line at `:713`).
+
 ---
 
 ## 9. Configuration reference

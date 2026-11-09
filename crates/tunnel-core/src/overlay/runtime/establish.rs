@@ -628,6 +628,10 @@ impl OverlayRuntime {
                     s.assert_ineligible(&nid, tier, now);
                 }
             });
+            // #3528 — read before the session goes. A carrier that boringtun's
+            // own handshake expiry marked dead had no send error at all, and
+            // the rebuild lines below must not claim one.
+            let expired = wg.peer_handshake_expired(&e.pubkey).unwrap_or(false);
             wg.remove_peer(&e.pubkey).await;
             // A carrier REPAIR, not an eviction (the relay is re-requested
             // below), so it deliberately does NOT go through `evict_peer` —
@@ -701,6 +705,13 @@ impl OverlayRuntime {
                             "overlay: established direct carrier went silent (no keepalive within the rx-stale deadline — peer roamed / NAT rebind / path died) — rebuilding via relay"
                         ),
                     }
+                } else if reason == DeathReason::HardDead && expired {
+                    // #3528 — boringtun gave up on the session's handshake, as
+                    // on the relay line below.
+                    warn!(
+                        peer = %nid, tier = tier_name,
+                        "overlay: direct carrier's WireGuard handshake expired (its own initiation went unanswered for 90 s: the peer refused it, or the path dropped it) — rebuilding via relay"
+                    );
                 } else {
                     warn!(
                         peer = %nid, tier = tier_name,
@@ -727,7 +738,18 @@ impl OverlayRuntime {
                 } else {
                     "re-allocating"
                 };
-                if reason == DeathReason::HardDead {
+                if reason == DeathReason::HardDead && expired {
+                    // #3528 — boringtun gave up on the session's handshake
+                    // (REKEY_ATTEMPT_TIME: 90 s without an answer) and the
+                    // timer marked the carrier dead; nothing hard-errored.
+                    // Field 2026-11-07: a peer refusing a stepped-back device's
+                    // initiations as replays read as "/derp WS closed under
+                    // it", on a WS that never closed.
+                    warn!(
+                        peer = %nid, kind = ?e.relay_kind,
+                        "overlay: relay carrier's WireGuard handshake expired (its own initiation went unanswered for 90 s: the peer refused it, or the path dropped it) — {rebuild}"
+                    );
+                } else if reason == DeathReason::HardDead {
                     let cause = if is_derp {
                         "/derp WS closed under it"
                     } else {
