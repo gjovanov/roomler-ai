@@ -295,6 +295,13 @@ enum Command {
         /// the same reason as `--stop-event`.
         #[arg(long, hide = true)]
         prior_end: Option<String>,
+        /// #3387 (Windows) — the SCM service host started this worker on its
+        /// user-context arm, as the person signed in, because SystemContext is
+        /// on and SYSTEM can open no machine enrollment yet. The worker says
+        /// so in `roomler status` and in its hello. Passed only by the host;
+        /// hidden for the same reason as `--stop-event`.
+        #[arg(long, hide = true)]
+        system_context_waiting: bool,
     },
     /// Run the codec capability probes and print the result as one
     /// `ROOMLER_CAPS_JSON:{…}` line. Spawned by the daemon itself — never
@@ -1079,97 +1086,82 @@ enum ServiceAction {
     },
 }
 
-/// rc.52: pure config-path precedence ladder. `exists` is injected so
-/// the resolution is unit-testable without touching the filesystem.
+/// The config a process loads, as a pure ladder: `opens` is injected so the
+/// resolution is unit-testable without touching the filesystem.
 ///
-/// Precedence:
-///   1. explicit `--config <path>` — operator override, used verbatim
-///      (no existence check; the operator named it deliberately).
-///   2. machine-global `%PROGRAMDATA%` config — **SystemContext
-///      workers only**, when the file exists. This is the canonical
-///      pre-logon-readable SC config source (a LocalSystem worker
-///      cannot reach a user-profile path before anyone logs in).
-///   3. the platform default (`%APPDATA%` perUser) when it exists.
-///   4. the active-user fallback — **SystemContext workers only**,
-///      when it exists (post-logon: a perUser config the SC worker
-///      reaches via `WTSQueryUserToken`).
-///   5. nothing exists → the platform default, so `config::load`
-///      fails with an honest "not found" naming that path.
+/// 1. An explicit `--config <path>`: an operator override, used verbatim (no
+///    check; the operator named it deliberately).
+/// 2. A SystemContext worker (LocalSystem) runs the machine's own enrollment
+///    and nothing else (#3387):
+///    - the machine-global `%PROGRAMDATA%` config, when it opens: the
+///      canonical one, readable before anyone signs in;
+///    - else the SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
+///      without `--machine-global`), when it opens;
+///    - else the machine-global path, so `config::load` fails with an honest
+///      "not found" naming where the machine's enrollment belongs.
 ///
-/// For a non-SystemContext worker the ladder collapses to
-/// `explicit > default` — unchanged pre-rc.52 behaviour.
+///    The config of the person signed in at the console is never one of them.
+///    That enrollment runs as that person, on the service host's user-context
+///    arm, until the machine has its own
+///    (`win_service::supervisor::want_system_worker`, which reads the same two
+///    rungs).
+/// 3. Every other process: the platform default (`%APPDATA%` per user).
 fn pick_config_path(
     explicit: Option<PathBuf>,
     is_system_context: bool,
     machine_global: Option<&std::path::Path>,
     default: &std::path::Path,
-    active_user: Option<&std::path::Path>,
-    exists: impl Fn(&std::path::Path) -> bool,
+    opens: impl Fn(&std::path::Path) -> bool,
 ) -> PathBuf {
     if let Some(p) = explicit {
         return p;
     }
-    if is_system_context
-        && let Some(mg) = machine_global
-        && exists(mg)
-    {
+    if is_system_context && let Some(mg) = machine_global {
+        if opens(mg) {
+            return mg.to_path_buf();
+        }
+        if opens(default) {
+            return default.to_path_buf();
+        }
         return mg.to_path_buf();
-    }
-    if exists(default) {
-        return default.to_path_buf();
-    }
-    if is_system_context
-        && let Some(au) = active_user
-        && exists(au)
-    {
-        return au.to_path_buf();
     }
     default.to_path_buf()
 }
 
-/// rc.52: resolve the config path by wiring [`pick_config_path`] to
-/// the real environment — the worker-role probe, the candidate paths,
-/// and `Path::exists`. Logs the chosen path so a "wrong config" or
-/// "config not found" investigation lands on a clear line.
+/// Resolve the config path by wiring [`pick_config_path`] to the real
+/// environment: the worker-role probe, the candidate paths, and a read open.
+/// Logs the chosen path so a "wrong config" or "config not found"
+/// investigation lands on a clear line.
 fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     let default = config::default_config_path().context("resolving default config path")?;
 
     #[cfg(all(feature = "system-context", target_os = "windows"))]
     {
-        use roomlerd::system_context::{user_profile, worker_role};
+        use roomlerd::system_context::worker_role;
         let is_sc = matches!(
             worker_role::probe_self(),
             Ok(worker_role::WorkerRole::SystemContext)
         );
         let machine_global = config::machine_global_config_path();
-        let active_user = user_profile::active_user_config_path();
-        // #3096 — `exists()` reads "cannot open" as "absent". A machine-global
-        // config this worker cannot read (a folder that seals SYSTEM out,
-        // #3073) sends it to the person's config, and to that config's device
-        // keys, without a word, and back again once the folder is readable.
+        // #3096 — a machine-global config this worker cannot read (a folder
+        // that shuts SYSTEM out, #3073) is not loaded: said here, because the
+        // ladder reads "cannot open" as "not there".
         if is_sc && let Err(e) = machine_global.try_exists() {
             tracing::warn!(
                 machine_global = %machine_global.display(), error = %e,
                 "config: the machine-global config cannot be read, so this SystemContext \
-                 worker falls back; it signs with the fallback config's device keys"
+                 worker cannot run it"
             );
         }
+        // A read open, as the service host's check (`sc_config_opens`): a file
+        // in a folder that refuses SYSTEM lists, and does not open.
         let chosen = pick_config_path(
             explicit,
             is_sc,
             Some(machine_global.as_path()),
             &default,
-            active_user.as_deref(),
-            |p| p.exists(),
+            |p| std::fs::File::open(p).is_ok(),
         );
-        // #3096 — on the machine-global config, an enrollment with no key yet
-        // takes the one it had in the person's config before minting one.
-        if is_sc
-            && chosen == machine_global
-            && let Some(au) = active_user.as_ref()
-        {
-            roomlerd::peer_auth::adopt_keys_from(au.clone());
-        }
         tracing::info!(
             config_path = %chosen.display(),
             is_system_context = is_sc,
@@ -1182,95 +1174,11 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     {
         // No SystemContext + no machine-global config concept on this
         // build — the ladder collapses to `explicit > default`.
-        Ok(pick_config_path(
-            explicit,
-            false,
-            None,
-            &default,
-            None,
-            |p| p.exists(),
-        ))
+        Ok(pick_config_path(explicit, false, None, &default, |p| {
+            std::fs::File::open(p).is_ok()
+        }))
     }
 }
-
-/// rc.52 Phase 4: should a healthy-run SystemContext worker copy its
-/// config to the machine-global `%PROGRAMDATA%` location? Pure +
-/// cross-platform-testable. True only when all three hold: this is a
-/// SystemContext worker; the config was loaded from somewhere OTHER
-/// than the machine-global path (a perUser `%APPDATA%` / active-user
-/// fallback); and the machine-global path does not already hold a
-/// config. That is exactly an rc.50-or-earlier SystemContext install
-/// pre-dating the machine-global path — promoting it makes the next
-/// boot pre-logon-controllable with zero operator action.
-///
-/// Only the `system-context` + Windows build calls this in non-test
-/// code (via [`self_heal_machine_global_config`]); on other builds it
-/// is exercised solely by the unit tests, so suppress the dead-code
-/// lint there rather than cfg-gating the pure logic out of reach.
-#[cfg_attr(
-    not(all(feature = "system-context", target_os = "windows")),
-    allow(dead_code)
-)]
-fn should_self_heal_config(
-    is_system_context: bool,
-    loaded_path: &std::path::Path,
-    machine_global: &std::path::Path,
-    machine_global_exists: bool,
-) -> bool {
-    is_system_context && loaded_path != machine_global && !machine_global_exists
-}
-
-/// rc.52 Phase 4: promote a perUser-loaded SystemContext config to the
-/// machine-global `%PROGRAMDATA%` path after a healthy run. No-op on
-/// non-Windows, non-SystemContext, or when the machine-global config
-/// already exists. The worker runs as LocalSystem here so it has the
-/// rights to write `%PROGRAMDATA%`.
-#[cfg(all(feature = "system-context", target_os = "windows"))]
-fn self_heal_machine_global_config(loaded_path: &std::path::Path, cfg: &config::AgentConfig) {
-    use roomlerd::system_context::worker_role;
-    let is_sc = matches!(
-        worker_role::probe_self(),
-        Ok(worker_role::WorkerRole::SystemContext)
-    );
-    let mg = config::machine_global_config_path();
-    if !should_self_heal_config(is_sc, loaded_path, &mg, mg.exists()) {
-        return;
-    }
-    // #3096 — the device keys go FIRST. The next start loads the
-    // machine-global config as soon as it exists, so it must never land there
-    // without the keys beside it: that start would mint new ones, and every
-    // browser that pinned this device would refuse it as `key-changed`.
-    match roomlerd::peer_auth::promote(loaded_path, &mg) {
-        Ok(0) => {}
-        Ok(files) => tracing::info!(
-            files,
-            "config: self-heal carried the device keys (peer-auth) to the machine-global path"
-        ),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "config: machine-global self-heal withheld: the device keys (peer-auth) \
-                 could not be copied (will retry next healthy run)"
-            );
-            return;
-        }
-    }
-    match config::save(&mg, cfg) {
-        Ok(()) => tracing::info!(
-            from = %loaded_path.display(),
-            to = %mg.display(),
-            "config: self-healed perUser config to machine-global path \
-             (machine_id preserved; next boot is pre-logon-controllable)"
-        ),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "config: machine-global self-heal copy failed (will retry next healthy run)"
-        ),
-    }
-}
-
-#[cfg(not(all(feature = "system-context", target_os = "windows")))]
-fn self_heal_machine_global_config(_loaded_path: &std::path::Path, _cfg: &config::AgentConfig) {}
 
 /// `roomlerd cli <args...>` → the argv to hand to the embedded `roomler`
 /// CLI, or `None` for every other invocation.
@@ -1653,6 +1561,8 @@ async fn daemon_main() -> Result<()> {
         gpu_pin_event: None,
         // #3289 — and what it saw of the last worker's end.
         prior_end: None,
+        // #3387 — and whether SystemContext waits for a machine enrollment.
+        system_context_waiting: false,
     });
     // Only the worker subcommand (`Run`) is the one the SCM supervisor
     // spawns + observes for crashes. On non-zero exit from that path,
@@ -1753,7 +1663,21 @@ async fn daemon_main() -> Result<()> {
             sas_event,
             gpu_pin_event,
             prior_end,
+            system_context_waiting,
         } => {
+            // #3387 — the host's word that this worker runs the person's own
+            // enrollment while SystemContext waits for a machine one.
+            #[cfg(target_os = "windows")]
+            if system_context_waiting {
+                roomlerd::win_service::note_system_context_waiting();
+                tracing::warn!(
+                    "SystemContext is on, but SYSTEM can open no machine enrollment: this \
+                     worker runs the signed-in person's own enrollment as that person until \
+                     one is written (the setup wizard, or `roomlerd enroll --machine-global`)"
+                );
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = system_context_waiting;
             // FR-97 P4a — the host's relay, for the real Ctrl+Alt+Del.
             #[cfg(target_os = "windows")]
             if let Some(name) = sas_event {
@@ -5410,15 +5334,6 @@ async fn run_cmd(
                                     "clean-run threshold reached; promoted to last-known-good"
                                 );
                             }
-                            // rc.52 Phase 4: this run proved healthy.
-                            // If we're a SystemContext worker that
-                            // loaded its config from a perUser path,
-                            // promote a copy to the machine-global
-                            // %PROGRAMDATA% location so the NEXT boot
-                            // can load it pre-logon. machine_id is the
-                            // stored config field — copying the loaded
-                            // struct preserves it verbatim.
-                            self_heal_machine_global_config(&path, &current);
                         }
                         Err(e) => tracing::warn!(error = %e, "could not reload config for clean-run promotion"),
                     }
@@ -8077,8 +7992,7 @@ mod tests {
                 r"C:\ProgramData\roomler\roomler-agent\config.toml",
             )),
             Path::new(r"C:\Users\u\AppData\config.toml"),
-            None,
-            |_| true, // everything "exists" — explicit still wins
+            |_| true, // everything opens — explicit still wins
         );
         assert_eq!(got, explicit);
     }
@@ -8087,7 +8001,7 @@ mod tests {
     fn pick_config_path_system_context_prefers_machine_global() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, None, |p| p == mg);
+        let got = pick_config_path(None, true, Some(mg), default, |_| true);
         assert_eq!(got, mg);
     }
 
@@ -8097,9 +8011,7 @@ mod tests {
         // machine-global path even if it exists.
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Users\u\AppData\config.toml");
-        let got = pick_config_path(None, false, Some(mg), default, None, |p| {
-            p == mg || p == default
-        });
+        let got = pick_config_path(None, false, Some(mg), default, |p| p == mg || p == default);
         assert_eq!(got, default);
     }
 
@@ -8113,7 +8025,7 @@ mod tests {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
         let person = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        // Every combination of what exists: the machine config, the
+        // Every combination of what opens: the machine config, the
         // SYSTEM-profile one, the person's.
         for bits in 0u8..8 {
             let on = |p: &Path| {
@@ -8121,15 +8033,15 @@ mod tests {
                     || (p == default && bits & 2 != 0)
                     || (p == person && bits & 4 != 0)
             };
-            let got = pick_config_path(None, true, Some(mg), default, Some(person), on);
-            assert_ne!(got, person, "exists bits {bits:03b}");
+            let got = pick_config_path(None, true, Some(mg), default, on);
+            assert_ne!(got, person, "opens bits {bits:03b}");
             assert!(
                 got == mg || got == default,
-                "exists bits {bits:03b}: {got:?}"
+                "opens bits {bits:03b}: {got:?}"
             );
         }
         // The case the person's rung served: only the person's config is there.
-        let got = pick_config_path(None, true, Some(mg), default, Some(person), |p| p == person);
+        let got = pick_config_path(None, true, Some(mg), default, |p| p == person);
         assert_eq!(got, mg);
     }
 
@@ -8141,10 +8053,10 @@ mod tests {
     fn pick_config_path_system_context_names_the_machine_path_when_nothing_exists() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, None, |_| false);
+        let got = pick_config_path(None, true, Some(mg), default, |_| false);
         assert_eq!(got, mg);
         let user_default = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        let got = pick_config_path(None, false, Some(mg), user_default, None, |_| false);
+        let got = pick_config_path(None, false, Some(mg), user_default, |_| false);
         assert_eq!(got, user_default);
     }
 
@@ -8155,25 +8067,34 @@ mod tests {
     fn pick_config_path_system_context_keeps_the_system_profile_rung() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, None, |p| p == default);
+        let got = pick_config_path(None, true, Some(mg), default, |p| p == default);
         assert_eq!(got, default);
     }
 
-    // ─── rc.52: self-heal predicate ────────────────────────────────────────
-
+    /// #3387 — the service host hands a worker it starts as the person, while
+    /// SystemContext waits for a machine enrollment, one more flag; a worker
+    /// that did not parse it would exit at once on every spawn.
+    #[cfg(target_os = "windows")]
     #[test]
-    fn should_self_heal_only_for_system_context_peruser_load_without_machine_global() {
-        let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
-        let peruser = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        // The one true case: SC worker, loaded from a perUser path,
-        // machine-global absent.
-        assert!(should_self_heal_config(true, peruser, mg, false));
-        // Not a SystemContext worker → never.
-        assert!(!should_self_heal_config(false, peruser, mg, false));
-        // Already loaded FROM the machine-global path → nothing to do.
-        assert!(!should_self_heal_config(true, mg, mg, false));
-        // Machine-global already exists → don't clobber it.
-        assert!(!should_self_heal_config(true, peruser, mg, true));
+    fn parses_a_waiting_worker_as_the_service_host_spawns_it() {
+        use roomlerd::win_service::supervisor::system_context_waiting_args;
+        for waiting in [true, false] {
+            let mut argv = vec!["roomlerd".to_string()];
+            argv.extend(win_service::worker_args());
+            argv.extend(system_context_waiting_args(waiting));
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            match cli.command {
+                Some(Command::Run {
+                    supervisor,
+                    system_context_waiting,
+                    ..
+                }) => {
+                    assert_eq!(supervisor.as_deref(), Some("scm"));
+                    assert_eq!(system_context_waiting, waiting);
+                }
+                other => panic!("expected run, got {other:?}"),
+            }
+        }
     }
     // RETIRED-NAME-ANCHOR-END
 

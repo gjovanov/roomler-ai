@@ -809,6 +809,12 @@ impl LocalApiState for DaemonState {
                 .config_persist
                 .as_ref()
                 .map(|(p, _)| p.display().to_string()),
+            // #3387 — the person's own worker, which a machine-wide service
+            // runs while the machine has no enrollment SYSTEM can open.
+            #[cfg(target_os = "windows")]
+            waiting_for_machine_enrollment: crate::win_service::system_context_waiting(),
+            #[cfg(not(target_os = "windows"))]
+            waiting_for_machine_enrollment: false,
             // S2 — MagicDNS status the overlay runtime published.
             dns,
             // NAT-traversal — the srflx gather outcome. Empty candidates means

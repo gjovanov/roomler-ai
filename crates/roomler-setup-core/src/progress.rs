@@ -158,13 +158,16 @@ pub enum ProgressEvent {
     /// session to the device drops for a few seconds.
     DaemonRestartStarted,
     /// #3116 — the daemon runs on the new enrollment; `pid` is the process
-    /// that answered, when it said.
+    /// that answered, when it said. #3387: also a fresh machine-wide install's
+    /// confirmation, which restarts nothing (the service swaps to the SYSTEM
+    /// worker on its own once the machine enrollment is written).
     #[serde(rename_all = "camelCase")]
     DaemonRestartOk { pid: Option<u32> },
     /// #3116 — the daemon was not restarted onto the new enrollment. Never
     /// fatal: the config is written, and no startup save of the running daemon
     /// writes over it (`config::StartupWrites`), so the enrollment takes effect
-    /// at its next start. `reason` says why, and what to do.
+    /// at its next start. `reason` says why, and what to do. #3387: also a
+    /// fresh machine-wide install whose service was not seen running it.
     #[serde(rename_all = "camelCase")]
     DaemonRestartSkipped { reason: String },
 

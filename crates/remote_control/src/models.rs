@@ -553,7 +553,10 @@ pub struct AgentCaps {
     /// * `sas` — Ctrl+Alt+Del is sent as ordinary keys (`keys-only`): on
     ///   Windows they miss the lock and sign-in screens until FR-97 P4a sends
     ///   the real secure attention sequence; on Linux the desktop binds them.
-    ///   On macOS the chord means nothing (`not-applicable`).
+    ///   On macOS the chord means nothing (`not-applicable`). #3387: a Windows
+    ///   machine-wide service that has no machine enrollment yet runs the
+    ///   signed-in person's own enrollment as that person, and says so here
+    ///   (`no-machine-enrollment`).
     /// * `display-match` — FR-97 P3e-2: this host's display cannot be switched
     ///   to the viewer's stage (macOS; a Linux system install, a Wayland
     ///   desktop). Until P3e-2 the viewer offered the toggle on Windows only,

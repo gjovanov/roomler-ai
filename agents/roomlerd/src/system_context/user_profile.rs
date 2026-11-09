@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-// RETIRED-NAME-ANCHOR(4): names the PRE-RENAME appdirs segment a host installed before
-// P4b still has; appdirs::app_segment resolves it, so it is an input.
 //! Resolve the active-session user's profile directory from a
 //! SystemContext worker.
 //!
@@ -9,19 +7,16 @@
 //!
 //! The SystemContext worker runs as `LocalSystem` (S-1-5-18) but
 //! lives in the user's interactive session (typically session 1).
-//! That means the worker's own `%APPDATA%` resolves to
-//! `C:\Windows\System32\config\systemprofile\AppData\Roaming\` —
-//! NOT the user's profile. The agent's config file (with the
-//! enrollment token, agent_id, server URL, etc.) was written into
-//! the user's profile by the user-context enrollment flow, so the
-//! SystemContext worker can't see it via the default
-//! `ProjectDirs::config_dir()` lookup.
+//! That means the worker's own `%USERPROFILE%` resolves to
+//! `C:\Windows\System32\config\systemprofile\` — NOT the user's
+//! profile, so a feature that needs the person's folders (the
+//! install clean-up's per-user leftovers, the file-DC's Downloads)
+//! has to find them another way.
 //!
-//! Field repro the field-test host 2026-05-06: every SystemContext spawn exited
-//! with `code=1` within ~500 ms, no log files written. Root cause:
-//! `config::load(default_path)` returned `not found` for the SYSTEM-
-//! profile path; `anyhow` propagated to main; process exited with
-//! code 1 BEFORE `logging::init()` had a chance to fire.
+//! A SystemContext worker never loads its CONFIG from here: it runs
+//! the machine's own enrollment and nothing else (#3387, `app.rs`
+//! `pick_config_path`). The person's own enrollment runs as that
+//! person, on the service host's user-context arm.
 //!
 //! ## How
 //!
@@ -31,19 +26,10 @@
 //! 2. `WTSQuerySessionInformationW(NULL, sid, WTSUserName)` — look
 //!    up the username for that session. Returns "Administrator"
 //!    or whatever; empty string if no user is logged in.
-//! 3. Build `C:\Users\<username>\AppData\Roaming\roomler\
-//!    roomler\config\config.toml` (a host installed before the
-//!    rename keeps `roomler-agent` there, so both are tried — see
-//!    `config_candidates_under`). Uses the standard Win11
-//!    profile location; fails gracefully (returns `None`) if the
-//!    profile isn't there.
+//! 3. Build `C:\Users\<username>`. Uses the standard Win11 profile
+//!    location; fails gracefully (returns `None`) if no user is
+//!    signed in.
 //!
-//!
-// RETIRED-NAME-ANCHOR-BEGIN
-// From here down, `roomler-agent` names the PRE-RENAME appdirs segment that
-// a host installed before P4b still has. The resolver returns both segments
-// and the tests pin the order; dropping the retired one is what removed the
-// user-config rung from every post-rename install in the first place.
 //! ## Limitations
 //!
 //! * Assumes the user's profile directory is at `C:\Users\<name>`.
@@ -51,16 +37,13 @@
 //!   home folders) this is wrong. We could read
 //!   `HKLM\Software\Microsoft\Windows NT\CurrentVersion\ProfileList`
 //!   for the SID-keyed profile path, but that's significantly more
-//!   FFI for a corner case. The operator can override with
-//!   `--config <explicit>` on the SCM service's ImagePath as the
-//!   workaround.
-//! * Returns `None` (caller falls back to default path) if any FFI
-//!   call fails. The worker will then exit with code 1, but at
-//!   least the supervisor's log line is honest about it.
+//!   FFI for a corner case.
+//! * Returns `None` (caller falls back to its own default) if any FFI
+//!   call fails.
 
 #![cfg(all(feature = "system-context", target_os = "windows"))]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::RemoteDesktop::{
@@ -75,62 +58,11 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 ///
 /// Used by the various `active_user_*_path()` helpers below; pulled
 /// out so each new feature with a profile-relative path doesn't
-/// re-implement the FFI dance. The lesson from rc.6 (config) and rc.7
-/// (file-DC Downloads): every SystemContext feature that touches a
-/// `%USERPROFILE%`-derived path needs an active-user fallback.
+/// re-implement the FFI dance.
 pub fn active_user_profile_root() -> Option<PathBuf> {
     let session_id = current_session_id()?;
     let username = user_name_for_session(session_id)?;
     Some(PathBuf::from(format!("C:\\Users\\{username}")))
-}
-
-/// Per-user config candidates under `root`, most-current first.
-///
-/// The segment under `%APPDATA%\roomler\` is the appdirs *application*
-/// name, which P4b renamed `roomler-agent` -> `roomler`. A host installed
-/// before that rename still has the old tree, so both are candidates.
-///
-/// This cannot just call `appdirs`: a SystemContext worker runs as
-/// LocalSystem, so `ProjectDirs` would resolve the LocalSystem profile —
-/// the whole reason this module exists is to reach the INTERACTIVE user's
-/// profile instead. The segment list is therefore duplicated here on
-/// purpose, and `appdirs`'s own constants are the thing to keep it in step
-/// with.
-fn config_candidates_under(root: &Path) -> [PathBuf; 2] {
-    let base = root.join("AppData").join("Roaming").join("roomler");
-    [
-        base.join("roomler").join("config").join("config.toml"),
-        base.join("roomler-agent")
-            .join("config")
-            .join("config.toml"),
-    ]
-}
-
-/// Resolve the active-session user's config file path.
-/// Returns `None` if any of the discovery steps fail (no logged-in
-/// user, FFI failure, profile not at standard location).
-///
-/// Caller (typically app.rs's config_path resolution) uses this as
-/// a fallback when the default `ProjectDirs::config_dir()` lookup
-/// returns a path that doesn't exist. That caller then filters on
-/// `exists()`, so returning only ONE segment silently drops the rung
-/// whenever the host is on the other one — which is what happened to
-/// every post-rename install until FR-21: the hardcoded segment was the
-/// pre-rename one, so a freshly installed host had no user-config rung
-/// at all, with nothing logged.
-///
-/// Returns the first candidate that exists; if neither does, the current
-/// one, so the logged path names where the config SHOULD go.
-pub fn active_user_config_path() -> Option<PathBuf> {
-    let root = active_user_profile_root()?;
-    let candidates = config_candidates_under(&root);
-    Some(
-        candidates
-            .iter()
-            .find(|p| p.exists())
-            .cloned()
-            .unwrap_or_else(|| candidates[0].clone()),
-    )
 }
 
 /// Resolve the active-session user's Downloads folder path.
@@ -246,46 +178,6 @@ mod tests {
     }
 
     #[test]
-    fn active_user_config_path_under_test_runner_resolves() {
-        // Under cargo test we're a logged-in user, so this resolves to OUR
-        // profile. Which SEGMENT it lands on depends on what exists on this
-        // box, so assert the shape, not one spelling — pinning a single
-        // segment is what let the pre-rename one survive here unnoticed.
-        let path = active_user_config_path();
-        assert!(path.is_some(), "should resolve under user context");
-        let p = path.unwrap();
-        let s = p.to_string_lossy().to_lowercase();
-        assert!(
-            s.contains("\\users\\"),
-            "path should be under C:\\Users: {p:?}"
-        );
-        assert!(
-            s.ends_with("\\roomler\\config\\config.toml")
-                || s.ends_with("\\roomler-agent\\config\\config.toml"),
-            "path should end with a known config segment: {p:?}"
-        );
-    }
-
-    #[test]
-    fn config_candidates_put_the_current_segment_first() {
-        // The bug this replaced: only the PRE-RENAME segment was ever
-        // returned, so on a freshly installed host the caller's exists()
-        // filter dropped the user-config rung entirely — silently, because
-        // a missing candidate is indistinguishable from no logged-in user.
-        let root = Path::new("C:\\Users\\someone");
-        let got = config_candidates_under(root);
-        let a = got[0].to_string_lossy().to_lowercase();
-        let b = got[1].to_string_lossy().to_lowercase();
-        assert!(
-            a.ends_with("\\roomler\\roomler\\config\\config.toml"),
-            "current segment must come first: {a}"
-        );
-        assert!(
-            b.ends_with("\\roomler\\roomler-agent\\config\\config.toml"),
-            "pre-rename segment must still be offered: {b}"
-        );
-    }
-    #[test]
     fn active_user_profile_root_under_test_runner_resolves() {
         let root = active_user_profile_root();
         assert!(root.is_some(), "should resolve under user context");
@@ -344,4 +236,3 @@ mod tests {
         assert!(result.is_none());
     }
 }
-// RETIRED-NAME-ANCHOR-END

@@ -22,8 +22,11 @@
 //! `keys-only` entry) only when both hold: this worker can ask the service (it
 //! runs as SYSTEM, the SystemContext worker of an SCM install, and was handed
 //! the relay), and the policy lets services. Anywhere else the button keeps
-//! typing keys, and its title says why. The policy is read, never written: it
-//! is a security setting, and on a managed laptop it is the organisation's.
+//! typing keys, and its title says why. A machine-wide service that has no
+//! machine enrollment yet runs the person's own worker, which says that under
+//! its own code (`no-machine-enrollment`, #3387). The policy is read, never
+//! written: it is a security setting, and on a managed laptop it is the
+//! organisation's.
 //!
 //! `sas.dll` is loaded when the host sends, never imported: a binary that
 //! imports a DLL some Windows edition lacks does not start at all. It is loaded
@@ -74,16 +77,34 @@ pub enum SasRefusal {
     /// SCM install whose worker runs as the signed-in person, or a daemon run
     /// by hand.
     NoService,
+    /// #3387 — a machine-wide service with SystemContext on, whose machine has
+    /// no enrollment SYSTEM can open yet: the service runs the signed-in
+    /// person's own enrollment as that person until it has one, and that
+    /// worker cannot ask for the real sequence.
+    NoMachineEnrollment,
     /// The policy lets no service generate a SAS.
     Policy(SasPolicy),
 }
 
 impl SasRefusal {
+    /// The `unavailable` code, when it is not the entry's own (`keys-only`).
+    /// #3387: `no-machine-enrollment` is what a server read finds the devices
+    /// that wait for a machine enrollment by.
+    pub fn code(self) -> Option<&'static str> {
+        match self {
+            Self::NoMachineEnrollment => Some("no-machine-enrollment"),
+            Self::NoService | Self::Policy(_) => None,
+        }
+    }
+
     /// One sentence for the viewer's title, after the button's own words.
     pub fn reason(self) -> &'static str {
         match self {
             Self::NoService => {
                 "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not. Only the Roomler service can send the real one, through a worker running as SYSTEM, and this install has none"
+            }
+            Self::NoMachineEnrollment => {
+                "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not. This computer's Roomler service has no machine enrollment yet, so it runs the signed-in person's own enrollment as that person: run Roomler Setup on it, or `roomlerd enroll --machine-global` from an elevated prompt"
             }
             Self::Policy(_) => {
                 "Ctrl+Alt+Del is sent as ordinary keys: apps on the desktop get it, but the Windows lock and sign-in screens do not. Windows' software Secure Attention Sequence policy (SoftwareSASGeneration) lets no service send the real one here"
@@ -93,8 +114,17 @@ impl SasRefusal {
 }
 
 /// The decision: the real sequence needs a worker that can ask the service AND
-/// a policy that lets services generate it.
-pub fn decide(reaches_service: bool, policy: SasPolicy) -> Result<(), SasRefusal> {
+/// a policy that lets services generate it. A worker the service started as
+/// the person while it waits for a machine enrollment (#3387) says that first:
+/// it is what would change the answer.
+pub fn decide(
+    reaches_service: bool,
+    waits_for_machine_enrollment: bool,
+    policy: SasPolicy,
+) -> Result<(), SasRefusal> {
+    if waits_for_machine_enrollment {
+        return Err(SasRefusal::NoMachineEnrollment);
+    }
     if !reaches_service {
         return Err(SasRefusal::NoService);
     }
@@ -120,6 +150,7 @@ pub fn set_host_relay(name: String) {
 pub fn availability() -> Result<(), SasRefusal> {
     decide(
         HOST_RELAY.get().is_some() && imp::is_system(),
+        crate::win_service::system_context_waiting(),
         SasPolicy::from_value(imp::read_policy()),
     )
 }
@@ -285,23 +316,45 @@ mod tests {
 
     #[test]
     fn the_real_sequence_needs_the_service_and_the_policy() {
-        assert_eq!(decide(true, SasPolicy::Services), Ok(()));
-        assert_eq!(decide(true, SasPolicy::ServicesAndEaseOfAccess), Ok(()));
+        assert_eq!(decide(true, false, SasPolicy::Services), Ok(()));
         assert_eq!(
-            decide(false, SasPolicy::Services),
+            decide(true, false, SasPolicy::ServicesAndEaseOfAccess),
+            Ok(())
+        );
+        assert_eq!(
+            decide(false, false, SasPolicy::Services),
             Err(SasRefusal::NoService),
             "a per-user install, however open the policy"
         );
         assert_eq!(
-            decide(true, SasPolicy::EaseOfAccess),
+            decide(true, false, SasPolicy::EaseOfAccess),
             Err(SasRefusal::Policy(SasPolicy::EaseOfAccess)),
             "the service is there, but Windows' default policy"
         );
         assert_eq!(
-            decide(false, SasPolicy::Nothing),
+            decide(false, false, SasPolicy::Nothing),
             Err(SasRefusal::NoService),
             "no service is said first: without it the policy does not matter"
         );
+    }
+
+    /// #3387 — the person's own worker, which the service runs while the
+    /// machine has no enrollment SYSTEM can open, says that, and under its own
+    /// code, whatever the policy: a machine enrollment is what would change it.
+    #[test]
+    fn a_service_waiting_for_a_machine_enrollment_says_so() {
+        for policy in [SasPolicy::Services, SasPolicy::Nothing] {
+            assert_eq!(
+                decide(false, true, policy),
+                Err(SasRefusal::NoMachineEnrollment)
+            );
+        }
+        assert_eq!(
+            SasRefusal::NoMachineEnrollment.code(),
+            Some("no-machine-enrollment")
+        );
+        assert_eq!(SasRefusal::NoService.code(), None);
+        assert_eq!(SasRefusal::Policy(SasPolicy::Nothing).code(), None);
     }
 
     /// The reasons extend the button's own words; each says what reaches the
@@ -309,6 +362,11 @@ mod tests {
     #[test]
     fn each_refusal_says_why() {
         assert!(SasRefusal::NoService.reason().contains("Roomler service"));
+        assert!(
+            SasRefusal::NoMachineEnrollment
+                .reason()
+                .contains("--machine-global")
+        );
         assert!(
             SasRefusal::Policy(SasPolicy::Nothing)
                 .reason()
