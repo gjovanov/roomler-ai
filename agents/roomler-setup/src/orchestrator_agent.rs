@@ -730,8 +730,22 @@ async fn run_install_inner(
     // for the OS stop that unenrolls it. A fresh install has no daemon on an
     // older config. Best-effort, like the steps after it: the config is
     // written either way.
+    //
+    // #3387 — a fresh machine-wide install restarts nothing either, and
+    // confirms instead: the service ran the signed-in person's own enrollment
+    // (if any) as that person until this write, and swaps to the SYSTEM worker
+    // on its own. Done then says whether the service runs what it shows.
     if had_config {
-        restart_onto_new_enrollment(&config_path, written_at_ms, settled, on_event).await;
+        restart_onto_new_enrollment(
+            &config_path,
+            is_system_context,
+            written_at_ms,
+            settled,
+            on_event,
+        )
+        .await;
+    } else if is_system_context {
+        confirm_fresh_service(&config_path, on_event).await;
     }
 
     // --- Step 7b: place the roomler-desktop GUI companion (GAP-A / P6) ---
@@ -982,6 +996,7 @@ async fn settle_daemon(
 #[cfg(target_os = "windows")]
 async fn restart_onto_new_enrollment(
     config_path: &std::path::Path,
+    is_system_context: bool,
     written_at_ms: u64,
     settled: Option<bool>,
     on_event: &Channel<ProgressEvent>,
@@ -1016,8 +1031,10 @@ async fn restart_onto_new_enrollment(
     };
     match needs_restart(
         status.config_path.as_deref(),
+        status.privileged,
         status.started_at_ms,
         config_path,
+        is_system_context,
         written_at_ms,
     ) {
         Err(why) => return skipped(why),
@@ -1106,6 +1123,7 @@ async fn daemon_status(budget: Duration) -> Option<roomler_localapi::NodeStatus>
 #[cfg(not(target_os = "windows"))]
 async fn restart_onto_new_enrollment(
     _config_path: &std::path::Path,
+    _is_system_context: bool,
     _written_at_ms: u64,
     _settled: Option<bool>,
     _on_event: &Channel<ProgressEvent>,
@@ -1113,21 +1131,31 @@ async fn restart_onto_new_enrollment(
 }
 
 /// #3116 — does the daemon that answered need a restart to run the enrollment
-/// written to `ours` at `written_at_ms`? `Err` when it runs another config
-/// (a plain perMachine worker signed in as someone other than the person
-/// running Setup): restarting it would not load this one. `Ok(false)` when it
-/// started after the write, so it loaded this one. A daemon that does not say
-/// when it started is restarted; one restart too many costs a few seconds.
+/// written to `ours` at `written_at_ms`? `Ok(false)` when it started after the
+/// write, so it loaded this one. A daemon that does not say when it started is
+/// restarted; one restart too many costs a few seconds.
+///
+/// One that runs another config: on a machine-wide install (`ours_is_machine`,
+/// `ours` the machine config) a SYSTEM worker (`privileged`) takes the
+/// machine's own enrollment at its next start, so it is restarted (#3387).
+/// Any other is `Err` (a plain perMachine worker signed in as someone other
+/// than the person running Setup, the person's own worker): restarting it
+/// would not load this one.
 #[cfg(any(target_os = "windows", test))]
 fn needs_restart(
     theirs: Option<&str>,
+    privileged: Option<bool>,
     started_at_ms: Option<u64>,
     ours: &std::path::Path,
+    ours_is_machine: bool,
     written_at_ms: u64,
 ) -> Result<bool, String> {
     if let Some(theirs) = theirs
         && !same_config_path(theirs, ours)
     {
+        if ours_is_machine && privileged == Some(true) {
+            return Ok(true);
+        }
         return Err(format!(
             "the running daemon uses {theirs}, not {}, so restarting it would not load this \
              enrollment",
@@ -1146,6 +1174,101 @@ fn same_config_path(theirs: &str, ours: &std::path::Path) -> bool {
         s.strip_prefix(r"\\?\").unwrap_or(&s).to_ascii_lowercase()
     };
     norm(theirs) == norm(&ours.display().to_string())
+}
+
+/// #3387 — what a machine-wide service's answer says about the enrollment a
+/// fresh install wrote to `ours`, the machine config.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceAnswer {
+    /// The person's own worker, which the service runs until the machine has
+    /// an enrollment SYSTEM can open, and swaps for the SYSTEM worker at the
+    /// next tick after the write: asked again.
+    Waiting,
+    /// A SYSTEM worker on the machine config: the service runs what Setup
+    /// wrote.
+    Runs,
+    /// A SYSTEM worker on another config, or one that does not say which:
+    /// asking again would not change it. The reason, for Done.
+    Other(String),
+}
+
+/// #3387 — [`ServiceAnswer`] for a status's `privileged` and `config_path`.
+#[cfg(any(target_os = "windows", test))]
+fn fresh_service_answer(
+    privileged: Option<bool>,
+    theirs: Option<&str>,
+    ours: &std::path::Path,
+) -> ServiceAnswer {
+    if privileged == Some(false) {
+        return ServiceAnswer::Waiting;
+    }
+    match theirs {
+        Some(theirs) if same_config_path(theirs, ours) => ServiceAnswer::Runs,
+        Some(theirs) => ServiceAnswer::Other(format!(
+            "the Roomler service runs {theirs}, not {}",
+            ours.display()
+        )),
+        None => ServiceAnswer::Other(
+            "the Roomler service does not say which enrollment it runs".to_string(),
+        ),
+    }
+}
+
+/// #3387 — on a fresh machine-wide install, confirm that the service runs the
+/// enrollment just written to `config_path`, the machine config. Nothing is
+/// restarted. Until the machine had an enrollment, the service ran the
+/// signed-in person's own (when there was one) as that person, and it swaps to
+/// the SYSTEM worker at the next tick after the write. So the answers are read
+/// for one from a SYSTEM worker on the machine config within
+/// [`DAEMON_ANSWER_BUDGET`], passing over the person's worker while the service
+/// swaps, and Done says whether the service runs the device it shows.
+#[cfg(target_os = "windows")]
+async fn confirm_fresh_service(config_path: &std::path::Path, on_event: &Channel<ProgressEvent>) {
+    let skipped = |why: String| {
+        let reason = format!(
+            "{why}. The new enrollment is written, and the service runs it from its next \
+             start: restart the Roomler service, or the computer"
+        );
+        tracing::warn!(%reason, "#3387: the service was not seen running the new enrollment");
+        emit(on_event, ProgressEvent::DaemonRestartSkipped { reason });
+    };
+    let begun = std::time::Instant::now();
+    loop {
+        let ask = async {
+            let mut client = roomler_localapi::connect().await.ok()?;
+            client.status().await.ok()
+        };
+        if let Ok(Some(status)) = tokio::time::timeout(LOCALAPI_EXCHANGE, ask).await {
+            match fresh_service_answer(
+                status.privileged,
+                status.config_path.as_deref(),
+                config_path,
+            ) {
+                ServiceAnswer::Runs => {
+                    emit(on_event, ProgressEvent::DaemonRestartOk { pid: status.pid });
+                    return;
+                }
+                ServiceAnswer::Other(why) => return skipped(why),
+                ServiceAnswer::Waiting => {}
+            }
+        }
+        if cancel_requested() {
+            return skipped("the wait for the Roomler service was cancelled".to_string());
+        }
+        if begun.elapsed() >= DAEMON_ANSWER_BUDGET {
+            return skipped(format!(
+                "the Roomler service did not answer with the new enrollment within {} s",
+                DAEMON_ANSWER_BUDGET.as_secs()
+            ));
+        }
+        tokio::time::sleep(roomler_localapi::RESTART_POLL).await;
+    }
+}
+
+/// The daemon roles exist only on Windows.
+#[cfg(not(target_os = "windows"))]
+async fn confirm_fresh_service(_config_path: &std::path::Path, _on_event: &Channel<ProgressEvent>) {
 }
 
 /// #3116 — what to do about an install that needs an elevated wizard.
@@ -2122,8 +2245,10 @@ mod tests {
         assert_eq!(
             needs_restart(
                 Some(r"C:\ProgramData\roomler\roomler\config.toml"),
+                Some(true),
                 Some(written - 1),
                 ours,
+                true,
                 written
             ),
             Ok(true),
@@ -2132,22 +2257,26 @@ mod tests {
         assert_eq!(
             needs_restart(
                 Some(r"c:/programdata/Roomler/roomler/CONFIG.toml"),
+                Some(true),
                 Some(written),
                 ours,
+                true,
                 written
             ),
             Ok(false),
             "started at or after the write: it loaded the new one (case and separators aside)"
         );
         assert_eq!(
-            needs_restart(None, None, ours, written),
+            needs_restart(None, None, None, ours, true, written),
             Ok(true),
             "an older daemon says neither: restarted, the cheap mistake"
         );
         let other = needs_restart(
             Some(r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml"),
+            Some(false),
             Some(written - 1),
             ours,
+            true,
             written,
         )
         .expect_err("another config");
@@ -2155,6 +2284,84 @@ mod tests {
         assert!(same_config_path(
             r"\\?\C:\ProgramData\roomler\roomler\config.toml",
             ours
+        ));
+    }
+
+    /// #3387 — a machine-wide service whose SYSTEM worker runs another config
+    /// takes the machine's own at its next start, so a reinstall restarts it
+    /// onto the enrollment it wrote. A daemon running as a person, or one on a
+    /// per-user install, is still left alone and said.
+    #[test]
+    fn needs_restart_accepts_a_system_worker_on_another_path_when_ours_is_machine() {
+        let machine = std::path::Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let persons = r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml";
+        let written = 1_000_000;
+        assert_eq!(
+            needs_restart(
+                Some(persons),
+                Some(true),
+                Some(written - 1),
+                machine,
+                true,
+                written
+            ),
+            Ok(true)
+        );
+        assert!(
+            needs_restart(
+                Some(persons),
+                Some(false),
+                Some(written - 1),
+                machine,
+                true,
+                written
+            )
+            .is_err(),
+            "the person's own daemon"
+        );
+        let per_user = std::path::Path::new(persons);
+        assert!(
+            needs_restart(
+                Some(r"C:\Users\other\AppData\Roaming\roomler\roomler\config.toml"),
+                Some(true),
+                Some(written - 1),
+                per_user,
+                false,
+                written
+            )
+            .is_err(),
+            "not a machine-wide install"
+        );
+    }
+
+    /// #3387 — on a fresh machine-wide install Setup confirms that the service
+    /// runs the enrollment it wrote. The person's own worker, which runs until
+    /// the machine has an enrollment, is passed over while the service swaps;
+    /// a SYSTEM worker on the machine config is the answer; one on any other
+    /// config is said.
+    #[test]
+    fn fresh_system_context_confirms_on_the_machine_path() {
+        let machine = std::path::Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let persons = r"C:\Users\someone\AppData\Roaming\roomler\roomler\config.toml";
+        assert_eq!(
+            fresh_service_answer(Some(false), Some(persons), machine),
+            ServiceAnswer::Waiting
+        );
+        assert_eq!(
+            fresh_service_answer(
+                Some(true),
+                Some(r"c:/programdata/roomler/roomler/config.toml"),
+                machine
+            ),
+            ServiceAnswer::Runs
+        );
+        match fresh_service_answer(Some(true), Some(persons), machine) {
+            ServiceAnswer::Other(why) => assert!(why.contains(persons), "{why}"),
+            other => panic!("a SYSTEM worker on another config: {other:?}"),
+        }
+        assert!(matches!(
+            fresh_service_answer(Some(true), None, machine),
+            ServiceAnswer::Other(_)
         ));
     }
 

@@ -246,7 +246,7 @@ into `roomlerd::purge_exit_routes()` and called:
   their replacement: [below](#a-stall-exit-hands-a-slow-dns-purge-to-its-replacement-3440),
   and
 - (FR-97 P0e) **after every exit of the daemon**, clean ones included, once the
-  runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2148`):
+  runtime is dropped (`purge_after_daemon`, `agents/roomlerd/src/app.rs:2072`):
   see [exit-client pins](#exit-client-pins-fr-97-p0e) below.
 
 The stale-route purge drops the peer and subnet routes it finds on the overlay's
@@ -295,7 +295,7 @@ purge finishes on a thread of its own.
 The last two rows say any Normal-priority child waits this way, so the bound
 alone does not get such a start to its probe. The next children on that path
 were the four `icacls` steps of the config save every start makes for its crash
-bookkeeping (`agents/roomlerd/src/app.rs:4147`). A save now reads the
+bookkeeping (`agents/roomlerd/src/app.rs:4071`). A save now reads the
 directory's owner and DACL in-process and runs the steps only when they would
 change something
 ([the hardening](operator-systemcontext-smoke.md#3-confirm-the-acl-is-locked-down)).
@@ -334,7 +334,7 @@ sequenceDiagram
 
 | Rule | Where | Why |
 |---|---|---|
-| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:360`, `:376`, called at `agents/roomlerd/src/app.rs:4027` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
+| The start waits for the DNS purge for `START_DNS_PURGE_WAIT`, 10 s | `agents/roomlerd/src/lib.rs:360`, `:376`, called at `agents/roomlerd/src/app.rs:3951` | Unloaded, the purge ends in under 2 s. Only a host that cannot run the child reaches the bound |
 | Past the bound the purge still runs to its end | `crates/tunnel-core/src/overlay/dns.rs:860` (`purge_exit_dns_within`), `:1243` (`run_within`) | A stale `.`-root rule outlives a crash and a reboot, and it must still go |
 | Every DNS change waits while a purge is in flight | `crates/tunnel-core/src/overlay/dns.rs:596` (`run_cmd`), `:1285` (`wait_idle`) | A purge that ended after a steer would delete the steer. The wait has no bound on purpose: the steer needs the order, and the change it holds is itself a child the same load would hold |
 | A purge counts in before its thread starts, and out however it ends | `crates/tunnel-core/src/overlay/dns.rs:1227` (`PurgeGate`) | No DNS change slips in between, and a purge that panics holds nothing |
@@ -416,7 +416,7 @@ What it leaves as it was:
   fatal goodbye and a duplicate-instance loser. Nothing waits on them, and a
   purge they cut short would have no next start behind it. A requested restart
   waits too, because `purge_after_daemon` runs the whole purge before it
-  (`agents/roomlerd/src/app.rs:1366`, `:1373`).
+  (`agents/roomlerd/src/app.rs:1274`, `:1281`).
 - Linux waits as before. A daemon outside systemd (a container, a hand run)
   would leave `resolvectl revert` running beside its replacement's steer, and
   the link config dies with `roomler0` anyway. macOS has nothing to purge.

@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3772`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:342`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1328`, `delegate.rs:1370`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4723`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1328`, `delegate.rs:1370`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4647`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -290,7 +290,7 @@ flowchart TD
 
 | Input | Where it comes from |
 |---|---|
-| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1082`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:4761`). The Hub sends `auto` to no other agent |
+| that the agent decides at all | the `rc-overlay-auto` verb in `AgentCaps.rpc` (`crates/remote_control/src/models.rs:1085`), advertised while the kill switch is on (`agents/roomlerd/src/encode/caps.rs:4761`). The Hub sends `auto` to no other agent |
 | that the policy is `auto` | `rc:request`'s `rc_overlay_auto`, sent with `rc_overlay: false`, so an agent older than the field reads off (`crates/remote_control/src/signaling.rs:2480`) |
 | the viewer's devices | `RcOverlayAutoWire.viewers` (`crates/remote_control/src/signaling.rs:3677`): the `overlay_ip` of every loopback relay the Hub hands the browser, at most `LOCAL_RELAYS_MAX`, since FR-121 P3b hands over one relay per agent on the viewer's computer. The Hub fills it from the relays in the overlay range (`rc_overlay_auto_wire`, `crates/modules/fleet/src/hub.rs:145`) |
 | the far TURN | `RcOverlayAutoWire.far_turn`: the last netcheck (`stun_udp`, since P2b alone) of the target and of the browser's best device, read by the server (below). The target folds its own netcheck in at the offer (D8, `own_far_turn`, `agents/roomlerd/src/rc_overlay.rs:351`). `None` = not measured, read as usable |
@@ -303,7 +303,7 @@ Notes on the implementation:
 - **It logs one line:** `rc ICE: overlay auto (FR-128) — the session may ride the mesh` (or `stays off`), with `viewers`, `carriers`, `far_turn` (the server's hint), `own_far_turn` (D8), `allow` and `exclude`.
 - **Kill switch:** `ROOMLERD_RC_OVERLAY_AUTO=0` (`rc_overlay.rs:66`) makes `auto` behave as `off`. The device then stops advertising `rc-overlay-auto`, so the Hub reads its policy as `off` too.
 
-**How the server feeds it.** The device row stores `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1435`), beside `rc_overlay`. A pod or a page older than the field therefore reads `off`, never a row it cannot parse. On the **Devices** page it is the middle choice of **Mesh: off / auto / on** (`ui/src/components/admin/devicePolicy.ts:82`).
+**How the server feeds it.** The device row stores `auto` in a field of its own, `AccessPolicy.rc_overlay_auto` (`crates/remote_control/src/models.rs:1438`), beside `rc_overlay`. A pod or a page older than the field therefore reads `off`, never a row it cannot parse. On the **Devices** page it is the middle choice of **Mesh: off / auto / on** (`ui/src/components/admin/devicePolicy.ts:82`).
 
 ```mermaid
 flowchart LR
@@ -317,7 +317,7 @@ flowchart LR
     H -->|"agent does not"| O["read as off: no rc_overlay_auto,<br/>relay refused rc_overlay_off"]
 ```
 
-- **The mode** is `RcOverlayMode` (`models.rs:1465`). `rc_overlay_mode()` (`:1513`) reads `on` first, then `auto`, else `off`, the same order the page uses.
+- **The mode** is `RcOverlayMode` (`models.rs:1468`). `rc_overlay_mode()` (`:1516`) reads `on` first, then `auto`, else `off`, the same order the page uses.
 - **The far-TURN hint** comes from the authz gate (`far_turn_hint`, `crates/modules/remote/src/controller.rs:701`). It asks the hook registry (`far_turn_udp`, `crates/core/src/hooks.rs:147`) about the target and every device the browser runs on. `network` answers from each one's live overlay node, behind the same 60-minute freshness gate every consumer uses (`far_turn_reach`, `crates/modules/network/src/hooks.rs:127`).
   - **The browser's end is its best device** (`browser_reach`, `crates/modules/network/src/hooks.rs:154`). One that measured the far TURN alive decides, because a WSL agent with no UDP out says nothing about the Windows browser beside it. Otherwise one that measured it dead decides, so a device that was not measured cannot hide a dead one.
   - **The rule** is `far_turn_verdict` (`crates/modules/network/src/hooks.rs:168`): either end measured dead is `false`; both measured alive is `true`; anything else is not measured.
@@ -665,7 +665,7 @@ of the process, so a root daemon started outside every session keeps its
 documents ([`remote-apps.md`](remote-apps.md)).
 
 The keys are matched by equality (`Unavailable::KEYS`,
-[`models.rs:568`](../crates/remote_control/src/models.rs#L568)) and the wire
+[`models.rs:571`](../crates/remote_control/src/models.rs#L571)) and the wire
 shape is locked by `unavailable_wire_shape_is_locked`. FR-97's census
 (`scripts/fr97-caps-census.sh`) counts the map by OS as `key:code`, beside
 the words.
@@ -879,7 +879,7 @@ sequenceDiagram
 ```
 
 - **The decision is one pure function**
-  ([`sas.rs:97`](../agents/roomlerd/src/input/sas.rs#L97)), compiled on every
+  ([`sas.rs:120`](../agents/roomlerd/src/input/sas.rs#L120)), compiled on every
   OS so the lanes that never run Windows tests check it. It is made at every
   announcement ([`signaling.rs:6798`](../agents/roomlerd/src/signaling.rs#L6798)),
   and the heartbeat re-announces the moment its answer changes, so a policy a
@@ -903,10 +903,10 @@ sequenceDiagram
   process that asks for one gains nothing it lacked. Signals that arrive while
   one is being answered coalesce into one more, never a queue.
 - **The host re-checks the policy before it sends**
-  ([`sas.rs:139`](../agents/roomlerd/src/input/sas.rs#L139)), never trusting
+  ([`sas.rs:170`](../agents/roomlerd/src/input/sas.rs#L170)), never trusting
   that the worker did.
 - **`sas.dll` is loaded when the host sends, never imported**
-  ([`sas.rs:224`](../agents/roomlerd/src/input/sas.rs#L224)). A binary that
+  ([`sas.rs:255`](../agents/roomlerd/src/input/sas.rs#L255)). A binary that
   imports a DLL some Windows edition lacks does not start at all. It is loaded
   from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`), so a SYSTEM process can
   never load a copy planted beside the binary.
@@ -2191,7 +2191,7 @@ live viewer to the consent page, and the device hung its session up.
 - absent for `auto`.
 
 The mapping is `ConsentMode::asks`
-([`models.rs:1358`](../crates/remote_control/src/models.rs#L1358)), sent at
+([`models.rs:1361`](../crates/remote_control/src/models.rs#L1361)), sent at
 [`hub.rs:1911`](../crates/modules/fleet/src/hub.rs#L1911). A duplicate request
 coalesced onto a live session gets the same value (`:1645`).
 
@@ -2536,7 +2536,7 @@ org or a device that sets nothing.
 | | The org's switch (P2a) | The device's floor (P2b) |
 |---|---|---|
 | Stored in | `TenantSettings.rc_session` ([`tenant.rs:116`](../crates/db/src/models/tenant.rs#L116)) | `rc_clipboard`, `rc_files`, `rc_audio` in the device's `config.toml` |
-| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3241`](../crates/localapi/src/lib.rs#L3241), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
+| Set through | `GET`/`PUT /api/tenant/{tid}/rc-session-policy` ([`session_policy.rs:85`](../crates/modules/remote/src/session_policy.rs#L85), [`:104`](../crates/modules/remote/src/session_policy.rs#L104)); `PUT` needs `MANAGE_TENANT`, is partial, and reads values strictly. The org settings card "Remote session features" | the LocalAPI, from **the person at the console only** ([`localapi/src/lib.rs:3250`](../crates/localapi/src/lib.rs#L3250), the `CONSOLE_PERSON_KEYS` entries since #2871); live, no restart |
 | Pushable by a server | — | **never**: absent from `DesiredConfig`, so a compromised server cannot switch back on what the owner switched off |
 | Reaches the session | in `rc:request.session_policy`, only when it restricts anything | advertised in `AgentCaps.session_policy` ([`models.rs:518`](../crates/remote_control/src/models.rs#L518)) and re-announced on the heartbeat when it changes |
 
@@ -2695,16 +2695,15 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
 - **The keys it remembers** live in `<config dir>/peer-auth/<tenant>.controllers.json`, beside the device key and
   with its protections: public keys only, 16 per user (the oldest goes first), 256 users. They are why a later
   `enforce` can ask only about a browser the device has never met.
-- **When the config moves, its keys go with it** (#3096). A SystemContext worker that runs on the person's config
-  promotes it to the machine-global path after a healthy run
-  ([`self_heal_machine_global_config`, `app.rs:1229`](../agents/roomlerd/src/app.rs#L1229)). The `peer-auth/` files
-  go first, never over a file already there, and the config is not promoted without them
-  ([`promote`, `peer_auth.rs:741`](../agents/roomlerd/src/peer_auth.rs#L741)). A config promoted before that has no
-  keys beside it. So an enrollment with no key at the machine-global path takes the one the active user's config
-  holds for it, when that config carries the same enrollment, the same machine and agent id
-  ([`adoption_source`, `peer_auth.rs:689`](../agents/roomlerd/src/peer_auth.rs#L689)), instead of minting one. A
-  minted key reads as `key-changed` in every browser that pinned the device, whose identity did not change. With
-  nobody signed in there is no active user, and that first start still mints.
+- **A config does not move by itself** (#3387). A SystemContext worker runs the machine's own enrollment and
+  nothing else ([`pick_config_path`, `app.rs:1109`](../agents/roomlerd/src/app.rs#L1109)), so no daemon copies a
+  person's config, or its `peer-auth/`, to the machine-global path any more: the copy after a healthy run and the
+  key adoption #3096 added to it are gone. A key is read from its file or made there
+  ([`load_or_make`, `peer_auth.rs:681`](../agents/roomlerd/src/peer_auth.rs#L681)). An administrator who moves an
+  enrollment to the machine-global path by hand moves its `peer-auth/` folder with it
+  ([the SystemContext checklist](operator-systemcontext-smoke.md), step 2c): an enrollment that arrives without its
+  key mints a new one, and every browser that pinned the device reads it as `key-changed`, though the device's
+  identity did not change.
 - **The policy is the device owner's**: `roomler config set peer_auth off|audit` (default `audit`), live, and only
   from the person at the console. It is never pushable by the server, and `enforce` is refused by name until P3.
   `off` stops the judging, the remembering and the record; the device still signs its answers.
@@ -3115,7 +3114,7 @@ with no grep of `agent_logs`.
 | a failed read | a heartbeat whose `rate_stats` failed reads `InputForm`'s default, CPU with no reason. A real CPU form always names its reason, so this one is dropped and the reading before it stands | `SessionCounters::note_video`, `agents/roomlerd/src/session_telemetry.rs:195` |
 | the early sample | a new reading sends one `rc:session.stats` at once, by the carrier's road (§11.9), so the row has it within a heartbeat and follows a form that moves in the session's first seconds | same |
 | the wire | `video: Option<SessionVideo>` on `rc:session.stats`, absent until the pump's first heartbeat; an older server ignores it | `crates/remote_control/src/signaling.rs:761` |
-| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:6004` |
+| the check | the device is the only writer, so a reading with any field that is not a short lowercase name is dropped whole, and the row keeps its last | `SessionVideo::checked`, `crates/remote_control/src/models.rs:6007` |
 | the row | `remote_sessions.video`, beside `stats`, so `mark_ended`'s whole-`stats` write cannot reset it | `merge_live_stats`, `crates/services/src/dao/remote_session.rs:152` |
 
 ⚠️ **The reading cannot wait for the session's last sample.** When the viewer hangs up, the server
@@ -3164,7 +3163,7 @@ The VP9 pump now sends P1d's reading too (`vp9_libvpx`, CPU, `no_gpu_cell`,
 `agents/roomlerd/src/peer.rs:4441-4452`), so a VP9 session names its cell as an FFmpeg one does.
 The server checks every count against a bound (30 days, 240 fps, 64 followers, an hour) and drops
 a reading with one out of range whole, as it drops a bad name (`SessionVideo::checked`,
-`crates/remote_control/src/models.rs:6004`). The agent saturates every count at those bounds
+`crates/remote_control/src/models.rs:6007`). The agent saturates every count at those bounds
 (`SessionCounters::video`), so a session past one, an hour's wait for its first frame, keeps its
 cell and loses only that count's precision. The struct defaults field by field, so a later agent
 that drops a field costs that reading and never the rest of the sample.
@@ -3243,7 +3242,7 @@ cumulative for the worker's session.
 | the parse | the viewer is the untrusted side: a histogram must be exactly twelve counts that fit a `u32`, and a count must sit inside the row's bounds, so no viewer can make the agent send a reading the server drops whole | `ViewerReport::parse`, `agents/roomlerd/src/media_window.rs:389` |
 | the gate | kept only with `stats` on the session's new path | `note_viewer_decodestat`, `agents/roomlerd/src/peer.rs:10925` |
 | the tally | windows summed between two heartbeats, and the counts as last reported | `SessionCounters::note_viewer_report` / `take_viewer_window`, `agents/roomlerd/src/session_telemetry.rs:239` |
-| the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:5976` |
+| the reading | `frames_painted` beside `frames_encoded`, and `freezes`, bounded by `checked` (30 days at 240 fps; five freezes a second) | `SessionVideo`, `crates/remote_control/src/models.rs:5979` |
 
 ⚠️ **`frames_painted` and `freezes` are the viewer's word.** They are bounded on intake, never
 checked against what the agent sent. A read that takes painted frames as a cell's proof checks
@@ -5554,7 +5553,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
-| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L988)) | `EndedByItsHost` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1049)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
 | Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
@@ -5588,7 +5587,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4148`](../agents/roomlerd/src/app.rs#L4148),
+([`agents/roomlerd/src/app.rs:4072`](../agents/roomlerd/src/app.rs#L4072),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -6084,8 +6083,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1343`). Again in
-  the `Stop` arm (`supervisor.rs:1485`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1404`). Again in
+  the `Stop` arm (`supervisor.rs:1546`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

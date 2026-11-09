@@ -223,8 +223,9 @@ fn active_config_path(is_scm: bool) -> Result<PathBuf, String> {
 }
 
 /// Machine-global only for an SCM-service flavour AND when the file exists
-/// (an SCM install briefly runs on a per-user config until the daemon
-/// self-heals it to machine-global); per-user in every other case.
+/// (an SCM install with no machine enrollment runs the person's own per-user
+/// config, as that person, until one is written: #3387); per-user in every
+/// other case.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn choose_config_path(
     is_scm: bool,

@@ -25,9 +25,14 @@ host (a field host). All PowerShell snippets must run from an
   which is reachable by LocalSystem **before any user logs in**. The
   parent dir gets an inheritable SYSTEM + Administrators DACL so the
   Agent JWT inside is not world-readable.
-- **Self-heal** — the first healthy post-logon run of an rc.50-or-earlier
-  SystemContext host copies its existing `%APPDATA%` config to
-  `%PROGRAMDATA%`, preserving `machine_id`.
+- **#3387** — the SystemContext worker runs the machine's own enrollment and
+  nothing else: the machine-global config, or the SYSTEM profile's own. Until
+  the machine has one that SYSTEM can open, the service runs the signed-in
+  person's own enrollment, if they have one, **as that person**, the way the
+  attended role does, and starts the SYSTEM worker at the next tick after one
+  appears (step 2a). Nothing copies a person's `%APPDATA%` config to
+  `%PROGRAMDATA%` any more; until 0.4.206 the first healthy post-logon run of an
+  rc.50-or-earlier host did.
 
 ---
 
@@ -60,33 +65,33 @@ Test-Path "C:\ProgramData\roomler\roomler\config.toml"
 # expect: True
 ```
 
-If **False**, populate it via one of:
+If **False**, 2a says what the service runs until the machine has an
+enrollment, and 2b or 2c gives it one.
 
-### 2a. Self-heal (automatic, requires one ≥5 min logged-in healthy run)
+### 2a. Until then: the person's own enrollment, as that person (#3387)
 
-1. Log in to the host as the normal user.
-2. Confirm the agent service is running and connecting:
-   ```powershell
-   Get-Service Roomler     # Status: Running
-   ```
-3. **Leave it idle for ≥5 minutes.** The agent's `clean_run_task` fires
-   at the threshold; its log line is:
-   ```
-   config: self-healed perUser config to machine-global path
-       (machine_id preserved; next boot is pre-logon-controllable)
-   ```
-   When the person's config has device keys, the line before it is
-   `config: self-heal carried the device keys (peer-auth) to the machine-global path`.
-   The keys go first (#3096), so browsers that pinned the device keep
-   knowing it after the move.
-4. Recheck step 2.
+With no machine config that SYSTEM can open, the service does not start the
+SYSTEM worker. It runs the signed-in person's own enrollment, if they have
+one, as that person, with their standard rights. The device stays reachable
+while someone is signed in, but not at the lock or sign-in screen, and not
+before anyone signs in. It says so in three places:
+
+- the service log, once: `supervisor: SystemContext is on, but SYSTEM can open
+  no machine enrollment: the signed-in person's own enrollment runs as that
+  person until one is written …`;
+- `roomler status` on the device: a line `machine     no machine enrollment yet: …`;
+- the device's row: the `sas` entry of its capabilities' `unavailable` map has the
+  code `no-machine-enrollment`, and the viewer's Ctrl+Alt+Del button says why.
+
+Nothing is copied to the machine location by itself. Write the machine's own
+enrollment with 2b or 2c: the service starts the SYSTEM worker within a second
+of it appearing, with no restart.
 
 ### 2b. Direct write via `enroll --machine-global` (no logon required)
 
-If self-heal isn't viable (kiosk that never gets logged into, or you
-can't wait), enroll directly to the machine-global path. **Get a fresh
-enrollment token from the admin UI first** — this counts as a new
-enrollment for that host:
+The usual way, and the only one for a kiosk that is never logged into: enroll
+directly to the machine-global path. **Get a fresh enrollment token from the
+admin UI first** — this counts as a new enrollment for that host:
 
 ```powershell
 & "C:\Program Files\Roomler\roomlerd.exe" enroll `
@@ -101,19 +106,23 @@ refuses to silently fall back to `%APPDATA%`.
 
 ### 2c. Manual copy (preserves machine_id, no new token needed)
 
-If the host already has a perUser config and you don't want a fresh
-enrollment, copy it across as SYSTEM (LocalSystem can write `%PROGRAMDATA%`,
-your admin token can with elevation):
+If the host already has a person's own config and the service should run that
+same enrollment, copy it across from an elevated shell, **with its `peer-auth`
+folder**. That folder holds the device keys browsers have pinned: an enrollment
+that arrives without them mints new ones, and every such browser reads the
+device as `key-changed`. On a machine with no machine config yet:
 
 ```powershell
-$Src = "C:\Users\<the-enrolling-user>\AppData\Roaming\roomler\roomler\config\config.toml"
-$Dst = "C:\ProgramData\roomler\roomler\config.toml"
-New-Item -ItemType Directory -Force -Path (Split-Path $Dst) | Out-Null
-Copy-Item $Src $Dst
+$Src = "C:\Users\<the-enrolling-user>\AppData\Roaming\roomler\roomler\config"
+$Dst = "C:\ProgramData\roomler\roomler"
+New-Item -ItemType Directory -Force -Path "$Dst\peer-auth" | Out-Null
+Copy-Item "$Src\config.toml" "$Dst\config.toml"
+if (Test-Path "$Src\peer-auth") { Copy-Item "$Src\peer-auth\*" "$Dst\peer-auth\" }
 ```
 
 `machine_id` is a stored field inside `config.toml` so a copy
-preserves it; the server's `agents` row stays the same.
+preserves it; the server's `agents` row stays the same. Then check step 3:
+the copy must end up readable by SYSTEM and Administrators only.
 
 ---
 
@@ -159,7 +168,7 @@ icacls "C:\ProgramData\roomler" /inheritance:r `
 > rewritten. The daemon's hardening (`crates/agent-core/src/config.rs:3470`,
 > steps at `:3508`) takes the directory for Administrators, grants, and only
 > then drops inheritance. The wizard's
-> (`agents/roomler-setup/src/orchestrator_agent.rs:1605`) takes it, then
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1728`) takes it, then
 > runs that one call. Both stop if they cannot take the directory.
 
 The daemon hardens on every save of this config, and every start saves it once
@@ -274,13 +283,12 @@ connects — no respawn churn.
 
 | Symptom in the log | Likely cause | Fix |
 |---|---|---|
-| `config_path = …\systemprofile\AppData\…` (NOT `%PROGRAMDATA%`) | `%PROGRAMDATA%\roomler\roomler\config.toml` is missing | redo step 2 (self-heal didn't fire, or no machine-global write yet) |
+| `config_path = …\systemprofile\AppData\…` (NOT `%PROGRAMDATA%`) | `%PROGRAMDATA%\roomler\roomler\config.toml` does not open, and the SYSTEM profile holds an enrollment of its own (`roomlerd enroll` run as SYSTEM without `--machine-global`) | step 2, if the machine's enrollment belongs at the machine location |
 | `supervisor: worker has failed N times in a row` after a reboot, never recovering | machine-global config missing | step 2 |
 | `enroll --machine-global` → "requires elevated terminal" | not running as admin | re-open PowerShell as Administrator |
-| Worker starts post-logon but crash-loops pre-logon | self-heal hasn't run yet (needs one ≥5 min healthy logged-in run) OR use step 2b directly | step 2a wait, or step 2b explicit |
-| `config: machine-global self-heal withheld: the device keys (peer-auth) could not be copied` | the machine-global `peer-auth\` folder is not writable by the worker | fix the DACL (step 3); the self-heal retries after the next healthy run |
-| `config: the machine-global config cannot be read, so this SystemContext worker falls back` | the machine-global folder shuts SYSTEM out (#3073) | fix the DACL (step 3). Until then the worker runs on the person's config and signs with its device keys |
-| Browsers say `key-changed` after the move, and the log has `peer-auth: made this enrollment's device key` | the config was promoted without its `peer-auth\` (before #3096), and nobody was signed in at its first start, so there was no person's config to take the key from | the device's identity did not change. Its owner either trusts the new key in the viewer, or puts the old key file back from the person's `peer-auth\` |
+| `supervisor: SystemContext is on, but SYSTEM can open no machine enrollment`; the device is reachable only while someone is signed in | no machine config that SYSTEM can open, so the service runs the signed-in person's own enrollment as that person (step 2a) | step 2b or 2c; when the file is there, the #3073 repair under step 3 |
+| `config: the machine-global config cannot be read, so this SystemContext worker cannot run it` | the machine-global folder shuts SYSTEM out (#3073) | the repair under step 3. Until then the service runs the signed-in person's own enrollment as that person (step 2a) |
+| Browsers say `key-changed` after a move to the machine location, and the log has `peer-auth: made this enrollment's device key` | the enrollment arrived without its `peer-auth\` folder (step 2c), or with keys this build cannot read | the device's identity did not change. Its owner either trusts the new key in the viewer, or puts the old key files back from the person's `peer-auth\` and restarts the service |
 | `Users` appears in `icacls` output | rc.52 dir-DACL wasn't applied (typical for auto-update path) | run the manual `icacls` from step 3 |
 | `crash_recorder: malformed sidecar moved aside` (once) | a crash sidecar torn by a power loss or OS crash, usually NUL-filled (#2955). It now sits in `crashes\malformed\`; the crash it described is lost | nothing to fix; read the file there if the crash matters |
 | `crash_recorder: suppressed sidecar write … reason=HardCapReached` flooding the log | `%PROGRAMDATA%\roomler\roomler\crashes\` filled up (100 file cap) while crash-looping; uploader can't drain because worker never starts | step 2 first (fixes the loop), then `Remove-Item C:\ProgramData\roomler\roomler\crashes\*.json` to clear the backlog |

@@ -741,11 +741,14 @@ pub enum SpawnDecision {
 ///   SystemContext while the controller is around.
 /// * `keep_stream_alive` — named for its M3 meaning, "a controller is
 ///   connected to *some* worker on this host". ⚠️ Since 0.3.0-rc.7 the
-///   supervisor loop passes `peer_presence_is_signaled()`, which is
-///   `ROOMLERD_ENABLE_SYSTEM_SWAP` and nothing else. So in production a
-///   SystemContext-mode host is SYSTEM from cold start, an attended host
-///   stays user-context, and the "swap" rows below never fire because a
-///   controller connected.
+///   supervisor loop passes `ROOMLERD_ENABLE_SYSTEM_SWAP`
+///   (`peer_presence_is_signaled()`), and since #3387 only while a SYSTEM
+///   worker runs or SYSTEM can open a machine enrollment
+///   ([`want_system_worker`]). So in production a SystemContext-mode host is
+///   SYSTEM from cold start once the machine is enrolled, runs the person's
+///   own enrollment as the person until then, and swaps up when the machine
+///   enrollment appears; an attended host stays user-context. The "swap"
+///   rows below never fire because a controller connected.
 /// * `last_active_session` — most recent `Some(active)` the
 ///   supervisor observed. Used only by the `(None, _) if
 ///   keep_stream_alive` branch as the target session id for the
@@ -915,6 +918,64 @@ fn system_swap_enabled() -> bool {
                 || t.eq_ignore_ascii_case("on")
         }
         None => false,
+    }
+}
+
+/// #3387 — whether the worker should be the SYSTEM one: SystemContext mode is
+/// on (`sc_mode`), and a SYSTEM worker already runs or SYSTEM can open an
+/// enrollment a SystemContext worker runs (`opens`, [`sc_config_opens`]).
+///
+/// A SystemContext worker runs the machine's own enrollment and nothing else
+/// (`app.rs`, `pick_config_path`). Until the machine has one that SYSTEM can
+/// open, the signed-in person's own enrollment runs AS THAT PERSON, on the
+/// user-context arm the attended role uses, and the host swaps up at the
+/// first tick after one opens (`decide_spawn`'s swap-up row).
+///
+/// Asymmetric on purpose. A running SYSTEM worker is never swapped down by the
+/// check, and `opens` is not even called for it: a healthy device opens no file
+/// a tick, and a read that fails for a moment can never end a live session.
+/// With no worker, `opens` picks the arm.
+pub(crate) fn want_system_worker(
+    sc_mode: bool,
+    current_is_system_context: bool,
+    opens: impl FnOnce() -> bool,
+) -> bool {
+    sc_mode && (current_is_system_context || opens())
+}
+
+/// #3387 — SYSTEM can open, for reading, an enrollment a SystemContext worker
+/// runs: the machine config, or the SYSTEM profile's own. The two rungs the
+/// worker's ladder takes, through the same resolvers, read by the same account
+/// (this host is LocalSystem), so the host and the worker cannot disagree.
+fn sc_config_opens() -> bool {
+    let machine = crate::config::machine_global_config_path();
+    let profile = crate::config::default_config_path().ok();
+    config_opens(std::iter::once(machine).chain(profile))
+}
+
+/// #3387 — any of `paths` opens for reading. An open, not `exists()`: a file in
+/// a folder that refuses SYSTEM (#3073) lists, and does not open.
+fn config_opens(paths: impl IntoIterator<Item = PathBuf>) -> bool {
+    paths.into_iter().any(|p| std::fs::File::open(&p).is_ok())
+}
+
+/// #3387 — whether the user-context arm spawns with the elevated linked token
+/// (rc.206, `ROOMLERD_ELEVATE_WORKER`). Not while SystemContext waits for a
+/// machine enrollment: that worker runs the person's own config, which their
+/// unelevated processes can write, so it runs with their standard rights.
+fn user_arm_elevates(elevation_requested: bool, waiting: bool) -> bool {
+    elevation_requested && !waiting
+}
+
+/// #3387 — the flag the host adds to a worker it starts on the user-context
+/// arm while SystemContext waits for a machine enrollment
+/// (`win_service::note_system_context_waiting` on the worker's side), and
+/// nothing otherwise.
+pub fn system_context_waiting_args(waiting: bool) -> Vec<String> {
+    if waiting {
+        vec!["--system-context-waiting".to_string()]
+    } else {
+        Vec::new()
     }
 }
 
@@ -1633,8 +1694,30 @@ pub fn run(
         if let Some(s) = active {
             last_active_session = Some(s);
         }
-        let keep_stream_alive = peer_presence_is_signaled();
+        // #3387 — and a SystemContext-mode host runs the SYSTEM worker only
+        // while SYSTEM can open a machine enrollment: until then the person's
+        // own enrollment runs as that person (`want_system_worker`).
+        let current_is_system_context = current.as_ref().is_some_and(|w| w.is_system_context);
+        let sc_mode = peer_presence_is_signaled();
+        let keep_stream_alive =
+            want_system_worker(sc_mode, current_is_system_context, sc_config_opens);
+        let system_context_waiting = sc_mode && !keep_stream_alive;
         if last_logged_keep_stream_alive != Some(keep_stream_alive) {
+            if system_context_waiting {
+                tracing::warn!(
+                    "supervisor: SystemContext is on, but SYSTEM can open no machine enrollment: \
+                     the signed-in person's own enrollment runs as that person until one is \
+                     written (the setup wizard, or `roomlerd enroll --machine-global`)"
+                );
+            } else if sc_mode && last_logged_keep_stream_alive == Some(false) {
+                // A machine enrollment opens now. A backoff the person's worker
+                // earned (one with no enrollment of its own exits at once)
+                // says nothing about the SYSTEM worker, which starts now.
+                tracing::info!(
+                    "supervisor: SYSTEM can open a machine enrollment; the SYSTEM worker runs it"
+                );
+                respawn_at = None;
+            }
             // Log on transitions only — at info level so it shows up
             // in production logs without raising the bar to debug.
             // Carry the marker snapshot's metadata so a "no swap
@@ -1665,7 +1748,7 @@ pub fn run(
         let decision = decide_spawn(
             active,
             current.as_ref().map(|w| w.session),
-            current.as_ref().is_some_and(|w| w.is_system_context),
+            current_is_system_context,
             keep_stream_alive,
             last_active_session,
         );
@@ -1685,7 +1768,14 @@ pub fn run(
                         // (no regression). `elevated` (when Some) owns the
                         // duplicated primary token and MUST outlive the
                         // spawn call below — hence the outer binding.
-                        let elevated = if worker_elevation_requested() {
+                        //
+                        // #3387 — never while SystemContext waits for a
+                        // machine enrollment: this worker then runs the
+                        // person's own config with their standard rights.
+                        let elevated = if user_arm_elevates(
+                            worker_elevation_requested(),
+                            system_context_waiting,
+                        ) {
                             // SAFETY: `token.raw()` is a live user token
                             // from WTSQueryUserToken, valid for this scope.
                             match unsafe { elevated_primary_token(token.raw()) } {
@@ -1723,11 +1813,15 @@ pub fn run(
                         let pin_args = super::gpu_pin_relay::worker_args();
                         // #3289 — what this host saw of the last worker's end.
                         let end_args = prior_end_args(prior_end);
+                        // #3387 — that this worker runs the person's own
+                        // enrollment while SystemContext waits.
+                        let wait_args = system_context_waiting_args(system_context_waiting);
                         let mut spawn_args: Vec<&str> = args_borrow.clone();
                         spawn_args.extend(ev_args.iter().map(String::as_str));
                         spawn_args.extend(sas_args.iter().map(String::as_str));
                         spawn_args.extend(pin_args.iter().map(String::as_str));
                         spawn_args.extend(end_args.iter().map(String::as_str));
+                        spawn_args.extend(wait_args.iter().map(String::as_str));
                         // SAFETY: `spawn_handle` is a live primary/user
                         // token — either the WTSQueryUserToken result or
                         // its duplicated elevated linked token; both
@@ -1739,6 +1833,7 @@ pub fn run(
                                     pid = p.pid,
                                     session_id = sid,
                                     elevated = is_elevated,
+                                    system_context_waiting,
                                     "supervisor: spawned worker"
                                 );
                                 current = Some(ActiveWorker {
@@ -2941,6 +3036,118 @@ mod tests {
                 "{v:?} must disable elevation (kill-switch)"
             );
         }
+    }
+
+    /// #3387 — SystemContext mode is the switch: off, the worker is never the
+    /// SYSTEM one, whatever runs and whatever opens.
+    #[test]
+    fn want_system_worker_is_off_without_system_context() {
+        for current in [false, true] {
+            for opens in [false, true] {
+                assert!(
+                    !want_system_worker(false, current, || opens),
+                    "current_is_system_context={current} opens={opens}"
+                );
+            }
+        }
+    }
+
+    /// #3387 — a running SYSTEM worker is never swapped down by the check, and
+    /// a healthy device opens no file for it: a read that fails for a moment
+    /// can never end a live session.
+    #[test]
+    fn want_system_worker_never_swaps_a_running_system_worker_down() {
+        let mut opened = false;
+        assert!(want_system_worker(true, true, || {
+            opened = true;
+            false
+        }));
+        assert!(!opened, "a running SYSTEM worker costs no file open a tick");
+    }
+
+    /// #3387 — with no SYSTEM worker running, SystemContext starts one only
+    /// while SYSTEM can open the machine's own enrollment. Until then the
+    /// person's own enrollment runs as that person, on the user-context arm.
+    #[test]
+    fn want_system_worker_runs_the_persons_enrollment_as_the_person_until_the_machine_has_one() {
+        assert!(!want_system_worker(true, false, || false));
+        assert!(want_system_worker(true, false, || true));
+    }
+
+    /// #3387 — the same decision as the loop takes it, through `decide_spawn`.
+    #[test]
+    fn want_system_worker_drives_decide_spawn() {
+        // A fresh machine-wide install, nothing the machine can open yet: the
+        // user-context arm, as the person.
+        let want = want_system_worker(true, false, || false);
+        assert_eq!(
+            decide_spawn(Some(2), None, false, want, Some(2)),
+            SpawnDecision::SpawnIn(2)
+        );
+        // The machine enrollment is written while the person's worker runs:
+        // swapped up at the next tick.
+        let want = want_system_worker(true, false, || true);
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), false, want, Some(2)),
+            SpawnDecision::SpawnSystemInSession(2)
+        );
+        // A SYSTEM worker whose config stops opening keeps running.
+        let want = want_system_worker(true, true, || false);
+        assert_eq!(
+            decide_spawn(Some(2), Some(2), true, want, Some(2)),
+            SpawnDecision::KeepCurrent
+        );
+        // Nobody signed in, and no machine enrollment: nothing runs.
+        let want = want_system_worker(true, false, || false);
+        assert_eq!(
+            decide_spawn(None, None, false, want, Some(2)),
+            SpawnDecision::Idle
+        );
+    }
+
+    /// #3387 — `exists()` reads a file SYSTEM may not open as present, so a
+    /// machine config sealed against SYSTEM (#3073) would have the host start a
+    /// SYSTEM worker that cannot load it. The check opens the file, as the
+    /// worker will.
+    #[test]
+    fn sc_config_opens_reads_a_sealed_file_as_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sealed = dir.path().join("config.toml");
+        std::fs::write(&sealed, "x").expect("write");
+        let open = dir.path().join("open.toml");
+        std::fs::write(&open, "x").expect("write");
+        let icacls = |args: &[&str]| {
+            let out = std::process::Command::new(crate::appdirs::system32_tool("icacls.exe"))
+                .arg(&sealed)
+                .args(args)
+                .output()
+                .expect("icacls runs");
+            assert!(out.status.success(), "icacls {args:?}: {out:?}");
+        };
+        // Everyone is refused the file's data. Its owner, this runner, keeps
+        // the right to give it back.
+        icacls(&["/deny", "*S-1-1-0:(RD)"]);
+        let lists = sealed.exists();
+        let opens = config_opens([sealed.clone()]);
+        let one_of_two = config_opens([sealed.clone(), open.clone()]);
+        let absent = config_opens([dir.path().join("absent.toml")]);
+        icacls(&["/reset"]);
+        assert!(lists, "the sealed file lists");
+        assert!(!opens, "and does not open");
+        assert!(one_of_two, "one enrollment that opens is enough");
+        assert!(!absent);
+    }
+
+    /// #3387 — the user-context arm runs a person-writable config, so while
+    /// SystemContext waits for a machine enrollment it runs it with the
+    /// person's own standard rights: never the elevated linked token that
+    /// rc.206 gives an attended administrator's worker.
+    #[test]
+    fn the_waiting_user_arm_spawns_with_the_filtered_token() {
+        assert!(!user_arm_elevates(true, true));
+        assert!(!user_arm_elevates(false, true));
+        assert!(user_arm_elevates(true, false), "attended: rc.206 unchanged");
+        assert!(!user_arm_elevates(false, false), "the kill switch");
     }
 
     #[test]

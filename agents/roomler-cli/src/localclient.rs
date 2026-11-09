@@ -2477,6 +2477,11 @@ pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
     format!("policy {}{source} — {state}{lid}", p.policy)
 }
 
+/// #3387 — `roomler status`'s line for [`NodeStatus::waiting_for_machine_enrollment`].
+const WAITING_FOR_MACHINE_ENROLLMENT: &str = "no machine enrollment yet: the Roomler service \
+     runs this person's own enrollment as them, so the lock and sign-in screens cannot be \
+     controlled. Run Roomler Setup, or `roomlerd enroll --machine-global` from an elevated prompt";
+
 fn print_status(s: &NodeStatus) {
     let mode = mode_label(s.mode, s.privileged);
     println!("{} {}", up_glyph(s.connected), s.name);
@@ -2493,6 +2498,12 @@ fn print_status(s: &NodeStatus) {
         );
     }
     println!("  mode        {mode}");
+    // #3387 — only from the person's own worker that a machine-wide service
+    // runs while the machine has no enrollment of its own: every other
+    // daemon's output stays byte-stable.
+    if s.waiting_for_machine_enrollment {
+        println!("  machine     {WAITING_FOR_MACHINE_ENROLLMENT}");
+    }
     // FR-51 — only when true: a permanent device's output stays byte-stable.
     if s.ephemeral {
         println!("  ephemeral   yes — removes itself after inactivity, or on clean stop");

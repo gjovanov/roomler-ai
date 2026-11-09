@@ -234,6 +234,15 @@ pub struct NodeStatus {
     /// Additive; absent from older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
+    /// #3387 — this daemon is the signed-in person's own worker, which a
+    /// machine-wide Windows service with SystemContext on runs as that person
+    /// while the machine has no enrollment SYSTEM can open. Until Setup or
+    /// `roomlerd enroll --machine-global` writes one, the lock and sign-in
+    /// screens cannot be controlled. Additive both ways: a daemon that is not
+    /// waiting, or predates the field, omits it (⇒ false); an older CLI
+    /// ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_machine_enrollment: bool,
     /// S2 — MagicDNS status, copied verbatim from [`OverlayView::dns`].
     /// `None` when the overlay is off, MagicDNS is off for the tenant, or
     /// the daemon predates the field.
@@ -5942,6 +5951,7 @@ mod tests {
                 route_offer_withheld: None,
                 host_firewall: None,
                 config_path: None,
+                waiting_for_machine_enrollment: false,
                 dns: None,
                 srflx: None,
                 warm_relay: None,
@@ -7457,6 +7467,34 @@ mod tests {
     /// no account rather than guessing one. `None` is never written. Both
     /// values round-trip with `mode` untouched, because a per-user daemon is
     /// still a `Service` node.
+    /// #3387 — `waiting_for_machine_enrollment` is additive: absent from an
+    /// older daemon and from one that is not waiting (its JSON is unchanged),
+    /// and round-tripped when a machine-wide service runs the person's own
+    /// enrollment as the person.
+    #[test]
+    fn waiting_for_machine_enrollment_is_additive() {
+        let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;
+        let st: NodeStatus = serde_json::from_str(old).unwrap();
+        assert!(!st.waiting_for_machine_enrollment);
+        assert!(
+            !serde_json::to_string(&st)
+                .unwrap()
+                .contains("waiting_for_machine_enrollment")
+        );
+        let waiting = NodeStatus {
+            privileged: Some(false),
+            waiting_for_machine_enrollment: true,
+            ..st
+        };
+        let wire = serde_json::to_string(&waiting).unwrap();
+        assert!(
+            wire.contains(r#""waiting_for_machine_enrollment":true"#),
+            "{wire}"
+        );
+        let back: NodeStatus = serde_json::from_str(&wire).unwrap();
+        assert!(back.waiting_for_machine_enrollment);
+    }
+
     #[test]
     fn privileged_is_additive_and_independent_of_mode() {
         let old = r#"{"node_id":"n","name":"h","version":"v","mode":"service","connected":true}"#;

@@ -304,7 +304,7 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:197`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2931`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2934`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:557`).
@@ -342,7 +342,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9557`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9560`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -366,7 +366,7 @@ sessions back to code the device already ran, or clears the list back to the
 built-in defaults, and never further, because nothing pushed can turn a path's new
 code on ahead of its default. The server checks the value's shape and refuses a
 spelling no device could read with a 400 (`check_media_path_list`,
-`crates/remote_control/src/models.rs:2955`, called at
+`crates/remote_control/src/models.rs:2958`, called at
 `crates/modules/fleet/src/remote_config.rs:279`), so `media-plan` or `Media_Plan`
 never reads as applied while doing nothing. It does not check the names, which
 belong to the device's build: it stores the value as given
@@ -628,7 +628,7 @@ which the daemon still refuses on the same terms as a local request.
    install does not have). Design A (the operator, 2026-10-25) admits two: the
    listing, and `ConfigSet` of exactly the keys that are the console person's
    own call — the table `localapi::CONSOLE_PERSON_KEYS`
-   (`crates/localapi/src/lib.rs:3156`): where incoming files land, whether a
+   (`crates/localapi/src/lib.rs:3165`): where incoming files land, whether a
    controller may record, keep busy, privacy mode, lock on end, display match,
    the browser check, what a session may use, external access. Where
    recordings are saved stays root's on a root-mode install, pending a check
@@ -642,11 +642,11 @@ which the daemon still refuses on the same terms as a local request.
    instead of another daemon's — on a two-half Mac the machine-side rows come
    from the root half and the session rows from the worker
    (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`;
-   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:635`; the table
+   `merge_two_halves`, `agents/roomler-desktop/src/commands.rs:636`; the table
    in [desktop-companion.md](desktop-companion.md) §5) — and a daemon older
    than design A, which still refuses the listing, gets the administrator's
    path in place of rows (`root_daemon_only`,
-   `agents/roomler-desktop/src/commands.rs:1053`). Whether the person at the
+   `agents/roomler-desktop/src/commands.rs:1054`). Whether the person at the
    seat may switch gate 4 on a root-mode install — Windows' pipe lets every
    interactive user — is the policy call still open on #2871.
 

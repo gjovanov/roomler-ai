@@ -6877,6 +6877,11 @@ fn stub_caps(multi_org_tun: bool, is_primary: bool) -> AgentCaps {
         Err(refusal) => {
             if let Some(entry) = caps.unavailable.get_mut("sas") {
                 entry.reason = refusal.reason().into();
+                // #3387 — `no-machine-enrollment` on a service that waits for
+                // a machine enrollment: what a server read finds it by.
+                if let Some(code) = refusal.code() {
+                    entry.code = code.into();
+                }
             }
         }
     }
