@@ -950,7 +950,7 @@ pub(crate) fn want_system_worker(
 fn sc_config_opens() -> bool {
     use roomler_node_core::machine_tree::{MachineTree, Switches};
     let profile = crate::config::default_config_path().ok();
-    config_opens_in(&MachineTree::here(), Switches::ON, profile)
+    config_opens_in(&MachineTree::here(), Switches::from_env(), profile)
 }
 
 /// #3609 — the host's question over `tree`: does any rung open.
@@ -963,13 +963,34 @@ pub(crate) fn config_opens_in(
         || profile.is_some_and(|p| rung_opens(tree, switches, &p))
 }
 
-/// #3609 — one rung of the SystemContext ladder. RED: master's read open.
+/// #3609 — one rung of the SystemContext ladder, the ONE function the host
+/// ([`sc_config_opens`]) and the worker's ladder (`app.rs`,
+/// `resolve_config_path`) read it with, so they cannot disagree. The machine
+/// config is taken only through `machine_tree::private_machine_config`: the
+/// chain repaired first, then checked. The SYSTEM profile's own config is a
+/// read open, as before: only SYSTEM and Administrators may write that profile.
+pub(crate) fn rung(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
+    path: &std::path::Path,
+) -> Result<(), roomler_node_core::machine_tree::Refusal> {
+    use roomler_node_core::machine_tree::{Refusal, private_machine_config};
+    if path == tree.config() {
+        private_machine_config(tree, switches)
+    } else if config_opens(std::iter::once(path.to_path_buf())) {
+        Ok(())
+    } else {
+        Err(Refusal::Absent)
+    }
+}
+
+/// [`rung`] as a yes or no.
 pub(crate) fn rung_opens(
-    _tree: &roomler_node_core::machine_tree::MachineTree,
-    _switches: roomler_node_core::machine_tree::Switches,
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
     path: &std::path::Path,
 ) -> bool {
-    config_opens(std::iter::once(path.to_path_buf()))
+    rung(tree, switches, path).is_ok()
 }
 
 /// #3387 — any of `paths` opens for reading. An open, not `exists()`: a file in

@@ -1128,6 +1128,13 @@ fn pick_config_path(
     default.to_path_buf()
 }
 
+/// #3609 — why the SystemContext ladder named the machine config although it
+/// failed the machine tree's check, set once by [`resolve_config_path`]. A
+/// SYSTEM worker (`Run`) refuses to load the config while this holds a
+/// reason; every other command runs as before.
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+static MACHINE_CONFIG_REFUSED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Resolve the config path by wiring [`pick_config_path`] to the real
 /// environment: the worker-role probe, the candidate paths, and a read open.
 /// Logs the chosen path so a "wrong config" or "config not found"
@@ -1153,17 +1160,34 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
                  worker cannot run it"
             );
         }
-        // A read open, as the service host's check (`sc_config_opens`): a file
-        // in a folder that refuses SYSTEM lists, and does not open.
+        // The service host's own question (`sc_config_opens`), through the
+        // same function: a read open for the SYSTEM profile's config (a file
+        // in a folder that refuses SYSTEM lists, and does not open), and for
+        // the machine config #3609's repair, then its check. The SYSTEM
+        // worker never runs a machine config that fails it: the last rung
+        // still names the machine path, and `Run` refuses to load it then.
         let tree = roomler_node_core::machine_tree::MachineTree::here();
-        let switches = roomler_node_core::machine_tree::Switches::ON;
+        let switches = roomler_node_core::machine_tree::Switches::from_env();
+        let refused = std::cell::RefCell::new(None);
         let chosen = pick_config_path(
             explicit,
             is_sc,
             Some(machine_global.as_path()),
             &default,
-            |p| roomlerd::win_service::supervisor::rung_opens(&tree, switches, p),
+            |p| match roomlerd::win_service::supervisor::rung(&tree, switches, p) {
+                Ok(()) => true,
+                Err(roomler_node_core::machine_tree::Refusal::NotPrivate(why)) => {
+                    *refused.borrow_mut() = Some(why);
+                    false
+                }
+                Err(roomler_node_core::machine_tree::Refusal::Absent) => false,
+            },
         );
+        if chosen == machine_global
+            && let Some(why) = refused.into_inner()
+        {
+            let _ = MACHINE_CONFIG_REFUSED.set(why);
+        }
         tracing::info!(
             config_path = %chosen.display(),
             is_system_context = is_sc,
@@ -1694,6 +1718,18 @@ async fn daemon_main() -> Result<()> {
             }
             #[cfg(not(target_os = "windows"))]
             let _ = gpu_pin_event;
+            // #3609 — a SYSTEM worker loads the machine config only while it
+            // passes the machine tree's check. The host asks the same question
+            // before it starts one, so this answers only a tree that changed
+            // in between; the host then runs the device as one with no machine
+            // enrollment.
+            #[cfg(all(feature = "system-context", target_os = "windows"))]
+            if let Some(why) = MACHINE_CONFIG_REFUSED.get() {
+                bail!(
+                    "the machine config at {} is not run as SYSTEM: {why}",
+                    config_path.display()
+                );
+            }
             run_cmd(
                 &config_path,
                 encoder.as_deref(),
@@ -5900,12 +5936,14 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 /// product's own record of the last switch.
 ///
 /// An unreadable record reads as "off": that is what an install with no
-/// property always did, so no host is worse off than before.
+/// property always did, so no host is worse off than before. #3609 — the
+/// record's folder is repaired first, and a record that SYSTEM and
+/// Administrators are not alone to change reads as unreadable, so as off.
 #[cfg(target_os = "windows")]
 fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
     use roomlerd::win_service::system_context_attempt as attempt;
 
-    let last = attempt::read_last().unwrap_or_else(|e| {
+    let last = attempt::read_last_private().unwrap_or_else(|e| {
         eprintln!(
             "keep-system-context: cannot read {} ({e}); treating it as off",
             attempt::path().display()

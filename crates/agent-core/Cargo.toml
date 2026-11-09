@@ -64,8 +64,17 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # #3609 — the machine tree reads the computer's account domain
+    # (LsaQueryInformationPolicy) to tell its own accounts apart.
+    "Win32_Security_Authentication_Identity",
     "Win32_Security_Authorization",
+    # #3609 — the machine tree opens each entry by handle, never through a link
+    # (FILE_FLAG_OPEN_REPARSE_POINT).
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    # #3609 — netapi32 from System32 at run time (LoadLibraryExW), never a
+    # static import into the setup wizard's EXE.
+    "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
 ] }

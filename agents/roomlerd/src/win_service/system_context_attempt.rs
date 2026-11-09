@@ -165,15 +165,32 @@ pub fn record(attempt: &Attempt) -> std::io::Result<()> {
 /// Explicit-path variant of [`record`] used by unit tests so they
 /// don't have to mutate `PROGRAMDATA` (which races across parallel
 /// test threads).
+///
+/// #3609 — the temp file is one this writer made: a file left under its name
+/// is removed first and `create_new` refuses one that appears, because a write
+/// into it would keep that file's owner and DACL and the rename would make it
+/// the record. Before it takes the name it is given Administrators as its
+/// owner and SYSTEM and Administrators alone as its DACL, through its handle;
+/// a caller that may not (not SYSTEM, not elevated) leaves the DACL its folder
+/// hands down, and the next repair does the rest.
 pub fn record_at(target: &std::path::Path, attempt: &Attempt) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = target.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(attempt)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, target)?;
+    let mut file = roomler_node_core::machine_tree::create_fresh(&tmp)?;
+    let written = file.write_all(&json).and_then(|()| file.sync_all());
+    if written.is_ok() {
+        let _ = roomler_node_core::machine_tree::seal_new_file(&file);
+    }
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, target)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -185,8 +202,16 @@ pub fn read_last() -> std::io::Result<Option<Attempt>> {
     read_last_at(&path())
 }
 
-/// #3609 — `keep-system-context`'s read of the record under `tree`. RED:
-/// master reads whatever is there.
+/// #3609 — what `keep-system-context` decides by: the record under this
+/// computer's `%ProgramData%\roomler`, repaired first and read only while it
+/// is private (`machine_tree::read_record`). A record that is not reads as an
+/// error, which the command takes as off, as it does an unreadable one.
+pub fn read_last_private() -> std::io::Result<Option<Attempt>> {
+    use roomler_node_core::machine_tree::{MachineTree, Switches};
+    read_last_private_in(&MachineTree::here(), Switches::from_env())
+}
+
+/// [`read_last_private`] over `tree`, with the switches given.
 pub fn read_last_private_in(
     tree: &roomler_node_core::machine_tree::MachineTree,
     switches: roomler_node_core::machine_tree::Switches,
