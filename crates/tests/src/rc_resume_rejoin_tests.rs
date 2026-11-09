@@ -500,6 +500,51 @@ async fn a_held_session_never_costs_its_own_viewer_the_orgs_slot() {
     assert_eq!(end_reason(&r), Some("controller_hangup"), "{r}");
 }
 
+/// P1b-1's review, C1 — a session a device's claim rebuilt waits for its
+/// viewer with NO controller, and another person's request to the device
+/// spares it: on a device that allows two sessions the request gets the
+/// second place, and on one that allows one it is refused busy. Before
+/// P1b-2 the orphan reap read a missing controller as a dead one and ended
+/// the resumed session at the next request to its device.
+#[tokio::test]
+async fn a_resumed_session_is_spared_against_another_persons_request() {
+    let (app1, app2) = pair_uncapped(WINDOW).await;
+    let seeded = app1.seed_tenant("fr138spare").await;
+    scope_all(&app1).await;
+    give_member(&app1, &seeded, "controller", REMOTE_CONTROL).await;
+    for max in [2u8, 1] {
+        let (agent_id, token) = enroll(&app1, &seeded, &format!("fr138-spare-{max}")).await;
+        let mut agent = hello_with(&app1, &token, &[RESUME], &[], max).await;
+        let (_ctl, sid, _) =
+            live_session(&app1, &seeded.admin.access_token, agent_id, &mut agent).await;
+        wait_row(&app1, sid, "the session goes live", open).await;
+        drop_socket(agent).await;
+        wait_row(&app1, sid, "the row records the detach", detached).await;
+        let mut agent2 = hello_with(&app2, &token, &[RESUME], &[sid], max).await;
+        let claim = answer_for(&mut agent2, sid, WITHIN)
+            .await
+            .expect("the claim is answered");
+        assert_eq!(claim["t"], "rc:session.resumed", "{max}: {claim}");
+
+        let mut other = controller(&app2, &seeded.member.access_token).await;
+        let answer = request(&mut other, agent_id, None).await;
+        if max == 1 {
+            assert_eq!(answer["code"], "agent_busy", "{max}: {answer}");
+        } else {
+            assert_eq!(answer["t"], "rc:session.created", "{max}: {answer}");
+        }
+        assert!(
+            answer_for(&mut agent2, sid, QUIET).await.is_none(),
+            "{max}: the device is not told to end the resumed session"
+        );
+        assert!(
+            app2.state.fleet().rc_hub.session_snapshot(sid).is_some(),
+            "{max}: the resumed session stands"
+        );
+        assert!(open(&row(&app2, sid).await), "{max}: its row stays open");
+    }
+}
+
 /// AC4 — the controller's own end, issued while no pod holds the session, is
 /// written to the row (conditional on the row naming that person: another
 /// person's end of it writes nothing), and the device's claim on the other
@@ -566,9 +611,10 @@ async fn a_controllers_end_during_the_gap_is_enforced_at_the_claim() {
 /// neither, so the registration read ends both as an inferred
 /// `agent_disconnect`. The device's own `rc:terminate` for each, sent after
 /// its hello, then REPLACES the inferred reason: `host_disconnect` and
-/// `idle_timeout`. Each keeps its inferred `ended_at` (the row's own last
-/// clock, the detach) and its `end_source`. A third session an admin ended
-/// during the gap keeps the admin's end, whatever the device then says.
+/// `idle_timeout`. Each is now an end that was seen, so its `end_source` is
+/// cleared, and it keeps its `ended_at` at the row's own last clock, the
+/// detach: the frame carries no time. A third session an admin ended during
+/// the gap keeps the admin's end, whatever the device then says.
 #[tokio::test]
 async fn a_device_reported_end_after_its_hello_replaces_the_inferred_one() {
     // Three sessions of one org: no org cap.
@@ -623,10 +669,9 @@ async fn a_device_reported_end_after_its_hello_replaces_the_inferred_one() {
         })
         .await;
         assert_eq!(r.get_str("phase"), Ok("closed"), "{r}");
-        assert_eq!(
-            r.get_str("end_source"),
-            Ok("registration"),
-            "the time is still the inference's: {r}"
+        assert!(
+            !r.contains_key("end_source"),
+            "the device saw the end, so it is no longer inferred: {r}"
         );
         assert_eq!(
             r.get_datetime("ended_at").unwrap(),
