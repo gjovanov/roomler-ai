@@ -14,8 +14,8 @@ the peer, the server keeps the row, and both ends claim the same session again o
 server decides at that claim whether the session may go on. A kick or a revoke issued during the gap ends the
 session at the reconnect, and never later than the window.
 
-**What it costs**: three sides change (agent, server, viewer), each behind a switch that is off by default, and
-FR-28's three constraints each get a mechanism (§3). Four decisions: the window (D1), what the session may do
+**What it costs**: three sides change (agent, server, viewer) behind two switches that are off by default, the
+server's window, which the viewer follows, and the agent's own. FR-28's three constraints each get a mechanism (§3). Four decisions: the window (D1), what the session may do
 during the gap (D2), external sessions (D3), and how the agent's default flips (D4).
 
 ## 1. Goal
@@ -175,8 +175,8 @@ it to the docs phase.
 | The row | stays Active, with `detached_at` and `resume_by` | until resumed, ended, or swept past `resume_by` |
 | Anything in the dying pod's memory | no | — |
 
-**The window** is the server's: `ROOMLER__RC__SESSION_RESUME_SECS`, 60 by default once on (D1), announced to each
-capable agent on its connection. The agent caps it at 120 s whatever the server says, so a wrong setting cannot keep
+**The window** is the server's: `ROOMLER__RC__SESSION_RESUME_SECS`, 0 (off) until P3 sets it to what D1 picks (60 s
+recommended), announced to each capable agent on its connection. The agent caps it at 120 s whatever the server says, so a wrong setting cannot keep
 a peer for an hour. A peer is kept only when three things hold: the agent's switch is on, the server it last spoke to
 announced a window, and the session was live.
 
