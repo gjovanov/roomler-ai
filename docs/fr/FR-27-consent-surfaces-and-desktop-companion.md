@@ -72,7 +72,7 @@ Every line below was read on `origin/master` at `861d4557`.
    The hub gives every owner-side mode `ASYNC_CONSENT_TIMEOUT` (300 s) and the
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
-   built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:1928` (the per-mode window),
+   built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:2025` (the per-mode window),
    `models.rs:1336` (the doc-comment on the `PromptThenEmail` variant at `:1346`),
    `consent_consumer.rs:207` (the email leg; it was `state.rs:1199`)
 

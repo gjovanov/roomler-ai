@@ -180,7 +180,7 @@ A bar reads in `gates` (`extauth.rs:396`), so it holds at `start`, at `finish` a
 `session`, and a login in flight dies with the rest. ⚠️ `standing` (`extauth.rs:447`)
 opens only on an answer it has seen: a read that fails refuses.
 
-`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2499`) ends what the person
+`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2636`) ends what the person
 opened **through an external login**. A session the same account holds as a member came
 through the other door, with gates of its own, and it stands (`LiveSession.external`).
 

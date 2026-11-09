@@ -235,12 +235,12 @@ device never gets an order recorded — the route refuses it 409 up front. The s
 appears when a device was ordered while offline and then connected without the verb
 (or whose build lost its overlay surface); the socket logs *"overlay-key rotation not
 ordered — this device's agent predates rc:agent.key_rotate"* and leaves the order
-standing (`fleet/src/socket.rs:384-388`).
+standing (`fleet/src/socket.rs:416-420`).
 
 ## Reconcile on connect — and the three races it must not re-run
 
 At agent register, where `ConfigPush` reconciles, a standing order is pushed again
-if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:285-301`,
+if the hello advertises `key-rotate` (`crates/modules/fleet/src/socket.rs:317-333`,
 `:362-370`) — the offline case, through the same path as the online one, so it runs
 on every connect rather than only when nobody is watching. Three field cycles on
 2026-08-30 each found a way for that to go wrong; each left a rule:
@@ -288,7 +288,7 @@ sequenceDiagram
 
 **The ledger** is per node: `overlay_nodes.retired_keys[]`, each entry
 `{ public_key, key_epoch, retired_at, reason }`, public halves only
-(`crates/remote_control/src/models.rs:3219`, `:6978`). It is written at one moment —
+(`crates/remote_control/src/models.rs:3219`, `:6997`). It is written at one moment —
 an **accepted join under a different key**, the verified identity change P1c made the
 proof — in the same write that installs the new key: a compare-and-set on
 `{_id, wg_public_key: <old>, retired_keys.public_key ≠ <old>}` that `$push`es the old key
@@ -340,7 +340,7 @@ under any other key satisfies the order (P1c and P1d hold unchanged). The frame 
 rotates.
 
 ⚠️ **The loop guard is the order already on the row** (`order_in_flight`,
-`models.rs:10508`). An order that is unsatisfied, unanswered, and delivered less than
+`models.rs:10527`). An order that is unsatisfied, unanswered, and delivered less than
 `REDELIVER_AFTER_SECS` (120 s) ago is being executed: a second retired-key join inside
 that window is refused and ordered nothing, with no second audit row. Past the window, the
 60 s ceiling bounds it. A device that refuses the order — its own switch off, say — is
@@ -432,11 +432,11 @@ The server cannot see the device switch, so a switched-off device is still order
 
 | piece | where |
 |---|---|
-| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:929`, `:1122`, `:1151`, test `:8257`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4805-4809` |
+| capability verb `key-rotate` (equality match, `ALL` entry, wire string locked) | `crates/remote_control/src/models.rs:929`, `:1122`, `:1151`, test `:8276`; advertised by any build with an overlay surface, `agents/roomlerd/src/encode/caps.rs:4805-4809` |
 | wire: `rc:agent.key_rotate` (order), `rc:agent.key_rotated` (report) | `crates/remote_control/src/signaling.rs:2810`, `:1020`; owner `network` (`:1997`, `modular-monolith.md`) |
-| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3106`, `:3140`, `:3165`, `:3196`, `:5557`, `:10473`, `:10488` |
+| models: request · outcome · report · identity · audit event · `order_is_satisfied` · `should_redeliver` | `models.rs:3106`, `:3140`, `:3165`, `:3196`, `:5557`, `:10492`, `:10507` |
 | route, `decide()`, the 409 bodies, the audit call site | `crates/modules/network/src/routes/overlay_key.rs` |
-| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:285-301`, `:366-387` |
+| reconcile-on-connect | `crates/modules/fleet/src/socket.rs:317-333`, `:398-419` |
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1091` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1056-1086` |
@@ -446,7 +446,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
 | kill switch · epoch | `crates/agent-core/src/config.rs:1075-1080`, `:1812-1817`, `:1942-1944`; `config_surface.rs:1258-1265` |
 | UI: action, dialog, chip, store | `ui/src/components/admin/AgentsSection.vue:178`, `:1290-1317`, `:2100-2201`; `ui/src/stores/agents.ts:1179-1193` |
-| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3219`, `:3237`, `:3959`, `:3207`, `:10508`, `:10770`; the node and network fields `:6978`, `:7220` |
+| P2 models: ledger entry · reason · the switch · `trigger` · `order_in_flight` · their tests | `crates/remote_control/src/models.rs:3219`, `:3237`, `:3959`, `:3207`, `:10527`, `:10789`; the node and network fields `:6997`, `:7239` |
 | P2 wire: `key_retired` | `crates/remote_control/src/signaling.rs:463`, `:478`, test `:7421` |
 | P2 join: the check · the refusal · the ledger write · detail · reason · the self-heal | `crates/modules/network/src/overlay.rs:378-420`, `:441-471`, `:790`, `:811`, `:860` |
 | P2 order path: `OrderedBy` · `place_order` · the switch route | `crates/modules/network/src/routes/overlay_key.rs:114`, `:156`, `:353`, `:380`; nest `crates/modules/network/src/lib.rs:545`, `:603` |

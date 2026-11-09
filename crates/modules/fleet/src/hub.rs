@@ -372,6 +372,23 @@ pub struct ConnectedAgent {
     /// goes with the connection; ⚠️ it holds a live credential, so it is
     /// never logged or stored.
     pub local_relay: Option<LocalRelayDescriptor>,
+    /// FR-138 — the device advertises `rc-resume` on this connection: it can
+    /// read `rc:agent.resume_window`, the only frame an announce sends. An
+    /// older agent drops the unknown tag, so it is never sent one.
+    pub advertises_resume: bool,
+    /// FR-138 — the window, in seconds, announced to THIS connection
+    /// (`rc:agent.resume_window`): set at registration for a device that
+    /// advertises `rc-resume` and is in the resume scope while
+    /// `rc.session_resume_secs` is above 0. `Some` ⇒ the connection's loss
+    /// detaches its live sessions instead of ending them
+    /// ([`Hub::unregister_agent`]). Per CONNECTION, like every word above:
+    /// the next connection is announced its own, or none.
+    pub resume_window: Option<u32>,
+    /// FR-138 — the sessions this connection's hello claims back that are not
+    /// answered yet. Each holds a place in the device's capacity (the busy
+    /// gate counts it) from the registration until the claim is answered,
+    /// so a new request cannot slip into a slot a kept session holds.
+    pub pending_claims: Vec<ObjectId>,
 }
 
 /// #2267 — what a removal's kick did to the device's connection on this pod
@@ -925,6 +942,40 @@ impl Hub {
         // (see [`ConnectedAgent::supports_exec`]).
         supports_exec: bool,
     ) -> (ClientTx, Arc<AgentCancel>, mpsc::Receiver<ServerMsg>) {
+        let reg = self.register_agent_resuming(
+            agent_id,
+            tenant_id,
+            owner_user_id,
+            os,
+            max_sessions,
+            input_arbiter,
+            supports_exec,
+            ResumeHello::default(),
+        );
+        (reg.tx, reg.cancel, reg.rx)
+    }
+
+    /// FR-138 — [`Self::register_agent`], with what the hello said about
+    /// resuming: whether the device advertises `rc-resume`, the window this
+    /// connection is announced (`None`: none) and the sessions it claims back.
+    /// Each claim the window admits holds a place in the device's capacity
+    /// from here until it is answered, and is spared the in-memory reap
+    /// below: whether it goes on is the claim's to decide. With no window,
+    /// every claim is refused at once and the reap runs as it always has.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_agent_resuming(
+        &self,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+        os: OsKind,
+        max_sessions: u8,
+        input_arbiter: bool,
+        supports_exec: bool,
+        hello: ResumeHello,
+    ) -> Registration {
+        let resume_window = hello.window;
+        let (claims, refused) = resume::sort_claims(hello.window, hello.kept, max_sessions);
         let (tx, rx) = mpsc::channel(SERVER_TX_CAPACITY);
         let cancel = Arc::new(AgentCancel::default());
         let entry = ConnectedAgent {
@@ -990,7 +1041,16 @@ impl Hub {
             // FR-121 — set by `set_agent_local_relay` when the device reports
             // one; until then a browser naming it is told `device_offline`.
             local_relay: None,
+            // FR-138 — whether the device keeps its peers at all, the window
+            // this connection is announced, and the claims it holds a place
+            // for until they are answered.
+            advertises_resume: hello.advertised,
+            resume_window,
+            pending_claims: claims.clone(),
         };
+        // FR-138 — a row created before this instant belongs to an earlier
+        // connection: the registration read's line.
+        let registered_at = bson::DateTime::now();
         if let Some(prev) = self.inner.agents.insert(agent_id, entry) {
             // rc.53: don't just `drop(prev)` — that leaves the old WS
             // read-loop polling `socket_rx.next()` for up to one 25 s
@@ -1059,6 +1119,11 @@ impl Hub {
         // (AwaitingConsent / Negotiating) are deliberately spared — they
         // legitimately span a WS flap and the consent re-push below plus
         // the negotiating reaper own their lifecycle.
+        //
+        // FR-138 — a session this hello claims back is spared: the device
+        // kept its peer, and the claim decides whether it goes on. With no
+        // window there are no claims, and every Active session is reaped as
+        // it always was.
         let zombies: Vec<ObjectId> = self
             .inner
             .sessions
@@ -1068,14 +1133,15 @@ impl Hub {
                 s.agent_id == agent_id && s.phase == SessionPhase::Active
             })
             .map(|e| *e.key())
+            .filter(|sid| !claims.contains(sid))
             .collect();
-        for session_id in zombies {
+        for session_id in &zombies {
             warn!(
                 %agent_id, %session_id,
                 "agent re-registered with a stale ACTIVE session — reaping the zombie \
                  (its Terminate died with the previous control WS)"
             );
-            let _ = self.terminate(session_id, EndReason::AgentDisconnect);
+            let _ = self.end_own(*session_id, EndReason::AgentDisconnect, None);
         }
         // Re-push any consent-pending Request to the fresh connection: an
         // agent whose control WS flapped between the Request and its
@@ -1102,7 +1168,15 @@ impl Hub {
                 let _ = tx.try_send(req);
             }
         }
-        (tx, cancel, rx)
+        Registration {
+            tx,
+            cancel,
+            rx,
+            claims,
+            refused,
+            reaped: zombies,
+            registered_at,
+        }
     }
 
     /// Unregister a connected agent. The optional `tx` is the channel
@@ -1142,15 +1216,33 @@ impl Hub {
                 return false;
             }
         }
-        let removed = self.inner.agents.remove(&agent_id).is_some();
-        if removed {
-            info!("agent {} offline", agent_id);
-            self.end_agent_sessions(agent_id);
+        // FR-138 — the identity is checked again AT the removal: a newer
+        // connection registering between the check above and here must keep
+        // its entry, and with it its sessions, which a removal would now
+        // detach as well as end.
+        let removed = match tx {
+            Some(expected_tx) => self
+                .inner
+                .agents
+                .remove_if(&agent_id, |_, a| ptr_eq(&a.tx, expected_tx)),
+            None => self.inner.agents.remove(&agent_id),
+        };
+        let Some((_, entry)) = removed else {
+            return false;
+        };
+        info!("agent {} offline", agent_id);
+        match entry.resume_window {
+            // FR-138 — this connection was announced a window: its live
+            // sessions outlive the socket (the device keeps their peers),
+            // and the rest end as they always have.
+            Some(window_secs) => self.detach_agent_sessions(agent_id, window_secs),
+            None => self.end_agent_sessions(agent_id),
         }
-        removed
+        true
     }
 
-    /// Force-close every session tied to this agent.
+    /// Force-close every session tied to this agent. FR-138 — an end the hub
+    /// decides on its own, so each is fenced at the number the hub holds.
     fn end_agent_sessions(&self, agent_id: ObjectId) {
         let dead: Vec<ObjectId> = self
             .inner
@@ -1162,7 +1254,7 @@ impl Hub {
             })
             .collect();
         for sid in dead {
-            let _ = self.terminate(sid, EndReason::AgentDisconnect);
+            let _ = self.end_own(sid, EndReason::AgentDisconnect, None);
         }
     }
 
@@ -1222,7 +1314,8 @@ impl Hub {
         let Some(agent) = self.inner.agents.get(&agent_id) else {
             return NudgeOutcome::NotRegistered;
         };
-        if agent.active_sessions > 0 {
+        // FR-138 — a claim not answered yet is a session the device holds.
+        if agent.active_sessions > 0 || !agent.pending_claims.is_empty() {
             return NudgeOutcome::RcBusy;
         }
         info!(
@@ -1331,7 +1424,7 @@ impl Hub {
             .map(|e| *e.key())
             .collect();
         for session_id in orphaned {
-            let _ = self.terminate(session_id, EndReason::ControllerHangup);
+            let _ = self.end_own(session_id, EndReason::ControllerHangup, None);
         }
     }
 
@@ -1551,7 +1644,7 @@ impl Hub {
             })
             .collect();
         for sid in orphaned {
-            let _ = self.terminate(sid, EndReason::ControllerHangup);
+            let _ = self.end_own(sid, EndReason::ControllerHangup, None);
         }
 
         // #1045 — coalesce a DUPLICATE request that arrives on the SAME
@@ -1711,7 +1804,11 @@ impl Hub {
                 .agents
                 .get_mut(&agent_id)
                 .ok_or_else(|| Error::AgentOffline(agent_id.to_hex()))?;
-            if agent.active_sessions >= agent.max_sessions {
+            // FR-138 — a claim not answered yet holds its place: a new request
+            // cannot slip into a slot a kept session holds.
+            if usize::from(agent.active_sessions) + agent.pending_claims.len()
+                >= usize::from(agent.max_sessions)
+            {
                 return Err(Error::AgentBusy);
             }
             agent.active_sessions += 1;
@@ -2083,7 +2180,7 @@ impl Hub {
                     s.transition(SessionPhase::Negotiating)
                 }) {
                     warn!("post-consent transition failed: {e}");
-                    let _ = self.terminate(session_id, EndReason::Error);
+                    let _ = self.end_own(session_id, EndReason::Error, None);
                     return;
                 }
                 // Tell the controller it can send its offer.
@@ -2155,7 +2252,7 @@ impl Hub {
                  likely never received Ready; terminating so its ladder can retry",
                 NEGOTIATING_TIMEOUT.as_secs()
             );
-            let _ = self.terminate(session_id, EndReason::Error);
+            let _ = self.end_own(session_id, EndReason::Error, None);
         }
     }
 
@@ -2365,8 +2462,14 @@ impl Hub {
         // Once the answer is in flight, mark the session active.
         // (The peers may still be doing ICE, but signaling is done from our POV.)
         self.with_session(session_id, |s| s.transition(SessionPhase::Active))?;
-        let (sid, aid, oid, max_duration) = self.with_session(session_id, |s| {
-            Ok((s.id, s.agent_id, s.tenant_id, s.max_duration.take()))
+        let (sid, aid, oid, max_duration, attach_seq) = self.with_session(session_id, |s| {
+            Ok((
+                s.id,
+                s.agent_id,
+                s.tenant_id,
+                s.max_duration.take(),
+                s.attach_seq,
+            ))
         })?;
         let peer_auth = peer_auth_verdict.filter(|v| {
             let known = roomler_ai_remote_control::signaling::peer_auth_verdict_is_known(v);
@@ -2381,21 +2484,11 @@ impl Hub {
         // session went live, not from the request: consent can take minutes.
         // Taken above, so a renegotiation never arms a second timer. A session
         // that ended first is simply gone when it fires (`terminate` is
-        // idempotent, and a session id is never reused).
+        // idempotent, and a session id is never reused). FR-138 — a session a
+        // claim resumes keeps its id, so the timer also checks the fencing
+        // number it was armed at: the resume arms its own, from `started_at`.
         if let Some(limit) = max_duration {
-            let hub = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(limit).await;
-                if hub.inner.sessions.contains_key(&sid) {
-                    info!(
-                        session = %sid.to_hex(),
-                        limit_secs = limit.as_secs(),
-                        "rc session reached the org's maximum length — ending it"
-                    );
-                    let _ =
-                        hub.terminate_with_limit(sid, EndReason::IdleTimeout, Some("max_duration"));
-                }
-            });
+            self.arm_max_duration(sid, attach_seq, limit, limit);
         }
         Ok(())
     }
@@ -2437,11 +2530,41 @@ impl Hub {
     /// FR-101 P4b — [`Self::terminate`], naming the limit that ended the
     /// session (`max_duration`) on `rc:terminate` and in the audit row, so a
     /// viewer and a reader of the audit can tell it from idleness.
+    ///
+    /// FR-138 — an end someone asked for (an admin's, the controller's, the
+    /// device's): written to the row at any fencing number, as every end was
+    /// before. An end the hub decides on its own goes through
+    /// [`Self::end_own`].
     pub fn terminate_with_limit(
         &self,
         session_id: ObjectId,
         reason: EndReason,
         limit: Option<&'static str>,
+    ) -> Result<()> {
+        self.end_session(session_id, reason, limit, EndWrite::Asked)
+    }
+
+    /// FR-138 — an end the hub decides on its own (a socket loss, an orphan,
+    /// the length limit, a reaper): written fenced at the number the hub
+    /// holds, so it cannot end a session another pod resumed.
+    pub(crate) fn end_own(
+        &self,
+        session_id: ObjectId,
+        reason: EndReason,
+        limit: Option<&'static str>,
+    ) -> Result<()> {
+        self.end_session(session_id, reason, limit, EndWrite::Own)
+    }
+
+    /// The one place a session this hub holds ends: out of the map, its slot
+    /// given back, the device's count freed, both ends told, and the end
+    /// written to its row as `write` says.
+    fn end_session(
+        &self,
+        session_id: ObjectId,
+        reason: EndReason,
+        limit: Option<&'static str>,
+        write: EndWrite,
     ) -> Result<()> {
         let Some((_, arc)) = self.inner.sessions.remove(&session_id) else {
             return Ok(()); // already gone, idempotent
@@ -2451,11 +2574,16 @@ impl Hub {
             self.release_slot(lease);
         }
 
-        let (agent_id, tenant_id, controller_tx) = {
+        let (agent_id, tenant_id, controller_tx, attach_seq) = {
             let mut s = arc.lock();
             // Best-effort transition; ignore if already closed.
             let _ = s.transition(SessionPhase::Closed);
-            (s.agent_id, s.tenant_id, s.controller_tx.clone())
+            (
+                s.agent_id,
+                s.tenant_id,
+                s.controller_tx.clone(),
+                s.attach_seq,
+            )
         };
 
         // Decrement agent session counter.
@@ -2476,6 +2604,12 @@ impl Hub {
             let _ = agent_tx.try_send(msg);
         }
 
+        let attach_seq = match write {
+            EndWrite::Asked => None,
+            EndWrite::Own => Some(attach_seq),
+            // FR-138 — the row already holds the end this one follows.
+            EndWrite::Nothing => return Ok(()),
+        };
         self.audit(
             session_id,
             agent_id,
@@ -2483,6 +2617,9 @@ impl Hub {
             AuditKind::SessionEnded {
                 reason,
                 limit: limit.map(str::to_string),
+                attach_seq,
+                ended_at: None,
+                end_source: None,
             },
         );
         Ok(())
@@ -3559,6 +3696,13 @@ impl Hub {
         }
     }
 }
+
+// FR-138 — the hub's half of a session that outlives its device's control
+// socket: the detach, the claim's bookkeeping and the row ends of sessions no
+// hub holds. At the end of the file so no anchor above moves.
+mod resume;
+use resume::EndWrite;
+pub use resume::{Registration, ResumeHello, Resumed, ResumedSession, RowEnd};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tests

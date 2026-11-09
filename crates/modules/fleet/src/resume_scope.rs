@@ -14,23 +14,26 @@
 //! a device registers is fleet's: `remote` and `network` reach fleet, fleet
 //! reaches neither, so no hook is needed.
 //!
-//! P1a keeps the list and nothing reads it: with the window at 0, the
-//! default, the server behaves as it did whatever the list holds. From P1b
-//! the hub reads it at registration
-//! ([`RcResumeScopeDao::covers`](roomler_ai_services::dao::rc_resume_scope::RcResumeScopeDao::covers))
-//! and re-announces the window when it changes ([`scope_changed`]).
+//! With the window at 0, the default, the server behaves as it did whatever
+//! the list holds, and nothing reads it. From P1b-1 the agent socket reads it
+//! at a device's registration ([`resume_hello`], through
+//! [`RcResumeScopeDao::covers`](roomler_ai_services::dao::rc_resume_scope::RcResumeScopeDao::covers)),
+//! for a device that advertises `rc-resume`; P1b-2 re-announces the window
+//! when the list changes ([`scope_changed`]).
 
 use axum::{
     Json,
     extract::{State, rejection::JsonRejection},
 };
 use bson::{DateTime, oid::ObjectId};
+use roomler_ai_remote_control::models::{AgentCaps, RpcCap};
 use roomler_ai_services::dao::rc_resume_scope::{ResumeScopeEntry, ResumeScopeKind};
 use roomler_core::{ApiError, extractors::auth::AuthUser, guards::require_platform_admin};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::FleetState;
+use crate::hub::ResumeHello;
 
 /// The longest note an entry keeps.
 pub const MAX_NOTE_LEN: usize = 200;
@@ -121,10 +124,12 @@ pub async fn put_scope(
     )))
 }
 
-/// The one place a change to the scope goes out from. P1a only records it:
-/// nothing reads the scope yet. FR-138 P1b re-announces the window from here,
-/// to this pod's connected devices whose cover changed and, over the rc ctrl
-/// lane ([`crate::ctrl::publish_rc_ctrl`]), to every other pod's, as FR-92's
+/// The one place a change to the scope goes out from. It only records the
+/// change for now: a connected device keeps the window it was announced at
+/// its registration until its next one. FR-138 P1b-2 re-announces the window
+/// from here ([`crate::hub::Hub::announce_resume_window`]), to this pod's
+/// connected devices whose cover changed and, over the rc ctrl lane
+/// ([`crate::ctrl::publish_rc_ctrl`]), to every other pod's, as FR-92's
 /// keep-busy deny reaches them. `0` withdraws it, so a change needs no roll
 /// and a device taken out of the scope loses its window at once.
 fn scope_changed(admin: ObjectId, before: &[ResumeScopeEntry], after: &[ResumeScopeEntry]) {
@@ -218,9 +223,59 @@ pub fn validate_entries(
     Ok(out)
 }
 
+/// FR-138 P1b — what a device's hello is told about resuming, decided at its
+/// registration (spec §4.1): the window is `rc.session_resume_secs`, the
+/// ceiling and the fleet-wide off, announced only to a device that advertises
+/// `rc-resume` (equality-matched) and that the scope covers. With the window
+/// at 0, or without the verb, nothing is read. A scope that cannot be read
+/// announces nothing: the session then ends at a socket loss as it always
+/// has, never kept on a guess.
+pub async fn resume_hello(
+    state: &FleetState,
+    tenant_id: ObjectId,
+    agent_id: ObjectId,
+    caps: &AgentCaps,
+    kept: Vec<ObjectId>,
+) -> ResumeHello {
+    let advertised = caps.has_rpc(RpcCap::RcResume);
+    let setting = state.settings.rc.session_resume_secs;
+    let covered = if advertised && setting > 0 {
+        match state.rc_resume_scope.covers(tenant_id, agent_id).await {
+            Ok(covered) => covered,
+            Err(e) => {
+                warn!(%agent_id, %e, "rc resume scope unreadable at the hello: no window announced");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    ResumeHello {
+        advertised,
+        window: window_for(setting, advertised, covered),
+        kept,
+    }
+}
+
+/// The window a connection is announced, in seconds: the setting, when it is
+/// above 0, the device advertises the verb and the scope covers it.
+pub fn window_for(setting: u64, advertised: bool, covered: bool) -> Option<u32> {
+    (setting > 0 && advertised && covered).then(|| u32::try_from(setting).unwrap_or(u32::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three gates, each alone enough to announce nothing.
+    #[test]
+    fn a_window_needs_the_setting_the_verb_and_the_scope() {
+        assert_eq!(window_for(60, true, true), Some(60));
+        assert_eq!(window_for(0, true, true), None, "0 is off");
+        assert_eq!(window_for(60, false, true), None, "no verb");
+        assert_eq!(window_for(60, true, false), None, "outside the scope");
+        assert_eq!(window_for(u64::MAX, true, true), Some(u32::MAX));
+    }
 
     const ORG: &str = "6a975e17971e2d55ddcdedb2";
     const DEVICE: &str = "6a975e17971e2d55ddcdedb3";

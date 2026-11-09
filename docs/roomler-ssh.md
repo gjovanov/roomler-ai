@@ -1056,7 +1056,7 @@ server's. These bounds hold whatever the device's clock says:
    session (`agents/roomler-cli/src/sshcmd.rs:46`) and drops it on any refusal
    (`:59-61`), so a grant that lands late admits a key nobody holds.
 4. **A queued grant dies with its connection.** It waits on the connection's
-   own queue (`crates/modules/fleet/src/hub.rs:3110`), so a reconnect drops it,
+   own queue (`crates/modules/fleet/src/hub.rs:3247`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
    `agents/roomlerd/src/signaling.rs:63`, checked at `:2325`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
@@ -1635,7 +1635,7 @@ A 0.4.199 SYSTEM service also still claims its grants with `one_command=true`.
 `a_ticketed_ssh_request_is_refused_and_audited`
 (`crates/tests/src/parked_wire_tests.rs:43`), `ssh_audit_rows_written_before_p2_list`
 (`:118`) and `ssh_audit_rows_written_before_p2_still_load`
-(`crates/remote_control/src/models.rs:8946`) lock it. The other surfaces FR-90
+(`crates/remote_control/src/models.rs:8965`) lock it. The other surfaces FR-90
 left reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
