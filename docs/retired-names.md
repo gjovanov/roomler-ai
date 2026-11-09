@@ -52,7 +52,7 @@ flowchart TD
 |---|---|---|---|
 | **ANCHOR** | `RETIRED-NAME-ANCHOR` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | code that resolves, matches or writes the retired name at runtime — a read-fallback over a pre-rename tree, a sweep that deletes the old unit, a wire value a deployed peer still sends | `anchors` must equal the baseline in both directions (`:562`, `:580`): a deleted anchor and a stale floor both fail |
 | **RECORD** | `RETIRED-NAME-RECORD` followed by `:` or `(N):`, or a `-BEGIN` … `-END` pair | prose and fixtures that name the retired thing *in order to explain it* — a field log quoting real output, a migration note, the table above | `records` must equal the baseline in both directions (`:594`) |
-| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:608`); the `name-audit` job in `.github/workflows/ci.yml:2391` runs it on every PR (`:2433`) |
+| unclassified | none | nobody has decided | `--check --strict` requires 0 (`:608`); the `name-audit` job in `.github/workflows/ci.yml:2394` runs it on every PR (`:2436`) |
 
 🔑 **The falsifiable rule**: *if deleting the live code would also delete this
 occurrence, it is an ANCHOR; if the occurrence would survive, it is a RECORD.*
@@ -70,7 +70,7 @@ comment would otherwise have exempted the regression.
 Both counts move only with `scripts/name-audit.sh --update-baseline`, committed
 in the same PR, whose body says which anchor retired (and which field state no
 longer exists) or which record was added (and what it records). The CI job
-prints the summary beside its verdict (`ci.yml:2436`), so a reviewer can diff
+prints the summary beside its verdict (`ci.yml:2439`), so a reviewer can diff
 the number against the claim. A marker that covers nothing fails `--check`
 (`:555`): an empty exemption is the one that silently widens.
 
@@ -155,7 +155,7 @@ build and no test. It surfaces in the field. Before you add a permission bit, an
 | A 0.4.199 peer's `RMHIVE01` DERP frame, dropped and counted first | [overlay-nat-traversal.md](overlay-nat-traversal.md#path-selection-the-two-plane-pathmonitor-cc1-lives-on) | `HIVE_MAGIC` (`crates/tunnel-core/src/transport/derp.rs:166`) | no deployed agent can send it: past the rollback reach of the last release that compiled Hive |
 | `ssh_ticket` on `rc:ssh.request`, refused, and the deny reasons `ticket_refused` · `session_not_allowed` · `target_too_old` | [roomler-ssh.md](roomler-ssh.md#what-parked-agent-sessions-left-behind-fr-137) | `crates/remote_control/src/signaling.rs:858`, `models.rs:5163` | the field: when the last ≤0.4.199 agent is gone (D8). The reasons: no sooner than 90 days after P1's roll (D7) |
 | `net_grant` on `rc:tunnel.open`, refused | [tunnels.md](tunnels.md#a-retired-agent-session-grant-is-refused-fr-137) | `NET_GRANT_REFUSED` (`signaling.rs:101`), the field at `:1363` | when the last ≤0.4.199 agent is gone (D8) |
-| The 23 agent-config keys (`hive_*`, `vault_*`, `knowhow_*`), kept through every save and never warned about | the [public configuration reference](../ui/docs/content/reference/configuration.md) | `RETIRED_KEYS` (`crates/agent-core/src/config.rs:4378`) and the unknown-key merge (`:4266`) | never: and never add `deny_unknown_fields` to `AgentConfig` |
+| The 23 agent-config keys (`hive_*`, `vault_*`, `knowhow_*`), kept through every save and never warned about | the [public configuration reference](../ui/docs/content/reference/configuration.md) | `RETIRED_KEYS` (`crates/agent-core/src/config.rs:4078`) and the unknown-key merge (`:3966`) | never: and never add `deny_unknown_fields` to `AgentConfig` |
 | `roomler hive hook`, hidden, exits 0 | its doc comment (`agents/roomler-cli/src/cli.rs:341`) | adopted terminals' Claude Code hooks | those accounts are unadopted (D6) |
 
 ```mermaid
