@@ -72,7 +72,7 @@ mod tests {
     fn levels(texts: &[&'static str]) -> Level {
         let (top, rest) = texts.split_first().expect("at least one level");
         Level {
-            text: *top,
+            text: top,
             below: (!rest.is_empty()).then(|| Box::new(levels(rest))),
         }
     }
