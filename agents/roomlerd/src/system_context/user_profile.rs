@@ -10,13 +10,14 @@
 //! That means the worker's own `%USERPROFILE%` resolves to
 //! `C:\Windows\System32\config\systemprofile\` — NOT the user's
 //! profile, so a feature that needs the person's folders (the
-//! install clean-up's per-user leftovers, the file-DC's Downloads)
-//! has to find them another way.
+//! install clean-up's per-user leftovers) has to find them another way.
 //!
 //! A SystemContext worker never loads its CONFIG from here: it runs
 //! the machine's own enrollment and nothing else (#3387, `app.rs`
 //! `pick_config_path`). The person's own enrollment runs as that
-//! person, on the service host's user-context arm.
+//! person, on the service host's user-context arm. Nor does it find the
+//! person's Downloads here: a received file is written as the person,
+//! into the Downloads their token names (#3048, `files::FsAs`).
 //!
 //! ## How
 //!
@@ -63,26 +64,6 @@ pub fn active_user_profile_root() -> Option<PathBuf> {
     let session_id = current_session_id()?;
     let username = user_name_for_session(session_id)?;
     Some(PathBuf::from(format!("C:\\Users\\{username}")))
-}
-
-/// Resolve the active-session user's Downloads folder path.
-///
-/// Used by the file-DC handler (`files::download_dir`) under
-/// SystemContext to land uploads in the user's actual Downloads
-/// folder, not the LocalSystem profile's
-/// `C:\Windows\System32\config\systemprofile\Downloads\` (which
-/// usually doesn't exist; field repro the field-test host rc.7: the file-DC
-/// `begin()` call hung because `tokio::fs::create_dir_all` failed
-/// silently on a path with no SYSTEM-profile parent ACL grant).
-///
-/// Returns `None` if the user has no logged-in session OR if the
-/// resolved path doesn't exist (don't optimistically point uploads
-/// at a phantom directory). The caller is expected to fall through
-/// to a non-SystemContext resolution (`directories::UserDirs`) or
-/// the temp-dir fallback.
-pub fn active_user_downloads_path() -> Option<PathBuf> {
-    let path = active_user_profile_root()?.join("Downloads");
-    if path.exists() { Some(path) } else { None }
 }
 
 /// `ProcessIdToSessionId(GetCurrentProcessId())`. Returns the session
@@ -187,30 +168,6 @@ mod tests {
             s.starts_with("c:\\users\\"),
             "path should be C:\\Users\\<name>: {p:?}"
         );
-    }
-
-    #[test]
-    fn active_user_downloads_path_existence_gated() {
-        // Under cargo test runner, our user profile DOES exist and
-        // Downloads usually does too — but not guaranteed (e.g. CI
-        // runners with stripped profiles). The function returns
-        // None when the path doesn't exist; assert only the shape
-        // when Some, and accept None silently otherwise.
-        if let Some(p) = active_user_downloads_path() {
-            let s = p.to_string_lossy().to_lowercase();
-            assert!(
-                s.contains("\\users\\"),
-                "path should be under C:\\Users: {p:?}"
-            );
-            assert!(
-                s.ends_with("\\downloads"),
-                "path should end with \\Downloads: {p:?}"
-            );
-            assert!(
-                p.exists(),
-                "function returned Some(p) but p doesn't exist: {p:?}"
-            );
-        }
     }
 
     #[test]

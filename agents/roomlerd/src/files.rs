@@ -219,10 +219,22 @@ fn process_home() -> Option<String> {
 /// is theirs to edit. "The person" is the one at seat0
 /// (`companion::seat0_user`, FR-97 P5a's definition), never whoever asked.
 /// `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the daemon's own identity.
+///
+/// #3048 — the Windows twin. A machine-wide (SystemContext) worker is
+/// LocalSystem in the session it serves, and every path step on the person's
+/// side (their folder, the file, a resume's placement) runs on a blocking
+/// thread impersonating the person signed in to that session
+/// (`win_identity::as_person`), never as LocalSystem. The person is read from
+/// their token (`win_identity::session_person`), never from a name. Staging
+/// stays the service's own folder, so the file is copied at the end into a new
+/// file the person creates: it is born theirs, with their folder's
+/// permissions. With nobody signed in, a received file is refused
+/// ([`NOBODY_SIGNED_IN`]), never written as LocalSystem. The same switch keeps
+/// the daemon's own identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
-    /// This process: every Windows and macOS install, every user install,
-    /// and a root daemon with nobody at seat0.
+    /// This process: every macOS install, every user install, a Windows
+    /// worker that is not LocalSystem, and a root daemon with nobody at seat0.
     Daemon,
     /// (Linux root) the person signed in at seat0.
     #[cfg(target_os = "linux")]
@@ -230,32 +242,57 @@ pub(crate) enum FsAs {
         account: crate::fs_identity::Account,
         home: PathBuf,
     },
-    /// (Windows, a LocalSystem worker) the person signed in to this
-    /// process's session.
+    /// (Windows, a LocalSystem worker) the person signed in to this process's
+    /// session, fixed when the transfer began.
     #[cfg(target_os = "windows")]
-    #[allow(dead_code)]
     Person {
+        /// Their SID: every step checks the token it runs with is theirs.
         sid: String,
+        /// Their profile folder, the placement rule's active home.
         profile: PathBuf,
+        /// Their Downloads known folder, read without being verified.
         downloads: Option<PathBuf>,
+        /// Where their token comes from at each step.
         token: crate::win_identity::PersonToken,
     },
     /// (Windows, a LocalSystem worker) nobody is signed in to this process's
-    /// session.
+    /// session: every step is refused with [`NOBODY_SIGNED_IN`].
     #[cfg(target_os = "windows")]
-    #[allow(dead_code)]
     Nobody,
 }
 
-/// #3048 — who a transfer starting now writes as on Windows.
-#[cfg(all(target_os = "windows", test))]
+/// #3048 — said when a step would be taken for someone other than the person
+/// the transfer began for: they signed out, or another person signed in.
+pub(crate) const NOT_THE_PERSON: &str = "the person this transfer began for is not signed in";
+
+/// #3048 — why a received file is refused on a machine-wide Windows install
+/// with nobody signed in. The viewer shows it in its `files:error`.
+#[cfg(target_os = "windows")]
+pub(crate) const NOBODY_SIGNED_IN: &str =
+    "Nobody is signed in to this computer to receive the file";
+
+/// #3048 — who a transfer starting now writes as on Windows: the person signed
+/// in to this process's session when it is LocalSystem; nobody when no one is;
+/// the daemon itself otherwise, or with `ROOMLERD_FILES_AS_SEAT_USER=0`. Pure,
+/// so the decision is a test.
+#[cfg(target_os = "windows")]
 fn fs_as_for(
     local_system: bool,
     switch_on: bool,
     person: Option<crate::win_identity::SessionPerson>,
 ) -> FsAs {
-    let _ = (local_system, switch_on, person);
-    FsAs::Daemon
+    if !local_system || !switch_on {
+        return FsAs::Daemon;
+    }
+    match person {
+        Some(p) => FsAs::Person {
+            sid: p.sid,
+            profile: p.profile,
+            downloads: p.downloads,
+            token: crate::win_identity::PersonToken::Session,
+        },
+        None => FsAs::Nobody,
+    }
 }
 
 impl FsAs {
@@ -275,7 +312,35 @@ impl FsAs {
                 }
             }
         }
+        // #3048 — only a LocalSystem process asks for the session's person.
+        #[cfg(target_os = "windows")]
+        if crate::win_identity::process_is_local_system() {
+            return fs_as_for(
+                true,
+                tunnel_core::env::flag("FILES_AS_SEAT_USER", true),
+                crate::win_identity::session_person(),
+            );
+        }
         Self::Daemon
+    }
+
+    /// #3048 — the reason a transfer is refused before anything is touched:
+    /// nobody signed in on a machine-wide Windows install.
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        #[cfg(target_os = "windows")]
+        if matches!(self, Self::Nobody) {
+            return Some(NOBODY_SIGNED_IN);
+        }
+        None
+    }
+
+    /// #3048 — the person a Windows transfer is written as, by SID.
+    pub(crate) fn person_sid(&self) -> Option<&str> {
+        #[cfg(target_os = "windows")]
+        if let Self::Person { sid, .. } = self {
+            return Some(sid);
+        }
+        None
     }
 
     /// Run blocking filesystem work as this identity, on a blocking thread:
@@ -303,7 +368,11 @@ impl FsAs {
                 f()
             }
             #[cfg(target_os = "windows")]
-            Self::Person { .. } | Self::Nobody => f(),
+            Self::Person { sid, token, .. } => {
+                crate::win_identity::as_person(sid, token, f).map_err(|why| anyhow!(why))?
+            }
+            #[cfg(target_os = "windows")]
+            Self::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         }
     }
 
@@ -318,8 +387,35 @@ impl FsAs {
                 active_home: Some(home.to_string_lossy().into_owned()),
             },
             #[cfg(target_os = "windows")]
-            Self::Person { .. } | Self::Nobody => writer_context(),
+            Self::Person { profile, .. } => files_dir::Writer {
+                privileged: true,
+                active_home: Some(profile.to_string_lossy().into_owned()),
+            },
+            // No profile: every folder refused, as for any privileged writer
+            // that cannot name one.
+            #[cfg(target_os = "windows")]
+            Self::Nobody => files_dir::Writer {
+                privileged: true,
+                active_home: None,
+            },
         }
+    }
+}
+
+/// #3048 — the person's Downloads on Windows: their known folder when
+/// `check` finds it a folder (read as them, so a share it is redirected to is
+/// reached with their logon), else their profile. Unchecked (the status card),
+/// the known folder as it is: no probe on that path, so an offline share
+/// cannot hold it up.
+#[cfg(target_os = "windows")]
+fn person_downloads_windows(
+    downloads: Option<&std::path::Path>,
+    profile: &std::path::Path,
+    check: bool,
+) -> PathBuf {
+    match downloads {
+        Some(d) if !check || d.is_dir() => d.to_path_buf(),
+        _ => profile.to_path_buf(),
     }
 }
 
@@ -624,9 +720,10 @@ pub(crate) struct PartialMeta {
     /// for collision-resolution.
     #[serde(default)]
     pub rel_path: Option<String>,
-    /// #3048 — the person the transfer began for.
+    /// #3048 — the person a Windows transfer began for (their SID): a resume
+    /// places the file only for them. `None` from a transfer written as the
+    /// daemon, and from a daemon before #3048; additive both ways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)]
     pub person_sid: Option<String>,
 }
 
@@ -1185,6 +1282,11 @@ pub(crate) struct IncomingTransfer {
     /// resumed): the end-time rename and its cleanup run as them too, even
     /// after someone else has signed in at the screen.
     pub who: FsAs,
+    /// #3048: who staged it. The daemon, when uploads stage in the machine's
+    /// own folder and `who` is the person: the end then copies across, from
+    /// a source the daemon opens into a file the person creates. Otherwise
+    /// `who`.
+    pub stager: FsAs,
     /// rc.19: increments [`ACTIVE_TRANSFERS`] on creation, decrements
     /// on drop. Last field so it drops AFTER `file` — guarantees the
     /// kernel page cache has reached the disk-flush queue before the
@@ -1273,6 +1375,27 @@ impl FilesHandler {
         partial_dir_for(dest_dir, id)
     }
 
+    /// Uploads stage in a folder of the daemon's own (the machine's on
+    /// Windows), not beside the target.
+    fn stages_in_a_root(&self) -> bool {
+        #[cfg(test)]
+        if self.staging_root.is_some() {
+            return true;
+        }
+        cfg!(target_os = "windows") && stage_in_programdata()
+    }
+
+    /// #3048 — who stages a transfer written as `who`: the daemon, in its own
+    /// folder, which the person may not write; `who` when staging sits beside
+    /// the target (every step then is theirs, as FR-97 P3d's).
+    fn stager_for(&self, who: &FsAs) -> FsAs {
+        if self.stages_in_a_root() {
+            FsAs::Daemon
+        } else {
+            who.clone()
+        }
+    }
+
     /// Start a new incoming transfer (browser → host upload). Returns
     /// the absolute destination path so the caller can reply
     /// `files:accepted { id, path }`.
@@ -1323,6 +1446,11 @@ impl FilesHandler {
         // Before anything lands on disk (a message straddling the session's
         // end); an upload that got past this is dropped by `end_session`.
         self.refuse_if_ended()?;
+        // #3048 — nobody signed in to a Windows worker's session: refused, in
+        // the words the viewer shows, before anything is touched.
+        if let Some(why) = who.refusal() {
+            return Err(anyhow!(why));
+        }
         if expected > MAX_TRANSFER_BYTES {
             return Err(anyhow!(
                 "transfer size {expected} exceeds the {} B cap",
@@ -1358,25 +1486,21 @@ impl FilesHandler {
         // mid-upload DC drop leaves the partial discoverable (B1 +
         // B2 fixes). `end()` renames to a freshly-resolved final path.
         let partial_dir = self.partial_dir(&target_dir, &id);
+        // #3048 — staging in the daemon's own folder is the daemon's to write,
+        // and the target folder the person's: the two halves below run as
+        // each. Staged beside the target, both are `who` (FR-97 P3d).
+        let stager = self.stager_for(&who);
 
-        // Every step below touches the target folder, so all of it runs as
-        // `who` (FR-97 P3d).
-        let (reserved_final, meta_path, file) = {
-            let (target_dir, partial_dir, filename, id) = (
-                target_dir.clone(),
-                partial_dir.clone(),
-                filename.clone(),
-                id.clone(),
-            );
+        // The target folder's half, as `who`: folder upload resolves
+        // `rel_path` to a path under the target dir, sanitising each
+        // component, and falls back to flat upload when rel_path is empty /
+        // missing / refused by sanitisation. This is the *reserved* final
+        // path; the real target is recomputed at `end()` time per M4 fix.
+        let reserved_final = {
+            let (target_dir, filename) = (target_dir.clone(), filename.clone());
             let rel_for_path = rel_path.filter(|p| !p.is_empty()).map(str::to_string);
-            let rel_for_meta = rel_path.map(str::to_string);
             who.run(move || {
-                // Folder upload: resolve `rel_path` to a path under the
-                // target dir, sanitising each component. Falls back to flat
-                // upload when rel_path is empty / missing / refused by
-                // sanitisation. This is the *reserved* final path; the real
-                // rename target is recomputed at `end()` time per M4 fix.
-                let reserved_final = match rel_for_path.as_deref() {
+                Ok(match rel_for_path.as_deref() {
                     Some(rel) => {
                         resolve_folder_upload_path(&target_dir, rel).unwrap_or_else(|| {
                             tracing::warn!(
@@ -1387,61 +1511,77 @@ impl FilesHandler {
                         })
                     }
                     None => unique_path(&target_dir, &filename),
-                };
-
-                // B1 fix — reject if an existing partial dir is on disk for
-                // this id. The browser MUST send `files:resume` instead, or
-                // generate a new UUID. Without this check the data file
-                // below would truncate the existing partial. The
-                // `PARTIAL_REGISTRY` lookup is an optimisation — the
-                // authoritative test is the on-disk dir. `symlink_metadata`:
-                // a link planted there counts as "on disk" too.
-                if std::fs::symlink_metadata(&partial_dir).is_ok() {
-                    return Err(anyhow!(
-                        "id {id} already has partial state; send files:resume"
-                    ));
-                }
-
-                let parent_partial = partial_dir
-                    .parent()
-                    .expect("partial_dir has a parent by construction");
-                std::fs::create_dir_all(parent_partial)
-                    .with_context(|| format!("creating {}", parent_partial.display()))?;
-                set_hidden(parent_partial);
-                // `create_dir`, never `_all`: this id's folder is made now,
-                // or the begin fails — an existing one is never adopted.
-                std::fs::create_dir(&partial_dir)
-                    .with_context(|| format!("creating {}", partial_dir.display()))?;
-
-                // Write meta.json BEFORE opening the data file. If meta
-                // write fails the staging dir is left empty (cheap to clean).
-                let meta = PartialMeta {
-                    protocol_version: 1,
-                    filename: filename.clone(),
-                    expected_size: expected,
-                    dest_dir: target_dir.clone(),
-                    reserved_final_path: reserved_final.clone(),
-                    created_at_unix: chrono::Utc::now().timestamp(),
-                    rel_path: rel_for_meta,
-                    person_sid: None,
-                };
-                let meta_path = partial_dir.join("meta.json");
-                let meta_bytes =
-                    serde_json::to_vec_pretty(&meta).context("serialising partial meta.json")?;
-                std::fs::write(&meta_path, &meta_bytes)
-                    .with_context(|| format!("writing {}", meta_path.display()))?;
-
-                // `create_new`: the folder is new, so the file must be too;
-                // a link planted in its place refuses the open.
-                let data_path = partial_dir.join("data");
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&data_path)
-                    .with_context(|| format!("creating {}", data_path.display()))?;
-                Ok((reserved_final, meta_path, file))
+                })
             })
             .await?
+        };
+
+        // The staging half, as the stager.
+        let (meta_path, file) = {
+            let (target_dir, partial_dir, filename, id, reserved_final) = (
+                target_dir.clone(),
+                partial_dir.clone(),
+                filename.clone(),
+                id.clone(),
+                reserved_final.clone(),
+            );
+            let rel_for_meta = rel_path.map(str::to_string);
+            let person_sid = who.person_sid().map(str::to_string);
+            stager
+                .run(move || {
+                    // B1 fix — reject if an existing partial dir is on disk for
+                    // this id. The browser MUST send `files:resume` instead, or
+                    // generate a new UUID. Without this check the data file
+                    // below would truncate the existing partial. The
+                    // `PARTIAL_REGISTRY` lookup is an optimisation — the
+                    // authoritative test is the on-disk dir. `symlink_metadata`:
+                    // a link planted there counts as "on disk" too.
+                    if std::fs::symlink_metadata(&partial_dir).is_ok() {
+                        return Err(anyhow!(
+                            "id {id} already has partial state; send files:resume"
+                        ));
+                    }
+
+                    let parent_partial = partial_dir
+                        .parent()
+                        .expect("partial_dir has a parent by construction");
+                    std::fs::create_dir_all(parent_partial)
+                        .with_context(|| format!("creating {}", parent_partial.display()))?;
+                    set_hidden(parent_partial);
+                    // `create_dir`, never `_all`: this id's folder is made now,
+                    // or the begin fails — an existing one is never adopted.
+                    std::fs::create_dir(&partial_dir)
+                        .with_context(|| format!("creating {}", partial_dir.display()))?;
+
+                    // Write meta.json BEFORE opening the data file. If meta
+                    // write fails the staging dir is left empty (cheap to clean).
+                    let meta = PartialMeta {
+                        protocol_version: 1,
+                        filename: filename.clone(),
+                        expected_size: expected,
+                        dest_dir: target_dir.clone(),
+                        reserved_final_path: reserved_final.clone(),
+                        created_at_unix: chrono::Utc::now().timestamp(),
+                        rel_path: rel_for_meta,
+                        person_sid,
+                    };
+                    let meta_path = partial_dir.join("meta.json");
+                    let meta_bytes = serde_json::to_vec_pretty(&meta)
+                        .context("serialising partial meta.json")?;
+                    std::fs::write(&meta_path, &meta_bytes)
+                        .with_context(|| format!("writing {}", meta_path.display()))?;
+
+                    // `create_new`: the folder is new, so the file must be too;
+                    // a link planted in its place refuses the open.
+                    let data_path = partial_dir.join("data");
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&data_path)
+                        .with_context(|| format!("creating {}", data_path.display()))?;
+                    Ok((meta_path, file))
+                })
+                .await?
         };
         // The open file carries the identity's rights from here on; the
         // writes through it need no identity of their own.
@@ -1449,13 +1589,15 @@ impl FilesHandler {
 
         // Populate the in-memory registry so a same-process resume
         // request (DC drop without agent restart) can find this
-        // partial without re-running the orphan sweep.
+        // partial without re-running the orphan sweep. It is registered as
+        // staged by the stager: a resume reads it and a cancel removes it as
+        // them.
         if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
             g.insert(
                 id.clone(),
                 PartialEntry {
                     meta_path,
-                    who: who.clone(),
+                    who: stager.clone(),
                 },
             );
         }
@@ -1479,6 +1621,7 @@ impl FilesHandler {
             last_synced: 0,
             rel_path: rel_path.map(|s| s.to_string()),
             who,
+            stager,
             _active_guard: ActiveTransferGuard::new(),
         });
         Ok(reserved_final)
@@ -1584,6 +1727,22 @@ impl FilesHandler {
             state.rel_path.clone(),
             state.partial_dir.clone(),
         );
+        // #3048 — staged by the daemon, placed for the person: copied across.
+        if matches!(state.stager, FsAs::Daemon) && !matches!(state.who, FsAs::Daemon) {
+            let placed = place_across(
+                &state.stager,
+                &state.who,
+                partial_dir,
+                dest_dir,
+                filename,
+                rel,
+            )
+            .await?;
+            if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
+                g.remove(&state.id);
+            }
+            return Ok((placed, state.received));
+        }
         let actual_final_path = state
             .who
             .run(move || {
@@ -1650,7 +1809,92 @@ impl FilesHandler {
 
         Ok((actual_final_path, state.received))
     }
+}
 
+/// #3048 — the end of a transfer the daemon staged (`stager`, in its own
+/// folder, which the person may not write) and the person receives (`who`).
+/// No rename crosses that boundary: a rename would carry the staging file's
+/// descriptor into the person's folder. Instead:
+///
+/// 1. the staging `data` is opened as the daemon;
+/// 2. as the person: the final path is resolved (`unique_path`, the M4 fix),
+///    its folder made, a NEW file created there (`create_new`: never one
+///    already there; it is born theirs, with their folder's permissions) and
+///    the data copied in through the daemon's handle;
+/// 3. the staging goes, as the daemon.
+///
+/// A copy that fails removes its half-written file and keeps the staging, so a
+/// resume can finish it.
+async fn place_across(
+    stager: &FsAs,
+    who: &FsAs,
+    partial_dir: PathBuf,
+    dest_dir: PathBuf,
+    filename: String,
+    rel: Option<String>,
+) -> Result<PathBuf> {
+    let data_path = partial_dir.join("data");
+    let source = stager
+        .run(move || {
+            std::fs::File::open(&data_path)
+                .with_context(|| format!("opening {}", data_path.display()))
+        })
+        .await?;
+    let placed = who
+        .run(move || {
+            let final_path = match rel.as_deref().filter(|p| !p.is_empty()) {
+                Some(rel) => resolve_folder_upload_path(&dest_dir, rel)
+                    .unwrap_or_else(|| unique_path(&dest_dir, &filename)),
+                None => unique_path(&dest_dir, &filename),
+            };
+            if let Some(parent) = final_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating final parent {}", parent.display()))?;
+            }
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&final_path)
+                .with_context(|| format!("creating {}", final_path.display()))?;
+            if let Err(e) = copy_into(source, &mut out) {
+                drop(out);
+                let _ = std::fs::remove_file(&final_path);
+                return Err(anyhow::Error::from(e)
+                    .context(format!("copying into {}", final_path.display())));
+            }
+            Ok(final_path)
+        })
+        .await?;
+    // Best-effort, as the rename path's cleanup.
+    let _ = stager
+        .run(move || {
+            let _ = std::fs::remove_dir_all(&partial_dir);
+            if let Some(parent) = partial_dir.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            Ok(())
+        })
+        .await;
+    Ok(placed)
+}
+
+/// Copy `source` into `out` through a 1 MiB buffer, then flush it to the
+/// disk. Plain reads and writes through handles already open: neither end is
+/// looked up again by path.
+fn copy_into(mut source: std::fs::File, out: &mut std::fs::File) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = source.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])?;
+    }
+    out.sync_all()
+}
+
+impl FilesHandler {
     /// Drop any in-flight incoming transfer (DC closed mid-upload).
     /// The staging dir is left on disk so a future `files:resume`
     /// can pick up where it left off. The 24h orphan sweep at the
@@ -1772,7 +2016,6 @@ impl FilesHandler {
         id: &str,
         requested_offset: u64,
     ) -> Result<u64> {
-        let _ = now;
         // Locate meta_path: registry first, then on-demand probe at
         // the canonical Downloads-rooted location for cross-restart
         // discovery survivors. Poison-tolerant — the HashMap has no
@@ -1781,7 +2024,7 @@ impl FilesHandler {
             let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             g.get(id).cloned()
         };
-        let (meta_path, who) = match entry {
+        let (meta_path, stager) = match entry {
             Some(e) => (e.meta_path, e.who),
             None => {
                 // On-demand fallback (sweep may have raced or the
@@ -1790,52 +2033,61 @@ impl FilesHandler {
                 // the strategy: PROGRAMDATA on Windows (always-on by
                 // default), or `<Downloads>/.roomler-partial/` for the
                 // legacy escape-hatch path / non-Windows. FR-97 P3d —
-                // probed, like everything after, as whoever a drop would
-                // be written as now.
-                let who = FsAs::now();
-                let canonical = {
-                    #[cfg(target_os = "windows")]
-                    {
-                        if stage_in_programdata() {
-                            staging_root_windows().join(id).join("meta.json")
-                        } else {
-                            download_dir()
-                                .context("resolving Downloads for on-demand resume probe")?
-                                .join(".roomler-partial")
-                                .join(id)
-                                .join("meta.json")
-                        }
-                    }
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        download_dir_for(&who)
-                            .await
-                            .context("resolving Downloads for on-demand resume probe")?
-                            .join(".roomler-partial")
-                            .join(id)
-                            .join("meta.json")
-                    }
+                // beside the target, probed as whoever a drop would be
+                // written as now; #3048 — in the daemon's own folder, as
+                // the daemon, whose folder it is.
+                let stager = self.stager_for(&now);
+                let canonical = if self.stages_in_a_root() {
+                    self.partial_dir(std::path::Path::new(""), id)
+                        .join("meta.json")
+                } else {
+                    let downloads = download_dir_for(&now)
+                        .await
+                        .context("resolving Downloads for on-demand resume probe")?;
+                    self.partial_dir(&downloads, id).join("meta.json")
                 };
                 let probe = canonical.clone();
-                if !who
+                if !stager
                     .run(move || Ok(std::fs::metadata(&probe).is_ok()))
                     .await?
                 {
                     return Err(anyhow!("no partial state for id {id}"));
                 }
-                (canonical, who)
+                (canonical, stager)
             }
         };
+        // #3048 — who places the file: the person a drop would be written as
+        // now, when the daemon staged it in its own folder; whoever staged it,
+        // when it sits beside the target (FR-97 P3d).
+        let who = if self.stages_in_a_root() && matches!(stager, FsAs::Daemon) {
+            now
+        } else {
+            stager.clone()
+        };
+        if let Some(why) = who.refusal() {
+            return Err(anyhow!(why));
+        }
 
         // FR-97 P3d — read, truncate and reopen as whoever staged the
         // partial: in the person's own folder, `meta.json` is theirs to
         // edit, and the end-time rename goes where it says.
-        let (meta, partial_dir, accepted, file) = who
+        let placer = who.person_sid().map(str::to_string);
+        let (meta, partial_dir, accepted, file) = stager
             .run(move || {
                 let meta_bytes = std::fs::read(&meta_path)
                     .with_context(|| format!("reading {}", meta_path.display()))?;
                 let meta: PartialMeta = serde_json::from_slice(&meta_bytes)
                     .with_context(|| format!("parsing {}", meta_path.display()))?;
+                // #3048 — placed only for the person the transfer began for,
+                // checked before anything is touched. A partial from a daemon
+                // that recorded no one goes to whoever is signed in now.
+                if let Some(began_for) = meta.person_sid.as_deref()
+                    && !placer
+                        .as_deref()
+                        .is_some_and(|sid| sid.eq_ignore_ascii_case(began_for))
+                {
+                    return Err(anyhow!(NOT_THE_PERSON));
+                }
                 let partial_dir = meta_path
                     .parent()
                     .ok_or_else(|| anyhow!("meta_path has no parent"))?
@@ -1896,6 +2148,7 @@ impl FilesHandler {
             last_synced: accepted,
             rel_path: meta.rel_path.clone(),
             who,
+            stager,
             _active_guard: ActiveTransferGuard::new(),
         });
         tracing::info!(
@@ -2891,12 +3144,34 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
             }
             Ok(person_downloads(home))
         }
+        // #3048 — the same for the person signed in to a Windows worker's
+        // session: their `files_dir` when it passes for them (inside THEIR
+        // profile), else their own Downloads, else their profile.
         #[cfg(target_os = "windows")]
         FsAs::Person {
             downloads, profile, ..
-        } => Ok(downloads.clone().unwrap_or_else(|| profile.clone())),
+        } => {
+            if let Some(raw) = configured_files_dir() {
+                let writer = who.writer();
+                match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
+                    Ok(dir) => return Ok(dir),
+                    Err(e) => tracing::warn!(
+                        files_dir = %raw,
+                        active_home = ?writer.active_home,
+                        %e,
+                        "files: configured files_dir refused for the person signed in — this \
+                         transfer lands in their Downloads"
+                    ),
+                }
+            }
+            Ok(person_downloads_windows(
+                downloads.as_deref(),
+                profile,
+                true,
+            ))
+        }
         #[cfg(target_os = "windows")]
-        FsAs::Nobody => download_dir(),
+        FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
     }
 }
 
@@ -2906,12 +3181,13 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
         FsAs::Daemon => default_download_dir(log),
         #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => Ok(person_downloads(home)),
+        // `log` is false for the status card and the sweep: no probe there.
         #[cfg(target_os = "windows")]
         FsAs::Person {
             downloads, profile, ..
-        } => Ok(downloads.clone().unwrap_or_else(|| profile.clone())),
+        } => Ok(person_downloads_windows(downloads.as_deref(), profile, log)),
         #[cfg(target_os = "windows")]
-        FsAs::Nobody => default_download_dir(log),
+        FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
     }
 }
 
@@ -2936,33 +3212,11 @@ fn download_dir() -> Result<PathBuf> {
 /// false for the status answer, which is recomputed every few seconds while
 /// the companion is open and must not repeat the fallback's warning each time.
 fn default_download_dir(log: bool) -> Result<PathBuf> {
-    // M3 A1 SystemContext fallback: when the worker is spawned by the
-    // SCM service via winlogon-token, it runs as LocalSystem
-    // (S-1-5-18) but in the user's interactive session.
-    // `directories::UserDirs::new()` resolves Downloads to the
-    // LocalSystem profile (`C:\Windows\System32\config\systemprofile\
-    // Downloads\`) which usually doesn't exist — uploads fail (or
-    // worse, succeed silently into a directory the user can't see).
-    // Field repro the field-test host rc.7 2026-05-06: file upload via browse-
-    // and-select hung because `create_dir_all` couldn't create the
-    // SYSTEM-profile path. Same fallback shape as the rc.6 config
-    // fix; see `system_context::user_profile`.
-    #[cfg(all(feature = "system-context", target_os = "windows"))]
-    {
-        use crate::system_context::{user_profile, worker_role};
-        if matches!(
-            worker_role::probe_self(),
-            Ok(worker_role::WorkerRole::SystemContext)
-        ) && let Some(dl) = user_profile::active_user_downloads_path()
-        {
-            tracing::debug!(
-                fallback_path = %dl.display(),
-                "files: SystemContext worker — using active-user Downloads (default would be SYSTEM profile)"
-            );
-            return Ok(dl);
-        }
-    }
-
+    // #3048 — a SystemContext worker (LocalSystem in the person's session)
+    // writes as the person signed in, into THEIR Downloads, read from their
+    // token (`FsAs::Person`, `person_downloads_windows`). This ladder is the
+    // daemon's own: a worker that is not LocalSystem, or one with
+    // `ROOMLERD_FILES_AS_SEAT_USER=0`.
     if let Some(dirs) = directories::UserDirs::new()
         && let Some(dl) = dirs.download_dir()
     {
@@ -2972,7 +3226,7 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
     // repro): when the worker is LocalSystem and the user's `Downloads`
     // is Folder-Redirected to a network share (e.g.
     // `\\fileserver\UserData$\<user>\Downloads`) that SYSTEM can't
-    // access, `active_user_downloads_path()` returns None AND
+    // access, the session user's Downloads was out of reach AND
     // `UserDirs::new().download_dir()` returns None. Pre-rc.21 the
     // code fell back to `std::env::temp_dir()` = `C:\Windows\SystemTemp\`
     // — which Windows Defender / SmartScreen scan AGGRESSIVELY for
