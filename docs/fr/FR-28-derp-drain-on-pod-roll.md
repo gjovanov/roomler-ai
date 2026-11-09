@@ -125,7 +125,8 @@ the live roll, not a measurement.
 
 FR-135's D15 settled the question the read left open: FR-28's flat redial and the pre-pull now, and a new
 FR next for an RC session that survives a control-socket loss. The operator approved it on 2026-11-02, open
-to being overturned (`docs/fr/FR-135-one-rc-media-pipeline.md` §10).
+to being overturned (`docs/fr/FR-135-one-rc-media-pipeline.md` §10). That FR is
+[FR-138](FR-138-the-session-outlives-its-control-socket.md) (#3604), claimed 2026-11-09.
 
 | Item | Outcome |
 |---|---|
@@ -374,8 +375,8 @@ The operator's decision of 2026-11-02 changed the first two. AC3 to AC6 keep the
 
 - ~~A deliberate `kubectl rollout restart` with a live relay-carried session produces **no `video DC delivery
   gap` > 500 ms** in the viewer console (today: 2436 ms measured).~~ **Moved** to the new FR for an RC session
-  that survives a control-socket loss: a roll ends the session on the control socket, 9 of 9, so nothing on
-  `/derp` can reach it.
+  that survives a control-socket loss ([FR-138](FR-138-the-session-outlives-its-control-socket.md), its AC2): a
+  roll ends the session on the control socket, 9 of 9, so nothing on `/derp` can reach it.
 - ~~Agent-side `relay carrier send hard-errored (/derp WS closed under it)` **disappears** for a graceful roll —
   the carrier should be rebuilt from a clean close, not from a failed send. Its continued presence means P0 did
   not take, regardless of what the timings say.~~ **Retired:** the line marks a close, as P0 found, and a roll
@@ -404,7 +405,7 @@ only above 1500 ms (`VIDEO_DC_GAP_MS`, `ui/src/workers/rc-video-channel.ts:18`, 
 - Non-graceful pod death (SIGKILL, node loss). Nothing can be announced there; that
   case keeps today's discover-by-failure path, which is why P0 cannot be the only
   defence and the existing recovery walk stays.
-- Making RC sessions survive a roll: the new FR.
+- Making RC sessions survive a roll: the new FR, [FR-138](FR-138-the-session-outlives-its-control-socket.md).
 - Changing the rollout strategy (maxSurge, pod count), pre-close draining, a per-pod `/derp` route.
 
 ## Field log
