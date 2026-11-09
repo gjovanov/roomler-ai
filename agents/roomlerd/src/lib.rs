@@ -57,6 +57,9 @@ pub mod displays;
 #[cfg(target_os = "windows")]
 pub mod dpi;
 pub mod encode;
+/// #3553 — the one line for an error and its `source()` chain, each cause
+/// once: the signalling loop, the preflight and the self-view share it.
+pub(crate) mod error_chain;
 pub mod exec;
 /// FR-94 — Fleet RPC as SYSTEM on Windows: the anchor, the doorbell between
 /// the worker and the SYSTEM service, and the service's runner. Compiled

@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
+use crate::error_chain::error_chain;
 use crate::indicator::ViewerIndicator;
 use crate::notify;
 use crate::peer::AgentPeer;
@@ -788,26 +789,6 @@ impl OrgCtx {
             );
         }
     }
-}
-
-/// rc.58: format an error chain by walking `source()` so the top-level
-/// `Display` (which `tokio_tungstenite::Error` keeps deliberately
-/// terse) doesn't hide the root cause — TLS handshake error,
-/// ECONNREFUSED, EAI_NONAME, etc. Field repro 2026-05-24: a flaky
-/// network turned every cold start into `error=ws connect` with no
-/// further detail, making it impossible to tell a DNS failure from a
-/// TLS failure without packet capture. The `preflight` module ships
-/// the same helper; duplicated here to avoid forcing every consumer
-/// crate to depend on `preflight`.
-fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = err.to_string();
-    let mut src = err.source();
-    while let Some(cause) = src {
-        out.push_str(": ");
-        out.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    out
 }
 
 /// rc.58: RAII guard that flips the watchdog's `signaling` pump on
@@ -8100,11 +8081,12 @@ mod tests {
         let reset = tungstenite::Error::Protocol(ProtocolError::ResetWithoutClosingHandshake);
         let e = session_ended("ws read", anyhow::Error::new(reset), s(170), s(160), none);
         assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        // #3553 — the reset once. tungstenite's `Protocol` prints the error it
+        // wraps, so the chain no longer appends that error a second time.
         assert_eq!(
             e.to_string(),
             "ws read: WebSocket protocol error: Connection reset without closing handshake: \
-             Connection reset without closing handshake: this agent did not run for ~135 s \
-             before it (frozen or suspended)"
+             this agent did not run for ~135 s before it (frozen or suspended)"
         );
         // Wording only: the reconnect still downcasts the error it got.
         assert!(matches!(
@@ -8120,6 +8102,56 @@ mod tests {
         let line = e.to_string();
         assert!(line.starts_with("heartbeat send: ws send: "), "{line}");
         assert!(line.ends_with("did not run for ~135 s before it (frozen or suspended)"));
+    }
+
+    /// #3553 — the #3530 lab's heartbeat line printed its io error twice:
+    /// `heartbeat send: ws send: IO error: Broken pipe (os error 32): Broken
+    /// pipe (os error 32): this agent did not run for ~145 s before it …`.
+    /// tungstenite's `Io` prints the io error it wraps and also returns it from
+    /// `source()`. The line names it once, paused or not, and the error is
+    /// still the one the reconnect downcasts.
+    #[test]
+    fn a_session_ended_line_names_its_io_cause_once() {
+        use tokio_tungstenite::tungstenite;
+        let s = Duration::from_secs;
+        let none = RememberedPause::default();
+        // EPIPE is 32 on Linux and macOS.
+        let io_text = std::io::Error::from_raw_os_error(32).to_string();
+        let pipe = || {
+            anyhow::Error::new(tungstenite::Error::Io(std::io::Error::from_raw_os_error(
+                32,
+            )))
+            .context("ws send")
+        };
+        // Paused: the reconnect's `why`.
+        let e = session_ended("heartbeat send", pipe(), s(170), s(160), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_some());
+        let why = e.to_string();
+        assert_eq!(
+            why,
+            format!(
+                "heartbeat send: ws send: IO error: {io_text}: this agent did not run for \
+                 ~135 s before it (frozen or suspended)"
+            )
+        );
+        assert_eq!(why.matches(io_text.as_str()).count(), 1, "{why}");
+        assert!(matches!(
+            e.downcast_ref::<tungstenite::Error>(),
+            Some(tungstenite::Error::Io(_))
+        ));
+        // Running: the `cause` of `signaling connect failed; backing off`.
+        let e = session_ended("heartbeat send", pipe(), s(20), s(20), none);
+        assert!(e.downcast_ref::<AgentDidNotRun>().is_none());
+        let cause = error_chain(e.as_ref());
+        assert_eq!(
+            cause,
+            format!("heartbeat send: ws send: IO error: {io_text}")
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            cause,
+            "heartbeat send: ws send: IO error: Broken pipe (os error 32)"
+        );
     }
 
     /// #3530 — a lab guest thawed from a 152 s SIGSTOP: a read failed 2.6 ms
