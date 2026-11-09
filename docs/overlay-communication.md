@@ -1011,7 +1011,7 @@ recipe, whose mark starts at zero (`HandshakeHeal`,
 session index, so the carrier plane's index route reaches it. The session's own
 `Tunn` stays as it is. The shadow takes its place only when a data packet or a
 keepalive decrypts under one of the shadow's sessions (`HandshakeHeal::promote`,
-`wg.rs:773`). That needs the ephemeral private key of the initiation the shadow
+`wg.rs:776`). That needs the ephemeral private key of the initiation the shadow
 answered, so only the peer completing its own handshake can do it.
 
 ```mermaid
@@ -1030,7 +1030,7 @@ sequenceDiagram
     B->>A: data
 ```
 
-What each initiation gets (`process_inbound`, `wg.rs:2710-2770`):
+What each initiation gets (`process_inbound`, `wg.rs:2713-2776`):
 
 | Initiation | B's `Tunn` | The shadow | The working session |
 |---|---|---|---|
@@ -1055,7 +1055,7 @@ What each initiation gets (`process_inbound`, `wg.rs:2710-2770`):
   before the step. The session remembers the ephemeral keys of the last 32
   initiations its `Tunn` accepted (`HEAL_SEEN`, `wg.rs:606`: about an hour of
   rekeys, 1 KiB a session) and drops a replay of any of them before boringtun
-  sees it (`already_accepted`, `wg.rs:715`). After a step larger than that, an
+  sees it (`already_accepted`, `wg.rs:716`). After a step larger than that, an
   initiation the peer made more than an hour before the step can still be
   accepted by the promoted `Tunn` until the peer's clock passes its old mark.
   Such a replay opens a session nobody can use. Each one takes one of
