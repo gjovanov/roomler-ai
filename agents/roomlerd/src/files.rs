@@ -230,6 +230,32 @@ pub(crate) enum FsAs {
         account: crate::fs_identity::Account,
         home: PathBuf,
     },
+    /// (Windows, a LocalSystem worker) the person signed in to this
+    /// process's session.
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    Person {
+        sid: String,
+        profile: PathBuf,
+        downloads: Option<PathBuf>,
+        token: crate::win_identity::PersonToken,
+    },
+    /// (Windows, a LocalSystem worker) nobody is signed in to this process's
+    /// session.
+    #[cfg(target_os = "windows")]
+    #[allow(dead_code)]
+    Nobody,
+}
+
+/// #3048 — who a transfer starting now writes as on Windows.
+#[cfg(all(target_os = "windows", test))]
+fn fs_as_for(
+    local_system: bool,
+    switch_on: bool,
+    person: Option<crate::win_identity::SessionPerson>,
+) -> FsAs {
+    let _ = (local_system, switch_on, person);
+    FsAs::Daemon
 }
 
 impl FsAs {
@@ -276,6 +302,8 @@ impl FsAs {
                     .map_err(|e| anyhow!("acting as {} for a received file: {e}", account.name))?;
                 f()
             }
+            #[cfg(target_os = "windows")]
+            Self::Person { .. } | Self::Nobody => f(),
         }
     }
 
@@ -289,6 +317,8 @@ impl FsAs {
                 privileged: true,
                 active_home: Some(home.to_string_lossy().into_owned()),
             },
+            #[cfg(target_os = "windows")]
+            Self::Person { .. } | Self::Nobody => writer_context(),
         }
     }
 }
@@ -594,6 +624,10 @@ pub(crate) struct PartialMeta {
     /// for collision-resolution.
     #[serde(default)]
     pub rel_path: Option<String>,
+    /// #3048 — the person the transfer began for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[allow(dead_code)]
+    pub person_sid: Option<String>,
 }
 
 /// Age threshold for [`sweep_orphans`] — partials older than this
@@ -1196,6 +1230,11 @@ pub struct FilesHandler {
     /// otherwise start a download after the teardown, whose pump outlives
     /// it (found in review; the clipboard's `stopped` is the same guard).
     ended: Arc<AtomicBool>,
+    /// #3048 — a test's own staging root, standing in for the machine one
+    /// ([`staging_root_windows`]), so the split between staging and placing
+    /// runs on any machine. `None` = [`partial_dir_for`]'s rule.
+    #[cfg(test)]
+    staging_root: Option<PathBuf>,
 }
 
 impl Default for FilesHandler {
@@ -1210,7 +1249,28 @@ impl FilesHandler {
             incoming: Arc::new(Mutex::new(None)),
             outgoing: Arc::new(Mutex::new(None)),
             ended: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            staging_root: None,
         }
+    }
+
+    /// #3048 — a handler that stages in `root`, as a Windows install stages in
+    /// the machine's own folder.
+    #[cfg(all(test, target_os = "windows"))]
+    pub(crate) fn with_staging_root(root: PathBuf) -> Self {
+        Self {
+            staging_root: Some(root),
+            ..Self::new()
+        }
+    }
+
+    /// The staging folder of upload `id` that targets `dest_dir`.
+    fn partial_dir(&self, dest_dir: &std::path::Path, id: &str) -> PathBuf {
+        #[cfg(test)]
+        if let Some(root) = &self.staging_root {
+            return root.join(id);
+        }
+        partial_dir_for(dest_dir, id)
     }
 
     /// Start a new incoming transfer (browser → host upload). Returns
@@ -1297,7 +1357,7 @@ impl FilesHandler {
         // rc.19: stage at <dest_dir>/.roomler-partial/<id>/data so a
         // mid-upload DC drop leaves the partial discoverable (B1 +
         // B2 fixes). `end()` renames to a freshly-resolved final path.
-        let partial_dir = partial_dir_for(&target_dir, &id);
+        let partial_dir = self.partial_dir(&target_dir, &id);
 
         // Every step below touches the target folder, so all of it runs as
         // `who` (FR-97 P3d).
@@ -1363,6 +1423,7 @@ impl FilesHandler {
                     reserved_final_path: reserved_final.clone(),
                     created_at_unix: chrono::Utc::now().timestamp(),
                     rel_path: rel_for_meta,
+                    person_sid: None,
                 };
                 let meta_path = partial_dir.join("meta.json");
                 let meta_bytes =
@@ -1699,6 +1760,19 @@ impl FilesHandler {
     /// when the agent's on-disk size is smaller than what the
     /// browser thinks it acked (B3 fix in the rc.19 plan).
     pub async fn resume_incoming(&self, id: &str, requested_offset: u64) -> Result<u64> {
+        self.resume_incoming_as(FsAs::now(), id, requested_offset)
+            .await
+    }
+
+    /// [`Self::resume_incoming`] with who a transfer starting now would be
+    /// written as: the seam the tests use.
+    pub(crate) async fn resume_incoming_as(
+        &self,
+        now: FsAs,
+        id: &str,
+        requested_offset: u64,
+    ) -> Result<u64> {
+        let _ = now;
         // Locate meta_path: registry first, then on-demand probe at
         // the canonical Downloads-rooted location for cross-restart
         // discovery survivors. Poison-tolerant — the HashMap has no
@@ -2817,6 +2891,12 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
             }
             Ok(person_downloads(home))
         }
+        #[cfg(target_os = "windows")]
+        FsAs::Person {
+            downloads, profile, ..
+        } => Ok(downloads.clone().unwrap_or_else(|| profile.clone())),
+        #[cfg(target_os = "windows")]
+        FsAs::Nobody => download_dir(),
     }
 }
 
@@ -2826,6 +2906,12 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
         FsAs::Daemon => default_download_dir(log),
         #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => Ok(person_downloads(home)),
+        #[cfg(target_os = "windows")]
+        FsAs::Person {
+            downloads, profile, ..
+        } => Ok(downloads.clone().unwrap_or_else(|| profile.clone())),
+        #[cfg(target_os = "windows")]
+        FsAs::Nobody => default_download_dir(log),
     }
 }
 
@@ -4751,6 +4837,7 @@ mod tests {
                 reserved_final_path: dest.join(format!("{id}.bin")),
                 created_at_unix: now - age_secs,
                 rel_path: None,
+                person_sid: None,
             };
             (dir, meta)
         };
@@ -4913,6 +5000,7 @@ mod tests {
                 reserved_final_path: root.join(format!("{id}.bin")),
                 created_at_unix: now - age_secs,
                 rel_path: None,
+                person_sid: None,
             };
             (dir, meta)
         };
@@ -5127,6 +5215,322 @@ mod seat_user_tests {
             assert_eq!(
                 download_dir_for(&who).await.unwrap(),
                 home.path().join("Fichiers")
+            );
+        }
+    }
+
+    /// #3048 — the Windows twin of `as_root`: a machine-wide (SystemContext)
+    /// worker writes a received file AS the person signed in to its session.
+    ///
+    /// A test runner is not SYSTEM and has no session user to ask for, so the
+    /// person is STOOD IN for: the runner's own token, duplicated at LOW
+    /// integrity (`win_token::low_integrity_copy`), handed to `FsAs::Person`
+    /// as a fixed token. A folder labelled low is one the person may write; an
+    /// unlabelled one reads as medium, which a low token may not write. The
+    /// runner itself, at medium or high, plays the daemon. This proves that
+    /// the person's identity is applied to every step on their side. It proves
+    /// nothing about `WTSQueryUserToken`, which needs SYSTEM: that half is the
+    /// lab's.
+    #[cfg(target_os = "windows")]
+    mod as_the_session_person {
+        use super::*;
+        use crate::win_identity::{PersonToken, SessionPerson};
+        use std::path::Path;
+
+        /// The person: the runner's own SID, through a low-integrity copy of
+        /// its token, with `downloads` as their Downloads.
+        fn person(profile: &Path, downloads: &Path) -> FsAs {
+            let token = crate::win_token::low_integrity_copy().expect("a low-integrity token");
+            FsAs::Person {
+                sid: crate::win_token::own_user_sid().expect("our own SID"),
+                profile: profile.to_path_buf(),
+                downloads: Some(downloads.to_path_buf()),
+                token: PersonToken::Fixed(std::sync::Arc::new(token)),
+            }
+        }
+
+        fn system32(tool: &str, args: &[&std::ffi::OsStr]) {
+            let out = std::process::Command::new(crate::appdirs::system32_tool(tool))
+                .args(args)
+                .output()
+                .unwrap_or_else(|e| panic!("{tool} runs: {e}"));
+            assert!(out.status.success(), "{tool} {args:?}: {out:?}");
+        }
+
+        /// A folder the low-integrity person may write: its own low label, not
+        /// handed down, so a file made inside it carries a label only when a
+        /// low token made it.
+        fn label_low(dir: &Path) {
+            system32(
+                "icacls.exe",
+                &[dir.as_os_str(), "/setintegritylevel".as_ref(), "L".as_ref()],
+            );
+        }
+
+        /// `from`, made to lead to the folder `to` (`mklink /J`).
+        fn lead_to(from: &Path, to: &Path) {
+            system32(
+                "cmd.exe",
+                &[
+                    "/c".as_ref(),
+                    "mklink".as_ref(),
+                    "/J".as_ref(),
+                    from.as_os_str(),
+                    to.as_os_str(),
+                ],
+            );
+        }
+
+        /// `path`'s mandatory label as SDDL (`S:(ML;;NW;;;LW)` for low), empty
+        /// when it has none (which reads as medium).
+        fn label_of(path: &Path) -> String {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::Security::Authorization::{
+                ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+                SDDL_REVISION_1, SE_FILE_OBJECT,
+            };
+            use windows_sys::Win32::Security::{LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: a NUL-terminated path and out-params; the descriptor is
+            // freed below.
+            let rc = unsafe {
+                GetNamedSecurityInfoW(
+                    wide.as_ptr(),
+                    SE_FILE_OBJECT,
+                    LABEL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut sd,
+                )
+            };
+            assert_eq!(rc, 0, "reading the label of {}", path.display());
+            let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+            // SAFETY: the descriptor read above; `text` is freed below.
+            let ok = unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    sd,
+                    SDDL_REVISION_1,
+                    LABEL_SECURITY_INFORMATION,
+                    &mut text,
+                    std::ptr::null_mut(),
+                )
+            };
+            // SAFETY: allocated by GetNamedSecurityInfoW, freed once.
+            unsafe { LocalFree(sd as _) };
+            assert!(ok != 0, "the label of {} as SDDL", path.display());
+            // SAFETY: a NUL-terminated string the call allocated.
+            let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+            let sddl = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+            // SAFETY: allocated by the conversion, freed once.
+            unsafe { LocalFree(text as _) };
+            sddl
+        }
+
+        /// A partial the daemon staged under `staging` for a transfer that
+        /// targets `dest`, begun for `person_sid`, and registered as staged by
+        /// the daemon (as the startup sweep registers one).
+        fn staged_partial(staging: &Path, id: &str, dest: &Path, person_sid: Option<&str>) {
+            let dir = staging.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = PartialMeta {
+                protocol_version: 1,
+                filename: "probe.txt".into(),
+                expected_size: 5,
+                dest_dir: dest.to_path_buf(),
+                reserved_final_path: dest.join("probe.txt"),
+                created_at_unix: chrono::Utc::now().timestamp(),
+                rel_path: None,
+                person_sid: person_sid.map(str::to_string),
+            };
+            std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::fs::write(dir.join("data"), b"").unwrap();
+            PARTIAL_REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    id.to_string(),
+                    PartialEntry {
+                        meta_path: dir.join("meta.json"),
+                        who: FsAs::Daemon,
+                    },
+                );
+        }
+
+        /// The person's Downloads leads to a folder they may not write: the
+        /// received file is refused, and nothing lands there, as for anything
+        /// they would write themselves.
+        #[tokio::test]
+        async fn a_link_in_the_persons_folder_is_followed_only_with_their_rights() {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = temp.path().join("profile");
+            std::fs::create_dir(&profile).unwrap();
+            let theirs_not = temp.path().join("admin-only");
+            std::fs::create_dir(&theirs_not).unwrap();
+            let downloads = profile.join("Downloads");
+            lead_to(&downloads, &theirs_not);
+            let h = FilesHandler::new();
+            let id = format!("w3048-link-{}", std::process::id());
+            let begun = h
+                .begin_as(
+                    person(&profile, &downloads),
+                    id.clone(),
+                    "probe.txt".into(),
+                    5,
+                    None,
+                    None,
+                )
+                .await;
+            if begun.is_ok() {
+                // Finished, so the file lands wherever the begin pointed it.
+                let _ = h.chunk(b"hello").await;
+                let _ = h.end(&id).await;
+            }
+            let landed: Vec<_> = std::fs::read_dir(&theirs_not)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert!(
+                landed.is_empty(),
+                "nothing lands where the person may not write: {landed:?}"
+            );
+            assert!(begun.is_err(), "the begin is refused");
+        }
+
+        /// Staging stays the daemon's (a folder the person may not write),
+        /// and the received file is copied into a new file the person makes:
+        /// it carries their low label, where a file the daemon renamed in
+        /// carries none.
+        #[tokio::test]
+        async fn the_programdata_split_stages_as_the_daemon_and_places_as_the_person() {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = temp.path().join("profile");
+            let downloads = profile.join("Downloads");
+            std::fs::create_dir_all(&downloads).unwrap();
+            label_low(&downloads);
+            let staging = temp.path().join("staging");
+            std::fs::create_dir(&staging).unwrap();
+            let h = FilesHandler::with_staging_root(staging.clone());
+            let id = format!("w3048-split-{}", std::process::id());
+            h.begin_as(
+                person(&profile, &downloads),
+                id.clone(),
+                "probe.txt".into(),
+                5,
+                None,
+                None,
+            )
+            .await
+            .expect("begin");
+            h.chunk(b"hello").await.expect("chunk");
+            let (placed, bytes) = h.end(&id).await.expect("end");
+            assert_eq!(bytes, 5);
+            assert_eq!(placed, downloads.join("probe.txt"));
+            assert_eq!(std::fs::read(&placed).unwrap(), b"hello");
+            let label = label_of(&placed);
+            assert!(
+                label.contains(";;;LW)"),
+                "born the person's, made by their token: {label:?}"
+            );
+            assert!(!staging.join(&id).exists(), "the staging is gone");
+        }
+
+        /// A resume places the file only for the person the transfer began
+        /// for; one from a daemon that recorded no person goes to whoever is
+        /// signed in now.
+        #[tokio::test]
+        async fn a_resume_places_only_for_the_person_it_began_for() {
+            let temp = tempfile::tempdir().unwrap();
+            let profile = temp.path().join("profile");
+            let downloads = profile.join("Downloads");
+            std::fs::create_dir_all(&downloads).unwrap();
+            label_low(&downloads);
+            let staging = temp.path().join("staging");
+            let me = person(&profile, &downloads);
+
+            let other = format!("w3048-other-{}", std::process::id());
+            staged_partial(&staging, &other, &downloads, Some("S-1-5-21-1-2-3-1001"));
+            let refused = FilesHandler::with_staging_root(staging.clone())
+                .resume_incoming_as(me.clone(), &other, 0)
+                .await
+                .expect_err("another person's transfer");
+            assert!(
+                format!("{refused:#}").contains("not signed in"),
+                "{refused:#}"
+            );
+
+            let older = format!("w3048-older-{}", std::process::id());
+            staged_partial(&staging, &older, &downloads, None);
+            let accepted = FilesHandler::with_staging_root(staging.clone())
+                .resume_incoming_as(me, &older, 0)
+                .await
+                .expect("a partial with no person recorded");
+            assert_eq!(accepted, 0);
+            PARTIAL_REGISTRY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|id, _| id != &other && id != &older);
+        }
+
+        /// With nobody signed in, a received file is refused with a reason the
+        /// viewer shows, and nothing is written.
+        #[tokio::test]
+        async fn nobody_signed_in_is_refused_with_a_reason() {
+            let temp = tempfile::tempdir().unwrap();
+            let dest = temp.path().to_string_lossy().into_owned();
+            let h = FilesHandler::new();
+            let id = format!("w3048-nobody-{}", std::process::id());
+            let err = h
+                .begin_as(
+                    FsAs::Nobody,
+                    id.clone(),
+                    "probe.txt".into(),
+                    5,
+                    None,
+                    Some(&dest),
+                )
+                .await
+                .expect_err("nobody to write as");
+            // What the viewer's `files:error` carries (`peer.rs` sends `{e}`).
+            assert_eq!(
+                format!("{err}"),
+                "Nobody is signed in to this computer to receive the file"
+            );
+            assert!(
+                std::fs::read_dir(temp.path()).unwrap().next().is_none(),
+                "nothing written"
+            );
+        }
+
+        /// Who a transfer writes as: the person signed in, on a LocalSystem
+        /// worker; nobody there refuses; anything else, or the switch off, is
+        /// the daemon itself.
+        #[test]
+        fn fs_as_for_takes_the_person_only_as_local_system() {
+            let p = SessionPerson {
+                sid: "S-1-5-21-1-2-3-1001".into(),
+                profile: r"C:\Users\p".into(),
+                downloads: Some(r"C:\Users\p\Downloads".into()),
+            };
+            assert_eq!(
+                fs_as_for(true, true, Some(p.clone())),
+                FsAs::Person {
+                    sid: p.sid.clone(),
+                    profile: p.profile.clone(),
+                    downloads: p.downloads.clone(),
+                    token: PersonToken::Session,
+                }
+            );
+            assert_eq!(fs_as_for(true, true, None), FsAs::Nobody);
+            assert_eq!(fs_as_for(false, true, Some(p.clone())), FsAs::Daemon);
+            assert_eq!(
+                fs_as_for(true, false, Some(p)),
+                FsAs::Daemon,
+                "the switch keeps the daemon's own identity"
             );
         }
     }

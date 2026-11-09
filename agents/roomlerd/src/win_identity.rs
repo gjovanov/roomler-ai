@@ -220,6 +220,56 @@ pub fn as_session_user<T>(f: impl FnOnce() -> T) -> Option<T> {
     Some(f())
 }
 
+/// #3048 — the person signed in to this process's session, as a SYSTEM
+/// worker writes a received file for them: read from their token, never from
+/// a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPerson {
+    /// Their SID (`S-1-5-21-…`).
+    pub sid: String,
+    /// Their profile folder, as Windows records it for them.
+    pub profile: std::path::PathBuf,
+    /// Their Downloads known folder, read without verifying it, so the
+    /// lookup never touches a share it is redirected to.
+    pub downloads: Option<std::path::PathBuf>,
+}
+
+/// #3048 — where a SYSTEM worker takes the person's token from, at every step
+/// it runs as them.
+#[derive(Clone)]
+pub enum PersonToken {
+    /// The person signed in to this process's session, asked for again at
+    /// each step (`WTSQueryUserToken`).
+    Session,
+    /// A token a test holds, standing in for the person.
+    #[cfg(test)]
+    Fixed(std::sync::Arc<crate::win_token::Owned>),
+}
+
+impl PartialEq for PersonToken {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Session, Self::Session) => true,
+            #[cfg(test)]
+            (Self::Fixed(a), Self::Fixed(b)) => std::sync::Arc::ptr_eq(a, b),
+            #[cfg(test)]
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PersonToken {}
+
+impl std::fmt::Debug for PersonToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session => f.write_str("Session"),
+            #[cfg(test)]
+            Self::Fixed(_) => f.write_str("Fixed"),
+        }
+    }
+}
+
 /// This process's OWN profile directory, from its own token — an
 /// unprivileged writer's home. A registry read, unlike the known-folder
 /// lookups `directories::UserDirs` makes (those verify every folder they
