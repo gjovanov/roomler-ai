@@ -83,6 +83,11 @@ pub struct Existing {
 /// the caller stops before the enroll spends the token on a config it could
 /// not write either. The text says what was found; the caller adds what to do,
 /// which is per platform.
+///
+/// #3609 — at the machine-global location a config that is not private to the
+/// computer's administrators, once the machine tree is repaired, is set aside:
+/// `cfg` is `None`, so a fresh config is written in its place, and the warning
+/// says so.
 pub fn read_existing(path: &Path) -> Result<Existing, String> {
     match roomlerd::config::read_merge_base(&path.to_path_buf()) {
         MergeBase::Absent => Ok(Existing {
@@ -107,10 +112,13 @@ pub fn read_existing(path: &Path) -> Result<Existing, String> {
             tracing::warn!(path = %path.display(), %reason, "the existing config may not be read by this process");
             Err(roomlerd::config::describe_denied(path, &reason))
         }
-        MergeBase::NotPrivate { .. } => Ok(Existing {
-            cfg: None,
-            warning: None,
-        }),
+        MergeBase::NotPrivate { reason } => {
+            tracing::warn!(path = %path.display(), %reason, "the existing config is not private to this computer's administrators; it is set aside");
+            Ok(Existing {
+                cfg: None,
+                warning: Some(roomlerd::config::describe_not_private(path, &reason)),
+            })
+        }
     }
 }
 

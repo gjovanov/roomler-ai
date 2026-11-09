@@ -706,6 +706,23 @@ async fn run_install_inner(
     // that org's row, never the primary's (the config's top-level ids).
     let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
     let added_org = roomlerd::enrollment::is_added_org(&outcome);
+    // #3609 — this elevated save takes the machine folder for Administrators
+    // first, the owner and nothing else, so the save's own repair seals it:
+    // the repair never takes over a folder another account made (a person's
+    // daemon stages received files below it). Best-effort, said if it fails.
+    #[cfg(target_os = "windows")]
+    if is_system_context && let Err(e) = roomlerd::config::take_machine_folder(&config_path) {
+        emit(
+            on_event,
+            ProgressEvent::PreflightWarning {
+                message: format!(
+                    "could not take the machine-global config folder for Administrators ({e}); \
+                     until it belongs to Administrators the service may not run this \
+                     enrollment as SYSTEM"
+                ),
+            },
+        );
+    }
     roomlerd::config::save(&config_path, &cfg)
         .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
     let written_at_ms = unix_now_ms();

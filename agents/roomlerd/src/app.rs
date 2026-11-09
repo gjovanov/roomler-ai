@@ -2699,7 +2699,29 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // must be re-enrolled` at ERROR — so enrolling a clean machine told the
     // operator to re-enroll it, mid-enrollment. Behaviour is unchanged: absent
     // still means "no machine_id to reuse".
-    let existing = config::read_if_present(&target_path);
+    //
+    // #3609 — at the machine-global location the config is folded into only
+    // when it is private to this computer's administrators once the machine
+    // tree is repaired (`config::read_merge_base`); one that is not is set
+    // aside, and a fresh config is written in its place. A config there that
+    // is absent, does not load or may not be read is nothing to fold, as the
+    // probe reads it.
+    let existing = if machine_global {
+        match config::read_merge_base(&target_path) {
+            config::MergeBase::Loaded(cfg) => Some(cfg),
+            config::MergeBase::NotPrivate { reason } => {
+                let said = config::describe_not_private(&target_path, &reason);
+                tracing::warn!(path = %target_path.display(), %reason, "enroll: {said}");
+                eprintln!("WARNING: {said}");
+                None
+            }
+            config::MergeBase::Absent
+            | config::MergeBase::Unreadable { .. }
+            | config::MergeBase::Denied { .. } => None,
+        }
+    } else {
+        config::read_if_present(&target_path)
+    };
     // FR-51 P3 — an ephemeral enrollment is a FRESH identity by definition:
     // folding it into an existing config would either hand this machine's
     // real device row a random fingerprint or hand the ephemeral row the
@@ -2811,6 +2833,28 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // start is already one row.
     if one_row {
         apply_one_row(&mut cfg);
+    }
+
+    // #3609 — an elevated save of the machine config takes the machine folder
+    // for Administrators first, the owner and nothing else, so the save's own
+    // repair seals it: the repair never takes over a folder another account
+    // made (a person's daemon stages received files below it).
+    #[cfg(target_os = "windows")]
+    if machine_global {
+        match config::take_machine_folder(&target_path) {
+            Ok(true) => tracing::info!(
+                path = %target_path.display(),
+                "enroll: the machine folder was taken for Administrators"
+            ),
+            Ok(false) => {}
+            Err(why) => {
+                tracing::warn!(%why, "enroll: the machine folder was not taken for Administrators");
+                eprintln!(
+                    "WARNING: {why}. Until the folder belongs to Administrators the service may \
+                     not run this enrollment as SYSTEM."
+                );
+            }
+        }
     }
 
     config::save(&target_path, &cfg).map_err(|e| {
@@ -2983,7 +3027,14 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
              prompt).",
             config::describe_denied(&target, &reason)
         ),
-        config::MergeBase::NotPrivate { .. } => None,
+        // #3609 — not private to the computer's administrators: never folded
+        // into; the adopted enrollment is written fresh in its place.
+        config::MergeBase::NotPrivate { reason } => {
+            let said = config::describe_not_private(&target, &reason);
+            tracing::warn!(path = %target.display(), %reason, "adopt-enrollment: {said}");
+            eprintln!("WARNING: {said}");
+            None
+        }
     };
     let previous = existing.clone();
     let new_agent_id = fresh.agent_id.clone();

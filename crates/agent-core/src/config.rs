@@ -3635,6 +3635,13 @@ impl MergeBase {
 /// is [`MergeBase::Denied`], never `Unreadable`, whose wording ("a fresh
 /// config is written, and this device's earlier settings do not carry over")
 /// would be false about a file that is only closed to the reader.
+///
+/// #3609 — at the machine-global location on Windows the merge base is the
+/// config SYSTEM runs, and only an elevated writer reads it (Setup's machine
+/// write, `roomlerd enroll --machine-global`, `roomlerd adopt-enrollment`). The
+/// machine tree is repaired first, as the save that follows will, and a config
+/// that then fails its check is [`MergeBase::NotPrivate`], never folded into;
+/// a config that does not load is recovered only from a `.prev` that passes.
 pub fn read_merge_base(path: &PathBuf) -> MergeBase {
     #[cfg(windows)]
     if let Some(tree) = machine_tree_of(path) {
@@ -3643,8 +3650,9 @@ pub fn read_merge_base(path: &PathBuf) -> MergeBase {
     merge_base(path, || Ok(()), try_load)
 }
 
-/// #3609 — [`read_merge_base`] at the machine-global location. RED: as
-/// anywhere else.
+/// #3609 — [`read_merge_base`] at the machine-global location: the repair and
+/// the check before anything is folded (`machine_tree::may_fold`), and the
+/// checked `.prev` ([`load_private_prev`]).
 #[cfg(windows)]
 fn machine_merge_base(
     path: &PathBuf,
@@ -3654,7 +3662,7 @@ fn machine_merge_base(
     merge_base(
         path,
         || crate::machine_tree::may_fold(tree, switches),
-        try_load,
+        load_private_prev,
     )
 }
 
@@ -3719,6 +3727,18 @@ pub fn describe_denied(path: &std::path::Path, reason: &str) -> String {
     )
 }
 
+/// #3609 — what to tell the person about a machine-global config that is not
+/// private to the computer's administrators ([`MergeBase::NotPrivate`]): it is
+/// set aside, and the enrollment is written fresh in its place.
+pub fn describe_not_private(path: &std::path::Path, reason: &str) -> String {
+    format!(
+        "{} is set aside, because {reason}: a config that is not private to this computer's \
+         administrators is never carried over. A fresh config is written in its place, and this \
+         device's earlier settings (its private network, routes, lock policy …) do not carry over.",
+        path.display()
+    )
+}
+
 /// #3116 — can a [`save`] at `path` create its file? Creates the parent
 /// directory, as a save would, then creates and removes the same sibling temp
 /// file a save writes first. For a caller that is about to spend something it
@@ -3744,9 +3764,28 @@ pub fn unreadable_copy_path(path: &std::path::Path) -> PathBuf {
 /// Copy a config that does not load aside ([`unreadable_copy_path`]) before it
 /// is written over, so whatever the person can still read out of it by hand
 /// is not lost. 0600 on Unix: a damaged config can still hold a bearer token.
+///
+/// #3609 — into a new file of its own (`machine_tree::create_fresh`): a file
+/// left under that name would keep its owner and DACL through a copy into it.
+/// At the machine-global location on Windows it gets SYSTEM and Administrators
+/// alone through its handle, as the config does.
 pub fn keep_unreadable(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
     let dest = unreadable_copy_path(path);
-    std::fs::copy(path, &dest)?;
+    let bytes = std::fs::read(path)?;
+    let mut copy = crate::machine_tree::create_fresh(&dest)?;
+    copy.write_all(&bytes)?;
+    copy.sync_all()?;
+    #[cfg(windows)]
+    if machine_tree_of(path).is_some()
+        && let Err(e) = crate::machine_tree::seal_new_file(&copy)
+    {
+        tracing::warn!(
+            path = %dest.display(), %e,
+            "config: could not give the kept copy its own owner and DACL; \
+             it keeps what its folder hands down"
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4402,6 +4441,27 @@ fn machine_tree_of(path: &std::path::Path) -> Option<crate::machine_tree::Machin
     path.starts_with(tree.folder()).then_some(tree)
 }
 
+/// #3609 — what an elevated save of the machine config (Setup's machine write,
+/// `roomlerd enroll --machine-global`) runs right before it [`save`]s at
+/// `path`: the machine folder is made if it is not there yet, as the save
+/// would make it, and taken for Administrators, its owner and nothing else
+/// (`machine_tree::adopt_machine_folder`), so that the save's own repair seals
+/// it. Never the daemon's: its saves and repairs take nothing over.
+/// `Ok(true)` when it was taken; `Ok(false)` at any other path, when there was
+/// nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+#[cfg(windows)]
+pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
+    let Some(tree) = machine_tree_of(path) else {
+        return Ok(false);
+    };
+    if !crate::machine_tree::Switches::from_env().repair {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(tree.folder())
+        .map_err(|e| format!("creating {}: {e}", tree.folder().display()))?;
+    crate::machine_tree::adopt_machine_folder(&tree)
+}
+
 /// #3609 — keep the outgoing config at `path` as its `.prev`, through a new
 /// file: the bytes go into a temp file this save made (never into a `.prev` or
 /// a temp file that was there, which would keep their owner and DACL), which
@@ -4457,19 +4517,28 @@ fn outgoing_bytes(path: &std::path::Path, machine: bool) -> Result<Option<Vec<u8
 
 /// #3609 — the `.prev` copy [`load`] recovers from. At the machine-global
 /// location on Windows it is taken only while it passes the machine tree's
-/// check, read through the handle it was checked on. It is not part of the
-/// chain the service checks before it runs the config, so an old copy another
-/// account made never stops a device: the next save replaces it with a new
-/// file ([`rotate_prev`]).
+/// check ([`load_private_prev`]). It is not part of the chain the service
+/// checks before it runs the config, so an old copy another account made never
+/// stops a device: the next save replaces it with a new file ([`rotate_prev`]).
 fn load_prev(path: &std::path::Path, prev: &PathBuf) -> Result<AgentConfig> {
     #[cfg(windows)]
-    if machine_tree_of(path).is_some()
-        && let Err(why) = crate::machine_tree::read_checked(prev, 1 << 20)
-    {
-        anyhow::bail!("{why}");
+    if machine_tree_of(path).is_some() {
+        return load_private_prev(prev);
     }
     #[cfg(not(windows))]
     let _ = path;
+    try_load(prev)
+}
+
+/// #3609 — a machine-global `.prev`, only while it is a plain file owned by
+/// SYSTEM or Administrators that no other account may change, checked through
+/// its handle (`machine_tree::read_checked`): what [`load`] and an elevated
+/// writer's merge base ([`read_merge_base`]) recover from.
+#[cfg(windows)]
+fn load_private_prev(prev: &PathBuf) -> Result<AgentConfig> {
+    if let Err(why) = crate::machine_tree::read_checked(prev, 1 << 20) {
+        anyhow::bail!("{why}");
+    }
     try_load(prev)
 }
 

@@ -36,6 +36,12 @@
 //!   [`read_record`].
 //! - The writers ([`create_fresh`], [`seal_new_file`]) make every file they
 //!   write: a file of that name made before them is never written into.
+//! - An elevated save of the machine config (Setup, `roomlerd enroll
+//!   --machine-global`) first takes the machine folder for Administrators, its
+//!   owner and nothing else ([`adopt_machine_folder`]); the repair never takes
+//!   over a folder another account owns. And an elevated writer folds a new
+//!   enrollment only into a config that passes the check after the repair
+//!   ([`may_fold`]); any other is replaced by a fresh one.
 //!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`
@@ -582,11 +588,40 @@ fn key_files(keys: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// An elevated save of the machine config takes the machine folder for
-/// Administrators before it writes. RED: master takes nothing over.
+/// An elevated save of the machine config (Setup's machine write, `roomlerd
+/// enroll --machine-global`, through `config::take_machine_folder`) takes the
+/// machine folder for Administrators before it writes, so that the save's own
+/// [`repair`] then seals it. The repair never takes over a folder another
+/// account owns: a person's daemon stages received files below it, and may
+/// have made it before the service ever ran, and such a device would wait for
+/// its machine enrollment.
+///
+/// The owner and nothing else, in one call: the DACL is the repair's to write,
+/// and nothing below the folder changes hands (what another account made there
+/// keeps its owner). A plain folder only: anything else is an `Err` naming it,
+/// and is never taken over. `Ok(true)` when it was taken; `Ok(false)` when it
+/// is not there, or SYSTEM or Administrators own it. The daemon never calls
+/// this: its own saves and repairs take nothing over.
 #[cfg(windows)]
-pub fn adopt_machine_folder(_tree: &MachineTree) -> Result<bool, String> {
-    Ok(false)
+pub fn adopt_machine_folder(tree: &MachineTree) -> Result<bool, String> {
+    let folder = tree.folder();
+    let Some(entry) = win::open(folder, win::Kind::Dir, false, true)? else {
+        return Ok(false);
+    };
+    let sd = win::read_sd(&entry.file)
+        .map_err(|e| format!("{}: reading its security: {e}", folder.display()))?;
+    if trusted(&sd.owner) {
+        return Ok(false);
+    }
+    if !entry.writable {
+        return Err(format!(
+            "{} is not taken for Administrators: this process may not change its owner",
+            folder.display()
+        ));
+    }
+    win::set_sd(&entry.file, true, None)
+        .map_err(|e| format!("{}: taking it for Administrators: {e}", folder.display()))?;
+    Ok(true)
 }
 
 /// B: may SYSTEM run the machine config under `tree`? `Ok` when the parent, the
@@ -607,41 +642,56 @@ pub fn check(tree: &MachineTree) -> Result<(), String> {
 
 #[cfg(windows)]
 fn check_chain(tree: &MachineTree) -> Result<(), Refusal> {
+    check_config(tree)?;
+    // `.prev` is not part of it: it is loaded only to recover a config that
+    // does not parse, and checked there (`config::load_prev`). An old copy
+    // another account made is replaced by the next save, never a reason the
+    // device stops.
+    if let Some(keys) = open_entry(&tree.keys(), win::Kind::Dir, false)? {
+        judge(&tree.keys(), &keys, WRITE_LIKE)?;
+        for key in key_files(&tree.keys()) {
+            if let Some(file) = open_entry(&key, win::Kind::File, false)? {
+                judge(&key, &file, WRITE_LIKE)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`check_chain`] as far as the config: the entries that decide who could
+/// have written it (the parent, the machine folder, the file), not the keys.
+/// What an elevated writer asks before it folds into it ([`may_fold`]).
+#[cfg(windows)]
+fn check_config(tree: &MachineTree) -> Result<(), Refusal> {
     // No config, no question: a waiting or attended host, whatever its folder
     // looks like, is quietly one with no machine enrollment.
     match std::fs::symlink_metadata(tree.config()) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Absent),
         _ => {}
     }
-    let open = |path: &Path, kind: win::Kind, read_data: bool| {
-        win::open(path, kind, read_data, false).map_err(Refusal::NotPrivate)
-    };
-    let Some(parent) = open(tree.parent(), win::Kind::Dir, false)? else {
+    let Some(parent) = open_entry(tree.parent(), win::Kind::Dir, false)? else {
         return Err(Refusal::Absent);
     };
     judge(tree.parent(), &parent, SWAP)?;
-    let Some(folder) = open(tree.folder(), win::Kind::Dir, false)? else {
+    let Some(folder) = open_entry(tree.folder(), win::Kind::Dir, false)? else {
         return Err(Refusal::Absent);
     };
     judge(tree.folder(), &folder, WRITE_LIKE)?;
     let config = tree.config();
-    let Some(file) = open(&config, win::Kind::File, true)? else {
+    let Some(file) = open_entry(&config, win::Kind::File, true)? else {
         return Err(Refusal::Absent);
     };
-    judge(&config, &file, WRITE_LIKE)?;
-    // `.prev` is not part of it: it is loaded only to recover a config that
-    // does not parse, and checked there (`config::load_prev`). An old copy
-    // another account made is replaced by the next save, never a reason the
-    // device stops.
-    if let Some(keys) = open(&tree.keys(), win::Kind::Dir, false)? {
-        judge(&tree.keys(), &keys, WRITE_LIKE)?;
-        for key in key_files(&tree.keys()) {
-            if let Some(file) = open(&key, win::Kind::File, false)? {
-                judge(&key, &file, WRITE_LIKE)?;
-            }
-        }
-    }
-    Ok(())
+    judge(&config, &file, WRITE_LIKE)
+}
+
+/// [`win::open`] for the check: read only, and a failure is a refusal.
+#[cfg(windows)]
+fn open_entry(
+    path: &Path,
+    kind: win::Kind,
+    read_data: bool,
+) -> Result<Option<win::Entry>, Refusal> {
+    win::open(path, kind, read_data, false).map_err(Refusal::NotPrivate)
 }
 
 #[cfg(windows)]
@@ -679,11 +729,33 @@ pub fn machine_config_opens(tree: &MachineTree, switches: Switches) -> bool {
     private_machine_config(tree, switches).is_ok()
 }
 
-/// Whether an elevated writer may fold a new enrollment into the machine
-/// config under `tree`. RED: master folds whatever is there.
+/// May an elevated writer (Setup's machine write, `roomlerd enroll
+/// --machine-global`, `roomlerd adopt-enrollment`) fold a new enrollment into
+/// the machine config under `tree`? R first (unless switched off), as the save
+/// that follows will run it, then B as far as the config ([`check_config`]):
+/// the parent, the machine folder and the file, not the keys. A config that
+/// fails is never folded into, whoever owns it: whoever else could change it
+/// may have chosen what it holds, so the writer writes a fresh one in its
+/// place (`config::MergeBase::NotPrivate`). `Ok` with no config there. With the
+/// check switched off a refusal is logged and the config folded into, as
+/// before #3609.
 #[cfg(windows)]
-pub fn may_fold(_tree: &MachineTree, _switches: Switches) -> Result<(), String> {
-    Ok(())
+pub fn may_fold(tree: &MachineTree, switches: Switches) -> Result<(), String> {
+    if switches.repair {
+        log_repairs(&repair(tree, true));
+    }
+    match check_config(tree) {
+        Ok(()) | Err(Refusal::Absent) => Ok(()),
+        Err(Refusal::NotPrivate(why)) if !switches.check => {
+            tracing::warn!(
+                reason = %why,
+                "machine tree: the machine config is not private; \
+                 ROOMLERD_MACHINE_TREE_CHECK=0, so an enrollment is folded into it anyway"
+            );
+            Ok(())
+        }
+        Err(Refusal::NotPrivate(why)) => Err(why),
+    }
 }
 
 /// Log what a repair changed, once per change, and what it left, once until
@@ -2275,6 +2347,7 @@ mod tests {
                 Err(Refusal::NotPrivate(_))
             ));
         }
+
 
         /// The brief's cell: a machine folder that is not a plain folder is
         /// refused, and the repair never touches what it leads to.
