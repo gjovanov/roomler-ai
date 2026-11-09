@@ -57,9 +57,8 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 /// Returns `None` if any of the discovery steps fail (no logged-in
 /// user, FFI failure).
 ///
-/// Used by the various `active_user_*_path()` helpers below; pulled
-/// out so each new feature with a profile-relative path doesn't
-/// re-implement the FFI dance.
+/// Used by the install clean-up (`install_cleanup.rs`), for the
+/// per-user leftovers of an earlier install.
 pub fn active_user_profile_root() -> Option<PathBuf> {
     let session_id = current_session_id()?;
     let username = user_name_for_session(session_id)?;

@@ -4471,7 +4471,10 @@ to-activate, so the browser never sees a bait-and-switch.
   profile), shown and changed from the companion's Overview —
   [desktop-companion.md](desktop-companion.md) §9 has the rules. Since FR-97
   P3d a Linux system install writes the file **as** the person at seat0, into
-  their Downloads, so it is born theirs (§9.1 there).
+  their Downloads, so it is born theirs (§9.1 there). Since #3048 a Windows
+  background-service install does the same, as the person signed in to the
+  session the service serves; with nobody signed in the upload is refused
+  with a reason the viewer shows (§9.2 there).
   Gated by `AgentCaps.files` — `upload · download ·
   download-folder · resume` always, `browse` only while
   `enable_remote_browse` is on. ⚠️ The list is assigned by the daemon in

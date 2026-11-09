@@ -513,7 +513,8 @@ struck through, and how long the probe took.
 The Overview's **Incoming files** card shows where a file a controller drops onto this
 screen will land **right now**, with **Open folder**, **Change…** (the native folder picker,
 which can create a folder) and **Use default**. The setting is `files_dir`; unset, the ladder
-is the active user's Downloads, then the service's own fallback. It is **live**: every
+is the active user's Downloads, then the service's own fallback (a Windows background service
+with nobody signed in refuses the file instead, §9.2). It is **live**: every
 transfer reads the current value, so a change needs no restart.
 
 ⚠️ `files_dir` is a security control, because the daemon writing the file can be SYSTEM or
@@ -559,9 +560,9 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who writes | `FsAs` (`:223-294`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:556-559`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
+| Who writes | `FsAs` (`:235-403`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:682-685`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
 | How | `FsAs::run` → `crate::fs_identity::FsIdentity` (FR-85's guard, moved out of `recording`) | Linux checks every open, create and unlink against the thread's fsuid, fsgid and groups; root's bypass capabilities leave with the fsuid |
-| Their folder | `person_downloads` / `xdg_download_dir` (`:310-343`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
+| Their folder | `person_downloads` / `xdg_download_dir` (`:436-469`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
 | The staging | `create_dir` and `create_new`, never reuse (`begin_as`) | a folder or a link planted where the staging goes refuses the begin |
 
 ⚠️ **Never as root followed by a `chown`.** In a folder the person owns, a link they planted
@@ -574,6 +575,44 @@ shows the begin refused, with a control proving root's own rights go straight th
 ⚠️ "The person" is seat0's (`companion::seat0_user`, FR-97 P5a), never whoever asked: an xrdp
 session sits on no seat. With nobody at seat0, the daemon's own ladder applies, as before.
 Downloads and browsing (the host → viewer direction) still read as the daemon.
+
+### 9.2 A Windows background-service install writes the file as the person at the screen (#3048)
+
+The background service's worker (SystemContext) is LocalSystem in the session it serves. It used to
+write a received file as LocalSystem: into a Downloads built from the person's user name, or, when
+that Downloads was out of its reach (redirected to a share), into the machine's own `uploads` folder.
+Either way the file was not the person's. It is now written the way §9.1 writes it on Linux: every
+path step on the person's side runs as the person signed in to that session, so the file is born
+theirs.
+
+```mermaid
+flowchart TD
+    B["files:begin"] --> L{"LocalSystem worker?"}
+    L -- "no, or ROOMLERD_FILES_AS_SEAT_USER=0" --> D["FsAs::Daemon<br/>files_dir, or the ladder"]
+    L -- "yes" --> S{"someone signed in<br/>to this session?"}
+    S -- "no" --> N["FsAs::Nobody: refused,<br/>'Nobody is signed in to this computer<br/>to receive the file'"]
+    S -- "yes" --> P["FsAs::Person<br/>SID, profile, Downloads from their token"]
+    P --> F["their files_dir (inside THEIR profile),<br/>else their Downloads known folder, else their profile"]
+    F --> T["staging in the service's own folder,<br/>as the service"]
+    T --> E["files:end: the data opened as the service;<br/>as the person, a new file made and filled;<br/>the staging removed as the service"]
+```
+
+| What | Where | Why |
+|---|---|---|
+| Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:235-262`), chosen by `fs_as_for` (`:279`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:276`), never from a name, which can name another account's folder |
+| How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:349`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
+| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:411`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). The status card takes it as it is and probes nothing |
+| The staging | `stager_for` (`:1391`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
+| The end | `place_across` (`:1828`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
+| A resume | `resume_incoming_as` (`:2013`), `PartialMeta::person_sid` (`:727`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
+
+- **A locked screen keeps its user**, so a file sent then lands in their Downloads.
+- **Nobody signed in** (before sign-in, after sign-out): the upload is refused with the reason
+  above, which the viewer shows. File transfer never writes as LocalSystem.
+- `files_dir` and a folder the viewer chose keep FR-84 D4's rule (inside the person's profile), and
+  are checked and written as the person.
+- `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the service's own identity, as on Linux.
+- Per-user and attended installs are unchanged: their daemon already is the person.
 
 ## 10. Starting after install, and the Welcome flow
 
