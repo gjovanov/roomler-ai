@@ -50,7 +50,7 @@ path is the same: `install.sh` without `--token` prints the enroll command to ru
 Every daemon-role arm of the wizard's detection says
 `supported: cfg!(target_os = "windows")` (`agents/roomler-setup/src/commands.rs:85, 92, 99, 109`),
 and the daemon surface off Windows is a set of no-op stubs
-(`agents/roomler-setup/src/orchestrator_agent.rs:758, 889, 922`). The docs say so plainly:
+(`agents/roomler-setup/src/orchestrator_agent.rs:772, 903, 936`). The docs say so plainly:
 on Linux and macOS the daemon is `install.sh` in a terminal, and the wizard does the tunnel
 client only (`docs/installation.md:22, 26`).
 

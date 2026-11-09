@@ -73,7 +73,7 @@ Every line below was read on `origin/master` at `861d4557`.
    agent uses that as its modal timeout. The doc-comment on
    `ConsentMode::PromptThenEmail` still describes a fallback that was never
    built (rewritten in P1–2, `e1501c9a4`). — `hub.rs:1922` (the per-mode window),
-   `models.rs:1320` (the doc-comment on the `PromptThenEmail` variant at `:1330`),
+   `models.rs:1323` (the doc-comment on the `PromptThenEmail` variant at `:1333`),
    `consent_consumer.rs:207` (the email leg; it was `state.rs:1199`)
 
 ### Desktop companion
@@ -90,13 +90,13 @@ Every line below was read on `origin/master` at `861d4557`.
    `/usr/local/bin` — hence the reported
    `Spawning self-update: No such file or directory (os error 2)`. The same
    failure kills apply-update, `probe_service_state`, service install/uninstall
-   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1905`
+   and the log-dir probe. — `agents/roomler-desktop/src/commands.rs:1906`
 8. ~~**macOS "Check for updates" targets the wrong mechanism.**~~ **Wrong —
    corrected during implementation.** The reported
    `Spawning self-update: No such file or directory (os error 2)` made this
    look like a second, independent macOS defect. It is not: `self_update_cmd`
    has queued the root `com.roomler.update` helper for a non-root macOS caller
-   since FR-5 (`app.rs:6144`), so the mechanism was already correct and
+   since FR-5 (`app.rs:6059`), so the mechanism was already correct and
    finding 7 alone accounts for the error. What WAS wrong is that
    `cmd_apply_update` spawned detached and discarded stdout, so the daemon's
    <!-- RETIRED-NAME-ANCHOR: quoting the daemon's OWN output; that log path is
@@ -168,7 +168,7 @@ dependency tree; and the macOS daemon **already ships as an `.app` with
 `LSUIElement=true`** (`release-agent.yml:2648`), the bundle identity AppKit
 windows require.
 
-⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:764`
+⚠️ **The macOS native backend has a prerequisite.** `agents/roomlerd/src/app.rs:771`
 is `#[tokio::main]`, so the main thread is parked in `block_on` for the daemon's
 whole life — the main dispatch queue never drains and AppKit can never deliver a
 click to an Approve button. The macOS arm has to build the runtime explicitly, run
