@@ -304,7 +304,7 @@ key, recording nothing (`pushed_tribool`,
 `crates/modules/fleet/src/remote_config.rs:197`). A tribool has no entries a
 device could skip, so an unreadable word would reach every device as a no-op
 reported as applied. Both ends read the word with one function
-(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2934`), and a test
+(`parse_pushed_tribool`, `crates/remote_control/src/models.rs:2947`), and a test
 holds it to what `roomler config set` reads. A word that reaches a device anyway,
 from some other server, leaves its key as it is, logged, and never fails the
 keys beside it (`agents/roomlerd/src/remote_config.rs:557`).
@@ -342,7 +342,7 @@ cell is on by default ([FR-132](fr/FR-132-zero-copy-by-default.md)).
 pushable** (FR-132 decision 1). Turning a cell on stays the device's decision,
 or a release's. `zero_copy` is a PREFIX of `zero_copy_deny`, so the test that
 guards it compares whole keys (`the_device_owned_refusals_are_not_pushable`,
-`crates/remote_control/src/models.rs:9560`); a prefix match would refuse the
+`crates/remote_control/src/models.rs:9646`); a prefix match would refuse the
 kill switch along with the switch.
 
 ⚠️ **A push reaches a connected device within seconds, and takes effect at the
@@ -366,7 +366,7 @@ sessions back to code the device already ran, or clears the list back to the
 built-in defaults, and never further, because nothing pushed can turn a path's new
 code on ahead of its default. The server checks the value's shape and refuses a
 spelling no device could read with a 400 (`check_media_path_list`,
-`crates/remote_control/src/models.rs:2958`, called at
+`crates/remote_control/src/models.rs:2971`, called at
 `crates/modules/fleet/src/remote_config.rs:279`), so `media-plan` or `Media_Plan`
 never reads as applied while doing nothing. It does not check the names, which
 belong to the device's build: it stores the value as given

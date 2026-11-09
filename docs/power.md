@@ -107,9 +107,9 @@ sequenceDiagram
 ### 3.1 The posture
 
 `PowerBrief { policy, on_ac?, held }`
-([`models.rs:1942`](../crates/remote_control/src/models.rs#L1942)) rides the
+([`models.rs:1955`](../crates/remote_control/src/models.rs#L1955)) rides the
 heartbeat as an optional `power`
-([`signaling.rs:676`](../crates/remote_control/src/signaling.rs#L676)). It is a
+([`signaling.rs:686`](../crates/remote_control/src/signaling.rs#L686)). It is a
 claim by the device, shown and never enforced on. The keeper publishes it before
 anything connects ([`app.rs:4702`](../agents/roomlerd/src/app.rs#L4702)) and
 after every pass, with what it actually holds, not what it wanted
@@ -121,7 +121,7 @@ after every pass, with what it actually holds, not what it wanted
   stay two answers.
 - `held: false` is what **asleep by policy** means: nothing was holding the
   machine, so the OS slept it as the policy allows
-  ([`models.rs:1963`](../crates/remote_control/src/models.rs#L1963)
+  ([`models.rs:1976`](../crates/remote_control/src/models.rs#L1976)
   `by_policy`). `held: true` means it slept past the hold: a closed lid, a
   person, or the OS overruling it.
 
@@ -142,7 +142,7 @@ every live control connection its goodbye
 
 The connection's own arm sends the frame, says it has gone out, closes every
 WebRTC peer and tunnel peer, and closes the socket
-([`signaling.rs:2242`](../agents/roomlerd/src/signaling.rs#L2242)). Then the run
+([`signaling.rs:2245`](../agents/roomlerd/src/signaling.rs#L2245)). Then the run
 loop holds every new dial until the wake
 ([`signaling.rs:1217`](../agents/roomlerd/src/signaling.rs#L1217),
 [`sleep_notice.rs:319`](../agents/roomlerd/src/sleep_notice.rs#L319)
@@ -152,7 +152,7 @@ sleep would say hello again and erase the reason.
 ### 3.3 The server
 
 - The fleet socket treats `rc:agent.sleeping` as the goodbye
-  ([`socket.rs:657`](../crates/modules/fleet/src/socket.rs#L657)). It records the
+  ([`socket.rs:661`](../crates/modules/fleet/src/socket.rs#L661)). It records the
   notice first, then leaves its loop, so the ordinary teardown runs at once: the
   hub unregistration, the `Offline` write, and the offline transition. Without
   the goodbye the device would read online until the receive deadline reaped a
@@ -168,7 +168,7 @@ sleep would say hello again and erase the reason.
 - The next hello `$unset`s `sleep`
   ([`agent.rs:492`](../crates/services/src/dao/agent.rs#L492)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
-  online ([`models.rs:1992`](../crates/remote_control/src/models.rs#L1992)). A
+  online ([`models.rs:2005`](../crates/remote_control/src/models.rs#L2005)). A
   read between the reconnect and that write never shows a stale "asleep".
 
 ### 3.4 What each surface shows
@@ -180,7 +180,7 @@ sleep would say hello again and erase the reason.
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
 | the admin agent API | `power`, `sleep` ([`agent.rs:644`](../crates/modules/fleet/src/agent.rs#L644)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
-| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3496`](../crates/remote_control/src/models.rs#L3496)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
+| peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3509`](../crates/remote_control/src/models.rs#L3509)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:
 

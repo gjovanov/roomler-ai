@@ -31,8 +31,8 @@ overlay address and loopback. It answers a probe on `127.0.0.1:47989` (`:44`), w
 (`:53`), returning a descriptor with freshly minted 1-hour credentials (`CRED_TTL`, `:68`; minted at `:268`). The
 viewer probes the whole range before every session (`probeLocalRelay`, `ui/src/composables/useRemoteControl.ts:7641`,
 called at `:9223`). It adds `turn:127.0.0.1:<port>` to its own ICE servers (`localRelayIceServer`, `:3811`) and
-forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `crates/remote_control/src/signaling.rs:1980`). The Hub stores it
-on the session (`crates/modules/fleet/src/hub.rs:1908`) and hands the remote agent `turn:<overlay>:<port>` with the
+forwards the descriptor on `rc:session.request` (`:10620`; the wire field is `crates/remote_control/src/signaling.rs:2018`). The Hub stores it
+on the session (`crates/modules/fleet/src/hub.rs:1911`) and hands the remote agent `turn:<overlay>:<port>` with the
 offer (`forward_offer`, `:2223`, the relay at `:2263`), only for an overlay address (`is_overlay_relay_ip`, `:66`) and
 only when the device lets remote desktop use the overlay (#1882's `rc_overlay`).
 
@@ -145,10 +145,10 @@ not on the device gets a loopback address it cannot use.
 | piece | where |
 |---|---|
 | The probe server publishes the relay on a process-wide `watch` (`report_tx`) when the TURN host comes up, moves or goes away, re-minted every half credential lifetime (`REPORT_REMINT`, 30 min); `None` on exit. The probe and the report mint through one function, which names the device | `agents/roomlerd/src/rc_local_turn.rs:138`, `:150`, `:164`, `:176` |
-| The primary org's connection subscribes after its hello, sends what it holds, then every change (`next_local_relay`, `send_local_relay`, `try_send`: a full queue waits for the next re-mint, and only the error's Display is logged) | `agents/roomlerd/src/signaling.rs:438`, `:457`, `:1983` |
+| The primary org's connection subscribes after its hello, sends what it holds, then every change (`next_local_relay`, `send_local_relay`, `try_send`: a full queue waits for the next re-mint, and only the error's Display is logged) | `agents/roomlerd/src/signaling.rs:438`, `:457`, `:1986` |
 | `local-relay` in `AgentCaps.rpc` while `ROOMLERD_LOCAL_TURN` is on | `agents/roomlerd/src/encode/caps.rs:2042` |
-| The wire: `rc:agent.local_relay` (Remote's), `local_relay_from` on the request, `local_relay` / `local_relay_refused` on the answer, `LocalRelayRefusal`'s five words | `crates/remote_control/src/signaling.rs:1013`, `:2006`, `:3300`, `:5479` |
-| The Hub keeps the report on the connection's entry (`set_agent_local_relay`), resolves a request against it (`resolve_local_relay`: same device, connected, owner, same organization, `rc_overlay`, a report), and echoes the relay or the refusal (`local_relay_reply`); a coalesced retry gets the live session's relay | `crates/modules/fleet/src/hub.rs:82`, `:3310`, `:3329`, `:3922`, `:3978` |
+| The wire: `rc:agent.local_relay` (Remote's), `local_relay_from` on the request, `local_relay` / `local_relay_refused` on the answer, `LocalRelayRefusal`'s five words | `crates/remote_control/src/signaling.rs:1023`, `:2044`, `:3392`, `:5582` |
+| The Hub keeps the report on the connection's entry (`set_agent_local_relay`), resolves a request against it (`resolve_local_relay`: same device, connected, owner, same organization, `rc_overlay`, a report), and echoes the relay or the refusal (`local_relay_reply`); a coalesced retry gets the live session's relay | `crates/modules/fleet/src/hub.rs:82`, `:3320`, `:3339`, `:3943`, `:3999` |
 | The viewer decides per connect (`localRelayPlan`): name the device, probe while none is known, or neither. A probe naming one of the person's own devices fills the choice in (`deviceToPairFromProbe`; someone else's device keeps the probe). A named device's relay arrives on `rc:session.created` and goes in with `setConfiguration` (`withLocalRelay`) before the offer | `ui/src/composables/useRemoteControl.ts:3798`, `:3823`, `:3840`, `:3852`, `:7285`, `:8410`, `:10756` |
 | Settings → "This browser runs on": the person's own devices that advertise `local-relay`, or none; the refusal in plain words beneath it | `ui/src/views/remote/RemoteControl.vue:1889`, `:3543` |
 
@@ -207,8 +207,8 @@ sequenceDiagram
 | A device stored before P3b is **legacy**. On a later connect the browser looks once more, only when the device list in view vouches for the stored device as the person's own (`mayLookAgain`; another organization in view, or a list that failed to load, waits for a later connect) and Chrome says the loopback permission is already granted (`loopback-network`, before the split `local-network-access`). It widens the pairing to every own device found, in probe order (the stored device was a race too), and that connect names them, so the Hub checks each. Found or not, the look happens once (`relayChoiceAfterProbe`) | `ui/src/composables/useRemoteControl.ts:4006`, `:4028`, `:4060`, `:9558` |
 | The plan names every paired device except the one being viewed; the request carries the first of each list where an older server reads it, and the rest as `local_relay_also` / `local_relay_from_also`; the answer's relays all go in with `setConfiguration`, in order | `ui/src/composables/useRemoteControl.ts:3961`, `:4083`, `:4099`, `:4112`, `:8671`, `:11034` |
 | The picker takes several devices; "Not set" or "None of my devices" picked wins over the rest | `ui/src/views/remote/RemoteControl.vue:1958`, `:3750`; `useRemoteControl.ts:4135` |
-| The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2037`, `:2044`, `:3349`, `:5573` |
-| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:85`, `:105`, `:126`, `:1746`, `:1974`, `:2405`, `:4156`, `:4165`; `crates/remote_control/src/session.rs:63` |
+| The wire: the two `_also` lists on the request, `local_relay_also` on the answer, `LOCAL_RELAYS_MAX` | `crates/remote_control/src/signaling.rs:2077`, `:2084`, `:3441`, `:5679` |
+| The Hub refuses a target whose `rc_overlay` is off first, whatever devices are named. Otherwise it resolves each named device on its own (`named_devices`, each once, at most four). The answer is `Ok` when any got a relay, else the **first** one's refusal. A probed list keeps one relay per address (`bounded_relays`); the session holds them all (`LiveSession::local_relays`); `forward_offer` hands the target each, behind the same overlay-range and `rc_overlay` gates; a coalesced retry gets the same list | `crates/modules/fleet/src/hub.rs:85`, `:105`, `:126`, `:1749`, `:1980`, `:2411`, `:4177`, `:4186`; `crates/remote_control/src/session.rs:63` |
 
 ⚠️ **ICE keeps the path that works, not the fastest one that works.** Chrome ranks its relay candidates by the order of
 its TURN servers, the first highest, and nominates the best-ranked pair that succeeds. The browser puts the relays in
@@ -287,7 +287,7 @@ its own sending is not known yet, and only `chrome://webrtc-internals` can show 
 - [x] **AC3 — owner-only.** A request naming a device the requester does not own is refused `not_your_device`, and no
   descriptor leaves the server. Also tested for `other_network`, `device_offline`, `rc_overlay_off` and
   `same_device`, each its own reason. **Met (tests, read 2026-11-03):**
-  `resolve_local_relay_hands_out_only_the_requesters_own_device` (`crates/modules/fleet/src/hub.rs:7320`) asserts all
+  `resolve_local_relay_hands_out_only_the_requesters_own_device` (`crates/modules/fleet/src/hub.rs:7346`) asserts all
   five refusals, and `a_named_device_s_relay_reaches_the_browser_and_the_target` (`:7390`) asserts through `dispatch`
   that the browser gets the word and no relay. A refused device adds nothing to the session's relays (`:4206`), so no
   descriptor reaches the target either. Both green on master in CI run 41538944854.

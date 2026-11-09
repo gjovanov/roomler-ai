@@ -59,7 +59,7 @@ Only `max_devices` and `max_tunnel_clients` are **established** — enforced wha
 an org created after 2026-08-30, by standing decision (`crates/db/src/models/tenant.rs:58`), so
 for a new signup MagicDNS and exit nodes already pass. The advertised "1 concurrent session"
 (Free) and "5" (Pro) are enforced **nowhere**: FR-32 withheld the gate because nothing wrote
-`remote_sessions` (`crates/services/src/dao/remote_session.rs:53`). That table is written now —
+`remote_sessions` (`crates/services/src/dao/remote_session.rs:58`). That table is written now —
 projected from the audit stream (`crates/remote_control/src/audit.rs:3`) — but it is
 best-effort: three rows have shown "open" for up to 25 days. **A gate must not count it.**
 
@@ -193,7 +193,7 @@ like the device cap: no org is over it today.
 (`org_session_cap_of`, `crates/modules/remote/src/controller.rs:654`) and hands it to the hub
 in `DispatchCtx`, and in the body of a request relayed to the pod that owns the device. The
 hub counts that org's live sessions after its coalesce, so a re-asked session is not a
-second one (`crates/modules/fleet/src/hub.rs:1658`). Tenant affinity puts an org's devices
+second one (`crates/modules/fleet/src/hub.rs:1661`). Tenant affinity puts an org's devices
 and its controllers on one pod, so that pod's count is the org's. Redis leases are needed
 only for the one case affinity cannot place: a session to **another** org's device, which
 must count against the controller's org. That is **P3b** (#2637), live since 2026-10-21 with
