@@ -202,6 +202,7 @@ starts the SYSTEM worker:
 | `… is owned by an account other than SYSTEM or Administrators`, or `… is left as it is: it is owned by an account that is not an administrator of this computer` | `takeown /F "<the entry>" /A`, for a folder with `/R /D Y` (`/D J` on German Windows) |
 | `… is a link (a junction or a symbolic link), not a plain folder` or `file` | move it away and put a plain folder or file in its place (step 2b or 2c for the config) |
 | `… lets an account other than SYSTEM or Administrators change it` | the repair is off (`ROOMLERD_MACHINE_TREE_REPAIR=0`), or this process may not change the entry; `icacls "<the entry>" /reset` from an elevated shell, or switch the repair back on |
+| `C:\ProgramData\roomler lets an account other than SYSTEM or Administrators rename or replace what it holds` | an entry the folder inherits, which the repair leaves: a person's daemon made the folder, so the creator's entry `%ProgramData%` hands down names that person | once the folder is Administrators' (`takeown /F C:\ProgramData\roomler /A`), `icacls C:\ProgramData\roomler /reset` |
 
 **Switches**, in the `Roomler` service's `Environment`
 (`roomlerd set-service-env-var`): `ROOMLERD_MACHINE_TREE_REPAIR=0` stops the
@@ -223,10 +224,11 @@ the installer and does not read the service's `Environment`: there, both are on.
 >   an empty DACL. Measured on 0.4.185, which took the directory first but
 >   still granted after.
 >
-> The service's repair writes each entry once, its DACL before its owner, so
-> SYSTEM keeps every entry it reached before; in one call with the owner, the
-> new DACL did not reach the children another account owns (measured on
-> #3609's tests). The wizard (`agents/roomler-setup/src/orchestrator_agent.rs:1728`)
+> The service's repair gives each folder its new DACL in one write, before its
+> owner, so SYSTEM keeps every entry it reached before; written in one call with
+> the owner, the new DACL did not reach the children another account owns
+> (measured on #3609's tests). A file gets both in one call. The wizard
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1728`)
 > takes `%ProgramData%\roomler` for Administrators, then drops its inheritance
 > and grants in one `icacls` call, and stops if it cannot take it.
 
