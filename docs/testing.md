@@ -487,7 +487,7 @@ what it measured (`target_fps`, `width`, `height`, `codec`, `chroma`, `carrier`,
   decode worker stamps its paint on its own, which reads a constant apart from the page's when the
   worker was made after its page (7.25 ms, 162 s after the page, on the Windows dev box: #3566).
   So a worker hands `paintedAt` back on the page's clock, through the skew the page measured when
-  it started the worker (`toPageEpochMs`, `ui/src/workers/rc-clock-cal.ts:160`;
+  it started the worker (`toPageEpochMs`, `ui/src/workers/rc-clock-cal.ts:191`;
   [remote-control.md §11.14.3](remote-control.md#11143-one-clock-for-the-page-and-its-worker-3566)).
   The `<video>` sampler stamps on the page's own clock. Under `roomler-rc-clock-cal=0`, or where
   no round trip came back fast enough to trust, a worker's stamp is its own, as before.

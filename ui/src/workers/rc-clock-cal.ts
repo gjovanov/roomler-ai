@@ -39,9 +39,13 @@
  * before #3566, bit for bit.
  *
  * ⚠️ The skew is only as fine as the browser's clock. Outside a cross-origin
- * isolated page Chrome coarsens `now()` to 100 µs, which adds about that to the
- * half round trip. A browser that coarsens to a millisecond or more measures the
- * skew to its grain, as it times every hop to its grain.
+ * isolated page Chrome coarsens `now()` to 100 µs ({@link CLOCK_GRAIN_MS}),
+ * which adds about that to the half round trip. That error is constant for the
+ * worker's life, and a relayed hop is about its size, so a real `fwd` hop can
+ * read a hair below zero. One below zero by no more than the error
+ * ({@link calBandMs}) counts as 0, and one further below is dropped as a fault
+ * (#3596, {@link fwdSampleMs}). A browser that coarsens to a millisecond or more
+ * measures the skew to its grain, as it times every hop to its grain.
  */
 import { epochNowMs } from './rc-hop-stats'
 
@@ -91,10 +95,12 @@ export interface ClockCalPong {
   tw: number
 }
 
-/** Page → worker: the worker's clock less the page's, in ms. */
+/** Page → worker: the worker's clock less the page's, in ms, and the round trip
+ *  it was measured on, whose half bounds its error (#3596). */
 export interface ClockCalMessage {
   type: 'clock-cal'
   skewMs: number
+  rttMs: number
 }
 
 /** The worker's answer to ping `seq`, stamped `tw` on the ping's arrival. */
@@ -144,6 +150,31 @@ export function normalizeSkewMs(v: unknown): number {
  *  worker's skew. With a skew of 0 it is `nowMs − sentAtMs`, bit for bit. */
 export function fwdHopMs(nowMs: number, sentAtMs: number, skewMs: number): number {
   return nowMs - sentAtMs - skewMs
+}
+
+/** Chrome's grain on `now()` outside a cross-origin isolated page: it coarsens
+ *  every stamp to 100 µs. */
+export const CLOCK_GRAIN_MS = 0.1
+
+/** #3596 — how far below zero a `fwd` reading of a real hop can fall, from the
+ *  round trip the skew was measured on: half of it plus a grain is the skew's
+ *  own error, and the hop's two stamps add a grain more. That holds on a clock
+ *  that truncates each stamp to its grain. Chrome rounds a stamp up or down at a
+ *  random point in its grain, so a hop can, rarely, read further below, and is
+ *  dropped as before. 0 for anything that is not a round trip: no band. */
+export function calBandMs(rttMs: unknown): number {
+  if (typeof rttMs !== 'number' || !Number.isFinite(rttMs) || rttMs < 0) return 0
+  return rttMs / 2 + 2 * CLOCK_GRAIN_MS
+}
+
+/** #3596 — a `fwd` reading as the accumulators take it: at or above zero as it
+ *  is, below zero by no more than `bandMs` as 0 (a real hop inside the clock's
+ *  error), and anything else null, a fault the caller drops. With a band of 0
+ *  it keeps exactly the readings `HopStats.add` and `LogHist.add` keep. */
+export function fwdSampleMs(rawMs: number, bandMs: number): number | null {
+  if (!Number.isFinite(rawMs)) return null
+  if (rawMs >= 0) return rawMs
+  return rawMs >= -bandMs ? 0 : null
 }
 
 /** FR-1 P7, FR-70 M0 — the agent's clock against the worker's, µs, which
@@ -222,7 +253,7 @@ export function createClockCalibration(deps: ClockCalDeps): ClockCalibration {
     halt()
     if (result.ok) {
       try {
-        deps.post({ type: 'clock-cal', skewMs: result.skewMs })
+        deps.post({ type: 'clock-cal', skewMs: result.skewMs, rttMs: result.rttMs })
       } catch {
         return // the worker is gone, and its path with it
       }

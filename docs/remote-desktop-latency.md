@@ -163,7 +163,7 @@ built **without a wire-format change**: the 13-byte video header already carried
   made after its page reads a constant apart from it (7.25 ms, 162 s after the
   page, on the Windows dev box). So the page measures that skew when it starts
   the worker, and the worker reads the offset through it
-  (`workerAgentOffsetUs`, `ui/src/workers/rc-clock-cal.ts:153`; #3566,
+  (`workerAgentOffsetUs`, `ui/src/workers/rc-clock-cal.ts:184`; #3566,
   [remote-control.md §11.14.3](remote-control.md#11143-one-clock-for-the-page-and-its-worker-3566)).
   Before that, a session whose worker started late read every age off by the
   skew.

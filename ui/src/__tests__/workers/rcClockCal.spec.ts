@@ -6,7 +6,8 @@
  *
  * The numbers are the Windows dev box's: a worker made 162 s after its page
  * read 7.25 ms behind it. The arithmetic and the page's half are pure and are
- * tested here, and so is the RTP transform worker's bench stamp. The
+ * tested here, and so is the RTP transform worker's bench stamp, and #3596's
+ * band, inside which a relayed hop that reads below zero counts as 0. The
  * data-channel worker is driven in `rcDcWorker.spec.ts`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -18,10 +19,13 @@ import {
   CAL_ROUNDS,
   CAL_SPACING_MS,
   CLOCK_CAL_STORAGE_KEY,
+  CLOCK_GRAIN_MS,
+  calBandMs,
   calSample,
   clockCalPong,
   createClockCalibration,
   fwdHopMs,
+  fwdSampleMs,
   normalizeSkewMs,
   pickCalSample,
   storedClockCal,
@@ -30,6 +34,7 @@ import {
   type ClockCalResult,
 } from '@/workers/rc-clock-cal'
 import { HopStats, frameAgeMs } from '@/workers/rc-hop-stats'
+import { LogHist } from '@/workers/rc-media-window'
 
 /** The worker's clock less the page's, measured on the dev box. */
 const SKEW = -7.25
@@ -135,6 +140,73 @@ describe("#3566 — a worker reads the page's timestamps through the skew", () =
 
   it("answers a ping with the seq it was given and the worker's own stamp", () => {
     expect(clockCalPong(4, T + SKEW)).toEqual({ type: 'clock-cal-pong', seq: 4, tw: T + SKEW })
+  })
+})
+
+describe("#3596 — a relayed hop inside the skew's error", () => {
+  /** The fastest round trip of #3566's 81 % read. */
+  const RTT = 0.1
+  const BAND = calBandMs(RTT)
+
+  it("is half the kept round trip and two of Chrome's 100 µs grains", () => {
+    expect(CLOCK_GRAIN_MS).toBe(0.1)
+    expect(BAND).toBeCloseTo(0.25, 9)
+    expect(calBandMs(0)).toBeCloseTo(2 * CLOCK_GRAIN_MS, 9)
+    expect(calBandMs(CAL_MAX_RTT_MS), 'the widest a trusted round trip gives').toBeCloseTo(0.7, 9)
+  })
+
+  it('is 0 for anything that is not a round trip', () => {
+    for (const v of [undefined, null, Number.NaN, Number.POSITIVE_INFINITY, -0.1, '0.1', {}]) {
+      expect(calBandMs(v), String(v)).toBe(0)
+    }
+  })
+
+  it('counts a reading below zero by no more than the band as 0, and keeps the rest as they are', () => {
+    expect(fwdSampleMs(-0.05, BAND)).toBe(0)
+    expect(fwdSampleMs(-BAND, BAND), 'at the band exactly').toBe(0)
+    for (const v of [0, 1e-4, 0.3, 2, 900]) {
+      expect(Object.is(fwdSampleMs(v, BAND), v), String(v)).toBe(true)
+    }
+  })
+
+  it('drops a reading past the band, and one that is not a number', () => {
+    expect(fwdSampleMs(-BAND - 1e-6, BAND), 'just past the band').toBeNull()
+    expect(fwdSampleMs(-5, BAND)).toBeNull()
+    for (const v of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(fwdSampleMs(v, BAND), String(v)).toBeNull()
+    }
+  })
+
+  it('times a 0.1 ms hop through a skew 0.15 ms off as 0, where it read negative and was dropped', () => {
+    // The ping took the whole 0.1 ms round trip, and the worker's stamp of it
+    // came out a grain late: the skew reads 0.15 ms high.
+    const cal = calSample(T, T + RTT + SKEW + CLOCK_GRAIN_MS, T + RTT)!
+    expect(cal.skewMs - SKEW).toBeCloseTo(0.15, 3)
+    const hop = 0.1
+    const raw = fwdHopMs(T + hop + SKEW, T, cal.skewMs)
+    expect(raw).toBeCloseTo(-0.05, 3)
+    expect(fwdSampleMs(raw, calBandMs(cal.rttMs))).toBe(0)
+    expect(fwdSampleMs(raw, 0), 'with no band, as before').toBeNull()
+  })
+
+  it('keeps exactly what HopStats and LogHist kept, with no band', () => {
+    const raws = [2, 0, -0, 1e-4, -1e-4, -0.05, -5, 1500, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]
+    for (const band of [0, calBandMs(undefined)]) {
+      const before = new HopStats()
+      const after = new HopStats()
+      const beforeHist = new LogHist()
+      const afterHist = new LogHist()
+      for (const raw of raws) {
+        before.add(raw)
+        beforeHist.add(raw)
+        const s = fwdSampleMs(raw, band)
+        if (s === null) continue
+        after.add(s)
+        afterHist.add(s)
+      }
+      expect(after.snapshotAndReset()).toEqual(before.snapshotAndReset())
+      expect(afterHist.take()).toEqual(beforeHist.take())
+    }
   })
 })
 
@@ -245,7 +317,8 @@ describe("#3566 — the page's half", () => {
     expect(h.results).toEqual([
       { ok: true, skewMs: expect.closeTo(SKEW, 3), rttMs: expect.closeTo(0.12, 3), samples: CAL_ROUND_TRIPS, rounds: 1 },
     ])
-    expect(h.verdicts()).toEqual([{ type: 'clock-cal', skewMs: (h.results[0] as { skewMs: number }).skewMs }])
+    const { skewMs, rttMs } = h.results[0] as { skewMs: number; rttMs: number }
+    expect(h.verdicts(), 'the skew, and the round trip it came from').toEqual([{ type: 'clock-cal', skewMs, rttMs }])
     expect(h.timers.size, 'nothing left running').toBe(0)
   })
 
@@ -269,7 +342,7 @@ describe("#3566 — the page's half", () => {
     expect(h.results).toEqual([
       { ok: true, skewMs: expect.closeTo(SKEW, 3), rttMs: expect.closeTo(0.3, 3), samples: 2 * CAL_ROUND_TRIPS, rounds: 2 },
     ])
-    expect(h.verdicts()).toHaveLength(1)
+    expect(h.verdicts()).toEqual([{ type: 'clock-cal', skewMs: expect.closeTo(SKEW, 3), rttMs: expect.closeTo(0.3, 3) }])
   })
 
   it(`gives up after ${CAL_ROUNDS} rounds with none trusted, and the worker keeps its own clock`, () => {
