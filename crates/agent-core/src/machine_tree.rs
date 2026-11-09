@@ -2348,6 +2348,40 @@ mod tests {
             ));
         }
 
+        /// A `%ProgramData%\roomler` another account owns (a person's daemon
+        /// made it, staging a received file before the service ever ran) is
+        /// refused, and the repair leaves it as it is: its owner may change
+        /// anything below it. The host runs the device as one with no
+        /// machine enrollment, and `keep-system-context` reads no record.
+        #[test]
+        fn a_parent_another_account_owns_is_refused_and_left_alone() {
+            if !elevated_or_skip("a parent another account owns") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.record(), b"{}").unwrap();
+            repair(&tree, false);
+            assert_eq!(check(&tree), Ok(()), "a repaired tree passes");
+            let other = local_guest().unwrap_or_else(|| USERS.to_string());
+            assert!(icacls(tree.parent(), &["/setowner", &format!("*{other}")]));
+            let parent = sddl(tree.parent());
+            repair(&tree, false);
+            assert_eq!(
+                sddl(tree.parent()),
+                parent,
+                "left as it is, its owner included"
+            );
+            let refused = format!("{} is owned by", tree.parent().display());
+            let why = check(&tree).expect_err("a parent another account owns");
+            assert!(why.contains(&refused), "the reason names the parent: {why}");
+            assert!(matches!(
+                private_machine_config(&tree, Switches::ON),
+                Err(Refusal::NotPrivate(_))
+            ));
+            let why = read_record(&tree, Switches::ON).expect_err("no record is read below it");
+            assert!(why.contains(&refused), "{why}");
+        }
 
         /// The brief's cell: a machine folder that is not a plain folder is
         /// refused, and the repair never touches what it leads to.
