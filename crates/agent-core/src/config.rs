@@ -623,6 +623,13 @@ pub struct AgentConfig {
     /// in the config surface.
     #[serde(default)]
     pub ws_flat_redial: Option<bool>,
+    /// FR-138 — keep a live remote-control session's peer through the loss of
+    /// the control socket, for the window the server announces (capped at
+    /// 120 s), instead of closing it with the socket
+    /// (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`). Built-in default: OFF. See
+    /// `rc_sessions_survive_reattach` in the config surface.
+    #[serde(default)]
+    pub rc_sessions_survive_reattach: Option<bool>,
     /// C4 stage 1 — the standing warm TURN/UDP allocation, established
     /// while UDP works and kept alive so corp-VPN flow-grandfathering
     /// preserves a UDP relay leg across a VPN connect. Measurement-only
@@ -2886,6 +2893,7 @@ pub fn test_fixture() -> AgentConfig {
         overlay_srflx_seek: None,
         ws_replaced_exit: None,
         ws_flat_redial: None,
+        rc_sessions_survive_reattach: None,
         overlay_warm_relay: None,
         overlay_quic_async: None,
         overlay_vpn_vantage: None,
@@ -3128,7 +3136,7 @@ mod derived_port_tests {
     }
 }
 
-pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95] {
+pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 96] {
     [
         ("SHARED_ENCODER", cfg.shared_encoder),
         ("AREA_MIN_BITRATE", cfg.area_min_bitrate),
@@ -3194,6 +3202,10 @@ pub fn env_bridge_bools(cfg: &AgentConfig) -> [(&'static str, Option<bool>); 95]
         ("OVERLAY_SRFLX_SEEK", cfg.overlay_srflx_seek),
         ("WS_REPLACED_EXIT", cfg.ws_replaced_exit),
         ("WS_FLAT_REDIAL", cfg.ws_flat_redial),
+        (
+            "RC_SESSIONS_SURVIVE_REATTACH",
+            cfg.rc_sessions_survive_reattach,
+        ),
         ("OVERLAY_WARM_RELAY", cfg.overlay_warm_relay),
         ("OVERLAY_QUIC_ASYNC", cfg.overlay_quic_async),
         ("OVERLAY_VPN_VANTAGE", cfg.overlay_vpn_vantage),

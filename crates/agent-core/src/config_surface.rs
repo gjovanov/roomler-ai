@@ -723,6 +723,14 @@ const KEYS: &[KeyMeta] = &[
         description: "FR-28: while the front load balancer answers 502 (a pod roll: its pin has no process behind it), redial the control WS and the central /derp WS every 0.5-1 s instead of climbing the backoff ladder, so a socket is back within a second of the replacement pod listening. Default OFF. Only a 502 at the upgrade is flat: every other failure, and a server that accepts and drops, keeps the ladder. Bounded at 30 flat redials per outage per socket, refilled by a connection that lived 30 s or a network change; a 502 that outlasts them climbs the ladder from where it stood. Regional relays keep their ladder. Env: ROOMLERD_WS_FLAT_REDIAL. Restart required.",
     },
     KeyMeta {
+        key: "rc_sessions_survive_reattach",
+        group: Group::NetworkCarriers,
+        tier: Tier::Advanced,
+        live: false,
+        kind: "tribool",
+        description: "FR-138: keep a live remote-control session through the loss of the control socket (a server roll, a path that drops) instead of closing it with the socket, until the server answers its claim on the next connection, for the window the server announces at most (capped at 120 s). Default OFF; on, it still keeps nothing unless the server announced a window. A stop, an update, sleep, rc:goodbye, a key rotation or a refused token still close every session, and kept sessions count against rc_max_sessions. Device-only: never pushable through remote config. Env: ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH. Restart required.",
+    },
+    KeyMeta {
         key: "overlay_warm_relay",
         group: Group::NetworkCarriers,
         tier: Tier::Advanced,
@@ -2015,6 +2023,7 @@ fn current_value(cfg: &AgentConfig, key: &str) -> Option<String> {
         "overlay_srflx_seek" => cfg.overlay_srflx_seek.map(fmt_bool),
         "ws_replaced_exit" => cfg.ws_replaced_exit.map(fmt_bool),
         "ws_flat_redial" => cfg.ws_flat_redial.map(fmt_bool),
+        "rc_sessions_survive_reattach" => cfg.rc_sessions_survive_reattach.map(fmt_bool),
         "overlay_warm_relay" => cfg.overlay_warm_relay.map(fmt_bool),
         "overlay_quic_async" => cfg.overlay_quic_async.map(fmt_bool),
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage.map(fmt_bool),
@@ -2436,6 +2445,7 @@ pub fn apply(cfg: &mut AgentConfig, key: &str, value: Option<&str>) -> Result<()
         "overlay_srflx_seek" => cfg.overlay_srflx_seek = parse_tribool(value)?,
         "ws_replaced_exit" => cfg.ws_replaced_exit = parse_tribool(value)?,
         "ws_flat_redial" => cfg.ws_flat_redial = parse_tribool(value)?,
+        "rc_sessions_survive_reattach" => cfg.rc_sessions_survive_reattach = parse_tribool(value)?,
         "overlay_warm_relay" => cfg.overlay_warm_relay = parse_tribool(value)?,
         "overlay_quic_async" => cfg.overlay_quic_async = parse_tribool(value)?,
         "overlay_vpn_vantage" => cfg.overlay_vpn_vantage = parse_tribool(value)?,
@@ -4021,6 +4031,41 @@ mod tests {
         );
         apply(&mut cfg, "ws_flat_redial", None).unwrap();
         assert_eq!(cfg.ws_flat_redial, None, "clear → built-in default");
+    }
+
+    /// FR-138 — keeping a session through the control socket's loss is opt-in,
+    /// reaches the daemon through the env bridge under the spelling
+    /// `session_table::survive_enabled` reads, and clears back to the built-in
+    /// default.
+    #[test]
+    fn rc_sessions_survive_reattach_set_echo_clear() {
+        let mut cfg = crate::config::test_fixture();
+        assert_eq!(
+            cfg.rc_sessions_survive_reattach, None,
+            "built-in default is OFF"
+        );
+        assert!(
+            !crate::config::env_fallbacks(&cfg).contains_key("RC_SESSIONS_SURVIVE_REATTACH"),
+            "an unset key must not reach the daemon's env at all"
+        );
+        apply(&mut cfg, "rc_sessions_survive_reattach", Some("on")).unwrap();
+        assert_eq!(cfg.rc_sessions_survive_reattach, Some(true));
+        assert_eq!(
+            current_value(&cfg, "rc_sessions_survive_reattach").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            crate::config::env_fallbacks(&cfg)
+                .get("RC_SESSIONS_SURVIVE_REATTACH")
+                .map(String::as_str),
+            Some("1"),
+            "what the bridge writes for true, which the switch reads as on"
+        );
+        apply(&mut cfg, "rc_sessions_survive_reattach", None).unwrap();
+        assert_eq!(
+            cfg.rc_sessions_survive_reattach, None,
+            "clear → built-in default"
+        );
     }
 
     /// W4(d) — the legacy ReplacedByNewer process-exit escalation is

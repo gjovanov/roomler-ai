@@ -13,7 +13,7 @@ to `Off` at enrolment with no way to change it short of hand-editing
 
 ## Root cause, with anchors
 
-`crates/agent-core/src/enrollment.rs:323` — every appended org, unconditionally:
+`crates/agent-core/src/enrollment.rs:324` — every appended org, unconditionally:
 
 ```rust
 let mut entry = crate::config::OrgEntry {
