@@ -1856,15 +1856,18 @@ jobs:
       - name: The installer's SystemContext record — unit tests (#1727)
         if: ${{ !cancelled() }}
         run: cargo test -p roomlerd --lib --features recording,openh264-encoder,synthetic-frame-source -- win_service::system_context_attempt --nocapture
-      # #3073 — a SystemContext host's first healthy run hardens the
-      # machine-global dir. Proven here on a real tree someone else owns (the
-      # elevated runner hands it to SYSTEM): with the owner taken and the grant
-      # made before inheritance goes, SYSTEM keeps full control of the
-      # directory and of every child. The other lane that runs
-      # `roomler-node-core` is Linux, where the test does not exist.
-      - name: The machine-global hardening keeps SYSTEM in (#3073)
+      # #3609 — the machine tree's repair and check (`machine_tree::`, which
+      # replaced the config save's `icacls` hardening) on real NTFS trees: an
+      # owner set to another account, a junction, a tree someone else owns
+      # (#3073: the elevated runner hands it to SYSTEM, and the repair keeps
+      # SYSTEM in on the folder and on every child). Setting an owner takes
+      # this lane's elevated token. The other lane that runs
+      # `roomler-node-core` is Linux, where these tests do not exist.
+      # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
+      # the whole workflow file fails to load), and no ` #` in a name.
+      - name: "The machine tree is repaired and checked (#3073, #3609)"
         if: ${{ !cancelled() }}
-        run: cargo test -p roomler-node-core --lib -- config::tests::harden --nocapture
+        run: cargo test -p roomler-node-core --lib -- machine_tree::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.

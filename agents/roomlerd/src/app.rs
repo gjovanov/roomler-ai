@@ -1155,12 +1155,14 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
         }
         // A read open, as the service host's check (`sc_config_opens`): a file
         // in a folder that refuses SYSTEM lists, and does not open.
+        let tree = roomler_node_core::machine_tree::MachineTree::here();
+        let switches = roomler_node_core::machine_tree::Switches::ON;
         let chosen = pick_config_path(
             explicit,
             is_sc,
             Some(machine_global.as_path()),
             &default,
-            |p| std::fs::File::open(p).is_ok(),
+            |p| roomlerd::win_service::supervisor::rung_opens(&tree, switches, p),
         );
         tracing::info!(
             config_path = %chosen.display(),
@@ -8069,6 +8071,47 @@ mod tests {
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
         let got = pick_config_path(None, true, Some(mg), default, |p| p == default);
         assert_eq!(got, default);
+    }
+
+    /// #3609 — the service host and the worker's ladder read the machine rung
+    /// through one function (`win_service::supervisor::rung_opens`), so they
+    /// cannot disagree: both refuse a machine config another account may
+    /// change while the repair is off, and both take it once the repair has
+    /// put it back to SYSTEM and Administrators.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_host_and_the_worker_refuse_the_same_config() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        use roomlerd::win_service::supervisor::{config_opens_in, rung_opens};
+        if !elevated_or_skip("the host and the worker on one config") {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let tree = enrolled_tree(root.path());
+        assert!(icacls(&tree.config(), &["/grant", "*S-1-5-32-546:(M)"]));
+        let mg = tree.config();
+        let absent = root.path().join("systemprofile").join("config.toml");
+        for switches in [
+            Switches {
+                repair: false,
+                check: true,
+            },
+            Switches::ON,
+        ] {
+            let host = config_opens_in(&tree, switches, Some(absent.clone()));
+            let ladder_opened = std::cell::Cell::new(None);
+            let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
+                let opens = rung_opens(&tree, switches, p);
+                if p == mg {
+                    ladder_opened.set(Some(opens));
+                }
+                opens
+            });
+            assert_eq!(picked, mg);
+            assert_eq!(Some(host), ladder_opened.get(), "{switches:?}");
+            assert_eq!(host, switches.repair, "{switches:?}");
+        }
     }
 
     /// #3387 — the service host hands a worker it starts as the person, while

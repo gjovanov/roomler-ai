@@ -40,6 +40,9 @@ pub mod files_dir;
 pub mod logging;
 pub mod logs_upload;
 pub mod machine;
+/// #3609 — the chain a Windows background service loads its machine
+/// enrollment from: repaired, then checked, and written only through new files.
+pub mod machine_tree;
 pub mod notify;
 /// FR-129 — the device-pairing client (`/api/pair/start`, `/api/pair/poll`):
 /// the wizard's half in A3, the daemon's `enroll --pair` in A4.

@@ -948,9 +948,28 @@ pub(crate) fn want_system_worker(
 /// worker's ladder takes, through the same resolvers, read by the same account
 /// (this host is LocalSystem), so the host and the worker cannot disagree.
 fn sc_config_opens() -> bool {
-    let machine = crate::config::machine_global_config_path();
+    use roomler_node_core::machine_tree::{MachineTree, Switches};
     let profile = crate::config::default_config_path().ok();
-    config_opens(std::iter::once(machine).chain(profile))
+    config_opens_in(&MachineTree::here(), Switches::ON, profile)
+}
+
+/// #3609 — the host's question over `tree`: does any rung open.
+pub(crate) fn config_opens_in(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
+    profile: Option<PathBuf>,
+) -> bool {
+    rung_opens(tree, switches, &tree.config())
+        || profile.is_some_and(|p| rung_opens(tree, switches, &p))
+}
+
+/// #3609 — one rung of the SystemContext ladder. RED: master's read open.
+pub(crate) fn rung_opens(
+    _tree: &roomler_node_core::machine_tree::MachineTree,
+    _switches: roomler_node_core::machine_tree::Switches,
+    path: &std::path::Path,
+) -> bool {
+    config_opens(std::iter::once(path.to_path_buf()))
 }
 
 /// #3387 — any of `paths` opens for reading. An open, not `exists()`: a file in
@@ -3136,6 +3155,34 @@ mod tests {
         assert!(!opens, "and does not open");
         assert!(one_of_two, "one enrollment that opens is enough");
         assert!(!absent);
+    }
+
+    /// #3609 — a host with the service and no machine enrollment keeps the
+    /// machine folder as `%ProgramData%` hands it down, so the person's own
+    /// daemon may stage files there. A `config.toml` another account put in
+    /// it is not the machine's enrollment: the host never starts the SYSTEM
+    /// worker on it, and the folder is left as it was.
+    #[test]
+    fn a_config_another_account_put_in_an_open_machine_folder_is_not_taken() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        if !elevated_or_skip("a config in an open machine folder") {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let tree = waiting_tree(root.path());
+        let folder = sddl(tree.folder());
+        assert!(names(&folder, USERS), "the folder is open: {folder}");
+        std::fs::write(tree.config(), "agent_token = \"t\"\n").expect("the config");
+        let other = local_guest().unwrap_or_else(|| USERS.to_string());
+        assert!(icacls(&tree.config(), &["/setowner", &format!("*{other}")]));
+        assert!(!config_opens_in(&tree, Switches::ON, None));
+        assert!(!want_system_worker(true, false, || config_opens_in(
+            &tree,
+            Switches::ON,
+            None
+        )));
+        assert_eq!(sddl(tree.folder()), folder, "the folder is left as it was");
     }
 
     /// #3387 — the user-context arm runs a person-writable config, so while

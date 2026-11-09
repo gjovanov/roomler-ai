@@ -4820,6 +4820,50 @@ machine_name = "devbox"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #3609 — a save writes only files it made itself. A file left under the
+    /// save's temp name or the `.prev` name keeps its own owner and DACL
+    /// through a write into it, and a rename carries them to the config. So
+    /// neither may receive the config: each is replaced by a new file. A hard
+    /// link to each pre-made file is the witness, on any filesystem: it still
+    /// reads what it held when the save is done.
+    #[test]
+    fn a_save_never_writes_into_a_file_it_did_not_make() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let cfg: AgentConfig = toml::from_str(&minimal_toml()).expect("parses");
+        save(&path, &cfg).expect("a first save, so the next one rotates");
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        let made_before: [(std::path::PathBuf, &str); 2] = [
+            (tmp, "made before the save"),
+            (prev_path(&path), "an old .prev"),
+        ];
+        let witnesses = dir.path().join("witnesses");
+        std::fs::create_dir(&witnesses).unwrap();
+        for (i, (file, text)) in made_before.iter().enumerate() {
+            std::fs::write(file, text).unwrap();
+            std::fs::hard_link(file, witnesses.join(i.to_string())).expect("a hard link");
+        }
+        let mut next = cfg.clone();
+        next.machine_name = "renamed".into();
+        save(&path, &next).expect("the save");
+        let written_into: Vec<String> = made_before
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, text))| {
+                std::fs::read_to_string(witnesses.join(i.to_string())).unwrap() != *text
+            })
+            .map(|(_, (file, _))| file.display().to_string())
+            .collect();
+        assert!(written_into.is_empty(), "written into: {written_into:?}");
+        assert_eq!(load(&path).unwrap().machine_name, "renamed");
+        assert_eq!(
+            try_load(&prev_path(&path))
+                .expect(".prev is the config before")
+                .machine_name,
+            "devbox"
+        );
+    }
+
     fn unknown_names(path: &std::path::Path) -> Vec<String> {
         let mut names: Vec<String> = unknown_keys(&std::fs::read_to_string(path).unwrap())
             .unwrap()
