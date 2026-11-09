@@ -331,8 +331,9 @@ async fn an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads()
         assert!(kinds.contains(&want), "no {want} in {kinds:?}");
     }
 
-    // Nothing projects the new kinds onto the row yet (FR-138 P1b does): the
-    // row reads, with none of the resume fields.
+    // A detach lands only on a live row at the fencing number it names, and a
+    // resume is written by the claim itself, never by the sink (P1b-1): this
+    // row never went live, so it reads with none of the resume fields.
     let row = app
         .db
         .collection::<Document>("remote_sessions")

@@ -1297,6 +1297,9 @@ async fn session_audit_reads_back_rows_the_audit_sink_wrote() {
         AuditKind::SessionEnded {
             reason: EndReason::ControllerHangup,
             limit: None,
+            attach_seq: None,
+            ended_at: None,
+            end_source: None,
         },
     );
     // Closing the channel makes the flusher drain and exit: every write

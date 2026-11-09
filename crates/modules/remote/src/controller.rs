@@ -1002,6 +1002,37 @@ fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::O
     }
 }
 
+/// FR-138 — the gate a new `rc:session.request` runs, run again for a claim
+/// on a session the controller already had (spec §4.4, "The claim"): the
+/// device not quarantined, the org not archived, and the controller its
+/// owner, or a member still holding what a request needs on it. Consent is
+/// the one check not re-run: the session is the one the device decided on.
+/// The request is the plainest one (no break-glass reason, no relay), so the
+/// answer is what that controller may do now.
+pub(crate) async fn authorize_resume(
+    state: &RemoteState,
+    controller_user_id: ObjectId,
+    agent_id: ObjectId,
+) -> Result<SessionAuthz, String> {
+    let request = ClientMsg::SessionRequest {
+        agent_id,
+        permissions: roomler_ai_remote_control::permissions::Permissions::VIEW,
+        browser_caps: Vec::new(),
+        preferred_transport: None,
+        chroma_pref: None,
+        chunk_framing: None,
+        audio_enabled: false,
+        override_reason: None,
+        local_relay: None,
+        local_relay_from: None,
+        local_relay_also: Vec::new(),
+        local_relay_from_also: Vec::new(),
+        replaces: None,
+    };
+    let text = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    resolve_session_authz(state, controller_user_id, &text).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

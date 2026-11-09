@@ -76,10 +76,23 @@ pub async fn claim(
     device: ObjectId,
     cap: u32,
 ) -> SlotDecision {
+    claim_for(state, scope, ObjectId::new(), user, device, cap).await
+}
+
+/// [`claim`], under `session`'s own id: FR-138's claim takes a resumed
+/// session's slot again, finding its own lease (renewed) or claiming a new
+/// one. Pending from here until [`release_unused`] or [`settle`].
+pub async fn claim_for(
+    state: &RemoteState,
+    scope: SlotScope,
+    session: ObjectId,
+    user: ObjectId,
+    device: ObjectId,
+    cap: u32,
+) -> SlotDecision {
     let Some(slots) = &state.session_slots else {
         return SlotDecision::Fallback;
     };
-    let session = ObjectId::new();
     let pod = state.pod.pod_id.clone();
     PENDING.insert(session);
     let mut retried = false;
@@ -146,4 +159,10 @@ pub async fn release_unused(state: &RemoteState, lease: &Lease, created: Option<
     {
         warn!(session = %lease.session, %e, "session slot: an unused slot was not given back; it expires on its own");
     }
+}
+
+/// FR-138 — the claim is no longer pending, and the slot stays held: the hub
+/// holds the session now, or another claim of it will take the lease again.
+pub fn settle(lease: &Lease) {
+    PENDING.remove(&lease.session);
 }

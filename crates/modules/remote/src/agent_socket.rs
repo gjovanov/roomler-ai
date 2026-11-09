@@ -13,7 +13,7 @@ use roomler_ai_remote_control::models::{
 };
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::{ClientMsg, TransferDirection, Transfers};
-use roomler_core::{AgentCtx, AgentMsgHandler};
+use roomler_core::{AgentCtx, AgentMsgHandler, AgentSocketLifecycle};
 use tracing::{debug, warn};
 
 use crate::RemoteState;
@@ -409,5 +409,26 @@ impl RemoteAgentSocket {
             // Best-effort, like every activity log: never gates the session.
             debug!(agent = %ctx.agent_id, %e, "transfer activity write failed");
         }
+    }
+}
+
+/// FR-138 — `remote`'s half of the agent socket's lifecycle: at the hello,
+/// before the socket's read loop starts, the device's claims on the sessions
+/// it kept and the registration read ([`crate::resume`]). Nothing for a
+/// connection announced no window.
+pub struct RemoteAgentLifecycle {
+    state: RemoteState,
+}
+
+impl RemoteAgentLifecycle {
+    pub fn new(state: RemoteState) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl AgentSocketLifecycle for RemoteAgentLifecycle {
+    async fn hello(&self, ctx: &AgentCtx) {
+        crate::resume::on_hello(&self.state, ctx).await;
     }
 }
