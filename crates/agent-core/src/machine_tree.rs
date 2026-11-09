@@ -421,10 +421,10 @@ fn is_sealed(sd: &Sd, flags: u8) -> bool {
 /// before it holds one. Every entry is opened by handle and changed through
 /// that handle, never through a junction or a symbolic link: such an entry,
 /// and anything below it, is left for [`check`] to refuse. The order keeps
-/// SYSTEM in at every step (#3073): each entry gets its final DACL in one
+/// SYSTEM in at every step (#3073): each folder gets its final DACL in one
 /// write, which never takes anything from SYSTEM or Administrators, and only
-/// then its owner (`win::write_sd`); the files go before the folders that
-/// hold them.
+/// then its owner; a file gets both in one call (`win::write_sd`). The files
+/// go before the folders that hold them.
 #[cfg(windows)]
 pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     let mut out = Repairs::default();
@@ -787,12 +787,14 @@ pub fn read_checked(path: &Path, max_len: u64) -> Result<Option<Vec<u8>>, String
 
 /// W: give a file this process just made ([`create_fresh`]) Administrators as
 /// its owner and a protected DACL of SYSTEM and Administrators alone, through
-/// its handle, before it takes its name. `Err` when this process may not (it
-/// is not SYSTEM or an elevated administrator): the file then keeps what its
-/// folder hands down, and the next [`repair`] does the rest.
+/// its handle, before it takes its name. One call, so the two land together or
+/// not at all (a file has nothing below it to hand a DACL down to). `Err` when
+/// this process may not (it is not SYSTEM or an elevated administrator): the
+/// file then keeps what its folder hands down, its writer can still rename it
+/// into place, and the next [`repair`] does the rest.
 #[cfg(windows)]
 pub fn seal_new_file(file: &std::fs::File) -> std::io::Result<()> {
-    win::write_sd(file, true, Some((&sealed_aces(0), true)))
+    win::set_sd(file, true, Some((&sealed_aces(0), true)))
 }
 
 /// FR-94's reader, shared (it moved here from `roomlerd`'s `exec_service`):
@@ -1130,25 +1132,28 @@ mod win {
     /// owner when `take`. On a folder the system hands the new inheritable
     /// ACEs down to what it holds, and never follows a link below it.
     ///
-    /// ⚠️ Two calls, the DACL first. With the owner in the same call, the
-    /// hand-down stopped at each entry below that another account owns, when
-    /// the process held the privileges that override a DACL disabled, as the
-    /// service does (measured: such a child kept every ACE it had inherited
-    /// before). The DACL alone reaches them. The DACL never leaves SYSTEM or
-    /// Administrators out, so taking the owner after it is still allowed.
+    /// ⚠️ On a folder, two calls, the DACL first. With the owner in the same
+    /// call, the hand-down stopped at each entry below that another account
+    /// owns, when the process held the privileges that override a DACL
+    /// disabled, as the service does (measured: such a child kept every ACE it
+    /// had inherited before). The DACL alone reaches them. The DACL never
+    /// leaves SYSTEM or Administrators out, so taking the owner after it is
+    /// still allowed. A file has nothing below it: one call, both or neither.
     pub(super) fn write_sd(
         file: &std::fs::File,
         take: bool,
         dacl: Option<(&[Ace], bool)>,
     ) -> std::io::Result<()> {
-        if take && dacl.is_some() {
+        if take && dacl.is_some() && file.metadata()?.is_dir() {
             set_sd(file, false, dacl)?;
             return set_sd(file, true, None);
         }
         set_sd(file, take, dacl)
     }
 
-    fn set_sd(
+    /// [`write_sd`]'s one call: the owner (when `take`) and `dacl` together,
+    /// both or neither.
+    pub(super) fn set_sd(
         file: &std::fs::File,
         take: bool,
         dacl: Option<(&[Ace], bool)>,
