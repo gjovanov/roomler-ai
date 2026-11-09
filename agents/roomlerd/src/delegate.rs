@@ -3354,6 +3354,9 @@ mod secondary_org_tests {
 
     #[tokio::test]
     async fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
+        // #3548 — no lib test runs the real probe: the loop's probe thread finds
+        // this answer, and the loop does not wait for one.
+        crate::encode::caps::install_first_answer_for_tests();
         for one_row in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let host = DelegateHost::new();
@@ -3442,5 +3445,10 @@ mod secondary_org_tests {
             let _ = stop.send(true);
             let _ = tokio::time::timeout(PATIENCE, task).await;
         }
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 }

@@ -399,6 +399,9 @@ mod tests {
             false,
             false,
         );
+        // #3548 — no lib test runs the real probe: the loop's probe thread finds
+        // this answer, and the loop does not wait for one.
+        crate::encode::caps::install_first_answer_for_tests();
         let task = tokio::spawn(signaling::run(
             ctx,
             crate::delegate::Delegation::Worker(crate::delegate::WorkerLink { inbound, outbound }),
@@ -526,6 +529,11 @@ mod tests {
         let _ = browser.close().await;
         let _ = worker.stop.send(true);
         let _ = tokio::time::timeout(PATIENCE, worker.task).await;
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 
     /// A control plane that sends an offer the moment it is dialled: what a
@@ -595,5 +603,10 @@ mod tests {
         let _ = worker.stop.send(true);
         let _ = tokio::time::timeout(PATIENCE, worker.task).await;
         let _ = browser.close().await;
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 }
