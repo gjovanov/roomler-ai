@@ -33,7 +33,10 @@ use crate::tunnel_tests::{connect_agent_ws, enroll_agent, read_until, wait_agent
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-async fn call(
+/// One request with a bearer token: the status, and the body as JSON (a body
+/// that is not JSON comes back as a string). Shared with
+/// `magic_dns_permission_tests`.
+pub(crate) async fn call(
     app: &TestApp,
     method: &str,
     path: &str,
@@ -96,7 +99,7 @@ async fn owner_creates(app: &TestApp, seeded: &SeededTenant, body: Value) -> Str
 /// One more person in the org, holding the org's own managed role `role`
 /// (`member`, `moderator`, `admin`) and nothing else. Seeded the way the
 /// fixture seeds its member.
-async fn person_with_role(
+pub(crate) async fn person_with_role(
     app: &TestApp,
     seeded: &SeededTenant,
     tag: &str,
@@ -144,7 +147,12 @@ async fn person_with_role(
 }
 
 /// The owner mints a custom role with `permissions` and gives it to `user`.
-async fn grant_role(app: &TestApp, seeded: &SeededTenant, user: &SeededUser, permissions: u64) {
+pub(crate) async fn grant_role(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    user: &SeededUser,
+    permissions: u64,
+) {
     let owner = &seeded.admin.access_token;
     let (status, role) = call(
         app,
@@ -172,7 +180,7 @@ async fn grant_role(app: &TestApp, seeded: &SeededTenant, user: &SeededUser, per
 
 /// The refusal a member without the bit gets: a 403 that names the
 /// permission, never `not_a_member`.
-fn assert_refused(what: &str, status: u16, body: &Value) {
+pub(crate) fn assert_refused(what: &str, status: u16, body: &Value) {
     assert_eq!(status, 403, "{what}: {body}");
     assert_eq!(body["error"], "forbidden", "{what}: {body}");
     assert!(
