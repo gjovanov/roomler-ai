@@ -4967,7 +4967,17 @@ to-activate, so the browser never sees a bait-and-switch.
   (`uploadLandedIn`, `useRemoteControl.ts:15554`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:15577`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:15580`), not "Uploaded".
+  **A success says where, too** (#3048): "Uploaded report.pdf to
+  `C:\Users\ana\Downloads`", and "Uploaded 3 files to `\\server\share\…\Downloads`"
+  for several in one folder (`useRemoteControl.ts:15614-15623`). On a
+  machine-wide Windows install that folder is the signed-in person's own
+  Downloads, which Folder Redirection may have moved to a share, and the
+  viewer is where the controller learns that path. The folder is `path`
+  without the uploaded name's tree (`uploadLandingFolder`,
+  `useRemoteControl.ts:15565`), read without a verbatim prefix:
+  `\\?\UNC\server\share` reads `\\server\share`. Files that landed in more
+  than one folder say "to 2 folders (first: …)".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
   `rc:apps.list` / `rc:apps.focus` / `rc:apps.launch` and their `*.reply`,
   id-correlated like `rc:logs-fetch`, handled off-thread in
