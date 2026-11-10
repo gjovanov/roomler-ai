@@ -902,8 +902,12 @@ async fn an_inferred_end_counts_its_hours_and_no_failure() {
         figf(&before["usage"]["remote"]["session_minutes"]),
         figf(&after["usage"]["remote"]["session_minutes"]),
     );
+    // The digest reports minutes to a tenth, and the difference of two such
+    // floats is not exact (150.2 - 90.2 = 59.999999999999986): compare it at
+    // the digest's own precision.
+    let grew = |after: f64, before: f64| ((after - before) * 10.0).round() / 10.0;
     assert_eq!(
-        (a.0 - b.0, a.1 - b.1, a.2 - b.2),
+        (grew(a.0, b.0), grew(a.1, b.1), grew(a.2, b.2)),
         (60.0, 60.0, 60.0),
         "the hour up to the inferred end counts: before {b:?}, after {a:?}"
     );
