@@ -19,7 +19,8 @@
 //! at a device's registration ([`resume_hello`], through
 //! [`RcResumeScopeDao::covers`](roomler_ai_services::dao::rc_resume_scope::RcResumeScopeDao::covers)),
 //! for a device that advertises `rc-resume`; P1b-2 re-announces the window
-//! when the list changes ([`scope_changed`]).
+//! when the list changes ([`scope_changed`]), and while the window is on
+//! every pod reads the list again on a cadence ([`spawn_reconciler`]).
 
 use axum::{
     Json,
@@ -126,12 +127,17 @@ pub async fn put_scope(
 
 /// The one place a change to the scope goes out from (spec §4.1). Every
 /// connected device that advertises `rc-resume` is told its window again:
-/// this pod's at once ([`reannounce`]), every other pod's over the rc ctrl
-/// lane (`resume_scope`, [`apply_scope_event`]), as FR-92's keep-busy deny
-/// reaches them. A device the scope now covers is told the window, one it no
-/// longer covers is told 0, which withdraws it, so a change needs no roll
-/// and reverses at once. Each pod tells its own devices its own window. With
-/// the window at 0 nobody holds one and nobody is told, so nothing is
+/// this pod's at once, every other pod's over the rc ctrl lane, as FR-92's
+/// keep-busy deny reaches them. A device the scope now covers is told the
+/// window, one it no longer covers is told 0, which withdraws it, so a change
+/// needs no roll and reverses at once.
+///
+/// The event is only a nudge (review 2, N2): it carries no list and no
+/// window. Each pod that hears it reads the store itself and applies its OWN
+/// window ([`reconcile`]), so an event that arrives late or twice applies
+/// the newest list, and a pod at 0 announces nothing whatever the sender
+/// holds. One that is lost is caught by the next cadence ([`spawn_reconciler`]).
+/// With the window at 0 nobody holds one and nobody is told, so nothing is
 /// published either.
 async fn scope_changed(
     state: &FleetState,
@@ -147,9 +153,7 @@ async fn scope_changed(
         .iter()
         .filter(|b| !after.iter().any(|e| e.same_target(b)))
         .count();
-    let window = capped_window(state.settings.rc.session_resume_secs);
-    let targets: Vec<ScopeTarget> = after.iter().map(|e| (e.kind, e.id)).collect();
-    let told = reannounce(&state.rc_hub, window, &targets);
+    let told = reconcile(state).await;
     info!(
         %admin,
         added,
@@ -158,38 +162,75 @@ async fn scope_changed(
         told,
         "rc resume scope saved"
     );
-    if window > 0 {
-        crate::ctrl::publish_rc_ctrl(
-            state,
-            "resume_scope",
-            serde_json::json!({ "entries": targets_wire(&targets) }),
-        )
-        .await;
+    if capped_window(state.settings.rc.session_resume_secs) > 0 {
+        crate::ctrl::publish_rc_ctrl(state, "resume_scope", serde_json::json!({})).await;
     }
 }
 
-/// FR-138 P1b-2 — a change to the scope made on another pod (`resume_scope`
-/// on the rc ctrl lane, through [`crate::ctrl::apply_rc_ctrl_on`]): this
-/// pod's connections that advertise `rc-resume` are told their window again
-/// ([`reannounce`]), under `own`, THIS pod's window (`rc.session_resume_secs`,
-/// capped), never the sender's. A device is told what its own pod announces
-/// at its registration, so a pod at 0 tells nobody while a roll changes the
-/// setting, whatever the pod that saved the scope holds. A scope this pod
-/// cannot read whole changes nothing here: each device gets the right window
-/// at its next registration. How many were told.
-pub fn apply_scope_event(hub: &crate::hub::Hub, own: u32, ctrl: &serde_json::Value) -> usize {
-    let Some(targets) = ctrl.get("entries").and_then(targets_from_wire) else {
+/// FR-138 P1b-2 (review 2, N2) — tell every connection on THIS pod that
+/// advertises `rc-resume` its window again ([`reannounce`]), from the store
+/// as it reads now and under this pod's OWN window (`rc.session_resume_secs`,
+/// capped): a device is told what its pod announces at a registration. At
+/// window 0 it reads nothing and tells nobody. Readings on one pod take turns
+/// (`FleetState::rc_resume_reconcile`), so the last one applies the newest
+/// list. A store that cannot be read changes nothing: the next reading
+/// tries again. How many were told.
+pub async fn reconcile(state: &FleetState) -> usize {
+    let window = capped_window(state.settings.rc.session_resume_secs);
+    if window == 0 {
         return 0;
-    };
-    let told = reannounce(hub, own, &targets);
-    if told > 0 {
-        info!(
-            told,
-            window = own,
-            "rc ctrl: the resume scope re-announced from another pod"
-        );
     }
-    told
+    let _turn = state.rc_resume_reconcile.lock().await;
+    let entries = match state.rc_resume_scope.list().await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(%e, "rc resume scope unreadable: every window stays as announced until the next reading");
+            return 0;
+        }
+    };
+    let targets: Vec<ScopeTarget> = entries.iter().map(|e| (e.kind, e.id)).collect();
+    reannounce(&state.rc_hub, window, &targets)
+}
+
+/// FR-138 P1b-2 (review 2, N2) — another pod saved the scope (`resume_scope`
+/// on the rc ctrl lane, through [`crate::ctrl::apply_rc_ctrl_on`]): read it
+/// here and tell this pod's connections ([`reconcile`]). Whatever the event
+/// carries is ignored. Nothing at window 0.
+pub fn nudge(state: &FleetState) {
+    if capped_window(state.settings.rc.session_resume_secs) == 0 {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let told = reconcile(&state).await;
+        if told > 0 {
+            info!(
+                told,
+                "rc ctrl: the resume scope read again after another pod saved it"
+            );
+        }
+    });
+}
+
+/// FR-138 P1b-2 (review 2, N2) — while the window is on, read the scope again
+/// on the presence sweep's cadence (`rc.presence_sweep_secs`) and tell each
+/// connection whose window changed: a change whose event was lost reaches the
+/// device all the same. Not spawned at window 0, which the setting fixes for
+/// the process. Every pod runs its own: each tells only its own connections.
+pub fn spawn_reconciler(state: FleetState) {
+    if capped_window(state.settings.rc.session_resume_secs) == 0 {
+        return;
+    }
+    let every = std::time::Duration::from_secs(state.settings.rc.presence_sweep_secs.max(5));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let told = reconcile(&state).await;
+            if told > 0 {
+                info!(told, "rc resume scope read again: windows told");
+            }
+        }
+    });
 }
 
 /// One entry of the scope as the re-announce reads it: what it names.
@@ -220,34 +261,6 @@ pub fn reannounce(hub: &crate::hub::Hub, window: u32, targets: &[ScopeTarget]) -
         }
     }
     told
-}
-
-/// The scope's targets as the `resume_scope` control event carries them.
-pub fn targets_wire(targets: &[ScopeTarget]) -> serde_json::Value {
-    serde_json::Value::Array(
-        targets
-            .iter()
-            .map(|(kind, id)| serde_json::json!({ "kind": kind.as_str(), "id": id.map(|i| i.to_hex()) }))
-            .collect(),
-    )
-}
-
-/// The scope's targets as another pod's control event carried them. `None`
-/// when any entry cannot be read (a newer pod's kind): the connections here
-/// then keep the windows they hold until their next registration, rather
-/// than lose one to an entry this pod could not read.
-pub fn targets_from_wire(v: &serde_json::Value) -> Option<Vec<ScopeTarget>> {
-    v.as_array()?
-        .iter()
-        .map(|e| {
-            let kind = ResumeScopeKind::parse(e.get("kind")?.as_str()?)?;
-            let id = match e.get("id") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(v) => Some(ObjectId::parse_str(v.as_str()?).ok()?),
-            };
-            Some((kind, id))
-        })
-        .collect()
 }
 
 /// The PUT's contract, pure so it is testable without a server: at most
@@ -393,11 +406,9 @@ mod tests {
         assert_eq!(capped_window(0), 0, "0 stays off");
     }
 
-    /// P1b-2 — the re-announce reads a scope as the store's `covers` does,
-    /// and the control event carries it whole: an entry another pod cannot
-    /// read leaves every window there as it is.
+    /// P1b-2 — the re-announce reads a scope as the store's `covers` does.
     #[test]
-    fn a_scope_covers_as_the_store_does_and_crosses_pods_whole() {
+    fn a_scope_covers_as_the_store_does() {
         let (org, dev, other) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
         assert!(covered_by(&[(ResumeScopeKind::All, None)], org, dev));
         assert!(covered_by(&[(ResumeScopeKind::Org, Some(org))], org, dev));
@@ -415,21 +426,6 @@ mod tests {
             dev
         ));
         assert!(!covered_by(&[], org, dev), "an empty scope covers nothing");
-        let targets = vec![
-            (ResumeScopeKind::All, None),
-            (ResumeScopeKind::Org, Some(org)),
-            (ResumeScopeKind::Device, Some(dev)),
-        ];
-        assert_eq!(targets_from_wire(&targets_wire(&targets)), Some(targets));
-        assert_eq!(
-            targets_from_wire(&serde_json::json!([{ "kind": "fleet" }])),
-            None,
-            "a kind this pod cannot read"
-        );
-        assert_eq!(
-            targets_from_wire(&serde_json::json!([{ "kind": "device", "id": "nope" }])),
-            None
-        );
     }
 
     /// P1b-2 — a scope change tells only the connections whose window
@@ -490,70 +486,6 @@ mod tests {
 
         assert_eq!(reannounce(&hub, 60, &only_a), 0, "nothing changed");
         assert!(told(&mut rx_a).is_empty() && told(&mut rx_b).is_empty());
-    }
-
-    /// P1b-2 — a scope change from another pod is announced under THIS
-    /// pod's window: a pod at 0 tells nobody, whatever the pod that saved
-    /// the scope holds (a roll that turns the window off); an event this pod
-    /// cannot read changes nothing; under a window it reads as the local
-    /// change does, the window to a device covered and 0 to one no longer.
-    #[tokio::test]
-    async fn a_scope_change_from_another_pod_is_told_under_this_pods_window() {
-        use crate::hub::{Hub, ResumeHello};
-        use roomler_ai_remote_control::models::OsKind;
-        use roomler_ai_remote_control::signaling::ServerMsg;
-
-        let client = mongodb::Client::with_uri_str("mongodb://localhost:27017")
-            .await
-            .expect("mongo for tests");
-        let (audit, _h) =
-            roomler_ai_remote_control::audit::AuditSink::spawn(client.database("rc_test"));
-        let hub = Hub::new(audit, None);
-        let (org, dev) = (ObjectId::new(), ObjectId::new());
-        let mut rx = hub
-            .register_agent_resuming(
-                dev,
-                org,
-                ObjectId::new(),
-                OsKind::Linux,
-                2,
-                true,
-                false,
-                ResumeHello {
-                    advertised: true,
-                    window: None,
-                    kept: Vec::new(),
-                },
-            )
-            .rx;
-        let mut told = || -> Vec<u32> {
-            let mut out = Vec::new();
-            while let Ok(m) = rx.try_recv() {
-                if let ServerMsg::AgentResumeWindow { secs } = m {
-                    out.push(secs);
-                }
-            }
-            out
-        };
-        let event = |targets: &[ScopeTarget]| serde_json::json!({ "class": "rc", "evt": "resume_scope", "entries": targets_wire(targets) });
-        let covers_dev = event(&[(ResumeScopeKind::Device, Some(dev))]);
-
-        assert_eq!(apply_scope_event(&hub, 0, &covers_dev), 0, "a pod at 0");
-        assert!(told().is_empty());
-        assert_eq!(hub.agent_resume_window(dev), None);
-
-        let unreadable =
-            serde_json::json!({ "evt": "resume_scope", "entries": [{ "kind": "fleet" }] });
-        assert_eq!(apply_scope_event(&hub, 60, &unreadable), 0);
-        assert!(told().is_empty(), "an entry this pod cannot read");
-
-        assert_eq!(apply_scope_event(&hub, 60, &covers_dev), 1);
-        assert_eq!(told(), vec![60], "covered, under this pod's window");
-        assert_eq!(hub.agent_resume_window(dev), Some(60));
-
-        assert_eq!(apply_scope_event(&hub, 60, &event(&[])), 1);
-        assert_eq!(told(), vec![0], "no longer covered: withdrawn");
-        assert_eq!(hub.agent_resume_window(dev), None);
     }
 
     const ORG: &str = "6a975e17971e2d55ddcdedb2";

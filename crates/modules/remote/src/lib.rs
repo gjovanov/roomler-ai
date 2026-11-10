@@ -115,6 +115,9 @@ pub struct RemoteState {
     /// ended without seeing their end, so the device's own end of one
     /// replaces the inferred reason (`resume::device_end`).
     pub registration_ends: Arc<resume::RegistrationEnds>,
+    /// FR-138 P1b-2 (review 2, N7) — where this pod's sweep reads the quiet
+    /// rows on from (`sweep::Cursor`).
+    pub sweep_cursor: Arc<sweep::Cursor>,
 }
 
 impl std::ops::Deref for RemoteState {
@@ -152,14 +155,18 @@ impl Module for RemoteState {
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
             extauth: Arc::new(extauth::ExtauthRelay::new()),
             registration_ends: Arc::new(resume::RegistrationEnds::new()),
+            sweep_cursor: Arc::new(sweep::Cursor::default()),
             fleet,
             core,
         };
         // PR-2 — the cross-pod rc signalling relay: owner-side rc.cmd /
         // rc.conn_closed / rc.conn_alive + the proxy janitor sweep.
         relay::wire_rc_relay(&state);
-        // FR-138 P1b-2 — the sweep of the session rows nobody will claim.
+        // FR-138 P1b-2 — the sweep of the session rows nobody will claim, and
+        // the answer the dead-row close asks of the pod that holds a device's
+        // socket: does your hub hold this session?
         sweep::spawn(state.clone());
+        dead_rows::wire_session_held(&state);
         // The agent socket is fleet's; this module's arm (the session-stats
         // merge) is dispatched to it by `ClientMsg::namespace()` (P5c).
         // FR-138 — and its lifecycle answers a hello's claims on the sessions

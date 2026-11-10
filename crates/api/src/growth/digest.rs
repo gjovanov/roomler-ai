@@ -1689,11 +1689,13 @@ struct RemoteFacts {
     per_org_day: HashMap<ObjectId, (i64, i64)>,
 }
 
-/// FR-138 — whether a session row's hours count in the hour-weighted sums:
-/// not when its end was inferred (`end_source`: the registration read, the
-/// sweep, the dead-row close), whose `ended_at` is only the row's own last
-/// clock.
-fn counts_hours(d: &Document) -> bool {
+/// FR-138 — whether somebody saw a session row's end: not when it was
+/// inferred (`end_source`: the registration read, the sweep, the dead-row
+/// close), whose `ended_at` is only the row's own last clock. Such a row adds
+/// no hours to the hour-weighted sums, and (review 2, N12) no end to the
+/// quality section's counts by `ended_at`, which would land, back-dated, in
+/// days already reported.
+fn end_was_seen(d: &Document) -> bool {
     matches!(d.get("end_source"), None | Some(Bson::Null))
 }
 
@@ -1727,7 +1729,7 @@ async fn read_remote_usage(
         // FR-138 — an end nobody saw (`end_source`) is the row's own last
         // clock, not when the session ended: its hours are left out of the
         // sums. The session still counts as started.
-        let hours = counts_hours(d);
+        let hours = end_was_seen(d);
         for (i, span) in [Span::Day, Span::D7, Span::D28].into_iter().enumerate() {
             let (lo, hi) = w.range(span);
             if hours {
@@ -2332,14 +2334,15 @@ async fn remote_quality(
             "ended_at": w.between(Span::D28),
             "tenant_id": { "$nin": excluded.clone() },
         },
-        doc! { "ended_at": 1, "end_reason": 1 },
+        doc! { "ended_at": 1, "end_reason": 1, "end_source": 1 },
     )
     .await?;
     let mut ended = Vec::new();
     let mut by_class: HashMap<&'static str, Vec<i64>> = HashMap::new();
     let mut day_reasons: BTreeMap<String, i64> = BTreeMap::new();
     for d in &docs {
-        let Some(t) = dt_ms(d, "ended_at") else {
+        // FR-138 (review 2, N12) — an inferred end is no end a pod saw.
+        let Some(t) = dt_ms(d, "ended_at").filter(|_| end_was_seen(d)) else {
             continue;
         };
         ended.push(t);
@@ -3792,10 +3795,10 @@ mod tests {
     /// or a row from before the field, counts as it always has.
     #[test]
     fn an_inferred_end_adds_no_hours() {
-        assert!(counts_hours(&doc! { "ended_at": DateTime::now() }));
-        assert!(counts_hours(&doc! { "end_source": Bson::Null }));
+        assert!(end_was_seen(&doc! { "ended_at": DateTime::now() }));
+        assert!(end_was_seen(&doc! { "end_source": Bson::Null }));
         for source in ["registration", "sweep", "backfill", "a_later_source"] {
-            assert!(!counts_hours(&doc! { "end_source": source }), "{source}");
+            assert!(!end_was_seen(&doc! { "end_source": source }), "{source}");
         }
     }
 

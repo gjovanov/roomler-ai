@@ -19,19 +19,35 @@
 //! FR-115 slot, which nobody renews once its session was detached, is given
 //! back. A row outside the scope with no `resume_by` stays as it is, until
 //! the scope reaches its device.
+//!
+//! The second kind is read a page a cycle (review 2, N7): the scope is read
+//! once and asked of the query, so rows outside it never come back, and the
+//! next cycle reads on after the page's last row ([`Cursor`]), so the rows it
+//! keeps (a device online, a session this pod holds) never starve a newer
+//! one. A device that was removed is gone for good (N6): its rows are
+//! abandoned like those of a device offline.
 
 use std::time::Duration;
 
-use bson::DateTime;
+use bson::{DateTime, doc};
 use roomler_ai_mod_fleet::hub::RowEnd;
+use roomler_ai_mod_fleet::resume_scope::{ScopeTarget, covered_by};
 use roomler_ai_remote_control::models::{EndReason, EndSource, RemoteSession};
+use roomler_ai_services::dao::base::DaoError;
+use roomler_ai_services::dao::rc_resume_scope::ResumeScopeKind;
+use roomler_ai_services::dao::remote_session::RowCursor;
 use roomler_core::cluster::session_slots::SlotScope;
 use tracing::{debug, info, warn};
 
 use crate::RemoteState;
 
-/// The most rows one cycle ends of each kind; the next cycle reads on.
+/// The most rows one cycle reads of each kind; the next cycle reads on.
 const SWEEP_LIMIT: i64 = 200;
+
+/// Where this pod's next cycle reads the quiet rows on from: after the last
+/// row of a full page, or from the start (review 2, N7). Per pod, like the
+/// cycle it serves; any pod's cycles cover every row in turn.
+pub type Cursor = std::sync::Mutex<Option<RowCursor>>;
 
 /// What one cycle ended.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -98,11 +114,27 @@ pub async fn run_sweep(state: &RemoteState) -> Swept {
     if window == 0 {
         return swept;
     }
+    // The scope, once a cycle: only a device it covers can have a row ended
+    // this way, so the read asks for those rows alone.
+    let targets: Vec<ScopeTarget> = match state.fleet.rc_resume_scope.list().await {
+        Ok(entries) => entries.iter().map(|e| (e.kind, e.id)).collect(),
+        Err(e) => {
+            warn!(%e, "rc resume sweep: the scope could not be read; the quiet rows wait");
+            return swept;
+        }
+    };
+    let Some(within) = scope_filter(&targets) else {
+        return swept;
+    };
     let window_ms = i64::from(window) * 1000;
     let quiet_since = DateTime::from_millis(now.timestamp_millis().saturating_sub(window_ms));
+    let after = *state
+        .sweep_cursor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let rows = match state
         .remote_sessions
-        .unclaimed_quiet(quiet_since, SWEEP_LIMIT)
+        .unclaimed_quiet(quiet_since, within, after, SWEEP_LIMIT)
         .await
     {
         Ok(rows) => rows,
@@ -111,8 +143,17 @@ pub async fn run_sweep(state: &RemoteState) -> Swept {
             return swept;
         }
     };
+    // A full page: the next cycle reads on after its last row. Else from the
+    // start again.
+    let next = (rows.len() as i64 >= SWEEP_LIMIT)
+        .then(|| rows.last().and_then(|r| Some((r.created_at, r.id?))))
+        .flatten();
+    *state
+        .sweep_cursor
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
     for row in rows {
-        if abandoned(state, &row, quiet_since).await
+        if abandoned(state, &row, quiet_since, &targets).await
             && end_row(state, &row, crate::resume::inferred_end(&row)).await
         {
             swept.abandoned += 1;
@@ -121,44 +162,76 @@ pub async fn run_sweep(state: &RemoteState) -> Swept {
     swept
 }
 
+/// The resume scope as a filter on the rows' org and device: `None` when it
+/// covers nothing (the read is skipped), `Some(None)` when it covers every
+/// org (`all`).
+fn scope_filter(targets: &[ScopeTarget]) -> Option<Option<bson::Document>> {
+    if targets.is_empty() {
+        return None;
+    }
+    if targets
+        .iter()
+        .any(|(kind, _)| *kind == ResumeScopeKind::All)
+    {
+        return Some(None);
+    }
+    let ids = |want: ResumeScopeKind| -> Vec<bson::oid::ObjectId> {
+        targets
+            .iter()
+            .filter(|(kind, _)| *kind == want)
+            .filter_map(|(_, id)| *id)
+            .collect()
+    };
+    let mut any = Vec::new();
+    let orgs = ids(ResumeScopeKind::Org);
+    if !orgs.is_empty() {
+        any.push(doc! { "tenant_id": { "$in": orgs } });
+    }
+    let devices = ids(ResumeScopeKind::Device);
+    if !devices.is_empty() {
+        any.push(doc! { "agent_id": { "$in": devices } });
+    }
+    if any.is_empty() {
+        return None;
+    }
+    Some(Some(doc! { "$or": any }))
+}
+
 /// A live row with no `resume_by` whose pod died without a word: its device
-/// is in the scope, no pod here holds it, and the presence sweep found the
-/// device offline before `quiet_since` (the window ago). Anything unread is
-/// not abandoned: the row waits for the next cycle.
-async fn abandoned(state: &RemoteState, row: &RemoteSession, quiet_since: DateTime) -> bool {
+/// is in the scope (`targets`), no pod here holds it, and the presence sweep
+/// found the device offline before `quiet_since` (the window ago), or the
+/// device was removed (review 2, N6: it never comes back for the session).
+/// Anything unread is not abandoned: the row waits for the next cycle.
+async fn abandoned(
+    state: &RemoteState,
+    row: &RemoteSession,
+    quiet_since: DateTime,
+    targets: &[ScopeTarget],
+) -> bool {
     let Some(session_id) = row.id else {
         return false;
     };
     let hub = &state.fleet.rc_hub;
-    if hub.session_snapshot(session_id).is_some() || hub.is_agent_online(row.agent_id) {
+    if hub.session_snapshot(session_id).is_some()
+        || hub.is_agent_online(row.agent_id)
+        || !covered_by(targets, row.tenant_id, row.agent_id)
+    {
         return false;
     }
-    let agent = match state
+    match state
         .fleet
         .agents
         .find_live_in_tenant(row.tenant_id, row.agent_id)
         .await
     {
-        Ok(agent) => agent,
+        Ok(agent) => {
+            agent.last_presence.as_deref() == Some(roomler_ai_mod_fleet::presence::OFFLINE)
+                && agent.last_seen_at < quiet_since
+        }
+        // A tombstone reads as no live device: removed, it is gone for good.
+        Err(DaoError::NotFound) => true,
         Err(e) => {
             debug!(session = %session_id, %e, "rc resume sweep: the device could not be read; left for later");
-            return false;
-        }
-    };
-    let offline = agent.last_presence.as_deref() == Some(roomler_ai_mod_fleet::presence::OFFLINE)
-        && agent.last_seen_at < quiet_since;
-    if !offline {
-        return false;
-    }
-    match state
-        .fleet
-        .rc_resume_scope
-        .covers(row.tenant_id, row.agent_id)
-        .await
-    {
-        Ok(covered) => covered,
-        Err(e) => {
-            debug!(session = %session_id, %e, "rc resume sweep: the scope could not be read; left for later");
             false
         }
     }
@@ -201,4 +274,46 @@ async fn end_row(state: &RemoteState, row: &RemoteSession, at: DateTime) -> bool
         debug!(session = %session_id, %e, "rc resume sweep: the slot was not given back; it expires on its own");
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::oid::ObjectId;
+
+    /// The scope becomes the rows' filter: nothing for an empty scope (the
+    /// read is skipped), no filter for `all`, else the orgs and devices it
+    /// names.
+    #[test]
+    fn the_scope_filters_the_rows_the_sweep_reads() {
+        assert_eq!(scope_filter(&[]), None, "an empty scope covers nothing");
+        let (org, dev) = (ObjectId::new(), ObjectId::new());
+        assert_eq!(
+            scope_filter(&[
+                (ResumeScopeKind::Device, Some(dev)),
+                (ResumeScopeKind::All, None)
+            ]),
+            Some(None),
+            "all covers every org"
+        );
+        assert_eq!(
+            scope_filter(&[(ResumeScopeKind::Org, Some(org))]),
+            Some(Some(doc! { "$or": [ { "tenant_id": { "$in": [org] } } ] }))
+        );
+        assert_eq!(
+            scope_filter(&[
+                (ResumeScopeKind::Org, Some(org)),
+                (ResumeScopeKind::Device, Some(dev)),
+            ]),
+            Some(Some(doc! { "$or": [
+                { "tenant_id": { "$in": [org] } },
+                { "agent_id": { "$in": [dev] } },
+            ] }))
+        );
+        assert_eq!(
+            scope_filter(&[(ResumeScopeKind::Device, None)]),
+            None,
+            "an entry that names nothing covers nothing"
+        );
+    }
 }
