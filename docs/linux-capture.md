@@ -568,6 +568,28 @@ probe and every capture, and captures it with the unchanged scrap + damage
 path. This is the hardware-encode test bed on the WSL2 dev host, and the
 remote-apps surface of FR-56 rides on it.
 
+⚠️ **On a host with NVIDIA's userspace driver, Xvfb does not survive its own
+start** ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643), open). Its
+GLX reaches EGL through Mesa's DRI shim, glvnd hands that call to its first
+vendor, and with NVIDIA's EGL inside the server it aborts within seconds
+(`double free or corruption`). The daemon does not watch the server, so it goes
+on advertising the desktop, and a session then shows "This device cannot
+capture its screen". Measured on an AWS g5g on 0.4.208 (FR-122 §8): an Xvfb
+started alone aborts, installing Mesa's EGL beside NVIDIA's changes nothing
+(NVIDIA's vendor file sorts first), and pinning the vendor for the server keeps
+it up. Until the fix, put a wrapper ahead of `/usr/bin/Xvfb` on the daemon's
+`PATH`:
+
+```sh
+#!/bin/sh
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+exec /usr/bin/Xvfb "$@"
+```
+
+A container that mounts only the driver's compute libraries (the rented DGX
+Spark of FR-122) has no NVIDIA EGL and is not affected. The Xorg dummy-driver
+path is untested on such a host.
+
 ⚠️ **A startup app can map before the window manager is listening.** `start`
 launches the WM and the apps back to back, and a window that maps while openbox
 is still starting stays unmapped, with no `WM_STATE`, until X traffic next wakes
