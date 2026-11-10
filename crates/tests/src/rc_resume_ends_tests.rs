@@ -14,7 +14,8 @@
 //!   older connection's claim leaves the winner's session and FR-115 slot
 //!   alone (L1);
 //! * the device's own end replaces an end inferred before this connection,
-//!   by an earlier connection's registration or by the sweep (N5);
+//!   by an earlier connection's registration or by the sweep, but never the
+//!   one-time close's (N5);
 //! * a hold nobody rejoins ends marked `hold_expired` (N17), and a rejoin that
 //!   comes just after it is told a reason the page redials on (N9);
 //! * an end someone asks for never overwrites an inferred one (N11), while at
@@ -164,8 +165,8 @@ async fn commit_elsewhere(app: &TestApp, sid: ObjectId, next: i64) {
 }
 
 /// Review 2, N3 — the device enters the scope while a session runs: its
-/// connection is told the window (what the re-announce on a scope change
-/// does), but the session's viewer was told no `resume_secs` when it began, so
+/// connection is told the window by the re-announce on a scope change
+/// (P1b-2), but the session's viewer was told no `resume_secs` when it began, so
 /// it would ignore `rc:session.detached` and never rejoin, and a rebuilt
 /// session would wait a whole window for nobody before it ended. At the
 /// device's socket loss the session therefore ends as it always has:
@@ -193,13 +194,13 @@ async fn a_session_its_viewer_was_never_told_it_may_hold_ends_at_the_devices_soc
     );
     wait_row(&app, sid, "the session goes live", open).await;
 
-    // The device enters the scope mid-session.
-    assert!(
-        app.state
-            .fleet()
-            .rc_hub
-            .announce_resume_window(agent_id, u32::try_from(WINDOW).unwrap())
-    );
+    // The device enters the scope mid-session and is told its window by the
+    // re-announce, which a scope change runs on every pod: the store read
+    // again under the pod's own window (`resume_scope::reconcile`, what the
+    // scope's event and the pod's own cadence both run). Not counted: the
+    // cadence may be the reading that tells it.
+    scope_all(&app).await;
+    roomler_ai_mod_fleet::resume_scope::reconcile(app.state.fleet()).await;
     let told = next_of(&mut agent, "rc:agent.resume_window", WITHIN)
         .await
         .expect("the device is told the window");
@@ -447,8 +448,8 @@ async fn a_claim_from_an_older_connection_leaves_the_winners_session_and_slot() 
 /// ended before the device could say how it ended. This connection's
 /// registration ended neither. The device's own `rc:terminate` for each still
 /// replaces the inferred `agent_disconnect`: its reason, `end_source`
-/// cleared, `ended_at` the row's own last clock. A seen end, and another
-/// device's inferred end, are left as they are.
+/// cleared, `ended_at` the row's own last clock. A seen end, another device's
+/// inferred end and the one-time close's `backfill` end are left as they are.
 #[tokio::test]
 async fn the_devices_own_end_replaces_an_end_inferred_before_this_connection() {
     let app = one(WINDOW).await;
@@ -470,12 +471,33 @@ async fn the_devices_own_end_replaces_an_end_inferred_before_this_connection() {
             "resume_by": at(ended_ms + 60_000),
         }
     };
-    let (swept, registered, seen, others) = (
+    let (swept, registered, seen, others, closed) = (
+        ObjectId::new(),
         ObjectId::new(),
         ObjectId::new(),
         ObjectId::new(),
         ObjectId::new(),
     );
+    // The one-time close's end, as `close_dead` writes it: at the row's own
+    // last clock, marked `backfill`.
+    insert(
+        &app,
+        leftover(
+            closed,
+            agent_id,
+            tenant,
+            ctl,
+            base,
+            doc! {
+                "phase": "closed",
+                "stats_at": at(base + 120_000),
+                "ended_at": at(base + 120_000),
+                "end_reason": "agent_disconnect",
+                "end_source": "backfill",
+            },
+        ),
+    )
+    .await;
     insert(
         &app,
         leftover(
@@ -531,6 +553,7 @@ async fn the_devices_own_end_replaces_an_end_inferred_before_this_connection() {
     let untouched = [
         (seen, row(&app, seen).await),
         (others, row(&app, others).await),
+        (closed, row(&app, closed).await),
     ];
 
     let mut agent = hello(&app, &token, &[RESUME], &[]).await;
@@ -542,6 +565,7 @@ async fn the_devices_own_end_replaces_an_end_inferred_before_this_connection() {
         (registered, "idle_timeout", Some("idle")),
         (seen, "host_disconnect", None),
         (others, "host_disconnect", None),
+        (closed, "host_disconnect", None),
     ] {
         let mut msg = json!({ "t": "rc:terminate", "session_id": sid.to_hex(), "reason": reason });
         if let Some(l) = limit {
