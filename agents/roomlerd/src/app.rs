@@ -1128,6 +1128,13 @@ fn pick_config_path(
     default.to_path_buf()
 }
 
+/// #3609 — why the SystemContext ladder named the machine config although it
+/// failed the machine tree's check, set once by [`resolve_config_path`]. A
+/// SYSTEM worker (`Run`) refuses to load the config while this holds a
+/// reason; every other command runs as before.
+#[cfg(all(feature = "system-context", target_os = "windows"))]
+static MACHINE_CONFIG_REFUSED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Resolve the config path by wiring [`pick_config_path`] to the real
 /// environment: the worker-role probe, the candidate paths, and a read open.
 /// Logs the chosen path so a "wrong config" or "config not found"
@@ -1153,15 +1160,34 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
                  worker cannot run it"
             );
         }
-        // A read open, as the service host's check (`sc_config_opens`): a file
-        // in a folder that refuses SYSTEM lists, and does not open.
+        // The service host's own question (`sc_config_opens`), through the
+        // same function: a read open for the SYSTEM profile's config (a file
+        // in a folder that refuses SYSTEM lists, and does not open), and for
+        // the machine config #3609's repair, then its check. The SYSTEM
+        // worker never runs a machine config that fails it: the last rung
+        // still names the machine path, and `Run` refuses to load it then.
+        let tree = roomler_node_core::machine_tree::MachineTree::here();
+        let switches = roomler_node_core::machine_tree::Switches::from_env();
+        let refused = std::cell::RefCell::new(None);
         let chosen = pick_config_path(
             explicit,
             is_sc,
             Some(machine_global.as_path()),
             &default,
-            |p| std::fs::File::open(p).is_ok(),
+            |p| match roomlerd::win_service::supervisor::rung(&tree, switches, p) {
+                Ok(()) => true,
+                Err(roomler_node_core::machine_tree::Refusal::NotPrivate(why)) => {
+                    *refused.borrow_mut() = Some(why);
+                    false
+                }
+                Err(roomler_node_core::machine_tree::Refusal::Absent) => false,
+            },
         );
+        if chosen == machine_global
+            && let Some(why) = refused.into_inner()
+        {
+            let _ = MACHINE_CONFIG_REFUSED.set(why);
+        }
         tracing::info!(
             config_path = %chosen.display(),
             is_system_context = is_sc,
@@ -1692,6 +1718,18 @@ async fn daemon_main() -> Result<()> {
             }
             #[cfg(not(target_os = "windows"))]
             let _ = gpu_pin_event;
+            // #3609 — a SYSTEM worker loads the machine config only while it
+            // passes the machine tree's check. The host asks the same question
+            // before it starts one, so this answers only a tree that changed
+            // in between; the host then runs the device as one with no machine
+            // enrollment.
+            #[cfg(all(feature = "system-context", target_os = "windows"))]
+            if let Some(why) = MACHINE_CONFIG_REFUSED.get() {
+                bail!(
+                    "the machine config at {} is not run as SYSTEM: {why}",
+                    config_path.display()
+                );
+            }
             run_cmd(
                 &config_path,
                 encoder.as_deref(),
@@ -2661,7 +2699,29 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // must be re-enrolled` at ERROR — so enrolling a clean machine told the
     // operator to re-enroll it, mid-enrollment. Behaviour is unchanged: absent
     // still means "no machine_id to reuse".
-    let existing = config::read_if_present(&target_path);
+    //
+    // #3609 — at the machine-global location the config is folded into only
+    // when it is private to this computer's administrators once the machine
+    // tree is repaired (`config::read_merge_base`); one that is not is set
+    // aside, and a fresh config is written in its place. A config there that
+    // is absent, does not load or may not be read is nothing to fold, as the
+    // probe reads it.
+    let existing = if machine_global {
+        match config::read_merge_base(&target_path) {
+            config::MergeBase::Loaded(cfg) => Some(cfg),
+            config::MergeBase::NotPrivate { reason } => {
+                let said = config::describe_not_private(&target_path, &reason);
+                tracing::warn!(path = %target_path.display(), %reason, "enroll: {said}");
+                eprintln!("WARNING: {said}");
+                None
+            }
+            config::MergeBase::Absent
+            | config::MergeBase::Unreadable { .. }
+            | config::MergeBase::Denied { .. } => None,
+        }
+    } else {
+        config::read_if_present(&target_path)
+    };
     // FR-51 P3 — an ephemeral enrollment is a FRESH identity by definition:
     // folding it into an existing config would either hand this machine's
     // real device row a random fingerprint or hand the ephemeral row the
@@ -2773,6 +2833,28 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // start is already one row.
     if one_row {
         apply_one_row(&mut cfg);
+    }
+
+    // #3609 — an elevated save of the machine config takes the machine folder
+    // for Administrators first, the owner and nothing else, so the save's own
+    // repair seals it: the repair never takes over a folder another account
+    // made (a person's daemon stages received files below it).
+    #[cfg(target_os = "windows")]
+    if machine_global {
+        match config::take_machine_folder(&target_path) {
+            Ok(true) => tracing::info!(
+                path = %target_path.display(),
+                "enroll: the machine folder was taken for Administrators"
+            ),
+            Ok(false) => {}
+            Err(why) => {
+                tracing::warn!(%why, "enroll: the machine folder was not taken for Administrators");
+                eprintln!(
+                    "WARNING: {why}. Until the folder belongs to Administrators the service may \
+                     not run this enrollment as SYSTEM."
+                );
+            }
+        }
     }
 
     config::save(&target_path, &cfg).map_err(|e| {
@@ -2945,6 +3027,14 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
              prompt).",
             config::describe_denied(&target, &reason)
         ),
+        // #3609 — not private to the computer's administrators: never folded
+        // into; the adopted enrollment is written fresh in its place.
+        config::MergeBase::NotPrivate { reason } => {
+            let said = config::describe_not_private(&target, &reason);
+            tracing::warn!(path = %target.display(), %reason, "adopt-enrollment: {said}");
+            eprintln!("WARNING: {said}");
+            None
+        }
     };
     let previous = existing.clone();
     let new_agent_id = fresh.agent_id.clone();
@@ -5898,12 +5988,14 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 /// product's own record of the last switch.
 ///
 /// An unreadable record reads as "off": that is what an install with no
-/// property always did, so no host is worse off than before.
+/// property always did, so no host is worse off than before. #3609 — the
+/// record's folder is repaired first, and a record that SYSTEM and
+/// Administrators are not alone to change reads as unreadable, so as off.
 #[cfg(target_os = "windows")]
 fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
     use roomlerd::win_service::system_context_attempt as attempt;
 
-    let last = attempt::read_last().unwrap_or_else(|e| {
+    let last = attempt::read_last_private().unwrap_or_else(|e| {
         eprintln!(
             "keep-system-context: cannot read {} ({e}); treating it as off",
             attempt::path().display()
@@ -8069,6 +8161,47 @@ mod tests {
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
         let got = pick_config_path(None, true, Some(mg), default, |p| p == default);
         assert_eq!(got, default);
+    }
+
+    /// #3609 — the service host and the worker's ladder read the machine rung
+    /// through one function (`win_service::supervisor::rung_opens`), so they
+    /// cannot disagree: both refuse a machine config another account may
+    /// change while the repair is off, and both take it once the repair has
+    /// put it back to SYSTEM and Administrators.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_host_and_the_worker_refuse_the_same_config() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        use roomlerd::win_service::supervisor::{config_opens_in, rung_opens};
+        if !elevated_or_skip("the host and the worker on one config") {
+            return;
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let tree = enrolled_tree(root.path());
+        assert!(icacls(&tree.config(), &["/grant", "*S-1-5-32-546:(M)"]));
+        let mg = tree.config();
+        let absent = root.path().join("systemprofile").join("config.toml");
+        for switches in [
+            Switches {
+                repair: false,
+                check: true,
+            },
+            Switches::ON,
+        ] {
+            let host = config_opens_in(&tree, switches, Some(absent.clone()));
+            let ladder_opened = std::cell::Cell::new(None);
+            let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
+                let opens = rung_opens(&tree, switches, p);
+                if p == mg {
+                    ladder_opened.set(Some(opens));
+                }
+                opens
+            });
+            assert_eq!(picked, mg);
+            assert_eq!(Some(host), ladder_opened.get(), "{switches:?}");
+            assert_eq!(host, switches.repair, "{switches:?}");
+        }
     }
 
     /// #3387 — the service host hands a worker it starts as the person, while

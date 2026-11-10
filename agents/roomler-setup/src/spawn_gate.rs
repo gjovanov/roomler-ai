@@ -50,6 +50,7 @@ const DAEMON_FILES: &[&str] = &[
     "crates/agent-core/src/config_surface.rs",
     "crates/agent-core/src/enrollment.rs",
     "crates/agent-core/src/machine.rs",
+    "crates/agent-core/src/machine_tree.rs",
     "crates/agent-core/src/pairing.rs",
 ];
 

@@ -165,15 +165,32 @@ pub fn record(attempt: &Attempt) -> std::io::Result<()> {
 /// Explicit-path variant of [`record`] used by unit tests so they
 /// don't have to mutate `PROGRAMDATA` (which races across parallel
 /// test threads).
+///
+/// #3609 — the temp file is one this writer made: a file left under its name
+/// is removed first and `create_new` refuses one that appears, because a write
+/// into it would keep that file's owner and DACL and the rename would make it
+/// the record. Before it takes the name it is given Administrators as its
+/// owner and SYSTEM and Administrators alone as its DACL, through its handle;
+/// a caller that may not (not SYSTEM, not elevated) leaves the DACL its folder
+/// hands down, and the next repair does the rest.
 pub fn record_at(target: &std::path::Path, attempt: &Attempt) -> std::io::Result<()> {
+    use std::io::Write as _;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = target.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(attempt)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, target)?;
+    let mut file = roomler_node_core::machine_tree::create_fresh(&tmp)?;
+    let written = file.write_all(&json).and_then(|()| file.sync_all());
+    if written.is_ok() {
+        let _ = roomler_node_core::machine_tree::seal_new_file(&file);
+    }
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, target)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -183,6 +200,29 @@ pub fn record_at(target: &std::path::Path, attempt: &Attempt) -> std::io::Result
 /// stage to the operator.
 pub fn read_last() -> std::io::Result<Option<Attempt>> {
     read_last_at(&path())
+}
+
+/// #3609 — what `keep-system-context` decides by: the record under this
+/// computer's `%ProgramData%\roomler`, repaired first and read only while it
+/// is private (`machine_tree::read_record`). A record that is not reads as an
+/// error, which the command takes as off, as it does an unreadable one.
+pub fn read_last_private() -> std::io::Result<Option<Attempt>> {
+    use roomler_node_core::machine_tree::{MachineTree, Switches};
+    read_last_private_in(&MachineTree::here(), Switches::from_env())
+}
+
+/// [`read_last_private`] over `tree`, with the switches given.
+pub fn read_last_private_in(
+    tree: &roomler_node_core::machine_tree::MachineTree,
+    switches: roomler_node_core::machine_tree::Switches,
+) -> std::io::Result<Option<Attempt>> {
+    match roomler_node_core::machine_tree::read_record(tree, switches) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        Ok(None) => Ok(None),
+        Err(why) => Err(std::io::Error::other(why)),
+    }
 }
 
 /// Explicit-path variant of [`read_last`] used by unit tests.
@@ -371,5 +411,71 @@ mod tests {
         .unwrap();
         let last = read_last_at(&target).unwrap();
         assert!(!last_switched_on(last.as_ref()));
+    }
+
+    /// #3609 — the record is written only into a file the writer made. A file
+    /// left under the temporary name would keep its own owner and DACL
+    /// through a write into it, and the rename would make it the record. A
+    /// hard link to the file left there is the witness: it still reads what
+    /// it held.
+    #[test]
+    fn the_record_is_never_written_into_a_file_it_did_not_make() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("last-system-context-attempt.json");
+        let tmp = target.with_extension("json.tmp");
+        std::fs::write(&tmp, b"made before the record").unwrap();
+        let witness = dir.path().join("witness");
+        std::fs::hard_link(&tmp, &witness).unwrap();
+        record_at(&target, &Attempt::ok(ENABLE_COMMAND)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&witness).unwrap(),
+            "made before the record",
+            "the record was written into a file it did not make"
+        );
+        let last = read_last_at(&target).unwrap();
+        assert!(last_switched_on(last.as_ref()));
+    }
+
+    fn an_enable() -> Vec<u8> {
+        serde_json::to_vec(&Attempt::ok(ENABLE_COMMAND)).unwrap()
+    }
+
+    /// #3609 — `keep-system-context` takes the record only when SYSTEM and
+    /// Administrators alone may change it. The field's usual drift (the record
+    /// inherits an account's entry, SYSTEM owns it) is repaired first and the
+    /// record still reads as on; a record an account that is not an
+    /// administrator owns is left alone and reads as no record, which is off.
+    #[test]
+    fn keep_system_context_reads_the_record_only_when_it_is_private() {
+        use roomler_node_core::machine_tree::Switches;
+        use roomler_node_core::machine_tree::test_support::*;
+        if !elevated_or_skip("the attempt record") {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let tree = waiting_tree(root.path());
+        std::fs::write(tree.record(), an_enable()).unwrap();
+        assert!(icacls(&tree.record(), &["/setowner", "*S-1-5-18"]));
+        assert!(icacls(&tree.record(), &["/grant", "*S-1-5-32-546:(F)"]));
+        let repair_off = Switches {
+            repair: false,
+            check: true,
+        };
+        let refused = read_last_private_in(&tree, repair_off);
+        assert!(refused.is_err(), "not private: {refused:?}");
+        let last = read_last_private_in(&tree, Switches::ON).expect("repaired, then read");
+        assert!(last_switched_on(last.as_ref()), "SystemContext stays on");
+        assert_eq!(
+            owner(&sddl(&tree.record())),
+            "SY",
+            "SYSTEM keeps its record"
+        );
+
+        let other = local_guest().unwrap_or_else(|| USERS.to_string());
+        assert!(icacls(&tree.record(), &["/setowner", &format!("*{other}")]));
+        let before = sddl(&tree.record());
+        let last = read_last_private_in(&tree, Switches::ON);
+        assert!(last.is_err(), "another account's record: {last:?}");
+        assert_eq!(sddl(&tree.record()), before, "and it is left alone");
     }
 }

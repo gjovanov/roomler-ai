@@ -181,7 +181,7 @@ to a local pipe. What each attempt to get around that meets:
 |---|---|
 | Ring the doorbell with a made-up or stale request id | the claim: the server has nothing pending under it for this device (404, audited `claim_refused`) |
 | Point the user's config at another server | the service never reads it: its origin is in the anchor |
-| Plant an anchor before an admin makes one (`%ProgramData%` lets users create folders) | the service trusts the file only if it and its directory are owned by SYSTEM or Administrators and grant nobody else write (`exec_service.rs` `check_private`) |
+| Plant an anchor before an admin makes one (`%ProgramData%` lets users create folders) | the service trusts the file only if it and its directory are owned by SYSTEM or Administrators and grant nobody else write (`machine_tree.rs` `read_private`, the reader the machine config's check shares since #3609) |
 | Squat the doorbell's pipe name | the worker refuses a pipe SYSTEM does not own; the service's `first_pipe_instance` refuses to share the name |
 | Read SYSTEM's output | it is posted from the service to the server over HTTPS |
 | An http origin, to rewrite the claim on the path | the anchor accepts https only (loopback excepted, for tests) |
