@@ -1369,7 +1369,77 @@ pub fn main() -> Result<()> {
         // Diverges when a restart was requested; otherwise a no-op.
         exit_for_requested_restart();
     }
+    // #3230 — a per-Machine MSI step's end line, and every queued line written
+    // out, before the process ends. A process that began no step skips it.
+    let (error, exit_code) = step_outcome(&res);
+    logging::end_step(error.as_deref(), exit_code);
     res
+}
+
+/// #3230 — the log role of the command this process runs, which decides where
+/// its file log goes ([`logging::ServiceLogRole`]). `None` for a person's verbs
+/// and for the daemon, which log in the profile. The SystemContext worker's role
+/// is read from the process itself, after this.
+fn service_log_role(command: Option<&Command>) -> Option<logging::ServiceLogRole> {
+    match command? {
+        Command::ServiceRun => Some(logging::ServiceLogRole::Host),
+        // Track A — netd is a LocalSystem session-0 child like the host; its own
+        // basename keeps three concurrent SYSTEM logs apart.
+        Command::Netd => Some(logging::ServiceLogRole::Netd),
+        command if is_installer_step(command) => Some(logging::ServiceLogRole::Installer),
+        _ => None,
+    }
+}
+
+/// #3230, #3640 — a step the per-Machine MSI runs as LocalSystem: what one of its
+/// custom actions runs (`wix-perMachine/main.wxs`, each deferred with
+/// `Impersonate='no'`). Such a step logs in the installer log, beside the
+/// service, with a start line and an end line, and what it repairs in the
+/// machine tree (`resolve_config_path`, for every SYSTEM command) is kept there.
+/// The per-user MSI runs its steps as the person, who cannot write that folder,
+/// and none of them is one: the same verbs without `--as-service`, or for the
+/// other flavour, keep the profile's log.
+/// `the_installer_role_is_what_each_msi_runs_as_local_system` holds every custom
+/// action of both WiX files to this rule.
+fn is_installer_step(command: &Command) -> bool {
+    use roomlerd::install_cleanup::TargetFlavour;
+    match command {
+        Command::Service {
+            action: ServiceAction::Install { as_service } | ServiceAction::Uninstall { as_service },
+        } => *as_service,
+        Command::CleanupLegacyInstall { target_flavour, .. } => {
+            TargetFlavour::parse(target_flavour) == Some(TargetFlavour::PerMachine)
+        }
+        Command::EnableSystemContext { .. }
+        | Command::DisableSystemContext { .. }
+        | Command::KeepSystemContext { .. } => true,
+        _ => false,
+    }
+}
+
+/// The code a process exits with when `main` returns an `Err`: std's
+/// `ExitCode::FAILURE`, which its `Termination` gives such a result.
+#[cfg_attr(
+    all(target_os = "macos", feature = "viewer-indicator-macos"),
+    allow(dead_code)
+)]
+const EXIT_CODE_OF_AN_ERR: i32 = 1;
+
+/// #3230 — what a per-Machine MSI step's end line says of how `main` ends: the
+/// error with its whole cause chain ([`roomlerd::error_chain::error_chain`]),
+/// and the exit code.
+#[cfg_attr(
+    all(target_os = "macos", feature = "viewer-indicator-macos"),
+    allow(dead_code)
+)]
+fn step_outcome(res: &Result<()>) -> (Option<String>, i32) {
+    match res {
+        Ok(()) => (None, 0),
+        Err(e) => (
+            Some(roomlerd::error_chain::error_chain(e.as_ref())),
+            EXIT_CODE_OF_AN_ERR,
+        ),
+    }
 }
 
 async fn daemon_main() -> Result<()> {
@@ -1460,32 +1530,18 @@ async fn daemon_main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // S1b — the SCM service host and the SystemContext worker log into the
-    // machine-global `service-logs` dir (the one the desktop app has always
-    // advertised — it was EMPTY until now because ProjectDirs resolves SYSTEM
-    // processes into the invisible systemprofile). Must precede logging::init.
+    // S1b — the SCM service host, netd, the SystemContext worker and the
+    // per-Machine MSI's own steps log into the machine-global `service-logs`
+    // dir (the one the desktop app has always advertised — it was EMPTY until
+    // S1b because ProjectDirs resolves SYSTEM processes into the invisible
+    // systemprofile). Must precede logging::init. Off Windows no role is set.
+    let log_role = service_log_role(cli.command.as_ref());
+    #[cfg(not(target_os = "windows"))]
+    let _ = log_role;
     #[cfg(target_os = "windows")]
     {
-        if matches!(cli.command, Some(Command::ServiceRun)) {
-            logging::set_service_logging(logging::ServiceLogRole::Host);
-        }
-        // Track A — netd is a LocalSystem session-0 child like the host;
-        // its own basename keeps three concurrent SYSTEM logs apart.
-        if matches!(cli.command, Some(Command::Netd)) {
-            logging::set_service_logging(logging::ServiceLogRole::Netd);
-        }
-        // #3609 — the per-Machine MSI's SystemContext commands log beside the
-        // service: `keep-system-context` repairs the machine tree first, and
-        // an upgrade's first repair is its own.
-        if matches!(
-            cli.command,
-            Some(
-                Command::KeepSystemContext { .. }
-                    | Command::EnableSystemContext { .. }
-                    | Command::DisableSystemContext { .. }
-            )
-        ) {
-            logging::set_service_logging(logging::ServiceLogRole::Installer);
+        if let Some(role) = log_role {
+            logging::set_service_logging(role);
         }
         #[cfg(feature = "system-context")]
         if matches!(cli.command, Some(Command::Run { .. }) | None) {
@@ -1500,6 +1556,22 @@ async fn daemon_main() -> Result<()> {
     }
 
     logging::init();
+
+    // #3230 — a per-Machine MSI step's start line, before the step does anything
+    // (`resolve_config_path` below already repairs the machine tree). Its end
+    // line is written in `main`, after the step returns.
+    #[cfg(target_os = "windows")]
+    if log_role == Some(logging::ServiceLogRole::Installer) {
+        let command: Vec<String> = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        logging::begin_step(
+            &command.join(" "),
+            env!("CARGO_PKG_VERSION"),
+            roomlerd::win_token::own_user_sid().as_deref(),
+        );
+    }
 
     // #3292 — the per-user task's daemon has no console, and its launcher gave it
     // `NUL`: what only stderr carries (a panic, a stack overflow, FFmpeg) goes to
@@ -2156,9 +2228,9 @@ fn exit_for_requested_restart() {
         exit_code = code,
         "requested restart: exiting for the supervisor to relaunch this daemon"
     );
-    // The file layer is non-blocking and its guard lives in a static that is
-    // never dropped; give it a moment to write the line above.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // The file layer is non-blocking and `exit` drops nothing: write the line
+    // above and everything queued before it (#3230), rather than sleep and hope.
+    logging::finish();
     std::process::exit(code);
 }
 
@@ -2212,7 +2284,7 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
     let target = match roomlerd::install_cleanup::TargetFlavour::parse(target_flavour) {
         Some(t) => t,
         None => {
-            eprintln!(
+            tracing::warn!(
                 "cleanup-legacy-install: unrecognised --target-flavour {target_flavour:?}; \
                  expected `perUser` or `perMachine` (no-op)"
             );
@@ -2220,10 +2292,11 @@ fn cleanup_legacy_install_cmd(target_flavour: &str, dry_run: bool) -> Result<()>
         }
     };
     let report = roomlerd::install_cleanup::run_cleanup(target, dry_run)?;
-    // Always print the one-line summary so the MSI's session log
-    // (msiexec /l*v) shows what happened. Exit 0 even on errors —
-    // a cleanup failure shouldn't sink the install.
-    println!("{}", report.summary());
+    // The one-line summary is the step's answer. Windows Installer keeps
+    // nothing it prints (`msiexec /l*v` shows only the return code), so for the
+    // per-Machine flavour it reaches the installer log (#3230). Exit 0 even on
+    // errors — a cleanup failure shouldn't sink the install.
+    logging::answer(report.summary());
     if !report.errors.is_empty() {
         for e in &report.errors {
             tracing::warn!(error = %e, "cleanup-legacy-install: partial failure");
@@ -5792,23 +5865,24 @@ fn service_stop_as_service() -> Result<()> {
 fn service_install_as_service() -> Result<()> {
     let exe = std::env::current_exe().context("locating current_exe for service install")?;
     let registered = win_service::install(&exe).context("registering Roomler with the SCM")?;
+    // #3230 — the answer reaches the installer log as well as the terminal.
     match registered {
         // #3115 — an existing service is reconfigured, never deleted: it keeps
         // running on its old configuration until its next start.
-        win_service::lifecycle::Registered::Reconfigured => println!(
+        win_service::lifecycle::Registered::Reconfigured => logging::answer(format!(
             "Service reconfigured in place: {} ({}). A running service keeps running; \
              the change applies from its next start.",
             win_service::NEW_SERVICE_NAME,
             win_service::SERVICE_DISPLAY_NAME
-        ),
+        )),
         win_service::lifecycle::Registered::Created
-        | win_service::lifecycle::Registered::CreatedAfterDelete => println!(
+        | win_service::lifecycle::Registered::CreatedAfterDelete => logging::answer(format!(
             "Service registered: {} ({}). Launching `sc start {}` will run the service \
              under LocalSystem; AutoStart fires on next boot.",
             win_service::NEW_SERVICE_NAME,
             win_service::SERVICE_DISPLAY_NAME,
             win_service::NEW_SERVICE_NAME
-        ),
+        )),
     }
     // FR-84 D6 — the machine-wide companion login start (`HKLM\…\Run`),
     // written here because this is the elevated step every perMachine install
@@ -5832,10 +5906,15 @@ fn service_install_as_service() -> Result<()> {
 #[cfg(target_os = "windows")]
 fn service_uninstall_as_service() -> Result<()> {
     win_service::uninstall().context("deregistering Roomler")?;
-    println!("Service deregistered ({}).", win_service::NEW_SERVICE_NAME);
-    // FR-84 D6 — no service, no machine-wide companion login start.
+    // #3230 — the step's answer, in the installer log as well as on the terminal.
+    logging::answer(format!(
+        "Service deregistered ({}).",
+        win_service::NEW_SERVICE_NAME
+    ));
+    // FR-84 D6 — no service, no machine-wide companion login start. Logged, so
+    // the step's answer stays the deregistration.
     match roomlerd::companion::remove_login_autostart(true) {
-        Ok(true) => println!("Companion login start removed."),
+        Ok(true) => tracing::info!("Companion login start removed."),
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "companion login start"),
     }
@@ -5908,12 +5987,15 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
         ));
         return Err(e).with_context(|| format!("setting {SYSTEM_CONTEXT_ENV_VAR}=1"));
     }
-    println!("{SYSTEM_CONTEXT_ENV_VAR}=1 written to SCM service env block.");
+    // #3230 — each answer reaches the installer log as well as the terminal.
+    logging::answer(format!(
+        "{SYSTEM_CONTEXT_ENV_VAR}=1 written to SCM service env block."
+    ));
 
     if no_restart {
         let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-        println!(
-            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply."
+        logging::answer(
+            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply.",
         );
         return Ok(());
     }
@@ -5934,7 +6016,7 @@ fn enable_system_context_cmd(no_restart: bool) -> Result<()> {
         return Err(e).context("restarting Roomler");
     }
     let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-    println!("Roomler restarted. SystemContext mode is active.");
+    logging::answer("Roomler restarted. SystemContext mode is active.");
     Ok(())
 }
 
@@ -5960,12 +6042,15 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
         ));
         return Err(e).with_context(|| format!("unsetting {SYSTEM_CONTEXT_ENV_VAR}"));
     }
-    println!("{SYSTEM_CONTEXT_ENV_VAR} removed from SCM service env block.");
+    // #3230 — each answer reaches the installer log as well as the terminal.
+    logging::answer(format!(
+        "{SYSTEM_CONTEXT_ENV_VAR} removed from SCM service env block."
+    ));
 
     if no_restart {
         let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-        println!(
-            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply."
+        logging::answer(
+            "--no-restart: skipping service restart. Run `roomlerd restart-service` to apply.",
         );
         return Ok(());
     }
@@ -5983,7 +6068,7 @@ fn disable_system_context_cmd(no_restart: bool) -> Result<()> {
         return Err(e).context("restarting Roomler");
     }
     let _ = attempt::record(&attempt::Attempt::ok(COMMAND));
-    println!("Roomler restarted. SystemContext mode is disabled.");
+    logging::answer("Roomler restarted. SystemContext mode is disabled.");
     Ok(())
 }
 
@@ -6008,8 +6093,10 @@ fn disable_system_context_cmd(_no_restart: bool) -> Result<()> {
 fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
     use roomlerd::win_service::system_context_attempt as attempt;
 
+    // #3230 — a warning, so the installer log has it: Windows Installer keeps
+    // nothing on stderr.
     let last = attempt::read_last_private().unwrap_or_else(|e| {
-        eprintln!(
+        tracing::warn!(
             "keep-system-context: cannot read {} ({e}); treating it as off",
             attempt::path().display()
         );
@@ -6017,14 +6104,14 @@ fn keep_system_context_cmd(no_restart: bool) -> Result<()> {
     });
     let on = attempt::last_switched_on(last.as_ref());
     match &last {
-        Some(a) => println!(
+        Some(a) => logging::answer(format!(
             "keep-system-context: the last recorded switch was `{}` ({:?}) at {} -> SystemContext {}",
             a.command,
             a.stage,
             a.ts,
             if on { "ON" } else { "off" }
-        ),
-        None => println!("keep-system-context: no recorded switch -> SystemContext off"),
+        )),
+        None => logging::answer("keep-system-context: no recorded switch -> SystemContext off"),
     }
     if on {
         enable_system_context_cmd(no_restart)
@@ -7644,6 +7731,108 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// #3230, #3640 — the installer role is exactly what each MSI runs as
+    /// LocalSystem. Every custom action that runs the daemon, in both WiX files,
+    /// is parsed as the daemon parses it: one that runs as LocalSystem
+    /// (`Impersonate='no'`: all of the per-Machine MSI's) takes the installer
+    /// role, and one that runs as the person (all of the per-user MSI's; the
+    /// person cannot write `service-logs`) takes none. A new custom action is held
+    /// to the same rule.
+    #[test]
+    fn the_installer_role_is_what_each_msi_runs_as_local_system() {
+        fn exe_actions(wxs: &str) -> Vec<(String, String, String)> {
+            // The WiX files break the line after `<CustomAction`.
+            wxs.split("<CustomAction")
+                .skip(1)
+                .filter(|rest| rest.starts_with(char::is_whitespace))
+                .filter_map(|element| {
+                    let element = &element[..element.find("/>")?];
+                    let attr = |name: &str| -> Option<String> {
+                        let key = format!("{name}='");
+                        let (at, _) = element.match_indices(&key).find(|(i, _)| {
+                            *i == 0 || element[..*i].ends_with(char::is_whitespace)
+                        })?;
+                        let value = &element[at + key.len()..];
+                        Some(value[..value.find('\'')?].to_string())
+                    };
+                    // WiX's default for a deferred action is to impersonate.
+                    let impersonate = attr("Impersonate").unwrap_or_else(|| "yes".into());
+                    Some((attr("Id")?, attr("ExeCommand")?, impersonate))
+                })
+                .collect()
+        }
+        let per_machine = exe_actions(include_str!("../wix-perMachine/main.wxs"));
+        let per_user = exe_actions(include_str!("../wix/main.wxs"));
+        // The parse found them: seven each today.
+        assert!(per_machine.len() >= 7, "{per_machine:?}");
+        assert!(per_user.len() >= 7, "{per_user:?}");
+        assert!(per_machine.iter().all(|a| a.2 == "no"), "{per_machine:?}");
+        assert!(per_user.iter().all(|a| a.2 == "yes"), "{per_user:?}");
+        let mut wrong = Vec::new();
+        for (id, exe, impersonate) in per_machine.iter().chain(&per_user) {
+            let argv = std::iter::once("roomlerd").chain(exe.split_whitespace());
+            let cli = Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{id}: `{exe}`: {e}"));
+            let want = (impersonate == "no").then_some(logging::ServiceLogRole::Installer);
+            let got = service_log_role(cli.command.as_ref());
+            if got != want {
+                wrong.push(format!("{id} `{exe}`: {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #3230 — the log role of the commands around those the MSIs run: the same
+    /// verbs without `--as-service`, for the other flavour, and the person's own
+    /// service verbs keep the profile's log.
+    #[test]
+    fn the_log_role_of_each_command() {
+        use logging::ServiceLogRole::{Host, Installer, Netd};
+        for (argv, want) in [
+            ("service-run", Some(Host)),
+            ("netd", Some(Netd)),
+            ("service install --as-service", Some(Installer)),
+            ("service uninstall --system", Some(Installer)),
+            (
+                "cleanup-legacy-install --target-flavour perMachine",
+                Some(Installer),
+            ),
+            ("enable-system-context", Some(Installer)),
+            ("disable-system-context", Some(Installer)),
+            ("keep-system-context", Some(Installer)),
+            ("service install", None),
+            ("service uninstall", None),
+            ("service status --as-service", None),
+            ("service start --as-service", None),
+            ("service stop --as-service", None),
+            ("cleanup-legacy-install --target-flavour perUser", None),
+            ("cleanup-legacy-install --target-flavour bogus", None),
+        ] {
+            let cli =
+                Cli::try_parse_from(std::iter::once("roomlerd").chain(argv.split_whitespace()))
+                    .unwrap_or_else(|e| panic!("`{argv}`: {e}"));
+            assert_eq!(service_log_role(cli.command.as_ref()), want, "`{argv}`");
+        }
+        assert_eq!(service_log_role(None), None);
+    }
+
+    /// #3230 — a failed step's end line carries every layer of its error, and the
+    /// code `main` exits with.
+    #[test]
+    fn a_failed_step_ends_with_its_whole_chain_and_its_exit_code() {
+        let res: Result<()> = Err(anyhow::Error::new(std::io::Error::from_raw_os_error(1072))
+            .context("CreateServiceW")
+            .context("registering Roomler with the SCM"));
+        let (error, code) = step_outcome(&res);
+        let error = error.expect("an error");
+        assert!(
+            error.starts_with("registering Roomler with the SCM: CreateServiceW: "),
+            "{error}"
+        );
+        assert!(error.ends_with("(os error 1072)"), "{error}");
+        assert_eq!(code, EXIT_CODE_OF_AN_ERR);
+        assert_eq!(step_outcome(&Ok(())), (None, 0));
     }
 
     /// #3292 — no marker, no stop: an ephemeral device's identity is at stake.

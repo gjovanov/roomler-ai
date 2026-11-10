@@ -1627,11 +1627,13 @@ jobs:
       # #3292 — the launcher is Windows-only code, and every Linux lane compiles
       # its stub. The rolling log's stderr capture is `cfg(windows)` too, in a crate
       # whose tests otherwise run only on Linux and on the Mac's machine id.
+      # #3230 — and the installer log of the per-Machine MSI's own steps, a
+      # Windows log, whose folder test is `cfg(windows)`.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |
