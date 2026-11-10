@@ -374,6 +374,11 @@ mod transfer_activity_tests;
 /// holder of `MANAGE_AGENTS`.
 #[cfg(test)]
 mod tunnel_enroll_tests;
+/// An org's tunnel policies are read and written under `MANAGE_AGENTS`, the
+/// bit decided before the policy or the body is read; the forward itself is
+/// the policy's to decide.
+#[cfg(test)]
+mod tunnel_policy_permission_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the
