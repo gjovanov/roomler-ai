@@ -1,6 +1,6 @@
-# FR-XXX: A daemon restart never splits a pair — every carrier transition is make-before-break on both ends
+# FR-139: A daemon restart never splits a pair — every carrier transition is make-before-break on both ends
 
-**Issue:** [#3541](https://github.com/gjovanov/roomler-ai/issues/3541) · **Status:** draft 2026-11-10, the number not yet claimed; D1–D5 (§7) open; nothing built · **Owner:** the overlay's carrier state machine (`crates/tunnel-core/src/overlay`) · **Anchors:** master `0d0f55d55`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Builds on:** [FR-9](FR-9-lan-pairs-converge-direct.md) (the promote grace), the demote-follow and its holdoff (#27, #31 and #34 in the code's notes), the DERP stamp probe (#2820), the shadow `Tunn` (#3602) · **Related:** #3528, #3539
+**Issue:** [#3618](https://github.com/gjovanov/roomler-ai/issues/3618) · **Status:** claimed 2026-11-10; D1–D5 (§7) open; nothing built · **Owner:** the overlay's carrier state machine (`crates/tunnel-core/src/overlay`) · **Anchors:** master `0d0f55d55`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#3541](https://github.com/gjovanov/roomler-ai/issues/3541), found by #3528's lab and re-specced by its triage on 2026-11-08 · **Builds on:** [FR-9](FR-9-lan-pairs-converge-direct.md) (the promote grace), the demote-follow and its holdoff (#27, #31 and #34 in the code's notes), the DERP stamp probe (#2820), the shadow `Tunn` (#3602) · **Related:** #3528, #3539
 
 ## Summary, for the operator
 
@@ -508,4 +508,4 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 |---|---|---|
 | 2026-11-07 | 0.4.203, two Linux root daemons on one LAN | #3528's controls: 7 of 7 restarts where B held A on LAN and accepted its new initiation stalled 15.67–15.68 s. 0 of 4 stalled where B refused the initiation (a backward step), and 0 of 1 where B held A on a relay (§2.1) |
 | 2026-11-07 | 0.4.204, Windows ↔ Windows on one LAN | one restart: the peer demote-followed away from LAN and stayed on `/derp` at 81–167 ms for about 3 minutes, until a 9 ms probe brought the pair back (§2.2) |
-| 2026-11-10 | master `0d0f55d55`, agent 0.4.207 | spec drafted, every anchor verified at the pin. Nothing has touched the follow, the grace, `follow_peer_to_derp` or the relayed-instead holdoff since #3541's anchor `28a268086`, so 0.4.207 carries the same follow, and P0's RED is expected to reproduce on it |
+| 2026-11-10 | master `0d0f55d55`, agent 0.4.207 | spec drafted and claimed as FR-139 (#3618), every anchor verified at the pin. Nothing has touched the follow, the grace, `follow_peer_to_derp` or the relayed-instead holdoff since #3541's anchor `28a268086`, so 0.4.207 carries the same follow, and P0's RED is expected to reproduce on it |
