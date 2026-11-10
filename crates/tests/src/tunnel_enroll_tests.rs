@@ -547,6 +547,11 @@ async fn a_removed_tunnel_client_comes_back_only_through_a_device_manager() {
     let revived = client_row(&app, &org, "mach-gone-a").await.unwrap();
     assert_eq!(revived.get("deleted_at"), Some(&Bson::Null));
     assert_eq!(revived.get("token_gen"), tombstone.get("token_gen"));
+    assert_eq!(
+        revived.get_object_id("owner_user_id").unwrap().to_hex(),
+        org.admin.id,
+        "it comes back as the reviver's: its new token acts for them"
+    );
     let new_token = body["tunnel_client_token"].as_str().unwrap().to_string();
     assert_eq!(token_generation(&new_token), 1);
     assert_eq!(overlay_state(&app, &org).await, overlay_before);
