@@ -2744,7 +2744,7 @@ mod tests {
             std::fs::remove_dir(tree.folder()).unwrap();
             junction(tree.folder(), &elsewhere);
             let target = sddl(&elsewhere);
-            let why = adopt_machine_folder(&tree).expect_err("a junction is never taken over");
+            let why = adopt_machine_folder(&tree).expect_err("never taken over");
             assert!(
                 why.contains(&tree.folder().display().to_string()),
                 "the reason names the entry: {why}"

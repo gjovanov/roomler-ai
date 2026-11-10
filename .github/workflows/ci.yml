@@ -1862,12 +1862,14 @@ jobs:
       # (#3073: the elevated runner hands it to SYSTEM, and the repair keeps
       # SYSTEM in on the folder and on every child). Setting an owner takes
       # this lane's elevated token. The other lane that runs
-      # `roomler-node-core` is Linux, where these tests do not exist.
+      # `roomler-node-core` is Linux, where these tests do not exist. Also the
+      # elevated writers' merge base (`config::tests::machine_merge_base`): a
+      # machine config is folded into only when it is private.
       # ⚠️ No `: ` in a plain YAML value (`machine_tree:: x` is a mapping, and
       # the whole workflow file fails to load), and no ` #` in a name.
       - name: "The machine tree is repaired and checked (#3073, #3609)"
         if: ${{ !cancelled() }}
-        run: cargo test -p roomler-node-core --lib -- machine_tree::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make --nocapture
+        run: cargo test -p roomler-node-core --lib -- machine_tree::tests config::tests::a_save_never_writes_into_a_file_it_did_not_make config::tests::machine_merge_base --nocapture
       # Runs even when the unit step failed: the two prove different halves
       # (the child's integrity, the daemon's impersonation), and one red must
       # not hide the other's evidence.
