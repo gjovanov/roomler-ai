@@ -1091,6 +1091,9 @@ pub(crate) async fn resume_gate(
     use roomler_ai_db::models::role::permissions;
     use roomler_ai_remote_control::models::AgentStatus;
 
+    state
+        .resume_gate_runs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let agent = match gate_read(
         state
             .fleet
