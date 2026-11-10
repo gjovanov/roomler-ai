@@ -259,6 +259,14 @@ remembers to add a predicate for it.
 shape; evicting someone from their organisation over a private channel would be
 absurd.
 
+⚠️ **A refusal about someone other than the caller is a plain `forbidden`.** An
+enrollment credential whose issuer has left the org, or no longer holds
+`MANAGE_AGENTS` there, and a tunnel enrollment token whose subject has left, are
+refused with 403 `forbidden` and the server's sentence, never `not_a_member`,
+which would say the caller is the one outside the org: the person in question is
+not the caller, and the caller is a device, not a page
+([`security-baseline.md`](security-baseline.md#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)).
+
 ### How it went wrong
 
 `ui/src/api/client.ts` used to read *any* `403` on a `GET` as a dead session —
