@@ -27,7 +27,15 @@
 #     the machine is enrolled in. FR-138's detach, resume and close lines do not
 #     exist before P2a, so this read prints them as absent at P0;
 #   - the media gap, as §6 step 4 defines it at P0: from the old row's
-#     ended_at to the redial's first_frame record.
+#     ended_at to the redial's first_frame record;
+#   - AC7's count: each session the roll window ended, by class. A session
+#     ended `agent_disconnect` (seen, or inferred: the row's `end_source`) and
+#     one whose resume was lost because its viewer never rejoined
+#     (`controller_hangup`, its `session_ended` audit marked
+#     `limit: hold_expired`) both count: the roll cost the session either way.
+#     An inferred end is dated by the row's own last clock, which can come a
+#     stats interval before the cut, so for AC7 take --from at the promote's
+#     dispatch.
 # With --active it counts instead the rows that have no end, by phase and by age
 # (under 1 h, 1-24 h, over 24 h), with the oldest five by started_at: the rows
 # P1's registration read and sweep will meet.
@@ -118,7 +126,7 @@ while [ $# -gt 0 ]; do
     --session)
       [[ "${2:-}" =~ ^[0-9a-f]{24}$ ]] || die "--session takes a 24-hex session id"
       SESSIONS="${SESSIONS:+$SESSIONS,}$2"; PASS+=("$1" "$2"); shift 2 ;;
-    -h|--help)  sed -n '2,81p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,89p' "$0"; exit 0 ;;
     *)          die "unknown argument: $1 (--help)" ;;
   esac
 done
@@ -261,7 +269,7 @@ if (MODE === "active") {
     print("refused: --to must be after --from and at most 2 h later");
   } else {
     print("window from=" + iso(FROM) + " to=" + iso(TO) + " tail_end=" + iso(TEND) + " lookback_from=" + iso(LB));
-    const PROJ = { agent_id: 1, tenant_id: 1, controller_user_id: 1, phase: 1, created_at: 1, started_at: 1, ended_at: 1, end_reason: 1, carrier: 1 };
+    const PROJ = { agent_id: 1, tenant_id: 1, controller_user_id: 1, phase: 1, created_at: 1, started_at: 1, ended_at: 1, end_reason: 1, end_source: 1, carrier: 1 };
     const rows = db2.remote_sessions.aggregate([
       { $match: { created_at: { $gte: LB, $lt: TEND } } },
       { $sort: { created_at: 1 } },
@@ -350,6 +358,20 @@ if (MODE === "active") {
     // enrollments seeks the {tenant_id, machine_id} index, one tenant at a time.
     const agentTids = study.length ? db2.agents.distinct("tenant_id", {}, { maxTimeMS: 10000 }) : [];
     const nextOf = new Map();
+    // FR-138 AC7 — each studied session the window ended, by class. A resume
+    // lost because its viewer never rejoined ends `controller_hangup`, its
+    // `session_ended` audit marked `limit: hold_expired`: the roll cost the
+    // session as surely as an `agent_disconnect` end.
+    const AC7 = ["agent_disconnect", "agent_disconnect_inferred", "hold_expired"];
+    const ac7 = { agent_disconnect: 0, agent_disconnect_inferred: 0, hold_expired: 0,
+      other_reason: 0, ended_outside_window: 0, still_open: 0 };
+    const ac7Class = (r, ends) => {
+      if (!r.ended_at) return "still_open";
+      if (r.ended_at < FROM || r.ended_at >= TEND) return "ended_outside_window";
+      if (r.end_reason === "agent_disconnect") return r.end_source ? "agent_disconnect_inferred" : "agent_disconnect";
+      if (r.end_reason === "controller_hangup" && ends.some((e) => e.event && e.event.limit === "hold_expired")) return "hold_expired";
+      return "other_reason";
+    };
     for (const r of study) {
       const A = r.agent_id, aH = hex(A), U = hex(r.controller_user_id);
       const d = db2.agents.find({ _id: A }, { _id: 0, os: 1, agent_version: 1, machine_id: 1, "access_policy.consent_mode": 1 })
@@ -362,10 +384,15 @@ if (MODE === "active") {
         + " consent_mode=" + ((d.access_policy && d.access_policy.consent_mode) || "unset") + " orgs_on_machine=" + orgs
         + " carrier=" + (r.carrier || "-") + (liveAt(r) ? "" : " [not live at --from]"));
       print("  old row: started " + at(r.started_at) + ", ended " + at(r.ended_at) + ", end_reason=" + (r.end_reason || "-")
-        + ", phase=" + r.phase);
-      const oa = db2.remote_audit.find({ session_id: r._id, "event.kind": "session_ended" }, { _id: 0, at: 1, "event.reason": 1 })
+        + (r.end_source ? ", end_source=" + r.end_source : "") + ", phase=" + r.phase);
+      const oa = db2.remote_audit.find({ session_id: r._id, "event.kind": "session_ended" },
+        { _id: 0, at: 1, "event.reason": 1, "event.limit": 1 })
         .sort({ at: 1 }).limit(3).maxTimeMS(5000).toArray();
-      print("  old row's session_ended audit: " + (oa.length ? oa.map((e) => at(e.at) + " " + e.event.reason).join("; ") : "none"));
+      print("  old row's session_ended audit: " + (oa.length ? oa.map((e) => at(e.at) + " " + e.event.reason
+        + (e.event.limit ? " limit=" + e.event.limit : "")).join("; ") : "none"));
+      const cls7 = ac7Class(r, oa);
+      ac7[cls7] += 1;
+      print("  AC7: " + cls7 + (AC7.includes(cls7) ? " (counted)" : ""));
       const nx = db2.remote_sessions.find({ agent_id: A, created_at: { $gt: r.created_at } }, PROJ)
         .sort({ created_at: 1 }).limit(5).maxTimeMS(5000).toArray();
       const N = nx.find((x) => hex(x.controller_user_id) === U);
@@ -441,6 +468,11 @@ if (MODE === "active") {
     print("AFTER_DROP RECORDS IN THE WINDOW, ANY DEVICE:");
     if (!ad.length) print("  none");
     for (const x of ad) print("  " + (x.f.agent_id ? dev(x.f.agent_id) : "dev?") + " " + recLine(x));
+    print("");
+    print("AC7, the sessions studied: counted=" + AC7.reduce((n, k) => n + ac7[k], 0)
+      + " (" + AC7.map((k) => k + "=" + ac7[k]).join(" ") + ")"
+      + "; not counted: other_reason=" + ac7.other_reason + " ended_outside_window=" + ac7.ended_outside_window
+      + " still_open=" + ac7.still_open);
   }
 }
 print("done");
