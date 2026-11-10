@@ -149,6 +149,10 @@
       "methods": "GET,HEAD,PUT"
     },
     {
+      "path": "/api/admin/rc-sessions/close-dead",
+      "methods": "POST"
+    },
+    {
       "path": "/api/admin/room-members/prune",
       "methods": "POST"
     },
@@ -2177,6 +2181,12 @@
               "phase": 1,
               "created_at": 1
             }
+          },
+          {
+            "key": {
+              "phase": 1,
+              "created_at": 1
+            }
           }
         ]
       },
@@ -4148,6 +4158,12 @@
           {
             "key": {
               "agent_id": 1,
+              "phase": 1,
+              "created_at": 1
+            }
+          },
+          {
+            "key": {
               "phase": 1,
               "created_at": 1
             }

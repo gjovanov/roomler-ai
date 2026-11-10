@@ -155,7 +155,7 @@ it to the docs phase.
 | `AgentPeer`'s `Drop` releases the session's bookkeeping but never closes its `RTCPeerConnection` | `agents/roomlerd/src/peer.rs:1973` | The reason the table may never drop a peer it has not closed (§4.2) |
 | The shutdown hook cancels agent sockets with `notify_waiters`, which loses the signal for a busy loop, so a pod may die without ending or detaching anything | `crates/modules/fleet/src/hub.rs:1283` | Routed around: the claim decides, and registration and the sweep close what the dead pod left (§4.4) |
 | No sweep ends a `remote_sessions` row that a dead pod left Active | `crates/remote_control/src/audit.rs:216` (the end is written only from the audit stream) | Closed by the registration read and the sweep (§4.4) |
-| Removing a member, or the right to control a device, never ends a live session; the gate runs once, at the request | `crates/modules/remote/src/controller.rs:729` | The claim re-runs the gate (§4.4); between rolls, unchanged |
+| A session's authorization gate runs when it is requested; the claim runs it again at a resume (§4.4) | `crates/modules/remote/src/controller.rs:729` | The claim re-runs the gate (§4.4); between rolls, unchanged |
 | An admin's end shows the viewer no reason, and its audit row names no actor | `useRemoteControl.ts:957-958`; `hub.rs:2473-2481` | The viewer gains a sentence in P1. The actor is not this FR's |
 | A TURN credential lives 600 s and bounds its allocation's whole life, by the code's own comment | `crates/remote_control/src/turn_creds.rs:57-63` | A resume mints nothing and keeps the allocation it had. §6 starts each TURN session shortly before the roll |
 | `docs/multi-pod-scale-out.md` says cross-pod frame relay is rejected permanently, names `rc:session.rehome`, and places the cluster code in `crates/api/src/cluster/`; the relay ships and answers a miss first, the rehome reply is `rc:error agent_on_other_pod` and only the relay's fallback (`crates/modules/remote/src/controller.rs:379`), and the code is in `crates/core/src/cluster/`. Its failure table says an agent socket's loss ends that pod's sessions | `docs/multi-pod-scale-out.md:35`, `:50`, `:73`, `:106`, `:111-115`, `:182`, `:197`, `:206`; `crates/modules/remote/src/relay.rs:3-31` | Corrected in the PR that lands this spec, line for line, where the doc is already wrong: the paths, the rehome reply and the relay. The failure table at `:182` is true until P3, so the docs phase rewrites it |
@@ -423,9 +423,11 @@ saw. They write `ended_at` as the best-known real end, never their own clock:
 
 The agent's `last_seen_at` is not used: the hello, the offline paths and the heartbeat all stamp it
 (`crates/services/src/dao/agent.rs:541`, `:629`, `:674`, `:791`), so it dates the agent's last connection, not this
-row's. Each such row also gets `end_source`, `registration` or `sweep`, so an hour-weighted read can leave it out.
-P1 makes the growth digest do so (`digest.rs:1698-1717`); FR-135's R0 and S19 weights need the same filter, which
-P1's PR names for their owner. P0 counted the rows first: 11 on 5 devices, none started in the 8 days before (§10).
+row's. Each such row also gets `end_source`, `registration` or `sweep`, so a read can tell it apart. The growth
+digest counts its hours up to that inferred end, a proven lower bound, as `growth_org_daily` does, and leaves it out
+of its quality section's ends (`digest.rs:1698-1717`; decided at P1b-2's review, 2026-11-10, so the live digest and
+the nightly freeze agree); FR-135's R0 and S19 weights face the same choice, which P1's PR names for their owner.
+P0 counted the rows first: 11 on 5 devices, none started in the 8 days before (§10).
 
 ⚠️ **An end wins over a resume.** Every end writes the row conditionally on its being Active, then publishes today's
 control event. A resume commits with its fencing update, which also requires Active and an unexpired `resume_by`, and

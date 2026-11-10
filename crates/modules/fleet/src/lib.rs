@@ -162,6 +162,10 @@ pub struct FleetState {
     /// at a device's registration (from P1b). Nothing reads it while
     /// `rc.session_resume_secs` is 0.
     pub rc_resume_scope: Arc<RcResumeScopeDao>,
+    /// FR-138 P1b-2 (review 2, N2) — the turn a reading of the scope takes on
+    /// this pod (`resume_scope::reconcile`): one at a time, so the last one
+    /// applies the newest list.
+    pub rc_resume_reconcile: Arc<tokio::sync::Mutex<()>>,
     pub rc_hub: Arc<Hub>,
     /// Phase A-1 — the Redis presence owner-token per locally-registered
     /// agent WS. Written/removed by the agent socket; read by the shutdown
@@ -340,6 +344,7 @@ impl Module for FleetState {
             config_audit: Arc::new(ConfigAuditDao::new(db)),
             keep_busy_events: Arc::new(KeepBusyEventDao::new(db)),
             rc_resume_scope: Arc::new(RcResumeScopeDao::new(db)),
+            rc_resume_reconcile: Arc::new(tokio::sync::Mutex::new(())),
             rc_hub,
             agent_presence_tokens: Arc::new(DashMap::new()),
             presence_fanout: Arc::new(presence::PresenceFanout::default()),
@@ -405,6 +410,10 @@ impl Module for FleetState {
         // a DB-name-scoped Redis NX claim; first tick a full interval out so
         // tests driving `run_presence_sweep` directly stay deterministic).
         presence::spawn_sweeper(state.clone());
+        // FR-138 P1b-2 (review 2, N2) — while the window is on, the resume
+        // scope is read again on the same cadence, so a change whose event
+        // was lost still reaches this pod's devices. Not spawned at window 0.
+        resume_scope::spawn_reconciler(state.clone());
         // C-2/PR-1 — the owner-side idle-agent nudge handler (P7b, from the
         // host): cycles an agent's socket iff every holder reads it idle.
         nudge::register_bus_handler(&state);

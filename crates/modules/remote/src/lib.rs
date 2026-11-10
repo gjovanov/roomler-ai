@@ -48,6 +48,9 @@ use roomler_core::{
 
 pub mod agent_socket;
 pub mod controller;
+/// FR-138 P1b-2 — `POST /api/admin/rc-sessions/close-dead`, the one-time
+/// close of the session rows a pod that died before FR-138 left open.
+pub mod dead_rows;
 pub mod extauth;
 pub mod extauth_notice;
 /// FR-138 P1b-2 — `rc:session.rejoin`, the viewer's claim on a session held
@@ -63,6 +66,9 @@ pub mod routes;
 pub mod row_end;
 pub mod session_policy;
 pub mod slots;
+/// FR-138 P1b-2 — the sweep: the rows nobody will ever claim, ended at their
+/// own last clock, one pod at a time.
+pub mod sweep;
 pub mod touch_presets;
 
 /// The module's state: the core, the fleet module it is built on, and what
@@ -109,6 +115,9 @@ pub struct RemoteState {
     /// ended without seeing their end, so the device's own end of one
     /// replaces the inferred reason (`resume::device_end`).
     pub registration_ends: Arc<resume::RegistrationEnds>,
+    /// FR-138 P1b-2 (review 2, N7) — where this pod's sweep reads the quiet
+    /// rows on from (`sweep::Cursor`).
+    pub sweep_cursor: Arc<sweep::Cursor>,
 }
 
 impl std::ops::Deref for RemoteState {
@@ -146,12 +155,18 @@ impl Module for RemoteState {
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
             extauth: Arc::new(extauth::ExtauthRelay::new()),
             registration_ends: Arc::new(resume::RegistrationEnds::new()),
+            sweep_cursor: Arc::new(sweep::Cursor::default()),
             fleet,
             core,
         };
         // PR-2 — the cross-pod rc signalling relay: owner-side rc.cmd /
         // rc.conn_closed / rc.conn_alive + the proxy janitor sweep.
         relay::wire_rc_relay(&state);
+        // FR-138 P1b-2 — the sweep of the session rows nobody will claim, and
+        // the answer the dead-row close asks of the pod that holds a device's
+        // socket: does your hub hold this session?
+        sweep::spawn(state.clone());
+        dead_rows::wire_session_held(&state);
         // The agent socket is fleet's; this module's arm (the session-stats
         // merge) is dispatched to it by `ClientMsg::namespace()` (P5c).
         // FR-138 — and its lifecycle answers a hello's claims on the sessions
@@ -209,6 +224,10 @@ impl Module for RemoteState {
         let privacy = Router::new().route("/{agent_id}", get(routes::privacy_activity));
 
         Router::new()
+            // FR-138 P1b-2 — a platform operator's one-time close of the
+            // rows a pod that died before FR-138 left open: a dry run unless
+            // the body says otherwise.
+            .route("/admin/rc-sessions/close-dead", post(dead_rows::close_dead))
             .nest("/tenant/{tenant_id}/session", session)
             .nest("/tenant/{tenant_id}/recording-activity", recording)
             .nest("/tenant/{tenant_id}/transfer-activity", transfers)
@@ -287,13 +306,17 @@ impl Module for RemoteState {
             // FR-138 P1b-2 (P1b-1's review, L3) — the registration read: a
             // device's live rows, oldest first, at each registration of a device
             // announced a window. Without it the read walked the device's whole
-            // history, for every device of a roll.
+            // history, for every device of a roll. Part two — every live row
+            // by age, for the sweep and the dead-row close: only live sessions
+            // and the rows a dead pod left are Active, so the phase bounds the
+            // read.
             IndexSet {
                 collection: "remote_sessions",
                 pre_ops: Vec::new(),
-                indexes: vec![index(
-                    bson::doc! { "agent_id": 1, "phase": 1, "created_at": 1 },
-                )],
+                indexes: vec![
+                    index(bson::doc! { "agent_id": 1, "phase": 1, "created_at": 1 }),
+                    index(bson::doc! { "phase": 1, "created_at": 1 }),
+                ],
             },
             // FR-85 P3 — remote-recording activity the devices report (a
             // claim, beside `remote_audit`'s decision) — 90-day retention,

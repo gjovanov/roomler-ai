@@ -84,14 +84,14 @@ pub const REJECT_REASON_SESSION_GONE: &str = "tunnel session not open on agent";
 /// e.g. an agent-disconnect teardown — while the client kept forwarding).
 /// Same session-death class as [`REJECT_REASON_SESSION_GONE`] but raised one
 /// hop earlier, at the server: clients match it too and re-open. Wire-stable,
-/// do not reword. Emitted at `crates/api/src/ws/tunnel.rs` (handle_forward_request).
+/// do not reword. Emitted at `crates/modules/network/src/tunnel.rs` (handle_forward_request).
 pub const REJECT_REASON_NO_SESSION: &str = "no open session (send rc:tunnel.open first)";
 
 /// Reject reason the SERVER sends when a forward's `session_id` doesn't match
 /// the session currently open on that connection — the client is still
 /// forwarding on a stale session id after the server rebuilt/replaced it.
 /// Also session-death: re-opening yields a fresh id both sides agree on.
-/// Wire-stable, do not reword. Emitted at `crates/api/src/ws/tunnel.rs`.
+/// Wire-stable, do not reword. Emitted at `crates/modules/network/src/tunnel.rs`.
 pub const REJECT_REASON_SESSION_MISMATCH: &str = "session_id mismatch";
 
 /// FR-137 S-B3 — the `rc:error` code that refuses an `rc:tunnel.open`
@@ -2716,11 +2716,11 @@ pub enum ServerMsg {
     /// surface a useful reason in its log + decide whether to
     /// reconnect or stop.
     ///
-    /// Emitted at three sites:
-    ///   * `crates/api/src/ws/handler.rs:189` — agent row is
-    ///     deleted/quarantined, `reason = AgentDeleted`.
-    ///   * `crates/remote_control/src/hub.rs::register_agent`
-    ///     displacement path, `reason = ReplacedByNewerConnection`.
+    /// Emitted at these sites (in `crates/modules/fleet/src/`):
+    ///   * `socket.rs`'s upgrade and `Hub::kick_removed_agent` (#2267) —
+    ///     the device was removed, `reason = AgentDeleted`.
+    ///   * `Hub::register_agent_resuming`'s displacement path (`hub.rs`),
+    ///     `reason = ReplacedByNewerConnection`.
     ///   * (future) policy gate (account suspended, etc.),
     ///     `reason = PolicyRejected`.
     ///
@@ -7090,9 +7090,9 @@ mod tests {
 
     #[test]
     fn server_tunnel_revoked_round_trips() {
-        // Promoted from the T1 stub plain-JSON frame in
-        // crates/api/src/ws/tunnel.rs. Reason field is human-readable;
-        // discriminator is what handlers gate on.
+        // Promoted from the T1 stub plain-JSON frame in the tunnel relay
+        // (now `crates/modules/network/src/tunnel.rs`). Reason field is
+        // human-readable; discriminator is what handlers gate on.
         let m = ServerMsg::TunnelRevoked {
             reason: "status changed to Quarantined".into(),
         };

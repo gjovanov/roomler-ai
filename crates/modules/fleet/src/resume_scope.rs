@@ -19,7 +19,8 @@
 //! at a device's registration ([`resume_hello`], through
 //! [`RcResumeScopeDao::covers`](roomler_ai_services::dao::rc_resume_scope::RcResumeScopeDao::covers)),
 //! for a device that advertises `rc-resume`; P1b-2 re-announces the window
-//! when the list changes ([`scope_changed`]).
+//! when the list changes ([`scope_changed`]), and while the window is on
+//! every pod reads the list again on a cadence ([`spawn_reconciler`]).
 
 use axum::{
     Json,
@@ -117,22 +118,33 @@ pub async fn put_scope(
     let before = state.rc_resume_scope.list().await?;
     state.rc_resume_scope.replace(&entries).await?;
     let after = state.rc_resume_scope.list().await?;
-    scope_changed(auth.user_id, &before, &after);
+    scope_changed(&state, auth.user_id, &before, &after).await;
     Ok(Json(ScopeResponse::of(
         state.settings.rc.session_resume_secs,
         &after,
     )))
 }
 
-/// The one place a change to the scope goes out from. It only records the
-/// change for now: a connected device keeps the window it was announced at
-/// its registration until its next one. FR-138 P1b-2 re-announces the window
-/// from here ([`crate::hub::Hub::announce_resume_window`]), to this pod's
-/// connected devices whose cover changed and, over the rc ctrl lane
-/// ([`crate::ctrl::publish_rc_ctrl`]), to every other pod's, as FR-92's
-/// keep-busy deny reaches them. `0` withdraws it, so a change needs no roll
-/// and a device taken out of the scope loses its window at once.
-fn scope_changed(admin: ObjectId, before: &[ResumeScopeEntry], after: &[ResumeScopeEntry]) {
+/// The one place a change to the scope goes out from (spec §4.1). Every
+/// connected device that advertises `rc-resume` is told its window again:
+/// this pod's at once, every other pod's over the rc ctrl lane, as FR-92's
+/// keep-busy deny reaches them. A device the scope now covers is told the
+/// window, one it no longer covers is told 0, which withdraws it, so a change
+/// needs no roll and reverses at once.
+///
+/// The event is only a nudge (review 2, N2): it carries no list and no
+/// window. Each pod that hears it reads the store itself and applies its OWN
+/// window ([`reconcile`]), so an event that arrives late or twice applies
+/// the newest list, and a pod at 0 announces nothing whatever the sender
+/// holds. One that is lost is caught by the next cadence ([`spawn_reconciler`]).
+/// With the window at 0 nobody holds one and nobody is told, so nothing is
+/// published either.
+async fn scope_changed(
+    state: &FleetState,
+    admin: ObjectId,
+    before: &[ResumeScopeEntry],
+    after: &[ResumeScopeEntry],
+) {
     let added = after
         .iter()
         .filter(|e| !before.iter().any(|b| b.same_target(e)))
@@ -141,13 +153,114 @@ fn scope_changed(admin: ObjectId, before: &[ResumeScopeEntry], after: &[ResumeSc
         .iter()
         .filter(|b| !after.iter().any(|e| e.same_target(b)))
         .count();
+    let told = reconcile(state).await;
     info!(
         %admin,
         added,
         removed,
         entries = after.len(),
+        told,
         "rc resume scope saved"
     );
+    if capped_window(state.settings.rc.session_resume_secs) > 0 {
+        crate::ctrl::publish_rc_ctrl(state, "resume_scope", serde_json::json!({})).await;
+    }
+}
+
+/// FR-138 P1b-2 (review 2, N2) — tell every connection on THIS pod that
+/// advertises `rc-resume` its window again ([`reannounce`]), from the store
+/// as it reads now and under this pod's OWN window (`rc.session_resume_secs`,
+/// capped): a device is told what its pod announces at a registration. At
+/// window 0 it reads nothing and tells nobody. Readings on one pod take turns
+/// (`FleetState::rc_resume_reconcile`), so the last one applies the newest
+/// list. A store that cannot be read changes nothing: the next reading
+/// tries again. How many were told.
+pub async fn reconcile(state: &FleetState) -> usize {
+    let window = capped_window(state.settings.rc.session_resume_secs);
+    if window == 0 {
+        return 0;
+    }
+    let _turn = state.rc_resume_reconcile.lock().await;
+    let entries = match state.rc_resume_scope.list().await {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!(%e, "rc resume scope unreadable: every window stays as announced until the next reading");
+            return 0;
+        }
+    };
+    let targets: Vec<ScopeTarget> = entries.iter().map(|e| (e.kind, e.id)).collect();
+    reannounce(&state.rc_hub, window, &targets)
+}
+
+/// FR-138 P1b-2 (review 2, N2) — another pod saved the scope (`resume_scope`
+/// on the rc ctrl lane, through [`crate::ctrl::apply_rc_ctrl_on`]): read it
+/// here and tell this pod's connections ([`reconcile`]). Whatever the event
+/// carries is ignored. Nothing at window 0.
+pub fn nudge(state: &FleetState) {
+    if capped_window(state.settings.rc.session_resume_secs) == 0 {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let told = reconcile(&state).await;
+        if told > 0 {
+            info!(
+                told,
+                "rc ctrl: the resume scope read again after another pod saved it"
+            );
+        }
+    });
+}
+
+/// FR-138 P1b-2 (review 2, N2) — while the window is on, read the scope again
+/// on the presence sweep's cadence (`rc.presence_sweep_secs`) and tell each
+/// connection whose window changed: a change whose event was lost reaches the
+/// device all the same. Not spawned at window 0, which the setting fixes for
+/// the process. Every pod runs its own: each tells only its own connections.
+pub fn spawn_reconciler(state: FleetState) {
+    if capped_window(state.settings.rc.session_resume_secs) == 0 {
+        return;
+    }
+    let every = std::time::Duration::from_secs(state.settings.rc.presence_sweep_secs.max(5));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let told = reconcile(&state).await;
+            if told > 0 {
+                info!(told, "rc resume scope read again: windows told");
+            }
+        }
+    });
+}
+
+/// One entry of the scope as the re-announce reads it: what it names.
+pub type ScopeTarget = (ResumeScopeKind, Option<ObjectId>);
+
+/// FR-138 P1b-2 — whether `targets` cover a device, as
+/// [`RcResumeScopeDao::covers`](roomler_ai_services::dao::rc_resume_scope::RcResumeScopeDao::covers)
+/// answers it for the stored list: `all`, the device's org, or the device.
+pub fn covered_by(targets: &[ScopeTarget], tenant_id: ObjectId, agent_id: ObjectId) -> bool {
+    targets.iter().any(|(kind, id)| match kind {
+        ResumeScopeKind::All => true,
+        ResumeScopeKind::Org => *id == Some(tenant_id),
+        ResumeScopeKind::Device => *id == Some(agent_id),
+    })
+}
+
+/// FR-138 P1b-2 — tell every connection on THIS pod that advertises
+/// `rc-resume` its window again after a scope change: `window` when
+/// `targets` cover its device, 0 when they no longer do. Only a connection
+/// whose window changes is told. With the window at 0 nobody is. How many
+/// were told.
+pub fn reannounce(hub: &crate::hub::Hub, window: u32, targets: &[ScopeTarget]) -> usize {
+    let mut told = 0;
+    for (agent_id, tenant_id, held) in hub.resume_connections() {
+        let want = (window > 0 && covered_by(targets, tenant_id, agent_id)).then_some(window);
+        if want != held && hub.announce_resume_window(agent_id, want.unwrap_or(0)) {
+            told += 1;
+        }
+    }
+    told
 }
 
 /// The PUT's contract, pure so it is testable without a server: at most
@@ -291,6 +404,88 @@ mod tests {
         assert_eq!(window_for(121, true, true), Some(MAX_WINDOW_SECS));
         assert_eq!(window_for(u64::MAX, true, true), Some(MAX_WINDOW_SECS));
         assert_eq!(capped_window(0), 0, "0 stays off");
+    }
+
+    /// P1b-2 — the re-announce reads a scope as the store's `covers` does.
+    #[test]
+    fn a_scope_covers_as_the_store_does() {
+        let (org, dev, other) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        assert!(covered_by(&[(ResumeScopeKind::All, None)], org, dev));
+        assert!(covered_by(&[(ResumeScopeKind::Org, Some(org))], org, dev));
+        assert!(covered_by(
+            &[(ResumeScopeKind::Device, Some(dev))],
+            org,
+            dev
+        ));
+        assert!(!covered_by(
+            &[
+                (ResumeScopeKind::Org, Some(other)),
+                (ResumeScopeKind::Device, Some(other)),
+            ],
+            org,
+            dev
+        ));
+        assert!(!covered_by(&[], org, dev), "an empty scope covers nothing");
+    }
+
+    /// P1b-2 — a scope change tells only the connections whose window
+    /// changes: one newly covered is told the window, one no longer covered is
+    /// told 0, one without the verb is never told, and the same change again
+    /// tells nobody.
+    #[tokio::test]
+    async fn a_scope_change_tells_only_the_connections_whose_window_changes() {
+        use crate::hub::{Hub, ResumeHello};
+        use roomler_ai_remote_control::models::OsKind;
+        use roomler_ai_remote_control::signaling::ServerMsg;
+
+        let client = mongodb::Client::with_uri_str("mongodb://localhost:27017")
+            .await
+            .expect("mongo for tests");
+        let (audit, _h) =
+            roomler_ai_remote_control::audit::AuditSink::spawn(client.database("rc_test"));
+        let hub = Hub::new(audit, None);
+        let org = ObjectId::new();
+        let register = |agent: ObjectId, advertised: bool, window: Option<u32>| {
+            hub.register_agent_resuming(
+                agent,
+                org,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                ResumeHello {
+                    advertised,
+                    window,
+                    kept: Vec::new(),
+                },
+            )
+            .rx
+        };
+        let told = |rx: &mut tokio::sync::mpsc::Receiver<ServerMsg>| -> Vec<u32> {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let ServerMsg::AgentResumeWindow { secs } = m {
+                    out.push(secs);
+                }
+            }
+            out
+        };
+        let (a, b, c) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let mut rx_a = register(a, true, None);
+        let mut rx_b = register(b, true, Some(60));
+        let mut rx_c = register(c, false, None);
+
+        let only_a = [(ResumeScopeKind::Device, Some(a))];
+        assert_eq!(reannounce(&hub, 60, &only_a), 2);
+        assert_eq!(told(&mut rx_a), vec![60], "newly covered");
+        assert_eq!(told(&mut rx_b), vec![0], "no longer covered: withdrawn");
+        assert!(told(&mut rx_c).is_empty(), "never sent blind");
+        assert_eq!(hub.agent_resume_window(a), Some(60));
+        assert_eq!(hub.agent_resume_window(b), None);
+
+        assert_eq!(reannounce(&hub, 60, &only_a), 0, "nothing changed");
+        assert!(told(&mut rx_a).is_empty() && told(&mut rx_b).is_empty());
     }
 
     const ORG: &str = "6a975e17971e2d55ddcdedb2";

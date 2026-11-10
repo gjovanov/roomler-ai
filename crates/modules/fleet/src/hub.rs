@@ -827,9 +827,9 @@ pub struct HubInner {
     consent_tx: Option<mpsc::Sender<ConsentEvent>>,
 
     /// Fleet RPC — callers parked on a `rc:rpc.result`, keyed by request id.
-    /// Same-pod only: the agent's WS receive path and the HTTP handler that
-    /// is awaiting live in one process, and the API layer routes a request to
-    /// the owner pod BEFORE reaching the Hub (see `ws/rc_relay.rs`).
+    /// Same-pod only: the agent's WS receive path and the awaiting HTTP
+    /// handler live in one process; a pod without the device's socket answers
+    /// offline (`agent_exec.rs`), and FR-94's service path uses `exec_pending`.
     exec_waiters: DashMap<String, oneshot::Sender<ExecOutcome>>,
 
     /// FR-115 P3b — the cluster-wide slot record, set once at startup when
@@ -1484,8 +1484,8 @@ impl Hub {
 
     /// Controller asked to start a session against `agent_id`.
     /// Creates the session, notifies the agent, returns the new session id.
-    /// The caller (WS dispatcher) is expected to follow up by awaiting consent
-    /// in a spawned task — see [`Self::run_consent_flow`].
+    /// Consent is then awaited on a task the session spawns itself
+    /// ([`Self::create_session_full`]), ending in `handle_consent_outcome`.
     // Each new field on `rc:session.request` lands as another arg
     // here. Clippy's 7-arg threshold is conservative for an internal
     // helper whose call sites are exhaustive; allowing it is cheaper
@@ -2717,8 +2717,8 @@ impl Hub {
     /// `SendFailed` if the channel is full (rare — the agent rx pump
     /// reads as fast as it can serialise + write to the socket).
     ///
-    /// Used by the `roomler` relay path in
-    /// `crates/api/src/ws/tunnel.rs` to forward
+    /// Used by the `roomler` relay path in the network module's
+    /// `crates/modules/network/src/tunnel.rs` to forward
     /// `ServerMsg::TcpForwardForward` / `TcpHalfClose` /
     /// `TcpClosed` / `TunnelTerminate` to the agent on behalf of a
     /// connected tunnel-client. Distinct from the remote-control
@@ -2751,9 +2751,9 @@ impl Hub {
     // ─── Fleet RPC broker ────────────────────────────────────────────
     //
     // Push a command to a device and park the caller on its answer. Purely
-    // same-pod: the API layer has already routed the request to whichever pod
-    // holds the agent's WS (`ws/rc_relay.rs`), so by the time we're here the
-    // agent's tx and the waiter live in one process.
+    // same-pod: the agent's tx and the waiter live in one process, and a pod
+    // that does not hold the agent's WS answers the request as offline
+    // (`agent_exec.rs`).
 
     /// Does this device's agent understand `rc:rpc.exec`? `None` = not online
     /// here.

@@ -3804,8 +3804,8 @@ default.
 
 | Switch | Default | Where it is read |
 |---|---|---|
-| `rc.session_resume_secs` (`ROOMLER__RC__SESSION_RESUME_SECS`), the window. The server caps it at 120 s, as the device caps what it is told, so a `resume_by` never outlives the device's own deadline | 0, off | `capped_window`, `crates/modules/fleet/src/resume_scope.rs:267` |
-| The resume scope, `GET`/`PUT /api/admin/rc-resume-scope` (platform admins only): `all`, an org, or a device | empty | `resume_hello`, `crates/modules/fleet/src/resume_scope.rs:233` |
+| `rc.session_resume_secs` (`ROOMLER__RC__SESSION_RESUME_SECS`), the window. The server caps it at 120 s, as the device caps what it is told, so a `resume_by` never outlives the device's own deadline | 0, off | `capped_window`, `crates/modules/fleet/src/resume_scope.rs:380` |
+| The resume scope, `GET`/`PUT /api/admin/rc-resume-scope` (platform admins only): `all`, an org, or a device | empty | `resume_hello`, `crates/modules/fleet/src/resume_scope.rs:346` |
 
 A device that advertises `rc-resume` and is in the scope is told `rc:agent.resume_window {secs}` right after its hello,
 and the viewer of every session created on it is told `resume_secs` on `rc:session.created` (`create_session_full`,
@@ -3834,7 +3834,7 @@ sequenceDiagram
 
 **The device's side** (P1b-1). When an announced device's socket goes, each live session leaves the hub without
 ending: its row gets `detached_at` and `resume_by`, written at the fencing number `attach_seq` the hub held, and its
-viewer is told `rc:session.detached` (`detach_agent_sessions`, `crates/modules/fleet/src/hub/resume.rs:234`). A session
+viewer is told `rc:session.detached` (`detach_agent_sessions`, `crates/modules/fleet/src/hub/resume.rs:244`). A session
 still waiting for consent or its offer, and an external one, ends as before. The next hello claims the kept sessions
 in `kept_sessions`, and the pod it reaches answers each before the socket's read loop starts (`claim`,
 `crates/modules/remote/src/resume.rs:125`):
@@ -3907,14 +3907,91 @@ receives the event:
 Each writes the audit's `session_ended` as its trail, which projects nothing onto the row
 (`AuditSink::record_trail`, `crates/remote_control/src/audit.rs:100`).
 
+**The sweep** ends the rows nobody will ever claim, one pod at a time, on the presence sweep's cadence
+(`rc.presence_sweep_secs`) with a Redis claim of its own (`run_sweep`, `crates/modules/remote/src/sweep.rs:94`):
+
+| Rows | When | `ended_at` |
+|---|---|---|
+| detached and live past `resume_by` | at every window, 0 included: only a detach writes `resume_by`, so a window turned back to 0 still ends what was detached before, and one at 0 from the start finds nothing | `detached_at` |
+| live with no `resume_by`, quiet for longer than the window, on a device in the scope that the presence sweep found offline for longer than the window, or that was removed: the pod that held it died without a word, and the device has not come back | only with the window on | `stats_at`, else `started_at` |
+
+Each is `agent_disconnect` with `end_source: sweep`, written only on the row as the sweep read it: still live, at the
+`attach_seq`, the `resume_by` and the `stats_at` read (`end_swept`, `crates/services/src/dao/remote_session.rs:552`). A
+claim that resumed the session meanwhile bumps the one and clears the other, and a session whose own clock moved is
+alive, so neither is undone. Its FR-115 slot is given back. A row outside the scope with no `resume_by` stays as it is
+until the scope reaches its device.
+
+The second kind is read a page at a time. The scope is read once a cycle and asked of the query
+(`scope_filter`, `crates/modules/remote/src/sweep.rs:168`), so the rows of a device outside it never come back. The
+next cycle reads on after the page's last row (`sweep::Cursor`, a `(created_at, _id)` cursor per pod), so the rows
+the sweep keeps, of a device online or a session this pod holds, never starve a newer one. A removed device reads as
+gone for good, never as "unreadable, try later" (`abandoned`, `crates/modules/remote/src/sweep.rs:205`).
+
+**A scope change is re-announced** at once: every connected device that advertises `rc-resume` is told its window
+again, on this pod and, over the rc ctrl lane (`resume_scope`), on every other, the window when the scope covers it
+and 0 when it no longer does, which withdraws it (`reannounce`, `crates/modules/fleet/src/resume_scope.rs:255`). Only
+a connection whose window changes is told.
+
+| Piece | What it does | Where |
+|---|---|---|
+| the event | A nudge, carrying no list and no window. A pod that hears it reads the store itself, so an event that arrives late or twice applies the newest list | `nudge`, `crates/modules/fleet/src/resume_scope.rs:199`; `apply_rc_ctrl_on`, `crates/modules/fleet/src/ctrl.rs:290` |
+| a reading | The store as it reads now, under this pod's OWN window, never the window of the pod that saved the scope: a device is told what its pod announces at a registration. Readings on one pod take turns, so the last applies the newest list. A store that cannot be read changes nothing until the next reading | `reconcile`, `crates/modules/fleet/src/resume_scope.rs:178` |
+| the cadence | While the window is on, every pod reads the store again every `rc.presence_sweep_secs`, so a change whose event was lost still reaches the device | `spawn_reconciler`, `crates/modules/fleet/src/resume_scope.rs:220` |
+| window 0 | Nothing is read, published or announced: the reader is never spawned, and a nudge does nothing. A pod at 0 never announces a window, whatever another pod holds while a roll changes the setting | the same |
+
+**The rows a pod that died before FR-138 left open** close once, by hand: `POST /api/admin/rc-sessions/close-dead`,
+for platform operators only, who are checked before the body is read (`close_dead`,
+`crates/modules/remote/src/dead_rows.rs:174`). It is a dry run unless the body says `"dry_run": false`. A live
+session is held in the hub of the pod that holds its device's control socket and nowhere else, so a row is **dead**
+when all of these hold:
+
+| Check | Evidence in the answer |
+|---|---|
+| live, created more than `min_age_hours` ago (24 by default, 1 at least), and its own clock has not moved since: no `stats_at`, or one that old | `stats_at`, `stats_age_hours` |
+| no hub on the answering pod holds it | `held_here` |
+| its device has had a session since, in its org | `later_row` |
+| its device is offline everywhere; or its socket is on the answering pod, whose hub does not hold the session; or it is on another pod, which answers over the bus that its hub does not hold it (`rc.session_held`) | `device` (`here`, `elsewhere`, `offline`, `unknown`), `owner_pod`, `held_by_owner` (`device_presence`, `crates/modules/remote/src/dead_rows.rs:347`; `held_by`, `:392`) |
+
+The answer lists the dead rows in `rows`, with the `ended_at` a real run writes and the hours each has been open, and
+every other row it read in `kept`, with its evidence and `why` (`held_here`, `no_later_row`, `held_by_owner`,
+`owner_no_answer`, `device_unknown`): anything the pod cannot read keeps the row. A real run is refused with 409 while
+`stats.enabled` is off (`stats_enabled` in the answer), because no row's own clock moves then and a live session looks
+as quiet as a dead one. It ends each dead row `agent_disconnect` at the row's own last clock (`detached_at`, else
+`stats_at`, else `started_at`), marked `end_source: backfill`, only on the row as it read it and only on a row
+created before the cut-off. It reads at most `limit` rows (50 by default, 500 at most); when `more` is true the answer
+carries `next`, and a call with `"after": next` reads on, so the rows it keeps never hide a newer dead one. A second
+run finds nothing left.
+
+```sh
+# The dry run: what a real run would close, nothing written.
+curl -sS -X POST "$SERVER/api/admin/rc-sessions/close-dead" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' -d '{}'
+# The real run, once the list reads right.
+curl -sS -X POST "$SERVER/api/admin/rc-sessions/close-dead" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' -d '{"dry_run": false}'
+# The next page, when the answer said "more": true.
+curl -sS -X POST "$SERVER/api/admin/rc-sessions/close-dead" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' -d '{"after": "<next>"}'
+```
+
+The growth digest counts a row with an `end_source` in its hour-weighted sums up to that inferred `ended_at`
+(`read_remote_usage`, `crates/api/src/growth/digest.rs:1702`). The row was seen alive at that clock, so the end is a
+proven lower bound, and `growth_org_daily` counts the row the same way (`compute_range`,
+`crates/api/src/growth/org_daily.rs:217`), so the live digest and the nightly freeze agree. The digest leaves such a
+row out of its quality section's ends by `ended_at` (`end_was_seen`, `crates/api/src/growth/digest.rs:1698`): the end
+is no failure a pod saw, and it would land, back-dated, in a day already reported. In the quality rule such a session
+still went live and still counts as requested, but it adds no duration and its end counts as `inferred`, never as an
+`agent_disconnect` failure (`session_quality`, `crates/api/src/growth/quality.rs:200`).
+
 | Off is today | What happens |
 |---|---|
-| window 0 | no window is announced and no `resume_secs` is told; a socket loss of either end ends its sessions as before; every claim is refused at once and nothing is read; a rejoin is dropped unanswered, as an older server drops it; no end is written to a row no hub holds |
+| window 0 | no window is announced and no `resume_secs` is told; a socket loss of either end ends its sessions as before; every claim is refused at once and nothing is read; a rejoin is dropped unanswered, as an older server drops it; no end is written to a row no hub holds; the sweep ends only a row a detach marked, and a scope change is told to nobody |
 | a device without `rc-resume`, or outside the scope | as window 0, for that device |
 | an older viewer | ignores `resume_secs` and never rejoins: its own socket's loss keeps the session for the window, which then ends it (AC5 allows as today, or at the window), and its next request reaps it as the same person's |
 
-The integration tests are `crates/tests/src/rc_resume_claim_tests.rs` (the device's side) and
-`crates/tests/src/rc_resume_rejoin_tests.rs` (the viewer's side, and the ends written to the row).
+The integration tests are `crates/tests/src/rc_resume_claim_tests.rs` (the device's side),
+`crates/tests/src/rc_resume_rejoin_tests.rs` (the viewer's side, and the ends written to the row) and
+`crates/tests/src/rc_resume_sweep_tests.rs` (the sweep, the re-announce and the dead-row close).
 
 ## 12. Performance targets & budget
 
@@ -4155,7 +4232,7 @@ the pod-log (~1 day) and `agent_logs` (7 d) windows, a stall in `requesting`
 leaves **no server row at all** (the request never reached a hub), and
 `agent_logs` held **zero** browser-source rows — `POST /api/log/browser`
 (`crates/modules/fleet/src/agent_log.rs:171`, mounted at
-`crates/modules/fleet/src/lib.rs:527`) had existed since rc.58 without a caller.
+`crates/modules/fleet/src/lib.rs:536`) had existed since rc.58 without a caller.
 
 Part 4 is that caller (`ui/src/composables/rcConnectTimingUpload.ts`). When an
 attempt ends — first paint, a phase bound firing, the operator cancelling, or
@@ -4229,7 +4306,7 @@ route by `browser_connect_timing_record_parses` (`agent_log.rs:459`), because a
 
 **Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
 `mongodb-0` and never prints a credential: [production-mongo-reads.md](production-mongo-reads.md)). Retention is the collection's **7 d
-TTL** (`crates/modules/fleet/src/lib.rs:859`, `crates/db/src/models/agent_log.rs:115`) — the same window
+TTL** (`crates/modules/fleet/src/lib.rs:868`, `crates/db/src/models/agent_log.rs:115`) — the same window
 as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.
 
