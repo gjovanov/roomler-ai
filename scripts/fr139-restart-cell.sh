@@ -23,7 +23,11 @@
 #             `roomler peers` row for B.
 #   4. b-stop  on B: the capture classified by WireGuard message length, B's
 #             log since the mark, the sampler, and the counts the spec reads
-#             (`demote-follow`, `UNREGISTERED receiver index`, `follow verdict`).
+#             (`demote-follow`, `UNREGISTERED receiver index`, `follow verdict`)
+#             for A only: A's node id (B's `roomler peers` row, read at b-start)
+#             or a datagram from A's LAN address. A lab org can hold other
+#             guests on the same LAN, and a follow of one of them is counted
+#             apart (`other_follow`).
 #
 # The promotion cell (spec §2.6 and §3.8, for P3's drain) holds the pair on a
 # relay with A's UDP blocked, lifts the block, and times each end's echo gap (a
@@ -65,8 +69,10 @@
 #             loopback, link-local, multicast and the overlay's own range, so
 #             neither a direct tier nor TURN over UDP can carry the pair and it
 #             rides a relay over TCP. off: remove exactly the fr139 rules.
-#   pstart  LABEL PEER_OIP   a 0.1 s ping with receive timestamps, in a unit
+#   pstart  LABEL PEER_OIP [PEER_LAN]   a 0.1 s ping with receive timestamps,
+#             in a unit; the peer's node id and LAN address for the counts
 #   pstop   LABEL            its gaps by arrival, and the daemon's carrier lines
+#             about that peer
 #
 # DRIVER SIDE (from the lab driver, which reaches both guests)
 #
@@ -78,8 +84,8 @@
 #   The driver needs, in its environment:
 #     FR139_A, FR139_B   a command that runs ONE shell command line on A / B,
 #                        e.g. a wrapper over ssh that refuses the wrong guest
-#     FR139_A_LAN        A's LAN address (B's capture filter)
-#     FR139_B_LAN        B's LAN address (A's block, for `promo`)
+#     FR139_A_LAN        A's LAN address (B's capture and counts filter)
+#     FR139_B_LAN        B's LAN address (A's block and counts filter, `promo`)
 #     FR139_A_OIP        A's overlay address
 #     FR139_B_OIP        B's overlay address
 #     FR139_LOGS         a local directory for the logs (created)
@@ -202,17 +208,43 @@ carrier_ok() {
   fi
 }
 
-# The counts the spec reads, from one log window.
+# This guest's overlay node id for the peer at overlay address $1 (the `peer=`
+# its log lines carry); empty when the peer is not listed.
+rowid() {
+  roomler peers --json 2>/dev/null | jq -r --arg ip "$1" '
+    [.. | objects | select((.overlay_ip? // "") == $ip)] | first | .node_id // empty' 2>/dev/null
+}
+
+# The lines of log window $1 about ONE peer: its node id $2, or a datagram from
+# its LAN address $3 (an UNREGISTERED drop names the source, not the peer). A
+# lab org can hold other guests on the same LAN, and their churn must not count.
+peerlines() {
+  awk -v id="peer=$2" -v src="src=$3:" '
+    index($0, id " ") || substr($0, length($0) - length(id) + 1) == id || index($0, src)' "$1"
+}
+
+# The counts the spec reads, from one log window, for the peer (node id $2, LAN
+# address $3). `other_follow` counts follows of any OTHER peer in the window.
+# boringtun's REKEY_TIMEOUT names no peer, so it counts every peer.
 counts() {
-  local f="$1"
-  echo "demote_follow=$(grep -c 'onto DERP now (demote-follow)' "$f")" \
-       "follow_declined=$(grep -c 'demote-follow declined' "$f")" \
-       "in_grace=$(grep -c 'within the promote grace' "$f")" \
-       "unregistered=$(grep -c 'UNREGISTERED receiver index' "$f")" \
-       "follow_verdict=$(grep -c 'follow verdict' "$f")" \
-       "derp_link_ready=$(grep -c 'DERP link ready' "$f")" \
-       "promoted=$(grep -c 'direct carrier promoted' "$f")" \
-       "rekey_timeout=$(grep -c 'REKEY_TIMEOUT' "$f")"
+  local f="$1" id="${2:-}" lan="${3:-}" sel all
+  if [ -z "$id" ]; then
+    echo "peer=UNKNOWN (counts cover every peer)"
+    sel="$(cat "$f")"
+  else
+    sel="$(peerlines "$f" "$id" "$lan")"
+  fi
+  all="$(grep -c 'onto DERP now (demote-follow)' "$f")"
+  printf '%s\n' "$sel" | awk -v id="${id:-?}" -v all="$all" -v rk="$(grep -c 'REKEY_TIMEOUT' "$f")" '
+    /onto DERP now \(demote-follow\)/ {df++}
+    /demote-follow declined/ {dd++}
+    /within the promote grace/ {ig++}
+    /UNREGISTERED receiver index/ {ur++}
+    /follow verdict/ {fv++}
+    /DERP link ready/ {dl++}
+    /direct carrier promoted/ {pr++}
+    END { printf "peer=%s demote_follow=%d follow_declined=%d in_grace=%d unregistered=%d follow_verdict=%d derp_link_ready=%d promoted=%d other_follow=%d rekey_timeout_any=%d\n",
+            id, df, dd, ig, ur, fv, dl, pr, all-df, rk }'
 }
 
 cmd_prep() {
@@ -257,7 +289,7 @@ cmd_pre() {
 
 cmd_a_cell() {
   local L="$1" peer="$2" probe="${3:-60}" sample="${4:-200}"
-  local cur lp p0 p1 t0 first="" n=0 tp pf pp smp spid end dur
+  local cur lp p0 p1 t0 first="" n=0 tp tpe pf pp smp spid end dur
   mkdir -p "$D"
   cur="$(journalctl -u roomlerd -n 0 --show-cursor --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')"
   lp="$(logpos)"
@@ -288,7 +320,8 @@ cmd_a_cell() {
   pf="$D/$L.ping.txt"
   smp="$D/$L.a-smp.txt"
   tp="$(mono)"
-  ping -n -O -i 0.5 -W 1 "$peer" > "$pf" 2>&1 &
+  tpe="$(epoch)"
+  ping -D -n -O -i 0.5 -W 1 "$peer" > "$pf" 2>&1 &
   pp=$!
   ( while :; do printf 'S %s %s %s\n' "$(sub "$(mono)" "$t0")" "$(wall)" "$(row "$peer")"; sleep 2; done ) > "$smp" &
   spid=$!
@@ -303,10 +336,12 @@ cmd_a_cell() {
   ev ping_stop lines="$(wc -l < "$pf")" ran_s="$dur"
   # A gap is a stretch with no reply ARRIVING: a ping queued during a split is
   # flushed and answered once a session works again, so counting by sequence
-  # number would call it answered.
-  awk '/icmp_seq=/ && /time=/ { s=$0; sub(/.*icmp_seq=/, "", s); sub(/[^0-9].*$/, "", s)
+  # number would call it answered. Arrival is ping's own receive timestamp
+  # (-D): seq x interval drifts by about 2 s over a 200 s sample.
+  awk -v tpe="$tpe" '/icmp_seq=/ && /time=/ { ts=$1; gsub(/[][]/, "", ts)
+                                s=$0; sub(/.*icmp_seq=/, "", s); sub(/[^0-9].*$/, "", s)
                                 t=$0; sub(/.*time=/, "", t); sub(/ ms.*$/, "", t)
-                                printf "%.3f %d %s\n", (s-1)*0.5 + t/1000, s, t }' "$pf" | sort -n |
+                                printf "%.3f %d %s\n", ts - tpe, s, t }' "$pf" | sort -n |
   awk -v t0="$(sub "$tp" "$t0")" -v dur="$dur" '
     { if (NR>1 && $1-p >= 1.5) printf "EV - - gap from_s=%.1f len_s=%.1f\n", t0+p, $1-p
       if (NR==1 && $1 >= 1.5) printf "EV - - gap from_s=%.1f len_s=%.1f\n", t0, $1
@@ -332,8 +367,9 @@ cmd_b_start() {
   systemd-run --unit="fr139-cap-$L" --collect sh -c \
     "exec tcpdump -n -tt -l -i any 'udp and host $alan' > $D/$L.cap.txt 2> $D/$L.cap.err" >/dev/null 2>&1
   systemd-run --unit="fr139-smp-$L" --collect bash "$0" b-sampler "$L" "$aoip" >/dev/null 2>&1
+  rowid "$aoip" > "$D/$L.apeer"
   sleep 1
-  echo "B mark $L at $(wall) mono=$(mono) capture=$(systemctl is-active "fr139-cap-$L") sampler=$(systemctl is-active "fr139-smp-$L") logfile=$(tr ' ' ':' < "$D/$L.logpos")"
+  echo "B mark $L at $(wall) mono=$(mono) capture=$(systemctl is-active "fr139-cap-$L") sampler=$(systemctl is-active "fr139-smp-$L") logfile=$(tr ' ' ':' < "$D/$L.logpos") a_peer=$(cat "$D/$L.apeer")"
   echo "B row_before $(row "$aoip")"
 }
 
@@ -355,7 +391,7 @@ cmd_b_stop() {
   logwin $(cat "$D/$L.logpos" 2>/dev/null) | nocolor > "$lf"
   if [ -s "$lf" ]; then src="$lf"; else src="$j"; fi
   echo "## B counts $L"
-  echo "B count src=$(basename "$src") $(counts "$src")"
+  echo "B count src=$(basename "$src") $(counts "$src" "$(cat "$D/$L.apeer" 2>/dev/null)" "$alan")"
   echo "## B capture $L (epoch dir len kind): 148 init, 92 response, 64 cookie, 32 keepalive"
   awk -v aip="$alan" '{
       ts=$1; len=$NF; dir="?"
@@ -433,20 +469,22 @@ cmd_block() {
 }
 
 cmd_pstart() {
-  local L="$1" peer="$2"
+  local L="$1" peer="$2" plan="${3:-}"
   mkdir -p "$D"
   epoch > "$D/$L.pstart"
+  printf '%s %s\n' "$(rowid "$peer")" "$plan" > "$D/$L.ppeer"
   logpos > "$D/$L.plogpos"
   journalctl -u roomlerd -n 0 --show-cursor --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p' > "$D/$L.pcursor"
   systemd-run --unit="fr139-pp-$L" --collect sh -c \
     "exec ping -D -n -O -i 0.1 -W 1 $peer > $D/$L.pping.txt 2>&1" >/dev/null 2>&1
   sleep 1
-  echo "P start $L on $(hostname) at $(wall) peer=$peer pinger=$(systemctl is-active "fr139-pp-$L") row=$(row "$peer")"
+  echo "P start $L on $(hostname) at $(wall) peer=$peer peer_node=$(cut -d' ' -f1 "$D/$L.ppeer") pinger=$(systemctl is-active "fr139-pp-$L") row=$(row "$peer")"
 }
 
 cmd_pstop() {
-  local L="$1" t0 t1 w j
+  local L="$1" t0 t1 w j pid plan
   systemctl stop "fr139-pp-$L" 2>/dev/null
+  read -r pid plan < "$D/$L.ppeer"
   t0="$(cat "$D/$L.pstart")"
   t1="$(epoch)"
   w="$D/$L.p-log.txt"
@@ -468,9 +506,10 @@ cmd_pstop() {
           if (t1-p >= th) printf "GAP start=%.3f len_s=%.3f trailing\n", p, t1-p
           printf "PSUM replies=%d ran_s=%.1f\n", n, t1-t0 }' "$D/$L.pping.txt"
   echo "## B-style counts $L on $(hostname)"
-  echo "P count $(counts "$w")"
-  echo "## carrier lines $L"
-  grep -E 'direct carrier promoted|onto DERP now \(demote-follow\)|demote-follow declined|within the promote grace|UNREGISTERED receiver index|DERP link ready|pathmon|relay link|stamp' "$w" | head -400
+  echo "P count $(counts "$w" "${pid:-}" "${plan:-}")"
+  echo "## carrier lines $L (the peer's only: node ${pid:-?}, LAN ${plan:-?})"
+  peerlines "$w" "${pid:-NONE}" "${plan:-NONE}" |
+    grep -E 'direct carrier promoted|onto DERP now \(demote-follow\)|demote-follow declined|within the promote grace|UNREGISTERED receiver index|DERP link ready|pathmon|relay link|stamp|make-before-break' | head -400
   echo "## log window $L"
   cat "$w"
 }
@@ -515,7 +554,7 @@ cmd_run() {
 
 cmd_promo() {
   local runs="$1" tag="$2" gs i L w="${FR139_WAIT_S:-900}"
-  need FR139_A FR139_B FR139_B_LAN FR139_A_OIP FR139_B_OIP FR139_LOGS
+  need FR139_A FR139_B FR139_A_LAN FR139_B_LAN FR139_A_OIP FR139_B_OIP FR139_LOGS
   gs="${FR139_GUEST_SCRIPT:-$D/fr139-restart-cell.sh}"
   mkdir -p "$FR139_LOGS"
   echo "fr139 promo $tag: $runs runs, start $(wall)"
@@ -534,8 +573,8 @@ cmd_promo() {
       exit 4
     fi
     # 2. Both ends ping each other every 0.1 s.
-    $FR139_A "sudo bash $gs pstart $L $FR139_B_OIP" > "$FR139_LOGS/$L.pstart.txt" 2>&1
-    $FR139_B "sudo bash $gs pstart $L $FR139_A_OIP" >> "$FR139_LOGS/$L.pstart.txt" 2>&1
+    $FR139_A "sudo bash $gs pstart $L $FR139_B_OIP $FR139_B_LAN" > "$FR139_LOGS/$L.pstart.txt" 2>&1
+    $FR139_B "sudo bash $gs pstart $L $FR139_A_OIP $FR139_A_LAN" >> "$FR139_LOGS/$L.pstart.txt" 2>&1
     sleep 10
     # 3. Lift the block; wait for both ends to read the pair direct again, then
     #    30 s more.
