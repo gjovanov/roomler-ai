@@ -19,7 +19,9 @@ nobody runs `down.sh`.
 - AWS CLI v2.32 or later, which has `aws login`. It gives the CLI short-lived credentials for the console
   session you pick in the browser, so no access keys are created:
   `aws login --profile <name> --region <the console's region>`. Start it in the region your console session
-  is in; a sign-in started in another region fails with "Something went wrong".
+  is in; a sign-in started in another region fails with "Something went wrong". The link it prints was good for
+  ten minutes when measured (2026-11-10): left longer, the command exits with `The pending authorization to
+  retrieve an SSO token has expired`, and the sign-in has to be started again.
 - `ssh`, `ssh-keygen`, `curl`. Git-Bash on Windows works (the scripts turn its path rewriting off).
 - Nothing defaults the account or the region. `AWS_PROFILE` and `AWS_REGION` are required on every call.
 
@@ -94,7 +96,7 @@ termination, cleans the org too.
 | Subcommand | Shows |
 |---|---|
 | `caps` | the daemon's `caps probe:` lines, including `child reported … hw_encoders=[…]`, the probe's matrix run again (`roomlerd caps-probe`), and the cache |
-| `smoke` | `encoder-smoke --encoder hardware`, with no session. ⚠️ On Linux that preference has only software to open, so it passes on `openh264` whatever the GPU is. For an offline open of one FFmpeg encoder, ask for it by name: `sudo roomlerd encoder-smoke --name h264_nvenc` |
+| `smoke` | `encoder-smoke --encoder hardware`, with no session. ⚠️ For H.264, the smoke's default codec, that preference has only software to open on Linux, so it passes on `openh264` whatever the GPU is ([#3652](https://github.com/gjovanov/roomler-ai/issues/3652)); with `--codec hevc` it does open the hardware encoder (`hevc_nvenc` on the g5g). For an offline open of one FFmpeg encoder, ask for it by name: `sudo roomlerd encoder-smoke --name h264_nvenc` |
 | `record hardware\|auto\|software` | a ten-second recording of a private Xvfb with `--system-audio` (a PulseAudio or PipeWire null sink). It prints the recorder's events (`started … "encoder":"h264_nvenc"`), the MP4's sample entries (`avc1`; `mp4a` and `esds` for AAC) and the sidecar, then deletes the file. `hardware` refuses on a host without a hardware H.264 encoder rather than recording in software |
 | `logs [REGEX] [N]` | the daemon's own log, filtered by regex: `encoder selected`, `media pump`, the DC pump heartbeat |
 
