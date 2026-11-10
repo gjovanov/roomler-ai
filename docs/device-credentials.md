@@ -90,7 +90,7 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328), and comes back as that holder's: its new token acts for them.
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1309`; tunnel clients `crates/services/src/dao/tunnel_client.rs:335`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1309`; tunnel clients `crates/services/src/dao/tunnel_client.rs:369`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
@@ -99,7 +99,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1425` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2113` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:352` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:412` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.
