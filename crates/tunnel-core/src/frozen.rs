@@ -16,9 +16,12 @@
 //! "half-open /derp WS" and a relay "not delivering the peer's frames", and
 //! none of it was true.
 //!
-//! ⚠️ Wording only. No verdict reads it, and a carrier convicted after a pause
-//! is torn down and rebuilt exactly as before: whether the socket survived the
-//! pause is the carrier's own question.
+//! ⚠️ No carrier's verdict reads it: a carrier convicted after a pause is torn
+//! down and rebuilt exactly as before, since whether the socket survived the
+//! pause is the carrier's own question. One reader goes further. roomlerd's
+//! control WS reads a pause of at least two minutes at its RX deadline as a
+//! resume from suspend, which closes the remote sessions FR-138 keeps through
+//! a socket's loss (`ConnExit::after_rx_deadline`, FR-138 P2a-2).
 
 use std::time::Duration;
 
