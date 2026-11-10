@@ -757,11 +757,11 @@ macOS the server's switch), and the tunnel client:
   tunnel client would be another product than the one the device has. This supersedes B.4's
   "Linux per-user (the default for a desktop)".
 - **The SPA** preselects `defaultRole` when nothing is picked and the card is shown
-  (`agents/roomler-setup/src/front/app.js:615`, `isOfferedRole` `:718`), never saves it (a
+  (`agents/roomler-setup/src/front/app.js:645`, `isOfferedRole` `:713`), never saves it (a
   click does), and evaluates the Continue gate as before — the cross-flavour acknowledgement
   and #3116's elevation note included. The overlay box keeps its per-OS default, already ticked
   for every preselected daemon role.
-- **A run resumes only from the Server or the Token page** (`RESUMABLE_STEPS`, `app.js:190`):
+- **A run resumes only from the Server or the Token page** (`RESUMABLE_STEPS`, `app.js:186`):
   there the saved role and device name come back with the step. A run that finished, stopped on
   Welcome or was cut off during the install starts again at Welcome with no role and the
   default device name. The server URL is the person's setting and is always kept.
@@ -958,7 +958,7 @@ sequenceDiagram
 - **The outcomes.** A declined prompt leaves the limited wizard as it was, with one line; any
   other failure shows its reason and the right-click way; a started copy makes this one exit.
   The elevated copy opens on Welcome with the handed role, which wins over C1's default
-  (`applyLaunchOptions`, `app.js:217`), and passes the Continue gate like any other pick.
+  (`applyLaunchOptions`, `app.js:213`), and passes the Continue gate like any other pick.
 - **Nothing else self-elevates.** A fresh install still gets the MSI's own UAC prompt.
 
 ## The pairing API
