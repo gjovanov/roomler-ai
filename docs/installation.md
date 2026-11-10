@@ -71,6 +71,144 @@ The server URL is kept either way. Before FR-129 C1 a finished run's role and
 name came back: a test run's tunnel-client role preselected the tunnel card on
 the operator's own machine, and its device name was offered again.
 
+### The Token page judges a token on the server's clock (#3523)
+
+On the paste path the Token page reads the token without verifying it and shows its
+issuer, type and expiry. It judges the token's `exp` on the **configured server's
+clock**, never on this computer's clock alone. A fresh enrollment token lives 10
+minutes, and a computer whose clock ran ahead (a cloned Windows VM boots about 3 h
+ahead) used to refuse tokens the server would still accept. The server verifies the
+token at enrollment either way.
+
+- **The reading** is the `Date` header of the server's answer to the setup-features
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:242`). It
+  counts only when the answer is the server's own: a 2xx JSON object from the origin that
+  was asked (`agents/roomler-setup/src/features.rs:197`, `tells_the_servers_clock`). The
+  target of a redirect to another origin, a proxy's or a captive portal's page, and an
+  older server's 404 leave the clock unknown. A reading is kept with the monotonic time it
+  arrived (`agents/roomler-setup/src/server_clock.rs:50`) and carried forward on that
+  clock, so a wall-clock step does not move it. It is used for 5
+  minutes by either clock; after that the check asks the server again
+  (`agents/roomler-setup/src/server_clock.rs:112`).
+- **The verdict** (`agents/roomler-setup/src/commands.rs:525`, `judge_expiry`):
+
+| The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
+|---|---|---|---|
+| known | **blocks**: "This token has already expired" | warns with the gap ("3 h ahead of the server's"); Continue stays enabled | continues |
+| unknown: no answer, no `Date` that parses, or an answer that is not the server's own | (cannot be known) | warns; Continue stays enabled | continues |
+
+A token with no `exp` blocks, as before. The macOS second token follows the same rule
+(`agents/roomler-setup/src/front/app.js:1030`, `rootTokenProblem`). The expiry the page shows
+("in N min", "N min ago") is counted on the server's clock when the wizard has a reading of it.
+
+### The install page: a list of steps, and a failure that says why (#3432, #3590)
+
+The Install page draws what Rust sends it and keeps nothing of its own about the
+run. Two models in the wizard make that hold: the checklist is the run's list of
+steps, and a failure is one typed value built in one place. Before them, a
+failed install read `resolve installer: GET <url>` for a refused connection, a
+name that does not resolve, a refused certificate, a timeout and a 503 alike,
+under a terminal event whose step was always `install`, and rows the page kept
+per event type stayed on the hourglass.
+
+```mermaid
+flowchart LR
+  S["a pipeline step"] -->|"begin and end marks, events"| T["Steps tracker (steps.rs)"]
+  S -->|"an error, .or_fail(code)"| T
+  T -->|"ProgressEvent::Steps, the whole checklist"| P["Install page (app.js)"]
+  T -->|"settle the rows, then Failure::build"| F["Failure (failure.rs)"]
+  F -->|"conclude: ProgressEvent::Error"| P
+  F -->|"the same line"| L["the wizard's log"]
+  T -->|"warnings()"| D["Done page"]
+```
+
+**The checklist.** Each pipeline starts the tracker with the steps every run of
+it takes (`Steps::started`, `agents/roomler-setup/src/steps.rs:377`): on Windows
+preflight, resolve, download, verify, package, enroll
+(`agents/roomler-setup/src/orchestrator_agent.rs:216`); for the tunnel client
+preflight, resolve, download, verify, extract, integrate, enroll
+(`agents/roomler-setup/src/orchestrator_tunnel.rs:81`); on Linux and macOS
+preflight, package, the person's steps
+(`agents/roomler-setup/src/orchestrator_unix.rs:99`). The begin and end marks
+the opt-in diagnostics already record move the rows (`Steps::begin`,
+`steps.rs:389`). A step the plan does not name (the service restart, the
+companion, the anchor, the root half) gets its row where the run is when it
+begins (`steps.rs:250`), and a pending row the run passes over is dropped: it
+did not apply. After every change the tracker sends the whole checklist as one
+`ProgressEvent::Steps { rows }` snapshot
+(`crates/roomler-setup-core/src/progress.rs:227`, each row a
+`StepRow { step, state, label, detail }`, `progress.rs:247`), and the page draws
+the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1671`;
+`renderInstall`, `app.js:1750`).
+
+| Row state | When | The page shows |
+|---|---|---|
+| `pending` | the plan names the step and the run has not reached it | ○ |
+| `running` | its begin mark came and its end has not | ⏳ |
+| `done` | the step ended well, or the next one began | ✓, with what the step's last event said |
+| `failed` | the run failed in it, or a best-effort step (the companion) failed and the run went on | ✗; "Cancelled" when the person cancelled |
+| `not_reached` | the run failed before it | –, dimmed |
+| `warning` | a warning-class event, a row of its own after the step it came in | ⚠ and its words |
+
+The looks are `agents/roomler-setup/src/front/styles.css:318-325`.
+
+Every event is placed in one exhaustive match (`seen`, `steps.rs:553`), so a new
+event does not compile until it says what it does to the checklist.
+`PreflightWarning`, `AnchorSkipped`, `DaemonRestartSkipped`, `CompanionAbsent`
+and `ElevationUnavailable` each keep a row of their own, in the order they came
+(`steps.rs:289`). A progress event (the version resolved, the checksum, the
+signer, the installer's exit, the preflight's words) replaces only its own
+step's words (`steps.rs:305`); the download's ticks and a script's lines have
+panels of their own. The daemon's and the companion's downloads are separate
+rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
+preflight says what is installed here already and what the install does to it,
+in a person's words (`label_existing`, `orchestrator_agent.rs:1878`,
+`orchestrator_unix.rs:1227`; `orchestrator_tunnel.rs:410`), for example
+"Roomler is installed for the whole computer (version 0.4.207): this install
+replaces it". A switch to the other kind is the switch's warning row to say.
+Done lists every warning the run raised, each once (`Steps::warnings`,
+`steps.rs:479`, into `DoneReport.warnings`,
+`agents/roomler-setup/src/commands.rs:662`; `renderDone`, `app.js:1839`): the
+anchor's note there carries only its manual command.
+
+**The failure.** An error site hands over the error itself (`.or_fail(code)`
+takes an error, never a `String`) and adds what it was doing with
+`.context(…)`, so no site can format the cause away. The tracker first settles
+every row (`steps.rs:324`: the open step fails and each pending row reads not
+reached) and sends them, then builds the failure (`fail_as`, `steps.rs:527`,
+which calls `Failure::build`, `agents/roomler-setup/src/failure.rs:129`, the one
+place the words are made). The step is the tracker's open step, never the
+site's say. One function sends the terminal
+`ProgressEvent::Error { step, kind, status, words, chain }`
+(`progress.rs:216`) to the page and the replay log and writes the same line to
+the wizard's log (`conclude`, `failure.rs:187`). The page titles it "Install
+failed at: ‹the failed row's label›" (`app.js:1793`), shows the words, and keeps
+the whole chain under Details.
+
+The kind (`Kind`, `failure.rs:46`) is decided by walking the error's causes and
+downcasting each, never by reading its text, and the words follow from it
+(`failure.rs:280`):
+
+| Kind | Decided on |
+|---|---|
+| `name_not_resolved` | `NameNotResolved`, from the wizard's own resolver (`crates/roomler-setup-core/src/http.rs:33`) |
+| `secure_connection_failed` | `native_tls::Error`, raised in the handshake: an untrusted certificate, or a handshake a middlebox cut, so the words name the usual cause rather than claim one (`failure.rs:293`) |
+| `connection_refused`, `timed_out` | the `io::Error` kind under a request, `reqwest::Error::is_timeout()` |
+| `status` | `HttpStatus` (`http.rs:83`), the enroll's `EnrollRejected`, `reqwest::Error::status()` |
+| `bad_answer`, `unreachable` | an answer that does not decode, any other request error |
+| `local_file` | an `io::Error` no request raised |
+| `refused` | a `package_step::Refusal`, or words with no cause under them (`Said`) |
+| `cancelled` | the person's cancel |
+
+Against local endpoints the wizard's own client reads, for a closed port, "could
+not reach 127.0.0.1: the connection was refused"; for a `.invalid` name, "could
+not find ‹name›: the name did not resolve"; for a self-signed certificate,
+"could not set up a secure connection to 127.0.0.1. The usual cause is a
+certificate this computer does not trust"; for a server that never answers,
+"it did not answer in time"; and for a 503, "answered 503 Service Unavailable,
+so it could not serve this right now". Each with the whole chain under it, from
+`GET <url>` to the operating system's own error.
+
 ## Enrollment — what every path does
 
 ```mermaid
@@ -134,14 +272,14 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3818`, `crates/agent-core/src/config.rs:4277`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:664`, `:990`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3891`, `crates/agent-core/src/config.rs:4277`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:673`, `:991`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** Once that config is there, the daemon keeps its folder to
 SYSTEM and Administrators (#3073, #3609), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1291`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1292`), and the
 install refuses it before anything is downloaded (`:295`). Before the enroll it
 also stops on a config it may not read (`agents/roomler-setup/src/machine_write.rs:157`,
 never reported as a damaged config) or a folder it may not write (`:160`). The
@@ -331,7 +469,7 @@ sequenceDiagram
 | who writes | `ConfigWriter::new` (`machine_write.rs:281`): the step's channel when there is one; an elevated wizard in its own process; and a limited wizard never, which stops the install instead (nothing enrolled, the token unused) |
 | a wizard that goes away | the step reads the end of the channel and exits without writing. The service is installed and waits for a machine enrollment ([the SystemContext checklist](operator-systemcontext-smoke.md), step 2a); Setup run again writes it |
 | a step that does not finish | it ends itself after 20 minutes, never in the middle of the write (`machine_write.rs:435`) |
-| the step's exit codes after the install | `0x5245_0001`-`0x5245_0004` (`agents/roomler-setup/src/package_step.rs:111`): the installer ran and the enrollment was not written, so Setup says to run it again with the same token |
+| the step's exit codes after the install | `0x5245_0001`-`0x5245_0004` (`agents/roomler-setup/src/package_step.rs:112`): the installer ran and the enrollment was not written, so Setup says to run it again with the same token |
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records
@@ -666,11 +804,13 @@ Details worth knowing:
   they write and give it its owner and permissions before it takes its name,
   never writing into a file of that name that was there. Each change the
   repair makes is a `machine tree: repaired` WARN line, which the default
-  filter keeps; on an upgrade the first repair is the installer's
-  (`keep-system-context`), which logs into
-  `service-logs\roomlerd-installer.log` beside the service's own log
-  (`crates/agent-core/src/logging.rs:100`). Read the logs with
-  `roomler logs` or an elevated shell rather than through Explorer's prompt.
+  filter keeps; on an upgrade the first repair is made by one of the
+  per-Machine MSI's own steps, which log into
+  `service-logs\roomlerd-installer.log` beside the service's own log once
+  their build has #3230
+  ([where those steps log](#where-the-per-machine-msis-own-steps-log-3230-3640)).
+  Read the logs with `roomler logs` (`--source installer` for that one) or
+  an elevated shell rather than through Explorer's prompt.
   `ROOMLERD_MACHINE_TREE_REPAIR=0` in the service's `Environment` stops the
   repair, and `ROOMLERD_MACHINE_TREE_CHECK=0` makes the check log only. The
   fixes per log line are step 3 of
@@ -1053,7 +1193,7 @@ both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6050`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6137`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1122,7 +1262,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:5922`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6004`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1159,23 +1299,138 @@ conhost left at Normal, the exit-DNS purge's 10 s bound logged its warning 40.1 
 
 | What the worker writes | Since #3438 | Why |
 |---|---|---|
-| tracing | The rolling log only (`crates/agent-core/src/logging.rs:229`) | The file has every line, and a console write waits for its conhost |
+| tracing | The rolling log only (`crates/agent-core/src/logging.rs:258`) | The file has every line, and a console write waits for its conhost |
 | stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:245`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
 | stdout, other than tracing | The console, as before | Only tracing's lines were measured waiting there |
 
-The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:270`):
+The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:302`):
 the process logs for a service role, and its stdout is a console that has no window. A
-verb a person runs, in a terminal or over `roomler ssh`, has no service role and keeps its
-console lines. The service host and netd have no console as their stdio, so they are
+verb a person runs, in a terminal or over `roomler ssh`, keeps its console lines when it has
+no service role. The per-Machine MSI's own steps have one, the installer role
+([below](#where-the-per-machine-msis-own-steps-log-3230-3640)); run in a terminal they keep
+their console lines too, since a terminal's console has a window. The service host and netd have no console as their stdio, so they are
 unchanged. With no usable log directory the console keeps its lines, since no file holds
 them. The worker says so once at its start: `logging: this console has no window, so
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:1817`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:2268`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
+
+### Where the per-Machine MSI's own steps log (#3230, #3640)
+
+```mermaid
+flowchart LR
+    M["msiexec<br/>the per-Machine MSI"] -->|"deferred custom action<br/>Impersonate='no'"| V["roomlerd, one verb<br/>as LocalSystem"]
+    V -->|"tracing: its start, its lines,<br/>its answers, its end"| L[("roomlerd-installer.log.YYYY-MM-DD<br/>in service-logs")]
+    V -.->|"stdout and stderr"| X["thrown away<br/>by Windows Installer"]
+```
+
+Each step of its own that the per-Machine MSI runs is a deferred custom action with
+`Impersonate='no'`: one `roomlerd` verb, run as LocalSystem. Windows Installer throws away
+what such a process prints on stdout and stderr, and `msiexec /l*v` records only its return
+code. Until #3230 a step logged, like any command without a role, into its profile's data
+folder, and its answer and its error reached no file. Under a hand-run `msiexec` that profile
+was not LocalSystem's: the field read found 0.4.208's steps in the log of the account that ran
+msiexec (`%LOCALAPPDATA%\roomler\roomler\data\logs\roomlerd.log.*`), and only a step started as
+LocalSystem itself, from a scheduled task, in LocalSystem's
+([#3230](https://github.com/gjovanov/roomler-ai/issues/3230#issuecomment-6775283704)). An upgrade
+by the updater, where msiexec runs as LocalSystem, was not run. Each step now logs into
+`%PROGRAMDATA%\Roomler\roomler\service-logs\roomlerd-installer.log`, beside the service's
+own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:120`):
+
+| Custom action | The verb | When it runs |
+|---|---|---|
+| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:402`, sequenced at `:607`) | `cleanup-legacy-install --target-flavour perMachine` | every install, repair and upgrade, first after `InstallFiles` |
+| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, `:591`) | `service install --as-service` | every install, repair and upgrade, right after `CleanupLegacyPerUser` |
+| `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:445`, `:630`), and its rollback partner `RollbackSystemContext` (`:463`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
+| `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:482`, `:633`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
+| `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:506`, `:636`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
+| `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:639`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
+
+The order is the built MSI's `InstallExecuteSequence`, not the order of the file.
+`CleanupLegacyPerUser` and `RegisterService` are both `After='InstallFiles'`, and WiX v3 (which
+`cargo wix` runs in the release lane) numbers actions scheduled after the same action in the
+order of their names: `InstallFiles` is 4000, `CleanupLegacyPerUser` 4001 and `RegisterService`
+4002. The three after `RestoreServiceEnvironment` follow the same rule against the file's order:
+`DisableSystemContext` 4005, `KeepSystemContext` 4006, `RollbackSystemContext` 4007, then
+`EnableSystemContext` 4008 after its rollback partner. 0.4.208 and the two test builds of the
+fix carry these numbers. On a Windows 11 lab guest msiexec's log showed this order on every
+install, repair and upgrade, and the installer log's timestamps agree
+([#3640](https://github.com/gjovanov/roomler-ai/issues/3640#issuecomment-6775284876)). On an
+upgrade the old product goes first: `MajorUpgrade` removes it right after `InstallInitialize`
+(`agents/roomlerd/wix-perMachine/main.wxs:91`), so its `service uninstall --as-service` runs
+before the new product's cleanup, `service install --as-service` and SystemContext step.
+
+`resolve_config_path` repairs the machine tree for every SYSTEM command
+(`agents/roomlerd/src/app.rs:1142`), so the first `machine tree: repaired` line comes from the
+first of these steps to run: on an install or a repair the cleanup step, and on an upgrade the
+old product's `service uninstall --as-service`, then the new product's cleanup step. It is in
+this log once that step's build has #3230. Which step writes it is read from the source, not
+seen in the field: on a clean lab guest no step had anything to repair, so none wrote it.
+
+What a step writes, in order. Its own lines have the target `roomler_node_core::logging::step`
+(`crates/agent-core/src/logging.rs:566`), which the filter keeps at INFO under any `RUST_LOG`:
+
+| Line | Fields | Written by |
+|---|---|---|
+| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:588`), right after `logging::init` (`agents/roomlerd/src/app.rs:1569`) |
+| everything the verb logs | as the verb logs it | the verb |
+| each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:606`): on stdout as before, and inside a step in the log |
+| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:625`), from `main` (`agents/roomlerd/src/app.rs:1375`) |
+| `installer step failed: roomlerd <verb and arguments>`, ERROR | `exit_code`, `elapsed_ms`, `error` (the whole cause chain) | the same |
+
+`end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:657`). It drops the
+file writer's guard, which writes every queued line before the process exits. The guard lives
+in a static, and no exit drops a static: without the flush, one run in six of the test below
+lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2233`).
+
+One function decides which commands take the installer role: `is_installer_step`
+(`agents/roomlerd/src/app.rs:1404`). It gives the role to `service install` and
+`service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
+and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
+(`agents/roomlerd/src/app.rs:7744`) reads every custom action with an `ExeCommand` in both WiX
+files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
+installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
+
+The per-user MSI does not change. Its actions run as the person (`Impersonate='yes'`), who
+cannot write the service log folder, and none of its verbs takes the role: its `service install`
+has no `--as-service`, and its cleanup is `--target-flavour perUser`
+(`agents/roomlerd/wix/main.wxs:505`), which keeps the person's profile log (#3640).
+
+Run by hand in a terminal, a step shows what it always showed: its answer once, and the
+verb's lines. The start and end lines go to the file only: the console's writer drops them
+(`crates/agent-core/src/logging.rs:254`). A per-layer filter on the console instead would leave the
+whole stack with no level, which tracing reads as TRACE in every daemon that keeps its console,
+and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
+write, the console keeps them too. One line moved:
+`service uninstall --as-service` logs `Companion login start removed.` rather than printing it
+(`agents/roomlerd/src/app.rs:5917`), and its answer stays `Service deregistered`.
+
+Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
+([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
+and `basename` (`crates/agent-core/src/logging.rs:108`, `:115`), and the appender, the prune
+(`rolling_basenames`, `crates/agent-core/src/logging.rs:1039`) and the `--source` reader
+(`newest_service_log`, `crates/agent-core/src/logging.rs:966`) all read it, so netd's dated
+files age out too. Two transports do not return this log yet, and each needs a wire change:
+the RC data channel's `logs:fetch` reads only the serving process's own `roomlerd.log*`
+(`agents/roomlerd/src/logs_fetch.rs:52`), and an installer step starts no log upload (a
+follow-up of #3230).
+
+`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1705`) pins the folder and
+the names, the prune and the source. It runs a failing step in a child with stdout on `NUL`,
+as under msiexec, and finds its start line, all 20,000 of its lines, its answer and its whole
+error chain in the file (`crates/agent-core/src/logging.rs:1879`); run with a console, the same
+step shows what it always showed (`crates/agent-core/src/logging.rs:1909`). A daemon's `init`,
+run in a child with a log file and a console, leaves tracing at the default filter's own level,
+INFO, not TRACE (`crates/agent-core/src/logging.rs:1952`). The Windows lane runs the module
+beside `stderr_capture` (`.github/workflows/ci.yml:1636`). In `roomlerd`,
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7790`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7823`)
+pin the role per command and the end line of a failure.
 
 ## Linux
 
@@ -2101,7 +2356,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3530`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3603`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -2348,7 +2603,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2123`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2195`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

@@ -210,8 +210,10 @@ copied run directory in seconds.
 - ⚠️ **Windows guests**: `$ErrorActionPreference='Stop'` turns native stderr
   (all of `roomlerd`'s logging) into a terminating error; the SSH readiness probe
   must be `echo`, not `true` (absent in PowerShell); a `.ps1` must be ASCII; a
-  cloned Win11 guest boots **~3 h ahead of UTC**, which makes a fresh 10-minute
-  enrollment token look already expired — resync `w32time` first.
+  cloned Win11 guest boots **~3 h ahead of UTC**. A wizard older than #3523 refuses a
+  fresh 10-minute enrollment token there as already expired; from #3523 the wizard judges
+  the token on the server's clock and only warns. Resync `w32time` first anyway (other
+  things follow the device's clock, #3528), unless the cell tests the clock skew itself.
 - ⚠️ **macOS**: `tart stop` loses writes made in the running VM (shut down from
   inside); the vmnet resolver times out (DNS is pinned in the golden); `roomler
   exec` splits space-containing argv (use `roomler ssh`, ship scripts as base64);

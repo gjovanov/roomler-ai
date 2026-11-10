@@ -374,7 +374,10 @@ Three more shapes the registry carries:
   route calls `core.hooks.org_member_removed`, chat's room leave `room_member_removed`. Network,
   first in `HOOK_ORDER`, removes the tunnel clients the person owns in the org
   (`crates/modules/network/src/membership.rs`); it never stops the cascade, since nothing after
-  it reads what it holds, and its operator prune ends what it could not. Conference ends the call
+  it reads what it holds, and its operator prune ends what it could not. Fleet, next, revokes the
+  live enrollment keys the person minted there (`crates/modules/fleet/src/membership.rs`); it
+  never stops the cascade either, and a key it could not revoke is refused, and revoked, at its
+  next use while the person is out of the org. Conference ends the call
   seats that membership admitted, on whichever pod holds them
   (`crates/modules/conference/src/revoke.rs`, the flow in `docs/real-time.md`). Then chat, the
   record owner and so later in `HOOK_ORDER`, drops the person's room memberships of an org they

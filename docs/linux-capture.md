@@ -557,7 +557,7 @@ mode of a missed damage event at a stale tile rather than a frozen stream.
 On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
-`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3447`,
+`ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3520`,
 `virtual_desktop.rs:685`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
@@ -567,6 +567,28 @@ dummy driver where it is installed, so a viewer's size can become the mode
 probe and every capture, and captures it with the unchanged scrap + damage
 path. This is the hardware-encode test bed on the WSL2 dev host, and the
 remote-apps surface of FR-56 rides on it.
+
+⚠️ **On a host with NVIDIA's userspace driver, Xvfb does not survive its own
+start** ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643), open). Its
+GLX reaches EGL through Mesa's DRI shim, glvnd hands that call to its first
+vendor, and with NVIDIA's EGL inside the server it aborts within seconds
+(`double free or corruption`). The daemon does not watch the server, so it goes
+on advertising the desktop, and a session then shows "This device cannot
+capture its screen". Measured on an AWS g5g on 0.4.208 (FR-122 §8): an Xvfb
+started alone aborts, installing Mesa's EGL beside NVIDIA's changes nothing
+(NVIDIA's vendor file sorts first), and pinning the vendor for the server keeps
+it up. Until the fix, put a wrapper ahead of `/usr/bin/Xvfb` on the daemon's
+`PATH`:
+
+```sh
+#!/bin/sh
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+exec /usr/bin/Xvfb "$@"
+```
+
+A container that mounts only the driver's compute libraries (the rented DGX
+Spark of FR-122) has no NVIDIA EGL and is not affected. The Xorg dummy-driver
+path is untested on such a host.
 
 ⚠️ **A startup app can map before the window manager is listening.** `start`
 launches the WM and the apps back to back, and a window that maps while openbox
@@ -1285,7 +1307,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:6978`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7065`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
@@ -2092,7 +2114,7 @@ Measured on the WSL2 dev host, 2026-09-25: with the test rig loading the box
 fresh NVENC probe **hung** — `caps probe: the probe child hung` after 60 s,
 `env -i roomlerd caps` reproducing a 75 s stall while the same command from an
 interactive login shell finished in ~5 s — the daemon's pumps then missed the
-watchdog's 90 s window (`app.rs:4436-4454`, `watchdog.rs:579`) and it forced
+watchdog's 90 s window (`app.rs:4509-4527`, `watchdog.rs:579`) and it forced
 `exit(2)`, which systemd answered by restarting it straight back into the same
 probe. Pre-warming the cache with a matching key did not hold. With the rig
 stopped, the identical probe completed in **4.6 s** (10.4 s that evening on a

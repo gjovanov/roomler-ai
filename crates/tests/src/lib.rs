@@ -125,6 +125,11 @@ mod device_list_tests;
 mod device_naming_tests;
 #[cfg(test)]
 mod enroll_key_tests;
+/// An enrollment credential works only while the person who minted it may
+/// still enroll devices in its org: the redemption asks again, and a removal
+/// revokes the person's keys.
+#[cfg(test)]
+mod enrollment_issuer_tests;
 #[cfg(test)]
 mod ephemeral_tests;
 #[cfg(test)]
@@ -406,6 +411,10 @@ mod tunnel_tests;
 mod turn_usage_tests;
 #[cfg(test)]
 mod tutorial_tests;
+/// #3656 — a native client's credential in an `Authorization: Bearer` header
+/// on `/ws` and `/derp`, beside the query form released clients send.
+#[cfg(test)]
+mod upgrade_credential_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
 #[cfg(test)]

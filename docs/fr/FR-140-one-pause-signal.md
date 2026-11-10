@@ -171,7 +171,7 @@ On the frozen end's pair to a lab node that kept running, which rode `/derp` in 
   reconnecting anyway (FR-55 P4)` (`:339`) means the timer did. On Windows the hold's timer runs on `Instant`, which
   counts the sleep, so after any sleep over 60 s both are ready at the wake and either can win (*reasoned*): only
   `awake again` proves the callback. Both lines reach `agent_logs`, because the upload layer takes every line the
-  filter passes (`crates/agent-core/src/logging.rs:189-196`). P0 reads them.
+  filter passes (`crates/agent-core/src/logging.rs:212-219`). P0 reads them.
 - **[R] The notice says that a sleep happened, not how long it lasted.** `woke()` (`sleep_notice.rs:446`) is also
   what a cancelled or failed sleep calls: macOS's `kIOMessageSystemWillNotSleep` (`:898`), and logind's
   `PrepareForSleep(false)` (`:676`), which logind also sends when a suspend fails. Windows may deliver both
@@ -183,7 +183,7 @@ On the frozen end's pair to a lab node that kept running, which rode `/derp` in 
 #3540, closed into this FR on 2026-11-08: a 30–65 s freeze during a remote session forces an exit through the
 encoder's and the capture's 30 s thresholds, because the async watchdog resets its pumps only once a scan is more than
 5 + 60 = 65 s late (`watchdog.rs:561`); under that, the pause counts against each pump's age. On master both pumps
-are registered inactive (`agents/roomlerd/src/app.rs:4445-4446`) and nothing gates them on (only the signaling pump
+are registered inactive (`agents/roomlerd/src/app.rs:4518-4519`) and nothing gates them on (only the signaling pump
 is gated, `signaling.rs:816`, `:823`), so the class is dormant and no field RED is possible on the release. Its RED is
 a unit test at the pin with a 30 s pump gated on. Its proposal is P4 here: take the scan's own lateness off every
 pump's age, still catch a real stall at most one scan later, and pin both with an injected-clock test like

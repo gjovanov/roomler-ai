@@ -143,7 +143,7 @@ plus `probe_ms` and `probe_cached`.
 | AV1, AMF, VideoToolbox and Media Foundation are never asked for 4:4:4 | `av1_nvenc` hard-errors on it and every other AV1 backend lists 4:2:0 only; AMF has no 4:4:4 surface; VideoToolbox HEVC has only Main / Main10 / Main42210; `*_mf` takes NV12 — locked by a test against the vocabulary |
 
 What the fleet advertised on 0.4.88 (server records, 2026-09-08; the D3D12 and
-Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
+Vulkan cells are FR-78's; the two arm64 rows are FR-122's, on 0.4.189 and 0.4.208):
 
 | Host | Cells | Probe |
 |---|---|---|
@@ -155,6 +155,7 @@ Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
 | the WSL sibling (RTX through WSL's libcuda) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — its four software Vulkan ICDs open and refuse | 5.9 s |
 | mars (no GPU, Linux) | `h264/openh264` · `vp9/libvpx` | 0.5 s |
 | a rented DGX Spark (NVIDIA GB10, arm64 Linux, driver 580; 2026-10-30) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — sessions proven on `h264/nvenc` 4:4:4 and `av1/nvenc` | 3.0 s |
+| an AWS g5g (NVIDIA T4G, arm64 Linux, driver 595; 2026-11-10, on 0.4.208) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `hevc/vulkan` · `h264/nvenc` 4:2:0+4:4:4 · `h264/vulkan` · `vp9/libvpx` — no AV1: the T4G has no AV1 encoder, and `av1_vulkan` is on the denylist. Sessions proven on `hevc/nvenc` and on `h264/nvenc`, each in 4:2:0 and in 4:4:4; the two Vulkan cells opened and no session ran on them | 2.9 s (18.9 s on the box's first start, 16.3 s of it opening `hevc_vulkan`) |
 
 The probe's cost grew with the device walk (the dev box 4.3 → 6.1 s, WSL 2.5 →
 5.9 s); the cache pays it once per build, driver and hardware.
@@ -1639,7 +1640,7 @@ encoder runs at the maxrate it opened with, and after that at the rung, never at
 | `idr_count` | every keyframe the encoder emitted, including one per frame while the DC is not open yet (`dc_unopen_drops`; a relayed session on 2026-10-31 started at 18), so baseline it at the first heartbeat. To isolate the rate-caused ones, read it per window against `dims_swaps`, the session's `keyframe_requests` (on `rc:session.stats`; `PLI/FIR → forcing keyframe`, `peer.rs:850`, is the RTP path's line) and `frames_dropped_backpressure`, because a drop burst adds a resync IDR of its own (FR-62 AC3's read) |
 | `reconfig_forces_idr` | whether the pump rations a move as an IDR: `false` on patched NVENC, `true` for QSV-CBR and every rebuild. `ROOMLERD_ENCODER_NVENC_ASSUME_IDR=1` flips NVENC back |
 
-**The read for any host** — the FR-62 A0 sweep (`app.rs:6462`):
+**The read for any host** — the FR-62 A0 sweep (`app.rs:6549`):
 
 ```
 roomlerd encoder-smoke --reconfigure-sweep --codec hevc --encoder hardware [--constrained] [--json]
@@ -1653,11 +1654,11 @@ bytes-per-frame `ratio` against `target ÷ fps ÷ 8`, `first3_max` and
 reads taught it:
 
 - **The rate change is charged with the keyframe on the rung's first output frame**
-  (`sweep_attribute_idrs`, `app.rs:6723`), not on frame 0. AMF answers the frame that
+  (`sweep_attribute_idrs`, `app.rs:6810`), not on frame 0. AMF answers the frame that
   fed the rebuilt encoder one call later, so the frame-0 rule filed its rebuild IDR as
   "periodic" on all 20 rungs of the Radeon 610M read and reported `total_rate_idr: 0`
   for a backend that rebuilds on every move.
-- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6752`). Every
+- **The verdict's basis is per backend** (`sweep_verdict`, `app.rs:6839`). Every
   backend must show no rate-caused IDR and an apply under 5 ms. Only QSV, which runs
   CBR (`select_rc_mode` takes the CBR branch because the session opens with
   `rc_max_rate == bit_rate`), is also gated on the ratio (±25 %) and the burst

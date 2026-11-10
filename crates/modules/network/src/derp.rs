@@ -58,7 +58,7 @@ use bson::oid::ObjectId;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::models::{OverlayNode, RetiredKey, RetiredKeyMode};
-use roomler_core::ws::upgrade::WsParams;
+use roomler_core::ws::upgrade::{WsParams, native_credential, with_challenge};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -318,18 +318,18 @@ pub fn spawn_registry_census(state: &NetworkState) {
         }
     });
 }
-/// `GET /derp?token=<agent-jwt>` — upgrade to the DERP relay WS. Agent-only,
-/// same audience as `/ws?role=agent`.
-pub async fn derp_upgrade(
-    State(state): State<NetworkState>,
-    Query(params): Query<WsParams>,
+/// The `/derp` upgrade, judged on the credential [`derp_upgrade`] found: every
+/// check is the same whichever carrier brought it (#3656).
+async fn admit(
+    state: NetworkState,
+    token: Option<String>,
+    tid: Option<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // `WsParams::token` became optional when `/ws` learned to accept a browser
-    // session cookie. DERP is agent-only — no cookie jar on this side, and a
-    // browser must never be able to register as a relay node — so the token
-    // stays REQUIRED here.
-    let Some(token) = params.token.as_deref() else {
+    // DERP is agent-only: no cookie jar on this side, and a browser must never
+    // be able to register as a relay node, so a credential (header or query)
+    // stays REQUIRED here, though `WsParams::token` is optional for `/ws`.
+    let Some(token) = token.as_deref() else {
         return Response::builder()
             .status(401)
             .body("Unauthorized (derp)".into())
@@ -347,7 +347,7 @@ pub async fn derp_upgrade(
     // S6 — DERP relays are pod-local: two mesh peers only meet if their
     // /derp sockets land on the SAME pod, so the LB hashes on `tid` and
     // the server rejects a present-but-wrong claim.
-    if let Some(t) = &params.tid
+    if let Some(t) = &tid
         && t != &claims.tenant_id
     {
         return Response::builder()
@@ -777,6 +777,23 @@ fn forward_frame(
         // (`spawn_derp_usage_flush`) does the I/O on its own timer.
         add_network_bytes(network_id, out_len);
     }
+}
+
+/// `GET /derp` — upgrade to the DERP relay WS. Agent-only, same audience as
+/// `/ws?role=agent`. The agent JWT arrives as `Authorization: Bearer`, or as
+/// `?token=` from a daemon older than 0.4.210; a Bearer header decides when
+/// both come, and a refusal carries the Bearer challenge a newer daemon reads
+/// (#3656, `native_credential`, `with_challenge`). `?tid=` stays in the query,
+/// because the LB hashes on it. Every check is [`admit`]'s.
+pub async fn derp_upgrade(
+    State(state): State<NetworkState>,
+    Query(params): Query<WsParams>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = native_credential(&headers, params.token);
+    let presented = token.is_some();
+    with_challenge(admit(state, token, params.tid, ws).await, presented)
 }
 #[cfg(test)]
 mod tests {

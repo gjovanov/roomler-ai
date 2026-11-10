@@ -41,20 +41,22 @@
 use std::backtrace::Backtrace;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, filter::Directive, filter::LevelFilter, fmt};
+use tracing_subscriber::{
+    EnvFilter, filter::Directive, filter::LevelFilter, fmt, fmt::writer::MakeWriterExt,
+};
 
 use crate::logs_upload::{LogLine, LogUploadLayer};
 
-/// Holds the non-blocking appender's worker thread alive for the
-/// process lifetime. Dropping it stops the writer thread, which would
-/// silently drop in-flight log lines.
-static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+/// Holds the non-blocking appender's worker thread alive until [`finish`]
+/// takes it. A static is never dropped, so a process that exits without
+/// [`finish`] loses the lines still queued for the file.
+static GUARD: OnceLock<Mutex<Option<WorkerGuard>>> = OnceLock::new();
 
 /// Resolved log directory, exposed for diagnostics (the `panic` /
 /// `service status` paths surface it to the operator).
@@ -91,14 +93,37 @@ pub enum ServiceLogRole {
     /// session 0). Own basename: up to THREE SYSTEM processes may log at
     /// once (host + worker + netd).
     Netd,
-    /// #3609 — the per-Machine MSI's SystemContext commands
-    /// (`keep-system-context`, `enable-system-context`,
-    /// `disable-system-context`), run as SYSTEM by its custom actions.
-    /// `keep-system-context` repairs the machine tree before it reads the
-    /// attempt record, so an upgrade's first repair is its own: what it
-    /// changes is kept beside the service's log, not in the SYSTEM profile's.
+    /// #3609, #3230, #3640 — a step the per-Machine MSI runs as LocalSystem,
+    /// one of its custom actions. Which commands those are is ONE rule, the
+    /// daemon's `is_installer_step`, pinned against both WiX files. Each such
+    /// process also writes a start line and an end line ([`begin_step`],
+    /// [`end_step`]), and what it repairs in the machine tree is kept here,
+    /// beside the service's log, not in a profile's log.
     Installer,
 }
+
+impl ServiceLogRole {
+    /// Every role. A new role goes here as well, or the prune never ages its
+    /// files out: netd's were kept forever until #3230 read this list.
+    pub const ALL: [Self; 4] = [Self::Host, Self::Worker, Self::Netd, Self::Installer];
+
+    /// #3230 — the rolling-log basename of a process with this role: the one
+    /// table the file appender, the prune ([`prune_old_logs_at`]) and the log
+    /// tail ([`tail_source_path`]) all read. The Host, netd and the installer
+    /// steps each have their own, so two SYSTEM processes never append the same
+    /// daily file; the worker keeps the daemon's.
+    pub const fn basename(self) -> &'static str {
+        match self {
+            Self::Host => "roomlerd-service.log",
+            Self::Worker => DAEMON_LOG,
+            Self::Netd => "roomlerd-netd.log",
+            Self::Installer => "roomlerd-installer.log",
+        }
+    }
+}
+
+/// The rolling-log basename of a process with no [`ServiceLogRole`].
+const DAEMON_LOG: &str = "roomlerd.log";
 
 static SERVICE_ROLE: OnceLock<ServiceLogRole> = OnceLock::new();
 
@@ -108,16 +133,14 @@ pub fn set_service_logging(role: ServiceLogRole) {
     let _ = SERVICE_ROLE.set(role);
 }
 
-/// The rolling-log basename for this process. The Host gets its own
-/// (`roomlerd-service.log`) so two SYSTEM processes never append the
-/// same daily file; everything else keeps `roomlerd.log`.
+/// The rolling-log basename for this process.
 fn log_basename() -> &'static str {
-    match SERVICE_ROLE.get() {
-        Some(ServiceLogRole::Host) => "roomlerd-service.log",
-        Some(ServiceLogRole::Netd) => "roomlerd-netd.log",
-        Some(ServiceLogRole::Installer) => "roomlerd-installer.log",
-        _ => "roomlerd.log",
-    }
+    basename_of(SERVICE_ROLE.get().copied())
+}
+
+/// The rolling-log basename of a process with `role`, or with none.
+fn basename_of(role: Option<ServiceLogRole>) -> &'static str {
+    role.map_or(DAEMON_LOG, ServiceLogRole::basename)
 }
 
 /// Mirror a legacy `roomler_agent=<level>` directive onto `roomlerd=<level>`.
@@ -219,11 +242,17 @@ pub fn init() {
         let d = dir.as_path();
         prune_old_logs(d, KEEP_DAYS);
         let (nb, guard) = tracing_appender::non_blocking(appender);
-        let _ = GUARD.set(guard);
+        let _ = GUARD.set(Mutex::new(Some(guard)));
         let file = fmt::layer()
             .with_writer(nb)
             .with_target(false)
             .with_ansi(false);
+        // #3230 — an installer step's own lines are the file's. The console
+        // already has each answer ([`answer`]) and shows what it always showed.
+        // Its writer drops them: a per-layer filter here would make the whole
+        // stack's level TRACE (`init_keeps_the_level_of_the_default_filter`).
+        let console = std::io::stdout.with_filter(|meta| meta.target() != STEP_TARGET);
+        let stdout = stdout.with_writer(console);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with((!quiet).then_some(stdout))
@@ -265,7 +294,10 @@ pub fn init() {
 /// write there waits for that conhost, which a host busy with higher-priority work
 /// runs only now and then: the exit-DNS purge's 10 s bound was logged 40-46 s
 /// after the purge began. Only a process with a [`ServiceLogRole`] is asked, so a
-/// verb a person runs keeps its console lines, in a terminal or over SSH.
+/// verb a person runs with no role keeps its console lines, in a terminal or over
+/// SSH. The installer steps have a role and are asked: run in a terminal window, a
+/// step keeps its console lines because that console has a window, and so does a
+/// step whose stdout is a file or a pipe, which is no console.
 #[cfg(windows)]
 fn console_nobody_reads() -> bool {
     use windows_sys::Win32::System::Console::{
@@ -528,6 +560,111 @@ pub fn say_on_stdout(msg: impl std::fmt::Display) {
     let _ = out.flush();
 }
 
+/// #3230 — the target of an installer step's own lines: its start, its answers
+/// and its end. [`KEPT_AT_INFO`] covers it, so the lines are kept at INFO under
+/// any `RUST_LOG`, and [`init`] keeps them off the console while a file has them.
+const STEP_TARGET: &str = "roomler_node_core::logging::step";
+
+/// #3230 — the step this process runs, from [`begin_step`] to [`end_step`].
+struct Step {
+    command: String,
+    started: Instant,
+    /// The last line the step gave as its answer ([`answer`]).
+    answer: Option<String>,
+}
+
+static STEP: Mutex<Option<Step>> = Mutex::new(None);
+
+fn step_slot() -> std::sync::MutexGuard<'static, Option<Step>> {
+    STEP.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// #3230 — begin the record of a step the per-Machine MSI runs: one line with
+/// the command, the version and the account, before the step does anything.
+/// Windows Installer throws away a custom action's stdout and stderr, so this
+/// log is the only place that says which step ran and how it ended. Call it
+/// after [`init`].
+pub fn begin_step(command: &str, version: &str, account: Option<&str>) {
+    tracing::info!(
+        target: STEP_TARGET,
+        %version,
+        pid = std::process::id(),
+        account = %account.unwrap_or("unknown"),
+        "installer step started: roomlerd {command}"
+    );
+    *step_slot() = Some(Step {
+        command: command.to_string(),
+        started: Instant::now(),
+        answer: None,
+    });
+}
+
+/// #3230 — a verb's answer: on stdout, as it always was, and inside a step, in
+/// the step's log as well. The last one is the result on the step's end line.
+/// With no log file the console already has it, so it is not said twice there.
+pub fn answer(line: impl std::fmt::Display) {
+    let line = line.to_string();
+    say_on_stdout(&line);
+    let in_a_step = match step_slot().as_mut() {
+        Some(step) => {
+            step.answer = Some(line.clone());
+            true
+        }
+        None => false,
+    };
+    if in_a_step && log_dir().is_some() {
+        tracing::info!(target: STEP_TARGET, "{line}");
+    }
+}
+
+/// #3230 — end the record [`begin_step`] began, then write every queued line
+/// ([`finish`]): the process exits right after. Success gives the step's last
+/// answer, failure gives the error with its whole cause chain, and both give
+/// the exit code. A process that began no step writes nothing here.
+pub fn end_step(error: Option<&str>, exit_code: i32) {
+    let Some(step) = step_slot().take() else {
+        return;
+    };
+    let elapsed_ms = u64::try_from(step.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match error {
+        None => tracing::info!(
+            target: STEP_TARGET,
+            exit_code,
+            elapsed_ms,
+            result = %step.answer.as_deref().unwrap_or("(no answer)"),
+            "installer step ended: roomlerd {}",
+            step.command
+        ),
+        Some(error) => tracing::error!(
+            target: STEP_TARGET,
+            exit_code,
+            elapsed_ms,
+            %error,
+            "installer step failed: roomlerd {}",
+            step.command
+        ),
+    }
+    finish();
+}
+
+/// #3230 — write every line still queued for the log file, then stop its
+/// writer. The writer's guard lives in a static, and no exit drops a static,
+/// so a process that ends with lines queued loses the last ones: the ones
+/// that say how it ended. Waits for the writer about a second at most
+/// (tracing-appender's own bound). No line reaches the file after this; the
+/// console and the upload layer still get theirs.
+pub fn finish() {
+    let Some(slot) = GUARD.get() else {
+        return;
+    };
+    let guard = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    drop(guard);
+}
+
 /// #3292 — a daemon the per-user Scheduled Task started has no console: its
 /// launcher (`roomlerdw.exe`) gives it `NUL` for stdio, so that no window opens
 /// on the person's desktop. Its stdout carries only what its rolling log carries
@@ -695,7 +832,7 @@ pub fn active_log_path() -> Option<PathBuf> {
     // first — no `roomler-agent.log*` exists on any reachable host, against a control
     // of 5-30 current log files per host. Retention below still matches it, so a host
     // that turns one up ages it out rather than leaking it forever.
-    for b in ["roomlerd.log", "roomlerd-service.log"] {
+    for b in [DAEMON_LOG, ServiceLogRole::Host.basename()] {
         if !bases.contains(&b) {
             bases.push(b);
         }
@@ -750,6 +887,8 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 ///   worker resolves its service-logs file);
 /// * `service` — the newest SCM-host/service file in the machine-global
 ///   `service-logs` dir (Windows; elsewhere = the daemon log);
+/// * `installer` — #3230: the newest file of the per-Machine MSI's own steps,
+///   in the same dir (Windows only: no other package runs them);
 /// * `panic`   — the newest `panic-*` dump across the log dirs.
 ///
 /// `None` = the source has no file yet (never errored, service never
@@ -761,20 +900,22 @@ pub fn tail_source_path(source: &str) -> Option<PathBuf> {
         // default dir for the newest daemon rolling file instead.
         "daemon" => active_log_path().or_else(|| {
             let dir = resolve_log_dir()?;
-            newest_file_matching(&[dir], |name| name.starts_with("roomlerd.log"))
+            newest_file_matching(&[dir], |name| name.starts_with(DAEMON_LOG))
         }),
-        "service" => {
+        "service" | "installer" => {
             #[cfg(target_os = "windows")]
             {
                 let dir = crate::appdirs::machine_global_dir().join("service-logs");
-                newest_file_matching(&[dir], |name| {
-                    name.starts_with("roomlerd-service.log") || name.starts_with("roomlerd.log")
-                })
+                newest_service_log(&dir, source)
             }
             #[cfg(not(target_os = "windows"))]
             {
                 // No SCM split off Windows — the daemon log IS the service log.
-                active_log_path()
+                if source == "service" {
+                    active_log_path()
+                } else {
+                    None
+                }
             }
         }
         "panic" => {
@@ -816,6 +957,28 @@ fn newest_file_matching(dirs: &[PathBuf], pred: impl Fn(&str) -> bool) -> Option
     best.map(|(_, p)| p)
 }
 
+/// #3230 — the newest rolling log in a `service-logs` dir of the processes a
+/// tail source names: `service` the SCM host's or the SystemContext worker's,
+/// `installer` the per-Machine MSI's own steps'. The basenames are
+/// [`ServiceLogRole::basename`]'s. Compiled everywhere, so its test runs on
+/// every lane; only Windows has such a dir to read.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn newest_service_log(dir: &Path, source: &str) -> Option<PathBuf> {
+    const SERVICE: [&str; 2] = [
+        ServiceLogRole::Host.basename(),
+        ServiceLogRole::Worker.basename(),
+    ];
+    const INSTALLER: [&str; 1] = [ServiceLogRole::Installer.basename()];
+    let bases: &[&str] = match source {
+        "service" => &SERVICE,
+        "installer" => &INSTALLER,
+        _ => return None,
+    };
+    newest_file_matching(&[dir.to_path_buf()], |name| {
+        bases.iter().any(|base| name.starts_with(base))
+    })
+}
+
 /// S2 — read the last ≤`cap` bytes of `path` as lossy UTF-8, starting on
 /// a line boundary when the cut landed mid-line. Returns the file's
 /// TOTAL size alongside (the client polls it to detect growth).
@@ -853,12 +1016,28 @@ pub fn resolve_log_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return std::env::var_os("ROOMLER_TEST_LOG_DIR").map(PathBuf::from);
     }
+    log_dir_for(SERVICE_ROLE.get().copied())
+}
+
+/// The folder a process with `role` logs in: the rule [`resolve_log_dir`]
+/// applies outside this crate's tests. S1b: on Windows every role logs beside
+/// the service, in the machine-global `service-logs`. A process with no role,
+/// and every process elsewhere, logs in its profile's data dir.
+fn log_dir_for(role: Option<ServiceLogRole>) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
-    if SERVICE_ROLE.get().is_some() {
+    if role.is_some() {
         return Some(crate::appdirs::machine_global_dir().join("service-logs"));
     }
+    #[cfg(not(target_os = "windows"))]
+    let _ = role;
     let dirs = crate::appdirs::project_dirs()?;
     Some(dirs.data_local_dir().join("logs"))
+}
+
+/// Every rolling-log basename a roomlerd process writes: the daemon's and each
+/// role's (#3230).
+fn rolling_basenames() -> impl Iterator<Item = &'static str> {
+    std::iter::once(DAEMON_LOG).chain(ServiceLogRole::ALL.map(ServiceLogRole::basename))
 }
 
 /// Delete rolling-log + panic files in `dir` older than `keep_days`.
@@ -895,9 +1074,7 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         };
         let name = entry.file_name();
         let lossy = name.to_string_lossy();
-        let is_ours = lossy.starts_with("roomlerd.log")
-            || lossy.starts_with("roomlerd-service.log")
-            || lossy.starts_with("roomlerd-installer.log")
+        let is_ours = rolling_basenames().any(|base| lossy.starts_with(base))
             // RETIRED-NAME-ANCHOR: legacy rolled logs must still AGE OUT; dropping this
             // leaks them forever on an upgraded host. See docs/fr/FR-21.
             || lossy.starts_with("roomler-agent.log")
@@ -1521,6 +1698,280 @@ mod tests {
         // No directory at all (tests, no home): stdout-only, quietly, as ever.
         let (got, notes) = open_log_appender(None, Some(fallback), |_| Ok(()));
         assert!(got.is_none() && notes.is_empty());
+    }
+
+    /// #3230, #3640 — the log of the per-Machine MSI's own steps. Every test but one
+    /// runs on every lane, and the Windows lane runs this module by name (`ci.yml`).
+    mod installer_log {
+        use super::super::*;
+        use std::path::{Path, PathBuf};
+
+        const CHILD: &str = "ROOMLER_TEST_INSTALLER_STEP";
+        const LEVEL_CHILD: &str = "ROOMLER_TEST_LEVEL_AFTER_INIT";
+        const LEVEL_SAID: &str = "level after init: ";
+        /// More lines than the writer drains between a step's last line and an
+        /// exit that does not wait for it.
+        const BURST: usize = 20_000;
+        const COMMAND: &str = "service install --as-service";
+        const ANSWER: &str = "Service registered: the step's answer";
+        /// What the daemon's `error_chain` makes of a `.context()`-layered error.
+        const CHAIN: &str = "registering Roomler with the SCM: CreateServiceW: \
+                             The specified service has been marked for deletion. (os error 1072)";
+
+        #[test]
+        fn the_installer_log_has_a_name_of_its_own() {
+            let installer = ServiceLogRole::Installer.basename();
+            assert_eq!(installer, "roomlerd-installer.log");
+            for other in [
+                None,
+                Some(ServiceLogRole::Host),
+                Some(ServiceLogRole::Worker),
+                Some(ServiceLogRole::Netd),
+            ] {
+                assert_ne!(basename_of(other), installer, "{other:?}");
+            }
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn every_role_logs_beside_the_service() {
+            let service_logs = crate::appdirs::machine_global_dir().join("service-logs");
+            for role in ServiceLogRole::ALL {
+                assert_eq!(
+                    log_dir_for(Some(role)),
+                    Some(service_logs.clone()),
+                    "{role:?}"
+                );
+            }
+        }
+
+        /// The prune reads the same table as the file appender, so no role's log is
+        /// kept forever. netd's was, until the prune read the table.
+        #[test]
+        fn the_prune_ages_out_the_log_of_every_role() {
+            let tmp = tempfile::tempdir().unwrap();
+            let files: Vec<PathBuf> = ServiceLogRole::ALL
+                .iter()
+                .map(|role| tmp.path().join(format!("{}.2026-10-01", role.basename())))
+                .collect();
+            for file in &files {
+                std::fs::write(file, b"x").unwrap();
+            }
+            prune_old_logs_at(tmp.path(), SystemTime::now() + Duration::from_secs(86_400));
+            let kept: Vec<&PathBuf> = files.iter().filter(|f| f.exists()).collect();
+            assert!(kept.is_empty(), "never aged out: {kept:?}");
+        }
+
+        /// `roomler logs --source installer`, which a Fleet RPC exec runs, reads the
+        /// installer log; `service` keeps reading the host's and the worker's.
+        #[test]
+        fn the_installer_source_reads_the_installer_log() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            let service = dir.join("roomlerd-service.log.2026-11-10");
+            let installer = dir.join("roomlerd-installer.log.2026-11-10");
+            let netd = dir.join("roomlerd-netd.log.2026-11-10");
+            for file in [&service, &installer, &netd] {
+                std::fs::write(file, b"x").unwrap();
+            }
+            assert_eq!(newest_service_log(dir, "installer"), Some(installer));
+            assert_eq!(newest_service_log(dir, "service"), Some(service));
+            assert_eq!(newest_service_log(dir, "nope"), None);
+        }
+
+        /// A per-Machine custom action's step that fails: its start, a burst of the
+        /// lines it logs (as many as `CHILD` says), its answer, its end with the
+        /// whole chain, then the exit, which waits for nothing. Nothing after `init`
+        /// may panic: the hook would record a crash.
+        #[test]
+        fn child_runs_a_step_that_fails() {
+            let Some(burst) = std::env::var(CHILD)
+                .ok()
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return;
+            };
+            set_service_logging(ServiceLogRole::Installer);
+            init();
+            begin_step(COMMAND, "9.9.9-test", Some("S-1-5-18"));
+            for i in 0..burst {
+                tracing::warn!(i, "a line the step logs");
+            }
+            answer(ANSWER);
+            end_step(Some(CHAIN), 1);
+            // The flush is what saves the lines this exit would lose, and a race
+            // shows that only now and then (1 run in 6 lost 1,101 lines here). So
+            // the child also says, every time, whether the writer was stopped.
+            let flushed = GUARD
+                .get()
+                .is_some_and(|slot| slot.lock().map_or(true, |guard| guard.is_none()));
+            std::process::exit(if flushed { 1 } else { 3 });
+        }
+
+        /// Runs the test `name` of this module alone in a new process, with `var`
+        /// set, a log dir of its own, no `RUST_LOG`, and stdout to `console` (or
+        /// nowhere, as under Windows Installer).
+        fn child(
+            name: &str,
+            (var, value): (&str, &str),
+            dir: &Path,
+            console: Option<&Path>,
+        ) -> std::process::ExitStatus {
+            let stdout = match console {
+                Some(file) => std::fs::File::create(file).unwrap().into(),
+                None => std::process::Stdio::null(),
+            };
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("logging::tests::installer_log::{name}"),
+                    "--nocapture",
+                ])
+                .env(var, value)
+                .env("ROOMLER_TEST_LOG_DIR", dir)
+                .env_remove("RUST_LOG")
+                .stdin(std::process::Stdio::null())
+                .stdout(stdout)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+        }
+
+        /// Runs [`child_runs_a_step_that_fails`] and returns the installer log's text.
+        fn run_child(dir: &Path, burst: usize, console: Option<&Path>) -> String {
+            let burst = burst.to_string();
+            let status = child(
+                "child_runs_a_step_that_fails",
+                (CHILD, &burst),
+                dir,
+                console,
+            );
+            assert_eq!(
+                status.code(),
+                Some(1),
+                "{status:?} (3: the step ended with its writer still running)"
+            );
+            installer_log_text(dir)
+        }
+
+        fn installer_log_text(dir: &Path) -> String {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("roomlerd-installer.log"))
+                })
+                .collect();
+            files.sort();
+            files
+                .iter()
+                .map(|f| std::fs::read_to_string(f).unwrap())
+                .collect()
+        }
+
+        /// #3230 — Windows Installer keeps nothing a custom action prints, so a step
+        /// that fails leaves its start, every line it logged and its error, whole,
+        /// in the log before it exits. Its stdout goes nowhere, as under
+        /// `msiexec`, which is also what lets lines queue up behind the writer.
+        #[test]
+        fn a_failing_step_leaves_its_start_its_lines_and_its_whole_error_in_the_log() {
+            let tmp = tempfile::tempdir().unwrap();
+            let log = run_child(tmp.path(), BURST, None);
+            let line_with = |needle: &str| log.lines().position(|l| l.contains(needle));
+            let started = line_with(&format!("installer step started: roomlerd {COMMAND}"));
+            let answered = line_with(ANSWER);
+            let failed = line_with(&format!("installer step failed: roomlerd {COMMAND}"));
+            let lines = log.matches("a line the step logs").count();
+            let tail: Vec<&str> = log.lines().rev().take(3).collect();
+            let report = format!(
+                "start={started:?} answer={answered:?} end={failed:?} lines={lines}/{BURST}, \
+                 log tail (last line first): {tail:?}"
+            );
+            assert!(started.is_some(), "no start line: {report}");
+            assert_eq!(lines, BURST, "lines lost: {report}");
+            assert!(answered.is_some(), "no answer: {report}");
+            let end = log.lines().nth(failed.expect(&report)).unwrap();
+            assert!(end.contains("ERROR"), "{end}");
+            assert!(end.contains("exit_code=1"), "{end}");
+            assert!(end.contains(&format!("error={CHAIN}")), "{end}");
+            assert!(started < answered && answered < failed, "{report}");
+            let start = log.lines().nth(started.unwrap()).unwrap();
+            assert!(start.contains("version=9.9.9-test"), "{start}");
+            assert!(start.contains("account=S-1-5-18"), "{start}");
+        }
+
+        /// #3230 — a person who runs the same verb in a terminal sees what it always
+        /// showed there: the lines it logs and its answer, once. The step's own
+        /// start and end lines are the log's.
+        #[test]
+        fn a_step_run_in_a_terminal_shows_what_it_always_showed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let console_file = tmp.path().join("console.txt");
+            let log = run_child(tmp.path(), 3, Some(&console_file));
+            assert!(log.contains("installer step failed"), "{log}");
+            let console = std::fs::read_to_string(&console_file).unwrap();
+            assert_eq!(console.matches(ANSWER).count(), 1, "{console}");
+            assert_eq!(
+                console.matches("a line the step logs").count(),
+                3,
+                "{console}"
+            );
+            assert!(!console.contains("installer step"), "{console}");
+        }
+
+        /// A daemon's [`init`]: a log file and a console, and no role, so nothing
+        /// turns the console off. Says the level tracing now compares callsites with.
+        #[test]
+        fn child_says_the_level_after_init() {
+            if std::env::var_os(LEVEL_CHILD).is_none() {
+                return;
+            }
+            init();
+            println!(
+                "{LEVEL_SAID}{}",
+                tracing::level_filters::LevelFilter::current()
+            );
+        }
+
+        /// #3230 — tracing compares every `debug!` and `trace!` with ONE level, and
+        /// `try_init` hands the same level to the `log` crate, whose macros webrtc,
+        /// sctp and ice use on per-packet paths. With the default filter that level
+        /// is INFO, and each line it turns off costs one compare. A per-layer
+        /// filter under a layer with no level of its own (the file layer, the upload
+        /// layer) takes the level away: the whole stack is left with none, which
+        /// tracing takes as TRACE (tracing-subscriber 0.3.23, `layer/layered.rs:496`),
+        /// and a callsite the default filter turns off is asked again on every hit
+        /// instead of never (`:470`). Every daemon that keeps its console then walks
+        /// the subscriber stack for each of those lines. This test keeps such a
+        /// filter out: after a daemon's `init` the level is the default filter's
+        /// own. A line kept off one output is kept off at that output's writer
+        /// (`MakeWriterExt::with_filter`), which leaves the level alone.
+        #[test]
+        fn init_keeps_the_level_of_the_default_filter() {
+            let tmp = tempfile::tempdir().unwrap();
+            let console_file = tmp.path().join("console.txt");
+            let status = child(
+                "child_says_the_level_after_init",
+                (LEVEL_CHILD, "1"),
+                tmp.path(),
+                Some(&console_file),
+            );
+            let console = std::fs::read_to_string(&console_file).unwrap();
+            assert!(status.success(), "{status:?}: {console}");
+            let said = console
+                .lines()
+                .find_map(|l| l.strip_prefix(LEVEL_SAID))
+                .unwrap_or_else(|| panic!("no level said: {console}"));
+            let own = filter_for(None).max_level_hint().map(|l| l.to_string());
+            assert_eq!(
+                own.as_deref(),
+                Some("info"),
+                "the default filter's own level"
+            );
+            assert_eq!(Some(said), own.as_deref(), "the level after init");
+        }
     }
 
     /// #3292 — the windowless task daemon's stderr. Each `child_*` test does nothing

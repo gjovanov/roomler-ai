@@ -595,14 +595,14 @@
               rc.18: scrub stale artefacts AFTER the new EXE lands
               (so we can shell out to it). NB both this and
               RegisterService are After='InstallFiles'; WiX v3 breaks
-              the tie in DOCUMENT order, so RegisterService actually
-              runs FIRST (an earlier comment here claimed the
-              opposite). Ordering is immaterial: the helper's
-              CA-reachable step only sweeps the vacated pre-rename
-              install dir (P4b), and its cross-flavour arms — which
-              touch the other flavour's task/service namespace — are
-              never reached from the CA (same-flavour fast path; see
-              install_cleanup.rs module docs). Skip during uninstall.
+              the tie by action NAME, not document order, so this runs
+              FIRST (4001, RegisterService 4002; #3640). Ordering is
+              immaterial: the helper's CA-reachable step only sweeps
+              the vacated pre-rename install dir (P4b), and its
+              cross-flavour arms — which touch the other flavour's
+              task/service namespace — are never reached from the CA
+              (same-flavour fast path; see install_cleanup.rs module
+              docs). Skip during uninstall.
             -->
             <Custom Action='CleanupLegacyPerUser' After='InstallFiles'>
                 NOT (REMOVE="ALL")

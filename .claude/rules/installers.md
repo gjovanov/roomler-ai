@@ -90,6 +90,18 @@ profile and still report Done. A policy that refuses prompts from a standard use
 (`ConsentPromptBehaviorUser=0`) leaves `daemon-user` and the tunnel, preselected, so nobody
 pairs first and meets the refusal after.
 
+⚠️ **The wizard never refuses a server-issued timestamp on the device's own clock (#3523).** A
+pasted token's `exp` is judged on the configured server's clock: `server_clock.rs` keeps the `Date`
+of the server's own answer to `features::ask` (a 2xx JSON object from the origin asked; a redirect's
+target, a proxy's or a captive portal's page and an older server's 404 leave the clock unknown),
+carries it forward on the monotonic clock (a wall-clock step does not move it), and retires it after
+5 minutes by either clock. Expired by the server's clock
+blocks; expired by this device's clock alone, or with the server's clock unknown, only warns, for the
+first token and the macOS second one: the server checks the token at enrollment anyway. A fresh
+enrollment token lives 10 minutes and a cloned Windows VM boots about 3 h ahead, so the device-clock
+check refused tokens the server would accept and enforced nothing. Any new check of a time the server
+issued follows the same rule (#3511, and #3522 for the SSH grant).
+
 ⚠️ **WebView2's browser process runs as the session's user, not as the wizard.** Under
 over-the-shoulder credentials an elevated wizard is the administrator and its browser
 the standard user, so the data folder must be one that user can open
