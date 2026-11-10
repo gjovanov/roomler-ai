@@ -1026,6 +1026,59 @@ mod tests {
         );
     }
 
+    /// P1b-1's review, L13 — the copy this hub held for the device's earlier
+    /// connection ended before the claim was answered. The claim reads the
+    /// hub only once it has taken the claim, so it rebuilds the session rather
+    /// than re-attaching a copy no longer in the map: the session is held,
+    /// counted once, and its lease renewed from here only while it is held.
+    #[tokio::test]
+    async fn a_held_copy_that_ended_before_the_claim_is_rebuilt_and_counted_once() {
+        use roomler_core::cluster::session_slots::SlotScope;
+        let hub = hub().await;
+        let (agent, tenant, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let _first = register(&hub, agent, tenant, 2, hello(Some(60), Vec::new()));
+        let (sid, _ctl) = open(&hub, agent, user);
+        live(&hub, sid).await;
+        let second = register(&hub, agent, tenant, 2, hello(Some(60), vec![sid]));
+        assert!(second.reaped.is_empty(), "the claimed copy is spared");
+        hub.terminate(sid, EndReason::AdminTerminated).unwrap();
+        assert!(hub.session_snapshot(sid).is_none());
+
+        let lease = Lease {
+            scope: SlotScope::Org(tenant),
+            session: sid,
+            user,
+            device: agent,
+        };
+        let r = ResumedSession {
+            session_id: sid,
+            tenant_id: tenant,
+            controller_user_id: user,
+            permissions: Permissions::VIEW,
+            created_at: DateTime::now(),
+            started_at: DateTime::now(),
+            attach_seq: 1,
+            max_duration: None,
+            slot: Some(lease),
+            resume_secs: 60,
+        };
+        assert_eq!(hub.resume_claimed(agent, &second.tx, r), Resumed::Rebuilt);
+        assert!(hub.session_snapshot(sid).is_some(), "held here now");
+        assert!(
+            hub.inner.slotted.contains_key(&sid),
+            "its lease renewed here"
+        );
+        let count = |hub: &Hub| hub.inner.agents.get(&agent).map(|a| a.active_sessions);
+        assert_eq!(count(&hub), Some(1), "counted once");
+
+        hub.terminate(sid, EndReason::ControllerHangup).unwrap();
+        assert!(
+            !hub.inner.slotted.contains_key(&sid),
+            "its end gives it back"
+        );
+        assert_eq!(count(&hub), Some(0));
+    }
+
     /// The announce reaches only a connection that advertises the verb, and
     /// 0 withdraws the window, so the next drop ends as today.
     #[tokio::test]
