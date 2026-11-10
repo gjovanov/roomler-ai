@@ -17,7 +17,8 @@ That made every hypothesis in a remote investigation cost a human round trip:
 that loop.
 
 **Reading a remote log: always `roomler exec <host> -- roomler logs`** (with
-`--grep <pat>` / `-n <lines>` / `--source daemon|service|panic`), never a path
+`--grep <pat>` / `-n <lines>` / `--source daemon|service|installer|panic`;
+`installer` is the per-Machine MSI's own steps on Windows, #3230), never a path
 guess. The daemon resolves its OWN log file — the path depends on the service
 role, the running user, and a UTC-dated suffix, and a Windows host carries
 two decoy `roomlerd.log*` files (the SCM supervisor's and the updater's).
@@ -26,9 +27,9 @@ twice (2026-08-07 and 2026-08-09); the verb existed both times.
 
 **What reaches that log.** The daemon keeps lines by `RUST_LOG` when its environment
 sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
-everything else at WARN (`crates/agent-core/src/logging.rs:360`). Either way it then
+everything else at WARN (`crates/agent-core/src/logging.rs:392`). Either way it then
 keeps INFO from two targets that no shipped unit names
-(`crates/agent-core/src/logging.rs:443`, #1928):
+(`crates/agent-core/src/logging.rs:475`, #1928):
 
 | Target | Its INFO lines |
 |---|---|
@@ -41,8 +42,8 @@ directive for the target, for a module under it or for any prefix of its name
 `RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
 silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
 logs ERROR from every target. Two directives are added whatever the spec says:
-`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:398`) and
-`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:409`).
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:430`) and
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:441`).
 
 ## Transport
 

@@ -210,7 +210,7 @@ that fails is not run: the device runs as in step 2a, and the service log says
 once which entry fails and why (step 6). The service host and the worker read
 it through one function (`agents/roomlerd/src/win_service/supervisor.rs:972`),
 so they cannot disagree, and a SYSTEM worker never loads a config the check
-refused (`agents/roomlerd/src/app.rs:1740`). `keep-system-context` reads a
+refused (`agents/roomlerd/src/app.rs:1812`). `keep-system-context` reads a
 record that fails as no record, so SystemContext off (`machine_tree.rs:913`).
 
 The writers make every file they write (`machine_tree.rs:287`): the config's temp file, its
@@ -284,7 +284,7 @@ can open nothing that was sealed.
 
 | What you see | Why |
 |---|---|
-| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:313`) |
+| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:345`) |
 | `icacls C:\ProgramData\roomler\roomler` lists **no** entries | the DACL is protected and empty (`icacls … /save` shows `D:PAI`) |
 | a leftover `config.toml.tmp.<pid>` in that directory | the config save whose hardening sealed it could not rename its file into place |
 | the directory lists SYSTEM and Administrators, but a child such as `crashes`, `service-logs` or `config.toml.prev` lists **no** entries; the log says `crash_recorder: read_dir failed … Access is denied`, or the daemon logs into SYSTEM's own profile because `service-logs` refused it | 0.4.185 hardened the directory for the first time, and dropped inheritance before it granted. Each child the user owned was left with an empty DACL. The same repair below heals it |
@@ -377,7 +377,7 @@ connects — no respawn churn.
 | `Users` appears in `icacls` output for the machine folder or the config | the folder holds no machine config yet (a waiting or attended host, step 2a), or the repair is switched off (`ROOMLERD_MACHINE_TREE_REPAIR=0`). On `C:\ProgramData\roomler` itself, what `%ProgramData%` hands down is expected | step 2; once the config is there, the service's next check repairs the rest (step 3) |
 | `machine tree: the machine enrollment is not private, so the service does not run it as SYSTEM …`, with `reason=` naming an entry; the device is reachable only while someone is signed in | that entry fails the check (#3609): owned by an account other than SYSTEM or Administrators, not a plain folder or file, or changeable by another account | step 3, "When the check refuses an entry". The service starts the SYSTEM worker within a second of the check passing |
 | `machine tree: not repaired` with `line=… is left as it is: it is owned by an account that is not an administrator of this computer` | the repair never takes over such an entry; the check then refuses it | the same |
-| `machine tree: repaired` WARN lines, once each, at the first start after an update, or in `service-logs\roomlerd-installer.log` when the installer's `keep-system-context` repaired first | the entries had drifted: an entry for another account (Explorer's folder prompt adds one), or permissions inherited from above | nothing to do; the device keeps running as before |
+| `machine tree: repaired` WARN lines, once each, at the first start after an update, or in `service-logs\roomlerd-installer.log` when one of the per-Machine MSI's own steps repaired first ([installation.md](installation.md#where-the-per-machine-msis-own-steps-log-3230-3640)) | the entries had drifted: an entry for another account (Explorer's folder prompt adds one), or permissions inherited from above | nothing to do; the device keeps running as before |
 | `the machine config at … is not run as SYSTEM: …` as a worker's last line | the tree changed between the host's check and the worker's start | the host runs the device as in step 2a; step 3 |
 | Setup or `enroll --machine-global` says `…\config.toml is set aside, because …` | the machine config that was there was not private to the computer's administrators once repaired (#3609): another account owns it, or that account may change it or the folders above it | nothing to undo: the enrollment was written as a fresh config in its place. Set again what the device had (its mesh, routes, lock policy), and fix what the reason names (step 3) |
 | Setup warns `could not take the machine-global config folder for Administrators (…)` or `could not take the machine-global config directory's parent for Administrators (…)`, or `enroll` prints a `WARNING:` ending `Until the folder belongs to Administrators the service may not run this enrollment as SYSTEM.` | the save could not give the machine folder or `C:\ProgramData\roomler` to Administrators: it is not a plain folder (a link), or, for `enroll`, the prompt was not elevated | step 3's row for the machine folder |

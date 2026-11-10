@@ -198,8 +198,9 @@ enum Command {
     /// Pairs with Fleet RPC: `roomler exec <host> -- roomler logs --grep ICE`.
     Logs {
         /// Which log: `daemon` (this process's rolling log — the one with the
-        /// overlay/media events), `service` (the SCM host log), or `panic`
-        /// (the newest panic dump).
+        /// overlay/media events), `service` (the SCM host log), `installer`
+        /// (Windows: the per-Machine MSI's own steps, #3230), or `panic` (the
+        /// newest panic dump).
         #[arg(long, default_value = "daemon")]
         source: String,
         /// Tail size in bytes; the daemon clamps it (≤64 KiB).
