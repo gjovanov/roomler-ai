@@ -125,5 +125,17 @@ roomler-node-core = { path = "../../crates/agent-core", features = ["test-fixtur
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 
+# #3609 — tests only: `machine_write`'s NTFS case runs the wizard's side with a
+# limited copy of the test's token (CreateRestrictedToken, impersonation), as a
+# Setup started by a person has. The app itself keeps every Win32 call in
+# roomler-setup-core.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

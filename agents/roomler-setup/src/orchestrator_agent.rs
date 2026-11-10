@@ -64,7 +64,7 @@ use crate::role::Role;
 /// right where the orchestrator saves it. `None`/empty fields keep the
 /// agent's defaults; route lists are validated BEFORE the MSI runs so a
 /// typo can't burn the single-use enrollment token.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AdvancedOptions {
     pub overlay_enabled: Option<bool>,
@@ -1289,11 +1289,12 @@ async fn confirm_fresh_service(_config_path: &std::path::Path, _on_event: &Chann
 }
 
 /// #3116 — what to do about an install that needs an elevated wizard.
-const RUN_AS_ADMINISTRATOR: &str =
+pub(crate) const RUN_AS_ADMINISTRATOR: &str =
     "Close Roomler Setup, then right-click it and choose Run as administrator.";
 
 /// #3116 — said by every refusal that comes before the enroll.
-const NOTHING_SPENT: &str = "Nothing was enrolled, and the enrollment token is still unused.";
+pub(crate) const NOTHING_SPENT: &str =
+    "Nothing was enrolled, and the enrollment token is still unused.";
 
 /// #3116 — the SystemContext preflight's refusal.
 pub(crate) fn needs_elevation() -> String {
@@ -1350,7 +1351,7 @@ fn config_open_to_this_process(path: &std::path::Path) -> bool {
 }
 
 /// #3116 — the refusal for a config path the write probe could not write.
-fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
+pub(crate) fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         format!(
             "{} may not be written by this process ({e}). {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}",
@@ -1672,7 +1673,10 @@ pub fn force_kill_msi() -> Result<(), String> {
 /// is left UNTOUCHED there — the agent's own default (off) — rather than
 /// written as a promise the daemon cannot keep. An explicit choice always
 /// wins: the box the operator saw is the box that lands in config.toml.
-fn overlay_enabled_default(explicit: Option<bool>, flavour: WindowsInstallFlavour) -> Option<bool> {
+pub(crate) fn overlay_enabled_default(
+    explicit: Option<bool>,
+    flavour: WindowsInstallFlavour,
+) -> Option<bool> {
     explicit.or(match flavour {
         WindowsInstallFlavour::PerMachine => Some(true),
         WindowsInstallFlavour::PerUser => None,
@@ -1716,7 +1720,7 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
 /// Administrators.
 #[cfg(target_os = "windows")]
-fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
         .parent() // …\roomler\<segment>
         .and_then(|p| p.parent()) // …\roomler

@@ -179,7 +179,7 @@ pub async fn enroll_fresh_as(
 
 /// The fold itself, without the network: `apply_enrollment`, then the
 /// previous row's key retired when the server made another row (F3).
-fn fold(existing: Option<AgentConfig>, fresh: AgentConfig) -> anyhow::Result<Enrolled> {
+pub(crate) fn fold(existing: Option<AgentConfig>, fresh: AgentConfig) -> anyhow::Result<Enrolled> {
     let previous = existing.clone();
     let (mut cfg, outcome) = roomlerd::enrollment::apply_enrollment(existing, fresh, None, false)?;
     let previous_row =
