@@ -86,6 +86,9 @@
 #     FR139_GUEST_SCRIPT this file's path on the guests
 #                        (default /var/tmp/fr139/fr139-restart-cell.sh)
 #     FR139_PROBE_S, FR139_SAMPLE_S, FR139_QUIET_S, FR139_WAIT_S (optional)
+#     FR139_UNTIL        optional, epoch seconds: a batch stops (exit 5) before
+#                        a run that would start past it, so a lab with a hard
+#                        stop is never torn down under a run in flight
 #   `summary` and `psummary` need GNU date.
 #
 # READING IT (spec §5)
@@ -476,6 +479,14 @@ cmd_pstop() {
 
 need() { for v in "$@"; do [ -n "${!v:-}" ] || { echo "set $v" >&2; exit 2; }; done; }
 
+# Exit 5 when FR139_UNTIL is set and has passed, before run $1 starts.
+until_ok() {
+  [ -n "${FR139_UNTIL:-}" ] || return 0
+  [ "$(date -u +%s)" -lt "$FR139_UNTIL" ] && return 0
+  echo "$1: past FR139_UNTIL ($(date -u -d "@$FR139_UNTIL" +%FT%TZ)); stopping before this run"
+  exit 5
+}
+
 cmd_run() {
   local runs="$1" tag="$2" c="${3:-lan}" gs i L
   need FR139_A FR139_B FR139_A_LAN FR139_A_OIP FR139_B_OIP FR139_LOGS
@@ -485,6 +496,7 @@ cmd_run() {
   for i in $(seq 1 "$runs"); do
     L="$tag-$i"
     [ -e "$FR139_LOGS/$L.a.txt" ] && { echo "refusing: $FR139_LOGS/$L.a.txt exists"; exit 3; }
+    until_ok "$L"
     $FR139_B "sudo bash $gs pre $FR139_A_OIP $c ${FR139_QUIET_S:-30} ${FR139_WAIT_S:-900}" > "$FR139_LOGS/$L.pre.txt" 2>&1 \
       && $FR139_A "sudo bash $gs pre $FR139_B_OIP $c 0 ${FR139_WAIT_S:-900}" >> "$FR139_LOGS/$L.pre.txt" 2>&1
     if [ "$(grep -c '^PRE ok' "$FR139_LOGS/$L.pre.txt")" != 2 ]; then
@@ -510,6 +522,7 @@ cmd_promo() {
   for i in $(seq 1 "$runs"); do
     L="$tag-$i"
     [ -e "$FR139_LOGS/$L.pa.txt" ] && { echo "refusing: $FR139_LOGS/$L.pa.txt exists"; exit 3; }
+    until_ok "$L"
     # 1. Hold the pair on a relay: A's UDP blocked, both ends on a relay.
     $FR139_A "sudo bash $gs block on $FR139_B_LAN" > "$FR139_LOGS/$L.hold.txt" 2>&1
     $FR139_A "sudo bash $gs pre $FR139_B_OIP relay:any ${FR139_QUIET_S:-30} $w" >> "$FR139_LOGS/$L.hold.txt" 2>&1 \
