@@ -431,13 +431,15 @@ fn ws_request(url: &str, token: &str, carrier: Carrier) -> Result<Request, tungs
 }
 
 /// #3656 — dial with the token in a header, each attempt bounded by
-/// [`WS_DIAL_TIMEOUT`], and hand back the last answer. The daemon's rule
+/// `WS_DIAL_TIMEOUT`, and hand back the last answer. The daemon's rule
 /// (`roomlerd::ws_connect::dial`): ONE redial in the query form after a
 /// refusal with no verdict on the credential (a server older than the header,
 /// or a header dropped on the way), and an endpoint where that redial
 /// upgraded keeps the query form for [`upgrade_auth::QUERY_FORM_FOR`]. A
 /// refusal that names an error never puts the token into a URL.
-async fn dial(url: &str, token: &str) -> Answer {
+///
+/// Public so `crates/tests` can drive it against the real server.
+pub async fn dial(url: &str, token: &str) -> Answer {
     let notes = upgrade_auth::query_form_notes();
     let endpoint = upgrade_auth::endpoint_of(url);
     let first = notes.carrier_for(endpoint);

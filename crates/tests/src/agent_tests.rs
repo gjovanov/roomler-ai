@@ -17,7 +17,7 @@ use std::time::Duration;
 /// (`ConsentBroker`) work. Centralises the 6-arg call so the tests below
 /// don't each have to fabricate those handles. `AutoGrant` consent + a
 /// per-agent temp sentinel dir keep it side-effect-light.
-fn spawn_agent_signaling(
+pub(crate) fn spawn_agent_signaling(
     cfg: AgentConfig,
     stop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -226,7 +226,7 @@ async fn agent_library_connects_and_goes_online() {
 }
 
 /// Poll one tenant's agent row for `is_online`.
-async fn agent_is_online(
+pub(crate) async fn agent_is_online(
     app: &TestApp,
     seeded: &crate::fixtures::seed::SeededTenant,
     agent_id: &str,

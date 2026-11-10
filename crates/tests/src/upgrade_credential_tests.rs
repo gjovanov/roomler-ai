@@ -13,11 +13,17 @@
 //!
 //! Integration tests, because what matters is the upgrade's wiring: which
 //! carrier the role gate reads and whether the refusal goes out with it.
+//!
+//! The clients that present it meet the real server here too: the daemon's
+//! signalling loop, the dial its DERP sockets make and the tunnel CLI's dial
+//! each upgrade on their first, header-only dial (a fallback to the query form
+//! would have noted their endpoint), and a refused credential hears the
+//! verdict that ends a dial.
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 use futures::StreamExt;
-use roomler_ai_remote_control::upgrade_auth::{self, CHALLENGE, CHALLENGE_REFUSED};
+use roomler_ai_remote_control::upgrade_auth::{self, CHALLENGE, CHALLENGE_REFUSED, Carrier};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio_tungstenite::connect_async;
@@ -414,4 +420,205 @@ async fn the_tunnel_client_socket_takes_its_token_in_a_header() {
         Answer::Refused(403, None),
         "a tid for another tenant"
     );
+}
+
+// ── The clients that present it ─────────────────────────────────────────────
+//
+// The daemon and the CLI dial with the credential in the header and redial once
+// in the query form only after a refusal with no verdict on it; their own unit
+// tests hold that rule against a loopback front. Here their real dials meet
+// the real server.
+
+/// Whether dials to `url`'s endpoint take the query form now: only after a
+/// header-only dial there was refused with no verdict and the query redial
+/// upgraded.
+fn carrier_noted_for(url: &str) -> Carrier {
+    upgrade_auth::query_form_notes().carrier_for(upgrade_auth::endpoint_of(url))
+}
+
+/// Whether a refused client dial, as `Debug` prints it, carries the verdict
+/// that ends a dial. The daemon and the CLI build on a newer tungstenite than
+/// this crate, whose types these tests never name; its `Http` error prints the
+/// status and every header.
+fn refused_with_a_verdict(shown: &str) -> bool {
+    shown.contains("status: 401") && shown.contains("invalid_token")
+}
+
+/// The real signalling loop brings a device online on its first dial, the
+/// token in the header: no query form is noted for its `/ws`.
+#[tokio::test]
+async fn the_daemons_control_socket_goes_online_on_its_header() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("hdr-loop").await;
+    let cfg =
+        crate::agent_tests::enrol_via_agent_lib(&app, &seeded, "m-hdr-loop", "Header loop").await;
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = crate::agent_tests::spawn_agent_signaling(cfg.clone(), stop_rx);
+
+    let mut online = false;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if crate::agent_tests::agent_is_online(&app, &seeded, &cfg.agent_id).await {
+            online = true;
+            break;
+        }
+    }
+    let carrier = carrier_noted_for(&cfg.ws_url());
+    let _ = stop_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+
+    assert!(
+        online,
+        "the signalling loop never brought the device online"
+    );
+    assert_eq!(carrier, Carrier::Header, "it upgraded on the header");
+}
+
+/// The daemon's dial (`roomlerd::ws_connect::dial`, which its DERP sockets
+/// make; `roomlerd::derp` is overlay-gated and out of this crate's reach)
+/// registers two devices on their tokens in the header, and `/derp` carries a
+/// frame between them. A refused token hears the verdict that ends the dial.
+#[tokio::test]
+async fn the_daemons_derp_dial_relays_on_its_header() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use futures::SinkExt;
+    use roomler_ai_remote_control::models::NodeRef;
+    use roomler_ai_services::dao::overlay_network::OverlayNetworkDao;
+    use roomler_ai_services::dao::overlay_node::{NewOverlayNode, OverlayNodeDao};
+    use roomlerd::ws_connect::{self, Credential, Dial};
+
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("hdr-relay").await;
+    let tid = bson::oid::ObjectId::parse_str(&seeded.tenant_id).unwrap();
+    let network_id = OverlayNetworkDao::new(&app.db)
+        .get_or_create(tid)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let nodes = OverlayNodeDao::new(&app.db);
+    // The central dial's URL: no credential in it.
+    let url = format!("ws://{}/derp?role=agent&tid={}", app.addr, seeded.tenant_id);
+    let (pk_a, pk_b) = ([0xa1u8; 32], [0xb2u8; 32]);
+    let payload = b"over the header";
+
+    let mut sockets = Vec::new();
+    for (machine, pk, ip) in [
+        ("m-hdr-relay-a", pk_a, "100.64.0.1"),
+        ("m-hdr-relay-b", pk_b, "100.64.0.2"),
+    ] {
+        let (agent_id, token) = enroll_agent(&app, &seeded, machine).await;
+        // `/derp` registers a key only off the node row of the machine the
+        // device enrolled as.
+        nodes
+            .create(NewOverlayNode {
+                tenant_id: tid,
+                node_ref: NodeRef::Agent {
+                    agent_id: bson::oid::ObjectId::parse_str(&agent_id).unwrap(),
+                },
+                network_id,
+                machine_id: machine.to_string(),
+                name: machine.to_string(),
+                overlay_ip: ip.to_string(),
+                wg_public_key: B64.encode(pk),
+                key_epoch: 0,
+                endpoints: vec![],
+                supports_quic: false,
+                supports_relay_single: false,
+                supports_derp: true,
+                supports_forced_derp: false,
+                supports_server_relay_strategy: false,
+                supports_derp_floor: false,
+                supports_overlay_echo: false,
+                supports_org_relay: false,
+                advertised_routes: vec![],
+                route_offer_withheld: None,
+            })
+            .await
+            .unwrap();
+        let dial = Dial {
+            url: url.clone(),
+            credential: Credential::token(token),
+        };
+        let (mut ws, _) = ws_connect::dial(&dial, Duration::from_secs(10))
+            .await
+            .expect("the dial answered in time")
+            .expect("the token in the header upgraded /derp");
+        ws.send(pk.to_vec().into()).await.unwrap();
+        sockets.push(ws);
+    }
+    let registered = |pk: [u8; 32]| {
+        app.state
+            .network()
+            .derp_registry
+            .contains_key(&(network_id, pk))
+    };
+    let mut both = false;
+    for _ in 0..50 {
+        if registered(pk_a) && registered(pk_b) {
+            both = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(both, "both devices registered on their header dials");
+
+    let (mut a, mut b) = (sockets.remove(0), sockets.remove(0));
+    let mut frame = pk_b.to_vec();
+    frame.extend_from_slice(payload);
+    a.send(frame.into()).await.unwrap();
+    let got = loop {
+        match tokio::time::timeout(Duration::from_secs(5), b.next()).await {
+            Ok(Some(Ok(msg))) if msg.is_binary() => break msg.into_data(),
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("B never got A's frame: {other:?}"),
+        }
+    };
+    assert_eq!(&got[..32], &pk_a, "the relay names the sender");
+    assert_eq!(&got[32..], payload);
+    assert_eq!(carrier_noted_for(&url), Carrier::Header, "on the header");
+
+    let refused = ws_connect::dial(
+        &Dial {
+            url: url.clone(),
+            credential: Credential::token("not-a-token"),
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the dial answered in time");
+    let shown = format!("{:?}", refused.expect_err("a bad token is refused"));
+    assert!(refused_with_a_verdict(&shown), "{shown}");
+    assert_eq!(carrier_noted_for(&url), Carrier::Header, "nothing noted");
+}
+
+/// The tunnel CLI's dial (`roomler_cli::forward::dial`) opens the
+/// tunnel-client socket on its token in the header, and a refused token hears
+/// the verdict that ends the dial.
+#[tokio::test]
+async fn the_tunnel_clis_dial_upgrades_on_its_header() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("hdr-cli").await;
+    let token = enroll_tunnel_client(&app, &seeded, "m-hdr-cli").await;
+    let url = format!(
+        "ws://{}/ws?role=tunnel-client&tid={}",
+        app.addr, seeded.tenant_id
+    );
+
+    let opened = roomler_cli::forward::dial(&url, &token)
+        .await
+        .expect("the dial answered in time");
+    assert!(
+        opened.is_ok(),
+        "the token in the header upgraded: {:?}",
+        opened.err()
+    );
+    assert_eq!(carrier_noted_for(&url), Carrier::Header, "on the header");
+
+    let refused = roomler_cli::forward::dial(&url, "not-a-token")
+        .await
+        .expect("the dial answered in time");
+    let shown = format!("{:?}", refused.expect_err("a bad token is refused"));
+    assert!(refused_with_a_verdict(&shown), "{shown}");
+    assert_eq!(carrier_noted_for(&url), Carrier::Header, "nothing noted");
 }
