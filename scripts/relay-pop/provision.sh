@@ -97,9 +97,12 @@ envsubst '${REGION} ${COTURN_HOST} ${DERP_HOST}' \
 if cmp -s "$POP/nginx-pop.conf.new" "$POP/nginx-pop.conf" 2>/dev/null; then
   rm -f "$POP/nginx-pop.conf.new"
 else
+  # A first render needs no reload: `up -d` below starts nginx on it.
+  if [ -f "$POP/nginx-pop.conf" ]; then
+    NGINX_CONF_CHANGED=1
+  fi
   cat "$POP/nginx-pop.conf.new" > "$POP/nginx-pop.conf"
   rm -f "$POP/nginx-pop.conf.new"
-  NGINX_CONF_CHANGED=1
 fi
 
 # ── start / refresh the stack ────────────────────────────────────────────────

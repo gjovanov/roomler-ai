@@ -106,6 +106,12 @@ every other native route already reads.
   (`scripts/relay-pop/nginx-pop.conf.tpl`), as the pod's nginx logs neither
   socket (`files/nginx-pod.conf`). The server's own spans drop a query that names a
   token (`crates/api/src/lib.rs`).
+- **Only the header keeps a credential out of every log.** An access-log setting
+  does not reach nginx's error log, which names the whole request line, query
+  included, whenever the upstream cannot be reached: a pod restarting behind the
+  load balancer, an API still booting behind the pod's nginx, a PoP whose
+  `derp-relay` is down. A client that still puts its credential in the URL can
+  land there, whatever the access log says.
 
 ### Open: user sessions are irrevocable
 

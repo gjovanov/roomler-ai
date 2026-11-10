@@ -114,8 +114,9 @@ pub fn asks_for_query_form<'a>(
     if status != 400 && status != 401 {
         return false;
     }
-    let mut verdicts = www_authenticate.into_iter().filter_map(bearer_verdict);
-    !verdicts.any(|names_an_error| names_an_error)
+    !www_authenticate
+        .into_iter()
+        .any(|value| bearer_verdict(value) == Some(true))
 }
 
 /// In one `WWW-Authenticate` value: `None` when it holds no Bearer challenge,

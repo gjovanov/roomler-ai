@@ -159,8 +159,9 @@ every daemon older than 0.4.210, from the query (`/derp?ticket=…`). When a dia
 carries both, the header decides. A refusal is a `401` whose
 `WWW-Authenticate: Bearer realm="roomler"` says whether a ticket arrived
 (`error="invalid_token"` when one did), so a newer daemon dials again with the
-query form only when it meets a relay older than the header (that one answers a
-header-only dial `400`, no challenge).
+query form only after a refusal that names no `error`: a relay older than the
+header (it answers a header-only dial `400`, no challenge), or a header lost on
+the way.
 
 The PoP's nginx logs `$uri`, never `$request`: the path without the query, and
 no request header (`log_format pop` in `nginx-pop.conf.tpl`). nginx's error log
