@@ -134,7 +134,7 @@ service's repair has run (`crates/agent-core/src/machine_tree.rs:836`). One that
 is not is set aside: the command says so, writes a fresh config in its place,
 and the device's earlier settings do not carry over. Setup's background-service
 role does the same, from the step that runs the installer when Setup itself
-was started without elevation (`agents/roomler-setup/src/machine_write.rs:434`).
+was started without elevation (`agents/roomler-setup/src/machine_write.rs:435`).
 
 ### 2c. Manual copy (preserves machine_id, no new token needed)
 
@@ -260,7 +260,7 @@ the installer and does not read the service's `Environment`: there, both are on.
 > the owner, the new DACL did not reach the children another account owns
 > (measured on #3609's tests). A file gets both in one call. Setup's machine
 > write (the wizard, or the step that runs the installer for a wizard started
-> without elevation, `agents/roomler-setup/src/machine_write.rs:406`) first gives
+> without elevation, `agents/roomler-setup/src/machine_write.rs:407`) first gives
 > the folder to Administrators by handle, refusing a link
 > (`crates/agent-core/src/machine_tree.rs:680`). Its `icacls` step
 > (`agents/roomler-setup/src/orchestrator_agent.rs:1747`)

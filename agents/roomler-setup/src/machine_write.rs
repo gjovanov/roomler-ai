@@ -267,10 +267,11 @@ const NO_STEP: &str = "Roomler was installed, but its administrator step ended b
      write this device's enrollment, which on this role only an administrator's process may write. \
      Run Roomler Setup again: nothing was enrolled, and the enrollment token is still unused.";
 
-/// How long one exchange with the step may take: the parent's seal and a few
-/// local reads and writes.
+/// How long one exchange with the step may take: the parent's seal (two
+/// `icacls` runs, each up to 20 s on a host busy with higher-priority work,
+/// #3291) and a few local reads and writes.
 #[cfg(target_os = "windows")]
-const EXCHANGE: Duration = Duration::from_secs(60);
+const EXCHANGE: Duration = Duration::from_secs(180);
 
 impl ConfigWriter {
     /// The writer for an install whose installer step handed back `link` (a
