@@ -423,11 +423,11 @@ pub fn build_router(state: AppState) -> Router {
 
     root.route("/ws", get(ws::handler::ws_upgrade))
         // Security — never let a bearer-carrying query string into the logs:
-        // `/ws?token=<jwt>&role=agent` and `/derp?token=<jwt>` authenticate
-        // via the query (WS clients can't set headers), and TraceLayer's
-        // default span records the FULL uri at DEBUG — pod logs held live
-        // long-lived agent JWTs (field 2026-08-18, task #15). Queries that
-        // carry no token stay logged verbatim (pagination etc. is useful).
+        // `/ws?token=<jwt>&role=agent` and `/derp?token=<jwt>` still authenticate via the
+        // query from browsers and from clients older than 0.4.210 (newer ones send
+        // `Authorization: Bearer`, which no span records; #3656), and TraceLayer's default
+        // span records the FULL uri at DEBUG — pod logs held live long-lived agent JWTs (field
+        // 2026-08-18, task #15). Queries that carry no token stay logged verbatim (pagination).
         .layer(TraceLayer::new_for_http().make_span_with(
             |req: &axum::http::Request<axum::body::Body>| {
                 let uri = req.uri();

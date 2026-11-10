@@ -411,6 +411,10 @@ mod tunnel_tests;
 mod turn_usage_tests;
 #[cfg(test)]
 mod tutorial_tests;
+/// #3656 — a native client's credential in an `Authorization: Bearer` header
+/// on `/ws` and `/derp`, beside the query form released clients send.
+#[cfg(test)]
+mod upgrade_credential_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
 #[cfg(test)]

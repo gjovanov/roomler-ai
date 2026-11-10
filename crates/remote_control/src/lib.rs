@@ -53,6 +53,9 @@ pub mod turn_creds;
 /// collector and by a PoP's `derp-relay` alike.
 pub mod turn_stats;
 pub mod turn_url;
+/// #3656 — where a native client's credential travels on an upgrade, read by
+/// the server, the regional relay and both clients alike.
+pub mod upgrade_auth;
 pub mod worker_pick;
 
 pub use error::{Error, Result};

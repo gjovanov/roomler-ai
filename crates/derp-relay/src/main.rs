@@ -43,7 +43,7 @@ use axum::{
         Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -54,7 +54,7 @@ use roomler_ai_remote_control::derp_frame::frame_is_bulk;
 use roomler_ai_remote_control::derp_ticket::{self, AllowanceSetClaims};
 // Shared through remote_control so mint and verify can never version-drift.
 use roomler_ai_remote_control::derp_ticket::jsonwebtoken::DecodingKey;
-use roomler_ai_remote_control::turn_stats;
+use roomler_ai_remote_control::{turn_stats, upgrade_auth};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -534,7 +534,7 @@ struct RelayState {
 
 #[derive(Deserialize)]
 struct DerpParams {
-    ticket: String,
+    ticket: Option<String>, // a daemon older than 0.4.210 sends it here: see `derp_upgrade`
 }
 
 #[tokio::main]
@@ -799,22 +799,30 @@ async fn coturn_prometheus() -> serde_json::Value {
     }
 }
 
-/// `GET /derp?ticket=<eddsa-jwt>` — verify the ticket, then upgrade. FR-76
-/// P3: a relay that serves only some networks (`DERP_NETWORKS`) answers 403
-/// to a valid ticket for any other, here, before anything is registered.
+/// `GET /derp` with `Authorization: Bearer <eddsa-jwt>`, or `?ticket=` from a
+/// daemon older than 0.4.210 (#3656: the header decides when both come) —
+/// verify the ticket, then upgrade. The query's ticket is optional, so a dial
+/// with the header alone is not the `Query` extractor's 400; with neither, the
+/// answer is a 401 whose challenge says no ticket arrived. FR-76 P3: a relay
+/// that serves only some networks (`DERP_NETWORKS`) answers 403 to a valid
+/// ticket for any other, here, before anything is registered.
 async fn derp_upgrade(
     State(state): State<RelayState>,
     Query(params): Query<DerpParams>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let claims = match derp_ticket::verify(&params.ticket, &state.ticket_key) {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let Some((ticket, _)) = upgrade_auth::presented(authorization, params.ticket.as_deref()) else {
+        return refused_ticket(false);
+    };
+    let claims = match derp_ticket::verify(ticket, &state.ticket_key) {
         Ok(c) => c,
         Err(e) => {
             debug!(%e, "derp-relay: rejected ticket");
-            return Response::builder()
-                .status(401)
-                .body("Unauthorized (derp ticket)".into())
-                .unwrap();
+            return refused_ticket(true);
         }
     };
     if !state.scope.serves(&claims.net) {
@@ -825,6 +833,23 @@ async fn derp_upgrade(
             .unwrap();
     }
     ws.on_upgrade(move |socket| handle_socket(state, socket, claims.net, claims.pk))
+}
+
+/// The relay's 401, with the Bearer challenge (#3656): `presented` says
+/// whether a ticket arrived in either carrier. A newer daemon tries the query
+/// form only when the challenge names no `error`.
+fn refused_ticket(presented: bool) -> Response {
+    let mut resp = Response::builder()
+        .status(401)
+        .body("Unauthorized (derp ticket)".into())
+        .unwrap();
+    if let Some(challenge) = upgrade_auth::challenge_for(401, presented) {
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(challenge),
+        );
+    }
+    resp
 }
 
 /// Drive one connection: validate the registration frame against the ticket's
@@ -1083,6 +1108,120 @@ mod tests {
         assert!(
             tokio_tungstenite::connect_async(&url).await.is_err(),
             "foreign-signed ticket must 401"
+        );
+    }
+
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// #3656 — dial `/derp` with the ticket in the query, in an
+    /// `Authorization` value, both or neither. The refusal's status and its
+    /// `WWW-Authenticate` when the upgrade is refused.
+    async fn dial(
+        addr: std::net::SocketAddr,
+        query_ticket: Option<&str>,
+        authorization: Option<&str>,
+    ) -> Result<Ws, (u16, Option<String>)> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
+        let url = match query_ticket {
+            Some(t) => format!("ws://{addr}/derp?ticket={t}&tid=t1"),
+            None => format!("ws://{addr}/derp?tid=t1"),
+        };
+        let mut req = url.into_client_request().unwrap();
+        if let Some(a) = authorization {
+            req.headers_mut()
+                .insert(header::AUTHORIZATION, HeaderValue::from_str(a).unwrap());
+        }
+        match tokio_tungstenite::connect_async(req).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => Err((
+                resp.status().as_u16(),
+                resp.headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            )),
+            Err(e) => panic!("the upgrade failed oddly: {e}"),
+        }
+    }
+
+    /// #3656 — a ticket in an `Authorization: Bearer` header admits a node as
+    /// the query form does, and the two meet: a node that dials with the
+    /// header relays to one that dialled as every released daemon does.
+    #[tokio::test]
+    async fn a_ticket_in_a_bearer_header_registers_and_relays() {
+        let (signer, key) = test_signer();
+        let (addr, _) = serve(key).await;
+        let (a, b) = (pk(0xA1), pk(0xB1));
+        let (ta, _) = signer.mint("net1", &BASE64.encode(a)).unwrap();
+        let (tb, _) = signer.mint("net1", &BASE64.encode(b)).unwrap();
+        let mut ws_a = dial(addr, None, Some(&format!("Bearer {ta}")))
+            .await
+            .expect("the header form upgrades");
+        ws_a.send(WsMsg::Binary(a.to_vec().into())).await.unwrap();
+        let mut ws_b = connect(addr, &tb, b).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut frame = b.to_vec();
+        frame.extend_from_slice(&[7, 7]);
+        ws_a.send(WsMsg::Binary(frame.into())).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), ws_b.next())
+            .await
+            .expect("B receives within 5s")
+            .unwrap()
+            .unwrap();
+        let data = got.into_data();
+        assert_eq!(&data[..32], &a, "src prefix rewritten to the sender");
+        assert_eq!(&data[32..], &[7, 7]);
+    }
+
+    /// #3656 — the header decides when both carriers hold a ticket, another
+    /// scheme leaves the query form alone, and every refusal carries the
+    /// challenge a new daemon reads before it would try the query form.
+    #[tokio::test]
+    async fn the_header_decides_and_a_refusal_says_bearer() {
+        use roomler_ai_remote_control::upgrade_auth::{
+            CHALLENGE, CHALLENGE_REFUSED, asks_for_query_form,
+        };
+        let (signer, key) = test_signer();
+        let (addr, _) = serve(key).await;
+        let a = pk(0xA2);
+        let (good, _) = signer.mint("net1", &BASE64.encode(a)).unwrap();
+        let (foreign_signer, _) = test_signer();
+        let (bad, _) = foreign_signer.mint("net1", &BASE64.encode(a)).unwrap();
+
+        assert!(
+            dial(addr, Some(&bad), Some(&format!("Bearer {good}")))
+                .await
+                .is_ok(),
+            "a good header beside a bad query: the header decides"
+        );
+        let refused = dial(addr, Some(&good), Some(&format!("Bearer {bad}")))
+            .await
+            .err();
+        assert_eq!(
+            refused,
+            Some((401, Some(CHALLENGE_REFUSED.to_string()))),
+            "a good query does not rescue a refused header"
+        );
+        assert!(!asks_for_query_form(401, [CHALLENGE_REFUSED]));
+        assert_eq!(
+            dial(addr, None, None).await.err(),
+            Some((401, Some(CHALLENGE.to_string()))),
+            "no ticket at all is a 401 with a challenge, not a 400"
+        );
+        assert_eq!(
+            dial(addr, Some(&bad), None).await.err(),
+            Some((401, Some(CHALLENGE_REFUSED.to_string()))),
+            "a released daemon's refused query ticket"
+        );
+        assert!(
+            dial(addr, Some(&good), Some("Basic dXNlcjpwYXNz"))
+                .await
+                .is_ok(),
+            "a Basic header leaves the query form alone"
         );
     }
 
