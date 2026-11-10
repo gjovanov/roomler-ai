@@ -1,6 +1,6 @@
 # FR-139: A daemon restart never splits a pair — every carrier transition is make-before-break on both ends
 
-**Issue:** [#3618](https://github.com/gjovanov/roomler-ai/issues/3618) · **Status:** claimed 2026-11-10; D1–D5 (§7) open; nothing built · **Owner:** the overlay's carrier state machine (`crates/tunnel-core/src/overlay`) · **Anchors:** master `0d0f55d55`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#3541](https://github.com/gjovanov/roomler-ai/issues/3541), found by #3528's lab and re-specced by its triage on 2026-11-08 · **Builds on:** [FR-9](FR-9-lan-pairs-converge-direct.md) (the promote grace), the demote-follow and its holdoff (#27, #31 and #34 in the code's notes), the DERP stamp probe (#2820), the shadow `Tunn` (#3602) · **Related:** #3528, #3539
+**Issue:** [#3618](https://github.com/gjovanov/roomler-ai/issues/3618) · **Status:** claimed 2026-11-10; P0 read on 0.4.207 (the RED, §9); D1–D5 (§7) open; nothing built · **Owner:** the overlay's carrier state machine (`crates/tunnel-core/src/overlay`) · **Anchors:** master `0d0f55d55`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** [#3541](https://github.com/gjovanov/roomler-ai/issues/3541), found by #3528's lab and re-specced by its triage on 2026-11-08 · **Builds on:** [FR-9](FR-9-lan-pairs-converge-direct.md) (the promote grace), the demote-follow and its holdoff (#27, #31 and #34 in the code's notes), the DERP stamp probe (#2820), the shadow `Tunn` (#3602) · **Related:** #3528, [FR-140](FR-140-one-pause-signal.md) (#3619, from #3539)
 
 ## Summary, for the operator
 
@@ -8,7 +8,10 @@
 `roomler restart`, a crash and a reboot are all restarts. In the lab, 7 of 7 LAN restarts left the
 restarted side's traffic going nowhere for **15.7 s**, while the peer had nothing of its own to send. On a
 Windows LAN pair the same restart then held the pair on `/derp` for **about 3 minutes**, at 81–167 ms
-instead of 6 ms. A fleet roll restarts every daemon, so every roll can pay this on every direct pair.
+instead of 6 ms. P0 reproduced both on 0.4.207 (§9): the split in 9 of 10 restarts of a pair with traffic,
+and the 3 minutes when the restarted end had nothing to send. An idle pair waits out the whole holdoff,
+and the holdoff grows to 15 min when restarts repeat. A fleet roll restarts every daemon, so every roll can
+pay this on every direct pair.
 
 **Why.** Each end guesses the other's carrier from where the peer's frames arrive. A `/derp` frame from a
 peer held on a direct carrier reads as "the peer has moved to the relay". The end that reads it follows at
@@ -82,6 +85,12 @@ was a corporate-managed laptop and got a clean `roomler restart` on agent 0.4.20
   path.
 - No echo was timed, so the split itself was not measured on Windows. B's log has no `UNREGISTERED`
   line in this window.
+- **It reads like P0's idle cells (§2.7).** At 16:25:06Z A held B on `/derp` too. With no echo running,
+  A had nothing to send. In the idle cells the restarted end, sending nothing, followed its silent peer
+  onto `/derp` once its own grace ended. Both ends then stayed on the relay until one end's holdoff ran out
+  and that end probed LAN. Here that end was B: its probe came 3 min 1.5 s after its follow, as soon as a
+  first 3 min holdoff allowed. A's log was not kept, so whether A followed B or never promoted LAN at
+  birth is not known.
 
 ### 2.3 The mechanism, in the code [R]
 
@@ -113,7 +122,8 @@ was a corporate-managed laptop and got a clean `roomler restart` on agent 0.4.20
    `RELAYED_INSTEAD_HOLDOFF` (3 min, `path.rs:193`). The holdoff doubles on repeats inside
    `RELAYED_INSTEAD_MEMORY` (30 min, `path.rs:199`), up to `H_ESCALATED` (15 min, `path.rs:185`). This is
    the 3 minutes of §2.2.
-6. **The other end ignores the way back.** B's initiations over `/derp` reach A as `Unrouted` too, and A's
+6. **The other end ignores the way back.** When B holds the smaller key, B initiates over `/derp` after
+   its follow (§2.7). B's initiations over `/derp` reach A as `Unrouted` too, and A's
    LAN carrier is seconds old, so A's own grace returns early (`establish.rs:2821-2831`, at DEBUG only).
    The split lasts until boringtun's 15 s re-initiation on A (boringtun 0.7.1, `src/noise/timers.rs`).
    By then B holds A on a relay, so B's inbound path takes the LAN initiation as a probe
@@ -209,10 +219,32 @@ does not remove it.
   shows `tunnel_core` only at WARN, so `DERP floor installed at birth` could not appear there. The
   `/derp` lines that did appear are the daemon's own (`agents/roomlerd/src/derp.rs:404`, `overlay.rs:367`).
 
-**Still not established:** why the Windows pair of §2.2 stayed on `/derp` for about 3 minutes. On this
-Linux pair, B installs A's DERP carrier with `initiate=false`, so after B's follow nobody initiates over
-`/derp`, and A's own 15 s WireGuard retry brings the pair back on LAN (§5). P0's reverse cell makes the
-silent end the one with the smaller key, to test whether the order of the keys decides it (§9).
+**The order of the keys, and an idle restart (P0's reverse and idle cells, §9).** In the RED, A holds the
+smaller key. B's follow installs A's DERP carrier with `initiate=false` (`establish.rs:2898`), so after
+the follow nobody initiates over `/derp`, and A's own 15 s WireGuard retry brings the pair back to LAN
+(§5). The reverse cells restarted the end with the larger key instead. The silent end then follows with
+`initiate=true`, and it re-sends a WireGuard initiation over `/derp` every 5 s.
+
+- **With traffic, the split is the same.** 3 of 3 runs split for 15.68–15.69 s. The restarted end's grace
+  (`establish.rs:2821-2831`) reads each `/derp` frame as a peer still cutting over, and it ignored four:
+  the bootstrap byte, then three initiations 5 s apart. Its grace and its WireGuard retry both start with its
+  LAN session, and the retry went out on LAN 1.3 ms before, 0.02 ms after and 0.5 ms before the grace
+  ended. The silent end took it as a probe and promoted. Its next `/derp` initiation, due about 50 ms
+  later, never went out.
+- **Without traffic, both ends end up on `/derp`.** In the idle cells the restarted end sent nothing for
+  30 s, so no retry came. The silent end's next `/derp` initiation landed 55 ms and 552 ms after the
+  restarted end's grace ended, and the restarted end followed it (`was=Some(Lan)`, a strike, a 3 min
+  holdoff). Both ends held the pair on `/derp` until that holdoff ran out and the restarted end probed LAN,
+  +199.9 s after `daemon_up` in both runs. The silent end answered the probe inside its own 15 min holdoff
+  (`path.rs:1313-1315`). The pair still carried traffic over the relay: the first echo, at +30 s, was
+  answered.
+
+So swapping the keys alone does not produce §2.2's three minutes. A swap with an idle restarted end does,
+and it reads like the Windows pair: both ends on `/derp`, back on LAN on a probe once a 3 min holdoff
+ends. The RED's 15 s is the best case. The cell's own echo is the data that makes the restarted end's
+WireGuard re-initiate, and an idle pair waits out a holdoff instead. **Still open:** an idle restart in
+the RED's key order, where the silent end follows with `initiate=false`; and whether the Windows pair's
+restarted end followed its peer or never promoted LAN at birth.
 
 ## 3. Design
 
@@ -290,6 +322,10 @@ stateDiagram-v2
 - **Symmetry.** When the verifying end's probe does initiate, a new peer receives it as `Unrouted` and runs
   the same verify. Its poke on its own carrier is answered when that carrier works, so it stays. Two ends
   that never moved cannot follow each other.
+- **Both key orders, and an idle pair.** P0 found a second way onto `/derp` (§2.7). A silent end that
+  holds the smaller key follows with `initiate=true`, and the restarted end follows its initiations once
+  its own grace ends. Under the verify the silent end never follows, so it sends nothing over `/derp`, and
+  the restarted end has nothing to follow. That holds in both key orders, with traffic or without.
 - **One probe slot per peer** (`start_relay_probe` drops any probe already there). A direct upgrade probe
   already in flight is kept, and the verify waits for its verdict: a direct tier beats every relay tier,
   and that probe settles within its own deadline. The next `Unrouted` re-runs the verify.
@@ -314,7 +350,7 @@ sequenceDiagram
         L-xB: dropped pre-decrypt, UNREGISTERED receiver index
         B->>D: initiations over /derp
         D-xA: inside A's promote grace, ignored
-        Note over A,B: split until a 15 s timer fires, then about 3 min on /derp
+        Note over A,B: split until A's 15 s retry, or, if A is idle, both on /derp for a holdoff
     else verify, then follow
         B->>L: poke, a forced rekey on the LAN session
         L->>A: A's LAN session answers it
@@ -371,16 +407,25 @@ A fleet roll is a mixed-version window, and **the end that restarts is always th
 So P1 alone fixes a pair only once its silent end has updated. P2 is what fixes a roll while it is running.
 **P1 and P2 should ride one agent release** (D1, D4).
 
+The "new restarts, old is silent" row with P1 alone is less bad when the old end holds the smaller key.
+That end follows and initiates over `/derp` (§2.7). The new end verifies the first of those initiations
+that lands after its grace, and its poke is a LAN handshake. The old end holds the new end on a relay, so
+it answers the poke as a probe (`inbound.rs:168`, #33) and promotes LAN. So the pair comes back when the
+new end's grace ends, not after a holdoff, even with no traffic. A verify that also ran inside the grace
+would bring it back within about one DERP round trip. P1 weighs that against keeping the grace as its
+first gate (§3.3).
+
 A new end that verifies never sends a `/derp` frame toward an old peer unless its poke went unanswered,
 so it gives an old peer nothing to follow by mistake.
 
-### 3.7 The strike, the holdoff and the resume seam (#3539)
+### 3.7 The strike, the holdoff and the resume seam (FR-140)
 
 - **The strike** (`on_peer_relayed_instead`, `path.rs:609`) moves from "a follow from a direct carrier" to
   "a *moved* verdict" (§3.3). Its escalation stays as it is (§2.3).
-- **The seam with #3539.** #3539's FR owns *when* `PathMonitor::on_resume` runs (`path.rs:794-802`), and
-  so when `on_network_changed` runs (`path.rs:810-812`). It calls `on_resume` from a new trigger, a
-  Windows sleep, and changes neither function. Today `on_resume` resets each peer's tier scores, its relay
+- **The seam with [FR-140](FR-140-one-pause-signal.md)** (#3619, from #3539). FR-140 owns *when*
+  `PathMonitor::on_resume` runs (`path.rs:794-802`), and so when `on_network_changed` runs
+  (`path.rs:810-812`). It calls `on_resume` from a new trigger, a host's sleep, and changes neither
+  function. Today `on_resume` resets each peer's tier scores, its relay
   quality and its last LAN attempt. It keeps the relayed-instead holdoff and its strike count
   (`relayed_instead_until`, `relayed_instead_strikes` and `relayed_instead_at`, `path.rs:376-384`).
   Whether a resume clears the holdoff is **this FR's call (D5)**.
@@ -388,7 +433,7 @@ so it gives an old peer nothing to follow by mistake.
   own doc says why: "every score and suppression is stale evidence after a sleep". The holdoff is a
   suppression earned before the world moved. P1 carries it under its own switch.
 - **A clean slate on one end looks like a restart to the far end**, because the far end sees a fresh
-  handshake and, possibly, a stray frame. So §3.3 covers a resume's far end as well, and #3539's freeze
+  handshake and, possibly, a stray frame. So §3.3 covers a resume's far end as well, and FR-140's freeze
   and sleep cells must state whether their build carries this FR's P1 and P2.
 
 ### 3.8 The other transitions (P3, P4, if D1 = B)
@@ -451,7 +496,7 @@ Setting a switch to `0` restores today's behaviour byte for byte.
 
 | Phase | What | Lives in | Kill switch, default | RED | GREEN | Retires |
 |---|---|---|---|---|---|---|
-| **P0** | The lab rig and the restart cell as a script. The RED on the current release, 10 runs of §5's LAN cell. The stray frame named, with A at DEBUG; if the existing DEBUG lines cannot name it, one DEBUG line at the `/derp` send path naming each frame's kind (inert). The far-end loss window at a promotion measured, for P3. Each tier's topology proven to classify (`roomler peers` reads the tier) before its RED. **As run (§9): the LAN pair only.** The RED, the named frame, three promotion cells and three reverse cells. The other tiers' topology proof and their REDs open P1's field read, in a lab that can route them | `scripts/` (the cell), the lab | none: a read | — | The RED in §9 | — |
+| **P0** | The lab rig and the restart cell as a script. The RED on the current release, 10 runs of §5's LAN cell. The stray frame named, with A at DEBUG; if the existing DEBUG lines cannot name it, one DEBUG line at the `/derp` send path naming each frame's kind (inert). The far-end loss window at a promotion measured, for P3. Each tier's topology proven to classify (`roomler peers` reads the tier) before its RED. **As run (§9): the LAN pair only.** The RED, the named frame, three promotion cells, three reverse cells and two idle cells. The other tiers' topology proof and their REDs open P1's field read, in a lab that can route them | `scripts/` (the cell), the lab | none: a read | — | The RED in §9 | — |
 | **P1** | Verify, then follow, for a direct incumbent (§3.3). A plain make-before-break follow for a relay incumbent (§3.4). The strike only on a *moved* verdict (§3.7). The verdict line and counters (§3.11). A resume clears the holdoff, if D5 = A | `runtime/establish.rs`, `runtime.rs` (`PokeArm`), `relay_link.rs` (the probe variant of the follow), `wg.rs` (payload counted on a probe), `path.rs` | `ROOMLERD_OVERLAY_FOLLOW_MBB`, on (D4) | §5's LAN, public and srflx cells, and the mixed pair (old restarts, new is silent) | §6's AC1–AC3, AC5, AC6 | the switch, one release after the fleet read is GREEN |
 | **P2** | The restarted side sends no stray frame (§3.5) | `relay_link.rs` (`build_floor`), `runtime/establish.rs` (`install_ready`), the `/derp` mux's flush at registration | `ROOMLERD_OVERLAY_DERP_QUIET`, on (D4) | the mixed pair (new restarts, old is silent) | AC4 | as P1 |
 | **P3** | The drain after any switch (§3.8), if D1 = B | `wg.rs` (`promote_direct_probe`, `add_peer`), `carrier_plane.rs` | `ROOMLERD_OVERLAY_SWITCH_DRAIN`, on | P0's far-end window | AC7 | as P1 |
@@ -486,6 +531,9 @@ GO (guests, GiB, hours). Fleet devices are read only, with the hub's OK for each
 4. **The number.** A pings B's overlay address every 0.2 s, with a 1 s timeout. `first_reply` is the time
    from `daemon_up` to the first echo reply, on A's monotonic clock. Then a 0.5 s ping runs for 200 s, and
    its gaps are read from when each reply arrived (ping's own receive stamps), not from its sequence numbers.
+   **The idle variant** (the cell's fifth argument, `FR139_IDLE_S` on the driver, default 0) keeps A silent
+   for that many seconds after `daemon_up` and reads A's row for B at its start and its end. The ping
+   starts after it, and `first_reply` still counts from `daemon_up`.
 5. **After.** At +60 s and at +180 s, read both ends' `roomler peers` rows for each other, with the holdoff
    and its strikes. Count, in B's log for the cell's window: `demote-follow`, `UNREGISTERED receiver index`,
    and (from P1) `follow verdict`. Count them for A only, by A's node id or a datagram from A's LAN address,
@@ -508,6 +556,11 @@ line per 10 s, so two lines cover 15 s of drops.
 - **The holdoff is booked anyway, split or not.** It climbs while the restarts land inside its 30 min
   memory: 3, 6 and 12 min, then the 15 min cap from the fourth follow on (`path.rs:641`). So AC2 reads RED
   in 10 of 10 runs.
+- **15 s is the best case. An idle pair sits on `/derp` for the holdoff.** The cell's echo is the data that
+  makes A's WireGuard re-initiate at 15 s. In the idle cells (§2.7: the reverse key order, the restarted
+  end silent for 30 s) nothing re-initiated on LAN, the restarted end followed its peer too, and both ends
+  stayed on `/derp` until +199.9 s, in 2 of 2 runs. An idle pair waits out a whole holdoff: 3 min after a
+  first strike, then 6, 12 and 15 min for restarts within 30 min of each other.
 
 Nothing touched the follow between #3541's anchor `28a268086` and the release that was read (§9).
 
@@ -520,6 +573,8 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 | Cell | Topology | What runs | GREEN reads |
 |---|---|---|---|
 | LAN | two Ubuntu guests on one /24 | A restarts, B silent | as above |
+| LAN, reversed | as LAN | as LAN, but the restarted end holds the larger key, so the silent end initiates over `/derp` after a follow (`establish.rs:2898`). RED on 0.4.207: 3 of 3 split (§2.7) | as LAN |
+| LAN, idle | as LAN | as LAN and as reversed, with the restarted end silent for 30 s after `daemon_up` (step 4's idle variant). RED on 0.4.207, reversed: 2 of 2 on `/derp` until +199.9 s (§2.7). The RED's key order is not read yet | at the idle's end both ends read `lan`, with no `demote-follow` and no strike on either end, and the first echo after it is answered within 1 s |
 | Public direct | two guests on two routed TEST-NET subnets (`198.51.100.0/24`, `203.0.113.0/24`), routed by the hypervisor, plus a NAT NIC each for the control plane. TEST-NET counts as public (`direct.rs:934-951`) | as LAN | as LAN, tier `Public` |
 | srflx | two guests behind two NATs with distinct public egress addresses. P0 proves `tier=Srflx` first; if the lab cannot produce it, the cell needs the operator's go for a fleet pair | as LAN | as LAN, tier `Srflx` |
 | TURN | the LAN pair with direct UDP blocked between the guests (#3528's rig), B holding A on `relay:turn` | as LAN | no split, no strike (the relay cell of §2.1 read 0.00 s) |
@@ -533,9 +588,12 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 
 ## 6. Acceptance criteria
 
-- [ ] **AC1, a restart does not split a LAN pair.** §5's LAN cell: `first_reply` ≤ 1 s in 10 of 10 runs, and
-  B logs no `UNREGISTERED receiver index` drop and no `demote-follow`. Shown RED first on the current release
-  (§5).
+- [ ] **AC1, a restart does not split a LAN pair, in either key order, busy or idle.** §5's LAN cell:
+  `first_reply` ≤ 1 s in 10 of 10 runs, and B logs no `UNREGISTERED receiver index` drop and no
+  `demote-follow`. The reversed cell meets the same in 3 of 3 runs. The idle cell, in both key orders and
+  3 of 3 runs each, reads both ends on `lan` at the idle's end, with no `demote-follow` and no strike on
+  either end, and its first echo is answered within 1 s. Each is shown RED first on the current release
+  (§5, §2.7).
 - [ ] **AC2, and leaves no holdoff.** In the same runs, `roomler peers` on both ends reads the pair direct on
   LAN within one make-before-break cycle, and `roomler why` shows no relayed-instead holdoff booked.
 - [ ] **AC3, a real move is still followed.** In §5's real-move cell, B follows A to `/derp`, and the pair
@@ -570,13 +628,13 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 | **D2** | Which model? | A: make-before-break on today's per-carrier sessions (§3.3–§3.8). B: one session per peer (§3.9). C: A now, and B as a separate FR after A's field read | **A** (C if you want B on record) | A changes the follow, the sweep and the probe slot. B rewrites the device core, the plane's routing and the probes, which is far more than the measured cost needs |
 | **D3** | The deadlines? | A: the poke 2 s and the probe 15 s, reusing `MAJOR_POKE_DEADLINE` and `STAMP_PROBE_DEADLINE`. B: the poke 2 s and the probe 6 s (one retransmit). C: a poke per tier (LAN 1 s, public and srflx 2 s) | **A** | The probe deadline matters only once the poke went unanswered, and by then the carrier is dead and its own death path takes over. Reusing both keeps one rule for "re-validate an established carrier" |
 | **D4** | How does it ship? | A: on by default in the release after the lab matrix is GREEN, with the switch per node, and PF's fleet read right after the roll. B: dark in that release, switched on through the node env on standing-consent devices first, on by default in the next release | **A** | The same pattern as `ROOMLERD_OVERLAY_MBB`. A new end changes nothing until a `/derp` frame arrives from a peer it holds direct, and the worst case is bounded by the existing death path. B means editing the environment of every opted-in host |
-| **D5** | Does a resume clear the holdoff? (the seam with #3539) | A: yes, `on_resume` and so `on_network_changed` clear the relayed-instead holdoff and its strikes, under P1's switch. B: no, the holdoff survives a resume, as today | **A** | `on_resume`'s own rule is that every suppression is stale evidence after a sleep, and the holdoff is a suppression. The cost is at most one extra probe cycle per resume |
+| **D5** | Does a resume clear the holdoff? (the seam with FR-140) | A: yes, `on_resume` and so `on_network_changed` clear the relayed-instead holdoff and its strikes, under P1's switch. B: no, the holdoff survives a resume, as today | **A** | `on_resume`'s own rule is that every suppression is stale evidence after a sleep, and the holdoff is a suppression. The cost is at most one extra probe cycle per resume |
 
 ## 8. Out of scope
 
 - **The WireGuard refusal after a backward clock step** (#3528, fixed by #3602).
 - **Which tier the server's verdict picks.**
-- **When a resume runs**: the pause and resume signal is #3539's. Whether a resume clears the holdoff is
+- **When a resume runs**: the pause and resume signal is FR-140's (#3539). Whether a resume clears the holdoff is
   here (D5), and nothing else in `on_resume` changes.
 - **One session per peer**, if D2 = A or C (§3.9).
 - **A process that ends.** The restarted side's own sessions die with it, so a restart still costs that
@@ -593,3 +651,5 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 | 2026-11-10 | 0.4.207, two Linux root daemons on one LAN (P0, the restart cell of §5) | **The RED.** 9 of 10 restarts split the pair, with `first_reply` at 15.68–15.70 s; run 5 did not (0.00 s). B followed with `was=Some(Lan)` and booked a strike in every run, and its holdoff reached the 15 min cap from run 3 on, yet B read A on `lan` again before +60 s in every run. In the 9 split runs B's follow came 45.8–51.5 ms after A's LAN initiation reached it; in run 5 it came 7.8 ms before (B's capture against B's log). On #3618 |
 | 2026-11-10 | 0.4.207, the same pair, A's `tunnel_core` at DEBUG | **The frame named.** 3 runs, all split at 15.68–15.69 s. The stray frame is the first send of the DERP floor that A builds at birth: the permission bootstrap byte, then a WireGuard initiation, held in the `/derp` writer's queue until the WS registered 44.8–47.0 ms after A's LAN probe (§2.7). A server pin built a second DERP link that resent both frames about 3 ms later |
 | 2026-11-10 | 0.4.207, the same pair, A's UDP to B's LAN blocked inside guest A until both ends read `/derp`, then lifted | **Promotion cells, P3's baseline.** 3 of 3: the far end promoted 10–15 ms after the near end and lost at most one 0.1 s ping (§2.6). The pair returned to `lan` 31.8, 28.1 and 135.2 s after the lift. Cell 3 waited out a 3 min holdoff that A booked by following B 48.7 s into the hold, when its LAN path really was blocked. In cell 3, B also ran a DERP→TURN regrade that A's next `/derp` frame undid 10 ms later (§2.6) |
+| 2026-11-10 | 0.4.207, the same pair, the restarted end holding the larger key | **Reverse cells.** 3 of 3 split, `first_reply` 15.69, 15.68 and 15.69 s. The silent end followed with `initiate=true` and booked a strike in each run. The restarted end's grace ignored the silent end's four `/derp` frames, and its WireGuard retry went out on LAN 1.3 ms before, 0.02 ms after and 0.5 ms before that grace ended. The silent end promoted on the retry, before its next `/derp` initiation was due (§2.7). On #3618 |
+| 2026-11-10 | 0.4.207, the reverse cells' pair, the restarted end silent for 30 s (the idle variant) | **Idle cells.** 2 of 2: the silent end's `/derp` initiation landed 55 ms and 552 ms after the restarted end's grace ended, and the restarted end followed it, with a strike and a 3 min holdoff. Both ends held the pair on `/derp` from +14.9 and +15.4 s to +199.9 s after `daemon_up`, when that holdoff ended and the silent end answered the restarted end's LAN probe. The first echo, at +30 s, was answered over the relay. This is the Windows read's shape, and it makes the RED's 15 s the best case (§2.7, §5). On #3618 |
