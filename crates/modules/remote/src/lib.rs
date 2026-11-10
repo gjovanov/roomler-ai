@@ -50,11 +50,17 @@ pub mod agent_socket;
 pub mod controller;
 pub mod extauth;
 pub mod extauth_notice;
+/// FR-138 P1b-2 — `rc:session.rejoin`, the viewer's claim on a session held
+/// for it, answered on the pod its socket reached.
+pub mod rejoin;
 pub mod relay;
 /// FR-138 — the answer to a device's claim on the sessions it kept, and the
 /// registration read.
 pub mod resume;
 pub mod routes;
+/// FR-138 P1b-2 — an end someone asked for, of a session no hub on this pod
+/// holds, written to its row.
+pub mod row_end;
 pub mod session_policy;
 pub mod slots;
 pub mod touch_presets;
@@ -99,6 +105,10 @@ pub struct RemoteState {
     /// the waiters for the device's answers. Pod-local, like the Hub it
     /// relays through. See [`extauth`].
     pub extauth: Arc<extauth::ExtauthRelay>,
+    /// FR-138 P1b-2 — per agent connection, the sessions its registration
+    /// ended without seeing their end, so the device's own end of one
+    /// replaces the inferred reason (`resume::device_end`).
+    pub registration_ends: Arc<resume::RegistrationEnds>,
 }
 
 impl std::ops::Deref for RemoteState {
@@ -135,6 +145,7 @@ impl Module for RemoteState {
             rc_proxy_controllers: Arc::new(relay::ProxyControllers::new()),
             remote_rc_conns: Arc::new(relay::RemoteRcConns::new()),
             extauth: Arc::new(extauth::ExtauthRelay::new()),
+            registration_ends: Arc::new(resume::RegistrationEnds::new()),
             fleet,
             core,
         };

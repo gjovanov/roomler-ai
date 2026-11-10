@@ -257,10 +257,22 @@ pub async fn resume_hello(
     }
 }
 
-/// The window a connection is announced, in seconds: the setting, when it is
-/// above 0, the device advertises the verb and the scope covers it.
+/// The longest window the server announces, in seconds: the device caps what
+/// it is told at the same value (`WINDOW_CAP` in the agent's session table),
+/// so the `resume_by` a detach writes never outlives the device's own
+/// deadline, whatever `rc.session_resume_secs` says.
+pub const MAX_WINDOW_SECS: u32 = 120;
+
+/// The window the setting gives, capped at [`MAX_WINDOW_SECS`]; 0 is off.
+pub fn capped_window(setting: u64) -> u32 {
+    u32::try_from(setting.min(u64::from(MAX_WINDOW_SECS))).unwrap_or(MAX_WINDOW_SECS)
+}
+
+/// The window a connection is announced, in seconds: the setting, capped,
+/// when it is above 0, the device advertises the verb and the scope covers
+/// it.
 pub fn window_for(setting: u64, advertised: bool, covered: bool) -> Option<u32> {
-    (setting > 0 && advertised && covered).then(|| u32::try_from(setting).unwrap_or(u32::MAX))
+    (setting > 0 && advertised && covered).then(|| capped_window(setting))
 }
 
 #[cfg(test)]
@@ -274,7 +286,11 @@ mod tests {
         assert_eq!(window_for(0, true, true), None, "0 is off");
         assert_eq!(window_for(60, false, true), None, "no verb");
         assert_eq!(window_for(60, true, false), None, "outside the scope");
-        assert_eq!(window_for(u64::MAX, true, true), Some(u32::MAX));
+        // P1b-2 (the review's L4) — capped as the device caps it.
+        assert_eq!(window_for(120, true, true), Some(120));
+        assert_eq!(window_for(121, true, true), Some(MAX_WINDOW_SECS));
+        assert_eq!(window_for(u64::MAX, true, true), Some(MAX_WINDOW_SECS));
+        assert_eq!(capped_window(0), 0, "0 stays off");
     }
 
     const ORG: &str = "6a975e17971e2d55ddcdedb2";

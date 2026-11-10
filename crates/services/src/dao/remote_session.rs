@@ -3,7 +3,9 @@
 use bson::{DateTime, doc, oid::ObjectId};
 use futures::TryStreamExt;
 use mongodb::Database;
-use roomler_ai_remote_control::models::{EndReason, RemoteSession, SessionPhase, SessionStats};
+use roomler_ai_remote_control::models::{
+    EndReason, EndSource, RemoteSession, SessionPhase, SessionStats,
+};
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::Tally;
 
@@ -11,6 +13,19 @@ use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct RemoteSessionDao {
     pub base: BaseDao<RemoteSession>,
+}
+
+/// FR-138 — what the row of a session no hub holds must name before an end
+/// someone asked for is written to it ([`RemoteSessionDao::end_unheld`]).
+/// Every part that is set must match; the session id always does.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EndScope {
+    /// An admin's end: the org the route names.
+    pub tenant_id: Option<ObjectId>,
+    /// The controller's own end, and a redial's `replaces`: the person.
+    pub controller_user_id: Option<ObjectId>,
+    /// A redial's `replaces`: the device the redial asks for.
+    pub agent_id: Option<ObjectId>,
 }
 
 impl RemoteSessionDao {
@@ -326,5 +341,142 @@ impl RemoteSessionDao {
             .try_collect()
             .await?;
         Ok(rows)
+    }
+
+    /// FR-138 P1b-2 — an end someone asked for (an admin's, the controller's
+    /// own, a redial's `replaces`, a rejoin's gate refused) of a session no
+    /// hub on the asking pod holds, written straight to the row (spec §4.4,
+    /// §4.6): one conditional update that ends it only while it is live
+    /// (Active, not ended) and names what `scope` names, at any fencing
+    /// number. The caller awaits it BEFORE it publishes the control event a
+    /// pod that does hold the session acts on: a claim reads the row once
+    /// more after it rebuilt the session, so it either finds this end or
+    /// receives that event. The row as it was, when it matched.
+    pub async fn end_unheld(
+        &self,
+        session_id: ObjectId,
+        scope: &EndScope,
+        reason: EndReason,
+        at: DateTime,
+    ) -> DaoResult<Option<RemoteSession>> {
+        let mut filter = doc! {
+            "_id": session_id,
+            "phase": bson::to_bson(&SessionPhase::Active)?,
+            "ended_at": bson::Bson::Null,
+        };
+        if let Some(t) = scope.tenant_id {
+            filter.insert("tenant_id", t);
+        }
+        if let Some(u) = scope.controller_user_id {
+            filter.insert("controller_user_id", u);
+        }
+        if let Some(a) = scope.agent_id {
+            filter.insert("agent_id", a);
+        }
+        let before = self
+            .base
+            .collection()
+            .find_one_and_update(
+                filter,
+                doc! { "$set": {
+                    "phase": bson::to_bson(&SessionPhase::Closed)?,
+                    "ended_at": at,
+                    "end_reason": bson::to_bson(&reason)?,
+                }},
+            )
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?;
+        Ok(before)
+    }
+
+    /// FR-138 P1b-2 — the session's row, when it names `controller_user_id`
+    /// as its controller. The rejoin and the controller's own end carry no
+    /// org, so the row must name the caller, which is narrower than an org.
+    /// `NotFound` for another person's session, exactly as for none at all.
+    pub async fn find_for_controller(
+        &self,
+        session_id: ObjectId,
+        controller_user_id: ObjectId,
+    ) -> DaoResult<RemoteSession> {
+        self.base
+            .find_one(doc! { "_id": session_id, "controller_user_id": controller_user_id })
+            .await?
+            .ok_or(super::base::DaoError::NotFound)
+    }
+
+    /// FR-138 P1b-2 — a device's own end of a session that its registration
+    /// just ended by inference, reported after its hello (spec §4.4, AC4):
+    /// the reason the device gives (`host_disconnect`, `idle_timeout`,
+    /// `error`) REPLACES the inferred `agent_disconnect`, in the device's
+    /// tenant and only for a row naming the device. The inference may not
+    /// have reached the row yet (its write is batched): the row then still
+    /// reads live, and this write ends it the same way, so whichever lands
+    /// first the row reads the same.
+    ///
+    /// * `inferred_at: Some(at)` — the registration read ended it at `at`,
+    ///   the row's own last clock. The end is now known, so `end_source` is
+    ///   CLEARED. `ended_at` stays that clock: the device's frame carries no
+    ///   time, and the end it reports happened during the gap, no earlier
+    ///   than that clock and no later than the device came back, so the row
+    ///   adds no hours it cannot prove.
+    /// * `None` — the hub reaped it at the registration (it still held the
+    ///   session for the device's earlier connection): a seen end, unmarked,
+    ///   so `ended_at` stays the reap's (`now` when this lands first).
+    ///
+    /// A row someone else ended meanwhile (an admin's end) matches neither
+    /// shape and is left alone. `false` = nothing matched.
+    pub async fn replace_inferred_end(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        session_id: ObjectId,
+        reason: EndReason,
+        inferred_at: Option<DateTime>,
+        now: DateTime,
+    ) -> DaoResult<bool> {
+        let live = doc! {
+            "phase": bson::to_bson(&SessionPhase::Active)?,
+            "ended_at": bson::Bson::Null,
+        };
+        let disconnect = bson::to_bson(&EndReason::AgentDisconnect)?;
+        let closed = bson::to_bson(&SessionPhase::Closed)?;
+        let reason = bson::to_bson(&reason)?;
+        let (inferred, set) = match inferred_at {
+            Some(at) => (
+                doc! {
+                    "end_reason": disconnect,
+                    "end_source": bson::to_bson(&EndSource::Registration)?,
+                },
+                doc! {
+                    "phase": closed,
+                    "end_reason": reason,
+                    "ended_at": { "$ifNull": ["$ended_at", at] },
+                },
+            ),
+            None => (
+                doc! { "end_reason": disconnect, "end_source": { "$exists": false } },
+                doc! {
+                    "phase": closed,
+                    "end_reason": reason,
+                    "ended_at": { "$ifNull": ["$ended_at", now] },
+                },
+            ),
+        };
+        let res = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": session_id,
+                    "tenant_id": tenant_id,
+                    "agent_id": agent_id,
+                    "$or": [live, inferred],
+                },
+                // An update pipeline: `$ifNull` reads the row's own value.
+                // The end is known now, so it is no longer marked inferred.
+                vec![doc! { "$set": set }, doc! { "$unset": ["end_source"] }],
+            )
+            .await?;
+        Ok(res.matched_count == 1)
     }
 }

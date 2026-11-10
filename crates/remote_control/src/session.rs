@@ -132,6 +132,18 @@ pub struct LiveSession {
     /// is still at it, so a hub that no longer holds the session cannot detach
     /// or end one another pod resumed.
     pub attach_seq: u32,
+
+    /// FR-138 — the window this session's viewer was told it may hold the
+    /// session for (`rc:session.created`'s `resume_secs`): set when the
+    /// session is created while the device's connection holds a window, and
+    /// on a session a device's claim rebuilt. `None` = never held: its
+    /// viewer's socket loss ends it, as before FR-138.
+    pub resume_secs: Option<u32>,
+
+    /// FR-138 — counts the viewer's comings and goings on a session it may
+    /// hold: bumped when its socket goes and when it rejoins. The timer a
+    /// departure arms ends the session only if nothing moved since.
+    pub controller_gen: u32,
 }
 
 impl LiveSession {
@@ -172,6 +184,8 @@ impl LiveSession {
             idle_secs: None,
             external: false,
             attach_seq: 0,
+            resume_secs: None,
+            controller_gen: 0,
         };
         (s, waiter)
     }
@@ -229,7 +243,8 @@ impl LiveSession {
     /// live since `started_at`, its consent given and its offer answered long
     /// ago, so neither can happen again (no consent slot, `offer_seen`), at
     /// the fencing number the claim committed. It has no controller until its
-    /// viewer rejoins.
+    /// viewer rejoins, and the hub that rebuilds it sets the window its
+    /// viewer may take to rejoin (`resume_secs`).
     #[allow(clippy::too_many_arguments)]
     pub fn resumed(
         id: ObjectId,
@@ -267,6 +282,8 @@ impl LiveSession {
             idle_secs: None,
             external: false,
             attach_seq,
+            resume_secs: None,
+            controller_gen: 0,
         }
     }
 }

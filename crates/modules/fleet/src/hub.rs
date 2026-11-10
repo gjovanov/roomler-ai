@@ -1423,8 +1423,10 @@ impl Hub {
             })
             .map(|e| *e.key())
             .collect();
+        // FR-138 — a session its viewer may hold is kept for the viewer to
+        // rejoin (`hold.rs`); everything else ends here as it always has.
         for session_id in orphaned {
-            let _ = self.end_own(session_id, EndReason::ControllerHangup, None);
+            let _ = self.viewer_gone(session_id, tx);
         }
     }
 
@@ -1627,6 +1629,16 @@ impl Hub {
         // indicator + peer. Mirrors the iterate-and-lock pattern in
         // `unregister_controller`; a mid-setup session keeps a live
         // controller_tx so it is never a false positive.
+        //
+        // FR-138 — a session with NO controller is never an orphan here: a
+        // session a device's claim rebuilt waits for its viewer's rejoin with
+        // none, and so does one held through its viewer's socket loss. Before
+        // FR-138 no session was ever without one. A session held for its
+        // viewer (`hold::held_for_viewer`: its controller gone or closed) is
+        // spared against ANOTHER person's request, and reaped as before for
+        // its own person's: a page too old to send `replaces`, or that
+        // person's other tab. The remote module reaps those first, before it
+        // claims the org's slot (`Hub::reap_held_for`).
         let orphaned: Vec<ObjectId> = self
             .inner
             .sessions
@@ -1634,11 +1646,14 @@ impl Hub {
             .filter_map(|e| {
                 let dead_controller = {
                     let s = e.value().lock();
+                    let gone = s.controller_tx.as_ref().is_none_or(|tx| tx.is_closed());
+                    let held = hold::held_for_viewer(&s) && gone;
                     s.agent_id == agent_id
-                        && s.controller_tx
-                            .as_ref()
-                            .map(|tx| tx.is_closed())
-                            .unwrap_or(true)
+                        && if held {
+                            s.controller_user_id == controller_user_id
+                        } else {
+                            s.controller_tx.as_ref().is_some_and(|tx| tx.is_closed())
+                        }
                 };
                 dead_controller.then(|| *e.key())
             })
@@ -1684,6 +1699,7 @@ impl Hub {
                     s.idle_secs,
                     s.consent_mode,
                     s.local_relays.clone(),
+                    s.resume_secs,
                 )
             })
         });
@@ -1696,6 +1712,7 @@ impl Hub {
             existing_idle_secs,
             existing_consent_mode,
             existing_local_relays,
+            existing_resume_secs,
         )) = existing
         {
             // FR-121 — a retry that named its device gets the relays the live
@@ -1739,9 +1756,9 @@ impl Hub {
                 local_relay: echo_relay,
                 local_relay_refused: echo_refused,
                 local_relay_also: echo_also,
-                // FR-138 — no window is announced yet (P1b), so no session
-                // may be held.
-                resume_secs: None,
+                // FR-138 — and whether it may be held, as its first answer
+                // said.
+                resume_secs: existing_resume_secs,
             });
             return Ok(existing_id);
         }
@@ -1798,6 +1815,7 @@ impl Hub {
             agent_floor,
             agent_enforces_idle,
             agent_honours_lock,
+            agent_window,
         ) = {
             let mut agent = self
                 .inner
@@ -1821,6 +1839,8 @@ impl Hub {
                 agent.device_session_policy,
                 agent.enforces_idle,
                 agent.honours_lock_on_end,
+                // FR-138 — the window this connection was announced, if any.
+                agent.resume_window,
             )
         };
 
@@ -1961,6 +1981,10 @@ impl Hub {
         live.idle_secs = idle_told;
         // FR-52 P5 — what a revocation ends (`terminate_external_of`).
         live.external = external.is_some();
+        // FR-138 — its viewer may hold it through a socket's loss for the
+        // window the device's connection holds; never an external one (D3).
+        let resume_secs = agent_window.filter(|_| external.is_none());
+        live.resume_secs = resume_secs;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
         // Offer/Answer all issue from the same PoP regardless of mid-setup
@@ -2012,9 +2036,10 @@ impl Hub {
             local_relay: echo_relay,
             local_relay_refused: echo_refused,
             local_relay_also: echo_also,
-            // FR-138 — no window is announced yet (P1b), so the viewer never
-            // holds this session.
-            resume_secs: None,
+            // FR-138 — this session may be held, for this long: the page then
+            // keeps it through a socket's loss and claims it back with
+            // `rc:session.rejoin`. Absent with no window, as before.
+            resume_secs,
         });
 
         // Per-mode consent window: modes with an owner-side (email/push) leg get
@@ -3446,9 +3471,10 @@ impl Hub {
                     // browser's computer runs more than one agent.
                     local_relay_also,
                     local_relay_from_also,
-                    // FR-138 — read from P1b, which ends the named held
-                    // session before the capacity gate. Nothing holds a
-                    // session yet, so the session it names has already ended.
+                    // FR-138 — the held session this redial gives up. The
+                    // remote module ends it before this request meets any
+                    // capacity gate, the org's slot it claims before this
+                    // dispatch included (`Hub::end_replaced`).
                     replaces: _,
                 },
             ) => {
@@ -3663,16 +3689,15 @@ impl Hub {
                 }
             }
             (_, ClientMsg::Ping { id: _ }) => Ok(()), // pong handled by WS layer
-            // FR-138 — a viewer's claim on a held session. Nothing holds a
-            // session before P1b, which answers it, so it is dropped unanswered,
-            // as a server that predates it drops it: the viewer's own deadline
-            // then falls back to the redial.
+            // FR-138 — a viewer's claim on a session held for it. The remote
+            // module answers it on the pod the viewer's socket is on: it checks
+            // that the row names this person and runs the gate a request runs
+            // before it binds here or relays here (`remote::rejoin`). This arm
+            // is the bind, on the hub that holds the session.
             (Role::Controller, ClientMsg::SessionRejoin { session_id }) => {
-                debug!(
-                    session = %session_id.to_hex(),
-                    "rc:session.rejoin dropped: no session is held"
-                );
-                Ok(())
+                let user_id = ctx.user_id.ok_or(Error::PermissionDenied("no user"))?;
+                let tx = ctx.controller_tx.clone().ok_or(Error::SendFailed)?;
+                self.rejoin(session_id, user_id, &tx)
             }
             (
                 _,
@@ -3703,6 +3728,11 @@ impl Hub {
 mod resume;
 use resume::EndWrite;
 pub use resume::{Registration, ResumeHello, Resumed, ResumedSession, RowEnd};
+// FR-138 P1b-2 — the hub's half of a session that outlives its VIEWER's
+// socket: the hold, the rejoin, `replaces`, and the orphan reap's same-person
+// rule.
+mod hold;
+pub use hold::HeldParties;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Tests

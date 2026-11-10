@@ -101,6 +101,9 @@ pub struct ResumedSession {
     pub max_duration: Option<(Duration, Duration)>,
     /// The FR-115 lease the claim took again under the session's own id.
     pub slot: Option<Lease>,
+    /// The window announced to the connection that claimed it, in seconds:
+    /// how long the rebuilt session waits for its viewer to rejoin (P1b-2).
+    pub resume_secs: u32,
 }
 
 /// What [`Hub::resume_claimed`] did.
@@ -137,15 +140,39 @@ pub struct RowEnd {
     pub attach_seq: Option<u32>,
     /// An end nobody saw: the row's own last clock, and who inferred it.
     pub inferred: Option<(DateTime, EndSource)>,
+    /// P1b-2 — the caller already wrote the row itself, with a condition the
+    /// audit's projection does not know (an end someone asked for, of a
+    /// session no hub held: Active and naming the right person), and awaited
+    /// it before its control event. The event is kept as the audit's trail
+    /// and projects nothing.
+    pub written: bool,
+    /// P1b-2 — for a written end, when the session ended, when that is not
+    /// when the event is recorded (a device's own end reported after its
+    /// hello keeps the time the row was dated by).
+    pub ended_at: Option<DateTime>,
 }
 
 impl RowEnd {
-    /// An end someone asked for (an admin's, the controller's): P1b-2's
-    /// write for a session no hub holds.
+    /// An end someone asked for, at any number, projected onto the row as
+    /// every end was before FR-138.
     pub fn asked() -> Self {
         Self {
             attach_seq: None,
             inferred: None,
+            written: false,
+            ended_at: None,
+        }
+    }
+
+    /// P1b-2 — an end someone asked for whose row the caller has written
+    /// itself (`RemoteSessionDao::end_unheld`, `replace_inferred_end`): the
+    /// audit's trail only, dated `ended_at` when that is not now.
+    pub fn written(ended_at: Option<DateTime>) -> Self {
+        Self {
+            attach_seq: None,
+            inferred: None,
+            written: true,
+            ended_at,
         }
     }
 
@@ -154,6 +181,8 @@ impl RowEnd {
         Self {
             attach_seq: Some(seq),
             inferred: None,
+            written: false,
+            ended_at: None,
         }
     }
 
@@ -163,6 +192,8 @@ impl RowEnd {
         Self {
             attach_seq: Some(seq),
             inferred: Some((at, source)),
+            written: false,
+            ended_at: None,
         }
     }
 }
@@ -372,7 +403,7 @@ impl Hub {
                 Resumed::Reattached
             }
             None => {
-                let live = LiveSession::resumed(
+                let mut live = LiveSession::resumed(
                     r.session_id,
                     agent_id,
                     r.tenant_id,
@@ -382,9 +413,14 @@ impl Hub {
                     r.started_at,
                     r.attach_seq,
                 );
+                // P1b-2 — no controller until its viewer rejoins, which it
+                // may for the window announced to the connection that
+                // claimed it; past that, it ends.
+                live.resume_secs = Some(r.resume_secs);
                 self.inner
                     .sessions
                     .insert(r.session_id, Arc::new(Mutex::new(live)));
+                self.arm_viewer_wait(r.session_id, 0, r.attach_seq, r.resume_secs);
                 Resumed::Rebuilt
             }
         };
@@ -498,8 +534,10 @@ impl Hub {
     /// FR-138 — write an end to the row of a session this hub does not hold,
     /// through the audit sink like every end, so the projection applies the
     /// fencing (`end`). The claim's refusals and the registration read use
-    /// it; P1b-2's end for a session no hub holds (an admin's, the
-    /// controller's) is [`RowEnd::asked`].
+    /// it. P1b-2's ends for a session no hub holds (an admin's, the
+    /// controller's own, a redial's `replaces`, the device's own after its
+    /// hello) write the row themselves and record it here as
+    /// [`RowEnd::written`]: the audit's trail, with no projection.
     pub fn record_end(
         &self,
         session_id: ObjectId,
@@ -511,20 +549,22 @@ impl Hub {
     ) {
         let (ended_at, end_source) = match end.inferred {
             Some((at, source)) => (Some(at), Some(source)),
-            None => (None, None),
+            None => (end.ended_at, None),
         };
-        self.audit(
-            session_id,
-            agent_id,
-            tenant_id,
-            AuditKind::SessionEnded {
-                reason,
-                limit: limit.map(str::to_string),
-                attach_seq: end.attach_seq,
-                ended_at,
-                end_source,
-            },
-        );
+        let event = AuditKind::SessionEnded {
+            reason,
+            limit: limit.map(str::to_string),
+            attach_seq: end.attach_seq,
+            ended_at,
+            end_source,
+        };
+        if end.written {
+            self.inner
+                .audit
+                .record_trail(session_id, agent_id, tenant_id, event);
+        } else {
+            self.audit(session_id, agent_id, tenant_id, event);
+        }
     }
 
     /// FR-101 P4b — end the session at the org's maximum length (`limit`),
@@ -833,6 +873,7 @@ mod tests {
             attach_seq: 1,
             max_duration: None,
             slot: None,
+            resume_secs: 60,
         };
         assert_eq!(
             hub.resume_claimed(agent, &reg.tx, resumed(sid)),
@@ -910,6 +951,7 @@ mod tests {
             attach_seq: 1,
             max_duration: None,
             slot: None,
+            resume_secs: 60,
         };
         assert_eq!(
             hub.resume_claimed(agent, &second.tx, r),

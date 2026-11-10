@@ -116,6 +116,37 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(session = %sid, "rc ctrl: terminate applied from another pod");
             }
         }
+        // FR-138 P1b-2 — the controller's own end (its `rc:terminate`, or a
+        // redial's `replaces`) of a session the pod it reached did not hold:
+        // that pod wrote the end to the row, and the pod that holds the
+        // session ends it here. The tenant AND the controller are re-checked,
+        // so an envelope cannot end another person's session. The reason is
+        // the one the hub records for a controller (`host_disconnect` is the
+        // device's alone); an absent or unknown one reads `controller_hangup`.
+        Some("controller_terminate") => {
+            let oid = |key: &str| {
+                ctrl.get(key)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| ObjectId::parse_str(s).ok())
+            };
+            let (Some(sid), Some(tid), Some(uid)) =
+                (oid("session_id"), oid("tenant_id"), oid("user_id"))
+            else {
+                return;
+            };
+            use roomler_ai_remote_control::models::EndReason;
+            let reason = match ctrl
+                .get("reason")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<EndReason>(v).ok())
+            {
+                None | Some(EndReason::HostDisconnect) => EndReason::ControllerHangup,
+                Some(r) => r,
+            };
+            if hub.session_snapshot(sid) == Some((tid, uid)) && hub.terminate(sid, reason).is_ok() {
+                info!(session = %sid, "rc ctrl: a controller's end applied from another pod");
+            }
+        }
         // FR-52 P5 — an admin barred a person from a device on another pod,
         // and the session they are in may be here. `terminate_external_of`
         // holds the tenant check `terminate` makes above.

@@ -383,8 +383,8 @@ flowchart LR
 
 Only three marks have a server record, via `remote_audit` (`event.kind`, 90 d TTL):
 `session_created` ≈ `consent_prompted`, `ready` ≈ `consent_granted`, `answer` ≈
-`session_started` (stamped when the hub forwards the SDP answer — `crates/modules/fleet/src/hub.rs:1688`,
-`crates/remote_control/src/audit.rs:162`). Everything blue is server-visible; everything grey
+`session_started` (stamped when the hub forwards the SDP answer — `crates/modules/fleet/src/hub.rs:1704`,
+`crates/remote_control/src/audit.rs:198`). Everything blue is server-visible; everything grey
 is **browser-only and unpersisted**:
 
 - ⚠️ **The `/api/log/browser` ingest route exists but is unwired** — no UI uploader ships to
