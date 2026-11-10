@@ -24,7 +24,7 @@ Replace eight estimators of one quantity — occupancy AIMD, blocked-send goodpu
 | **B-opener** | Slow-start for the session opener — `encode::slow_start` (pure law) + the governor cap on the opening ceiling **and floor** | `rate_slow_start` (default **OFF**) | shipped **inert** in 0.4.55 (#1262, #1265 capped only the ceiling, which `set_ceiling` raised back to the flat 1.5 M floor); fixed in 0.4.56 (#1275) and **field-verified engaging** — AC0a done, AC0b open |
 | B0 | `encode/sim.rs` — pipe/encoder/viewer simulator + the four scenario fixtures, driving the SHIPPED laws | n/a (test-only) | **shipped** — 11 tests in `cargo test -p roomlerd --lib` on the default build. CSV trace replay deferred (see below) |
 | B1 | `ratectl` shadow beside the governor, `shadow_*` heartbeat fields | `ROOMLERD_RATECTL` (env; `off` disables, default shadow) | **shipped in `agent-v0.4.188`** (#3102, published 2026-10-30 14:21Z; merged after 0.4.187 was cut) — `encode::ratectl::Controller` (pure, 13 unit tests) fed at the five live positions, six `shadow_*` fields on both pump heartbeats, a containment test (`the_shadow_never_moves_the_live_decision`, red-run confirmed) and a `RateLaw` adapter running it on the B0 cells. **Observe-only: it drives nothing.** AC2 (the fleet-log flip criterion) still needs a release + a week of logs |
-| B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass inside the Mongo pod; rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
+| B1b | AC2's instrument — `scripts/rc-shadow-report.cjs` (+ `.sh`): the flip criterion measured over `agent_logs` | n/a (a read; the prod targets refuse without `--yes`) | **built** — see "B1b — the shadow report" below. The plan's read path (`list_for_agent(?session_id=…)`) does not exist, so the fleet read runs as a bounded mongosh pass outside the Mongo pod (`scripts/prod-mongo-read.sh`); rehearsed on `mongo:7` with three-way parity. It measures; the operator runs the prod read and decides the flip. Since 2026-11-02 it also reads what the encoder spent, because the criterion cannot fail a shadow that asks for too little |
 | B2 | Flip to `live` on the flip criterion | `ratectl = shadow\|live\|off` | not started |
 | B3 | Retire the eight estimators and their switches | `ratectl = off` for one release | not started |
 | B4 | FR-62's A4, moved here 2026-11-05: retire the IDR-rationing heuristics through the registry, per backend. NVENC only, while every other backend rebuilds with an IDR on every move (AC7) | none of their own: each deletion PR cites its row's precondition in [`rate-control.md` § Kill switches](../rate-control.md#kill-switches-and-when-each-retires--the-registry-fr-62-ac4) | not started; after B2 plus one release soak |
@@ -257,12 +257,12 @@ hold the whole population — every daemon and every RC worker runs the uploader
 Windows host's pump runs in its console-session worker, `roomlerd run --supervisor
 scm`, which goes through `run_cmd` and spawns it), across every org, for 7 days.
 
-So the fleet read is a **mongosh pass inside the Mongo pod**, bounded by construction
-(the 2026-10-26 OOM was an unbounded read in that same container): at most 8 days, one
-day per query, `$match`/`$sort` served by an index (`explain`: `IXSCAN created_at_1`, no
-blocking SORT), streaming stages only, 14 projected fields, credentials from the pod's
-own environment. The production targets refuse without `--yes` and print the pod's
-restart count before and after.
+So the fleet read is a **mongosh pass over a port-forward, outside the Mongo pod**, bounded
+by construction (the 2026-10-26 OOM was an unbounded read inside that pod): at most 8 days,
+one day per query, `$match`/`$sort` served by an index (`explain`: `IXSCAN created_at_1`, no
+blocking SORT), streaming stages only, 14 projected fields, credentials from the pod's secret
+through `scripts/prod-mongo-read.sh`. The production targets refuse without `--yes` and print
+the pod's restart count before and after.
 
 ### The criterion, as the script measures it
 

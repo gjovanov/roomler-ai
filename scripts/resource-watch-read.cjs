@@ -1,17 +1,20 @@
 // FR-134: the fleet's `resource watch` lines, from `agent_logs`.
 //
-// Runs inside the Mongo container, where its memory counts against the
-// database's own limit, so it is bounded by construction: the text index picks
-// the batches, $limit caps them, and only the matching lines leave the server.
+// Its client runs OUTSIDE the Mongo container, through scripts/prod-mongo-read.sh
+// (a port-forward and a throwaway client container), so its memory never counts
+// against the database's own limit (docs/production-mongo-reads.md). The server
+// still runs the query inside that limit, so it is bounded by construction: the
+// text index picks the batches, $limit caps them, and only the matching lines
+// leave the server.
 //
-//   roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
-//     < scripts/resource-watch-read.cjs | grep -o 'OUT .*'
+//   scripts/prod-mongo-read.sh --mars --yes scripts/resource-watch-read.cjs | grep -o 'OUT .*'
 //
 // Prints one line per reading, then a count. `agent_logs` keeps 7 days.
 //
-// ⚠️ mongosh reads stdin as a REPL, so a line that parses alone runs alone. Keep
-// `coll.aggregate([` together and `.forEach` on the closing line: split them and
-// every line errors, and the only output left is a misleading `lines 0`.
+// ⚠️ The runner hands mongosh this file whole. Fed on stdin instead, mongosh reads
+// it as a REPL, so a line that parses alone runs alone. Keep `coll.aggregate([`
+// together and `.forEach` on the closing line: split them and every line errors,
+// and the only output left is a misleading `lines 0`.
 const HOURS = 168;
 const MAX_BATCHES = 5000;
 

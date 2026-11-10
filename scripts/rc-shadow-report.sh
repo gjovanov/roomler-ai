@@ -13,10 +13,13 @@
 #   exec sweep of host logs reaches only exec-enabled, online hosts of one org,
 #   which is a biased sample of exactly the proportion AC2 asks for.
 #
-#   So the read runs INSIDE the Mongo container, as mongosh, with the
-#   container's own credentials. It is bounded by construction; see
-#   `runMongosh` in rc-shadow-report.cjs. An unbounded read inside that same
-#   container OOM-killed production Mongo once (2026-10-26).
+#   So the read runs as mongosh against production Mongo, with the Mongo
+#   container's own credentials, but OUTSIDE that container: through
+#   prod-mongo-read.sh, a port-forward and a throwaway client container, so the
+#   client's memory never counts against the database's limit. It is bounded
+#   by construction; see `runMongosh` in rc-shadow-report.cjs. An unbounded
+#   read whose client ran inside the Mongo container OOM-killed production
+#   Mongo once (2026-10-26).
 #
 # TARGETS (pick one)
 #
@@ -24,10 +27,11 @@
 #                                rehearsal. --seed loads `rc-shadow-report.cjs
 #                                --to-ejson` output (real log lines, stored the
 #                                way the uploader stores them) before the read.
-#   --kubectl --yes              where kubectl reaches namespace roomler-ai
-#                                (on mars, as gjovanov).
-#   --mars --yes                 from the dev box: ships both files to mars over
-#                                `roomler ssh` and runs --kubectl there.
+#   --kubectl --yes              where kubectl reaches namespace roomler-ai and
+#                                docker runs (on mars, as gjovanov).
+#   --mars --yes                 from the dev box: ships the report and
+#                                prod-mongo-read.sh to mars over one `roomler ssh`
+#                                and runs --kubectl there.
 #
 # OPTIONS
 #
@@ -40,7 +44,8 @@
 #
 # A production read (--kubectl / --mars) is refused without --yes: it is a
 # bounded read of the live database, and still the operator's to start. The
-# mongodb pod's restart count is printed before and after it.
+# mongodb pod's restart count and memory are printed before and after it, on
+# stderr, and a restart fails the run (exit 3).
 
 set -euo pipefail
 
@@ -54,8 +59,9 @@ JS="$HERE/rc-shadow-report.cjs"
 # Inside a container the copy is named .js on purpose: mongosh runs a positional
 # argument as a script only when it ends in .js (anything else is a connection
 # string).
-NS="roomler-ai"
-POD="mongodb-0"
+# The production client: a port-forward and a throwaway mongo:7 container, never
+# mongodb-0.
+READ="$HERE/prod-mongo-read.sh"
 
 die() { echo "rc-shadow-report: $*" >&2; exit 1; }
 
@@ -84,7 +90,7 @@ while [ $# -gt 0 ]; do
     --min-windows) ENVS+=("RC_SHADOW_MIN_WINDOWS=${2:?}"); PASS+=("$1" "$2"); shift 2 ;;
     --json)        ENVS+=("RC_SHADOW_JSON=1"); PASS+=("$1"); shift ;;
     --rows)        ENVS+=("RC_SHADOW_EMIT=rows"); PASS+=("$1"); shift ;;
-    -h|--help)     sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help)     sed -n '2,48p' "$0"; exit 0 ;;
     *)             die "unknown argument: $1 (--help)" ;;
   esac
 done
@@ -127,33 +133,26 @@ case "$TARGET" in
 
   kubectl)
     [ "$YES" = 1 ] || die "this reads PRODUCTION agent_logs; re-run with --yes to start it"
-    command -v kubectl >/dev/null || die "kubectl is not on PATH"
-    restarts() { kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
-    before="$(restarts)"
-    echo "mongodb pod $POD: restarts=$before before the read"
-    kubectl -n "$NS" cp "$JS" "$POD:/tmp/rc-shadow-report.js" >/dev/null
-    rc=0
-    kubectl -n "$NS" exec "$POD" -- env "${ENVS[@]+"${ENVS[@]}"}" mongosh --nodb --quiet /tmp/rc-shadow-report.js || rc=$?
-    kubectl -n "$NS" exec "$POD" -- rm -f /tmp/rc-shadow-report.js || true
-    after="$(restarts)"
-    echo "mongodb pod $POD: restarts=$after after the read"
-    if [ "$after" != "$before" ]; then
-      echo "rc-shadow-report: ⚠️ the mongodb pod RESTARTED during the read — treat this run as harmful, not as data:" >&2
-      kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].lastState}' >&2 || true
-      echo >&2
-      exit 3
-    fi
-    exit "$rc"
+    [ -f "$READ" ] || die "missing $READ"
+    # The runner prints the mongodb pod's restart count and memory before and
+    # after, and exits 3 when the pod restarted: treat that run as harmful, not
+    # as data.
+    EOPTS=()
+    for e in "${ENVS[@]+"${ENVS[@]}"}"; do EOPTS+=(--env "$e"); done
+    exec bash "$READ" --kubectl --yes "${EOPTS[@]+"${EOPTS[@]}"}" "$JS"
     ;;
 
   mars)
     [ "$YES" = 1 ] || die "this reads PRODUCTION agent_logs; re-run with --yes to start it"
+    [ -f "$READ" ] || die "missing $READ"
     command -v roomler >/dev/null || die "roomler is not on PATH"
-    roomler ssh mars -- 'mkdir -p ~/fr63-shadow && cat > ~/fr63-shadow/rc-shadow-report.cjs' < "$JS"
-    roomler ssh mars -- 'cat > ~/fr63-shadow/rc-shadow-report.sh' < "$HERE/rc-shadow-report.sh"
+    # One `roomler ssh`, carrying the files on stdin: a device has a ceiling on
+    # SSH requests per caller, and four in a row meet it.
+    OPTS=""
+    [ "${#PASS[@]}" = 0 ] || OPTS="$(printf '%q ' "${PASS[@]}")"
     rc=0
-    roomler ssh mars -- "bash ~/fr63-shadow/rc-shadow-report.sh --kubectl --yes $(printf '%q ' "${PASS[@]+"${PASS[@]}"}")" || rc=$?
-    roomler ssh mars -- 'rm -rf ~/fr63-shadow' || true
+    tar -C "$HERE" -cf - rc-shadow-report.cjs rc-shadow-report.sh prod-mongo-read.sh |
+      roomler ssh mars -- "D=\$(mktemp -d ~/fr63-shadow.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/rc-shadow-report.sh\" --kubectl --yes $OPTS; rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
     exit "$rc"
     ;;
 esac

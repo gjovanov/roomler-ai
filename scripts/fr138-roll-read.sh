@@ -34,9 +34,11 @@
 #
 # TARGETS (pick one)
 #
-#   --kubectl --yes      where kubectl reaches namespace roomler-ai (on mars).
-#   --mars --yes         from the dev box: sends this file to mars over
-#                        `roomler ssh` and runs --kubectl there. The CLI is
+#   --kubectl --yes      where kubectl reaches namespace roomler-ai and docker
+#                        runs (on mars).
+#   --mars --yes         from the dev box: sends this file and
+#                        prod-mongo-read.sh to mars over one `roomler ssh`
+#                        and runs --kubectl there. The CLI is
 #                        $ROOMLER_CLI, else /c/Program Files/Roomler/roomler.exe,
 #                        else `roomler` on PATH.
 #
@@ -64,13 +66,15 @@
 #
 # BOUNDS
 #
-#   An unbounded read inside the mongodb pod OOM-killed production Mongo once
-#   (2026-10-26). Every read here starts on an indexed field (created_at, the
-#   session id, agent_id + created_at, tenant_id + phase), carries a limit and
-#   maxTimeMS, and the browser read counts its window first and refuses a large
-#   one. The mongodb pod's restart count is printed before and after; a change
-#   fails the run. The database URL is read from the roomler2 pod and handed to
-#   mongosh on stdin, never printed.
+#   An unbounded read whose client ran inside the mongodb pod OOM-killed
+#   production Mongo once (2026-10-26). Every read here starts on an indexed
+#   field (created_at, the session id, agent_id + created_at, tenant_id +
+#   phase), carries a limit and maxTimeMS, and the browser read counts its
+#   window first and refuses a large one. mongosh runs OUTSIDE the mongodb pod,
+#   through prod-mongo-read.sh (a port-forward and a throwaway client
+#   container), which prints the pod's restart count and memory before and
+#   after; a restart fails the run. The credentials go from the secret into
+#   files, never printed and never in an argument list.
 #
 # examples
 #   scripts/fr138-roll-read.sh --mars --yes --from 2026-11-09T13:19:24Z --to 2026-11-09T13:19:58Z
@@ -83,7 +87,9 @@ set -euo pipefail
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 NS="${ROOMLER_NS:-roomler-ai}"
-POD="mongodb-0"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# The client: a port-forward and a throwaway mongo:7 container, never mongodb-0.
+READ="$HERE/prod-mongo-read.sh"
 
 die() { echo "fr138-roll-read: $*" >&2; exit 2; }
 
@@ -112,7 +118,7 @@ while [ $# -gt 0 ]; do
     --session)
       [[ "${2:-}" =~ ^[0-9a-f]{24}$ ]] || die "--session takes a 24-hex session id"
       SESSIONS="${SESSIONS:+$SESSIONS,}$2"; PASS+=("$1" "$2"); shift 2 ;;
-    -h|--help)  sed -n '2,77p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,81p' "$0"; exit 0 ;;
     *)          die "unknown argument: $1 (--help)" ;;
   esac
 done
@@ -127,6 +133,7 @@ if [ "$MODE" = roll ]; then
 fi
 [ -n "$TARGET" ] || die "pick a target: --kubectl --yes or --mars --yes (--help)"
 [ "$YES" = 1 ] || die "this reads PRODUCTION Mongo; re-run with --yes to start it"
+[ -f "$READ" ] || die "missing $READ"
 
 if [ "$TARGET" = mars ]; then
   CLI="${ROOMLER_CLI:-}"
@@ -135,14 +142,21 @@ if [ "$TARGET" = mars ]; then
     else CLI="$(command -v roomler || true)"; fi
   fi
   [ -n "$CLI" ] || die "no roomler CLI: set ROOMLER_CLI"
-  # One `roomler ssh`, this file on stdin: a device caps SSH requests per caller.
-  exec "$CLI" ssh mars "bash -s -- --kubectl --yes $(printf '%q ' "${PASS[@]+"${PASS[@]}"}")" < "$0"
+  # One `roomler ssh`, both files on stdin: a device caps SSH requests per caller.
+  OPTS=""
+  [ "${#PASS[@]}" = 0 ] || OPTS="$(printf '%q ' "${PASS[@]}")"
+  rc=0
+  tar -C "$HERE" -cf - "$(basename "$0")" prod-mongo-read.sh |
+    "$CLI" ssh mars -- "D=\$(mktemp -d ~/fr138-roll-read.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/$(basename "$0")\" --kubectl --yes $OPTS; rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
+  exit "$rc"
 fi
 
 command -v kubectl >/dev/null || die "kubectl is not on PATH"
-restarts() { kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
-before="$(restarts)"
-echo "mongodb pod: restarts=$before before the read"
+# The cluster is named, never this host's current context: the runner refuses a
+# host that has no production context, before any cluster call.
+KUBE_CONTEXT="$(bash "$READ" --print-context)" || exit 2
+export ROOMLER_KUBE_CONTEXT="$KUBE_CONTEXT"
+kubectl() { command kubectl --context "$KUBE_CONTEXT" "$@"; }
 
 if [ "$MODE" = roll ]; then
   # The rollout, for picking --from and --to: each roomler2 ReplicaSet's
@@ -155,9 +169,7 @@ if [ "$MODE" = roll ]; then
     grep '^roomler2-' | grep -v prepull | sed -E 's#^[^ ]+ #pod started=#; s# ([^ ]+) [^ ]*/[^ /]*:([^ :]+) # ready_since=\1 tag=\2 restarts=#' | sort || true
 fi
 
-url="$(kubectl -n "$NS" exec deploy/roomler2 -- printenv ROOMLER__DATABASE__URL)"
 name="$(kubectl -n "$NS" exec deploy/roomler2 -- printenv ROOMLER__DATABASE__NAME)"
-[ -n "$url" ] || { echo "could not read the database URL" >&2; exit 3; }
 case "$name" in '' | *[!A-Za-z0-9_-]*) echo "unexpected database name" >&2; exit 3 ;; esac
 
 # The read, one block (mongosh must not see a statement split across lines).
@@ -443,13 +455,7 @@ js="${js//__TAIL__/$TAIL}"
 js="${js//__LOOKBACK__/$LOOKBACK}"
 js="${js//__SESSIONS__/$SESSIONS}"
 
-rc=0
-{ printf '%s\n' "$url"; printf '%s\n' "$js"; } |
-  kubectl -n "$NS" exec -i "$POD" -- sh -c 'IFS= read -r u; exec mongosh --quiet "$u" --file /dev/stdin' || rc=$?
-after="$(restarts)"
-echo "mongodb pod: restarts=$after after the read"
-if [ "$after" != "$before" ]; then
-  echo "fr138-roll-read: the mongodb pod RESTARTED during the read; treat this run as harmful, not as data" >&2
-  exit 3
-fi
-exit "$rc"
+# The script on stdin; the runner opens `db` on the app database, prints the
+# mongodb pod's restart count and memory before and after, and exits 3 when the
+# pod restarted: treat that run as harmful, not as data.
+printf '%s\n' "$js" | bash "$READ" --kubectl --yes --db "$name" -

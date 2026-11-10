@@ -300,7 +300,7 @@ user id, never a code.
 
 > ⚠️ A read of the audit on a production pod is a bounded read or nothing: filter by
 > `pairing_id`, `tenant_id` or `user_id` (each has its index), sort by `at` descending, and
-> `.limit()` it. An unbounded scan inside the Mongo pod has taken the database down before.
+> `.limit()` it. Run it through `scripts/prod-mongo-read.sh`, whose client runs outside the Mongo pod ([production-mongo-reads.md](production-mongo-reads.md)), because an unbounded read inside that pod has taken the database down before. The server still scans inside it, so the bounds stay.
 
 ## 8 · The admins' notice
 

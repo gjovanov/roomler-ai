@@ -1082,11 +1082,12 @@ own, and only a restart freed them.
 
 `rc:session.stats` carries neither the transport nor the encoder, so how far the RTP path reaches,
 and how it behaves, can only be read from `agent_logs`. `scripts/rtp-reach-read.cjs` does that, bounded
-by construction, with no exec on any host:
+by construction, with no exec on any host. Its client runs outside the database's container, so
+its memory never counts against mongod's limit
+([production-mongo-reads.md](production-mongo-reads.md)):
 
 ```bash
-roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
-  < scripts/rtp-reach-read.cjs | grep -o 'OUT .*'
+scripts/prod-mongo-read.sh --mars --yes scripts/rtp-reach-read.cjs | grep -o 'OUT .*'
 ```
 
 ```mermaid
