@@ -20,26 +20,43 @@
 //!   200 (N10);
 //! * the rejoin of a detached session runs the gate at most once per 5 s for
 //!   its viewer (N14).
+//!
+//! And the edges PR D's own review found:
+//!
+//! * a lease this pod holds for a session no hub holds is kept only while
+//!   the row can still be resumed: past `resume_by` plus the 10 s grace, or
+//!   live with no `resume_by` on a device outside the resume scope, it is
+//!   dropped as before FR-138 (MEDIUM 1, LOW 4);
+//! * the lease's expiry only grows: a renewal, a claim, a restore and a keep
+//!   never shorten a kept lease, and a keep never revives a lapsed one
+//!   (LOW 5, LOW 7, and the renewal's test gap);
+//! * a resumed session whose slot another session took during the gap ends,
+//!   fenced at the number its claim committed (a test gap);
+//! * a viewer removed from the org during the gap is refused within about
+//!   5 s on a detached row, and the rate's entry goes once the session is
+//!   bound (a test gap, LOW 8).
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bson::{DateTime, Document, doc, oid::ObjectId};
+use redis::aio::ConnectionManager;
 use roomler_ai_mod_fleet::hub::{OrgPolicy, ResumeHello};
 use roomler_ai_remote_control::models::{ConsentMode, OsKind, RcOverlayMode};
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::signaling::{ExternalGrant, ServerMsg};
-use roomler_core::cluster::session_slots::{SlotClaim, SlotScope};
+use roomler_ai_services::dao::rc_resume_scope::ResumeScopeKind;
+use roomler_core::cluster::session_slots::{Lease, SlotClaim, SlotScope};
 use tokio::sync::mpsc;
 
 use crate::fixtures::test_app::TestApp;
 use crate::rc_resume_claim_tests::{
-    RESUME, WINDOW, WITHIN, answer_for, attach_seq, detached, drop_socket, end_reason, ended,
-    enroll, go_live, hello, insert, leftover, now_ms, oid, one, open, row, scope_all, tenant_of,
-    wait_row,
+    REMOTE_CONTROL, RESUME, WINDOW, WITHIN, answer_for, attach_seq, detached, drop_socket,
+    end_reason, ended, enroll, give_member, go_live, hello, insert, leftover, now_ms, oid, one,
+    open, row, scope, scope_all, tenant_of, wait_row,
 };
 use crate::rc_resume_ends_tests::{as_read, claiming_connection, hub_answer, remote};
-use crate::rc_resume_rejoin_tests::{controller, rejoin, rejoin_answer, request};
+use crate::rc_resume_rejoin_tests::{controller, live_session, rejoin, rejoin_answer, request};
 
 /// One pod with the window `window` and the org's sessions counted in
 /// cluster-wide slots (FR-115 P3b): the harness's orgs run one at a time.
@@ -56,6 +73,28 @@ fn resume_by_ms(r: &Document) -> i64 {
     r.get_datetime("resume_by")
         .expect("a resume_by")
         .timestamp_millis()
+}
+
+/// `sid`'s score in the payer's set `set` (its lease's expiry, ms), when the
+/// set holds it.
+async fn score(conn: &mut ConnectionManager, set: &str, sid: ObjectId) -> Option<i64> {
+    let s: Option<String> = redis::cmd("ZSCORE")
+        .arg(set)
+        .arg(sid.to_hex())
+        .query_async(conn)
+        .await
+        .unwrap();
+    s.and_then(|s| s.parse::<f64>().ok()).map(|f| f as i64)
+}
+
+/// A key's time to live, in ms (-2: no key, -1: no expiry).
+async fn pttl(conn: &mut ConnectionManager, key: &str) -> i64 {
+    redis::cmd("PTTL").arg(key).query_async(conn).await.unwrap()
+}
+
+/// The holder hash of `sid`'s lease.
+fn holder_key(app: &TestApp, sid: ObjectId) -> String {
+    format!("roomler:rc:slot:{}:{}", app.db.name(), sid.to_hex())
 }
 
 /// Review 1, M5 — the org runs one session at a time. Its session on device
@@ -521,4 +560,463 @@ async fn a_detached_sessions_rejoins_run_the_gate_once_per_five_seconds() {
         1,
         "five asks inside 5 s run the gate once"
     );
+}
+
+/// PR D's review, MEDIUM 1 — a pod that dies writes none of
+/// its ends, and the pod that replaces it on the node has its pod id. The
+/// lease of a session its hub held is then this pod's, its hub holds nothing,
+/// and the row reads live with no `resume_by`. On a device outside the resume
+/// scope nothing will ever resume that session, so the lease is dropped as
+/// stale and the org's request is created at once, as before FR-138. On a
+/// device inside the scope a detach may still be on its way to the row, so
+/// the same lease is kept, and lapses on its own.
+#[tokio::test]
+async fn a_dead_pods_lease_is_dropped_outside_the_resume_scope_and_kept_inside() {
+    let app = one_slotted(WINDOW).await;
+    let Some(slots) = app.state.session_slots.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let pod = app.state.pod.pod_id.clone();
+    let outside = app.seed_tenant("fr138pd11o").await;
+    let inside = app.seed_tenant("fr138pd11i").await;
+    scope(&app, &[(ResumeScopeKind::Org, Some(tenant_of(&inside)))]).await;
+    for (seeded, machine, in_scope) in [
+        (&outside, "fr138-pd-11o", false),
+        (&inside, "fr138-pd-11i", true),
+    ] {
+        let tenant = tenant_of(seeded);
+        let (agent_id, token) = enroll(&app, seeded, machine).await;
+        // No `rc-resume`: no window, so no registration read races the row
+        // below. The scope list alone decides.
+        let _agent = hello(&app, &token, &[], &[]).await;
+        let admin_id = oid(&seeded.admin.id);
+        let ghost = ObjectId::new();
+        assert_eq!(
+            slots
+                .claim(SlotScope::Org(tenant), ghost, admin_id, agent_id, 1, &pod)
+                .await
+                .unwrap(),
+            SlotClaim::Claimed,
+            "the org's one slot, held for a session of the pod that died"
+        );
+        insert(
+            &app,
+            leftover(
+                ghost,
+                agent_id,
+                tenant,
+                admin_id,
+                now_ms() - 60_000,
+                doc! {},
+            ),
+        )
+        .await;
+
+        let mut ctl = controller(&app, &seeded.admin.access_token).await;
+        let answer = request(&mut ctl, agent_id, None).await;
+        if in_scope {
+            assert_eq!(
+                answer["t"], "rc:error",
+                "inside the scope a detach may be in flight: {answer}"
+            );
+            assert_eq!(answer["code"], "org_session_limit", "{answer}");
+        } else {
+            assert_eq!(
+                answer["t"], "rc:session.created",
+                "outside the scope the stale lease is dropped, as before FR-138: {answer}"
+            );
+        }
+    }
+}
+
+/// PR D's review, LOW 4 — a claim that began before its row's `resume_by`
+/// may commit just after it, and finds its slot only because the detach kept
+/// the lease 10 s past the deadline. The stale-lease check honours the same
+/// grace: inside it the lease is kept and the org's request refused; past it
+/// the lease is over, dropped, and the request created.
+#[tokio::test]
+async fn a_lease_past_its_deadline_is_kept_through_the_grace_and_no_longer() {
+    let app = one_slotted(WINDOW).await;
+    let Some(slots) = app.state.session_slots.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let seeded = app.seed_tenant("fr138pdl4").await;
+    let tenant = tenant_of(&seeded);
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-pd-l4").await;
+    let _agent = hello(&app, &token, &[], &[]).await;
+    let admin_id = oid(&seeded.admin.id);
+    let ghost = ObjectId::new();
+    assert_eq!(
+        slots
+            .claim(
+                SlotScope::Org(tenant),
+                ghost,
+                admin_id,
+                agent_id,
+                1,
+                &app.state.pod.pod_id,
+            )
+            .await
+            .unwrap(),
+        SlotClaim::Claimed
+    );
+    let now = now_ms();
+    insert(
+        &app,
+        leftover(
+            ghost,
+            agent_id,
+            tenant,
+            admin_id,
+            now - 120_000,
+            doc! {
+                "detached_at": DateTime::from_millis(now - 63_000),
+                "resume_by": DateTime::from_millis(now - 3_000),
+            },
+        ),
+    )
+    .await;
+
+    let mut ctl = controller(&app, &seeded.admin.access_token).await;
+    let refused = request(&mut ctl, agent_id, None).await;
+    assert_eq!(
+        refused["t"], "rc:error",
+        "3 s past resume_by a late claim may still commit: {refused}"
+    );
+    assert_eq!(refused["code"], "org_session_limit", "{refused}");
+
+    app.db
+        .collection::<Document>("remote_sessions")
+        .update_one(
+            doc! { "_id": ghost },
+            doc! { "$set": { "resume_by": DateTime::from_millis(now - 11_000) } },
+        )
+        .await
+        .unwrap();
+    let mut ctl = controller(&app, &seeded.admin.access_token).await;
+    let created = request(&mut ctl, agent_id, None).await;
+    assert_eq!(
+        created["t"], "rc:session.created",
+        "11 s past resume_by the lease is over: {created}"
+    );
+}
+
+/// PR D's review, LOW 7 — a lease whose pod stopped renewing it has lapsed,
+/// and no claim has purged it yet. A keep must not bring it back: it would
+/// take the org's slot again until the deadline it was kept to.
+#[tokio::test]
+async fn a_lapsed_lease_is_never_kept_again() {
+    let app = one_slotted(WINDOW).await;
+    let (Some(slots), Some(redis)) = (
+        app.state.session_slots.clone(),
+        app.state.redis_pubsub.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let org = SlotScope::Org(ObjectId::new());
+    let sid = ObjectId::new();
+    assert_eq!(
+        slots
+            .claim(org, sid, ObjectId::new(), ObjectId::new(), 1, "fr138-pd-l7")
+            .await
+            .unwrap(),
+        SlotClaim::Claimed
+    );
+    let set = slots.slots_key(org);
+    let mut conn = redis.connection();
+    redis::cmd("ZADD")
+        .arg(&set)
+        .arg(1)
+        .arg(sid.to_hex())
+        .query_async::<()>(&mut conn)
+        .await
+        .unwrap();
+
+    let kept = slots.keep(org, sid, now_ms() + 60_000).await.unwrap();
+    assert!(!kept, "a lapsed lease stays lapsed");
+    assert_eq!(slots.held(org).await.unwrap(), 0, "no slot is taken");
+    assert_eq!(score(&mut conn, &set, sid).await, Some(1), "left as it was");
+}
+
+/// PR D's review, LOW 5 — a detached session's lease is kept past a lease's
+/// 90 s when its window is longer. Another session's claim in the org, and a
+/// renewal round that puts back the leases Redis lost, wrote the set's expiry
+/// as 90 s from then, which could take the kept lease with the set before its
+/// deadline. Both only lengthen an expiry now, and a restore never lowers a
+/// kept lease's score.
+#[tokio::test]
+async fn a_claim_or_a_restore_never_shortens_a_kept_lease() {
+    let app = one_slotted(WINDOW).await;
+    let (Some(slots), Some(redis)) = (
+        app.state.session_slots.clone(),
+        app.state.redis_pubsub.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let org = SlotScope::Org(ObjectId::new());
+    let pod = "fr138-pd-l5b";
+    let (user, device) = (ObjectId::new(), ObjectId::new());
+    let (kept, other) = (ObjectId::new(), ObjectId::new());
+    let lease = |session| Lease {
+        scope: org,
+        session,
+        user,
+        device,
+    };
+    assert_eq!(
+        slots.claim(org, kept, user, device, 2, pod).await.unwrap(),
+        SlotClaim::Claimed
+    );
+    let until = now_ms() + 130_000;
+    assert!(slots.keep(org, kept, until).await.unwrap(), "kept");
+    let set = slots.slots_key(org);
+    let holder = holder_key(&app, kept);
+    let mut conn = redis.connection();
+
+    assert_eq!(
+        slots.claim(org, other, user, device, 2, pod).await.unwrap(),
+        SlotClaim::Claimed
+    );
+    let left = pttl(&mut conn, &set).await;
+    assert!(
+        left > 120_000,
+        "a claim leaves the set's longer expiry alone, not {left} ms"
+    );
+
+    slots
+        .restore(&[lease(other), lease(kept)], pod)
+        .await
+        .unwrap();
+    for key in [&set, &holder] {
+        let left = pttl(&mut conn, key).await;
+        assert!(
+            left > 120_000,
+            "a restore leaves {key}'s longer expiry alone, not {left} ms"
+        );
+    }
+    assert_eq!(
+        score(&mut conn, &set, kept).await,
+        Some(until),
+        "a restore never lowers a kept lease"
+    );
+}
+
+/// PR D's review, a test gap (review 1, L5's renewal race) — a renewal
+/// round can be in flight when a session detaches, and its lease is kept to
+/// `resume_by` plus 10 s, past the 90 s the round writes. The round only
+/// raises a lease (`GT` on the score and on both expiries): the kept lease
+/// stands, and is answered as missing, so the hub, which no longer holds the
+/// session, does not put it back. Without `GT` the round cut it to 90 s.
+#[tokio::test]
+async fn a_renewal_never_shortens_a_kept_lease() {
+    let app = one_slotted(WINDOW).await;
+    let (Some(slots), Some(redis)) = (
+        app.state.session_slots.clone(),
+        app.state.redis_pubsub.clone(),
+    ) else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let org = SlotScope::Org(ObjectId::new());
+    let (sid, user, device) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+    assert_eq!(
+        slots
+            .claim(org, sid, user, device, 1, "fr138-pd-gt")
+            .await
+            .unwrap(),
+        SlotClaim::Claimed
+    );
+    let until = now_ms() + 130_000;
+    assert!(slots.keep(org, sid, until).await.unwrap(), "kept");
+
+    let lease = Lease {
+        scope: org,
+        session: sid,
+        user,
+        device,
+    };
+    let missing = slots.renew(std::slice::from_ref(&lease)).await.unwrap();
+    assert_eq!(
+        missing,
+        vec![lease],
+        "a lease the round did not raise is answered missing"
+    );
+    let set = slots.slots_key(org);
+    let mut conn = redis.connection();
+    assert_eq!(
+        score(&mut conn, &set, sid).await,
+        Some(until),
+        "the kept score stands"
+    );
+    for key in [set.clone(), holder_key(&app, sid)] {
+        let left = pttl(&mut conn, &key).await;
+        assert!(left > 120_000, "{key} keeps the kept expiry, not {left} ms");
+    }
+}
+
+/// PR D's review, a test gap — another session took the org's one slot
+/// during the gap, on another pod. The device's claim wins its commit and
+/// then finds the org full: the session ends, the device is told
+/// `agent_disconnect`, the row ends with that reason at the number the claim
+/// committed, and no lease of the session is left.
+#[tokio::test]
+async fn a_resumed_session_whose_slot_another_took_during_the_gap_ends() {
+    let app = one_slotted(WINDOW).await;
+    let Some(slots) = app.state.session_slots.clone() else {
+        eprintln!("skipping: no Redis available");
+        return;
+    };
+    let seeded = app.seed_tenant("fr138pdfull").await;
+    scope_all(&app).await;
+    let org = SlotScope::Org(tenant_of(&seeded));
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-pd-full").await;
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    let (_ctl, sid) = go_live(&app, &seeded.admin.access_token, agent_id, &mut agent).await;
+    wait_row(&app, sid, "the session goes live", open).await;
+    drop_socket(agent).await;
+    let r = wait_row(&app, sid, "the row records the detach", detached).await;
+    let read_at = attach_seq(&r);
+
+    // The slot goes to another session, held by another pod.
+    slots.release(org, sid).await.unwrap();
+    assert_eq!(
+        slots
+            .claim(
+                org,
+                ObjectId::new(),
+                ObjectId::new(),
+                ObjectId::new(),
+                1,
+                "fr138-pd-other",
+            )
+            .await
+            .unwrap(),
+        SlotClaim::Claimed
+    );
+
+    let mut agent2 = hello(&app, &token, &[RESUME], &[sid]).await;
+    let answer = answer_for(&mut agent2, sid, WITHIN)
+        .await
+        .expect("the claim is answered");
+    assert_eq!(answer["t"], "rc:terminate", "{answer}");
+    assert_eq!(answer["reason"], "agent_disconnect", "{answer}");
+    let r = wait_row(&app, sid, "the row ends", ended).await;
+    assert_eq!(end_reason(&r), Some("agent_disconnect"), "{r}");
+    assert_eq!(
+        attach_seq(&r),
+        read_at + 1,
+        "fenced at the number committed: {r}"
+    );
+    assert!(app.state.fleet().rc_hub.session_snapshot(sid).is_none());
+    assert_eq!(
+        slots.held(org).await.unwrap(),
+        1,
+        "only the other session's lease"
+    );
+}
+
+/// PR D's review, a test gap (review 2, N14) — the viewer of a DETACHED row
+/// asks every second, and the gate runs at most once per 5 s for it. A
+/// viewer removed from the org during the gap is still told `detached` inside
+/// those 5 s, and is refused `admin_terminated` at its first ask after them,
+/// the row ended with that reason. (The held-here path, whose gate always
+/// runs, is `a_viewer_removed_from_the_org_is_refused_at_its_rejoin`.)
+#[tokio::test]
+async fn a_viewer_removed_from_the_org_during_the_gap_is_refused_within_five_seconds() {
+    let app = one(WINDOW).await;
+    let seeded = app.seed_tenant("fr138pdgap").await;
+    scope_all(&app).await;
+    give_member(&app, &seeded, "controller", REMOTE_CONTROL).await;
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-pd-gap").await;
+    let member = seeded.member.access_token.clone();
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    let (_ctl, sid, _) = live_session(&app, &member, agent_id, &mut agent).await;
+    drop_socket(agent).await;
+    wait_row(&app, sid, "the row records the detach", detached).await;
+
+    let mut ctl = controller(&app, &member).await;
+    rejoin(&mut ctl, sid).await;
+    let first = rejoin_answer(&mut ctl, sid, WITHIN)
+        .await
+        .expect("the rejoin is answered");
+    let gated_at = tokio::time::Instant::now();
+    assert_eq!(first["t"], "rc:session.detached", "{first}");
+
+    let resp = app
+        .auth_delete(
+            &format!(
+                "/api/tenant/{}/member/{}",
+                seeded.tenant_id, seeded.member.id
+            ),
+            &seeded.admin.access_token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the member is removed");
+
+    rejoin(&mut ctl, sid).await;
+    let soon = rejoin_answer(&mut ctl, sid, WITHIN)
+        .await
+        .expect("the rejoin is answered");
+    if gated_at.elapsed() < Duration::from_secs(4) {
+        assert_eq!(
+            soon["t"], "rc:session.detached",
+            "inside the 5 s the gate does not run again: {soon}"
+        );
+    }
+
+    tokio::time::sleep_until(gated_at + Duration::from_millis(5_300)).await;
+    rejoin(&mut ctl, sid).await;
+    let refused = rejoin_answer(&mut ctl, sid, WITHIN)
+        .await
+        .expect("the rejoin is answered");
+    assert_eq!(refused["t"], "rc:terminate", "{refused}");
+    assert_eq!(refused["reason"], "admin_terminated", "{refused}");
+    let r = wait_row(&app, sid, "the session ends", ended).await;
+    assert_eq!(end_reason(&r), Some("admin_terminated"), "{r}");
+}
+
+/// PR D's review, LOW 8 — the rate's entry for a viewer goes once its
+/// session is bound: the viewer's asks while the row is detached are timed,
+/// and once the device has claimed the session back, the ask that binds it
+/// takes the entry with it. Before, an entry left only when the map held
+/// more than 1024, and then every ask walked the whole map.
+#[tokio::test]
+async fn a_rejoins_rate_entry_goes_once_its_session_is_bound() {
+    let app = one(WINDOW).await;
+    let seeded = app.seed_tenant("fr138pdl8").await;
+    scope_all(&app).await;
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-pd-l8").await;
+    let admin = seeded.admin.access_token.clone();
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    let (_ctl, sid) = go_live(&app, &admin, agent_id, &mut agent).await;
+    wait_row(&app, sid, "the session goes live", open).await;
+    drop_socket(agent).await;
+    wait_row(&app, sid, "the row records the detach", detached).await;
+
+    let mut ctl = controller(&app, &admin).await;
+    rejoin(&mut ctl, sid).await;
+    let waiting = rejoin_answer(&mut ctl, sid, WITHIN)
+        .await
+        .expect("the rejoin is answered");
+    assert_eq!(waiting["t"], "rc:session.detached", "{waiting}");
+    let gates = &remote(&app).rejoin_gates;
+    assert_eq!(gates.len(), 1, "the viewer's ask is timed");
+
+    let mut agent2 = hello(&app, &token, &[RESUME], &[sid]).await;
+    let claimed = answer_for(&mut agent2, sid, WITHIN)
+        .await
+        .expect("the claim is answered");
+    assert_eq!(claimed["t"], "rc:session.resumed", "{claimed}");
+    rejoin(&mut ctl, sid).await;
+    let bound = rejoin_answer(&mut ctl, sid, WITHIN)
+        .await
+        .expect("the rejoin is answered");
+    assert_eq!(bound["t"], "rc:session.resumed", "{bound}");
+    assert_eq!(gates.len(), 0, "a bound session's entry goes with the bind");
 }
