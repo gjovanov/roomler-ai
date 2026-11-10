@@ -405,6 +405,47 @@ impl RemoteSessionDao {
             .ok_or(super::base::DaoError::NotFound)
     }
 
+    /// FR-138 (review 2, N5) — a device's own end of a session whose end was
+    /// inferred BEFORE this connection: by the sweep, once the device had
+    /// been away past the window, or by an earlier connection's registration,
+    /// before the device could say how the session ended. As
+    /// [`Self::replace_inferred_end`] does for this connection's own
+    /// inference, the device's reason replaces `agent_disconnect` and
+    /// `end_source` is cleared, in the device's tenant and only for a row
+    /// naming the device; `ended_at` stays the row's own last clock. Not the
+    /// one-time close's rows: it dates an end at `started_at`, a bound and not
+    /// a clock, which a seen end must not carry. When it matched, the row's
+    /// `ended_at` (for the audit's trail); `None` = nothing matched.
+    pub async fn replace_earlier_inferred_end(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        session_id: ObjectId,
+        reason: EndReason,
+    ) -> DaoResult<Option<DateTime>> {
+        let before = self
+            .base
+            .collection()
+            .find_one_and_update(
+                doc! {
+                    "_id": session_id,
+                    "tenant_id": tenant_id,
+                    "agent_id": agent_id,
+                    "end_reason": bson::to_bson(&EndReason::AgentDisconnect)?,
+                    "end_source": { "$in": inferred_by_device_loss()? },
+                    // Every inferred end is dated, so a match always has one.
+                    "ended_at": { "$ne": bson::Bson::Null },
+                },
+                doc! {
+                    "$set": { "end_reason": bson::to_bson(&reason)? },
+                    "$unset": { "end_source": "" },
+                },
+            )
+            .return_document(mongodb::options::ReturnDocument::Before)
+            .await?;
+        Ok(before.and_then(|row| row.ended_at))
+    }
+
     /// FR-138 P1b-2 — a device's own end of a session that its registration
     /// just ended by inference, reported after its hello (spec §4.4, AC4):
     /// the reason the device gives (`host_disconnect`, `idle_timeout`,
@@ -424,6 +465,9 @@ impl RemoteSessionDao {
     ///   session for the device's earlier connection): a seen end, unmarked,
     ///   so `ended_at` stays the reap's (`now` when this lands first).
     ///
+    /// Either way an end the sweep or another pod's registration inferred
+    /// first (review 2, N5) is replaced the same way, keeping its clock.
+    ///
     /// A row someone else ended meanwhile (an admin's end) matches neither
     /// shape and is left alone. `false` = nothing matched.
     pub async fn replace_inferred_end(
@@ -442,11 +486,13 @@ impl RemoteSessionDao {
         let disconnect = bson::to_bson(&EndReason::AgentDisconnect)?;
         let closed = bson::to_bson(&SessionPhase::Closed)?;
         let reason = bson::to_bson(&reason)?;
+        // Review 2, N5 — the sweep's inference as well as a registration's:
+        // whichever reached the row first, the device's own end replaces it.
         let (inferred, set) = match inferred_at {
             Some(at) => (
                 doc! {
                     "end_reason": disconnect,
-                    "end_source": bson::to_bson(&EndSource::Registration)?,
+                    "end_source": { "$in": inferred_by_device_loss()? },
                 },
                 doc! {
                     "phase": closed,
@@ -455,7 +501,14 @@ impl RemoteSessionDao {
                 },
             ),
             None => (
-                doc! { "end_reason": disconnect, "end_source": { "$exists": false } },
+                {
+                    // The reap's seen end (no `end_source`; `null` in `$in`
+                    // matches an absent field), or an inference that reached
+                    // the row before it.
+                    let mut sources = inferred_by_device_loss()?;
+                    sources.insert(0, bson::Bson::Null);
+                    doc! { "end_reason": disconnect, "end_source": { "$in": sources } }
+                },
                 doc! {
                     "phase": closed,
                     "end_reason": reason,
@@ -683,6 +736,16 @@ fn after_filter((created_at, id): RowCursor) -> bson::Document {
         { "created_at": { "$gt": created_at } },
         { "created_at": created_at, "_id": { "$gt": id } },
     ]}
+}
+
+/// FR-138 (review 2, N5) — the inferred ends a device's own end may replace:
+/// the registration read's and the sweep's. Both ended a session because its
+/// device's connection went, and both are dated by the row's own last clock.
+fn inferred_by_device_loss() -> DaoResult<Vec<bson::Bson>> {
+    Ok(vec![
+        bson::to_bson(&EndSource::Registration)?,
+        bson::to_bson(&EndSource::Sweep)?,
+    ])
 }
 
 /// FR-138 P1b-2 (P1b-1's review, L3) — the longest a background read of the

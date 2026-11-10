@@ -6,11 +6,14 @@
 //! between pods, and what is here is the in-memory side of each step.
 //!
 //! * **The detach** ([`Hub::detach_agent_sessions`]): a connection that was
-//!   announced a window loses its socket. Each LIVE session leaves this hub
-//!   without ending: its row is marked `detached_at` and `resume_by`, fenced
-//!   at the number the hub held; its FR-115 slot is kept; its viewer is told
-//!   `rc:session.detached`. A session not yet live, and an external one
-//!   (D3), end as they always have.
+//!   announced a window loses its socket. Each live session its viewer may
+//!   hold (told `resume_secs`, not external) leaves this hub without ending:
+//!   its row is marked `detached_at` and `resume_by`, fenced at the number
+//!   the hub held; its FR-115 slot is kept; its viewer is told
+//!   `rc:session.detached`. A session not yet live, an external one (D3), and
+//!   one that began before its device was announced a window (its viewer
+//!   was never told it may hold it, so it would never rejoin) end as they
+//!   always have.
 //! * **The claim's bookkeeping**: registration holds a place in the device's
 //!   capacity for each session the hello claims back ([`Registration`]). The
 //!   module that owns remote sessions decides each claim from the row and the
@@ -33,7 +36,7 @@ use std::time::Duration;
 use bson::DateTime;
 use bson::oid::ObjectId;
 use parking_lot::Mutex;
-use roomler_ai_remote_control::models::{AuditKind, EndReason, EndSource, SessionPhase};
+use roomler_ai_remote_control::models::{AuditKind, EndReason, EndSource};
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
 use roomler_ai_remote_control::signaling::ServerMsg;
@@ -238,9 +241,18 @@ pub(super) fn sort_claims(
 
 impl Hub {
     /// FR-138 — the drop of a connection that was announced a window. Each
-    /// LIVE session of the device leaves this hub without ending (the device
-    /// keeps its peer), until `resume_by` = now plus the window; a session not
-    /// yet live, and an external one (D3), end as they always have.
+    /// live session of the device its viewer may hold leaves this hub without
+    /// ending (the device keeps its peer), until `resume_by` = now plus the
+    /// window; a session not yet live, and an external one (D3), end as they
+    /// always have.
+    ///
+    /// Review 2, N3 — so does a session whose viewer was never told
+    /// `resume_secs`: it began before its device was announced a window (the
+    /// device entered the scope mid-session). Its page ignores
+    /// `rc:session.detached` and never rejoins, so a session kept for it
+    /// would wait a whole window for nobody and then end anyway; ended now,
+    /// the page hears `agent_disconnect` and redials at once, as before
+    /// FR-138. The predicate is the hold's own ([`super::hold::held_for_viewer`]).
     pub(super) fn detach_agent_sessions(&self, agent_id: ObjectId, window_secs: u32) {
         // Collected first: the map is written below.
         let mine: Vec<(ObjectId, bool)> = self
@@ -250,7 +262,7 @@ impl Hub {
             .filter_map(|e| {
                 let s = e.value().lock();
                 if s.agent_id == agent_id {
-                    Some((*e.key(), s.phase == SessionPhase::Active && !s.external))
+                    Some((*e.key(), super::hold::held_for_viewer(&s)))
                 } else {
                     None
                 }
@@ -393,6 +405,34 @@ impl Hub {
         Some(a.tenant_id)
     }
 
+    /// FR-138 (P1b-1's review, M4) — `session_id` is still one of `conn`'s
+    /// unanswered claims: this hub holds `conn` as the device's connection
+    /// (no later one displaced it) and nothing has answered the claim. Half
+    /// of "this is the device's newest connection"; the module that answers
+    /// claims adds the device's presence, which names the pod of its newest
+    /// connection.
+    pub fn claim_pending(&self, agent_id: ObjectId, conn: &ClientTx, session_id: ObjectId) -> bool {
+        self.inner
+            .agents
+            .get(&agent_id)
+            .is_some_and(|a| ptr_eq(&a.tx, conn) && a.pending_claims.contains(&session_id))
+    }
+
+    /// FR-115 — hold `lease` for `session_id` from here, unless the session
+    /// ended meanwhile (P1b-1's review, L13). An end takes the session out of
+    /// the map BEFORE it takes the lease out of `slotted`, so a lease put in
+    /// after that end would never be given back, and this pod's renewal round
+    /// would keep the org's slot taken for good. Checked after the insert:
+    /// whichever of the two removes the lease gives it back, exactly once.
+    fn hold_lease(&self, session_id: ObjectId, lease: Lease) {
+        self.inner.slotted.insert(session_id, lease);
+        if !self.inner.sessions.contains_key(&session_id)
+            && let Some((_, lease)) = self.inner.slotted.remove(&session_id)
+        {
+            self.release_slot(lease);
+        }
+    }
+
     /// FR-138 — a claim committed: rebuild the session on this hub, counted
     /// in the device's capacity from here (its place moves from the claims),
     /// its slot renewed from here, and its maximum length armed again from
@@ -404,9 +444,6 @@ impl Hub {
         conn: &ClientTx,
         r: ResumedSession,
     ) -> Resumed {
-        // Read before the agent's entry is locked: the entry's guard is never
-        // held while a session's lock is taken.
-        let held = self.held_for(r.session_id, agent_id);
         match self.take_claim(agent_id, conn, r.session_id, true) {
             Some(tenant_id) if tenant_id == r.tenant_id => {}
             Some(_) => {
@@ -419,9 +456,31 @@ impl Hub {
             }
             None => return Resumed::NotPending,
         }
+        // P1b-1's review, L13 — the held copy is read only once the claim is
+        // taken (and the entry's guard, taken in `take_claim`, dropped: it is
+        // never held while a session's lock is). Read first, a copy that ended
+        // in between was re-attached outside the map and never rebuilt.
+        let held = self.held_for(r.session_id, agent_id);
         let outcome = match held {
             Some(arc) => {
-                arc.lock().attach_seq = r.attach_seq;
+                // Review 2, N8 — a copy held for its viewer (no controller)
+                // keeps waiting for it, from here: the wait its viewer's
+                // departure armed is void once the number moves, so without a
+                // new one a page that never rejoins kept the session, its
+                // place and its slot for good.
+                let rearm = {
+                    let mut s = arc.lock();
+                    s.attach_seq = r.attach_seq;
+                    if s.controller_tx.is_none() {
+                        s.held_until = Some(super::hold::due_in(r.resume_secs));
+                        Some(s.controller_gen)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(turn) = rearm {
+                    self.arm_viewer_wait(r.session_id, turn, r.attach_seq, r.resume_secs);
+                }
                 Resumed::Reattached
             }
             None => {
@@ -448,7 +507,7 @@ impl Hub {
             }
         };
         if let Some(lease) = r.slot {
-            self.inner.slotted.insert(r.session_id, lease);
+            self.hold_lease(r.session_id, lease);
         }
         if let Some((left, limit)) = r.max_duration {
             self.arm_max_duration(r.session_id, r.attach_seq, left, limit);
@@ -627,7 +686,7 @@ mod tests {
     use super::*;
     use mongodb::Client;
     use roomler_ai_remote_control::audit::AuditSink;
-    use roomler_ai_remote_control::models::{ConsentMode, OsKind};
+    use roomler_ai_remote_control::models::{ConsentMode, OsKind, SessionPhase};
 
     async fn hub() -> Hub {
         // As the hub's own tests: Mongo is never contacted unless the sink

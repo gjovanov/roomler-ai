@@ -11,7 +11,9 @@
 //!   still holds a window outlives the viewer's socket. The hub keeps it with
 //!   no controller, tells the device nothing and writes nothing to the row,
 //!   until the viewer rejoins or the window ends, when it ends as the socket's
-//!   loss ended it before: `controller_hangup`.
+//!   loss ended it before: `controller_hangup`, marked `limit: hold_expired`
+//!   ([`LIMIT_HOLD_EXPIRED`]) so a reader can tell a resume its viewer never
+//!   rejoined from a hangup.
 //! * **The rejoin** ([`Hub::rejoin`]): the viewer's new socket is bound to the
 //!   session. The caller has checked the row names that person and run the
 //!   gate a request runs. A late call for the socket it replaced finds a
@@ -41,6 +43,16 @@ use roomler_core::cluster::session_slots::Lease;
 use tracing::info;
 
 use super::{EndWrite, Hub, ptr_eq};
+
+/// Review 2, N17 — the `limit` a held session ends with when its window ends
+/// with no rejoin, on the device's `rc:terminate` and in the audit's
+/// `session_ended`. The reason stays `controller_hangup`, as the viewer's
+/// socket loss ended it before FR-138; the mark is what tells a resume lost
+/// this way (a cached page that never rejoins, a session re-attached on
+/// another pod) from a person's hangup, and AC7's read counts it
+/// (`scripts/fr138-roll-read.sh`). Not an `end_source`: the session's time is
+/// real, not inferred, so its hours count. The device only logs a limit.
+pub(super) const LIMIT_HOLD_EXPIRED: &str = "hold_expired";
 
 /// A session its viewer may hold through the loss of the viewer's own socket:
 /// its viewer was told `resume_secs` (or a device's claim rebuilt it), it is
@@ -166,7 +178,11 @@ impl Hub {
                     window_secs,
                     "rc session held for its viewer: the window ended with no rejoin — ending it"
                 );
-                let _ = hub.end_own(session_id, EndReason::ControllerHangup, None);
+                let _ = hub.end_own(
+                    session_id,
+                    EndReason::ControllerHangup,
+                    Some(LIMIT_HOLD_EXPIRED),
+                );
             }
         });
     }

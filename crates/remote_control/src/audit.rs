@@ -292,6 +292,20 @@ async fn set_phase(
         .map(|_| ())
 }
 
+/// An end someone asked for (an admin's, the controller's, the device's, a
+/// consent verdict): written at any fencing number, and over an earlier SEEN
+/// end, as every end was before FR-138. FR-27 relies on that: a device with no
+/// prompt surface is audited `consent_timeout` and then ended
+/// `no_prompt_surface` on the same row, and the row reads the second.
+///
+/// FR-138 (review 2, N11) — but never over an INFERRED end (`end_source`
+/// set: the registration read, the sweep, the one-time close). Such a row
+/// was ended because the session was over, by the best evidence there was,
+/// and a later asked end can only come from a copy some pod still held of a
+/// session already ended (a half-open socket kept it): its reason and its
+/// `now` would rewrite the row's end and leave the mark on it. `{end_source:
+/// null}` matches a row with no `end_source` at all, which is every row but
+/// an inferred one.
 async fn end_session(
     sessions: &Collection<RemoteSession>,
     ev: &RemoteAuditEvent,
@@ -299,7 +313,7 @@ async fn end_session(
 ) -> Result<(), mongodb::error::Error> {
     sessions
         .update_one(
-            doc! { "_id": ev.session_id },
+            doc! { "_id": ev.session_id, "end_source": bson::Bson::Null },
             doc! { "$set": {
                 "phase": bson::to_bson(&SessionPhase::Closed).unwrap_or(bson::Bson::Null),
                 "ended_at": ev.at,
