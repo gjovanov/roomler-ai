@@ -98,7 +98,7 @@ pub enum ServiceLogRole {
     /// daemon's `is_installer_step`, pinned against both WiX files. Each such
     /// process also writes a start line and an end line ([`begin_step`],
     /// [`end_step`]), and what it repairs in the machine tree is kept here,
-    /// beside the service's log, not in the SYSTEM profile's.
+    /// beside the service's log, not in a profile's log.
     Installer,
 }
 

@@ -1193,24 +1193,45 @@ flowchart LR
 Each step of its own that the per-Machine MSI runs is a deferred custom action with
 `Impersonate='no'`: one `roomlerd` verb, run as LocalSystem. Windows Installer throws away
 what such a process prints on stdout and stderr, and `msiexec /l*v` records only its return
-code. Until #3230 a step logged into LocalSystem's own profile, where nobody reads, and its
-answer and its error reached no file. Each step now logs into
+code. Until #3230 a step logged, like any command without a role, into its profile's data
+folder, and its answer and its error reached no file. Under a hand-run `msiexec` that profile
+was not LocalSystem's: the field read found 0.4.208's steps in the log of the account that ran
+msiexec (`%LOCALAPPDATA%\roomler\roomler\data\logs\roomlerd.log.*`), and only a step started as
+LocalSystem itself, from a scheduled task, in LocalSystem's
+([#3230](https://github.com/gjovanov/roomler-ai/issues/3230#issuecomment-6775283704)). An upgrade
+by the updater, where msiexec runs as LocalSystem, was not run. Each step now logs into
 `%PROGRAMDATA%\Roomler\roomler\service-logs\roomlerd-installer.log`, beside the service's
 own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:120`):
 
 | Custom action | The verb | When it runs |
 |---|---|---|
-| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, sequenced at `:591`) | `service install --as-service` | every install, repair and upgrade, first after `InstallFiles` |
-| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:402`, `:607`) | `cleanup-legacy-install --target-flavour perMachine` | right after `RegisterService`: both are `After='InstallFiles'`, and WiX breaks the tie in document order |
+| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:402`, sequenced at `:607`) | `cleanup-legacy-install --target-flavour perMachine` | every install, repair and upgrade, first after `InstallFiles` |
+| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, `:591`) | `service install --as-service` | every install, repair and upgrade, right after `CleanupLegacyPerUser` |
 | `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:445`, `:630`), and its rollback partner `RollbackSystemContext` (`:463`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
 | `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:482`, `:633`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
 | `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:506`, `:636`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
 | `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:639`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
 
+The order is the built MSI's `InstallExecuteSequence`, not the order of the file.
+`CleanupLegacyPerUser` and `RegisterService` are both `After='InstallFiles'`, and WiX v3 (which
+`cargo wix` runs in the release lane) numbers actions scheduled after the same action in the
+order of their names: `InstallFiles` is 4000, `CleanupLegacyPerUser` 4001 and `RegisterService`
+4002. The three after `RestoreServiceEnvironment` follow the same rule against the file's order:
+`DisableSystemContext` 4005, `KeepSystemContext` 4006, `RollbackSystemContext` 4007, then
+`EnableSystemContext` 4008 after its rollback partner. 0.4.208 and the two test builds of the
+fix carry these numbers. On a Windows 11 lab guest msiexec's log showed this order on every
+install, repair and upgrade, and the installer log's timestamps agree
+([#3640](https://github.com/gjovanov/roomler-ai/issues/3640#issuecomment-6775284876)). On an
+upgrade the old product goes first: `MajorUpgrade` removes it right after `InstallInitialize`
+(`agents/roomlerd/wix-perMachine/main.wxs:91`), so its `service uninstall --as-service` runs
+before the new product's cleanup, `service install --as-service` and SystemContext step.
+
 `resolve_config_path` repairs the machine tree for every SYSTEM command
-(`agents/roomlerd/src/app.rs:1142`), so on an upgrade the first `machine tree: repaired` line
-comes from the first of these steps to run: the old product's `service uninstall --as-service`,
-then `RegisterService`'s. It is in this log once that step's build has #3230.
+(`agents/roomlerd/src/app.rs:1142`), so the first `machine tree: repaired` line comes from the
+first of these steps to run: on an install or a repair the cleanup step, and on an upgrade the
+old product's `service uninstall --as-service`, then the new product's cleanup step. It is in
+this log once that step's build has #3230. Which step writes it is read from the source, not
+seen in the field: on a clean lab guest no step had anything to repair, so none wrote it.
 
 What a step writes, in order. Its own lines have the target `roomler_node_core::logging::step`
 (`crates/agent-core/src/logging.rs:560`), which the filter keeps at INFO under any `RUST_LOG`:
