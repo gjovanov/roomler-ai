@@ -1384,6 +1384,106 @@ mod socket_inherit_tests {
     }
 }
 
+/// The overlay TUN against a real Linux kernel: a device the daemon brings
+/// up is close-on-exec, so no program the daemon starts holds it.
+///
+/// Creating a TUN needs `CAP_NET_ADMIN`, hence root and the
+/// `ROOMLER_TUN_KERNEL_TEST=1` opt-in (CI's "Overlay TUN against real kernel
+/// networking" step). Anywhere else the test says by name that it skipped.
+#[cfg(all(test, target_os = "linux", feature = "overlay-l3"))]
+mod tun_kernel_tests {
+    use std::net::Ipv4Addr;
+    use std::os::fd::RawFd;
+    use tunnel_core::overlay::tun::{SystemTun, TunOptions};
+
+    const NAME: &str = "tun_kernel_tests::the_overlay_tun_reaches_no_child";
+
+    /// The descriptors `pid` holds on the TUN clone device.
+    fn tun_fds(pid: &str) -> Vec<RawFd> {
+        let dir = format!("/proc/{pid}/fd");
+        let mut fds = Vec::new();
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir}: {e}")) {
+            let entry = entry.expect("a /proc fd entry");
+            let is_tun = std::fs::read_link(entry.path())
+                .map(|t| t == std::path::Path::new("/dev/net/tun"))
+                .unwrap_or(false);
+            if is_tun && let Ok(fd) = entry.file_name().to_string_lossy().parse() {
+                fds.push(fd);
+            }
+        }
+        fds
+    }
+
+    #[tokio::test]
+    async fn the_overlay_tun_reaches_no_child() {
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("SKIPPED {NAME}: set ROOMLER_TUN_KERNEL_TEST=1 and run as root");
+            return;
+        }
+        let mut opts = TunOptions::legacy(
+            Ipv4Addr::new(100, 127, 250, 1),
+            Ipv4Addr::new(255, 255, 255, 0),
+            1280,
+        );
+        opts.name = "rltest-cloexec".into();
+        let tun = match SystemTun::up_with(opts) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("SKIPPED {NAME}: no TUN can be created here ({e})");
+                return;
+            }
+        };
+
+        let ours = tun_fds("self");
+        assert!(!ours.is_empty(), "the bring-up holds no /dev/net/tun");
+        for fd in &ours {
+            // SAFETY: F_GETFD on a descriptor the device owns.
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+                "TUN fd {fd} is not close-on-exec (flags {flags:#x})"
+            );
+        }
+
+        // A program started with no sweep of its own.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a plain child");
+        let held = tun_fds(&child.id().to_string());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(held.is_empty(), "a plain child holds the TUN at {held:?}");
+
+        // A command through the exec engine, as Fleet RPC and SSH run one.
+        let req = crate::exec::ExecRequest {
+            request_id: "tun-kernel".into(),
+            shell: String::new(),
+            command: "ls -l /proc/self/fd".into(),
+            timeout_ms: 30_000,
+            max_output_bytes: 0,
+            cwd: None,
+            caller: "test".into(),
+            run_as: crate::exec::RunAs::Daemon,
+            start_in_home: false,
+            session_owned: false,
+        };
+        let out = crate::exec::ExecEngine::new()
+            .run(req, &crate::exec::Redactor::default())
+            .await;
+        assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+        assert!(
+            !out.stdout.contains("/dev/net/tun"),
+            "a command holds the TUN:\n{}",
+            out.stdout
+        );
+        drop(tun);
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // FR-47 — the last join the server refused
 // ───────────────────────────────────────────────────────────────────────────

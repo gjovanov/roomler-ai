@@ -846,19 +846,18 @@ too ([fleet-rpc.md](fleet-rpc.md)). An SSH prompt shows no org line yet:
 
 ## 12. Open items
 
-- **The refusal path runs against a real kernel; the two-control-plane
-  field run is now unblocked but not yet done.** `TunMux`'s bookkeeping was
-  always unit-tested against a fake device; the half that touches the OS —
-  a REFUSED registration leaving no address behind, a disjoint block really
-  getting one, a released org really losing it — now runs on every CI push
-  (`tun_kernel_tests`, root + `ROOMLER_TUN_KERNEL_TEST=1`, skipped
-  everywhere else). It earned its keep on its first run by catching
-  `deregister` handing back the block BASE instead of the org's address.
-  What is still untested is the same path driven by two real control
-  planes. That needed a third organization on the legacy `/10` and a way to
-  retire it afterwards; **archiving now exists** (§13), so the remaining
-  work is scheduling it on a disposable host — deliberately not a prod
-  cluster node, since the test is an intentional address collision.
+- **The shared-TUN refusal path — RETIRED with the mux.** `TunMux`'s
+  kernel half (a REFUSED registration leaving no address behind, a disjoint
+  block really getting one, a released org really losing it) ran on every
+  CI push as `tun_kernel_tests`, and caught `deregister` handing back the
+  block BASE on its first run. #516 removed the shared-TUN mux and that
+  module with it; each organization now gets its own adapter. The CI step
+  that ran it ran no test from then until `tun_kernel_tests` came back with
+  one about the overlay TUN's descriptor
+  (`agents/roomlerd/src/overlay.rs:1394`, root +
+  `ROOMLER_TUN_KERNEL_TEST=1`, a named skip everywhere else). The step,
+  "Overlay TUN against real kernel networking", now fails unless the test
+  ran.
 - **macOS meshes, including multi-org — CLOSED.** `add_peer_route`,
   `add_cidr_route`, `del_*`, `purge_one` and the derived-v6 assign were
   `#[cfg(not(any(linux, windows)))]` no-ops and `add_address_sync` refused

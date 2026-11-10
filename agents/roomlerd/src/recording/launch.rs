@@ -533,6 +533,9 @@ fn launch_piped(mut cmd: tokio::process::Command) -> std::io::Result<Launched> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(false);
+    // The recorder keeps its stdio and nothing else of the daemon's.
+    #[cfg(unix)]
+    tunnel_core::child::inherit_only_stdio_async(&mut cmd);
     let mut child = cmd.spawn()?;
     let stdin = child
         .stdin

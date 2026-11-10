@@ -2351,7 +2351,12 @@ fn install_tarball_linux(euid: u32, tarball: &std::path::Path) -> Result<u32> {
 fn run_linux_install_candidates(euid: u32, path: &str) -> Result<u32> {
     let mut attempts: Vec<String> = Vec::new();
     for (bin, args) in linux_install_candidates(euid, path) {
-        let mut child = match std::process::Command::new(bin).args(&args).spawn() {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(&args);
+        // The installer may outlive this daemon: it keeps its stdio and
+        // nothing else of ours.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(bin, error = %e, "update install: candidate not spawnable");
@@ -2466,10 +2471,12 @@ fn spawn_installer_for_flavour_inner(installer_path: &std::path::Path) -> Result
         // silently does nothing, on the one platform whose grants are keyed to
         // the binary. `/` is also what scripts/install.sh uses, so the update
         // path and the install path finally agree.
-        let child = std::process::Command::new("installer")
-            .args(["-pkg", &path_str, "-target", "/"])
-            .spawn()
-            .context("spawning installer(8)")?;
+        let mut cmd = std::process::Command::new("installer");
+        cmd.args(["-pkg", &path_str, "-target", "/"]);
+        // The installer outlives this daemon: it keeps its stdio and nothing
+        // else of ours.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
+        let child = cmd.spawn().context("spawning installer(8)")?;
         Ok(child.id())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -2776,6 +2783,9 @@ fn spawn_watcher(
     // #2718 — the watcher outlives whoever ran this (by ~30 s). It logs to its
     // file; nothing reads its stdio.
     without_caller_stdio(&mut cmd);
+    // ...and it keeps nothing else of ours either.
+    #[cfg(unix)]
+    tunnel_core::child::inherit_only_stdio(&mut cmd);
     let _child = cmd
         .spawn()
         .context("spawning post-install-watch subprocess")?;

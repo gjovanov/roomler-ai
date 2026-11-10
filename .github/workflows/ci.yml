@@ -736,20 +736,20 @@ jobs:
         # tunnel-core's `pgp_verify`, tested in the step above.
         run: cargo test -p roomler-cli --lib
 
-      - name: Multi-org shared TUN against real kernel networking
-        # The mux's bookkeeping is unit-tested against a fake device; the half
-        # that touches the OS — a REFUSED registration leaving no address
-        # behind, a disjoint block really getting one, a released org really
-        # losing it — was never run against a kernel, because reproducing it
-        # in the field needs a third organization and there is no way to
-        # retire a throwaway one (docs/multi-org.md §12). A `tun` device is
-        # free here, so it runs on every push instead.
+      - name: Overlay TUN against real kernel networking (tun_kernel_tests)
+        # A real TUN, brought up as the daemon brings it up: its descriptor
+        # is close-on-exec, and neither a plain child nor an exec-engine
+        # command holds it (`agents/roomlerd/src/overlay.rs`,
+        # `tun_kernel_tests`). The shared-TUN mux this step was made for went
+        # with #516, and the step then ran no test at all
+        # (docs/multi-org.md §12). It now fails unless the test RAN.
         #
-        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test skips
-        # itself silently everywhere else, including developer machines).
+        # Needs CAP_NET_ADMIN, hence sudo + the env opt-in (the test says by
+        # name that it skipped everywhere else, including developer machines).
         # Built as the normal user and only RUN under sudo, so root never
         # takes ownership of the shared cargo cache.
         run: |
+          set -o pipefail
           sudo modprobe tun || true
           # Build FIRST with human diagnostics. The json pass below would
           # otherwise swallow a compile error into records jq drops, leaving
@@ -760,7 +760,12 @@ jobs:
                 | jq -r 'select(.profile.test == true) | .executable' | head -1)
           echo "test binary: $BIN"
           sudo ROOMLER_TUN_KERNEL_TEST=1 "$BIN" tun_kernel_tests \
-            --test-threads=1 --nocapture
+            --test-threads=1 --nocapture 2>&1 | tee tun-kernel-tests.txt
+          if ! grep -qE '^test result: ok\. [1-9][0-9]* passed' tun-kernel-tests.txt \
+             || grep -q 'SKIPPED' tun-kernel-tests.txt; then
+            echo "::error::tun_kernel_tests did not run against the kernel"
+            exit 1
+          fi
 
       - name: DERP dialer — unit tests (#2512)
         # `derp.rs` compiles only under an overlay feature. Its suite already
@@ -1421,12 +1426,16 @@ jobs:
       # reads this test process, and its real report must parse.
       # FR-112 P3: and `encode::clock::`, a thread's QoS class: it reads back,
       # and a thread it starts does not inherit it, which only a Mac can say.
+      # And `exec::tests::a_command_keeps_only_its_standard_streams`: a command
+      # keeps 0-2 only, which on a Mac rests on the sweep alone. A filter on
+      # the build already made here; the pty's own tests need `ssh-server`,
+      # which this build does not carry.
       - name: cargo check + test the agent's Mac-only units
         env:
           ROOMLERD_TEST_MAC_PASTEBOARD: "1"
         run: |
           cargo check -p roomlerd --lib --bins
-          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock::
+          cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the

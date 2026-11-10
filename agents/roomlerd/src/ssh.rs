@@ -1244,6 +1244,10 @@ mod sshd {
                 let _ = handle.close(channel).await;
                 return Ok(());
             }
+            // It keeps its three pipes and nothing else, as every program a
+            // session runs does.
+            #[cfg(unix)]
+            tunnel_core::child::inherit_only_stdio_async(&mut cmd);
 
             let mut child = match cmd.spawn() {
                 Ok(c) => c,

@@ -1808,6 +1808,12 @@ impl ExecEngine {
             );
             return ExecOutcome::failed(e);
         }
+        // The command keeps its standard streams and nothing else: in the
+        // child, after the drop, each descriptor above stderr is marked
+        // close-on-exec. It marks and never closes, so it cannot undo the
+        // drop.
+        #[cfg(unix)]
+        tunnel_core::child::inherit_only_stdio_async(&mut cmd);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -2349,6 +2355,61 @@ mod tests {
             "the fed bytes never reached the command: stdout {:?}",
             out.stdout
         );
+    }
+
+    /// A command keeps its standard streams and nothing else: a descriptor
+    /// the daemon holds without close-on-exec does not reach it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_keeps_only_its_standard_streams() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        // SAFETY: a NUL-terminated path; the result is checked before use.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(
+            fd >= 0,
+            "open /dev/null: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fd` was just returned by open and is owned by nothing else.
+        let stray = unsafe { OwnedFd::from_raw_fd(fd) };
+        let n = stray.as_raw_fd();
+
+        let out = engine()
+            .run(
+                req(&format!(
+                    "if [ -e /dev/fd/{n} ]; then echo FD-OPEN; else echo FD-CLOSED; fi"
+                )),
+                &Redactor::default(),
+            )
+            .await;
+        assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "FD-CLOSED", "the command held fd {n}");
+
+        // Linux lists them all: 0-2, and the directory `ls` itself reads.
+        #[cfg(target_os = "linux")]
+        {
+            let out = engine()
+                .run(req("ls -l /proc/self/fd"), &Redactor::default())
+                .await;
+            assert_eq!(out.error, None, "stderr was: {}", out.stderr);
+            let mut fds = Vec::new();
+            for line in out.stdout.lines() {
+                let Some((lhs, target)) = line.split_once(" -> ") else {
+                    continue;
+                };
+                let fd: i32 = lhs
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("no fd number in {line:?}"));
+                if fd > 2 && !target.starts_with("/proc/") {
+                    panic!("the command holds fd {fd} -> {target}:\n{}", out.stdout);
+                }
+                fds.push(fd);
+            }
+            assert!(fds.starts_with(&[0, 1, 2]), "{}", out.stdout);
+        }
+        drop(stray);
     }
 
     /// The control, and Fleet RPC's contract: with no feed the command reads

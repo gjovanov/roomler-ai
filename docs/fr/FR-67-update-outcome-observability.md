@@ -44,7 +44,7 @@ nothing being waited *for*: the install finished before the watcher existed. The
 **2. The cgroup teardown then removes any chance of finishing.** Both packaged
 units ship with no `KillMode` (`packaging/linux/roomlerd.service`,
 `roomler.service`) ⇒ systemd's default `control-group`. `spawn_watcher` launches
-the watcher as a plain child (`updater.rs:2432`) on the reasoning that it "is
+the watcher as a plain child (`updater.rs:2437`) on the reasoning that it "is
 reparented to init and runs to completion on its own" — but reparenting to PID 1
 does not leave the cgroup. `docs/fr/FR-36-wayland-capture.md:371` already recorded
 this exact lesson for a different subsystem.
@@ -187,7 +187,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:360`); `UpdateRefusal` and `update_refusal()` (`:576`, `:1255`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5557`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:2914`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:2896`), else `self` |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5557`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:2924`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:2906`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`signaling.rs:6926`, `:6942`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1729`): a 409 on one device (`:1776`), a `refused` row with its `refused_code` in a bulk (`:1908`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |

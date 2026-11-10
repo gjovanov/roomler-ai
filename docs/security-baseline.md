@@ -506,6 +506,15 @@ route enforces `exp`.
   every action re-checks the row, but the device's own status still read
   "connected".
 
+### A program the daemon starts keeps its standard streams only
+
+A command, a terminal session's shell, `sftp-server`, an app launch, the virtual
+desktop, the recorder and an installer keep 0-2 and nothing else of the daemon's:
+the daemon's own descriptors (a session's pty ends, the overlay TUN) are close-on-exec,
+those children mark everything above stderr close-on-exec before they exec, and on
+Windows a terminal session's own pipe handles are not inheritable
+([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)).
+
 ### An enrollment token is spent once, through one owner (#3328)
 
 **A single-use enrollment token enrolls once**, at every door: the daemon's

@@ -119,6 +119,8 @@ impl LinuxWm {
                     .map_err(|e| anyhow::anyhow!("cannot run `{program}` as {user}: {e}"))?;
             }
         }
+        // What it launches keeps its stdio and nothing else of the daemon's.
+        tunnel_core::child::inherit_only_stdio(&mut c);
         Ok(c)
     }
 
