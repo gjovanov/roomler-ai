@@ -214,8 +214,8 @@
          the SPA sees the user code, the page to open and the clock. -->
     <section id="step-token" class="step" hidden>
       <h1>Join your organization</h1>
-      <p class="lead" id="token-lead">Approve this device from your browser — nothing to
-      copy. Or paste a token you already have.</p>
+      <p class="lead" id="token-lead">Approve this device from your browser with a short
+      code. Or paste a token you already have.</p>
 
       <div id="pair-card" class="card">
         <!-- Idle: the primary action. -->
@@ -231,8 +231,11 @@
 
         <!-- Waiting: the code, large; the page; the clock. -->
         <div id="pair-active" hidden>
-          <p class="muted">Type this code at <code id="pair-uri"></code>:</p>
+          <p class="muted">Type this code in your browser, at <code id="pair-uri"></code>:</p>
           <div class="pair-code" id="pair-code" aria-live="polite">····-····</div>
+          <p class="muted" id="pair-cover-note">The browser opens over this window and can
+          hide the code. Press Copy code first to take it along, then paste it into the
+          page.</p>
           <footer class="actions actions-start">
             <button id="pair-copy" class="secondary">Copy code</button>
             <button id="pair-open">Open the page</button>

@@ -201,6 +201,66 @@ mod front_tests {
         );
     }
 
+    /// #3395 — after Open the browser comes up over this window and covers the
+    /// code the page asks for, and neither page said where the code was. The
+    /// waiting state says it before Open: the code is typed in the browser, the
+    /// browser opens over this window, and Copy code takes the code along. And
+    /// no line of the step says "nothing to copy" while a code has to be typed.
+    #[test]
+    fn the_pairing_step_says_where_the_code_goes_and_how_to_take_it_along() {
+        let html = include_str!("front/index.html");
+        let js = include_str!("front/app.js");
+        let mut wrong = Vec::new();
+
+        let from = html
+            .find("<div id=\"pair-active\"")
+            .expect("the waiting state");
+        let to = from
+            + html[from..]
+                .find("<!-- Approved")
+                .expect("the state after the waiting one");
+        let waiting = one_line(&visible_text(&html[from..to]));
+        for said in [
+            "Type this code in your browser",
+            "The browser opens over this window",
+            "Press Copy code first to take it along",
+        ] {
+            if !waiting.contains(said) {
+                wrong.push(format!("the waiting state does not say {said:?}"));
+            }
+        }
+
+        // The lead line is in the markup and in `renderPairing`, which sets it
+        // when the server offers pairing. Neither may say "nothing to copy".
+        let literals = js_string_literals(js);
+        if !literals
+            .iter()
+            .any(|l| l.starts_with("Approve this device from your browser"))
+        {
+            wrong.push("renderPairing's lead line moved; point this test at it".into());
+        }
+        let page = one_line(&visible_text(html)).to_ascii_lowercase();
+        if page.contains("nothing to copy") {
+            wrong.push("index.html still says \"nothing to copy\"".into());
+        }
+        for literal in literals {
+            if one_line(literal)
+                .to_ascii_lowercase()
+                .contains("nothing to copy")
+            {
+                wrong.push(format!(
+                    "app.js still says \"nothing to copy\": {literal:?}"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `text` with every run of whitespace, line breaks included, as one space.
+    fn one_line(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     /// The text of `html` a person sees: markup and comments dropped.
     fn visible_text(html: &str) -> String {
         let mut text = String::new();

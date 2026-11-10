@@ -1411,7 +1411,7 @@ function renderPairing() {
   document.getElementById("pair-card").hidden = !available;
 
   document.getElementById("token-lead").textContent = available
-    ? "Approve this device from your browser — nothing to copy. Or paste a token you already have."
+    ? "Approve this device from your browser with a short code. Or paste a token you already have."
     : "This server does not offer pairing from the browser. Paste a fresh enrollment token.";
   const paste = document.getElementById("paste-wrap");
   document.getElementById("paste-summary").textContent = available
