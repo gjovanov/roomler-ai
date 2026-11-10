@@ -2,7 +2,7 @@
 
 Every enrolled device and every `roomler` tunnel client holds a long-lived credential the server issued. This page is what each one is, how it stays alive without hands on the machine (FR-103), and how it ends.
 
-> **The short version.** A device's agent token lives a year. The device renews it itself, 180 days early. A device that was off across its expiry renews within a 90-day grace when it comes back. Removing a device ends every token it was ever given, even if the same machine enrolls again and revives the row. A device connected at its removal is told at once and stops (#2267).
+> **The short version.** A device's agent token lives a year. The device renews it itself, 180 days early. A device that was off across its expiry renews within a 90-day grace when it comes back. Removing a device ends every token it was ever given, even if the same machine enrolls again and revives the row, and the revived row starts from a new device's settings (#3627). A device connected at its removal is told at once and stops (#2267).
 
 ## 1. The credentials
 
@@ -90,7 +90,7 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328).
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1158`; tunnel clients `crates/services/src/dao/tunnel_client.rs:335`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1309`; tunnel clients `crates/services/src/dao/tunnel_client.rs:335`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
@@ -99,12 +99,49 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 | the agent socket, decided before the upgrade (answers 401) | `ws_upgrade_agent`, `crates/modules/fleet/src/socket.rs:1425` |
 | DERP | `crates/modules/network/src/derp.rs:401` |
 | the tunnel-client socket | `crates/modules/network/src/tunnel.rs:2108` |
-| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:354` |
+| the tunnel-client HTTP routes | `accepted_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs:352` |
 
 - **The order at each site:** the deleted/quarantined check runs first, so a removed device still gets its typed `Goodbye AgentDeleted` and exits 7. The generation is compared only on a live row.
 - **The service credential** has no generation: a removal clears `exec_anchor` (#2133), which ends it.
 
 > ⚠️ Rows removed before FR-103 P1 reached the server keep generation 0, so their old tokens can still revive. That is accepted (the spec's decision 3): such rows are few, and only an old removal is affected.
+
+### A revived device starts from a new device's settings (#3627)
+
+The row comes back, but not what the removed device was allowed. Before #3627 a revive cleared `deleted_at` and nothing else, so the row came back with its SSH, exec and access policies, the org-relay and External access approvals, its connect code, approved routes, owner and labels, a pending config (pushed to the machine again on its first connect) and a standing key-rotation order, and the org's tunnel policies that named it applied to it again.
+
+`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:366`):
+
+| The row for `(tenant_id, machine_id)` | What the enrollment does |
+|---|---|
+| none | a new device (`AgentDao::create`), after the plan cap |
+| live: a device nobody removed (a lost token, a reinstall, `roomlerd re-enroll`) | refreshes it (`AgentDao::rehydrate`): os, version, the name unless an admin renamed it, the install method if the request says. **Everything it was allowed stays** |
+| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:326`) |
+
+What a revive keeps, and nothing else:
+
+| Kept | Why |
+|---|---|
+| `_id`, `tenant_id`, `machine_id` | the row's identity: sessions, audits, logs, crash reports and External access history hang off the id |
+| `created_at`, `enrolled_by` | when and by whom the row was first enrolled |
+| `token_gen` | the removal advanced it, so every token from before the removal stays refused ([above](#4-a-removal-ends-every-earlier-token)) |
+| `desired_config.revision` | a counter, so the next config saved for the device is one above every revision the row has used. The config itself is gone: nothing is requested |
+| a `Quarantined` status | a restriction, not a grant: enrolling the machine again must not be the way to lift a quarantine (nothing in the product sets one on a device; an operator does, in the database) |
+
+Everything else is what a new enrollment writes: every policy and approval at its closed default, no connect code, no approved routes, no key-rotation order, the machine's own name with no admin label or tag, and as owner the person whose enrollment token revived it. The device's own reports (capabilities, host key, device key, power, keep busy) wait for its first hello, as a new device's do. This holds by construction: the revive **replaces** the document with the one `AgentDao::new_row` builds for a new enrollment, so a field added later resets too.
+
+Before the row comes back, `HookRegistry::agent_revived` asks each holder to drop what it holds about the removed device (`network`, `crates/modules/network/src/hooks.rs:74`):
+
+- **its place in the org's tunnel policies**: its id leaves every live policy's subjects and targets (`TunnelPolicyDao::forget_agent`). A policy that named only this device is left naming nobody and grants nothing; it stays in the list to edit or delete;
+- **a lease its removal left behind**, normally none. A removal releases the device's overlay lease before the row goes; if that release did not happen, the leftover node goes through the same release (tombstone, then the pool, then the peers' `removes`). The device's first join then takes a fresh lease, as any device does ([overlay-communication.md](overlay-communication.md#address-leases--allocation-and-release)).
+
+A holder that cannot do its part stops the enrollment with a 503 and the row stays removed. The token is spent by then, so the retry needs a new one.
+
+**The races.** The revive is a compare-and-swap on the removal it read: the filter names the row's exact `deleted_at`, so a concurrent revive (the row is live) or a revive and a second removal (a new removal time, a higher `token_gen`) make it match nothing, and the route reads the row again. A stale read can never write an older generation back. The live refresh matches only a live row (`deleted_at: null`), so a removal that lands between the route's read and its write becomes a revive instead of being undone. After three rounds of such changes the enrollment answers 409.
+
+> ⚠️ A device removed by mistake therefore comes back blank: its policies, approvals, owner, name and tags are set again by hand. Removing a device is the way to end what it was allowed, and enrolling its machine again does not undo that. A device that was never removed keeps all of it.
+
+The server logs each revive: `enroll: a removed device enrolled again and starts from a new device's settings`, with the previous owner and the names (never the values) of the grants the removed device still held.
 
 ### A connected device is told at once (#2267)
 

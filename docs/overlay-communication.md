@@ -156,7 +156,13 @@ a tombstone holds neither its address nor its MagicDNS name.
 Two consequences worth knowing:
 
 - **Removal is final.** A removed machine that re-enrolls comes back as a *new*
-  node with a fresh address and a fresh name; the tombstone is never revived.
+  node with a fresh lease and a freshly de-duplicated name; the tombstone is never
+  revived. A fresh lease is the pool's head, so in an org whose pool holds no
+  older host it is the machine's own old address, handed out as it would be to
+  any joiner. Its agent row comes back as a new device too (#3627,
+  [`device-credentials.md`](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)):
+  before that row is live, the revive releases a lease the removal left behind
+  (normally none), through this same writer and in this order.
   Until it does, it takes no lease at all: a join is refused while the row behind
   the socket is a tombstone (#1829), or its org is archived (#3042), and it is the
   kick or the revocation poll that tells it why. A relay request naming a released

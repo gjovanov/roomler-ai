@@ -106,6 +106,27 @@ pub trait FleetLifecycle: Send + Sync {
         Ok(None)
     }
 
+    /// A REMOVED agent's machine is enrolling again, and its row is about to
+    /// come back as a new device (`AgentDao::revive`, #3627): drop whatever you hold
+    /// that names the removed device and would apply to the revived one,
+    /// because a new enrollment would not have it. `network` releases a
+    /// lease the removal did not, and takes the device out of the org's
+    /// tunnel policies.
+    ///
+    /// Runs BEFORE the row is revived, and a failing holder stops the
+    /// enrollment, so the row never turns live beside a grant that was meant
+    /// for the removed device. Idempotent: an enrollment that lost a race runs
+    /// it again.
+    async fn agent_revived(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        machine_id: &str,
+    ) -> anyhow::Result<()> {
+        let _ = (tenant_id, agent_id, machine_id);
+        Ok(())
+    }
+
     /// The agent's name changed. A holder of a derived label (the overlay
     /// node's MagicDNS name) propagates it and says what happened.
     async fn agent_renamed(
@@ -344,6 +365,24 @@ impl HookRegistry {
         Ok(released)
     }
 
+    /// Run every `agent_revived` hook in order, before a removed agent's row
+    /// comes back for a new enrollment. A failing holder stops the cascade and
+    /// the enrollment: reviving the row beside a grant a holder could not drop
+    /// would hand the removed device's grant to the new one.
+    pub async fn agent_revived(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        machine_id: &str,
+    ) -> anyhow::Result<()> {
+        for (module, hook) in self.fleet_lifecycles() {
+            hook.agent_revived(tenant_id, agent_id, machine_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{module}: agent_revived: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Run every `agent_renamed` hook in order; the first holder that had a
     /// live record decides the outcome. A failing hook is an error for the
     /// caller to report — a rename that did not reach the mesh must not read
@@ -470,6 +509,71 @@ mod tests {
         ) -> anyhow::Result<Option<ReleasedLease>> {
             anyhow::bail!("lease still held")
         }
+
+        async fn agent_revived(
+            &self,
+            _tenant_id: ObjectId,
+            _agent_id: ObjectId,
+            _machine_id: &str,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("policy store unreachable")
+        }
+    }
+
+    /// Records which holders were asked to forget a revived agent, in order.
+    struct Forgets(&'static str, Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    #[async_trait]
+    impl FleetLifecycle for Forgets {
+        async fn agent_revived(
+            &self,
+            _tenant_id: ObjectId,
+            _agent_id: ObjectId,
+            _machine_id: &str,
+        ) -> anyhow::Result<()> {
+            self.1.lock().unwrap().push(self.0);
+            Ok(())
+        }
+    }
+
+    /// A revive asks every holder in hook order, and one that cannot drop
+    /// what it holds stops the enrollment (named in the error).
+    #[tokio::test]
+    async fn a_revive_asks_every_holder_and_a_failing_one_stops_it() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reg = HookRegistry::default();
+        reg.register(
+            "fleet",
+            Hooks {
+                fleet: Some(Arc::new(Forgets("fleet", asked.clone()))),
+                ..Default::default()
+            },
+        );
+        reg.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(Forgets("network", asked.clone()))),
+                ..Default::default()
+            },
+        );
+        reg.agent_revived(ObjectId::new(), ObjectId::new(), "m")
+            .await
+            .unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec!["network", "fleet"]);
+
+        let failing = HookRegistry::default();
+        failing.register(
+            "network",
+            Hooks {
+                fleet: Some(Arc::new(Fails)),
+                ..Default::default()
+            },
+        );
+        let err = failing
+            .agent_revived(ObjectId::new(), ObjectId::new(), "m")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("network: agent_revived"));
     }
 
     #[tokio::test]
@@ -531,6 +635,9 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none());
+        reg.agent_revived(ObjectId::new(), ObjectId::new(), "m")
+            .await
+            .unwrap();
         assert_eq!(
             reg.agent_renamed(ObjectId::new(), ObjectId::new(), "n")
                 .await

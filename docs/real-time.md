@@ -199,7 +199,7 @@ The gate checks membership once, at `media:join`. The seat it admits lasts only 
 that membership: when someone is removed from the org or leaves it, or leaves the room, any
 seat they hold in a call of that org or room goes at once, on whichever pod serves the call.
 The membership's owner tells `conference` through core's `MembershipLifecycle` hook
-(`crates/core/src/hooks.rs:170`), after the membership row is gone, so nothing can be
+(`crates/core/src/hooks.rs:191`), after the membership row is gone, so nothing can be
 admitted on it again while the seats are withdrawn.
 
 ```mermaid

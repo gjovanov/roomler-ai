@@ -396,7 +396,7 @@ saw. They write `ended_at` as the best-known real end, never their own clock:
 3. else its `started_at`, so a row from before P1 adds no hours.
 
 The agent's `last_seen_at` is not used: the hello, the offline paths and the heartbeat all stamp it
-(`crates/services/src/dao/agent.rs:445`, `:533`, `:578`, `:695`), so it dates the agent's last connection, not this
+(`crates/services/src/dao/agent.rs:541`, `:629`, `:674`, `:791`), so it dates the agent's last connection, not this
 row's. Each such row also gets `end_source`, `registration` or `sweep`, so an hour-weighted read can leave it out.
 P1 makes the growth digest do so (`digest.rs:1698-1717`); FR-135's R0 and S19 weights need the same filter, which
 P1's PR names for their owner. P0 counted the rows first: 11 on 5 devices, none started in the 8 days before (§10).

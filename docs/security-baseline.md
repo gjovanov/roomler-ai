@@ -389,6 +389,17 @@ route enforces `exp`.
   row's `token_gen`, removing the device increments it in the same atomic update
   that tombstones the row, and all five verification sites compare the two.
   Re-enrolling the same machine revives the row, but never its old tokens.
+- **A removed device that enrolls again starts from a new device's settings**
+  (#3627). The revive replaces the row with what a new enrollment writes and keeps
+  only its identity and history (`_id`, `machine_id`, `created_at`,
+  `enrolled_by`), `token_gen`, the desired-config revision counter and a quarantine
+  (a restriction, which a re-enrollment never lifts), so nothing
+  the removed device was allowed comes back: policies, approvals, the connect code,
+  approved routes, a pending config, the owner. Before the row is live, `network`
+  takes the device out of the org's tunnel policies and releases a lease its
+  removal left. A live row's re-enrollment keeps everything, and it writes only
+  while the row is live, so a removal landing mid-enrollment is never undone
+  ([`device-credentials.md`](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)).
 - ⚠️ The deleted/quarantined check stays FIRST at each site, so a removed device is
   still told it was removed (and stops), rather than seeing a bare 401 it would
   retry forever.
@@ -480,8 +491,8 @@ live rows only, and a tombstone gets `NotFound`, the answer an unknown id gets:
   devices (#1821); tunnel clients, tunnel policies and overlay ACL policies (#1829);
   FR-52's External access routes, which reached through `base` after #1821 and
   reopened the device hole (#3322: they minted connect codes and wrote approvals
-  onto removed devices, and a tombstone revives whole when its machine
-  re-enrolls); and chat (#3327), where a deleted file's GET and download, and a
+  onto removed devices, and a tombstone then revived whole when its machine
+  re-enrolled, until #3627); and chat (#3327), where a deleted file's GET and download, and a
   deleted message's edit, reaction and thread, still answered 200.
 - **A write that raced the removal matches nothing.** The admin setters are
   live-scoped on their own (`AgentDao::live_row`), the anchor and the desired
@@ -518,7 +529,7 @@ Readers that keep the tombstone, and why:
 | `auth_agent`, the agent socket upgrade, `/derp`, `accepted_tunnel_client`, the tunnel socket's connect and its 60 s poll | they say **why** a device is refused. A removed device is told `rc:goodbye AgentDeleted` or `rc:tunnel.revoked` and stops; a bare `NotFound` would read as a network fault and it would reconnect forever. On any of them a lookup **failure** stays apart from a removal: 500 or a kept socket, never a revocation |
 | `recording-activity`, `transfer-activity`, `privacy-activity`, `…/logs`, `…/crash` (both read under `MANAGE_AGENTS`, [below](#device-diagnostics-manage_agents-and-a-second-scrub)), the External access decision log and people list | an audit view of a removed device. Removing a device must not be the way to hide what it did |
 | External access's re-read of its gates as a session opens (`extauth::org_gates_open`) | a removed device is its removal's to end (`removal::kick`), not this read's, and a tombstone answering here keeps a removal that raced the open from reading as a failed read. It reached through `base` until #3327, and reads through `AgentDao::find_any_in_tenant` now |
-| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone. A tunnel client's tombstone revives only through a holder of `MANAGE_AGENTS` ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)) |
+| `find_by_tenant_and_machine` on agents and tunnel clients, at enrollment | the unique `(tenant_id, machine_id)` index covers tombstones, so a known machine must revive its row or it could never enroll again. Revival advances nothing that a removal ended: old tokens stay dead (`token_gen`) and the exec anchor stays gone, and a device's row comes back with a new device's settings, everything else it was allowed staying with the removal ([#3627](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)). A tunnel client's tombstone revives only through a holder of `MANAGE_AGENTS` ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)) |
 | `overlay_nodes` by id after a release | the release's own `removes` frame goes to the tombstone's address (`docs/overlay-communication.md` §1). The lease order is not changed by any of this: a node is tombstoned first, then its host goes back to the pool, and pooling first would lock the next joiner out permanently |
 
 **An overlay join reads the row, and a removed row does not join.** A socket can

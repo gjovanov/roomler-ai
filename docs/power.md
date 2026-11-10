@@ -158,7 +158,7 @@ sleep would say hello again and erase the reason.
   the goodbye the device would read online until the receive deadline reaped a
   socket nobody answers.
 - `AgentDao::record_sleep`
-  ([`agent.rs:504`](../crates/services/src/dao/agent.rs#L504)) is keyed by the
+  ([`agent.rs:600`](../crates/services/src/dao/agent.rs#L600)) is keyed by the
   connection's `conn_id`, like `mark_offline_if_conn`: a displaced connection's
   late notice matches nothing, so it can never mark a reconnected device asleep.
 - The offline `device:presence` row carries `sleep`
@@ -166,7 +166,7 @@ sleep would say hello again and erase the reason.
   without one is byte-for-byte the old shape
   ([`presence.rs:190`](../crates/modules/fleet/src/presence.rs#L190)).
 - The next hello `$unset`s `sleep`
-  ([`agent.rs:492`](../crates/services/src/dao/agent.rs#L492)), and every reader
+  ([`agent.rs:588`](../crates/services/src/dao/agent.rs#L588)), and every reader
   goes through `SleepView::of`, which shows a notice only on a device that is not
   online ([`models.rs:2005`](../crates/remote_control/src/models.rs#L2005)). A
   read between the reconnect and that write never shows a stale "asleep".
@@ -179,7 +179,7 @@ sleep would say hello again and erase the reason.
 | `roomler devices` | `asleep_since` | `◌ … asleep` instead of `offline` ([`localclient.rs:3380`](../agents/roomler-cli/src/localclient.rs#L3380)) |
 | the dashboard's devices grid | `sleep { since, power }` ([`device.rs:119`](../crates/api/src/routes/device.rs#L119)) | an `asleep` chip with `mdi-sleep`; its title says since when, the posture, and how to keep the device reachable ([`devicePresence.ts:90`](../ui/src/utils/devicePresence.ts#L90) `sleepTitle`) |
 | the sidebar's device list | `presence` | a grey dot and a disabled row, the same as offline. It has no words, and nothing can connect to a sleeping device anyway; the grid says which it is |
-| the admin agent API | `power`, `sleep` ([`agent.rs:644`](../crates/modules/fleet/src/agent.rs#L644)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
+| the admin agent API | `power`, `sleep` ([`agent.rs:783`](../crates/modules/fleet/src/agent.rs#L783)) | the posture as last reported, and the notice on a device that is not online. ⚠️ The grid's route has `sleep` and no `power`, so a read of `power` belongs here |
 | peers (the agent-facing device list) | `asleep_since` only ([`models.rs:3509`](../crates/remote_control/src/models.rs#L3509)) | the fact and the moment, never the policy: a peer sees the netmap's view, not the fleet record |
 
 The dashboard's words, for a device that announced a sleep:

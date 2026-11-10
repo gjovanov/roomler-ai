@@ -12,7 +12,10 @@ use axum::{
 };
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_db::models::role::permissions;
-use roomler_ai_remote_control::models::{AccessPolicy, AgentStatus, InstallInfo, OsKind};
+use roomler_ai_remote_control::models::{
+    AccessPolicy, Agent, AgentStatus, ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind,
+    PeerRelayPolicy, SshPolicy,
+};
 use roomler_ai_services::auth::{AgentEnrollment, EnrollmentCredential, SpendPurpose};
 use roomler_ai_services::dao::base::{DaoError, PaginationParams};
 use roomler_ai_services::dao::tenant::TenantDao;
@@ -231,11 +234,11 @@ pub async fn enroll_agent(
         }
     };
 
-    // If a row already exists for (tenant_id, machine_id), rehydrate it —
-    // refresh name / os / agent_version, clear `deleted_at` if soft-deleted,
-    // and re-issue a token against the same _id. The unique index on
-    // (tenant_id, machine_id) covers soft-deleted rows too, so we must look
-    // them up *including* tombstones and revive in place rather than create.
+    // A row for (tenant_id, machine_id) is reused whatever its state: the
+    // unique index on the pair covers soft-deleted rows too, so the lookup
+    // takes tombstones and the row comes back in place rather than a second
+    // one being made. A LIVE row is refreshed and keeps everything; a REMOVED
+    // one comes back as a new device (`enroll_row`).
     let existing = state
         .agents
         .find_by_tenant_and_machine(tid, &body.machine_id)
@@ -279,41 +282,11 @@ pub async fn enroll_agent(
     let claims = spent.claims();
 
     // FR-102 P3 — the request's install claim, clamped to the vocabulary. A
-    // known row keeps what it has unless this request says (a re-enroll by
-    // an older agent must not downgrade it); a new row records `unknown`
-    // when nothing was said.
+    // live row keeps what it has unless this request says (a re-enroll by an
+    // older agent must not downgrade it); a new or revived row records
+    // `unknown` when nothing was said.
     let install = body.install.as_ref().map(InstallInfo::clamped);
-    let agent = match existing {
-        Some(a) => {
-            let id =
-                a.id.ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
-            state
-                .agents
-                .rehydrate(
-                    id,
-                    &body.machine_name,
-                    body.os,
-                    &body.agent_version,
-                    install.as_ref(),
-                )
-                .await?
-        }
-        None => {
-            state
-                .agents
-                .create(
-                    tid,
-                    admin_uid,
-                    body.machine_name,
-                    body.machine_id,
-                    body.os,
-                    body.agent_version,
-                    String::new(), // agent_token_hash unused in JWT-only scheme
-                    install,
-                )
-                .await?
-        }
-    };
+    let agent = enroll_row(&state, tid, admin_uid, existing, &body, install).await?;
 
     let agent_id = agent
         .id
@@ -358,6 +331,172 @@ pub async fn enroll_agent(
         agent_token,
         ephemeral: false,
     }))
+}
+
+/// How many times [`enroll_row`] reads a known machine's row again when it
+/// changed between the read and the write: a removal that landed meanwhile, or
+/// a second enrollment of the same machine id. Each round is a race of a few
+/// milliseconds between two admins acting on one machine; three is plenty.
+const ENROLL_ROUNDS: usize = 3;
+
+/// Create, refresh or revive the row for a single-use enrollment, by what the
+/// row IS when the write lands, not what it was when the route read it.
+///
+/// * No row: a new device ([`AgentDao::create`]). Only on the route's own
+///   read, the one the plan cap was checked against.
+/// * A live row: a device nobody removed enrolls again (a lost token, a
+///   reinstall). It is refreshed and keeps everything it was allowed
+///   ([`AgentDao::rehydrate`], live-only).
+/// * A removed row: the machine id of a device its org removed. It comes back
+///   as a NEW device ([`AgentDao::revive`], #3627): what the removed device was
+///   allowed stays with the removal. First the holders drop what they hold
+///   that names the removed device ([`HookRegistry::agent_revived`]: network
+///   takes it out of the org's tunnel policies and releases a lease the
+///   removal left), and a holder that cannot stops the enrollment.
+///
+/// A write that finds the row changed under it reads it again: a live
+/// refresh that meets a removal becomes a revive (#3328 closed the same race
+/// for tunnel clients), and a revive that meets a concurrent one refreshes the
+/// row that one made.
+///
+/// [`AgentDao::create`]: roomler_ai_services::dao::agent::AgentDao::create
+/// [`AgentDao::rehydrate`]: roomler_ai_services::dao::agent::AgentDao::rehydrate
+/// [`AgentDao::revive`]: roomler_ai_services::dao::agent::AgentDao::revive
+/// [`HookRegistry::agent_revived`]: roomler_core::hooks::HookRegistry::agent_revived
+async fn enroll_row(
+    state: &FleetState,
+    tid: ObjectId,
+    enroller: ObjectId,
+    existing: Option<Agent>,
+    body: &EnrollRequest,
+    install: Option<InstallInfo>,
+) -> Result<Agent, ApiError> {
+    let mut row = existing;
+    for round in 0..ENROLL_ROUNDS {
+        match row.take() {
+            None if round == 0 => {
+                return Ok(state
+                    .agents
+                    .create(
+                        tid,
+                        enroller,
+                        body.machine_name.clone(),
+                        body.machine_id.clone(),
+                        body.os,
+                        body.agent_version.clone(),
+                        String::new(), // agent_token_hash unused in JWT-only scheme
+                        install,
+                    )
+                    .await?);
+            }
+            // The row the route read is gone (only an ephemeral row is ever
+            // hard-deleted). A new one would skip the plan cap, so the device
+            // enrolls again from the start instead.
+            None => break,
+            Some(live) if live.deleted_at.is_none() => {
+                let id = live
+                    .id
+                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                match state
+                    .agents
+                    .rehydrate(
+                        id,
+                        &body.machine_name,
+                        body.os,
+                        &body.agent_version,
+                        install.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(agent) => return Ok(agent),
+                    // Removed after the read: decide again from the row as it is.
+                    Err(DaoError::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Some(removed) => {
+                let id = removed
+                    .id
+                    .ok_or_else(|| ApiError::Internal("agent missing _id".to_string()))?;
+                if let Err(e) = state
+                    .hooks
+                    .agent_revived(tid, id, &removed.machine_id)
+                    .await
+                {
+                    tracing::error!(tenant = %tid, agent_id = %id, error = %e,
+                        "enroll: a removed device's grants could not be dropped; not reviving it");
+                    return Err(ApiError::ServiceUnavailable(
+                        "This device was removed and could not be enrolled again just now. \
+                         Retry with a new enrollment token."
+                            .to_string(),
+                    ));
+                }
+                if let Some(agent) = state
+                    .agents
+                    .revive(
+                        &removed,
+                        enroller,
+                        body.machine_name.clone(),
+                        body.os,
+                        body.agent_version.clone(),
+                        install.clone(),
+                    )
+                    .await?
+                {
+                    tracing::info!(
+                        tenant = %tid, agent_id = %id, removed_at = ?removed.deleted_at,
+                        previous_owner = %removed.owner_user_id, owner = %enroller,
+                        reset = ?grants_held(&removed),
+                        "enroll: a removed device enrolled again and starts from a new device's settings"
+                    );
+                    return Ok(agent);
+                }
+            }
+        }
+        row = state
+            .agents
+            .find_by_tenant_and_machine(tid, &body.machine_id)
+            .await?;
+    }
+    Err(ApiError::Conflict(
+        "This device's record changed while it enrolled (it was removed or enrolled again \
+         at the same moment). Enroll it again with a new enrollment token."
+            .to_string(),
+    ))
+}
+
+/// The grants a removed device still held, by name, for the line a revive
+/// logs: the trail of what the new device did NOT inherit. Informational only:
+/// [`AgentDao::revive`] replaces the whole row, so a grant this list misses is
+/// reset all the same. Names only, never a value (a connect code or an
+/// authorized key does not belong in a log).
+///
+/// [`AgentDao::revive`]: roomler_ai_services::dao::agent::AgentDao::revive
+fn grants_held(a: &Agent) -> Vec<&'static str> {
+    let access_default = serde_json::to_value(AccessPolicy::default()).ok();
+    [
+        ("ssh_policy", a.ssh_policy != SshPolicy::default()),
+        ("exec_policy", a.exec_policy != ExecPolicy::default()),
+        (
+            "access_policy",
+            serde_json::to_value(&a.access_policy).ok() != access_default,
+        ),
+        (
+            "peer_relay_policy",
+            a.peer_relay_policy != PeerRelayPolicy::default(),
+        ),
+        (
+            "external_access_policy",
+            a.external_access_policy != ExternalAccessPolicy::default(),
+        ),
+        ("connect_code", a.connect_code.is_some()),
+        ("desired_config", !a.desired_config.is_empty()),
+        ("routes", !a.routes.is_empty()),
+        ("key_rotation", a.key_rotation.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, held)| held.then_some(name))
+    .collect()
 }
 
 /// FR-51 P2 — the ephemeral-key enrollment path. Differs from the standard
