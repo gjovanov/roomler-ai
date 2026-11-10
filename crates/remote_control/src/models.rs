@@ -6112,6 +6112,13 @@ pub struct RemoteSession {
     /// was seen, so an hour-weighted read can leave out the inferred ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_source: Option<EndSource>,
+    /// FR-138 (review 1, L6) — an external session (FR-52's door) requested
+    /// while its device's connection held a resume window. A device never
+    /// keeps one (D3), so a claim of a row marked external is refused. Absent
+    /// on every other row, and on an external session requested with no
+    /// window (harmless: the device does not keep it either).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external: bool,
 }
 
 /// `skip_serializing_if` for a count whose zero is its absence.
@@ -6690,6 +6697,12 @@ pub enum AuditKind {
         /// admin asked for that this session's end will not take.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lock_enforced: Option<bool>,
+        /// FR-138 (review 1, L6) — an external session (FR-52's door), whose
+        /// device's connection held a resume window when it was requested:
+        /// projected onto the row, where a claim refuses it (D3). Written only
+        /// then, so a session with no window records what it always did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        external: bool,
     },
     ConsentPrompted,
     ConsentGranted,
@@ -9972,6 +9985,7 @@ mod tests {
                 idle_enforced: None,
                 lock_on_end: None,
                 lock_enforced: None,
+                external: false,
             },
             // FR-99 — the new bit takes the same raw path.
             AuditKind::SessionRequested {
@@ -9990,6 +10004,7 @@ mod tests {
                 // FR-99 P3b — and a lock it cannot take.
                 lock_on_end: Some(LockOnEnd::Always),
                 lock_enforced: Some(false),
+                external: true,
             },
             AuditKind::PermissionsChanged {
                 permissions: Permissions::VIEW,
@@ -10074,6 +10089,7 @@ mod tests {
             resume_by: None,
             stats_at: None,
             end_source: None,
+            external: false,
         };
         let names = bson::to_document(&row).unwrap();
         assert_eq!(
@@ -11075,6 +11091,7 @@ mod fr138_resume_tests {
             resume_by: None,
             stats_at: None,
             end_source: None,
+            external: false,
         }
     }
 

@@ -2066,6 +2066,10 @@ impl Hub {
         // Move to AwaitingConsent and tell the agent. The agent always gets the
         // Request (it needs the codec / transport context) + the mode directive;
         // for Email/Push it will NOT respond — the owner resolves the slot.
+        // FR-138 (review 1, L6) — the row's `external` marker, where a claim
+        // refuses it (D3): only while the device's connection holds a window,
+        // so with none the row is the one it always was.
+        let external_marked = external.is_some() && agent_window.is_some_and(|w| w > 0);
         let request = ServerMsg::Request {
             session_id,
             controller_user_id,
@@ -2131,6 +2135,7 @@ impl Hub {
                 idle_enforced: idle_secs.map(|_| agent_enforces_idle),
                 lock_on_end,
                 lock_enforced: lock_on_end.map(|_| agent_honours_lock),
+                external: external_marked,
             },
         );
         self.audit(session_id, agent_id, agent_org, AuditKind::ConsentPrompted);
@@ -2594,6 +2599,21 @@ impl Hub {
         let Some((_, arc)) = self.inner.sessions.remove(&session_id) else {
             return Ok(()); // already gone, idempotent
         };
+        self.end_removed(session_id, &arc, reason, limit, write);
+        Ok(())
+    }
+
+    /// [`Self::end_session`], once the session is out of the map: the caller
+    /// took exactly this copy out (FR-138's refused claim removes the copy it
+    /// read, and no other).
+    fn end_removed(
+        &self,
+        session_id: ObjectId,
+        arc: &Arc<Mutex<LiveSession>>,
+        reason: EndReason,
+        limit: Option<&'static str>,
+        write: EndWrite,
+    ) {
         // FR-115 P3b — the session's slot goes back with it.
         if let Some((_, lease)) = self.inner.slotted.remove(&session_id) {
             self.release_slot(lease);
@@ -2633,7 +2653,7 @@ impl Hub {
             EndWrite::Asked => None,
             EndWrite::Own => Some(attach_seq),
             // FR-138 — the row already holds the end this one follows.
-            EndWrite::Nothing => return Ok(()),
+            EndWrite::Nothing => return,
         };
         self.audit(
             session_id,
@@ -2647,7 +2667,6 @@ impl Hub {
                 end_source: None,
             },
         );
-        Ok(())
     }
 
     /// FR-52 P5 — end every session this pod holds that `principal` opened on

@@ -321,9 +321,10 @@ the new pod folds the session back from the row through a join path, the claim a
 socket, the hub does not call `end_agent_sessions` for its live sessions. It audits a new `SessionDetached` instead,
 carrying the `attach_seq` it holds (fencing, below). The sink projects it onto the row as `detached_at` and
 `resume_by` (now plus the window), and the hub tells each session's viewer `rc:session.detached` if the viewer's
-socket is still up. A detach keeps the session's FR-115 slot: only an end releases one (`hub.rs:2444-2446`), and a
-lease that nobody renews frees itself within 90 s. A session still waiting for consent or for its offer ends as
-today. ⚠️ A dying pod may write none of this (§2.2), so nothing below depends on it.
+socket is still up. A detach keeps the session's FR-115 slot: only an end releases one (`hub.rs:2444-2446`), and the
+detach keeps its lease until `resume_by` plus 10 s, when a lease nobody claimed frees itself. A session still waiting
+for consent or for its offer ends as today. ⚠️ A dying pod may write none of this (§2.2), so nothing below depends on
+it.
 
 **The controller's side stays in memory.** When a viewer's socket goes, `unregister_controller`, and the cross-pod
 relay's `rc.conn_closed`, detach a resumable session instead of ending it as `controller_hangup`. The hub that holds
@@ -365,7 +366,7 @@ left by a pod that died without a word, is claimable too: the agent's own deadli
 | The device is not removed or quarantined: the upgrade already loads the row and refuses a missing one with 401 (`crates/modules/fleet/src/auth_agent.rs:10-11`, `crates/modules/fleet/src/socket.rs:1441-1446`) | the socket is refused before any claim; the agent closes its kept peers at a refused token, and at the latest at its deadline (§4.1) |
 | The controller is still a member of the org and still holds what a new request needs on this device, re-run through the gate a request uses (`resolve_session_authz`, `crates/modules/remote/src/controller.rs:729`) | `admin_terminated` |
 | The session is not external (D3) | `agent_disconnect` |
-| The FR-115 slot is claimed again under the session's own id. A lease lives 90 s (`crates/core/src/cluster/session_slots.rs:37`), longer than the window, and a replacement on the same node shares the dead process's pod id, so the claim finds its own lease or drops it as stale (`crates/modules/remote/src/slots.rs:12-20`) | the slot refusal a request gets |
+| The FR-115 slot is taken again under the session's own id, once the commit has been won and before the session is rebuilt: a claim that took it before its commit and then lost had already renewed the winner's lease and written its own pod into it, and one that took it after the rebuild could find the session already detached again, with no lease to keep. A lease lives 90 s (`crates/core/src/cluster/session_slots.rs:37`), and the detach keeps it until `resume_by` plus 10 s, so the claim finds its own lease. A replacement on the same node shares the dead process's pod id, and its stale check reads the row first, so it drops only the lease of a session that is over (`crates/modules/remote/src/slots.rs:12-20`) | `agent_disconnect`, before the session is rebuilt, fenced at the number committed |
 
 Consent is the one check not re-run: the session is the same one the device already decided on, at its start. Today
 a roll costs the same gate anyway, through the redial's new request, so the re-run takes nothing a roll does not.

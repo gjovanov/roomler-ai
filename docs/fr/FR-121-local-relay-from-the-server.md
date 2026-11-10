@@ -287,7 +287,7 @@ its own sending is not known yet, and only `chrome://webrtc-internals` can show 
 - [x] **AC3 — owner-only.** A request naming a device the requester does not own is refused `not_your_device`, and no
   descriptor leaves the server. Also tested for `other_network`, `device_offline`, `rc_overlay_off` and
   `same_device`, each its own reason. **Met (tests, read 2026-11-03):**
-  `resolve_local_relay_hands_out_only_the_requesters_own_device` (`crates/modules/fleet/src/hub.rs:7520`) asserts all
+  `resolve_local_relay_hands_out_only_the_requesters_own_device` (`crates/modules/fleet/src/hub.rs:7539`) asserts all
   five refusals, and `a_named_device_s_relay_reaches_the_browser_and_the_target` (`:7390`) asserts through `dispatch`
   that the browser gets the word and no relay. A refused device adds nothing to the session's relays (`:4206`), so no
   descriptor reaches the target either. Both green on master in CI run 41538944854.

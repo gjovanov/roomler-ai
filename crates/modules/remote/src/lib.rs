@@ -118,6 +118,16 @@ pub struct RemoteState {
     /// FR-138 P1b-2 (review 2, N7) — where this pod's sweep reads the quiet
     /// rows on from (`sweep::Cursor`).
     pub sweep_cursor: Arc<sweep::Cursor>,
+    /// FR-138 (review 2, N14) — how many times this pod has run the resume
+    /// gate (`controller::resume_gate`). The integration tests' counting
+    /// seam for the rejoin's rate limit; nothing reads it in production.
+    #[doc(hidden)]
+    pub resume_gate_runs: Arc<std::sync::atomic::AtomicU64>,
+    /// FR-138 (review 2, N14) — when each viewer last ran the resume gate
+    /// for a session no hub on this pod holds (`rejoin::gate_due`): its
+    /// rejoin runs the gate at most once per 5 s per session and viewer, and
+    /// always before a bind or a relay.
+    pub rejoin_gates: Arc<rejoin::GateRuns>,
 }
 
 impl std::ops::Deref for RemoteState {
@@ -156,6 +166,8 @@ impl Module for RemoteState {
             extauth: Arc::new(extauth::ExtauthRelay::new()),
             registration_ends: Arc::new(resume::RegistrationEnds::new()),
             sweep_cursor: Arc::new(sweep::Cursor::default()),
+            resume_gate_runs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rejoin_gates: Arc::new(rejoin::GateRuns::new()),
             fleet,
             core,
         };

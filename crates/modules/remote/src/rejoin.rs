@@ -23,12 +23,23 @@
 //! | live in the hub of the pod that holds the device's socket | relayed there (`rc.cmd`), bound there, answered through the relay |
 //! | live, but in no hub yet (the claim is not answered, or a pod died without a word) | `rc:session.detached` with when it would end, or `rc:terminate agent_disconnect` once that has passed |
 //!
+//! Review 2, N14 — the gate costs about five reads, and a page asks every
+//! second while its session waits for the device's claim. Where nothing is
+//! bound or relayed (a detached row, a live row in no hub yet) the gate runs
+//! at most once per 5 s per session and viewer ([`GateRuns`]), and a refusal
+//! answers as the table says: a viewer removed from the org is refused
+//! within about 5 s. Before a bind (held here) or a relay it always runs. A
+//! pair's timing goes at its bind, its relay or its refusal, and the rest
+//! are pruned at most once a second (PR D's review, LOW 8).
+//!
 //! With the window at 0 the rejoin is dropped unanswered, as a server before
 //! FR-138 drops it. No page sends one then: none was told `resume_secs`.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bson::{DateTime, oid::ObjectId};
+use dashmap::DashMap;
 use roomler_ai_mod_fleet::hub::OrgPolicy;
 use roomler_ai_remote_control::models::{
     ConsentMode, EndReason, RcOverlayMode, RemoteSession, SessionPhase,
@@ -40,6 +51,108 @@ use tracing::{debug, info, warn};
 
 use crate::RemoteState;
 use crate::controller::{ResumeGate, resume_gate};
+
+/// At most one gate per session and viewer this often, while nothing is
+/// bound or relayed.
+const GATE_EVERY: Duration = Duration::from_secs(5);
+
+/// PR D's review, LOW 8 — how often [`GateRuns`] drops its old entries: at
+/// most once in this long, whatever the number of asks.
+const PRUNE_EVERY: Duration = Duration::from_secs(1);
+
+/// Review 2, N14 — when each (session, viewer) last ran the gate on a rejoin
+/// that binds nothing (`RemoteState::rejoin_gates`), on this pod.
+///
+/// PR D's review, LOW 8 — bounded without walking the map on every ask: an
+/// entry goes when its session binds or is relayed, and when the gate
+/// refuses its viewer ([`Self::forget`]); the rest go once they are older
+/// than [`GATE_EVERY`], at a prune that runs at most once per
+/// [`PRUNE_EVERY`] across all asks. Every call is synchronous: no guard of
+/// the map outlives it.
+pub struct GateRuns {
+    runs: DashMap<(ObjectId, ObjectId), Instant>,
+    /// What `pruned_ms` counts from.
+    base: Instant,
+    /// When the last prune ran, in ms after `base`.
+    pruned_ms: AtomicU64,
+}
+
+impl Default for GateRuns {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GateRuns {
+    pub fn new() -> Self {
+        Self {
+            runs: DashMap::new(),
+            base: Instant::now(),
+            pruned_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// The (session, viewer) pairs timed now.
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// `user_id`'s rejoins of `session_id` are timed no more: its session is
+    /// bound or relayed, or the gate refused the viewer.
+    pub fn forget(&self, session_id: ObjectId, user_id: ObjectId) {
+        self.runs.remove(&(session_id, user_id));
+    }
+
+    /// Whether the ask of `key` at `now` runs the gate: the first ask does,
+    /// and then one every [`GATE_EVERY`].
+    fn due(&self, key: (ObjectId, ObjectId), now: Instant) -> bool {
+        self.prune(now);
+        let mut due = true;
+        self.runs
+            .entry(key)
+            .and_modify(|at| {
+                if now.saturating_duration_since(*at) < GATE_EVERY {
+                    due = false;
+                } else {
+                    *at = now;
+                }
+            })
+            .or_insert(now);
+        due
+    }
+
+    /// Drop the entries older than [`GATE_EVERY`], at most once per
+    /// [`PRUNE_EVERY`]: of two asks in the same instant, one prunes.
+    fn prune(&self, now: Instant) {
+        let now_ms =
+            u64::try_from(now.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX);
+        let last = self.pruned_ms.load(Ordering::Relaxed);
+        if u128::from(now_ms.saturating_sub(last)) < PRUNE_EVERY.as_millis() {
+            return;
+        }
+        if self
+            .pruned_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.runs
+            .retain(|_, at| now.saturating_duration_since(*at) < GATE_EVERY);
+    }
+}
+
+/// Whether `user_id`'s rejoin of `session_id` runs the gate now
+/// ([`GateRuns`]).
+fn gate_due(state: &RemoteState, session_id: ObjectId, user_id: ObjectId) -> bool {
+    state
+        .rejoin_gates
+        .due((session_id, user_id), Instant::now())
+}
 
 /// The viewer's socket the rejoin came in on.
 pub struct Viewer<'a> {
@@ -119,7 +232,10 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
     {
         match resume_gate(state, v.user_id, p.tenant_id, p.agent_id).await {
             ResumeGate::Allow { .. } => match hub.rejoin(session_id, v.user_id, v.tx) {
-                Ok(()) => return,
+                Ok(()) => {
+                    state.rejoin_gates.forget(session_id, v.user_id);
+                    return;
+                }
                 // It ended, or may not be held: the row says how.
                 Err(e) => {
                     debug!(session = %session_id.to_hex(), %e, "rc:session.rejoin: not held here any more; reading the row");
@@ -128,6 +244,7 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
             ResumeGate::Deny(why) => {
                 info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
                 hub.refuse_rejoin(session_id, v.user_id, v.tx, EndReason::AdminTerminated);
+                state.rejoin_gates.forget(session_id, v.user_id);
                 return;
             }
             // Decided nothing: when the hold ends, and the viewer asks again.
@@ -167,31 +284,37 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
         answer(end(session_id, EndReason::AgentDisconnect));
         return;
     }
-    let allowed = match resume_gate(state, v.user_id, row.tenant_id, row.agent_id).await {
-        ResumeGate::Allow { .. } => true,
-        ResumeGate::Deny(why) => {
-            info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
-            crate::row_end::revoked(state, &row).await;
-            answer(end(session_id, EndReason::AdminTerminated));
+    // Detached when the device's socket went, and not claimed yet: nothing is
+    // bound, so the gate runs once per `GATE_EVERY` for this viewer (N14).
+    if let Some(by) = row.resume_by {
+        if gate_due(state, session_id, v.user_id)
+            && run_gate(state, &v, &row, session_id).await.is_none()
+        {
             return;
         }
-        // Nothing is bound below; the deadline is answered, and the viewer
-        // asks again.
-        ResumeGate::Unknown(why) => {
-            warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run; ask again");
-            false
-        }
-    };
-    // Detached when the device's socket went, and not claimed yet.
-    if let Some(by) = row.resume_by {
         answer(until(session_id, by, DateTime::now()));
         return;
     }
-    // Live in the hub of the pod that holds the device's socket: bound there.
-    if allowed
-        && !hub.is_agent_online(row.agent_id)
-        && let Some(owner) = foreign_owner(state, row.agent_id).await
-        && relay(state, &v, &owner, session_id).await
+    // Live in the hub of the pod that holds the device's socket: bound there,
+    // so the gate always runs first.
+    let owner = if hub.is_agent_online(row.agent_id) {
+        None
+    } else {
+        foreign_owner(state, row.agent_id).await
+    };
+    if let Some(owner) = owner {
+        match run_gate(state, &v, &row, session_id).await {
+            None => return,
+            Some(true) => {
+                if relay(state, &v, &owner, session_id).await {
+                    state.rejoin_gates.forget(session_id, v.user_id);
+                    return;
+                }
+            }
+            Some(false) => {}
+        }
+    } else if gate_due(state, session_id, v.user_id)
+        && run_gate(state, &v, &row, session_id).await.is_none()
     {
         return;
     }
@@ -199,6 +322,34 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
     // it died without a word. The viewer may ask again until it would end.
     let by = wait_until(state, &row, window).await;
     answer(until(session_id, by, DateTime::now()));
+}
+
+/// The gate a request runs, for the viewer of a session no hub on this pod
+/// holds. `None` when it refused: the row is ended as an admin's end is, the
+/// viewer is told `admin_terminated`, and its rejoins are timed no more.
+/// `Some(true)` when allowed; `Some(false)` when a read failed and nothing
+/// was decided, so nothing is bound, the deadline is answered, and the viewer
+/// asks again.
+async fn run_gate(
+    state: &RemoteState,
+    v: &Viewer<'_>,
+    row: &RemoteSession,
+    session_id: ObjectId,
+) -> Option<bool> {
+    match resume_gate(state, v.user_id, row.tenant_id, row.agent_id).await {
+        ResumeGate::Allow { .. } => Some(true),
+        ResumeGate::Deny(why) => {
+            info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
+            crate::row_end::revoked(state, row).await;
+            let _ = v.tx.try_send(end(session_id, EndReason::AdminTerminated));
+            state.rejoin_gates.forget(session_id, v.user_id);
+            None
+        }
+        ResumeGate::Unknown(why) => {
+            warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run; ask again");
+            Some(false)
+        }
+    }
 }
 
 /// The pod that holds the device's socket, when it is another one.
@@ -301,6 +452,53 @@ mod tests {
         }
         assert_eq!(after(at(1_000), 60), at(61_000));
         assert_eq!(after(at(i64::MAX - 1), 60), at(i64::MAX), "saturates");
+    }
+
+    /// Review 2, N14 — one gate per pair every 5 s: the first ask runs it,
+    /// the asks inside the 5 s do not, and the first after them does.
+    #[test]
+    fn a_pairs_gate_runs_once_per_five_seconds() {
+        let runs = GateRuns::new();
+        let t0 = runs.base + Duration::from_secs(10);
+        let pair = (ObjectId::new(), ObjectId::new());
+        assert!(runs.due(pair, t0), "the first ask runs it");
+        for ms in [1, 1_000, 4_999] {
+            assert!(
+                !runs.due(pair, t0 + Duration::from_millis(ms)),
+                "{ms} ms after it"
+            );
+        }
+        assert!(runs.due(pair, t0 + Duration::from_secs(5)), "5 s after it");
+        let other = (pair.0, ObjectId::new());
+        assert!(runs.due(other, t0 + Duration::from_secs(5)), "per viewer");
+        runs.forget(pair.0, pair.1);
+        assert!(runs.due(pair, t0 + Duration::from_secs(6)), "forgotten");
+    }
+
+    /// PR D's review, LOW 8 — the old entries go at a prune, and a prune runs
+    /// at most once a second, however many asks come: an entry past 5 s
+    /// stays until the next prune is due.
+    #[test]
+    fn the_rate_map_drops_old_entries_at_most_once_a_second() {
+        let runs = GateRuns::new();
+        let t0 = runs.base + Duration::from_secs(10);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let pair = || (ObjectId::new(), ObjectId::new());
+        let (x, y, z, w, v) = (pair(), pair(), pair(), pair(), pair());
+        runs.due(x, at(0)); // prunes, at 0
+        runs.due(y, at(500)); // too soon to prune
+        assert_eq!(runs.len(), 2);
+        runs.due(z, at(5_200)); // prunes: x is 5.2 s old, y 4.7 s
+        assert!(!runs.runs.contains_key(&x), "x went");
+        assert_eq!(runs.len(), 2, "y and z");
+        runs.due(w, at(5_700)); // 0.5 s after the last prune: none
+        assert!(runs.runs.contains_key(&y), "y, now 5.2 s old, waits");
+        assert_eq!(runs.len(), 3);
+        runs.due(v, at(6_300)); // prunes: y is 5.8 s old
+        assert!(!runs.runs.contains_key(&y), "y went");
+        assert_eq!(runs.len(), 3, "z, w and v");
+        runs.forget(v.0, v.1);
+        assert_eq!(runs.len(), 2);
     }
 
     /// Review 2, N9 — a page that rejoins never hung up, so a row ended
