@@ -71,6 +71,32 @@ The server URL is kept either way. Before FR-129 C1 a finished run's role and
 name came back: a test run's tunnel-client role preselected the tunnel card on
 the operator's own machine, and its device name was offered again.
 
+### The Token page judges a token on the server's clock (#3523)
+
+On the paste path the Token page reads the token without verifying it and shows its
+issuer, type and expiry. It judges the token's `exp` on the **configured server's
+clock**, never on this computer's clock alone. A fresh enrollment token lives 10
+minutes, and a computer whose clock ran ahead (a cloned Windows VM boots about 3 h
+ahead) used to refuse tokens the server would still accept. The server verifies the
+token at enrollment either way.
+
+- **The reading** is the `Date` header of the server's answer to the setup-features
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:220`). It is
+  kept with the monotonic time it arrived (`agents/roomler-setup/src/server_clock.rs:50`) and
+  carried forward on that clock, so a wall-clock step does not move it. It is used for 5
+  minutes by either clock; after that the check asks the server again
+  (`agents/roomler-setup/src/server_clock.rs:112`).
+- **The verdict** (`agents/roomler-setup/src/commands.rs:525`, `judge_expiry`):
+
+| The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
+|---|---|---|---|
+| known | **blocks**: "This token has already expired" | warns with the gap ("3 h ahead of the server's"); Continue stays enabled | continues |
+| unknown: no answer, or no `Date` that parses | (cannot be known) | warns; Continue stays enabled | continues |
+
+A token with no `exp` blocks, as before. The macOS second token follows the same rule
+(`agents/roomler-setup/src/front/app.js:1035`, `rootTokenProblem`). The expiry the page shows
+("in N min", "N min ago") is counted on the server's clock when the wizard has a reading of it.
+
 ## Enrollment — what every path does
 
 ```mermaid

@@ -96,6 +96,8 @@ toml = { workspace = true }
 roomler-ai-remote-control = { path = "../../crates/remote_control", default-features = false }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+# #3523 — the server's `Date` header, the clock the Token step judges `exp` on.
+httpdate = "1"
 
 # FR-129 B1 — the Linux/macOS daemon pipeline's private scratch directory
 # (0700, the person's own) for the embedded `install.sh` and the
@@ -124,6 +126,8 @@ roomler-node-core = { path = "../../crates/agent-core", features = ["test-fixtur
 # its `cfg` applied, to see how each spawn names its program.
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
+# #3523 — the Token step's tests mint tokens that expire at a chosen time.
+base64 = { workspace = true }
 
 # #3609 — tests only: `machine_write`'s NTFS case runs the wizard's side with a
 # limited copy of the test's token (CreateRestrictedToken), as a

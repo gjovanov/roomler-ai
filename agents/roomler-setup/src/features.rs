@@ -136,8 +136,14 @@ impl Asked {
 /// The URL to fetch for `server`, read as the enroll reads it (a remote
 /// `http://` upgraded to `https://`, loopback left alone, no trailing slash).
 pub fn features_url(server: &str) -> String {
+    format!("{}{ROUTE}", origin(server))
+}
+
+/// `server`'s origin as [`features_url`] reads it, without the trailing slash:
+/// the key its clock reading is kept under ([`crate::server_clock`]).
+pub fn origin(server: &str) -> String {
     let origin = roomler_ai_remote_control::server_url::secure(server, false).url;
-    format!("{}{ROUTE}", origin.trim_end_matches('/'))
+    origin.trim_end_matches('/').to_string()
 }
 
 /// The answer as the switches: a 2xx whose body is a JSON object, with each
@@ -199,9 +205,20 @@ pub async fn ask(server: &str) -> Asked {
     };
     match client.get(&url).send().await {
         Ok(resp) => {
+            // #3523 — the server's clock as of the moment its answer arrived.
+            let at = std::time::Instant::now();
+            let device_unix = crate::server_clock::device_now();
+            let date = resp
+                .headers()
+                .get(reqwest::header::DATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             let status = resp.status().as_u16();
             let body = resp.bytes().await.unwrap_or_default();
             let asked = read_answer(status, &body);
+            if asked.answered {
+                crate::server_clock::record(&origin(server), date.as_deref(), at, device_unix);
+            }
             if older_server(status) {
                 tracing::debug!(%url, status, "setup features: an older server; every switch off");
             } else if !asked.answered {

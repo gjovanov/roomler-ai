@@ -52,6 +52,9 @@ pub mod role;
 /// FR-129 B1 (F3) — the running root daemon's own word on which device it is
 /// (Linux: its person socket), asked before a system-scope enroll.
 pub mod root_identity;
+/// #3523 — the configured server's clock, which the Token step judges a
+/// pasted token's expiry on.
+pub mod server_clock;
 /// FR-129 C — the gate on how the wizard's Windows path names a program.
 #[cfg(test)]
 mod spawn_gate;
@@ -297,5 +300,116 @@ mod front_tests {
             }
         }
         found
+    }
+
+    /// #3523 — the Token page never refuses a token on this computer's clock
+    /// alone. Rust judges `exp` on the server's clock when it holds a reading
+    /// (`expiry`: `valid`, `expired`, `deviceClockOnly`); the page blocks only
+    /// on `expired`, for the first token and the macOS second one alike.
+    mod token_step_clock {
+        fn app_js() -> String {
+            include_str!("front/app.js").replace("\r\n", "\n")
+        }
+
+        /// `function name(…) { … }` in `js`, up to the first `}` at a line start.
+        fn js_function<'a>(js: &'a str, name: &str) -> &'a str {
+            let start = js
+                .find(&format!("function {name}("))
+                .unwrap_or_else(|| panic!("app.js has no function {name}"));
+            let end = js[start..].find("\n}").map_or(js.len(), |at| start + at);
+            &js[start..end]
+        }
+
+        #[test]
+        fn the_page_reads_no_verdict_of_the_device_clock() {
+            assert!(
+                !app_js().contains("appearsExpired"),
+                "the device clock's verdict is gone from the wire"
+            );
+        }
+
+        #[test]
+        fn both_tokens_are_judged_on_the_configured_servers_clock() {
+            let js = app_js();
+            for name in ["validateToken", "validateRootToken"] {
+                assert!(
+                    js_function(&js, name).contains(
+                        "invoke(\"cmd_validate_token\", { token: t, role: state.role, server: state.server })"
+                    ),
+                    "{name} names the server whose clock judges the token"
+                );
+            }
+            assert!(
+                js_function(&js, "validateToken").contains("if (state.token.trim() !== t) return;"),
+                "an answer that waited on the server's clock never overwrites a newer one"
+            );
+        }
+
+        #[test]
+        fn the_first_token_blocks_only_on_the_servers_expiry() {
+            let js = app_js();
+            let render = js_function(&js, "renderToken");
+            let blocks = render
+                .find("if (view.expiry === \"expired\") {\n    warnExpired.hidden = false;\n    return;\n  }")
+                .expect("an expiry by the server's clock blocks, as before");
+            let warns = render
+                .find("warnClock.hidden = clockWords === null;")
+                .expect("an expiry by this computer's clock alone warns");
+            let gate = render
+                .find("continueBtn.disabled = rootHalf && rootProblem !== null;")
+                .expect("the Continue gate");
+            assert!(blocks < warns && warns < gate);
+            assert!(
+                !render[warns..gate].contains("return"),
+                "the clock warning never disables Continue"
+            );
+        }
+
+        #[test]
+        fn the_second_token_blocks_only_on_the_servers_expiry() {
+            let js = app_js();
+            let problem = js_function(&js, "rootTokenProblem");
+            assert!(problem.contains(
+                "if (state.rootTokenView.expiry === \"expired\") return \"The second token has already expired. Mint a new one.\";"
+            ));
+            assert!(
+                !problem.contains("deviceClockOnly"),
+                "this computer's clock alone is no problem for the second token"
+            );
+            assert!(
+                js_function(&js, "renderToken").contains("clockWarning(state.rootTokenView)"),
+                "the second token's line carries the clock warning"
+            );
+        }
+
+        #[test]
+        fn the_expiry_shown_is_the_servers_time_when_known() {
+            let js = app_js();
+            let format = js_function(&js, "formatExpiry");
+            assert!(format.starts_with("function formatExpiry(unix, offsetSecs) {"));
+            assert!(format.contains("Date.now() - offsetSecs * 1000"));
+            let render = js_function(&js, "renderToken");
+            assert!(render.contains("formatExpiry(view.expiresAtUnix, view.clockOffsetSecs)"));
+            assert!(render.contains(
+                "formatExpiry(state.rootTokenView.expiresAtUnix, state.rootTokenView.clockOffsetSecs)"
+            ));
+        }
+
+        #[test]
+        fn the_clock_warning_is_a_warning_and_says_the_server_decides() {
+            let html = include_str!("front/index.html");
+            assert!(html.contains("<div id=\"token-warn-clock\" class=\"warning\" hidden></div>"));
+            let js = app_js();
+            let words = js_function(&js, "clockWarning");
+            assert!(words.contains("view.expiry !== \"deviceClockOnly\""));
+            assert!(
+                words.contains("ahead of the server's"),
+                "by how much, when known"
+            );
+            assert!(
+                words.contains("the server checks it when the device enrolls"),
+                "the server decides at enrollment"
+            );
+        }
     }
 }

@@ -984,20 +984,24 @@ async function validateToken() {
   const t = state.token.trim();
   if (!t) {
     state.tokenView = null;
+    state.tokenValidating = false;
     renderToken();
     return;
   }
   state.tokenValidating = true;
   renderToken();
+  let view;
   try {
-    state.tokenView = await invoke("cmd_validate_token", { token: t, role: state.role });
-    state.tokenView.error = null;
+    // #3523: judged on the configured server's clock, which may take a request.
+    view = await invoke("cmd_validate_token", { token: t, role: state.role, server: state.server });
+    view.error = null;
   } catch (err) {
-    state.tokenView = { error: String(err) };
-  } finally {
-    state.tokenValidating = false;
-    renderToken();
+    view = { error: String(err) };
   }
+  if (state.token.trim() !== t) return; // a newer paste is being judged
+  state.tokenView = view;
+  state.tokenValidating = false;
+  renderToken();
 }
 
 // FR-129 B2 — the same unverified peek for the second token. A stale answer
@@ -1014,7 +1018,7 @@ async function validateRootToken() {
   renderToken();
   let view;
   try {
-    view = await invoke("cmd_validate_token", { token: t, role: state.role });
+    view = await invoke("cmd_validate_token", { token: t, role: state.role, server: state.server });
     view.error = null;
   } catch (err) {
     view = { error: String(err) };
@@ -1033,7 +1037,7 @@ function rootTokenProblem() {
   if (!t) return "The private network is a second device: paste a second token for it.";
   if (state.rootTokenValidating || !state.rootTokenView) return "Checking the second token…";
   if (state.rootTokenView.error) return "Could not parse the second token as a JWT — copy the whole token.";
-  if (state.rootTokenView.appearsExpired) return "The second token has already expired. Mint a new one.";
+  if (state.rootTokenView.expiry === "expired") return "The second token has already expired. Mint a new one.";
   if (t === state.token.trim()) return "That is the first token again: each token enrolls one device, so the private network needs a different one.";
   return null;
 }
@@ -1057,15 +1061,20 @@ function renderToken() {
   document.getElementById("root-token-wrap").hidden = !rootHalf;
   const rootStatus = document.getElementById("root-token-status");
   const rootProblem = rootHalf ? rootTokenProblem() : null;
+  // #3523: expired by this computer's clock alone is a warning, not a problem.
+  const rootClock = rootHalf && !rootProblem ? clockWarning(state.rootTokenView) : null;
   rootStatus.hidden = !rootHalf || (!rootProblem && !state.rootTokenView);
-  rootStatus.className = rootProblem && state.rootToken.trim() ? "warning" : "muted";
+  rootStatus.className = (rootProblem && state.rootToken.trim()) || rootClock ? "warning" : "muted";
   rootStatus.textContent = rootProblem
     ?? `Second token: ${state.rootTokenView?.tokenType ?? "enrollment"}, expires ${
-      state.rootTokenView?.expiresAtUnix ? formatExpiry(state.rootTokenView.expiresAtUnix) : "(no exp)"}.`;
+      state.rootTokenView?.expiresAtUnix
+        ? formatExpiry(state.rootTokenView.expiresAtUnix, state.rootTokenView.clockOffsetSecs)
+        : "(no exp)"}.${rootClock ? ` ${rootClock}` : ""}`;
 
   const info = document.getElementById("token-info");
   const warnAudience = document.getElementById("token-warn-audience");
   const warnExpired = document.getElementById("token-warn-expired");
+  const warnClock = document.getElementById("token-warn-clock");
   const warnParse = document.getElementById("token-warn-parse");
   const continueBtn = document.getElementById("token-continue");
 
@@ -1073,6 +1082,7 @@ function renderToken() {
   info.hidden = true;
   warnAudience.hidden = true;
   warnExpired.hidden = true;
+  warnClock.hidden = true;
   warnParse.hidden = true;
   continueBtn.disabled = true;
 
@@ -1089,7 +1099,7 @@ function renderToken() {
   document.getElementById("token-type").textContent =
     view.tokenType ?? view.audience ?? "(none)";
   document.getElementById("token-expiry").textContent =
-    view.expiresAtUnix ? formatExpiry(view.expiresAtUnix) : "(no exp)";
+    view.expiresAtUnix ? formatExpiry(view.expiresAtUnix, view.clockOffsetSecs) : "(no exp)";
   // FR-104 — say up front that a second administrator prompt is coming.
   document.getElementById("token-anchor-yes").hidden = view.willAnchor !== true;
   document.getElementById("token-anchor-no").hidden = view.willAnchor !== false;
@@ -1102,22 +1112,48 @@ function renderToken() {
       view.tokenType ?? view.audience ?? "(none)";
     return;
   }
-  if (view.appearsExpired) {
+  if (view.expiry === "expired") {
     warnExpired.hidden = false;
     return;
   }
+  // #3523: expired by this computer's clock alone warns and never blocks; the
+  // server checks the token when the device enrolls.
+  const clockWords = clockWarning(view);
+  warnClock.textContent = clockWords ?? "";
+  warnClock.hidden = clockWords === null;
   // FR-129 B2: with the root half, its own token must be fit to go too.
   continueBtn.disabled = rootHalf && rootProblem !== null;
 }
 
-function formatExpiry(unix) {
+// #3523: `offsetSecs` is this computer's clock minus the server's, when the
+// wizard read the server's; "in N min" and "N min ago" then count on the
+// server's clock.
+function formatExpiry(unix, offsetSecs) {
   const date = new Date(unix * 1000);
-  const now = new Date();
+  const now = typeof offsetSecs === "number" ? Date.now() - offsetSecs * 1000 : Date.now();
   const minutes = Math.round((date - now) / 60000);
   const stamp = date.toLocaleString();
   if (minutes < 0) return `${stamp} (${-minutes} min ago)`;
   if (minutes < 60) return `${stamp} (in ${minutes} min)`;
   return stamp;
+}
+
+// #3523 — the words for a token expired by this computer's clock alone, or
+// null. The server's clock is the one that counts.
+function clockWarning(view) {
+  if (!view || view.expiry !== "deviceClockOnly") return null;
+  const gap = typeof view.clockOffsetSecs === "number"
+    ? `this computer's clock is ${formatOffset(view.clockOffsetSecs)} ahead of the server's`
+    : "the server's clock could not be read to compare";
+  return `By this computer's clock the token has expired, but ${gap}. The token may still be good: the server checks it when the device enrolls, so you can continue.`;
+}
+
+function formatOffset(secs) {
+  const minutes = Math.round(Math.abs(secs) / 60);
+  if (minutes < 1) return "less than a minute";
+  if (minutes < 60) return `${minutes} min`;
+  const rest = minutes % 60;
+  return rest ? `${Math.floor(minutes / 60)} h ${rest} min` : `${Math.floor(minutes / 60)} h`;
 }
 
 // ─── Step 3, FR-129 A3: pairing from the browser ───────────────────────────
