@@ -14,7 +14,7 @@
 //! | `cancelled` | the operator's cancel flag, when the step failed |
 //! | `refused` | a [`Refusal`] in the chain, or words with no cause ([`Said`]) at its root |
 //! | `name_not_resolved` | [`NameNotResolved`], from the wizard's own resolver |
-//! | `certificate_refused` | a `native_tls::Error`: the secure handshake, which is where a middlebox's certificate is refused |
+//! | `secure_connection_failed` | a `native_tls::Error`: the secure connection could not be set up. An untrusted certificate is the usual cause and a handshake the network cut another, so the words name the first as the usual one |
 //! | `status` | a server's answer: [`HttpStatus`], [`EnrollRejected`], `reqwest::Error::status()` |
 //! | `connection_refused` | an `io::Error` of kind `ConnectionRefused` under a request |
 //! | `timed_out` | `reqwest::Error::is_timeout()`, or an `io::Error` of kind `TimedOut` under a request |
@@ -47,7 +47,7 @@ pub enum Kind {
     Cancelled,
     Refused,
     NameNotResolved,
-    CertificateRefused,
+    SecureConnectionFailed,
     ConnectionRefused,
     TimedOut,
     Status,
@@ -64,7 +64,7 @@ impl Kind {
             Kind::Cancelled => "cancelled",
             Kind::Refused => "refused",
             Kind::NameNotResolved => "name_not_resolved",
-            Kind::CertificateRefused => "certificate_refused",
+            Kind::SecureConnectionFailed => "secure_connection_failed",
             Kind::ConnectionRefused => "connection_refused",
             Kind::TimedOut => "timed_out",
             Kind::Status => "status",
@@ -247,7 +247,7 @@ impl Found {
             found.host = Some(n.name.clone());
             Kind::NameNotResolved
         } else if find::<native_tls::Error>(err).is_some() {
-            Kind::CertificateRefused
+            Kind::SecureConnectionFailed
         } else if let Some(s) = find::<HttpStatus>(err) {
             found.status = Some(s.status);
             found.said = Some(s.said.clone());
@@ -290,11 +290,11 @@ impl Found {
                 "Roomler Setup could not find {host}: the name did not resolve. Check the \
                  server's address and this computer's network or DNS, then Retry."
             ),
-            Kind::CertificateRefused => format!(
-                "Roomler Setup could not make a secure connection to {host}: this computer did \
-                 not trust the certificate it was shown. A network that inspects secure \
-                 connections (a proxy or a security product) can cause this: ask whoever runs \
-                 it to let {host} through, then Retry."
+            Kind::SecureConnectionFailed => format!(
+                "Roomler Setup could not set up a secure connection to {host}. The usual cause \
+                 is a certificate this computer does not trust, as on a network that inspects \
+                 secure connections (a proxy or a security product): ask whoever runs it to let \
+                 {host} through, then Retry."
             ),
             Kind::ConnectionRefused => format!(
                 "Roomler Setup could not reach {host}: the connection was refused. Check this \
@@ -497,10 +497,18 @@ mod tests {
         let (f, root) = resolve_against(&base, Duration::from_secs(30)).await;
         holds(
             &f,
-            Kind::CertificateRefused,
-            "this computer did not trust the certificate",
+            Kind::SecureConnectionFailed,
+            "could not set up a secure connection to 127.0.0.1.",
             &format!("GET {base}/"),
             &root,
+        );
+        // The type also covers a handshake the network cut, so the words
+        // name the certificate as the usual cause, never as the fact.
+        assert!(
+            f.words
+                .contains("The usual cause is a certificate this computer does not trust"),
+            "{}",
+            f.words
         );
         assert!(f.chain.len() >= 3, "{:?}", f.chain);
     }
@@ -640,7 +648,7 @@ mod tests {
     #[test]
     fn the_terminal_event_names_the_step_and_the_log_says_the_same() {
         let (steps, _) = crate::steps::tests::tracker();
-        steps.started();
+        steps.started(&[], None);
         steps.begin(StepId::Preflight);
         steps.ok();
         steps.begin(StepId::Download);

@@ -77,7 +77,19 @@ pub async fn run_install(
     // boundaries flush to it and every step reports as it ends — only if
     // the Welcome box was ticked.
     Diagnostics::global().server_known(&roomler_cli::config::enrollment_server_url(&server));
-    Steps::global().started();
+    // #3590: the steps every run takes.
+    Steps::global().started(
+        &[
+            StepId::Preflight,
+            StepId::Resolve,
+            StepId::Download,
+            StepId::Verify,
+            StepId::Extract,
+            StepId::Integrate,
+            StepId::Enroll,
+        ],
+        Some(crate::steps::to_page(&on_event)),
+    );
 
     let outcome = run_install_inner(role, server, token, device_name, &on_event).await;
 
@@ -329,6 +341,7 @@ async fn run_install_inner(
     steps.done();
 
     Ok(DoneReport {
+        warnings: Steps::global().warnings(),
         principal_kind: "tunnel_client".to_string(),
         principal_id: result.tunnel_client_id,
         tenant_id: result.tenant_id,
@@ -377,6 +390,8 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     // cmd_install_progress_replay; channel send is best-effort
     // (errs only when the receiver has been closed = SPA moved on).
     replay_log().push(event.clone());
+    // #3590: the checklist hears it (a warning gets its row, a step its words).
+    Steps::global().saw(&event);
     let _ = channel.send(event);
 }
 

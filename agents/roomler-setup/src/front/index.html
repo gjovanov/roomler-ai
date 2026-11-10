@@ -449,6 +449,12 @@
         <p id="done-restart-reason"></p>
       </div>
 
+      <!-- #3590: every warning the install raised, in the order it came. -->
+      <div id="done-warnings" class="warning" hidden>
+        <strong>What the install warned about</strong>
+        <ul id="done-warnings-list"></ul>
+      </div>
+
       <!-- FR-129 B1: what the daemon on Linux / macOS still needs from the
            person — the macOS privacy grants the OS never asks for, and where
            the daemon's logs are. Filled by app.js renderDone. -->

@@ -205,7 +205,7 @@ pub enum ProgressEvent {
     /// `"extract"`, `"integrate"`, `"root_half"`, `"enroll"`, `"restart"`,
     /// `"user_steps"`, `"companion"`, `"anchor"`), `kind` what kind of
     /// failure it was (decided on the error's types: `"connection_refused"`,
-    /// `"name_not_resolved"`, `"certificate_refused"`, `"timed_out"`,
+    /// `"name_not_resolved"`, `"secure_connection_failed"`, `"timed_out"`,
     /// `"status"` with its `status`, …), `words` what failed, why and what to
     /// try, and `chain` every cause, outermost first. The wizard's own
     /// `failure::Failure` fills it; this crate keeps plain fields so it stays
@@ -217,6 +217,11 @@ pub enum ProgressEvent {
         words: String,
         chain: Vec<String>,
     },
+
+    /// #3590 — the install's checklist as it now is: every row, in order. The
+    /// wizard's step tracker sends it whenever a row changes, and the page
+    /// draws this and nothing else.
+    Steps { rows: Vec<StepRow> },
 
     /// Daemon SystemContext role only: a WiX `EnableSystemContext` /
     /// `DisableSystemContext` custom action failed inside msiexec.
@@ -230,6 +235,22 @@ pub enum ProgressEvent {
         message: String,
         hint: String,
     },
+}
+
+/// #3590 — one row of the install's checklist: a step, or a warning the run
+/// raised, which keeps a row of its own in the order it came.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StepRow {
+    /// The step's name (`"resolve"`, …, as in `Error`), or `"warning"`.
+    pub step: String,
+    /// `"pending"`, `"running"`, `"done"`, `"failed"` or `"not_reached"`, and
+    /// `"warning"` for a warning's row.
+    pub state: String,
+    /// What the person reads: what the step does, or the warning's words.
+    pub label: String,
+    /// What the step's last progress event said, if anything.
+    pub detail: Option<String>,
 }
 
 /// Process-wide replay log. Every emit lands here (minus per-chunk

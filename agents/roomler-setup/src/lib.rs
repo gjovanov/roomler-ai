@@ -258,6 +258,87 @@ mod front_tests {
         assert_eq!(without_interpolations("a ${perUserWord} b ${c}"), "a  b ");
     }
 
+    /// The text of `function name(…) { … }` in `js`: from its head to the
+    /// first brace at the start of a line, which ends it.
+    fn function_body<'a>(js: &'a str, name: &str) -> &'a str {
+        let start = js
+            .find(&format!("function {name}("))
+            .unwrap_or_else(|| panic!("app.js has no function {name}"));
+        let end = js[start..].find("\n}").map_or(js.len(), |at| start + at);
+        &js[start..end]
+    }
+
+    /// #3590 — the checklist is the wizard's list of steps. The page draws the
+    /// last `Steps` snapshot the tracker sent and keeps no row of its own: no
+    /// row keyed by an event's type (a failure left those running), and no
+    /// label made from an event's fields (`AssetResolving`'s `artifact` named
+    /// the MSI flavour).
+    #[test]
+    fn the_checklist_draws_the_steps_snapshot_and_nothing_else() {
+        let js = include_str!("front/app.js");
+        assert!(
+            function_body(js, "handleProgress").contains("type === \"Steps\""),
+            "the page does not read the Steps snapshot"
+        );
+        assert!(
+            function_body(js, "renderInstall").contains("for (const row of state.installSteps)"),
+            "renderInstall does not draw the snapshot's rows"
+        );
+        for own in [
+            "installRows",
+            "STEP_LABELS",
+            "checklistLabel",
+            "checklistClass",
+        ] {
+            assert!(!js.contains(own), "app.js keeps rows of its own: {own}");
+        }
+        for field in ["artifact", "existing"] {
+            assert!(
+                !js.contains(&format!("d.{field}")) && !js.contains(&format!("data.{field}")),
+                "app.js draws an event's {field}"
+            );
+        }
+    }
+
+    /// #3590 — every state a row can be in has a look of its own, and the page
+    /// maps each wire state to it.
+    #[test]
+    fn every_row_state_has_a_look_of_its_own() {
+        let css = include_str!("front/styles.css");
+        let js = include_str!("front/app.js");
+        for (state, class) in [
+            ("pending", "pending"),
+            ("running", "running"),
+            ("done", "ok"),
+            ("failed", "error"),
+            ("not_reached", "not-reached"),
+            ("warning", "warning"),
+        ] {
+            assert!(
+                css.contains(&format!(".checklist li.{class} .icon::before")),
+                "styles.css has no look for {class}"
+            );
+            assert!(
+                js.contains(&format!("{state}: \"{class}\"")),
+                "app.js maps no class for {state}"
+            );
+        }
+    }
+
+    /// #3590 — a warning the install raised can still be read on Done.
+    #[test]
+    fn the_done_page_lists_the_warnings() {
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("id=\"done-warnings\"") && html.contains("id=\"done-warnings-list\""),
+            "Done has no place for the warnings"
+        );
+        assert!(
+            function_body(include_str!("front/app.js"), "renderDone").contains("done.warnings"),
+            "renderDone does not list the report's warnings"
+        );
+    }
+
     /// `literal` with each `${…}` taken out.
     fn without_interpolations(literal: &str) -> String {
         let mut shown = String::new();

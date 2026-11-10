@@ -95,7 +95,11 @@ pub async fn run_install(
     replay_log().reset();
 
     Diagnostics::global().server_known(&crate::orchestrator_agent::diagnostics_server(&server));
-    Steps::global().started();
+    // #3590: the steps every run takes; the enrolls get their rows when they begin.
+    Steps::global().started(
+        &[StepId::Preflight, StepId::Package, StepId::UserSteps],
+        Some(crate::steps::to_page(&on_event)),
+    );
 
     let outcome = run_install_inner(
         role,
@@ -319,7 +323,11 @@ async fn run_install_inner(
     }
     // The server's word for this OS, for the server the person chose (after
     // the role).
-    let features = crate::features::fetch(&server).await;
+    // #3432: a server that could not be asked fails here with its cause; only
+    // its answer can say it does not offer the install.
+    let features = crate::features::fetch(&server)
+        .await
+        .map_err(|e| steps.fail(ErrorCode::Preflight, e))?;
     if !features.daemon_offered(os) {
         return Err(steps.fail(
             ErrorCode::UnsupportedPlatform,
@@ -779,6 +787,7 @@ async fn run_install_inner(
     drop(scratch);
 
     Ok(DoneReport {
+        warnings: Steps::global().warnings(),
         principal_kind: "agent".to_string(),
         principal_id: agent_id,
         tenant_id,
@@ -1280,6 +1289,8 @@ fn last_line(text: &str) -> &str {
 
 fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     replay_log().push(event.clone());
+    // #3590: the checklist hears it (a warning gets its row, a step its words).
+    Steps::global().saw(&event);
     let _ = channel.send(event);
 }
 

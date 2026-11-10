@@ -111,6 +111,7 @@ const state = {
   rootTokenValidating: false,
   installError: null,
   installErrorStep: null, // step scope from the last Error event
+  installSteps: [], // #3590: the checklist's rows, as the last Steps snapshot sent them
   installErrorChain: [],  // #3432: the failure's causes, outermost first
   installDone: null,   // DoneReport
   installInFlight: false,
@@ -168,10 +169,6 @@ const state = {
   },
 };
 
-// Checklist rows keyed by event type — replay + live events render
-// idempotently (a repeated type overwrites its row instead of
-// appending a duplicate). JS Map preserves insertion order.
-let installRows = new Map();
 
 // ─── Bootstrap ─────────────────────────────────────────────────────────────
 
@@ -1472,61 +1469,7 @@ function renderPairStatus() {
 
 // ─── Step 4: Install ───────────────────────────────────────────────────────
 
-const STEP_LABELS = {
-  Started: "Install started",
-  PreflightStarted: "Pre-flight checks",
-  PreflightOk: "Pre-flight: detected install",
-  PreflightWarning: "Pre-flight warning",
-  AssetResolving: "Resolving download URL",
-  AssetResolved: "Download URL resolved",
-  DownloadStarted: "Downloading",
-  DownloadVerified: "Download verified (SHA256)",
-  PublisherVerified: "Publisher verified",
-  MsiSpawned: "Running MSI installer",
-  MsiCompleted: "MSI installer finished",
-  ExtractStarted: "Extracting archive",
-  ExtractDone: "Archive extracted",
-  IntegrationStarted: "Wiring up PATH",
-  IntegrationDone: "PATH integration finished",
-  EnrollStarted: "Enrolling with Roomler",
-  EnrollOk: "Enrolled",
-  // #3174: whoever placed it, this is what the machine has.
-  CompanionWaiting: "Waiting for the Roomler service to add roomler-desktop",
-  CompanionPresent: "roomler-desktop is in place",
-  CompanionAbsent: "roomler-desktop is not there yet",
-  AnchorStarted: "Anchoring for SYSTEM exec (administrator prompt)",
-  AnchorOk: "Anchored for SYSTEM exec",
-  AnchorSkipped: "Not anchored",
-  // #3116 (Windows reinstall): the daemon onto the new enrollment.
-  DaemonRestartStarted: "Restarting the Roomler service onto the new enrollment",
-  DaemonRestartOk: "The Roomler service runs the new enrollment",
-  DaemonRestartSkipped: "The Roomler service was not restarted",
-  // FR-129 B1 (Linux/macOS): the install.sh halves.
-  ScriptHalfStarted: "Running the install steps",
-  ScriptHalfDone: "Install steps finished",
-  ElevationCancelled: "Cancelled at the administrator prompt",
-  ElevationUnavailable: "No administrator prompt — run the command below",
-  Done: "Done",
-  Error: "Error",
-  SystemContextError: "Turning on lock-screen access failed",
-};
-
-// FR-129 B1 — the halves' rows are keyed by half, so the privileged and the
-// user half each keep a row; the lines they print go to the output panel.
-const SCRIPT_HALF_WORDS = {
-  privileged: "Installing the package (administrator prompt)",
-  user: "Starting the service in your session",
-};
-const SCRIPT_TOOL_WORDS = {
-  pkexec: "the system's password prompt",
-  osascript: "the macOS administrator prompt",
-  terminal: "a terminal you run the command in",
-  sh: "as you",
-};
 const SCRIPT_LINES_SHOWN = 14;
-// FR-129 B2 — the `EnrollOk` kind of a Mac's root half
-// (`orchestrator_unix::ROOT_HALF_PRINCIPAL_KIND`).
-const ROOT_HALF_KIND = "agent_root_half";
 
 function wireInstall() {
   document.getElementById("install-cancel").addEventListener("click", async () => {
@@ -1582,7 +1525,7 @@ function wireInstall() {
     state.installError = null;
     state.installErrorStep = null;
     state.installErrorChain = [];
-    installRows = new Map();
+    state.installSteps = [];
     // FR-129: a failed paired install's token is dropped with the pairing —
     // the next pass through the Join step starts clean.
     if (state.installMode === "paired") await cancelPairing();
@@ -1592,7 +1535,7 @@ function wireInstall() {
 }
 
 async function runInstall() {
-  installRows = new Map();
+  state.installSteps = [];
   state.installError = null;
   state.installErrorStep = null;
   state.installErrorChain = [];
@@ -1710,10 +1653,13 @@ function handleProgress(event, live) {
     return;
   }
 
-  // A (live) Started marks the beginning of a fresh pipeline run —
-  // clear any rows a stale replay painted.
-  if (type === "Started" && live) {
-    installRows = new Map();
+  // #3590: the checklist is the wizard's. Each Steps snapshot holds every
+  // row (a stale replay's too: the next run's first snapshot replaces it),
+  // and the page draws the last one and nothing else.
+  if (type === "Steps") {
+    state.installSteps = Array.isArray(data.rows) ? data.rows : [];
+    renderInstall();
+    return;
   }
 
   if (type === "AssetResolved" || type === "DownloadStarted") {
@@ -1747,13 +1693,6 @@ function handleProgress(event, live) {
   if (type === "ScriptHalfDone" || type === "Error" || type === "Done") {
     state.elevation = null;
   }
-  // Each half keeps its own row (the type alone would merge them).
-  if (type === "ScriptHalfStarted" || type === "ScriptHalfDone") {
-    installRows.delete(type === "ScriptHalfStarted" ? `ScriptHalfDone:${data.half}` : `ScriptHalfStarted:${data.half}`);
-    installRows.set(`${type}:${data.half}`, { type, data });
-    renderInstall();
-    return;
-  }
 
   if (type === "SystemContextError") {
     const stageLabel = {
@@ -1771,35 +1710,40 @@ function handleProgress(event, live) {
     state.installErrorStep = data.step ?? null;
   }
 
-  // Idempotent checklist row keyed by event type — FR-129 B2: a Mac's root
-  // half enrolls as a device of its own and keeps its own row.
-  const key = type === "EnrollOk" && data.principalKind === ROOT_HALF_KIND ? "EnrollOk:root" : type;
-  installRows.set(key, { type, data });
+  // The panels this event moves; the rows come in Steps.
   renderInstall();
 }
+
+// #3590: a row's look, by its state on the wire.
+const ROW_CLASS = {
+  pending: "pending",
+  running: "running",
+  done: "ok",
+  failed: "error",
+  not_reached: "not-reached",
+  warning: "warning",
+};
 
 function renderInstall() {
   const list = document.getElementById("install-checklist");
   list.innerHTML = "";
-  for (const event of installRows.values()) {
+  for (const row of state.installSteps) {
     const li = document.createElement("li");
-    li.className = checklistClass(event);
+    li.className = ROW_CLASS[row.state] ?? "pending";
     const icon = document.createElement("span");
     icon.className = "icon";
     li.appendChild(icon);
     const label = document.createElement("span");
-    label.textContent = checklistLabel(event);
+    label.textContent = row.detail ? `${row.label}: ${row.detail}` : row.label;
     li.appendChild(label);
     list.appendChild(li);
   }
 
-  // Progress bar visible only while a download is active.
-  const downloadStarted = installRows.has("DownloadStarted");
-  // #3246 — a release with no digest sends only the publisher's row, and a
-  // refused download sends neither: the bar must not outlive the refusal.
-  const downloadVerified = installRows.has("DownloadVerified") || installRows.has("PublisherVerified");
+  // The bar shows while the installer's download runs (the companion's is a
+  // step of its own), and never past a failure.
+  const download = state.installSteps.find((row) => row.step === "download");
   document.getElementById("install-progress").hidden =
-    !(downloadStarted && !downloadVerified) || !!state.installError;
+    download?.state !== "running" || !!state.installError;
 
   // FR-129 B1: the halves' output, and the terminal fallback.
   renderScriptOutput();
@@ -1819,8 +1763,11 @@ function renderInstall() {
   const errorEl = document.getElementById("install-error");
   if (state.installError) {
     errorEl.hidden = false;
+    // #3432: the failed step in a person's words, from its row (the wire
+    // names it `resolve`, `download`, …).
+    const failedRow = state.installSteps.find((row) => row.step === state.installErrorStep);
     document.getElementById("install-error-title").textContent =
-      state.installErrorStep ? `Install failed at: ${state.installErrorStep}` : "Install failed";
+      failedRow ? `Install failed at: ${failedRow.label}` : "Install failed";
     document.getElementById("install-error-message").textContent = state.installError;
     const chain = state.installErrorChain ?? [];
     const chainEl = document.getElementById("install-error-chain");
@@ -1852,91 +1799,12 @@ function renderScriptOutput() {
   pre.scrollTop = pre.scrollHeight;
 }
 
-function checklistClass(event) {
-  const t = event.type;
-  const d = event.data ?? {};
-  if (t === "Error" || t === "SystemContextError" || t === "ElevationCancelled") return "error";
-  if (t === "ScriptHalfDone" && d.code !== 0) return "error";
-  if (
-    t === "PreflightWarning" || t === "AnchorSkipped" || t === "ElevationUnavailable" ||
-    t === "DaemonRestartSkipped" || t === "CompanionAbsent"
-  ) {
-    return "warning";
-  }
-  if (
-    t === "Done" || t === "EnrollOk" || t === "AnchorOk" || t === "DaemonRestartOk" || t === "MsiCompleted" ||
-    t === "ExtractDone" || t === "IntegrationDone" || t === "ScriptHalfDone" ||
-    t === "PublisherVerified" || t === "PreflightOk" || t === "AssetResolved" || t === "CompanionPresent"
-  ) {
-    return "ok";
-  }
-  if (t === "DownloadVerified") return d.sha256Match ? "ok" : "error";
-  return "running";
-}
-
-function checklistLabel(event) {
-  const t = event.type;
-  const d = event.data ?? {};
-  const base = STEP_LABELS[t] ?? t;
-  if (t === "ScriptHalfStarted") {
-    return `${SCRIPT_HALF_WORDS[d.half] ?? base} — ${SCRIPT_TOOL_WORDS[d.tool] ?? d.tool}`;
-  }
-  if (t === "ScriptHalfDone") {
-    const what = SCRIPT_HALF_WORDS[d.half] ?? base;
-    return d.code === 0 ? `${what}: done` : `${what}: failed (exit ${d.code})`;
-  }
-  if (t === "ElevationUnavailable") return `${base}: ${d.reason}`;
-  if (t === "PreflightOk") return `Pre-flight: detected ${d.existing}`;
-  if (t === "PreflightWarning") return `${base}: ${d.message}`;
-  if (t === "AssetResolving") return `Resolving download URL (${d.artifact})`;
-  if (t === "AssetResolved") return `Resolved ${releaseLabel(d.tag)} (${(d.sizeBytes / 1_000_000).toFixed(1)} MB)`;
-  if (t === "DownloadVerified") return d.sha256Match ? base : "The download does not match its checksum";
-  if (t === "PublisherVerified") return `Signed by ${d.signer}`;
-  if (t === "MsiSpawned") return `Running MSI installer (PID ${d.pid})`;
-  if (t === "MsiCompleted") return `MSI installer finished (exit ${d.code}, ${d.decoded})`;
-  if (t === "ExtractDone") return `Extracted. Binary at ${d.tunnelBinary}`;
-  if (t === "IntegrationDone")
-    return `Integration: PATH ${d.pathUpdated ? "updated" : "unchanged"}; shortcut ${d.shortcutCreated ? "created" : "skipped"}`;
-  if (t === "EnrollOk" && d.principalKind === ROOT_HALF_KIND) {
-    return `Enrolled the private network's root half (device ${d.principalId})`;
-  }
-  if (t === "EnrollOk") return `Enrolled (${principalKindLabel(d.principalKind)} ${d.principalId})`;
-  if (t === "CompanionAbsent") return `${base}. ${d.message}`;
-  if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
-  if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
-  if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
-  if (t === "Error") return `Error at ${d.step}: ${d.words}`;
-  if (t === "SystemContextError") {
-    const stageLabel = {
-      env_var_write: "Saving the service's lock-screen setting",
-      service_restart: "Restarting the service",
-      unknown: "Turning on lock-screen access",
-    }[d.stage] ?? `Turning on lock-screen access (${d.stage})`;
-    return `${stageLabel} failed: ${d.message}${d.hint ? " — " + d.hint : ""}`;
-  }
-  return base;
-}
-
 // FR-129 C1 — what a person reads for a release: the product and its
 // version, never the release tag (`agent-v0.4.188`), which stays a wire
 // value — the updater, the proxies and the DoneReport all key on it.
 function releaseVersion(tag) {
   const m = /^(?:agent|tunnel|setup)-v(.+)$/.exec(tag ?? "");
   return m ? m[1] : (tag ?? "");
-}
-
-function releaseLabel(tag) {
-  const version = releaseVersion(tag) || "(unknown version)";
-  if (/^agent-v/.test(tag ?? "")) return `roomlerd ${version}`;
-  if (/^tunnel-v/.test(tag ?? "")) return `the roomler CLI ${version}`;
-  return version;
-}
-
-// FR-129 C1 — the EnrollOk kind for a person (the wire keeps `agent`).
-function principalKindLabel(kind) {
-  if (kind === "agent") return "device";
-  if (kind === "tunnel_client") return "tunnel client";
-  return kind ?? "";
 }
 
 // ─── Step 5: Done ──────────────────────────────────────────────────────────
@@ -1983,6 +1851,17 @@ function renderDone() {
     lead += ` It joined ${pairOrgLabel(state.pair)}, approved by ${pairApproverLabel(state.pair)}.`;
   }
   document.getElementById("done-lead").textContent = lead;
+
+  // #3590: every warning the install raised, readable here too.
+  const warnings = Array.isArray(done.warnings) ? done.warnings : [];
+  document.getElementById("done-warnings-list").replaceChildren(
+    ...warnings.map((words) => {
+      const li = document.createElement("li");
+      li.textContent = words;
+      return li;
+    }),
+  );
+  document.getElementById("done-warnings").hidden = warnings.length === 0;
 
   // FR-104 — the anchor step ran and did not anchor: the manual command,
   // with a placeholder where a fresh token goes (the one pasted here is

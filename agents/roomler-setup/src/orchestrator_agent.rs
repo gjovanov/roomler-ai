@@ -60,7 +60,7 @@ use wizard_shared::progress::{ProgressEvent, replay_log};
 use crate::commands::DoneReport;
 use anyhow::Context as _;
 
-use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code};
+use crate::diagnostics::{Diagnostics, enroll_error_code};
 use crate::failure::{Failure, Said};
 use crate::package_step;
 use crate::role::Role;
@@ -212,7 +212,18 @@ pub async fn run_install(
     // pages' buffered boundaries flush now and every step below reports
     // as it ends. Nothing is sent unless the Welcome box was ticked.
     Diagnostics::global().server_known(&diagnostics_server(&server));
-    Steps::global().started();
+    // #3590: the steps every run takes; a reinstall's restart, the companion and the anchor get their rows when they begin.
+    Steps::global().started(
+        &[
+            StepId::Preflight,
+            StepId::Resolve,
+            StepId::Download,
+            StepId::Verify,
+            StepId::Package,
+            StepId::Enroll,
+        ],
+        Some(crate::steps::to_page(&on_event)),
+    );
 
     // Outer Result so we can always clear INSTALL_IN_PROGRESS on
     // any exit path.
@@ -796,6 +807,7 @@ async fn run_install_inner(
     let (cli_binary_path, cli_included, cli_path_updated) = cli_done_surface(wfx);
 
     Ok(DoneReport {
+        warnings: Steps::global().warnings(),
         principal_kind: "agent".to_string(),
         principal_id: agent_id,
         tenant_id,
@@ -999,7 +1011,7 @@ async fn restart_onto_new_enrollment(
     };
     let Some(status) = daemon_status(budget).await else {
         match settled {
-            Some(false) if cancel_requested() => {
+            Some(false) if crate::diagnostics::cancel_requested() => {
                 skipped("the wait for the Roomler service was cancelled".to_string())
             }
             Some(false) => skipped(format!(
@@ -1235,7 +1247,7 @@ async fn confirm_fresh_service(config_path: &std::path::Path, on_event: &Channel
                 ServiceAnswer::Waiting => {}
             }
         }
-        if cancel_requested() {
+        if crate::diagnostics::cancel_requested() {
             return skipped("the wait for the Roomler service was cancelled".to_string());
         }
         if begun.elapsed() >= DAEMON_ANSWER_BUDGET {
@@ -1843,6 +1855,8 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     // effort (Tauri 2 returns Err only when the receiver has been
     // closed, which means the SPA already moved on).
     replay_log().push(event.clone());
+    // #3590: the checklist hears it (a warning gets its row, a step its words).
+    Steps::global().saw(&event);
     let _ = channel.send(event);
 }
 

@@ -596,6 +596,10 @@ pub struct DoneReport {
     /// person's device: its own device row, the one that owns the overlay.
     /// `None` everywhere else.
     pub root_half: Option<RootHalfReport>,
+    /// #3590 — the warnings the install raised, in the order they came: the
+    /// Done page lists them.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// FR-129 B2 — the device the macOS root half enrolled as, for the Done page.
@@ -1214,6 +1218,7 @@ mod tests {
             cli_included: None,
             desktop_installed: None,
             anchored: None,
+            warnings: Vec::new(),
             root_half: Some(RootHalfReport {
                 principal_id: "507f1f77bcf86cd799439012".to_string(),
                 tenant_id: "507f191e810c19729de860ea".to_string(),
