@@ -15,14 +15,19 @@
 //! | the row exists in the device's tenant and names this device | `agent_disconnect`, nothing written |
 //! | the row is live and not ended | the row's own end reason (an admin's end written during the gap reads `admin_terminated`), nothing written |
 //! | `resume_by` has not passed, when the row has one | `agent_disconnect`, the row ended as inferred |
+//! | the row is not marked `external` (review 1, L6: a device never keeps an external session, D3) | `agent_disconnect`, the row ended at the number read |
 //! | the gate a request runs, run again (`controller::resume_gate`) | `admin_terminated`; a read that failed decides nothing: `agent_disconnect`, and the session is over, so the device's newest connection ends the row as inferred |
 //! | the org's maximum length, counted from `started_at` | `idle_timeout`, limit `max_duration` |
-//! | the FR-115 slot, taken again under the session's own id | `agent_disconnect` |
 //!
 //! A claim that passes commits with one conditional update that bumps the
 //! fencing number ([`RemoteSessionDao::commit_resume`]); the hub rebuilds the
 //! session and counts it; the row is read once more, so an end that landed
-//! meanwhile wins; and only then does the device hear `rc:session.resumed`.
+//! meanwhile wins; the FR-115 slot is taken again under the session's own id,
+//! only now that the commit has won (PR C's deferred race: a claim that loses
+//! never renews or retags the winner's lease), and a session whose slot
+//! another took during the gap ends, fenced at the number committed; and only
+//! then does the device hear `rc:session.resumed`. A claim whose connection
+//! was gone once it had committed writes the detach back (review 1, L2).
 //! Consent is the one check not re-run. A commit that matched nothing is
 //! decided from the row read again (`commit`): the device's NEWEST
 //! connection tries once more at the row's number while the row is still
@@ -228,6 +233,20 @@ pub async fn claim_as_read(
             Some(end),
         );
     }
+    // Review 1, L6 (D3) — a device never keeps an external session: a row
+    // marked external (requested while the device held a window) is refused
+    // whatever the gate says, and ended at the number read.
+    if row.external {
+        info!(%agent, session = %session_id, "rc session claim names an external session, which a device never keeps — refused");
+        return refuse(
+            state,
+            ctx,
+            session_id,
+            EndReason::AgentDisconnect,
+            None,
+            Some(RowEnd::fenced(seq)),
+        );
+    }
     let (max_limit, org_session_cap) = match crate::controller::resume_gate(
         state,
         row.controller_user_id,
@@ -309,22 +328,13 @@ pub async fn claim_as_read(
             }
         }
     };
-    let Ok(slot) = reclaim_slot(state, &row, session_id, org_session_cap).await else {
-        info!(%agent, session = %session_id, "rc session claim: the org's slots are taken — refused");
-        let end = RowEnd::fenced(seq);
-        return refuse(
-            state,
-            ctx,
-            session_id,
-            EndReason::AgentDisconnect,
-            None,
-            Some(end),
-        );
-    };
 
     // The commit: at the number read, still live, its window still open; one
-    // that matched nothing is decided from the row read again.
-    let Some(committed) = commit(state, ctx, session_id, seq, now, slot.as_ref()).await else {
+    // that matched nothing is decided from the row read again. Nothing before
+    // it touches the org's slot (PR C's deferred race): a claim takes the slot
+    // only once its commit has won, so one that loses never renews the
+    // winner's lease or writes its own pod into it.
+    let Some(committed) = commit(state, ctx, session_id, seq, now).await else {
         return;
     };
     let next = committed + 1;
@@ -341,18 +351,29 @@ pub async fn claim_as_read(
             started_at,
             attach_seq: next,
             max_duration,
-            slot: slot.clone(),
+            external: row.external,
             // P1b-2 — how long the rebuilt session waits for its viewer.
             resume_secs: ctx.resume.window_secs,
         },
     );
-    if let Some(lease) = &slot {
-        crate::slots::settle(lease);
-    }
     if built == Resumed::NotPending {
-        // Displaced or closed while the claim was decided: the row stays at
-        // the committed number, for whichever connection claims it next.
-        info!(%agent, session = %session_id, "rc session claim: the connection that made it is gone");
+        // Review 1, L2 — displaced or closed after the commit, which cleared
+        // the row's deadline: no pod holds the session, so the detach is
+        // written back, fenced at the number committed, with a deadline a
+        // window from now and the slot kept to match. Whichever connection
+        // of the device claims it next resumes it at that number, and the
+        // sweep ends it if none does.
+        let resume_by = DateTime::from_millis(
+            DateTime::now()
+                .timestamp_millis()
+                .saturating_add(i64::from(ctx.resume.window_secs).saturating_mul(1000)),
+        );
+        info!(%agent, session = %session_id, attach_seq = next, "rc session claim: the connection that made it is gone after its commit — the detach written back");
+        state
+            .fleet
+            .rc_hub
+            .record_detach(session_id, agent, ctx.tenant_id, next, resume_by);
+        crate::slots::keep(state, ctx.tenant_id, session_id, resume_by).await;
         return;
     }
 
@@ -374,6 +395,26 @@ pub async fn claim_as_read(
             debug!(%agent, session = %session_id, %e, "rc session claim: the second read failed; the resume stands");
         }
     }
+    // FR-115 — the org's slot, taken again under the session's own id now
+    // that the commit has won: its own lease when it outlived the gap (the
+    // detach kept it), a new one when the org has room. When another session
+    // took it during the gap, the rebuilt session ends here, fenced at the
+    // number committed.
+    match reclaim_slot(state, &row, session_id, org_session_cap).await {
+        Ok(Some(lease)) => {
+            state.fleet.rc_hub.hold_lease(session_id, lease.clone());
+            crate::slots::settle(&lease);
+        }
+        Ok(None) => {}
+        Err(()) => {
+            info!(%agent, session = %session_id, attach_seq = next, "rc session claim: the org's slots are taken — the resumed session ends");
+            state
+                .fleet
+                .rc_hub
+                .refuse_resumed(session_id, EndReason::AgentDisconnect);
+            return;
+        }
+    }
     state
         .fleet
         .rc_hub
@@ -390,15 +431,18 @@ const PRESENCE_READ_BUDGET: Duration = Duration::from_millis(250);
 ///
 /// A commit that matched nothing (or failed) is decided from the row read
 /// again. Before P1b-1's review it was always refused with no write, and its
-/// slot given back by the session's id (M4, L1; review 2, N4):
+/// slot given back by the session's id (M4, L1; review 2, N4). The claim
+/// holds no slot of its own here: it takes the slot only once its commit has
+/// won (PR C's deferred race), so a claim that loses leaves the lease alone,
+/// whoever holds it:
 ///
 /// | The row read again | Answer | Slot |
 /// |---|---|---|
 /// | cannot be read | `agent_disconnect`, nothing written | left alone |
-/// | ended | its own reason, nothing written | given back: nobody holds it |
+/// | ended | its own reason, nothing written | given back by the session's id: nobody holds it |
 /// | this is not the device's newest connection | `agent_disconnect`, nothing written | left alone: the newest may hold it |
-/// | live, names the device, inside any `resume_by`, not yet tried again | committed once more, at the row's number | as committed |
-/// | anything else | `agent_disconnect`, the row ended as inferred, fenced at the number last tried | given back when that end lands |
+/// | live, names the device, inside any `resume_by`, not yet tried again | committed once more, at the row's number | taken after the commit |
+/// | anything else | `agent_disconnect`, the row ended as inferred, fenced at the number last tried | given back by the session's id when that end lands |
 ///
 /// The second try is the case M4 found: an older connection's claim of the
 /// same device read the row first and committed first, then found its
@@ -415,7 +459,6 @@ async fn commit(
     session_id: ObjectId,
     mut seq: u32,
     mut now: DateTime,
-    slot: Option<&Lease>,
 ) -> Option<u32> {
     let agent = ctx.agent_id;
     let mut retried = false;
@@ -439,9 +482,6 @@ async fn commit(
             Ok(row) => row,
             Err(e) => {
                 warn!(%agent, session = %session_id, %e, "rc session claim: the commit missed and the row could not be read again — refused, nothing written");
-                if let Some(lease) = slot {
-                    crate::slots::settle(lease);
-                }
                 refuse(
                     state,
                     ctx,
@@ -456,17 +496,12 @@ async fn commit(
         if row.ended_at.is_some() || row.phase == SessionPhase::Closed {
             let reason = row.end_reason.unwrap_or(EndReason::AgentDisconnect);
             info!(%agent, session = %session_id, ?reason, "rc session claim: it ended before the commit — refused");
-            if let Some(lease) = slot {
-                crate::slots::release_unused(state, lease, None).await;
-            }
+            crate::slots::release_ended(state, ctx.tenant_id, session_id).await;
             refuse(state, ctx, session_id, reason, None, None);
             return None;
         }
         if !newest_connection(state, ctx, session_id).await {
             info!(%agent, session = %session_id, "rc session claim: an older connection of the device lost its commit — refused; the row and its slot are the newest connection's");
-            if let Some(lease) = slot {
-                crate::slots::settle(lease);
-            }
             refuse(
                 state,
                 ctx,
@@ -493,12 +528,8 @@ async fn commit(
         // session another claim resumed since would be a false entry in the
         // audit, and writes nothing to the row anyway.
         let lands = row.attach_seq == seq;
-        if let Some(lease) = slot {
-            if lands {
-                crate::slots::release_unused(state, lease, None).await;
-            } else {
-                crate::slots::settle(lease);
-            }
+        if lands {
+            crate::slots::release_ended(state, ctx.tenant_id, session_id).await;
         }
         let end = lands.then(|| {
             let at = inferred_end(&row);
@@ -783,6 +814,7 @@ mod tests {
             resume_by: None,
             stats_at: stats.map(at),
             end_source: None,
+            external: false,
         }
     }
 

@@ -41,14 +41,27 @@ pub(crate) fn enabled(state: &RemoteState) -> bool {
     state.settings.rc.session_resume_secs > 0
 }
 
-/// Write the end to the row and record its trail. The row as it was, when
-/// it matched.
+/// Review 2, N10 — what writing an end to a row did, so a caller never
+/// reports an end it failed to write as taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    /// The row was live and now holds the end: the org it is in.
+    Wrote { tenant_id: ObjectId },
+    /// Nothing to write: the window is off, a hub on this pod holds the
+    /// session, or the row is not live (or does not name what it must).
+    NotLive,
+    /// The write failed: the row may still be live, and a claim may still
+    /// resume it.
+    Failed,
+}
+
+/// Write the end to the row and record its trail.
 async fn write(
     state: &RemoteState,
     session_id: ObjectId,
     scope: &EndScope,
     reason: EndReason,
-) -> Option<RemoteSession> {
+) -> Written {
     match state
         .remote_sessions
         .end_unheld(session_id, scope, reason, DateTime::now())
@@ -80,12 +93,14 @@ async fn write(
             {
                 warn!(session = %session_id.to_hex(), %e, "session slot: an ended session's slot was not given back; it expires on its own");
             }
-            Some(before)
+            Written::Wrote {
+                tenant_id: before.tenant_id,
+            }
         }
-        Ok(None) => None,
+        Ok(None) => Written::NotLive,
         Err(e) => {
             warn!(session = %session_id.to_hex(), %e, "rc session end: its row could not be written");
-            None
+            Written::Failed
         }
     }
 }
@@ -111,19 +126,18 @@ fn end_here_if_rebuilt(
 /// An admin's end (`POST …/session/{id}/terminate`) of a session no hub on
 /// this pod holds, in the org the route names: written to the row. The route
 /// publishes its `terminate` control event after this, as it always has.
-/// `true` when this wrote the row.
-pub async fn admin_end(state: &RemoteState, tenant_id: ObjectId, session_id: ObjectId) -> bool {
+/// Review 2, N10 — [`Written::Failed`] when the write failed: the route must
+/// not answer that end as taken, since a claim may still resume the session.
+pub async fn admin_end(state: &RemoteState, tenant_id: ObjectId, session_id: ObjectId) -> Written {
     if !enabled(state) || state.fleet.rc_hub.session_snapshot(session_id).is_some() {
-        return false;
+        return Written::NotLive;
     }
     let scope = EndScope {
         tenant_id: Some(tenant_id),
         ..EndScope::default()
     };
-    let wrote = write(state, session_id, &scope, EndReason::AdminTerminated)
-        .await
-        .is_some();
-    if wrote {
+    let written = write(state, session_id, &scope, EndReason::AdminTerminated).await;
+    if matches!(written, Written::Wrote { .. }) {
         end_here_if_rebuilt(
             state,
             session_id,
@@ -132,7 +146,7 @@ pub async fn admin_end(state: &RemoteState, tenant_id: ObjectId, session_id: Obj
             EndReason::AdminTerminated,
         );
     }
-    wrote
+    written
 }
 
 /// The controller's own `rc:terminate` of a session no hub on this pod
@@ -223,8 +237,8 @@ async fn end_and_publish(
     reason: EndReason,
 ) {
     let tenant = match write(state, session_id, scope, reason).await {
-        Some(before) => Some(before.tenant_id),
-        None => match state
+        Written::Wrote { tenant_id } => Some(tenant_id),
+        Written::NotLive | Written::Failed => match state
             .remote_sessions
             .find_for_controller(session_id, user_id)
             .await
@@ -268,9 +282,10 @@ pub(crate) async fn revoked(state: &RemoteState, row: &RemoteSession) {
         controller_user_id: Some(row.controller_user_id),
         ..EndScope::default()
     };
-    let wrote = write(state, session_id, &scope, EndReason::AdminTerminated)
-        .await
-        .is_some();
+    let wrote = matches!(
+        write(state, session_id, &scope, EndReason::AdminTerminated).await,
+        Written::Wrote { .. }
+    );
     roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
         state,
         "terminate",

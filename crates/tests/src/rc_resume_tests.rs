@@ -279,6 +279,7 @@ async fn an_audit_listing_holding_the_new_kinds_and_an_unknown_one_still_reads()
             idle_enforced: None,
             lock_on_end: None,
             lock_enforced: None,
+            external: false,
         },
     );
     sink.record(

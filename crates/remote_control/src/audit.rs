@@ -154,6 +154,7 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
         AuditKind::SessionRequested {
             controller_user_id,
             permissions,
+            external,
             ..
         } => {
             let row = RemoteSession {
@@ -183,6 +184,8 @@ async fn project_session(sessions: &Collection<RemoteSession>, ev: &RemoteAuditE
                 resume_by: None,
                 stats_at: None,
                 end_source: None,
+                // Review 1, L6 — the event carries it only under a window.
+                external: *external,
             };
             let doc = match bson::to_document(&row) {
                 Ok(d) => d,

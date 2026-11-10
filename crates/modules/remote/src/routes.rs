@@ -120,7 +120,11 @@ pub async fn terminate_session(
     // below. A session kept through its device's socket loss is held by no
     // pod at all, and its device's claim, or its viewer's rejoin, reads the
     // end there. Nothing at window 0.
-    let row_ended = live.is_none() && crate::row_end::admin_end(&state, tid, sid).await;
+    let row_end = if live.is_none() {
+        crate::row_end::admin_end(&state, tid, sid).await
+    } else {
+        crate::row_end::Written::NotLive
+    };
     // P3 — rc sessions are pod-local (S6): when the session is homed on a
     // different pod the local terminate is a no-op that previously STILL
     // returned `{"terminated": true}`. Broadcast an idempotent ctrl event so
@@ -135,10 +139,19 @@ pub async fn terminate_session(
         }),
     )
     .await;
+    // Review 2, N10 — the end could not be written to a live row no hub
+    // here holds: the device's claim may still resume the session, so the
+    // admin is not told it ended. The event above still reaches a pod that
+    // holds it; asking again writes it, or finds it ended.
+    if row_end == crate::row_end::Written::Failed {
+        return Err(ApiError::ServiceUnavailable(
+            "the session's end could not be recorded; try again".into(),
+        ));
+    }
     Ok(Json(serde_json::json!({
         "terminated": terminated_here && live.is_some(),
         // FR-138 — this request wrote the end to the session's row itself.
-        "row_ended": row_ended,
+        "row_ended": matches!(row_end, crate::row_end::Written::Wrote { .. }),
         "broadcast": true,
     })))
 }

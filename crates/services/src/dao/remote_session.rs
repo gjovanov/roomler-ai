@@ -65,6 +65,7 @@ impl RemoteSessionDao {
             resume_by: None,
             stats_at: None,
             end_source: None,
+            external: false,
         };
         // Insert with explicit _id so the Hub-provided ObjectId remains the canonical key.
         self.base.collection().insert_one(&session).await?;

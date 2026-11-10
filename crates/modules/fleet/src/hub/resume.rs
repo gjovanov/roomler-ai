@@ -40,9 +40,9 @@ use roomler_ai_remote_control::models::{AuditKind, EndReason, EndSource};
 use roomler_ai_remote_control::permissions::Permissions;
 use roomler_ai_remote_control::session::{ClientTx, LiveSession};
 use roomler_ai_remote_control::signaling::ServerMsg;
-use roomler_core::cluster::session_slots::Lease;
+use roomler_core::cluster::session_slots::{Lease, SLOT_KEEP_PAST_RESUME_MS};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{AgentCancel, Hub, ptr_eq};
 
@@ -102,8 +102,10 @@ pub struct ResumedSession {
     /// What is left of the org's maximum length, counted from `started_at`,
     /// and the limit itself; `None` = no limit.
     pub max_duration: Option<(Duration, Duration)>,
-    /// The FR-115 lease the claim took again under the session's own id.
-    pub slot: Option<Lease>,
+    /// Review 1, L6 — the row's `external` marker, kept on the rebuilt
+    /// session so an FR-52 revocation still finds it. Never true behind D3
+    /// today: the claim refuses a row marked external.
+    pub external: bool,
     /// The window announced to the connection that claimed it, in seconds:
     /// how long the rebuilt session waits for its viewer to rejoin (P1b-2).
     pub resume_secs: u32,
@@ -292,10 +294,15 @@ impl Hub {
             return;
         };
         // FR-115 — the slot stays the session's: only an end gives one back.
-        // Nobody renews it from here. The claim takes it again under the
-        // session's own id, and a lease nobody renews lapses on its own
-        // (`SLOT_TTL_SECS`, 90 s, longer than D1's 60 s window).
-        self.inner.slotted.remove(&session_id);
+        // Nobody renews it from here. Review 1, L5 — it is kept once, in
+        // Redis, until `resume_by` plus 10 s, so a window longer than what
+        // the lease had left (up to 120 s against 60-90 s) keeps it, and so
+        // does the death of this pod. A claim takes it again under the
+        // session's own id once its commit has won; a session nobody claims
+        // gives it back 10 s after its deadline.
+        if let Some((_, lease)) = self.inner.slotted.remove(&session_id) {
+            self.keep_slot(lease, resume_by);
+        }
         let (agent_id, tenant_id, attach_seq, controller_tx) = {
             let s = arc.lock();
             (
@@ -424,7 +431,10 @@ impl Hub {
     /// after that end would never be given back, and this pod's renewal round
     /// would keep the org's slot taken for good. Checked after the insert:
     /// whichever of the two removes the lease gives it back, exactly once.
-    fn hold_lease(&self, session_id: ObjectId, lease: Lease) {
+    ///
+    /// The claim calls it once its commit has won and the slot is taken
+    /// again (`refuse_claim`'s race): a claim that loses never touches it.
+    pub fn hold_lease(&self, session_id: ObjectId, lease: Lease) {
         self.inner.slotted.insert(session_id, lease);
         if !self.inner.sessions.contains_key(&session_id)
             && let Some((_, lease)) = self.inner.slotted.remove(&session_id)
@@ -433,11 +443,74 @@ impl Hub {
         }
     }
 
+    /// Review 1, L5 — keep a detached session's lease, off the caller's
+    /// thread, until `resume_by` plus 10 s: written once, in Redis, so no
+    /// pod renews it through the gap. A failed keep leaves the lease to
+    /// lapse at its own expiry, as before.
+    fn keep_slot(&self, lease: Lease, resume_by: DateTime) {
+        let Some(slots) = self.inner.session_slots.get().cloned() else {
+            return;
+        };
+        let until = resume_by
+            .timestamp_millis()
+            .saturating_add(SLOT_KEEP_PAST_RESUME_MS);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = slots.keep(lease.scope, lease.session, until).await {
+                    warn!(
+                        session = %lease.session,
+                        %e,
+                        "session slot: a detached session's lease was not kept; it lapses at its own expiry"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Review 1, L2 — a claim committed and its connection was gone before
+    /// the hub rebuilt the session: the detach is written back, fenced at the
+    /// number committed, so the row is not left open with no pod and no
+    /// deadline. The claim keeps the slot (`slots::keep`) and answers nothing.
+    pub fn record_detach(
+        &self,
+        session_id: ObjectId,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        attach_seq: u32,
+        resume_by: DateTime,
+    ) {
+        self.audit(
+            session_id,
+            agent_id,
+            tenant_id,
+            AuditKind::SessionDetached {
+                attach_seq,
+                resume_by,
+            },
+        );
+        info!(
+            session = %session_id.to_hex(),
+            %agent_id,
+            attach_seq,
+            resume_by_ms = resume_by.timestamp_millis(),
+            "rc session detached again: the claim that committed it lost its connection"
+        );
+    }
+
+    /// `refuse_claim`'s race — a session the claim rebuilt, once its commit
+    /// had won, whose org slot another session took during the gap: it ends
+    /// here, fenced at the number the claim committed, and its device is
+    /// told `reason`.
+    pub fn refuse_resumed(&self, session_id: ObjectId, reason: EndReason) {
+        let _ = self.end_own(session_id, reason, None);
+    }
+
     /// FR-138 — a claim committed: rebuild the session on this hub, counted
     /// in the device's capacity from here (its place moves from the claims),
-    /// its slot renewed from here, and its maximum length armed again from
-    /// `started_at`. Nothing is sent yet: the caller reads the row once more
-    /// and then confirms or drops it, so an end that landed meanwhile wins.
+    /// and its maximum length armed again from `started_at`. Nothing is sent
+    /// yet: the caller reads the row once more, takes the org's slot again
+    /// ([`Self::hold_lease`]), and then confirms or drops it, so an end that
+    /// landed meanwhile wins.
     pub fn resume_claimed(
         &self,
         agent_id: ObjectId,
@@ -499,6 +572,7 @@ impl Hub {
                 // claimed it; past that, it ends.
                 live.resume_secs = Some(r.resume_secs);
                 live.held_until = Some(super::hold::due_in(r.resume_secs));
+                live.external = r.external;
                 self.inner
                     .sessions
                     .insert(r.session_id, Arc::new(Mutex::new(live)));
@@ -506,9 +580,6 @@ impl Hub {
                 Resumed::Rebuilt
             }
         };
-        if let Some(lease) = r.slot {
-            self.hold_lease(r.session_id, lease);
-        }
         if let Some((left, limit)) = r.max_duration {
             self.arm_max_duration(r.session_id, r.attach_seq, left, limit);
         }
@@ -574,15 +645,30 @@ impl Hub {
         limit: Option<&'static str>,
         row: Option<RowEnd>,
     ) -> bool {
-        let held = self.held_for(session_id, agent_id);
-        // A copy held for the earlier connection was never counted on this
-        // one: count it, so that its end below gives back what it takes.
-        let Some(tenant_id) = self.take_claim(agent_id, conn, session_id, held.is_some()) else {
+        // PR C's deferred race, L13's twin — the claim is taken first, and
+        // the held copy read only then, as `resume_claimed` does. Read
+        // before, a copy that ended in between was counted on this
+        // connection and never given back.
+        let Some(tenant_id) = self.take_claim(agent_id, conn, session_id, false) else {
             return false;
         };
         info!(session = %session_id.to_hex(), %agent_id, ?reason, "rc session claim refused");
-        if held.is_some() {
-            let _ = self.end_session(session_id, reason, limit, EndWrite::Own);
+        // The copy this hub still holds for the device's earlier connection,
+        // taken out of the map exactly as read: one that an end removed
+        // meanwhile is that end's, and is neither counted nor ended here.
+        let held = self.held_for(session_id, agent_id).and_then(|arc| {
+            self.inner
+                .sessions
+                .remove_if(&session_id, |_, v| Arc::ptr_eq(v, &arc))
+                .map(|(_, held)| held)
+        });
+        if let Some(arc) = held {
+            // Never counted on this connection: counted now, so that its end
+            // gives back what it takes.
+            if let Some(mut a) = self.inner.agents.get_mut(&agent_id) {
+                a.active_sessions = a.active_sessions.saturating_add(1);
+            }
+            self.end_removed(session_id, &arc, reason, limit, EndWrite::Own);
             return true;
         }
         let _ = conn.try_send(ServerMsg::Terminate {
@@ -954,7 +1040,7 @@ mod tests {
             started_at: DateTime::now(),
             attach_seq: 1,
             max_duration: None,
-            slot: None,
+            external: false,
             resume_secs: 60,
         };
         assert_eq!(
@@ -1032,7 +1118,7 @@ mod tests {
             started_at: DateTime::now(),
             attach_seq: 1,
             max_duration: None,
-            slot: None,
+            external: false,
             resume_secs: 60,
         };
         assert_eq!(
@@ -1085,6 +1171,48 @@ mod tests {
         );
     }
 
+    /// PR C's deferred race, L13's twin (a guard: the race is a few
+    /// instructions wide) — the refusal takes the claim first and reads the
+    /// held copy only then, removing exactly the copy it read. A copy an end
+    /// took out first is that end's: the refusal counts nothing for it,
+    /// answers the device with its own reason, and the device's one place is
+    /// free.
+    #[tokio::test]
+    async fn a_refused_claim_whose_held_copy_already_ended_counts_nothing() {
+        let hub = hub().await;
+        let (agent, tenant, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let _first = register(&hub, agent, tenant, 1, hello(Some(60), Vec::new()));
+        let (sid, _ctl) = open(&hub, agent, user);
+        live(&hub, sid).await;
+        let mut second = register(&hub, agent, tenant, 1, hello(Some(60), vec![sid]));
+        hub.terminate(sid, EndReason::AdminTerminated).unwrap();
+        drain(&mut second.rx);
+
+        assert!(hub.refuse_claim(
+            agent,
+            &second.tx,
+            sid,
+            EndReason::AgentDisconnect,
+            None,
+            None,
+        ));
+        assert_eq!(
+            terminated(&drain(&mut second.rx), sid),
+            Some(EndReason::AgentDisconnect)
+        );
+        let count = |hub: &Hub| hub.inner.agents.get(&agent).map(|a| a.active_sessions);
+        assert_eq!(
+            count(&hub),
+            Some(0),
+            "nothing counted for a copy that ended"
+        );
+        let (next, _c) = open(&hub, agent, user);
+        assert!(
+            hub.session_snapshot(next).is_some(),
+            "the device's one place is free"
+        );
+    }
+
     /// P1b-1's review, L13 — the copy this hub held for the device's earlier
     /// connection ended before the claim was answered. The claim reads the
     /// hub only once it has taken the claim, so it rebuilds the session rather
@@ -1118,10 +1246,12 @@ mod tests {
             started_at: DateTime::now(),
             attach_seq: 1,
             max_duration: None,
-            slot: Some(lease),
+            external: false,
             resume_secs: 60,
         };
         assert_eq!(hub.resume_claimed(agent, &second.tx, r), Resumed::Rebuilt);
+        // The claim takes the slot again once its commit has won.
+        hub.hold_lease(sid, lease);
         assert!(hub.session_snapshot(sid).is_some(), "held here now");
         assert!(
             hub.inner.slotted.contains_key(&sid),

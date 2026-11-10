@@ -23,12 +23,20 @@
 //! | live in the hub of the pod that holds the device's socket | relayed there (`rc.cmd`), bound there, answered through the relay |
 //! | live, but in no hub yet (the claim is not answered, or a pod died without a word) | `rc:session.detached` with when it would end, or `rc:terminate agent_disconnect` once that has passed |
 //!
+//! Review 2, N14 — the gate costs about five reads, and a page asks every
+//! second while its session waits for the device's claim. Where nothing is
+//! bound or relayed (a detached row, a live row in no hub yet) the gate runs
+//! at most once per 5 s per session and viewer ([`gate_due`]), and a refusal
+//! answers as the table says: a viewer removed from the org is refused
+//! within about 5 s. Before a bind (held here) or a relay it always runs.
+//!
 //! With the window at 0 the rejoin is dropped unanswered, as a server before
 //! FR-138 drops it. No page sends one then: none was told `resume_secs`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bson::{DateTime, oid::ObjectId};
+use dashmap::DashMap;
 use roomler_ai_mod_fleet::hub::OrgPolicy;
 use roomler_ai_remote_control::models::{
     ConsentMode, EndReason, RcOverlayMode, RemoteSession, SessionPhase,
@@ -40,6 +48,40 @@ use tracing::{debug, info, warn};
 
 use crate::RemoteState;
 use crate::controller::{ResumeGate, resume_gate};
+
+/// Review 2, N14 — when each (session, viewer) last ran the gate on a rejoin
+/// that binds nothing (`RemoteState::rejoin_gates`).
+pub type GateRuns = DashMap<(ObjectId, ObjectId), Instant>;
+
+/// At most one gate per session and viewer this often, while nothing is
+/// bound or relayed.
+const GATE_EVERY: Duration = Duration::from_secs(5);
+
+/// Past this many entries, the ones older than [`GATE_EVERY`] are dropped:
+/// only a session waiting for its claim has one, so the map stays small.
+const GATE_RUNS_KEPT: usize = 1024;
+
+/// Whether `user_id`'s rejoin of `session_id` runs the gate now: the first
+/// ask does, and then one every [`GATE_EVERY`]. Synchronous: no guard of the
+/// map outlives this call.
+fn gate_due(state: &RemoteState, session_id: ObjectId, user_id: ObjectId) -> bool {
+    let runs = &state.rejoin_gates;
+    if runs.len() > GATE_RUNS_KEPT {
+        runs.retain(|_, at| at.elapsed() < GATE_EVERY);
+    }
+    let now = Instant::now();
+    let mut due = true;
+    runs.entry((session_id, user_id))
+        .and_modify(|at| {
+            if at.elapsed() < GATE_EVERY {
+                due = false;
+            } else {
+                *at = now;
+            }
+        })
+        .or_insert(now);
+    due
+}
 
 /// The viewer's socket the rejoin came in on.
 pub struct Viewer<'a> {
@@ -167,31 +209,36 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
         answer(end(session_id, EndReason::AgentDisconnect));
         return;
     }
-    let allowed = match resume_gate(state, v.user_id, row.tenant_id, row.agent_id).await {
-        ResumeGate::Allow { .. } => true,
-        ResumeGate::Deny(why) => {
-            info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
-            crate::row_end::revoked(state, &row).await;
-            answer(end(session_id, EndReason::AdminTerminated));
+    // Detached when the device's socket went, and not claimed yet: nothing is
+    // bound, so the gate runs once per `GATE_EVERY` for this viewer (N14).
+    if let Some(by) = row.resume_by {
+        if gate_due(state, session_id, v.user_id)
+            && run_gate(state, &v, &row, session_id).await.is_none()
+        {
             return;
         }
-        // Nothing is bound below; the deadline is answered, and the viewer
-        // asks again.
-        ResumeGate::Unknown(why) => {
-            warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run; ask again");
-            false
-        }
-    };
-    // Detached when the device's socket went, and not claimed yet.
-    if let Some(by) = row.resume_by {
         answer(until(session_id, by, DateTime::now()));
         return;
     }
-    // Live in the hub of the pod that holds the device's socket: bound there.
-    if allowed
-        && !hub.is_agent_online(row.agent_id)
-        && let Some(owner) = foreign_owner(state, row.agent_id).await
-        && relay(state, &v, &owner, session_id).await
+    // Live in the hub of the pod that holds the device's socket: bound there,
+    // so the gate always runs first.
+    let owner = if hub.is_agent_online(row.agent_id) {
+        None
+    } else {
+        foreign_owner(state, row.agent_id).await
+    };
+    if let Some(owner) = owner {
+        match run_gate(state, &v, &row, session_id).await {
+            None => return,
+            Some(true) => {
+                if relay(state, &v, &owner, session_id).await {
+                    return;
+                }
+            }
+            Some(false) => {}
+        }
+    } else if gate_due(state, session_id, v.user_id)
+        && run_gate(state, &v, &row, session_id).await.is_none()
     {
         return;
     }
@@ -199,6 +246,32 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
     // it died without a word. The viewer may ask again until it would end.
     let by = wait_until(state, &row, window).await;
     answer(until(session_id, by, DateTime::now()));
+}
+
+/// The gate a request runs, for the viewer of a session no hub on this pod
+/// holds. `None` when it refused: the row is ended as an admin's end is, and
+/// the viewer is told `admin_terminated`. `Some(true)` when allowed;
+/// `Some(false)` when a read failed and nothing was decided, so nothing is
+/// bound, the deadline is answered, and the viewer asks again.
+async fn run_gate(
+    state: &RemoteState,
+    v: &Viewer<'_>,
+    row: &RemoteSession,
+    session_id: ObjectId,
+) -> Option<bool> {
+    match resume_gate(state, v.user_id, row.tenant_id, row.agent_id).await {
+        ResumeGate::Allow { .. } => Some(true),
+        ResumeGate::Deny(why) => {
+            info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
+            crate::row_end::revoked(state, row).await;
+            let _ = v.tx.try_send(end(session_id, EndReason::AdminTerminated));
+            None
+        }
+        ResumeGate::Unknown(why) => {
+            warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run; ask again");
+            Some(false)
+        }
+    }
 }
 
 /// The pod that holds the device's socket, when it is another one.

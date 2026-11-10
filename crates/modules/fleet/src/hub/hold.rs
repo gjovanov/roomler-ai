@@ -756,7 +756,7 @@ mod tests {
                 started_at: DateTime::now(),
                 attach_seq: 1,
                 max_duration: None,
-                slot: None,
+                external: false,
                 resume_secs: 60,
             },
         );
@@ -885,7 +885,7 @@ mod tests {
                 started_at: DateTime::now(),
                 attach_seq: 1,
                 max_duration: None,
-                slot: None,
+                external: false,
                 resume_secs: 1,
             },
         );
