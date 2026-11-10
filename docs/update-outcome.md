@@ -202,7 +202,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2887`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4067`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4119`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1265`): the two quiet states and a watcher

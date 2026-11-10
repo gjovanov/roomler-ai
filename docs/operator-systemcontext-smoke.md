@@ -41,7 +41,11 @@ host (a field host). All PowerShell snippets must run from an
   the config, and `keep-system-context` at every per-machine upgrade. What it
   cannot repair, an entry owned by an account that is not an administrator of
   the computer or one that is not a plain folder or file, it refuses, and the
-  device runs as in step 2a until it is fixed (step 3).
+  device runs as in step 2a until it is fixed (step 3). Setup and step 2b,
+  run elevated, take the machine folder for Administrators before they write,
+  and carry an existing machine config over only when it is private to the
+  computer's administrators: one that is not is set aside, and a fresh one is
+  written in its place.
 
 ---
 
@@ -113,6 +117,19 @@ admin UI first** — this counts as a new enrollment for that host:
 A non-elevated prompt will fail with a clear message; the command
 refuses to silently fall back to `%APPDATA%`.
 
+From an elevated prompt it first takes the machine folder for Administrators,
+its owner and nothing else (#3609,
+`crates/agent-core/src/config.rs:4453`). A person's daemon may have made that
+folder to stage received files before the service ever ran, and the service
+never takes over a folder another account owns, so without this the device
+would keep waiting (2a). What that person made below the folder stays theirs.
+A config already at the path is carried over (its `machine_id`, mesh and
+settings) only when it is private to the computer's administrators once the
+service's repair has run (`crates/agent-core/src/machine_tree.rs:743`). One that
+is not is set aside: the command says so, writes a fresh config in its place,
+and the device's earlier settings do not carry over. Setup's machine-wide
+roles do the same.
+
 ### 2c. Manual copy (preserves machine_id, no new token needed)
 
 If the host already has a person's own config and the service should run that
@@ -134,6 +151,12 @@ preserves it; the server's `agents` row stays the same. Copied from an elevated
 shell, the files belong to you or to Administrators; the service's next check
 (within a second) gives them to Administrators and makes them readable by
 SYSTEM and Administrators only (#3609). Step 3 says what to expect.
+
+A copy does not take the machine folder itself, as Setup and 2b do. If another
+account owns it (a person's daemon made it to stage received files, and the
+service log says `C:\ProgramData\roomler\roomler is owned by an account other
+than SYSTEM or Administrators`), take it first, the folder alone:
+`takeown /F C:\ProgramData\roomler\roomler /A`.
 
 ---
 
@@ -160,18 +183,18 @@ icacls "C:\ProgramData\roomler"
 ```
 
 The service repairs the tree in-process, by handle, with no `icacls` child
-(`crates/agent-core/src/machine_tree.rs:429`), before every check: its own
+(`crates/agent-core/src/machine_tree.rs:435`), before every check: its own
 start, the worker's start, every save of the config, and `keep-system-context`
 at every per-machine upgrade:
 
 | Entry | The repair leaves it | It never |
 |---|---|---|
-| `%ProgramData%\roomler` | an entry of its own for another account that lets that account change anything, cut to read and execute (`machine_tree.rs:191`). Explorer adds full control for the account that confirms its "You don't currently have permission to access this folder" prompt | turns its inheritance off: on an attended host the person's daemon stages received files below it |
+| `%ProgramData%\roomler` | an entry of its own for another account that lets that account change anything, cut to read and execute (`machine_tree.rs:197`). Explorer adds full control for the account that confirms its "You don't currently have permission to access this folder" prompt | turns its inheritance off: on an attended host the person's daemon stages received files below it |
 | the machine folder, once it holds the machine config or a save writes one | owned by Administrators, not inheriting, SYSTEM and Administrators `(OI)(CI)` full control only. What is below it inherits that | touches a folder that holds no machine config (a waiting or attended host's) |
 | `config.toml`, `.prev`, `peer-auth\` and the key files the daemon loads, the attempt record | not inheriting, SYSTEM and Administrators full control only, so an entry added to a folder above later does not reach them | — |
 | any of them owned by a member of the computer's Administrators group | given to the Administrators group. The computer's own account database decides, read locally: an account of this computer directly or through another group, a domain account only when the group names it directly | takes over one owned by any other account, or by one that database does not name (a domain account that is an administrator only through a domain group, an Entra account) |
 
-Then it checks the same entries (`machine_tree.rs:594`), all but `.prev`: each is a plain folder or file, owned
+Then it checks the same entries (`machine_tree.rs:636`), all but `.prev`: each is a plain folder or file, owned
 by SYSTEM or Administrators, and no other account may change it (for
 `%ProgramData%\roomler`: may rename or replace what it holds). `.prev` is checked
 where it is read, to recover a config that does not parse; an old one another
@@ -181,11 +204,11 @@ once which entry fails and why (step 6). The service host and the worker read
 it through one function (`agents/roomlerd/src/win_service/supervisor.rs:972`),
 so they cannot disagree, and a SYSTEM worker never loads a config the check
 refused (`agents/roomlerd/src/app.rs:1727`). `keep-system-context` reads a
-record that fails as no record, so SystemContext off (`machine_tree.rs:732`).
+record that fails as no record, so SystemContext off (`machine_tree.rs:818`).
 
-The writers make every file they write (`machine_tree.rs:278`): the config's temp file, its
+The writers make every file they write (`machine_tree.rs:284`): the config's temp file, its
 `.prev` and the record are new files, given their owner and DACL through their
-handle before they take the name (`machine_tree.rs:794`). A file of that name made by anyone
+handle before they take the name (`machine_tree.rs:882`). A file of that name made by anyone
 before them is never written into; at worst the save fails and says so.
 
 **Reading the logs:** use `roomler logs` or an elevated shell. Opening these
@@ -200,6 +223,7 @@ starts the SYSTEM worker:
 | The log's reason | Fix |
 |---|---|
 | `… is owned by an account other than SYSTEM or Administrators`, or `… is left as it is: it is owned by an account that is not an administrator of this computer` | `takeown /F "<the entry>" /A`, for a folder with `/R /D Y` (`/D J` on German Windows) |
+| the same for the machine folder, `C:\ProgramData\roomler\roomler`: a person's daemon made it to stage received files | Setup, or step 2b, from an elevated shell: an elevated save of the machine config takes the machine folder for Administrators before it writes (`crates/agent-core/src/machine_tree.rs:606`), its owner and nothing else, and its repair then seals the folder. What that person made below it keeps its owner. By hand: `takeown /F C:\ProgramData\roomler\roomler /A`, without `/R` |
 | `… is a link (a junction or a symbolic link), not a plain folder` or `file` | move it away and put a plain folder or file in its place (step 2b or 2c for the config) |
 | `… lets an account other than SYSTEM or Administrators change it` | the repair is off (`ROOMLERD_MACHINE_TREE_REPAIR=0`), or this process may not change the entry; `icacls "<the entry>" /reset` from an elevated shell, or switch the repair back on |
 | `C:\ProgramData\roomler lets an account other than SYSTEM or Administrators rename or replace what it holds` | an entry the folder inherits, which the repair leaves: a person's daemon made the folder, so the creator's entry `%ProgramData%` hands down names that person | once the folder is Administrators' (`takeown /F C:\ProgramData\roomler /A`), `icacls C:\ProgramData\roomler /reset` |
@@ -228,7 +252,7 @@ the installer and does not read the service's `Environment`: there, both are on.
 > owner, so SYSTEM keeps every entry it reached before; written in one call with
 > the owner, the new DACL did not reach the children another account owns
 > (measured on #3609's tests). A file gets both in one call. The wizard
-> (`agents/roomler-setup/src/orchestrator_agent.rs:1728`)
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1745`)
 > takes `%ProgramData%\roomler` for Administrators, then drops its inheritance
 > and grants in one `icacls` call, and stops if it cannot take it.
 
@@ -344,6 +368,8 @@ connects — no respawn churn.
 | `machine tree: not repaired` with `line=… is left as it is: it is owned by an account that is not an administrator of this computer` | the repair never takes over such an entry; the check then refuses it | the same |
 | `machine tree: repaired` lines, once each, at the first start after an update | the entries had drifted: an entry for another account (Explorer's folder prompt adds one), or permissions inherited from above | nothing to do; the device keeps running as before |
 | `the machine config at … is not run as SYSTEM: …` as a worker's last line | the tree changed between the host's check and the worker's start | the host runs the device as in step 2a; step 3 |
+| Setup or `enroll --machine-global` says `…\config.toml is set aside, because …` | the machine config that was there was not private to the computer's administrators once repaired (#3609): another account owns it, or that account may change it or the folders above it | nothing to undo: the enrollment was written as a fresh config in its place. Set again what the device had (its mesh, routes, lock policy), and fix what the reason names (step 3) |
+| Setup warns `could not take the machine-global config folder for Administrators (…)`, or `enroll` prints a `WARNING:` ending `Until the folder belongs to Administrators the service may not run this enrollment as SYSTEM.` | the elevated save could not give the machine folder to Administrators: the process is not elevated, or the folder is not a plain folder | step 3's row for the machine folder |
 | `keep-system-context: cannot read …last-system-context-attempt.json (…); treating it as off` after an update, and SystemContext is off | the record fails the check (owned by another account) | step 3 for the record, then `roomlerd enable-system-context` from an elevated shell |
 | `crash_recorder: malformed sidecar moved aside` (once) | a crash sidecar torn by a power loss or OS crash, usually NUL-filled (#2955). It now sits in `crashes\malformed\`; the crash it described is lost | nothing to fix; read the file there if the crash matters |
 | `crash_recorder: suppressed sidecar write … reason=HardCapReached` flooding the log | `%PROGRAMDATA%\roomler\roomler\crashes\` filled up (100 file cap) while crash-looping; uploader can't drain because worker never starts | step 2 first (fixes the loop), then `Remove-Item C:\ProgramData\roomler\roomler\crashes\*.json` to clear the backlog |
