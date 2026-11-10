@@ -124,13 +124,13 @@ driven by the compositor, so a tab busy decoding/compositing heavy video slows
 the pointer stream **exactly when a drag needs it most**, and even idle it adds up
 to a frame (~16 ms) before the first send.
 
-P6 drives sends from a timer instead (`useRemoteControl.ts:7145`
+P6 drives sends from a timer instead (`useRemoteControl.ts:7323`
 `INPUT_MOVE_GAP_MS`, `:7158` `schedulePendingMove`): send immediately when the
 min-gap has elapsed, else arm one `setTimeout` for the remainder; latest position
 wins. 8 ms ≈ a 125 Hz ceiling at ~60 B/message — noise even on a constrained
 relay. Where the browser supports it (Chromium), `pointerrawupdate` feeds the
 coalescer at device rate between rAF-aligned moves, so the freshest position is
-always queued (`useRemoteControl.ts:12761`). The gap is a per-browser knob,
+always queued (`useRemoteControl.ts:13050`). The gap is a per-browser knob,
 0 to 16 ms (`roomler-rc-input-gap`, `:2766` `storedInputGapMs`, from FR-98 C3); the
 same timer drives the relative-pointer path (`:7257`).
 
@@ -150,7 +150,7 @@ built **without a wire-format change**: the 13-byte video header already carried
 - **An echo on the same clock.** A new `rc:clock` control verb echoes `t0`
   verbatim plus the agent's epoch µs (`peer.rs:3716` `clock_echo_json`, handled at
   `:11065`). The browser probes it every stats tick and keeps the **lowest-RTT**
-  sample of the last 8 (`useRemoteControl.ts:7066` `CLOCK_RING`, `:7070`
+  sample of the last 8 (`useRemoteControl.ts:7244` `CLOCK_RING`, `:7248`
   `sendClockProbe`): both clocks are fixed-origin, so the offset is a constant and
   min-RTT bounds the asymmetry error to RTT/2 of the best probe.
 - **Measured at paint.** The decode worker computes
@@ -276,7 +276,7 @@ heartbeats with a `viewer_age_ms`.
 
 So the wire carries the number the person reads. Each window's `age` goes to the
 pill and to `sendDecodeStat` from one worker `stats` message
-(`useRemoteControl.ts:7617`, `:8263`, `RemoteControl.vue:4880`). A once-a-second
+(`useRemoteControl.ts:7795`, `:8449`, `RemoteControl.vue:4880`). A once-a-second
 read can skip a window, which fits the three misses, though this read can't prove it.
 
 That is all this read shows. The session was VP9 software on a loaded host, under
@@ -290,10 +290,10 @@ different times disagree by the wall-clock slew between their starts, so every a
 read off by that much, low on some hosts and high on others: 7 ms after 162 s on one
 host, near 160 ms after an hour (§5, "On one clock"). The fix, #3568, merged the same
 day: the worker now reads the offset through a skew the page measures when it starts
-the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:845`). Production runs the old
+the worker (`workerAgentOffsetUs`, `rc-dc-worker.ts:861`). Production runs the old
 arithmetic until a promote. The read above started each session right after loading
 its page, so it stands, and the pill and the wire still take one worker `stats`
-message (`useRemoteControl.ts:7788`, `:8436`, `RemoteControl.vue:4846`). The fleet
+message (`useRemoteControl.ts:7966`, `:8622`, `RemoteControl.vue:4846`). The fleet
 tables above carry the error, and a window whose ages all read negative sent none,
 since `HopStats` drops a negative sample (`rc-hop-stats.ts:54`). AC8 ticks once #3568
 is on production and its owed GREEN read is in.

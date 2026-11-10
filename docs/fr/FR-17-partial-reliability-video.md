@@ -257,11 +257,11 @@ that could not tolerate reordering; what unordered delivery costs or buys on thi
 not been measured.
 
 ⚠️ **The default flip is NOT taken, and its criterion is written down.** `videoDcOptions`
-(`useRemoteControl.ts:5073`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:5078`)
+(`useRemoteControl.ts:5093`) still opens `{ ordered: false, maxRetransmits: 0 }` (`:5098`)
 only behind `roomler-rc-unordered-video=1` (`storedUnorderedVideo`, `:5085`). FR-59's
 criterion for the flip: an airport-class session with the opt-in ON showing
 `chunkStragglers` climbing while `chunkGaps` stays flat and fps holds — both counters are
-in the worker's stats (`rc-dc-worker.ts:450`). Stragglers
+in the worker's stats (`rc-dc-worker.ts:459`). Stragglers
 rising with steady fps is the transport working; gaps rising is real loss costing an IDR
 each. The flip cannot be scoped to constrained paths (the deviation recorded under B), so
 it is a fleet-wide decision — and it should wait on the field read of #3112's repair

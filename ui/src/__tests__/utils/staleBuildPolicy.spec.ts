@@ -290,4 +290,20 @@ describe('the resume a reload hands to the next page load', () => {
     expect(resumeArgsFor(intent, { ...here, firstRoute: false }, 101_000)).toBeNull()
     expect(resumeArgsFor(null, here, 101_000)).toBeNull()
   })
+
+  // FR-138 P1c (#3604) — a redial of a held session names the session it
+  // replaces, so the server ends it before its capacity gate. A reload that
+  // takes the redial over carries that id to the next page load.
+  it('carries the held session a redial replaces, by shape only', () => {
+    const SESSION = '69f0000000000000000000d1'
+    const s = memoryStorage()
+    expect(writeRcResumeIntent(s, { ...args, replaces: SESSION }, 1, PATH, USER)).toBe(true)
+    const taken = takeRcResumeIntent(s)
+    expect(taken).toEqual({ v: 1, ...args, replaces: SESSION, at: 1, path: PATH, userId: USER })
+    expect(resumeArgsFor(taken, here, 2_000)).toEqual({ ...args, replaces: SESSION })
+    expect(writeRcResumeIntent(s, { ...args, replaces: '../x' }, 1, PATH, USER)).toBe(false)
+    // Without one, the intent is the one a page before FR-138 wrote, field for field.
+    expect(writeRcResumeIntent(s, args, 1, PATH, USER)).toBe(true)
+    expect(Object.keys(takeRcResumeIntent(s)!).sort()).toEqual(['agentId', 'at', 'orgId', 'path', 'permissions', 'userId', 'v'])
+  })
 })

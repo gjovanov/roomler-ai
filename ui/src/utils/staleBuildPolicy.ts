@@ -201,6 +201,9 @@ export interface RcResumeArgs {
   agentId: string
   permissions: string
   orgId?: string
+  /** FR-138 — the held session the redial replaces: the next page's first
+   *  request names it, so the server ends it before its capacity gate. */
+  replaces?: string
 }
 
 export interface RcResumeIntent extends RcResumeArgs {
@@ -221,18 +224,22 @@ const PERMISSIONS = /^[A-Z_]{1,32}(?: \| [A-Z_]{1,32}){0,15}$/
 
 function validArgs(a: unknown): a is RcResumeArgs {
   if (!a || typeof a !== 'object') return false
-  const { agentId, permissions, orgId } = a as Record<string, unknown>
+  const { agentId, permissions, orgId, replaces } = a as Record<string, unknown>
   return (
     typeof agentId === 'string' &&
     OBJECT_ID.test(agentId) &&
     typeof permissions === 'string' &&
     PERMISSIONS.test(permissions) &&
-    (orgId === undefined || (typeof orgId === 'string' && OBJECT_ID.test(orgId)))
+    (orgId === undefined || (typeof orgId === 'string' && OBJECT_ID.test(orgId))) &&
+    (replaces === undefined || (typeof replaces === 'string' && OBJECT_ID.test(replaces)))
   )
 }
 
 function argsOf(a: RcResumeArgs): RcResumeArgs {
-  return a.orgId ? { agentId: a.agentId, permissions: a.permissions, orgId: a.orgId } : { agentId: a.agentId, permissions: a.permissions }
+  const args: RcResumeArgs = a.orgId ? { agentId: a.agentId, permissions: a.permissions, orgId: a.orgId } : { agentId: a.agentId, permissions: a.permissions }
+  // FR-138 — present only on a redial that replaces a held session.
+  if (a.replaces) args.replaces = a.replaces
+  return args
 }
 
 /**

@@ -39,14 +39,23 @@ import {
   type ClockCalMessage,
   type ClockCalPing,
 } from './rc-clock-cal'
+import { PAINT_GAP_CLOSED, PAINT_GAP_MARK, PAINT_GAP_MARKED, createPaintGapMark } from './rc-paint-gap'
 
 /** `bench` — FR-16 L4 bench mode, set only when the knob is on AND the
  *  agent advertised `bench`: sample the probe marker while a probe is armed. */
 type InitCanvasMessage = { type: 'init-canvas'; canvas: OffscreenCanvas; bench?: boolean }
 /** FR-16 L4 — the main thread just sent bench probe `seq`. */
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
+/** FR-138 — the page started to hold its session (`rc-paint-gap.ts`). */
+type PaintGapMarkMessage = { type: typeof PAINT_GAP_MARK }
 type CloseMessage = { type: 'close' }
-type IncomingMessage = InitCanvasMessage | BenchArmMessage | ClockCalPing | ClockCalMessage | CloseMessage
+type IncomingMessage =
+  | InitCanvasMessage
+  | BenchArmMessage
+  | ClockCalPing
+  | ClockCalMessage
+  | PaintGapMarkMessage
+  | CloseMessage
 
 interface RTCTransformerLike {
   readable: ReadableStream<unknown>
@@ -83,6 +92,9 @@ const bench = createBenchSampler({ post: (m) => workerScope.postMessage(m), now:
  *  probe from its own clock, so a paint stamp goes back through it. 0 until it
  *  arrives, and for a session that measures none: the stamp of before. */
 let pageSkewMs = 0
+/** FR-138 — the gap in the painted frames across a held session's cut. Says
+ *  nothing unless the page marks a cut. */
+const paintGap = createPaintGapMark()
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -137,6 +149,10 @@ workerScope.onmessage = (e) => {
     bench.arm(msg.seq)
   } else if (msg.type === 'clock-cal') {
     pageSkewMs = normalizeSkewMs(msg.skewMs)
+  } else if (msg.type === PAINT_GAP_MARK) {
+    // FR-138 — the page holds its session from here: when this worker last
+    // painted, and the gap at the first frame it paints next.
+    workerScope.postMessage({ type: PAINT_GAP_MARKED, sinceMs: paintGap.mark(performance.now()) })
   } else if (msg.type === 'close') {
     try {
       decoder?.close()
@@ -150,6 +166,7 @@ workerScope.onmessage = (e) => {
     framesDecoded = 0
     awaitingKeyAfterRebuild = false
     pageSkewMs = 0
+    paintGap.reset()
   }
 }
 
@@ -174,7 +191,10 @@ workerScope.onrtctransform = async (event) => {
         const colorSpace = firstDims ? frameColorSpace(frame) : null
         // FR-16 L4 — a clone for the probe read; null unless a probe is armed.
         const benchClone = bench.take(frame)
-        paintFrame(frame)
+        const drew = paintFrame(frame)
+        // FR-138 — the first frame painted after a held session's cut.
+        const gapClosed = drew ? paintGap.painted(performance.now()) : null
+        if (gapClosed) workerScope.postMessage({ type: PAINT_GAP_CLOSED, gapMs: gapClosed.gapMs })
         // #3566 — on the page's clock, which times the probe.
         if (benchClone) bench.settle(benchClone, toPageEpochMs(epochNowMs(), pageSkewMs))
         if (firstDims) {
@@ -410,17 +430,20 @@ workerScope.onrtctransform = async (event) => {
   })
 }
 
-function paintFrame(frame: VideoFrame): void {
+/** Paint `frame` and close it; `true` when it reached the canvas. */
+function paintFrame(frame: VideoFrame): boolean {
   if (!canvas || !ctx) {
     frame.close()
-    return
+    return false
   }
   try {
     if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth
     if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight
     ctx.drawImage(frame, 0, 0)
+    return true
   } catch {
     /* canvas vanished mid-teardown */
+    return false
   } finally {
     frame.close()
   }
