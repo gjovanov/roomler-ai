@@ -182,8 +182,9 @@ pub async fn list_members(
 /// (409 — ownership transfer is a different operation); removing YOURSELF is
 /// allowed and simply means leaving. What the membership admitted ends with
 /// it, through the membership hook once the row is gone: the tunnel clients
-/// the person owns in the org (`network`), their seats in the org's calls
-/// (`conference`) and their room memberships (`chat`).
+/// the person owns in the org (`network`), the enrollment keys they minted
+/// there (`fleet`), their seats in the org's calls (`conference`) and their
+/// room memberships (`chat`).
 pub async fn remove_member(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -223,7 +224,8 @@ pub async fn remove_member(
     }
     tracing::info!(admin = %auth.user_id, tenant = %tid, user = %target, "member removed");
     // What the membership admitted ends with it, told once the row is gone:
-    // tunnel clients, call seats and room memberships, in `HOOK_ORDER`. The
+    // tunnel clients, enrollment keys, call seats and room memberships, in
+    // `HOOK_ORDER`. The
     // removal has happened whatever the hooks say, so a failure there is
     // logged, not answered.
     if let Err(e) = state.core.hooks.org_member_removed(tid, target).await {

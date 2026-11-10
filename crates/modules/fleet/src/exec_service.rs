@@ -115,6 +115,8 @@ pub struct AnchorResponse {
 /// What it checks, in order:
 /// - the token is a single-use enrollment token, and the org is not
 ///   archived;
+/// - the admin who minted it may still enroll devices in that org
+///   (`agent::issuer_may_enroll`, 403 otherwise): the anchor records them;
 /// - the device is LIVE in that same org, and is Windows;
 /// - the host name matches the device, unless `force`.
 ///
@@ -142,6 +144,19 @@ pub async fn anchor(
     {
         return Err(ApiError::Forbidden(
             "This organization is archived and anchors no devices".to_string(),
+        ));
+    }
+
+    // The token acts for the admin who minted it (`anchored_by` below), so it
+    // anchors only while they may still enroll devices in this org: the
+    // enroll route's own question, asked before either spend.
+    if let Some(lost) = crate::agent::issuer_may_enroll(&state, tid, admin_uid).await? {
+        tracing::info!(
+            tenant_id = %tid, issuer = %admin_uid, jti = %claims.jti, reason = lost.as_str(),
+            "fleet-rpc: anchor refused: the token's issuer may no longer enroll devices here"
+        );
+        return Err(ApiError::Forbidden(
+            crate::agent::TOKEN_ISSUER_CANNOT_ENROLL.to_string(),
         ));
     }
 
