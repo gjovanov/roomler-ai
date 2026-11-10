@@ -122,7 +122,7 @@ this server, not reachable, or not built yet is `{"not_measured": "<reason>",
 | `headline` | sign-ups, orgs created, devices enrolled, active orgs (a value event: a remote session that reached Active and lasted ≥ 30 s, or a call with ≥ 2 participants), coverage (`{purestat_signup_goals, server_signups}`; a ratio only at n ≥ 30) | all of the below | P1d; coverage with a purestat key |
 | `signups` | provider, campaign key, landing path, referrer host, self-reported — **never the address, username or name**; at most 20 rows, else aggregated by source | `users` | P1d |
 | `orgs_devices` | orgs created; devices enrolled by OS (tombstones count); orgs that enrolled their **first** device; the day's devices by install method | `tenants`, `agents` | P1d; by install method P3 |
-| `usage` | remote-desktop sessions started and session-minutes (each session's overlap with the window — a session spanning midnight counts only its part), calls and participant-minutes, active orgs, the top 10 orgs by remote-desktop minutes | `remote_sessions`, `call_sessions` | P1d |
+| `usage` | remote-desktop sessions started and session-minutes (each session's overlap with the window — a session spanning midnight counts only its part; one whose end nobody saw, FR-138's `end_source`, counts up to that inferred end, a proven lower bound, as `growth_org_daily` counts it), calls and participant-minutes, active orgs, the top 10 orgs by remote-desktop minutes | `remote_sessions`, `call_sessions` | P1d |
 | `website` | visitors, visits, pageviews; the day's visitors by organic channel; top 10 referrers and paths | purestat | with a key |
 | `blog` | per post viewed that day: visitors, pageviews, reads, median read time (top 20); top sources | purestat | with a key |
 | `campaigns` | per `(source, medium, campaign)`: visitors, pageviews, the four goals (`signup`, `subscribe`, `install-copy`, `github-outbound`), joined in code with the server's own sign-ups by the same normalised key | purestat + `users` | with a key |
@@ -1467,7 +1467,7 @@ with its reason on hover, a rate appears only with n ≥ 30, subjects are render
 
 **In the digest**, the `newsletter` section gains `delivery` — the day's (and 7/28 days')
 delivered, bounced (hard), dropped, spam reports and addresses suppressed, by each event's own
-time ([`delivery_figures`, digest.rs:1876](../crates/api/src/growth/digest.rs)), `not_measured`
+time ([`delivery_figures`, digest.rs:1874](../crates/api/src/growth/digest.rs)), `not_measured`
 on a server without the webhook — `unsubscribed_via_issue`, and per issue sent that day its
 delivery so far and its unsubscribes, by the same reads and the same three cells as the table.
 
@@ -1640,7 +1640,7 @@ current month.
 
 > [!NOTE]
 > **"Nothing on record" states what the backfill did, as its ledger row says**
-> ([`no_billing_record`, digest.rs:2066](../crates/api/src/growth/digest.rs)). The panel's `billed` and
+> ([`no_billing_record`, digest.rs:2064](../crates/api/src/growth/digest.rs)). The panel's `billed` and
 > the digest's share one reason, and it reads three ways:
 >
 > - *the backfill has not run*;
@@ -1660,9 +1660,9 @@ current month.
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
   the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
   cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2090](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  ([`billed_figures`, digest.rs:2088](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2185](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2183](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel

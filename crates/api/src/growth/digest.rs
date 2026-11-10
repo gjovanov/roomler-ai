@@ -1691,10 +1691,10 @@ struct RemoteFacts {
 
 /// FR-138 — whether somebody saw a session row's end: not when it was
 /// inferred (`end_source`: the registration read, the sweep, the dead-row
-/// close), whose `ended_at` is only the row's own last clock. Such a row adds
-/// no hours to the hour-weighted sums, and (review 2, N12) no end to the
-/// quality section's counts by `ended_at`, which would land, back-dated, in
-/// days already reported.
+/// close), whose `ended_at` is only the row's own last clock. Such an end is
+/// no end in the quality section's counts by `ended_at` (review 2, N12): it
+/// is no failure a pod saw, and it would land, back-dated, in a day already
+/// reported. Its hours still count, up to that end (`read_remote_usage`).
 fn end_was_seen(d: &Document) -> bool {
     matches!(d.get("end_source"), None | Some(Bson::Null))
 }
@@ -1713,7 +1713,7 @@ async fn read_remote_usage(
             "$or": [ { "ended_at": Bson::Null }, { "ended_at": { "$gte": w.start_dt(Span::D28) } } ],
             "tenant_id": { "$nin": excluded_ids(&set.tenants) },
         },
-        doc! { "tenant_id": 1, "started_at": 1, "ended_at": 1, "end_source": 1 },
+        doc! { "tenant_id": 1, "started_at": 1, "ended_at": 1 },
     )
     .await?;
     let mut started = Vec::new();
@@ -1724,23 +1724,21 @@ async fn read_remote_usage(
         let (Some(s), Ok(tenant)) = (dt_ms(d, "started_at"), d.get_object_id("tenant_id")) else {
             continue;
         };
+        // FR-138 — an end nobody saw (`end_source`) counts up to the inferred
+        // `ended_at`: the row was seen alive at that clock, so the end is a
+        // proven lower bound, and `growth_org_daily` counts the row the same
+        // way, so this digest and the nightly freeze agree.
         let e = dt_ms(d, "ended_at").unwrap_or(now_ms).max(s);
         started.push(s);
-        // FR-138 — an end nobody saw (`end_source`) is the row's own last
-        // clock, not when the session ended: its hours are left out of the
-        // sums. The session still counts as started.
-        let hours = end_was_seen(d);
         for (i, span) in [Span::Day, Span::D7, Span::D28].into_iter().enumerate() {
             let (lo, hi) = w.range(span);
-            if hours {
-                ms[i] += overlap_ms(s, e, lo, hi);
-            }
+            ms[i] += overlap_ms(s, e, lo, hi);
         }
         if super::value::rc_session_is_value(s, e) {
             value.add(w, s, tenant);
         }
         let (lo, hi) = w.range(Span::Day);
-        let day_ms = if hours { overlap_ms(s, e, lo, hi) } else { 0 };
+        let day_ms = overlap_ms(s, e, lo, hi);
         if day_ms > 0 || w.contains(Span::Day, s) {
             let entry = per_org_day.entry(tenant).or_insert((0, 0));
             entry.0 += day_ms;
@@ -3790,11 +3788,13 @@ mod tests {
         parse_day(s).unwrap()
     }
 
-    /// FR-138 — a row whose end was inferred (`end_source`) adds no hours:
-    /// its `ended_at` is only its own last clock. A row whose end was seen,
-    /// or a row from before the field, counts as it always has.
+    /// FR-138 (review 2, N12) — a row whose end was inferred (`end_source`)
+    /// is no end the quality section counts: its `ended_at` is only its own
+    /// last clock. A row whose end was seen, or a row from before the field,
+    /// counts as it always has. Its hours count either way
+    /// (`growth_digest_tests::an_inferred_end_counts_its_hours_and_no_failure`).
     #[test]
-    fn an_inferred_end_adds_no_hours() {
+    fn an_inferred_end_is_no_end_a_pod_saw() {
         assert!(end_was_seen(&doc! { "ended_at": DateTime::now() }));
         assert!(end_was_seen(&doc! { "end_source": Bson::Null }));
         for source in ["registration", "sweep", "backfill", "a_later_source"] {

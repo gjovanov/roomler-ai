@@ -3974,10 +3974,13 @@ curl -sS -X POST "$SERVER/api/admin/rc-sessions/close-dead" \
   -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' -d '{"after": "<next>"}'
 ```
 
-The growth digest leaves every row with an `end_source` out of its hour-weighted sums and out of its quality
-section's ends by `ended_at` (`end_was_seen`, `crates/api/src/growth/digest.rs:1698`): its `ended_at` is only the
-row's own last clock, which would land, back-dated, in days already reported. In the quality rule such a session still
-went live and still counts as requested, but it adds no duration and its end counts as `inferred`, never as an
+The growth digest counts a row with an `end_source` in its hour-weighted sums up to that inferred `ended_at`
+(`read_remote_usage`, `crates/api/src/growth/digest.rs:1702`). The row was seen alive at that clock, so the end is a
+proven lower bound, and `growth_org_daily` counts the row the same way (`compute_range`,
+`crates/api/src/growth/org_daily.rs:217`), so the live digest and the nightly freeze agree. The digest leaves such a
+row out of its quality section's ends by `ended_at` (`end_was_seen`, `crates/api/src/growth/digest.rs:1698`): the end
+is no failure a pod saw, and it would land, back-dated, in a day already reported. In the quality rule such a session
+still went live and still counts as requested, but it adds no duration and its end counts as `inferred`, never as an
 `agent_disconnect` failure (`session_quality`, `crates/api/src/growth/quality.rs:200`).
 
 | Off is today | What happens |
