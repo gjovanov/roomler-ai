@@ -134,17 +134,15 @@ pub async fn anchor(
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
-    if state
-        .tenants
-        .base
-        .find_by_id(tid)
-        .await
-        .map(|t| t.is_archived)
-        .unwrap_or(false)
-    {
-        return Err(ApiError::Forbidden(
-            "This organization is archived and anchors no devices".to_string(),
-        ));
+    // A failed read refuses (500, nothing spent), as `agent::org_accepts_enrollment` does.
+    match state.tenants.base.find_by_id(tid).await {
+        Ok(t) if t.is_archived => {
+            return Err(ApiError::Forbidden(
+                "This organization is archived and anchors no devices".to_string(),
+            ));
+        }
+        Ok(_) | Err(roomler_ai_services::dao::base::DaoError::NotFound) => {}
+        Err(e) => return Err(e.into()),
     }
 
     // The token acts for the admin who minted it (`anchored_by` below), so it

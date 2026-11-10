@@ -531,6 +531,55 @@ async fn an_anchor_by_a_token_whose_issuer_left_the_org_is_refused_and_unspent()
     assert_eq!(status, 200, "the owner's token anchors: {body}");
 }
 
+/// The anchor asks whether the org is archived, and a read that fails
+/// refuses: a 500 that anchors nothing and leaves the token unspent, as the
+/// enroll route's gate does. Once the org reads again, the same token anchors.
+#[tokio::test]
+async fn an_anchor_whose_org_cannot_be_read_anchors_nothing_and_stays_unspent() {
+    let app = TestApp::spawn().await;
+    let org = app.seed_tenant("iss-anchor-read").await;
+    let (owners, _) = mint_token(&app, &org, &org.admin, false).await;
+    let device = enroll_ok(&app, &owners, "m-anchor-read", "windows").await;
+    let (token, jti) = mint_token(&app, &org, &org.admin, false).await;
+
+    // A tenant row the server cannot read: its archived flag holds a string.
+    let tenants = app.db.collection::<Document>("tenants");
+    tenants
+        .update_one(
+            doc! { "_id": tid(&org) },
+            doc! { "$set": { "is_archived": "unreadable" } },
+        )
+        .await
+        .unwrap();
+
+    let (status, body) = anchor(&app, &token, &device, "m-anchor-read").await;
+    assert_eq!(status, 500, "a failed read anchors nothing: {body}");
+    assert!(
+        ledger_use(&app, &jti).await.is_none(),
+        "the token is unspent"
+    );
+    assert!(
+        matches!(
+            agent_row(&app, &device).await.get("exec_anchor"),
+            None | Some(Bson::Null)
+        ),
+        "the device is not anchored"
+    );
+
+    tenants
+        .update_one(
+            doc! { "_id": tid(&org) },
+            doc! { "$set": { "is_archived": false } },
+        )
+        .await
+        .unwrap();
+    let (status, body) = anchor(&app, &token, &device, "m-anchor-read").await;
+    assert_eq!(
+        status, 200,
+        "the same token anchors once the org reads: {body}"
+    );
+}
+
 // ── the FR-51 ephemeral key ─────────────────────────────────────────────────
 
 /// A removal revokes the live keys the person minted in that org, and their
