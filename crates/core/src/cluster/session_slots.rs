@@ -17,8 +17,8 @@
 //! the next renewal round puts back every session its hub still holds
 //! ([`SessionSlots::restore`]). Renewal itself only updates (`ZADD XX`), so a
 //! session released while a round was in flight is never put back, and only
-//! lengthens (`GT`, on the score and on both keys' expiry; Redis 6.2 and 7.0),
-//! so a round in flight never shortens a lease FR-138 kept.
+//! lengthens (`GT` on the score, Redis 6.2, and on both keys' expiry, Redis
+//! 7.0: the floor), so a round in flight never shortens a lease FR-138 kept.
 //!
 //! FR-138 (review 1, L5) — a detached session is held by no pod, so nobody
 //! renews its lease through the gap. The detach keeps it once, in Redis,
@@ -29,7 +29,9 @@
 //! set's expiry to a lease (90 s), so above an 80 s window, another session
 //! of the org claimed early in the gap, and then neither renewed nor followed
 //! by a later claim, can take the kept lease with the set up to `window - 80`
-//! seconds early. At D1's 60 s window it cannot happen.
+//! seconds early. At D1's 60 s window it cannot happen. A window above 80 s
+//! needs the `CLAIM` script to read the set's expiry first (or write it `NX`, then
+//! `GT`) BEFORE such a window is set.
 //!
 //! The holder record names the claiming pod. A caller refused by a full set
 //! may drop a holder that ITS OWN pod claimed but no longer holds (a release
