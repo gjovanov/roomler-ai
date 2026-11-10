@@ -218,7 +218,8 @@ A newer driver still opens an older SDK: the dev box's 610.88 runs the Windows b
    quota case stays open; an approval would bill nothing unless used.
    **2026-11-10: AWS granted it** (4 vCPUs of on-demand G and VT in `eu-central-1`, read back from Service Quotas;
    the spot quota is still 0). The operator opened `eu-central-1` in `RegionFloor` for the run, and the g5g run
-   happened that day (§8).
+   happened that day (§8). Afterwards the CLI logins were removed again and, by the operator's choice,
+   `eu-central-1` stays in `RegionFloor`, so the next g5g run needs no policy edit.
 2. **Which NVENC SDK the Linux trees take** (P0c). **D2, the operator, 2026-10-30: 12.1 (driver 530.41).** The
    first cut (#3135) took 13.0 (driver 570), the Windows build's, which admits NVIDIA's current long-term branch,
    R580. 12.1 is the oldest SDK FFmpeg 9.0.1 builds against, and it also admits R535 (its support ended in June
