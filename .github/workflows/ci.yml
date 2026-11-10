@@ -1656,8 +1656,14 @@ jobs:
       # FR-129 C3 — its mechanics crate too: `roomler-setup-core` holds the
       # wizard's Win32 calls (the elevated relaunch, the MSI wait), and its
       # Windows tests compiled out on the Linux step that runs its others.
+      # #3609 — `machine_write`'s NTFS cases (a background-service install's
+      # machine config, written by the step a Setup started without elevation
+      # crosses to) set owners, which takes this runner's elevated token: here
+      # a runner that is not elevated fails them instead of skipping them.
       - name: The setup wizard on Windows — clippy + unit tests (#3116)
         if: ${{ !cancelled() }}
+        env:
+          ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
         run: |
           cargo clippy -p roomler-setup -p roomler-setup-core --all-targets -- -D warnings
           cargo test -p roomler-setup -p roomler-setup-core --lib

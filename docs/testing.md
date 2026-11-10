@@ -26,7 +26,7 @@ flowchart TB
 | Agent w/ media+input | `cargo test -p roomlerd --lib --features full` | libxcb*-dev on Linux |
 | Agent overlay tests | add `--features overlay-l3` | ⚠️ feature-gated — the default `--lib` run silently skips them |
 | Frontend types+build | `cd ui && bun run build` | includes `vue-tsc --noEmit` |
-| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2565`) |
+| Frontend types, the hosted image's way | `cd ui && bun --bun x vue-tsc --noEmit` | ⚠️ the image has no `node`, so vue-tsc runs on bun and types `.vue` through `env.d.ts`'s shim: a spec's `setProps({ realProp })` passes on Node and fails there (cast it as `VideoTileFr124.spec.ts` does). CI runs both (`ci.yml:2571`) |
 | Frontend unit | `cd ui && bun run test:unit` (`:coverage`) | jsdom |
 | E2E | `cd ui && bun run e2e` | dev stack on :5000/:5001 (`E2E_BASE_URL`, `E2E_API_URL`, `E2E_MAILPIT_URL` to point elsewhere) |
 | Self-host quickstart | `bash scripts/selfhost-pull-check.sh` (lane `Self-host pull`, amd64 and arm64) | a throwaway machine with Docker, since it ends with `down -v`: no registry login, an empty image cache, `pull` then `up -d`, and every image pinned |
@@ -252,6 +252,23 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > open-feed test is the same shape. Its "well before the deadline" was half of 60 s, and the
 > busy Windows runner once needed 35.3 s to start PowerShell and echo, so it now runs under a
 > deadline four times the others'.
+
+Fixed since:
+
+> [!WARNING]
+> **A lib test that runs the signalling loop in process holds the probe's fixture for the whole
+> run** (#3548). `signaling::run` starts the capability probe, and in a test binary the probe's
+> child is the test binary itself. So each such test ran the real probe, and its fallback answer
+> filled the process's first answer at a moment no other test controlled. Two probe tests failed
+> whenever it landed inside them. The probe's state is now one value, `ProbeState`, and a test
+> that asks whether there is an answer holds an instance of its own. A loop test is a plain
+> `#[test]` that takes `caps::loop_fixture()`
+> ([`caps.rs:2574`](../agents/roomlerd/src/encode/caps.rs#L2574)) and runs its body with the
+> fixture's `block_on`. The first answer is in, the probe counts as started (no thread, no
+> child), and `DENY_ENV_LOCK` is held, so no probe test runs beside the loop: unlocked, a loop's
+> session ask landed in a retry test's quiet wait and held that test, and the lock, for 60 s.
+> Each loop test ends by asserting that `caps_probe_spawns()` is zero. The pattern:
+> [`unenrolled.rs:479`](../agents/roomlerd/src/unenrolled.rs#L479).
 
 ## CI & special lanes
 
@@ -630,7 +647,7 @@ roomlerd encoder-smoke --bench --name hevc_vaapi                 # one FFmpeg en
 
 | Flag | Default | |
 |---|---|---|
-| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7761`) |
+| `--bench` | off | The bench instead of the 10-frame smoke. It conflicts with `--reconfigure-sweep`, `--dump` and `--json`, and every `--bench-*` flag requires it, so none of them reaches the smoke the release lane runs (`release-agent.yml:1850`, `encoder-smoke --encoder hardware`; pinned by `the_release_lanes_encoder_smoke_is_still_the_plain_smoke`, `app.rs:7774`) |
 | `--bench-full` | off | Every chroma a path takes, 10 cells less what the build cannot open, × 3 sizes (720p, 1080p, 1440p) × 2 rates (`auto`, 1.5 Mbps) × 3 motions: up to 180 rows, a 280 s budget. Pair it with `roomler exec --timeout 300` |
 | `--bench-cells` | every cell the build can open | `path:codec[:chroma]`: path `rtp` or `dc`, codec `h264`, `h265`, `av1` or `vp9`, chroma `420` or `444`. A cell no session opens (`rtp:vp9`, `rtp:h264:444`, `dc:av1:444`) is refused before anything opens |
 | `--bench-sizes` | `1280x720` | `WxH`, even sides |
@@ -709,7 +726,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:4427`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:4579`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.

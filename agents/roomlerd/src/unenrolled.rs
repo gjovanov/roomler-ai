@@ -188,6 +188,7 @@ fn offers_secret(query: Option<&str>, secret: &str) -> bool {
 mod tests {
     use super::*;
     use crate::delegate::{SessionParams, WorkerInbound};
+    use crate::encode::caps::{LoopFixture, loop_fixture};
     use crate::signaling::{self, OrgCtx};
     use futures::SinkExt;
     use roomler_ai_remote_control::permissions::Permissions;
@@ -320,6 +321,7 @@ mod tests {
     }
 
     fn child_loses_its_listener() {
+        let probe = loop_fixture();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (kill, killed) = tokio::sync::oneshot::channel::<()>();
@@ -333,7 +335,7 @@ mod tests {
             .await
             .unwrap();
             let port = stand_in.port;
-            let worker = spawn_worker(&stand_in, true).await;
+            let worker = spawn_worker(&probe, &stand_in, true).await;
             wait_connected(&worker).await;
             kill.send(()).unwrap();
             // A local process taking the freed port, as fast as it can.
@@ -366,8 +368,9 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    async fn spawn_worker(stand_in: &StandIn, unenrolled: bool) -> Worker {
+    async fn spawn_worker(probe: &LoopFixture, stand_in: &StandIn, unenrolled: bool) -> Worker {
         spawn_worker_on(
+            probe,
             &stand_in.server_url(),
             &stand_in.ws_url(),
             stand_in.secret(),
@@ -376,7 +379,15 @@ mod tests {
         .await
     }
 
-    async fn spawn_worker_on(server: &str, ws: &str, secret: &str, unenrolled: bool) -> Worker {
+    /// `_probe`: #3548 — the caller holds the probe's state, with its first answer
+    /// in, for as long as this loop runs: no lib test runs the real probe.
+    async fn spawn_worker_on(
+        _probe: &LoopFixture,
+        server: &str,
+        ws: &str,
+        secret: &str,
+        unenrolled: bool,
+    ) -> Worker {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let cfg = crate::config::test_fixture().for_unenrolled_worker(server, ws, secret);
@@ -464,10 +475,16 @@ mod tests {
 
     /// P3a's point: with no enrollment, on the stand-in alone, a session the root
     /// hands over is answered on the delegation channel.
-    #[tokio::test]
-    async fn a_worker_with_no_enrollment_answers_a_delegated_offer() {
+    #[test]
+    fn a_worker_with_no_enrollment_answers_a_delegated_offer() {
+        // #3548 — the loop runs inside the probe's fixture: no probe test beside it.
+        let probe = loop_fixture();
+        probe.block_on(answer_a_delegated_offer(&probe));
+    }
+
+    async fn answer_a_delegated_offer(probe: &LoopFixture) {
         let stand_in = StandIn::start().await.unwrap();
-        let mut worker = spawn_worker(&stand_in, true).await;
+        let mut worker = spawn_worker(probe, &stand_in, true).await;
         wait_connected(&worker).await;
 
         let session_id = bson::oid::ObjectId::new();
@@ -526,6 +543,11 @@ mod tests {
         let _ = browser.close().await;
         let _ = worker.stop.send(true);
         let _ = tokio::time::timeout(PATIENCE, worker.task).await;
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 
     /// A control plane that sends an offer the moment it is dialled: what a
@@ -570,13 +592,19 @@ mod tests {
     /// The second gate: whatever holds the socket, an unenrolled worker takes no
     /// session off it. The control is the same server and the same offer with
     /// the switch off, which is answered, so the silence is the gate's.
-    #[tokio::test]
-    async fn an_offer_off_the_socket_is_dropped() {
+    #[test]
+    fn an_offer_off_the_socket_is_dropped() {
+        // #3548 — the loop runs inside the probe's fixture: no probe test beside it.
+        let probe = loop_fixture();
+        probe.block_on(drop_an_offer_off_the_socket(&probe));
+    }
+
+    async fn drop_an_offer_off_the_socket(probe: &LoopFixture) {
         let (browser, sdp) = browser_offer().await;
 
         let (url, mut said, port) = offering_server(sdp.clone()).await;
         let server = format!("http://127.0.0.1:{port}");
-        let worker = spawn_worker_on(&server, &url, "s3", false).await;
+        let worker = spawn_worker_on(probe, &server, &url, "s3", false).await;
         assert!(
             answers_within(&mut said, PATIENCE).await,
             "control: an enrolled worker answers its own control plane"
@@ -586,7 +614,7 @@ mod tests {
 
         let (url, mut said, port) = offering_server(sdp).await;
         let server = format!("http://127.0.0.1:{port}");
-        let worker = spawn_worker_on(&server, &url, "s3", true).await;
+        let worker = spawn_worker_on(probe, &server, &url, "s3", true).await;
         wait_connected(&worker).await;
         assert!(
             !answers_within(&mut said, Duration::from_secs(5)).await,
@@ -595,5 +623,10 @@ mod tests {
         let _ = worker.stop.send(true);
         let _ = tokio::time::timeout(PATIENCE, worker.task).await;
         let _ = browser.close().await;
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 }

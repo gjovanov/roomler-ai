@@ -180,7 +180,7 @@ A bar reads in `gates` (`extauth.rs:396`), so it holds at `start`, at `finish` a
 `session`, and a login in flight dies with the rest. ⚠️ `standing` (`extauth.rs:447`)
 opens only on an answer it has seen: a read that fails refuses.
 
-`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2636`) ends what the person
+`terminate_external_of` (`crates/modules/fleet/src/hub.rs:2661`) ends what the person
 opened **through an external login**. A session the same account holds as a member came
 through the other door, with gates of its own, and it stands (`LiveSession.external`).
 
@@ -213,9 +213,9 @@ leaves the session running, as a failed `note_session` does. `set_enabled` and
 `set_policy` end sessions on a repeat too, for a bar's reason.
 
 **Across pods**, `set_principal` also publishes `terminate_external` on the control lane
-(`crates/modules/fleet/src/ctrl.rs:122`), and the pod holding the session applies it.
+(`crates/modules/fleet/src/ctrl.rs:153`), and the pod holding the session applies it.
 `set_enabled` publishes `terminate_external_org` and `set_policy` publishes
-`terminate_external_device` (`ctrl.rs:156`, `:142`). The scope is the event's name, so an
+`terminate_external_device` (`ctrl.rs:187`, `:173`). The scope is the event's name, so an
 envelope short a key ends nothing, and can never read as a wider one. Each names the
 tenant and the Hub checks it, so a mismatched one ends nothing. ⚠️ With Redis down that
 event never arrives: a session on the other pod keeps running, while every new login is

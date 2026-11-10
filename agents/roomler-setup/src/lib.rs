@@ -32,6 +32,10 @@ pub mod features;
 /// FR-129 C3 — the wizard's command line: what an elevated relaunch is
 /// handed, and the WebView2 folder an elevated run keeps apart.
 pub mod launch;
+/// #3609 — who writes a daemon install's config: the background-service
+/// role's machine enrollment is written by an administrator's process, the
+/// elevated wizard or the step that ran the installer.
+pub mod machine_write;
 pub mod orchestrator_agent;
 pub mod orchestrator_tunnel;
 /// FR-129 B1 — the Linux and macOS daemon pipeline: the embedded

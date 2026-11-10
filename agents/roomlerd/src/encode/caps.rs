@@ -38,14 +38,35 @@ use super::cells::{cell_denied, denied_cells, ffmpeg_444_capable};
 // FR-135 R9 — what the probe found, and the six fields the hello takes from it.
 use super::cell_table::{ProbeFindings, ProbedFields};
 
-static CACHED_CAPS: OnceLock<AgentCaps> = OnceLock::new();
-/// #3280 — a later try's answer, once one is adopted ([`adopt`]). [`CACHED_CAPS`]
-/// keeps the first and keeps serialising the first probe, so every reader asks
-/// here first.
-static LATE_CAPS: RwLock<Option<AgentCaps>> = RwLock::new(None);
-/// #3280 — moves when the answer in force does. Each connection's heartbeat
-/// compares it, so every organization's row gets the new answer within a beat.
-static CAPS_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// #3548 — what the probe has answered, and who hears of it: the first answer, a
+/// later try's, the interim one, the generation and its news. The daemon has one,
+/// [`PROCESS`], and every free function here reads it. A test that asks whether
+/// there is an answer, or waits for one, holds an instance of its own: in a test
+/// binary the process's is filled by whichever in-process signalling-loop test
+/// starts first, at a moment no other test controls.
+pub(crate) struct ProbeState {
+    /// The first probe's answer ([`detect`]). It keeps serialising the first probe.
+    first: OnceLock<AgentCaps>,
+    /// #3280 — a later try's answer, once one is adopted ([`adopt`]). `first` keeps
+    /// the first, so every reader asks here first.
+    late: RwLock<Option<AgentCaps>>,
+    /// #3280 — moves when the answer in force does. Each connection's heartbeat
+    /// compares it, so every organization's row gets the new answer within a beat.
+    generation: AtomicU64,
+    /// #3439 — what the async path answers before the first probe has ([`answer_now`]).
+    interim: OnceLock<AgentCaps>,
+    /// #3439 — the first answer is news, once ([`detect`]).
+    first_is_news: std::sync::Once,
+    /// #3439 — wakes every connection when [`generation`] moves ([`news`]).
+    news: OnceLock<tokio::sync::watch::Sender<u64>>,
+    /// #3439 — the first probe's thread has started ([`start_probing`]): once per
+    /// process, so a second organization's loop finds it running.
+    started: std::sync::atomic::AtomicBool,
+}
+
+/// #3548 — the daemon's probe state: one per process, however many organizations
+/// it serves.
+static PROCESS: ProbeState = ProbeState::new();
 /// #3280 — what the first answer ran out of time on. [`arm_retry`] takes it, so a
 /// second organization's loop finds nothing to arm.
 static FIRST_SHORT: Mutex<Option<child::Shortfall>> = Mutex::new(None);
@@ -53,15 +74,112 @@ static FIRST_SHORT: Mutex<Option<child::Shortfall>> = Mutex::new(None);
 static LAST_ASK: Mutex<Option<Instant>> = Mutex::new(None);
 /// #3280 — the GPU-input forms of the answer in force, for [`weigh`].
 static GPU_IN_FORCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// #3439 — what the async path answers before the first probe has ([`answer_now`]).
-static INTERIM_CAPS: OnceLock<AgentCaps> = OnceLock::new();
-/// #3439 — the first answer is news, once ([`detect`]).
-static FIRST_IS_NEWS: std::sync::Once = std::sync::Once::new();
-/// #3439 — wakes every connection when [`generation`] moves ([`news`]).
-static NEWS: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
 
-fn late_caps() -> Option<AgentCaps> {
-    LATE_CAPS.read().unwrap_or_else(|e| e.into_inner()).clone()
+impl ProbeState {
+    /// No answer yet, at generation 0.
+    pub(crate) const fn new() -> Self {
+        Self {
+            first: OnceLock::new(),
+            late: RwLock::new(None),
+            generation: AtomicU64::new(0),
+            interim: OnceLock::new(),
+            first_is_news: std::sync::Once::new(),
+            news: OnceLock::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn late_caps(&self) -> Option<AgentCaps> {
+        self.late.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// [`cached`], on this instance.
+    pub(crate) fn cached(&self) -> Option<AgentCaps> {
+        self.late_caps().or_else(|| self.first.get().cloned())
+    }
+
+    /// [`generation`], on this instance.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// [`news`], on this instance.
+    pub(crate) fn news(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.news_sender().subscribe()
+    }
+
+    fn news_sender(&self) -> &tokio::sync::watch::Sender<u64> {
+        self.news
+            .get_or_init(|| tokio::sync::watch::channel(self.generation()).0)
+    }
+
+    /// The answer [`detect`] gives has changed. Called once the new answer is
+    /// stored: the generation, then the wake, so whoever wakes finds the new answer.
+    fn answer_moved(&self) {
+        let now = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.news_sender().send_replace(now);
+    }
+
+    /// [`answered`], on this instance.
+    pub(crate) fn answered(&self) -> bool {
+        self.first.get().is_some()
+    }
+
+    /// [`answer_now`], on this instance.
+    pub(crate) fn answer_now(&self) -> AgentCaps {
+        self.cached()
+            .unwrap_or_else(|| self.interim.get_or_init(interim_answer).clone())
+    }
+
+    /// [`interim`], on this instance.
+    pub(crate) fn interim(&self) {
+        let _ = self.interim.get_or_init(interim_answer);
+    }
+
+    /// [`first_answer_within`], on this instance: its news wakes the wait, and its
+    /// answer ends it.
+    pub(crate) async fn first_answer_within(&self, within: Duration) -> bool {
+        let mut news = self.news();
+        let came = async {
+            while !self.answered() {
+                if news.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(within, came).await;
+        self.answered()
+    }
+
+    /// [`summarize_cached`], on this instance.
+    pub(crate) fn summarize_cached(&self) -> tunnel_core::localapi::EncoderCapsSummary {
+        summarize(
+            self.cached().as_ref(),
+            denied_cells(),
+            super::resolved_preference().map(|p| p.wire()),
+        )
+    }
+
+    /// [`detect`], on this instance.
+    pub(crate) fn detect(&self) -> AgentCaps {
+        let first = self.first.get_or_init(|| {
+            let caps = cached_or_probed();
+            let short = FIRST_SHORT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .filter(|_| retry_enabled());
+            assigned_by_the_daemon(
+                caps,
+                &HostFacts::here(),
+                &super::cells::learned(),
+                short.as_ref(),
+            )
+        });
+        // #3439 — after the store, so a connection woken by it finds the answer.
+        self.first_is_news.call_once(|| self.answer_moved());
+        self.late_caps().unwrap_or_else(|| first.clone())
+    }
 }
 
 /// FR-84 D4 — the probe's result if it has run in this process, else `None`.
@@ -74,7 +192,7 @@ fn late_caps() -> Option<AgentCaps> {
 /// ([`start_probing`]), so until its first answer this is `None`, and the
 /// Overview says "not probed yet" and asks again later.
 pub fn cached() -> Option<AgentCaps> {
-    late_caps().or_else(|| CACHED_CAPS.get().cloned())
+    PROCESS.cached()
 }
 
 /// #3280 — a number that changes when the answer [`detect`] gives does. Read it
@@ -82,44 +200,33 @@ pub fn cached() -> Option<AgentCaps> {
 /// #3439 — the first answer moves it too: a connection that said hello with the
 /// interim answer has to hear of the real one.
 pub fn generation() -> u64 {
-    CAPS_GENERATION.load(Ordering::SeqCst)
+    PROCESS.generation()
 }
 
 /// #3439 — wakes when [`generation`] moves. Each connection holds one, so a new
 /// answer reaches its row at once rather than within a heartbeat. Subscribe
 /// before reading the generation, so a change in between wakes it.
 pub fn news() -> tokio::sync::watch::Receiver<u64> {
-    news_sender().subscribe()
-}
-
-fn news_sender() -> &'static tokio::sync::watch::Sender<u64> {
-    NEWS.get_or_init(|| tokio::sync::watch::channel(generation()).0)
-}
-
-/// The answer [`detect`] gives has changed. Called once the new answer is stored:
-/// the generation, then the wake, so whoever wakes finds the new answer.
-fn answer_moved() {
-    let now = CAPS_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    news_sender().send_replace(now);
+    PROCESS.news()
 }
 
 /// #3439 — whether the first probe has answered. Before it has, a session request
 /// waits for it (`crate::held_requests`).
 pub fn answered() -> bool {
-    CACHED_CAPS.get().is_some()
+    PROCESS.answered()
 }
 
 /// #3439 — the answer in force, or before the first probe has answered, the
 /// interim one ([`interim`]). It never waits for a probe: this is what the
 /// signalling loop reads, where a wait on the probe is a stalled pump.
 pub fn answer_now() -> AgentCaps {
-    cached().unwrap_or_else(|| INTERIM_CAPS.get_or_init(interim_answer).clone())
+    PROCESS.answer_now()
 }
 
 /// #3439 — build the interim answer, on a blocking thread: it reads the host the
 /// way a cache hit does. `signaling::run` builds it before it connects with it.
 pub fn interim() {
-    let _ = INTERIM_CAPS.get_or_init(interim_answer);
+    PROCESS.interim()
 }
 
 /// #3439 — how long a start waits for the first answer before it connects with
@@ -130,16 +237,7 @@ pub const FIRST_ANSWER_WAIT: Duration = Duration::from_secs(10);
 
 /// #3439 — wait for the first answer, `within` at most. Whether it came.
 pub async fn first_answer_within(within: Duration) -> bool {
-    let mut news = news();
-    let came = async {
-        while !answered() {
-            if news.changed().await.is_err() {
-                return;
-            }
-        }
-    };
-    let _ = tokio::time::timeout(within, came).await;
-    answered()
+    PROCESS.first_answer_within(within).await
 }
 
 /// Whether this build carries ANY video encoder. A signalling-only build
@@ -198,11 +296,7 @@ pub fn summarize(
 /// probe (never a fresh one), the denylist in force (env > config > built-in,
 /// plus what the probe learned, #3267) and the preference `run` resolved.
 pub fn summarize_cached() -> tunnel_core::localapi::EncoderCapsSummary {
-    summarize(
-        cached().as_ref(),
-        denied_cells(),
-        super::resolved_preference().map(|p| p.wire()),
-    )
+    PROCESS.summarize_cached()
 }
 
 /// Running the hardware probes in a CHILD PROCESS.
@@ -250,6 +344,11 @@ mod child {
     /// ended, so a child that dies between opens (an enumeration, its own
     /// exit) is not read as dying in the last cell it opened.
     pub(super) const NO_OPEN: &str = "-";
+    /// #3548 — every `caps-probe` child this process tried to start, counted
+    /// before the spawn, so one that failed to start counts too. Test builds
+    /// only: no lib test may run the real probe ([`super::caps_probe_spawns`]).
+    #[cfg(test)]
+    pub(super) static SPAWNS: AtomicU32 = AtomicU32::new(0);
 
     /// #3267 — one open in the `base` phase, announced for as long as this
     /// lives, so `last_open` names the cell if the process dies in it. Holds
@@ -1380,6 +1479,8 @@ mod child {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
+        #[cfg(test)]
+        SPAWNS.fetch_add(1, Ordering::SeqCst);
         let childp = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -2388,23 +2489,7 @@ pub(crate) fn in_probe_child() -> bool {
 /// ⚠️ The first call blocks until the probe answers, and so does every call made
 /// while it runs. The signalling loop reads [`answer_now`] instead (#3439).
 pub fn detect() -> AgentCaps {
-    let first = CACHED_CAPS.get_or_init(|| {
-        let caps = cached_or_probed();
-        let short = FIRST_SHORT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .filter(|_| retry_enabled());
-        assigned_by_the_daemon(
-            caps,
-            &HostFacts::here(),
-            &super::cells::learned(),
-            short.as_ref(),
-        )
-    });
-    // #3439 — after the store, so a connection woken by it finds the answer.
-    FIRST_IS_NEWS.call_once(answer_moved);
-    late_caps().unwrap_or_else(|| first.clone())
+    PROCESS.detect()
 }
 
 /// #3439 — the first probe, on a thread of its own, so the start does not wait
@@ -2419,8 +2504,7 @@ pub fn detect() -> AgentCaps {
 ///
 /// `false` when no thread could start: the caller probes in place, as before.
 pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::SeqCst) {
+    if PROCESS.started.swap(true, Ordering::SeqCst) {
         return true;
     }
     let spawned = std::thread::Builder::new()
@@ -2432,11 +2516,79 @@ pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
     match spawned {
         Ok(_) => true,
         Err(e) => {
-            STARTED.store(false, Ordering::SeqCst);
+            PROCESS.started.store(false, Ordering::SeqCst);
             tracing::warn!(%e, "caps probe: no thread for the probe; the start waits for it");
             false
         }
     }
+}
+
+/// #3548 — what a lib test that runs the signalling loop in process holds for as
+/// long as the loop runs ([`loop_fixture`]). The loop reads the process's probe
+/// state (the answer in force, its generation, the denylist in the environment)
+/// and writes some of it (a session's ask, [`session_asked`]), and the probe's
+/// own tests set and read that state under `DENY_ENV_LOCK`. A loop's ask landing
+/// in a retry test's quiet wait held that test, and the lock, for a minute. So a
+/// loop test holds the lock too, from before its loop starts until after its
+/// runtime has stopped: no probe test runs beside a loop.
+///
+/// Held by the test's own thread around the runtime ([`LoopFixture::block_on`]),
+/// never inside an async body: nothing on that runtime takes this lock.
+#[cfg(test)]
+pub(crate) struct LoopFixture {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl LoopFixture {
+    /// A loop test's body, on the runtime `#[tokio::test]` builds, which stops
+    /// before this fixture is let go.
+    pub(crate) fn block_on<F: std::future::Future>(&self, body: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(body)
+    }
+}
+
+#[cfg(test)]
+impl Drop for LoopFixture {
+    fn drop(&mut self) {
+        // A session's ask is the loop's one write to the probe's state: the next
+        // test to hold the lock finds none, as the probe's own tests leave it.
+        *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// #3548 — the probe lock, with the process's first answer in and the probe
+/// marked as started, so that a loop started under it finds an answer, starts no
+/// probe thread and spawns no child, and does not wait out
+/// [`FIRST_ANSWER_WAIT`]. The answer is what the probe answered such a test
+/// before: in a test binary the probe's child is the test harness, which prints
+/// no answer, so the probe fell back to the encoders that need no driver.
+///
+/// Idempotent. The generation moves only under the lock, which every test that
+/// reads it holds, so none of them sees it move.
+#[cfg(test)]
+pub(crate) fn loop_fixture() -> LoopFixture {
+    let guard = crate::encode::DENY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _ = PROCESS.first.get_or_init(|| {
+        assigned_by_the_daemon(compute_caps(false, false), &HostFacts::here(), &[], None)
+    });
+    PROCESS.first_is_news.call_once(|| PROCESS.answer_moved());
+    PROCESS.started.store(true, Ordering::SeqCst);
+    LoopFixture { _guard: guard }
+}
+
+/// #3548 — how many `caps-probe` children this test binary has tried to start.
+/// A lib test reads this rather than waiting for a failure: a panic on the probe's
+/// own thread would fail no test.
+#[cfg(test)]
+pub(crate) fn caps_probe_spawns() -> u32 {
+    child::SPAWNS.load(Ordering::SeqCst)
 }
 
 /// What the daemon says over whatever `cached_or_probed` answered, on every
@@ -3452,8 +3604,8 @@ fn offered_forms(caps: &AgentCaps) -> std::collections::BTreeMap<String, bool> {
 /// A later answer is in force. The generation last, so a heartbeat that sees it
 /// finds the new answer.
 fn install_late(answer: AgentCaps) {
-    *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
-    answer_moved();
+    *PROCESS.late.write().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+    PROCESS.answer_moved();
 }
 
 /// #3280 — a later try's child that would not die costs Media Foundation as a first
@@ -5065,10 +5217,14 @@ mod tests {
     /// from a control-surface poll on every host that has not connected yet
     /// — vendor driver code, run because someone opened the Overview.
     ///
-    /// The lock is read DIRECTLY, not through `cached()`: a `cached()` that
-    /// called `detect()` would fill the lock before `before` was taken and
-    /// pass. (Negative control, run for the PR: `cached()` returning
-    /// `Some(detect())` turns this red.) No other lib test fills the lock.
+    /// The answer is read DIRECTLY (`answered`), not through `cached()`: a
+    /// `cached()` that called `detect()` would fill it before `before` was
+    /// taken and pass. (Negative control, run for #3548's PR: a
+    /// `ProbeState::cached` returning `Some(self.detect())` turns this red.)
+    ///
+    /// #3548 — on an instance of its own, which nothing else fills: in a test
+    /// binary the process's is filled by whichever in-process signalling-loop
+    /// test starts first, at a moment no other test controls.
     #[test]
     fn not_probed_never_triggers_a_probe() {
         // It reads `ENCODER_CELLS_DENY` twice (inside `summarize_cached` and
@@ -5078,23 +5234,23 @@ mod tests {
         let _guard = crate::encode::DENY_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let before = CACHED_CAPS.get().is_some();
-        let summary = summarize_cached();
-        let after = CACHED_CAPS.get().is_some();
-        assert_eq!(
-            before, after,
+        let state = ProbeState::new();
+        let before = state.answered();
+        let summary = state.summarize_cached();
+        let after = state.answered();
+        assert!(!before, "a new instance has no answer");
+        assert!(
+            !after,
             "reading the summary must not populate the probe cache"
         );
-        match (ENCODERS_COMPILED, before) {
-            (false, _) => assert_eq!(summary.state, "unsupported"),
-            (true, false) => {
-                assert_eq!(summary.state, "not_probed");
-                assert!(summary.cells.is_empty());
-                assert!(summary.hw_encoders.is_empty());
-                assert_eq!(summary.probe_ms, None);
-                assert!(!summary.probe_cached);
-            }
-            (true, true) => assert_eq!(summary.state, "ready"),
+        if ENCODERS_COMPILED {
+            assert_eq!(summary.state, "not_probed");
+            assert!(summary.cells.is_empty());
+            assert!(summary.hw_encoders.is_empty());
+            assert_eq!(summary.probe_ms, None);
+            assert!(!summary.probe_cached);
+        } else {
+            assert_eq!(summary.state, "unsupported");
         }
         // The denylist and the preference are facts about the process, not
         // about the probe: reported whatever the state.
@@ -7757,7 +7913,7 @@ mod tests {
     impl Drop for ProbeFixture {
         fn drop(&mut self) {
             cells::install_learned(Vec::new());
-            *LATE_CAPS.write().unwrap_or_else(|e| e.into_inner()) = None;
+            *PROCESS.late.write().unwrap_or_else(|e| e.into_inner()) = None;
             *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
             GPU_IN_FORCE
                 .lock()
@@ -9035,7 +9191,7 @@ mod tests {
     }
 
     fn set_in_force(caps: AgentCaps) {
-        *LATE_CAPS.write().unwrap() = Some(caps);
+        *PROCESS.late.write().unwrap() = Some(caps);
     }
 
     fn offered_in_force() -> Vec<String> {
@@ -9897,33 +10053,75 @@ mod tests {
     /// already moved, so whoever wakes reads the new one.
     #[test]
     fn a_moved_answer_wakes_every_connection() {
-        let _fixture = probe_fixture();
-        let (mut one, mut two) = (news(), news());
-        let before = generation();
-        answer_moved();
-        assert_eq!(generation(), before + 1);
+        let state = ProbeState::new();
+        let (mut one, mut two) = (state.news(), state.news());
+        let before = state.generation();
+        state.answer_moved();
+        assert_eq!(state.generation(), before + 1);
         for news in [&mut one, &mut two] {
             assert!(
                 news.has_changed()
-                    .expect("the sender lives as long as the process")
+                    .expect("the sender lives as long as the instance")
             );
             assert_eq!(*news.borrow_and_update(), before + 1);
         }
     }
 
     /// #3439 — the start's wait for a first answer is a bound, not a wait for the
-    /// probe. No test in this binary runs the probe, so nothing answers here.
+    /// probe. #3548 — on an instance of its own, which nothing answers, so it
+    /// tests the bound whatever any other test has done to the process's.
     #[test]
     fn the_wait_for_a_first_answer_ends_at_its_bound() {
-        if answered() {
-            return;
-        }
+        let state = ProbeState::new();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .expect("a runtime");
+        let bound = Duration::from_millis(50);
         let started = Instant::now();
-        assert!(!rt.block_on(first_answer_within(Duration::from_millis(50))));
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(!rt.block_on(state.first_answer_within(bound)));
+        let waited = started.elapsed();
+        assert!(waited >= bound, "ended before its bound: {waited:?}");
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
+    }
+
+    /// #3548 — what a wait reads is its own instance's answer and nothing else.
+    /// Another thread fills the PROCESS's first answer, as an in-process
+    /// signalling-loop test's fixture does, released at the moment this wait
+    /// begins: `join!` polls the wait first, so it has subscribed and found no
+    /// answer before the filler runs, and it is not polled again until the fill
+    /// is done. Before #3548 the two were one, and this wait reported the
+    /// process's answer every time.
+    #[test]
+    fn a_wait_hears_nothing_of_the_process_answer() {
+        let state = ProbeState::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (filled, was_filled) = std::sync::mpsc::channel::<()>();
+        let filler = std::thread::spawn(move || {
+            released.recv().expect("released");
+            drop(loop_fixture());
+            filled.send(()).expect("told");
+        });
+        let bound = Duration::from_millis(50);
+        let started = Instant::now();
+        let (came, ()) = rt.block_on(async {
+            tokio::join!(state.first_answer_within(bound), async {
+                release.send(()).expect("release");
+                was_filled.recv().expect("the filler filled");
+            })
+        });
+        let waited = started.elapsed();
+        filler.join().expect("the filler");
+        assert!(answered(), "the process's first answer is in");
+        assert!(
+            !came,
+            "the wait reported the answer another thread filled while it waited"
+        );
+        assert!(!state.answered());
+        assert!(waited >= bound, "ended before its bound: {waited:?}");
     }
 }

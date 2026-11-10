@@ -426,7 +426,7 @@ sequenceDiagram
 
 - **It is not a crash.** The restart leaves through the same internal shutdown an auto-update
   uses, so the clean shutdown is recorded and the crash / rollback accounting never sees it
-  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2128`).
+  (`exit_for_requested_restart`, `agents/roomlerd/src/app.rs:2141`).
 - ⚠️ **A virtual-desktop host reaps its own desktop before it exits (#1684).** On Linux the
   daemon may run a virtual desktop (Xvfb + WM + apps, `ROOMLERD_VIRTUAL_DESKTOP=1`), and under
   systemd `KillMode=control-group` whatever it spawned that outlives it — the desktop's
@@ -495,7 +495,7 @@ the software encoders — with the chroma each cell produced (4:2:0 / 4:4:4), de
 struck through, and how long the probe took.
 
 - It asks `Request::EncoderCaps`, which answers from the probe's **cached** result only
-  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:76`). The capability probe runs in
+  (`caps::cached()`, `agents/roomlerd/src/encode/caps.rs:194`). The capability probe runs in
   child processes (vendor driver code) at the first server hello; a control-surface poll
   must never be what launches it — locked by `not_probed_never_triggers_a_probe`.
 - Three states: `ready` (the matrix), `not_probed` (the daemon has not connected yet — the

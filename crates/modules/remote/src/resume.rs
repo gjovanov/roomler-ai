@@ -15,7 +15,7 @@
 //! | the row exists in the device's tenant and names this device | `agent_disconnect`, nothing written |
 //! | the row is live and not ended | the row's own end reason (an admin's end written during the gap reads `admin_terminated`), nothing written |
 //! | `resume_by` has not passed, when the row has one | `agent_disconnect`, the row ended as inferred |
-//! | the gate a request runs, run again (`controller::authorize_resume`) | `admin_terminated` |
+//! | the gate a request runs, run again (`controller::resume_gate`) | `admin_terminated`; a read that failed decides nothing: `agent_disconnect`, nothing written |
 //! | the org's maximum length, counted from `started_at` | `idle_timeout`, limit `max_duration` |
 //! | the FR-115 slot, taken again under the session's own id | `agent_disconnect` |
 //!
@@ -33,19 +33,46 @@
 //!
 //! [`RemoteSessionDao::commit_resume`]: roomler_ai_services::dao::remote_session::RemoteSessionDao::commit_resume
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use bson::DateTime;
 use bson::oid::ObjectId;
+use dashmap::DashMap;
 use roomler_ai_mod_fleet::hub::{Resumed, ResumedSession, RowEnd};
 use roomler_ai_remote_control::models::{EndReason, EndSource, RemoteSession, SessionPhase};
+use roomler_ai_remote_control::signaling::Role;
 use roomler_ai_services::dao::base::DaoError;
 use roomler_core::AgentCtx;
 use roomler_core::cluster::session_slots::{Lease, SlotScope};
 use tracing::{debug, info, warn};
 
 use crate::RemoteState;
+use crate::controller::ResumeGate;
 use crate::slots::SlotDecision;
+
+/// P1b-2 — the sessions each connection's registration ended because the
+/// hello did not claim them, keyed by the connection (`AgentCtx::conn_id`):
+/// the registration read's inferred ends, with the row's own clock they were
+/// dated by, and the hub's in-memory reap (`None`). The device's own end of
+/// one, reported after its hello, replaces the reason ([`device_end`]).
+/// Filled only under a window; released when the connection closes.
+pub type RegistrationEnds = DashMap<String, HashMap<ObjectId, Option<DateTime>>>;
+
+/// Remember that this connection's registration ended `session_id` without
+/// seeing its end.
+fn note_registration_end(
+    state: &RemoteState,
+    ctx: &AgentCtx,
+    session_id: ObjectId,
+    inferred_at: Option<DateTime>,
+) {
+    state
+        .registration_ends
+        .entry(ctx.conn_id.clone())
+        .or_default()
+        .insert(session_id, inferred_at);
+}
 
 /// The most rows an earlier connection left open that one registration ends.
 /// A device holds at most its capacity of live sessions, so past this the
@@ -57,6 +84,11 @@ const REGISTRATION_READ_LIMIT: i64 = 64;
 pub async fn on_hello(state: &RemoteState, ctx: &AgentCtx) {
     if ctx.resume.window_secs == 0 {
         return;
+    }
+    // The hub's in-memory reap ended these at the registration: the device
+    // may still report how they really ended (`device_end`).
+    for &session_id in &ctx.resume.reaped {
+        note_registration_end(state, ctx, session_id, None);
     }
     for &session_id in &ctx.resume.claims {
         claim(state, ctx, session_id).await;
@@ -153,7 +185,9 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
     let seq = row.attach_seq;
     let now = DateTime::now();
     if row.resume_by.is_some_and(|by| by <= now) {
-        let end = RowEnd::inferred(seq, inferred_end(&row), EndSource::Registration);
+        let at = inferred_end(&row);
+        note_registration_end(state, ctx, session_id, Some(at));
+        let end = RowEnd::inferred(seq, at, EndSource::Registration);
         return refuse(
             state,
             ctx,
@@ -163,11 +197,19 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
             Some(end),
         );
     }
-    let authz = match crate::controller::authorize_resume(state, row.controller_user_id, agent)
-        .await
+    let (max_limit, org_session_cap) = match crate::controller::resume_gate(
+        state,
+        row.controller_user_id,
+        ctx.tenant_id,
+        agent,
+    )
+    .await
     {
-        Ok(authz) => authz,
-        Err(why) => {
+        ResumeGate::Allow {
+            max_duration,
+            org_session_cap,
+        } => (max_duration, org_session_cap),
+        ResumeGate::Deny(why) => {
             info!(%agent, session = %session_id, %why, "rc session claim: the controller may no longer control the device — refused");
             let end = RowEnd::fenced(seq);
             return refuse(
@@ -179,11 +221,25 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
                 Some(end),
             );
         }
+        // P1b-2 (P1b-1's review, H1) — a read failed, so nothing was
+        // decided: not resumed, and nothing written. The viewer's redial
+        // runs the whole gate again, consent included.
+        ResumeGate::Unknown(why) => {
+            warn!(%agent, session = %session_id, %why, "rc session claim: the gate could not be run — refused, the row left as it is");
+            return refuse(
+                state,
+                ctx,
+                session_id,
+                EndReason::AgentDisconnect,
+                None,
+                None,
+            );
+        }
     };
     // FR-101 — the org's maximum length runs from when the session went
     // live, never from the resume.
     let started_at = row.started_at.unwrap_or(row.created_at);
-    let max_duration = match authz.max_duration {
+    let max_duration = match max_limit {
         None => None,
         Some(limit) => {
             let lived_ms = now
@@ -206,7 +262,7 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
             }
         }
     };
-    let Ok(slot) = reclaim_slot(state, &row, session_id, authz.org_session_cap).await else {
+    let Ok(slot) = reclaim_slot(state, &row, session_id, org_session_cap).await else {
         info!(%agent, session = %session_id, "rc session claim: the org's slots are taken — refused");
         let end = RowEnd::fenced(seq);
         return refuse(
@@ -258,6 +314,8 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
             attach_seq: next,
             max_duration,
             slot: slot.clone(),
+            // P1b-2 — how long the rebuilt session waits for its viewer.
+            resume_secs: ctx.resume.window_secs,
         },
     );
     if let Some(lease) = &slot {
@@ -362,6 +420,7 @@ async fn registration_read(state: &RemoteState, ctx: &AgentCtx) {
             ended_at_ms = at.timestamp_millis(),
             "rc session an earlier connection left open — ended at its own last clock"
         );
+        note_registration_end(state, ctx, session_id, Some(at));
         state.fleet.rc_hub.record_end(
             session_id,
             ctx.agent_id,
@@ -371,6 +430,78 @@ async fn registration_read(state: &RemoteState, ctx: &AgentCtx) {
             RowEnd::inferred(row.attach_seq, at, EndSource::Registration),
         );
     }
+}
+
+/// P1b-2 (AC4, P1b-1's review H2) — the device's own `rc:terminate` for a
+/// session no hub here holds, which THIS connection's registration ended
+/// without seeing its end: the person at the device pressed Disconnect
+/// during the gap, or the session reached its idle limit there, and the
+/// device reports it after its hello (it cannot sooner). The device's reason
+/// (`host_disconnect`, `idle_timeout` with `limit: idle`, `error`) replaces
+/// the inferred `agent_disconnect` on the row, which then reads as an end
+/// that was seen: `end_source` cleared, `ended_at` still the row's own last
+/// clock, since the frame carries no time (`replace_inferred_end`). `false`
+/// when it is not such a session, and the hub's dispatch takes the frame as
+/// before.
+pub async fn device_end(
+    state: &RemoteState,
+    ctx: &AgentCtx,
+    session_id: ObjectId,
+    reason: EndReason,
+    limit: Option<&str>,
+) -> bool {
+    let noted = state
+        .registration_ends
+        .get(&ctx.conn_id)
+        .and_then(|ended| ended.get(&session_id).copied());
+    let Some(inferred_at) = noted else {
+        return false;
+    };
+    // As the hub takes an agent's end: the reason as sent, and a limit only
+    // where the device may name one.
+    let limit = roomler_ai_mod_fleet::hub::device_end_limit(Role::Agent, reason, limit);
+    match state
+        .remote_sessions
+        .replace_inferred_end(
+            ctx.tenant_id,
+            ctx.agent_id,
+            session_id,
+            reason,
+            inferred_at,
+            DateTime::now(),
+        )
+        .await
+    {
+        Ok(true) => {
+            info!(
+                agent = %ctx.agent_id,
+                session = %session_id,
+                ?reason,
+                "rc session ended at the device during the gap: its own reason replaces the inferred one"
+            );
+            state.fleet.rc_hub.record_end(
+                session_id,
+                ctx.agent_id,
+                ctx.tenant_id,
+                reason,
+                limit,
+                RowEnd::written(inferred_at),
+            );
+        }
+        Ok(false) => {
+            debug!(agent = %ctx.agent_id, session = %session_id, "rc session the device ended: its row was ended otherwise meanwhile — left as it is");
+        }
+        Err(e) => {
+            warn!(agent = %ctx.agent_id, session = %session_id, %e, "rc session the device ended: its row could not be written");
+        }
+    }
+    true
+}
+
+/// P1b-2 — the connection closed: what its registration ended is no longer
+/// its to replace.
+pub fn forget_connection(state: &RemoteState, ctx: &AgentCtx) {
+    state.registration_ends.remove(&ctx.conn_id);
 }
 
 #[cfg(test)]

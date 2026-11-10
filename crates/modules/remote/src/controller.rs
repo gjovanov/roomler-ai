@@ -177,6 +177,36 @@ pub async fn dispatch_controller_rc(
         return false;
     };
     let is_session_request = matches!(&parsed, ClientMsg::SessionRequest { .. });
+    // FR-138 P1b-2 — the viewer's half of a held session, all of it inert at
+    // window 0. Its rejoin is answered here, on the pod its socket reached
+    // (`crate::rejoin`). A request first ends what it `replaces` and what is
+    // held for this person on that device, before the org's slot below is
+    // claimed. And an end the controller asks for of a session no hub here
+    // holds is written to the row (`crate::row_end`); the hub's own dispatch
+    // then finds nothing of it to end, as before.
+    match &parsed {
+        ClientMsg::SessionRejoin { session_id } => {
+            let viewer = crate::rejoin::Viewer {
+                user_id,
+                name: controller_name,
+                tx: controller_tx,
+                connection_id,
+            };
+            crate::rejoin::rejoin(state, viewer, *session_id).await;
+            return true;
+        }
+        ClientMsg::SessionRequest {
+            agent_id, replaces, ..
+        } => {
+            crate::row_end::before_request(state, user_id, *agent_id, *replaces).await;
+        }
+        ClientMsg::Terminate {
+            session_id, reason, ..
+        } => {
+            crate::row_end::controller_end(state, user_id, *session_id, *reason).await;
+        }
+        _ => {}
+    }
     // FR-115 P3b — on the pod that owns the device, the org's cap is a
     // cluster-wide slot, claimed here because the hub is synchronous: the
     // org's own sessions and the external ones run for it share one count.
@@ -1002,41 +1032,173 @@ fn error_session_id(e: &roomler_ai_remote_control::Error) -> Option<bson::oid::O
     }
 }
 
-/// FR-138 — the gate a new `rc:session.request` runs, run again for a claim
-/// on a session the controller already had (spec §4.4, "The claim"): the
-/// device not quarantined, the org not archived, and the controller its
-/// owner, or a member still holding what a request needs on it. Consent is
-/// the one check not re-run: the session is the one the device decided on.
-/// The request is the plainest one (no break-glass reason, no relay), so the
-/// answer is what that controller may do now.
-pub(crate) async fn authorize_resume(
+/// FR-138 — what the gate a request runs says, run again at a resume: the
+/// device's claim and the viewer's rejoin (spec §4.4). Three ways, so a read
+/// that fails is never taken for a yes or a no (P1b-1's review, H1): the
+/// request's own gate reads a device row it cannot read as "allow" and a
+/// member row it cannot read as "no permission", and neither is right for a
+/// session that is already running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeGate {
+    /// Allowed, with what a claim arms again: the org's maximum length and
+    /// its session cap.
+    Allow {
+        max_duration: Option<std::time::Duration>,
+        org_session_cap: Option<u32>,
+    },
+    /// Refused: the device or its org is gone, quarantined or archived, or
+    /// the person may no longer control the device.
+    Deny(String),
+    /// A read failed, so the gate decided nothing. The caller refuses the
+    /// resume as `agent_disconnect` and writes nothing: the viewer's redial
+    /// then runs the whole gate, consent included.
+    Unknown(String),
+}
+
+/// One read the resume gate makes: a missing row (the device removed, the
+/// org gone, the person no longer a member) is a refusal; any other failure
+/// is no answer.
+fn gate_read<T>(
+    read: Result<T, roomler_ai_services::dao::base::DaoError>,
+    missing: &str,
+    what: &str,
+) -> Result<T, ResumeGate> {
+    use roomler_ai_services::dao::base::DaoError;
+    match read {
+        Ok(v) => Ok(v),
+        Err(DaoError::NotFound | DaoError::NotAMember) => {
+            Err(ResumeGate::Deny(missing.to_string()))
+        }
+        Err(e) => Err(ResumeGate::Unknown(format!("{what}: {e}"))),
+    }
+}
+
+/// FR-138 — the gate a new `rc:session.request` runs, run again for a
+/// session `controller_user_id` already had on `agent_id`, a device of
+/// `tenant_id` (spec §4.4, "The claim"; the rejoin, §4.5): the device live
+/// in its org and not quarantined, the org there and not archived, and the
+/// person its owner, an ADMINISTRATOR, or a member still holding
+/// `REMOTE_CONTROL` and on the device's allowlist. The same decisions as
+/// [`resolve_session_authz`] makes for a request, in the same order. Consent
+/// is the one check not re-run: the session is the one the device decided
+/// on.
+pub(crate) async fn resume_gate(
     state: &RemoteState,
     controller_user_id: ObjectId,
+    tenant_id: ObjectId,
     agent_id: ObjectId,
-) -> Result<SessionAuthz, String> {
-    let request = ClientMsg::SessionRequest {
-        agent_id,
-        permissions: roomler_ai_remote_control::permissions::Permissions::VIEW,
-        browser_caps: Vec::new(),
-        preferred_transport: None,
-        chroma_pref: None,
-        chunk_framing: None,
-        audio_enabled: false,
-        override_reason: None,
-        local_relay: None,
-        local_relay_from: None,
-        local_relay_also: Vec::new(),
-        local_relay_from_also: Vec::new(),
-        replaces: None,
+) -> ResumeGate {
+    use roomler_ai_db::models::role::permissions;
+    use roomler_ai_remote_control::models::AgentStatus;
+
+    let agent = match gate_read(
+        state
+            .fleet
+            .agents
+            .find_live_in_tenant(tenant_id, agent_id)
+            .await,
+        "the device was removed",
+        "the device could not be read",
+    ) {
+        Ok(a) => a,
+        Err(gate) => return gate,
     };
-    let text = serde_json::to_string(&request).map_err(|e| e.to_string())?;
-    resolve_session_authz(state, controller_user_id, &text).await
+    if agent.status == AgentStatus::Quarantined {
+        return ResumeGate::Deny("the device is quarantined".to_string());
+    }
+    let tenant = match gate_read(
+        state.tenants.base.find_by_id(agent.tenant_id).await,
+        "the organization is gone",
+        "the organization could not be read",
+    ) {
+        Ok(t) => t,
+        Err(gate) => return gate,
+    };
+    if tenant.is_archived {
+        return ResumeGate::Deny("the organization is archived".to_string());
+    }
+    let allow = ResumeGate::Allow {
+        max_duration: tenant
+            .settings
+            .rc_limits
+            .max_secs
+            .map(|secs| std::time::Duration::from_secs(u64::from(secs))),
+        org_session_cap: if state.settings.rc.org_session_cap && state.plans_sold {
+            org_session_cap_of(&tenant)
+        } else {
+            None
+        },
+    };
+    if agent.owner_user_id == controller_user_id {
+        return allow;
+    }
+    let perms = match gate_read(
+        state
+            .tenants
+            .get_member_permissions(agent.tenant_id, controller_user_id)
+            .await,
+        "no longer a member of the device's organization",
+        "the membership could not be read",
+    ) {
+        Ok(p) => p,
+        Err(gate) => return gate,
+    };
+    if permissions::has(perms, permissions::ADMINISTRATOR) {
+        return allow;
+    }
+    if !permissions::has(perms, permissions::REMOTE_CONTROL) {
+        return ResumeGate::Deny("no longer allowed to control others' devices".to_string());
+    }
+    let policy = &agent.access_policy;
+    if (policy.allowed_user_ids.is_empty() && policy.allowed_role_ids.is_empty())
+        || policy.allowed_user_ids.contains(&controller_user_id)
+    {
+        return allow;
+    }
+    match gate_read(
+        state
+            .tenants
+            .member_role_ids(agent.tenant_id, controller_user_id)
+            .await,
+        "no longer a member of the device's organization",
+        "the member's roles could not be read",
+    ) {
+        Ok(roles) if policy.allowed_role_ids.iter().any(|r| roles.contains(r)) => allow,
+        Ok(_) => ResumeGate::Deny("no longer on the device's control allowlist".to_string()),
+        Err(gate) => gate,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use roomler_ai_remote_control::signaling::LOCAL_RELAYS_MAX;
+
+    /// FR-138 (P1b-1's review, H1) — the resume gate's reads: a row that is
+    /// not there (the device removed, the org gone, the person not a member)
+    /// refuses; any other failure decides nothing, so a database that cannot
+    /// answer neither resumes a session nor ends a healthy one.
+    #[test]
+    fn a_resume_gate_read_refuses_a_missing_row_and_decides_nothing_on_a_failure() {
+        use roomler_ai_services::dao::base::DaoError;
+        assert_eq!(gate_read(Ok::<u8, DaoError>(7), "gone", "read"), Ok(7));
+        for missing in [DaoError::NotFound, DaoError::NotAMember] {
+            assert_eq!(
+                gate_read::<u8>(Err(missing), "gone", "read"),
+                Err(ResumeGate::Deny("gone".to_string()))
+            );
+        }
+        for failed in [
+            DaoError::Validation("x".into()),
+            DaoError::Forbidden("x".into()),
+            DaoError::Conflict("x".into()),
+        ] {
+            assert!(matches!(
+                gate_read::<u8>(Err(failed), "gone", "read"),
+                Err(ResumeGate::Unknown(_))
+            ));
+        }
+    }
 
     fn probed(agent_id: Option<String>) -> LocalRelayDescriptor {
         relay_at("100.64.0.9", agent_id)

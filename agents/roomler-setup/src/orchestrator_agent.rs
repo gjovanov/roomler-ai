@@ -24,7 +24,10 @@
 //!   6. Wait for its exit through `MsiRunner` (caller's Tauri-future cancel
 //!      propagates through 250 ms-slice polling)
 //!   7. Enroll the agent against the configured server, persist
-//!      `config.toml`. Emits `EnrollOk` then `Done`.
+//!      `config.toml`. Emits `EnrollOk` then `Done`. The background-service
+//!      role's machine config is written by an administrator's process only:
+//!      this one when elevated, else the step that ran the MSI (#3609,
+//!      [`crate::machine_write`]).
 //!
 //! ## Cancel + force-kill
 //!
@@ -64,7 +67,7 @@ use crate::role::Role;
 /// right where the orchestrator saves it. `None`/empty fields keep the
 /// agent's defaults; route lists are validated BEFORE the MSI runs so a
 /// typo can't burn the single-use enrollment token.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AdvancedOptions {
     pub overlay_enabled: Option<bool>,
@@ -463,7 +466,7 @@ async fn run_install_inner(
     // --- Step 5: start the install ---------------------------------------
     diag.begin(Step::Msi);
     check_cancel()?;
-    let started = package_step::start_install(
+    let mut started = package_step::start_install(
         &staged,
         health.digest.as_deref(),
         wfx,
@@ -476,18 +479,24 @@ async fn run_install_inner(
     emit(on_event, ProgressEvent::MsiSpawned { pid });
 
     // --- Step 6: wait + decode --------------------------------------------
-    // 15-min budget covers slow corporate disks + Defender scans.
-    let outcome = started
-        .runner
-        .wait_for_exit(Duration::from_secs(15 * 60))
-        .await
-        .map_err(|e| failed(ErrorCode::MsiWait, format!("wait for msiexec: {e}")))?;
+    // 15-min budget covers slow corporate disks + Defender scans. #3609: on a
+    // limited wizard's background-service install the step says the installer
+    // ran on its channel, and stays to write the machine enrollment (step 7).
+    let (outcome, step_link) =
+        package_step::wait_for_install(&mut started, Duration::from_secs(15 * 60))
+            .await
+            .map_err(|e| failed(ErrorCode::MsiWait, format!("wait for msiexec: {e}")))?;
     drop(checked);
     let code = msi_exit_code(&outcome);
     // The elevated step's own verdict: no installer ran, so there is no outcome
     // of one to report.
     if let Some(refusal) = package_step::Refusal::from_step_exit(code) {
         return Err(refusal.fail());
+    }
+    // #3609 — the installer ran, and the step could not write the machine
+    // enrollment: nothing was enrolled yet.
+    if let Some(words) = package_step::not_written(code) {
+        return Err(failed(ErrorCode::ConfigWrite, words.to_string()));
     }
     if package_step::keeps_log(code) {
         staging.keep_log_of(&staged);
@@ -595,26 +604,30 @@ async fn run_install_inner(
         roomlerd::config::default_config_path()
             .map_err(|e| failed(ErrorCode::ConfigWrite, format!("resolve config path: {e}")))?
     };
-    // rc.52: for the SystemContext flavour, lock down
-    // %PROGRAMDATA%\roomler\ with an inheritable SYSTEM+Administrators
-    // DACL BEFORE the config (carrying the Agent JWT) is written —
-    // %PROGRAMDATA% is world-readable by default. The orchestrator
-    // runs inside the wizard's already-elevated context so `icacls`
-    // has the rights. Best-effort: a failure is logged + surfaced but
-    // doesn't abort the install (the config still lands; the operator
-    // can re-tighten). See harden_machine_global_dir.
+    // #3609 — who writes it. The background-service role's config is the
+    // machine's, which an administrator's process writes and nothing else: this
+    // one when it is elevated, otherwise the step that ran the installer, which
+    // stayed for it (`machine_write`). Every other role writes the person's own
+    // config here.
+    let mut writer = crate::machine_write::ConfigWriter::new(
+        step_link,
+        &config_path,
+        is_system_context,
+        elevated_here(),
+    )
+    .map_err(crate::machine_write::Failure::fail)?;
+    // rc.52: for the SystemContext flavour, lock down %PROGRAMDATA%\roomler\
+    // with an inheritable SYSTEM+Administrators DACL before the config is
+    // written, here when this process writes it (the step does the same before
+    // it reads the config). #3609: the parent is taken for Administrators by
+    // handle first, so the seal, which names it by path, finds a plain folder
+    // that is Administrators' (a person's daemon may have made it).
+    // Best-effort: a failure is said, and the install goes on.
     #[cfg(target_os = "windows")]
-    if is_system_context && let Err(e) = harden_machine_global_dir(&config_path) {
-        emit(
-            on_event,
-            ProgressEvent::PreflightWarning {
-                message: format!(
-                    "could not restrict permissions on the machine-global \
-                     config directory ({e}); the daemon's token file may be \
-                     readable by non-admin users until corrected"
-                ),
-            },
-        );
+    if is_system_context && writer.is_local() {
+        for message in crate::machine_write::seal_parent(&config_path) {
+            emit(on_event, ProgressEvent::PreflightWarning { message });
+        }
     }
     // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
     // scope its role installs (`Role::install_scope`). A daemon role always
@@ -629,7 +642,7 @@ async fn run_install_inner(
     );
     install.run = diag.run_id();
     // #2338 — a config already at the path is the base: the fresh identity
-    // is folded into it (`crate::enroll_step`), as `roomlerd enroll` does,
+    // is folded into it (`machine_write::write`), as `roomlerd enroll` does,
     // so a reinstall keeps the mesh, the routes and every other
     // operator-owned key. FR-99 decision 3's `lock_on_end = auto` and the
     // flavour's overlay default (FR-84 S2) apply to a FRESH config only; the
@@ -638,93 +651,56 @@ async fn run_install_inner(
     // recovered from its last good copy when it can be, and kept aside —
     // never read as absent and silently written over.
     //
-    // #3116 — a config this process may not read, or a path it may not write,
-    // stops the install HERE: the enroll below spends the token, and the save
-    // after it would fail. Before this a limited wizard enrolled, then failed
-    // on "creating parent dir", and first read the access-denied as a damaged
-    // config whose settings were lost.
+    // #3116 — a config the writer may not read, or a path it may not write,
+    // stops the install HERE (`writer.prepare`): the enroll below spends the
+    // token, and the save after it would fail. Before this a limited wizard
+    // enrolled, then failed on "creating parent dir", and first read the
+    // access-denied as a damaged config whose settings were lost.
     //
     // #3116 — and on a perMachine reinstall the config is read only once the
     // daemon the MSI restarted onto it answers on its LocalAPI, which it serves
     // after its startup writes. Up to 0.4.187 one of those wrote the copy it
     // had loaded back over this wizard's, a second after it.
     let settled = settle_daemon(wfx, &config_path).await;
-    let existing = crate::enroll_step::read_existing(&config_path).map_err(|said| {
-        failed(
-            ErrorCode::ConfigWrite,
-            format!("{said} {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}"),
-        )
-    })?;
-    if let Err(e) = roomlerd::config::probe_writable(&config_path) {
-        return Err(failed(
-            ErrorCode::ConfigWrite,
-            config_unwritable(&config_path, &e),
-        ));
-    }
-    if let Some(message) = existing.warning {
+    let prepared = writer
+        .prepare()
+        .await
+        .map_err(crate::machine_write::Failure::fail)?;
+    for message in prepared.warnings {
         emit(on_event, ProgressEvent::PreflightWarning { message });
     }
     // #3116 — a config was already here: a reinstall, whose MSI restarted the
     // service onto it before the write below (step 7a).
-    let had_config = existing.cfg.is_some();
-    let crate::enroll_step::Enrolled {
-        mut cfg,
-        outcome,
-        previous_row,
-    } = crate::enroll_step::enroll_folded(
-        &config_path,
-        existing.cfg,
-        &server,
-        &token,
-        &device_name,
-        install,
-    )
-    .await
-    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
-    // F3: the machine id was read back from the config, so the server reuses
-    // the row — unless it no longer can; then the old key is retired and said.
-    if let Some(row) = &previous_row {
-        emit(
-            on_event,
-            ProgressEvent::PreflightWarning {
-                message: roomlerd::enrollment::describe_previous_row(row, &cfg.agent_id),
-            },
-        );
-    }
-    let note = crate::enroll_step::finish(
-        &mut cfg,
-        &outcome,
-        is_system_context,
-        &advanced,
-        overlay_enabled_default(None, wfx),
-    )
-    .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
-    if let Some(message) = note {
+    let had_config = prepared.had_config;
+    // The existing config's machine id, so the server reuses its row; else the
+    // one derived from the path, as `roomlerd enroll` does.
+    let machine_id = match prepared.machine_id {
+        Some(id) => {
+            tracing::info!(machine_id = %id, "existing config found — reusing its machine fingerprint");
+            id
+        }
+        None => roomlerd::machine::derive_machine_id(&config_path),
+    };
+    let issued =
+        crate::enroll_step::enroll_issued(&machine_id, &server, &token, &device_name, install)
+            .await
+            .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    // The fold, a fresh install's defaults and the boxes, the machine folder
+    // taken for Administrators on the background-service role, and the save:
+    // here, or in the step.
+    let crate::machine_write::Written {
+        agent_id,
+        tenant_id,
+        added_org,
+        warnings,
+    } = writer
+        .write(issued, &advanced, wfx)
+        .await
+        .map_err(crate::machine_write::Failure::fail)?;
+    drop(writer);
+    for message in warnings {
         emit(on_event, ProgressEvent::PreflightWarning { message });
     }
-    // The device this install enrolled: on an org added beside the primary,
-    // that org's row, never the primary's (the config's top-level ids).
-    let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
-    let added_org = roomlerd::enrollment::is_added_org(&outcome);
-    // #3609 — this elevated save takes the machine folder for Administrators
-    // first, the owner and nothing else, so the save's own repair seals it:
-    // the repair never takes over a folder another account made (a person's
-    // daemon stages received files below it). Best-effort, said if it fails.
-    #[cfg(target_os = "windows")]
-    if is_system_context && let Err(e) = roomlerd::config::take_machine_folder(&config_path) {
-        emit(
-            on_event,
-            ProgressEvent::PreflightWarning {
-                message: format!(
-                    "could not take the machine-global config folder for Administrators ({e}); \
-                     until it belongs to Administrators the service may not run this \
-                     enrollment as SYSTEM"
-                ),
-            },
-        );
-    }
-    roomlerd::config::save(&config_path, &cfg)
-        .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}")))?;
     let written_at_ms = unix_now_ms();
     emit(
         on_event,
@@ -1289,11 +1265,12 @@ async fn confirm_fresh_service(_config_path: &std::path::Path, _on_event: &Chann
 }
 
 /// #3116 — what to do about an install that needs an elevated wizard.
-const RUN_AS_ADMINISTRATOR: &str =
+pub(crate) const RUN_AS_ADMINISTRATOR: &str =
     "Close Roomler Setup, then right-click it and choose Run as administrator.";
 
 /// #3116 — said by every refusal that comes before the enroll.
-const NOTHING_SPENT: &str = "Nothing was enrolled, and the enrollment token is still unused.";
+pub(crate) const NOTHING_SPENT: &str =
+    "Nothing was enrolled, and the enrollment token is still unused.";
 
 /// #3116 — the SystemContext preflight's refusal.
 pub(crate) fn needs_elevation() -> String {
@@ -1305,12 +1282,12 @@ pub(crate) fn needs_elevation() -> String {
 }
 
 /// #3116 — must a SystemContext install run from an elevated wizard on this
-/// machine? Only when the wizard could not write the machine-global config.
-/// An elevated wizard always can. A limited one can on a machine where the
-/// folder was never hardened: on a fresh install the MSI makes it, the wizard
-/// writes into it (its own `icacls` fails, and says so), and the daemon
-/// hardens it after its first healthy run. Once hardened (#3073), which is
-/// what a reinstall finds, only SYSTEM and Administrators may open it.
+/// machine? Only when the wizard could not read the config it folds into. An
+/// elevated wizard always can. A limited one can on a fresh machine, where
+/// there is none: the step that runs the MSI behind the one prompt then writes
+/// the machine enrollment too (#3609, `machine_write`), owned by
+/// Administrators. Once a machine config is there (#3073), which is what a
+/// reinstall finds, only SYSTEM and Administrators may open it.
 pub(crate) fn system_context_needs_elevation() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -1350,7 +1327,7 @@ fn config_open_to_this_process(path: &std::path::Path) -> bool {
 }
 
 /// #3116 — the refusal for a config path the write probe could not write.
-fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
+pub(crate) fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         format!(
             "{} may not be written by this process ({e}). {RUN_AS_ADMINISTRATOR} {NOTHING_SPENT}",
@@ -1368,6 +1345,19 @@ fn config_unwritable(path: &std::path::Path, e: &std::io::Error) -> String {
 #[cfg(target_os = "windows")]
 fn wizard_is_elevated() -> bool {
     roomlerd::win_identity::process_is_elevated()
+}
+
+/// [`wizard_is_elevated`] wherever the wizard runs: off Windows there is no
+/// administrator's step, and no role whose config is the machine's.
+fn elevated_here() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        wizard_is_elevated()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
 /// Wall-clock milliseconds, the unit a daemon reports its start in.
@@ -1672,7 +1662,10 @@ pub fn force_kill_msi() -> Result<(), String> {
 /// is left UNTOUCHED there — the agent's own default (off) — rather than
 /// written as a promise the daemon cannot keep. An explicit choice always
 /// wins: the box the operator saw is the box that lands in config.toml.
-fn overlay_enabled_default(explicit: Option<bool>, flavour: WindowsInstallFlavour) -> Option<bool> {
+pub(crate) fn overlay_enabled_default(
+    explicit: Option<bool>,
+    flavour: WindowsInstallFlavour,
+) -> Option<bool> {
     explicit.or(match flavour {
         WindowsInstallFlavour::PerMachine => Some(true),
         WindowsInstallFlavour::PerUser => None,
@@ -1716,7 +1709,7 @@ fn flavour_parts(role: Role) -> Result<(WindowsInstallFlavour, bool), String> {
 /// fail there. `*S-1-5-18` = LocalSystem, `*S-1-5-32-544` =
 /// Administrators.
 #[cfg(target_os = "windows")]
-fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
+pub(crate) fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String> {
     let roomler_dir = config_path
         .parent() // …\roomler\<segment>
         .and_then(|p| p.parent()) // …\roomler
@@ -1728,6 +1721,15 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
         })?;
     std::fs::create_dir_all(roomler_dir)
         .map_err(|e| format!("create {}: {e}", roomler_dir.display()))?;
+    // #3609 — `icacls` names the folder by path, and would follow a junction
+    // or a symbolic link there to whatever it leads to: such a parent is left
+    // for the service's check to refuse.
+    if is_a_link(roomler_dir) {
+        return Err(format!(
+            "{} is a link (a junction or a symbolic link), not a plain folder",
+            roomler_dir.display()
+        ));
+    }
     // #3073 — the owner first. Only the owner keeps WRITE_DAC once
     // `/inheritance:r` has removed every ACE, so a directory someone else
     // owns (the daemon hardening it later runs as SYSTEM) must belong to
@@ -1770,6 +1772,17 @@ fn harden_machine_global_dir(config_path: &std::path::Path) -> Result<(), String
         ));
     }
     Ok(())
+}
+
+/// Is `path` itself a reparse point (a junction, a symbolic link)? Read without
+/// following it. One that cannot be read is not called a link: what follows
+/// fails on it by itself.
+#[cfg(target_os = "windows")]
+fn is_a_link(path: &std::path::Path) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_attributes() & REPARSE_POINT != 0)
 }
 
 /// Projection of [`roomlerd::win_service::system_context_attempt::Attempt`]

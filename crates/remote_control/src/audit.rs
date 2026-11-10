@@ -24,9 +24,19 @@ use crate::models::{AuditKind, EndReason, RemoteAuditEvent, RemoteSession, Sessi
 
 const AUDIT_BUFFER: usize = 4096;
 
+/// One event on its way to the flusher, and whether its session row is
+/// projected from it.
+struct Queued {
+    ev: RemoteAuditEvent,
+    /// FR-138 — `false` for an event whose row its writer already wrote
+    /// itself ([`AuditSink::record_trail`]): the audit keeps the event, and
+    /// the row is left as the writer left it.
+    project: bool,
+}
+
 #[derive(Clone)]
 pub struct AuditSink {
-    tx: mpsc::Sender<RemoteAuditEvent>,
+    tx: mpsc::Sender<Queued>,
 }
 
 impl AuditSink {
@@ -34,7 +44,7 @@ impl AuditSink {
     pub fn spawn(db: Database) -> (Self, tokio::task::JoinHandle<()>) {
         let coll: Collection<RemoteAuditEvent> = db.collection(RemoteAuditEvent::COLLECTION);
         let sessions: Collection<RemoteSession> = db.collection(RemoteSession::COLLECTION);
-        let (tx, mut rx) = mpsc::channel::<RemoteAuditEvent>(AUDIT_BUFFER);
+        let (tx, mut rx) = mpsc::channel::<Queued>(AUDIT_BUFFER);
 
         let handle = tokio::spawn(async move {
             // Batch up to 64 events or 200ms, whichever first.
@@ -79,6 +89,32 @@ impl AuditSink {
         tenant_id: ObjectId,
         event: AuditKind,
     ) {
+        self.queue(session_id, agent_id, tenant_id, event, true);
+    }
+
+    /// FR-138 — [`Self::record`] for an event whose session row its writer
+    /// already wrote, with a condition the projection does not know: the end
+    /// of a session no hub holds, written straight to the row so that the
+    /// write lands before the control event that follows it. The audit keeps
+    /// the event; the row is not projected from it.
+    pub fn record_trail(
+        &self,
+        session_id: ObjectId,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        event: AuditKind,
+    ) {
+        self.queue(session_id, agent_id, tenant_id, event, false);
+    }
+
+    fn queue(
+        &self,
+        session_id: ObjectId,
+        agent_id: ObjectId,
+        tenant_id: ObjectId,
+        event: AuditKind,
+        project: bool,
+    ) {
         let ev = RemoteAuditEvent {
             id: None,
             session_id,
@@ -87,7 +123,7 @@ impl AuditSink {
             at: DateTime::now(),
             event,
         };
-        if let Err(e) = self.tx.try_send(ev) {
+        if let Err(e) = self.tx.try_send(Queued { ev, project }) {
             warn!("audit channel full, dropping event: {e}");
         }
     }
@@ -96,16 +132,16 @@ impl AuditSink {
 async fn flush(
     coll: &Collection<RemoteAuditEvent>,
     sessions: &Collection<RemoteSession>,
-    buf: &mut Vec<RemoteAuditEvent>,
+    buf: &mut Vec<Queued>,
 ) {
     // Project session mutations BEFORE draining the buffer into the audit
     // insert. Session events are low-rate (a handful per minute at fleet
     // scale), so per-event updates are fine; every write is best-effort —
     // the projection is a VIEW of the audit truth, never a gate on it.
-    for ev in buf.iter() {
-        project_session(sessions, ev).await;
+    for q in buf.iter().filter(|q| q.project) {
+        project_session(sessions, &q.ev).await;
     }
-    if let Err(e) = coll.insert_many(buf.drain(..)).await {
+    if let Err(e) = coll.insert_many(buf.drain(..).map(|q| q.ev)).await {
         error!("audit insert_many failed: {e}");
     }
 }

@@ -271,6 +271,14 @@ mod rc_request_ceiling_tests;
 /// the registration read's inferred ends, and off is today.
 #[cfg(test)]
 mod rc_resume_claim_tests;
+/// FR-138 P1b-2 — the viewer's half of the server's resume: the hold through
+/// the viewer's own socket loss, the rejoin on either pod with the gate run
+/// again, the slot a held session never costs its own viewer (`replaces`
+/// and the same-person orphan rule), the ends written to the row while no
+/// pod holds the session, a device's own end after its hello, and off is
+/// today.
+#[cfg(test)]
+mod rc_resume_rejoin_tests;
 /// FR-138 P1a — the session-resume wire, row and scope, all inert: the scope
 /// is a platform admin's, an audit listing reads the new kinds and an unknown
 /// one, and at the window's default of 0 the new wire changes nothing.

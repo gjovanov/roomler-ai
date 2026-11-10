@@ -3352,8 +3352,16 @@ mod secondary_org_tests {
         .unwrap_or(false)
     }
 
-    #[tokio::test]
-    async fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
+    #[test]
+    fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
+        // #3548 — the loop runs inside the probe's fixture, which puts its first
+        // answer in: no lib test runs the real probe, and no probe test runs
+        // beside a loop.
+        let probe = crate::encode::caps::loop_fixture();
+        probe.block_on(a_secondary_orgs_session_reaches_one_row());
+    }
+
+    async fn a_secondary_orgs_session_reaches_one_row() {
         for one_row in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let host = DelegateHost::new();
@@ -3442,5 +3450,10 @@ mod secondary_org_tests {
             let _ = stop.send(true);
             let _ = tokio::time::timeout(PATIENCE, task).await;
         }
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 }

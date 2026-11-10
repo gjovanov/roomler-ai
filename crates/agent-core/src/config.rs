@@ -4077,6 +4077,22 @@ fn merge_unknown_keys(
     Ok((merged, lost))
 }
 
+/// #3609 — `file`'s text, when it is a plain file that SYSTEM and
+/// Administrators alone may change (`machine_tree::read_checked`, through the
+/// handle it was checked on); `None` otherwise, or when it is not there.
+fn private_text(file: &std::path::Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let bytes = crate::machine_tree::read_checked(file, 1 << 20).ok()??;
+        String::from_utf8(bytes).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        None
+    }
+}
+
 /// #2078 — the text [`save`] writes over `path`: `cfg`, plus every key `base`
 /// holds that this build does not model. `base` is the file being replaced:
 /// `path` itself, or on [`load`]'s recovery the `.prev` copy it loaded, since
@@ -4091,14 +4107,25 @@ fn merge_unknown_keys(
 /// A base with no such key is written exactly as before, byte for byte, and
 /// any failure to keep them saves `cfg` alone and says so: the worst case is
 /// the old behaviour. Comments are still lost; that needs an in-place editor.
+///
+/// #3609 — at the machine location (`machine`) a key is kept only from a file
+/// that SYSTEM and Administrators alone may change (`machine_tree::read_checked`,
+/// after the save's own repair): what any other account could have put in a
+/// file there never reaches the machine config, as the fold refuses such a
+/// config ([`read_merge_base`]).
 fn serialise_for(
     path: &std::path::Path,
     base: &std::path::Path,
     cfg: &AgentConfig,
+    machine: bool,
 ) -> Result<String> {
     let plain = toml::to_string_pretty(cfg).context("serialising config")?;
     let read = |file: &std::path::Path| {
-        let raw = std::fs::read_to_string(file).ok()?;
+        let raw = if machine {
+            private_text(file)?
+        } else {
+            std::fs::read_to_string(file).ok()?
+        };
         let unknown = unknown_keys(&raw)?;
         Some((raw, unknown))
     };
@@ -4117,9 +4144,9 @@ fn serialise_for(
         tracing::warn!(
             path = %path.display(),
             base = %base.display(),
-            "the config being replaced does not read as a config, and neither does its last \
-             good copy: keys this build does not know in them, if any, are NOT kept through \
-             this save"
+            "the config being replaced does not read as a config (at the machine location: or \
+             is not private to the computer's administrators), and neither does its last good \
+             copy: keys this build does not know in them, if any, are NOT kept through this save"
         );
         return Ok(plain);
     };
@@ -4335,7 +4362,10 @@ fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> 
     {
         crate::machine_tree::log_repairs(&crate::machine_tree::repair(tree, true));
     }
-    let serialised = serialise_for(path, base, cfg)?;
+    #[cfg(windows)]
+    let serialised = serialise_for(path, base, cfg, machine.is_some())?;
+    #[cfg(not(windows))]
+    let serialised = serialise_for(path, base, cfg, false)?;
 
     // ATOMIC (P6 hardening): write a sibling temp file, then rename over
     // the target. The file holds `agent_token` — a torn `fs::write`
@@ -4444,11 +4474,13 @@ fn machine_tree_of(path: &std::path::Path) -> Option<crate::machine_tree::Machin
 /// #3609 — what an elevated save of the machine config (Setup's machine write,
 /// `roomlerd enroll --machine-global`) runs right before it [`save`]s at
 /// `path`: the machine folder is made if it is not there yet, as the save
-/// would make it, and taken for Administrators, its owner and nothing else
-/// (`machine_tree::adopt_machine_folder`), so that the save's own repair seals
-/// it. Never the daemon's: its saves and repairs take nothing over.
-/// `Ok(true)` when it was taken; `Ok(false)` at any other path, when there was
-/// nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+/// would make it, and it and its parent, `%ProgramData%\roomler`, are taken for
+/// Administrators (`machine_tree::adopt_machine_parent`, `::adopt_machine_folder`),
+/// so that the save's own repair seals the folder and the check takes the
+/// parent. A person's daemon may have made both to stage a received file before
+/// the service ever ran. Never the daemon's: its saves and repairs take nothing
+/// over. `Ok(true)` when either was taken; `Ok(false)` at any other path, when
+/// there was nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
     let Some(tree) = machine_tree_of(path) else {
@@ -4459,7 +4491,30 @@ pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, 
     }
     std::fs::create_dir_all(tree.folder())
         .map_err(|e| format!("creating {}: {e}", tree.folder().display()))?;
-    crate::machine_tree::adopt_machine_folder(&tree)
+    let parent = crate::machine_tree::adopt_machine_parent(&tree);
+    let folder = crate::machine_tree::adopt_machine_folder(&tree);
+    match (parent, folder) {
+        (Ok(parent), Ok(folder)) => Ok(parent || folder),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+        (Err(parent), Err(folder)) => Err(format!("{parent}; {folder}")),
+    }
+}
+
+/// #3609 — the parent alone, `%ProgramData%\roomler`, for the machine config at
+/// `path` (`machine_tree::adopt_machine_parent`): what Setup's machine write runs
+/// before it seals the parent, so that the seal, which names it by path, finds a
+/// plain folder that belongs to Administrators. An `Err` for a parent that is
+/// not a plain folder. `Ok(false)` at any other path, when there was nothing to
+/// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+#[cfg(windows)]
+pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, String> {
+    let Some(tree) = machine_tree_of(path) else {
+        return Ok(false);
+    };
+    if !crate::machine_tree::Switches::from_env().repair {
+        return Ok(false);
+    }
+    crate::machine_tree::adopt_machine_parent(&tree)
 }
 
 /// #3609 — keep the outgoing config at `path` as its `.prev`, through a new
@@ -6865,6 +6920,34 @@ tenant_id = "tid2"
 
         fn other_account() -> String {
             local_guest().unwrap_or_else(|| USERS.to_string())
+        }
+
+        /// What a save keeps of the file it replaces at the machine location,
+        /// the keys this build does not know, it keeps only from a file that
+        /// SYSTEM and Administrators alone may change: from one another account
+        /// owns, nothing. Elsewhere nothing changes.
+        #[test]
+        fn a_machine_save_keeps_no_key_from_a_file_another_account_owns() {
+            if !elevated_or_skip("the keys a machine save keeps") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            let path = tree.config();
+            std::fs::write(&path, format!("{}future_switch = true\n", minimal_toml())).unwrap();
+            crate::machine_tree::repair(&tree, false);
+            let cfg = try_load(&path).unwrap();
+            let kept = serialise_for(&path, &path, &cfg, true).unwrap();
+            assert!(kept.contains("future_switch"), "a private file's: {kept}");
+
+            assert!(icacls(
+                &path,
+                &["/setowner", &format!("*{}", other_account())]
+            ));
+            let dropped = serialise_for(&path, &path, &cfg, true).unwrap();
+            assert!(!dropped.contains("future_switch"), "{dropped}");
+            let elsewhere = serialise_for(&path, &path, &cfg, false).unwrap();
+            assert!(elsewhere.contains("future_switch"), "{elsewhere}");
         }
 
         /// A config another account owns is never folded into: what it
