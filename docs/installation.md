@@ -134,7 +134,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3818`, `crates/agent-core/src/config.rs:4277`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3891`, `crates/agent-core/src/config.rs:4277`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:664`, `:990`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -666,11 +666,13 @@ Details worth knowing:
   they write and give it its owner and permissions before it takes its name,
   never writing into a file of that name that was there. Each change the
   repair makes is a `machine tree: repaired` WARN line, which the default
-  filter keeps; on an upgrade the first repair is the installer's
-  (`keep-system-context`), which logs into
-  `service-logs\roomlerd-installer.log` beside the service's own log
-  (`crates/agent-core/src/logging.rs:100`). Read the logs with
-  `roomler logs` or an elevated shell rather than through Explorer's prompt.
+  filter keeps; on an upgrade the first repair is made by one of the
+  per-Machine MSI's own steps, which log into
+  `service-logs\roomlerd-installer.log` beside the service's own log once
+  their build has #3230
+  ([where those steps log](#where-the-per-machine-msis-own-steps-log-3230-3640)).
+  Read the logs with `roomler logs` (`--source installer` for that one) or
+  an elevated shell rather than through Explorer's prompt.
   `ROOMLERD_MACHINE_TREE_REPAIR=0` in the service's `Environment` stops the
   repair, and `ROOMLERD_MACHINE_TREE_CHECK=0` makes the check log only. The
   fixes per log line are step 3 of
@@ -1053,7 +1055,7 @@ both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6050`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6137`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1122,7 +1124,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:5922`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6004`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1159,23 +1161,112 @@ conhost left at Normal, the exit-DNS purge's 10 s bound logged its warning 40.1 
 
 | What the worker writes | Since #3438 | Why |
 |---|---|---|
-| tracing | The rolling log only (`crates/agent-core/src/logging.rs:229`) | The file has every line, and a console write waits for its conhost |
+| tracing | The rolling log only (`crates/agent-core/src/logging.rs:255`) | The file has every line, and a console write waits for its conhost |
 | stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:245`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
 | stdout, other than tracing | The console, as before | Only tracing's lines were measured waiting there |
 
-The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:270`):
+The rule asks two things (`console_nobody_reads`, `crates/agent-core/src/logging.rs:296`):
 the process logs for a service role, and its stdout is a console that has no window. A
-verb a person runs, in a terminal or over `roomler ssh`, has no service role and keeps its
-console lines. The service host and netd have no console as their stdio, so they are
+verb a person runs, in a terminal or over `roomler ssh`, keeps its console lines when it has
+no service role. The per-Machine MSI's own steps have one, the installer role
+([below](#where-the-per-machine-msis-own-steps-log-3230-3640)); run in a terminal they keep
+their console lines too, since a terminal's console has a window. The service host and netd have no console as their stdio, so they are
 unchanged. With no usable log directory the console keeps its lines, since no file holds
 them. The worker says so once at its start: `logging: this console has no window, so
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:1817`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:2192`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
+
+### Where the per-Machine MSI's own steps log (#3230, #3640)
+
+```mermaid
+flowchart LR
+    M["msiexec<br/>the per-Machine MSI"] -->|"deferred custom action<br/>Impersonate='no'"| V["roomlerd, one verb<br/>as LocalSystem"]
+    V -->|"tracing: its start, its lines,<br/>its answers, its end"| L[("roomlerd-installer.log.YYYY-MM-DD<br/>in service-logs")]
+    V -.->|"stdout and stderr"| X["thrown away<br/>by Windows Installer"]
+```
+
+Each step of its own that the per-Machine MSI runs is a deferred custom action with
+`Impersonate='no'`: one `roomlerd` verb, run as LocalSystem. Windows Installer throws away
+what such a process prints on stdout and stderr, and `msiexec /l*v` records only its return
+code. Until #3230 a step logged into LocalSystem's own profile, where nobody reads, and its
+answer and its error reached no file. Each step now logs into
+`%PROGRAMDATA%\Roomler\roomler\service-logs\roomlerd-installer.log`, beside the service's
+own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:120`):
+
+| Custom action | The verb | When it runs |
+|---|---|---|
+| `RegisterService` (`agents/roomlerd/wix-perMachine/main.wxs:361`, sequenced at `:591`) | `service install --as-service` | every install, repair and upgrade, first after `InstallFiles` |
+| `CleanupLegacyPerUser` (`agents/roomlerd/wix-perMachine/main.wxs:402`, `:607`) | `cleanup-legacy-install --target-flavour perMachine` | right after `RegisterService`: both are `After='InstallFiles'`, and WiX breaks the tie in document order |
+| `EnableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:445`, `:630`), and its rollback partner `RollbackSystemContext` (`:463`) | `enable-system-context`; the rollback runs `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=1`, which the updater passes while SystemContext is on |
+| `DisableSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:482`, `:633`) | `disable-system-context` | `ENABLE_SYSTEM_CONTEXT=0` |
+| `KeepSystemContext` (`agents/roomlerd/wix-perMachine/main.wxs:506`, `:636`) | `keep-system-context` | no `ENABLE_SYSTEM_CONTEXT`, as in a hand-run install or upgrade |
+| `UnregisterService` (`agents/roomlerd/wix-perMachine/main.wxs:379`, `:639`) | `service uninstall --as-service` | `REMOVE="ALL"`, before `RemoveFiles`: an uninstall, and in an upgrade the old product's removal, which runs the OLD product's binary. Its lines are here only when the old build has #3230 too |
+
+`resolve_config_path` repairs the machine tree for every SYSTEM command
+(`agents/roomlerd/src/app.rs:1142`), so on an upgrade the first `machine tree: repaired` line
+comes from the first of these steps to run: the old product's `service uninstall --as-service`,
+then `RegisterService`'s. It is in this log once that step's build has #3230.
+
+What a step writes, in order. Its own lines have the target `roomler_node_core::logging::step`
+(`crates/agent-core/src/logging.rs:560`), which the filter keeps at INFO under any `RUST_LOG`:
+
+| Line | Fields | Written by |
+|---|---|---|
+| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:582`), right after `logging::init` (`agents/roomlerd/src/app.rs:1569`) |
+| everything the verb logs | as the verb logs it | the verb |
+| each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:600`): on stdout as before, and inside a step in the log |
+| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:619`), from `main` (`agents/roomlerd/src/app.rs:1375`) |
+| `installer step failed: roomlerd <verb and arguments>`, ERROR | `exit_code`, `elapsed_ms`, `error` (the whole cause chain) | the same |
+
+`end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:651`). It drops the
+file writer's guard, which writes every queued line before the process exits. The guard lives
+in a static, and no exit drops a static: without the flush, one run in six of the test below
+lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2233`).
+
+One function decides which commands take the installer role: `is_installer_step`
+(`agents/roomlerd/src/app.rs:1404`). It gives the role to `service install` and
+`service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
+and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
+(`agents/roomlerd/src/app.rs:7744`) reads every custom action with an `ExeCommand` in both WiX
+files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
+installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
+
+The per-user MSI does not change. Its actions run as the person (`Impersonate='yes'`), who
+cannot write the service log folder, and none of its verbs takes the role: its `service install`
+has no `--as-service`, and its cleanup is `--target-flavour perUser`
+(`agents/roomlerd/wix/main.wxs:505`), which keeps the person's profile log (#3640).
+
+Run by hand in a terminal, a step shows what it always showed: its answer once, and the
+verb's lines. The start and end lines go to the file only (`crates/agent-core/src/logging.rs:252`),
+and with no log folder it can write, the console keeps them too. One line moved:
+`service uninstall --as-service` logs `Companion login start removed.` rather than printing it
+(`agents/roomlerd/src/app.rs:5917`), and its answer stays `Service deregistered`.
+
+Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
+([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
+and `basename` (`crates/agent-core/src/logging.rs:108`, `:115`), and the appender, the prune
+(`rolling_basenames`, `crates/agent-core/src/logging.rs:1033`) and the `--source` reader
+(`newest_service_log`, `crates/agent-core/src/logging.rs:960`) all read it, so netd's dated
+files age out too. Two transports do not return this log yet, and each needs a wire change:
+the RC data channel's `logs:fetch` reads only the serving process's own `roomlerd.log*`
+(`agents/roomlerd/src/logs_fetch.rs:52`), and an installer step starts no log upload (a
+follow-up of #3230).
+
+`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1699`) pins the folder and
+the names, the prune and the source. It runs a failing step in a child with stdout on `NUL`,
+as under msiexec, and finds its start line, all 20,000 of its lines, its answer and its whole
+error chain in the file (`crates/agent-core/src/logging.rs:1855`); run with a console, the same
+step shows what it always showed (`crates/agent-core/src/logging.rs:1885`). The Windows lane
+runs it beside `stderr_capture` (`.github/workflows/ci.yml:1636`). In `roomlerd`,
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7790`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7823`)
+pin the role per command and the end line of a failure.
 
 ## Linux
 
@@ -2101,7 +2192,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3530`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3603`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -2348,7 +2439,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2123`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2195`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 
