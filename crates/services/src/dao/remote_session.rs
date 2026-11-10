@@ -337,6 +337,7 @@ impl RemoteSessionDao {
             })
             .sort(doc! { "created_at": 1 })
             .limit(limit)
+            .max_time(READ_BUDGET) // P1b-2: indexed and bounded (review L3)
             .await?
             .try_collect()
             .await?;
@@ -480,3 +481,10 @@ impl RemoteSessionDao {
         Ok(res.matched_count == 1)
     }
 }
+
+/// FR-138 P1b-2 (P1b-1's review, L3) — the longest a background read of the
+/// resume waits on the database: an answer that has not come by then is a
+/// failed read, which each caller already handles. The read is indexed
+/// (`{agent_id, phase, created_at}`, the remote module's `index_plan`), so
+/// this only bounds a database in trouble.
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);

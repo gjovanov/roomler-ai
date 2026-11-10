@@ -417,6 +417,7 @@ impl Hub {
                 // may for the window announced to the connection that
                 // claimed it; past that, it ends.
                 live.resume_secs = Some(r.resume_secs);
+                live.held_until = Some(super::hold::due_in(r.resume_secs));
                 self.inner
                     .sessions
                     .insert(r.session_id, Arc::new(Mutex::new(live)));

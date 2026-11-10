@@ -284,6 +284,17 @@ impl Module for RemoteState {
                 pre_ops: Vec::new(),
                 indexes: vec![index(bson::doc! { "tenant_id": 1, "created_at": -1 })],
             },
+            // FR-138 P1b-2 (P1b-1's review, L3) — the registration read: a
+            // device's live rows, oldest first, at each registration of a device
+            // announced a window. Without it the read walked the device's whole
+            // history, for every device of a roll.
+            IndexSet {
+                collection: "remote_sessions",
+                pre_ops: Vec::new(),
+                indexes: vec![index(
+                    bson::doc! { "agent_id": 1, "phase": 1, "created_at": 1 },
+                )],
+            },
             // FR-85 P3 — remote-recording activity the devices report (a
             // claim, beside `remote_audit`'s decision) — 90-day retention,
             // like the audit it is read with.

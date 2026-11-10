@@ -31,6 +31,7 @@
 
 use std::time::Duration;
 
+use bson::DateTime;
 use bson::oid::ObjectId;
 use roomler_ai_remote_control::error::{Error, Result};
 use roomler_ai_remote_control::models::{EndReason, SessionPhase};
@@ -46,6 +47,15 @@ use super::{EndWrite, Hub, ptr_eq};
 /// live, and it is not external (D3).
 pub(super) fn held_for_viewer(s: &LiveSession) -> bool {
     s.resume_secs.is_some() && s.phase == SessionPhase::Active && !s.external
+}
+
+/// When a hold that starts now ends: `window_secs` from now.
+pub(super) fn due_in(window_secs: u32) -> DateTime {
+    DateTime::from_millis(
+        DateTime::now()
+            .timestamp_millis()
+            .saturating_add(i64::from(window_secs) * 1000),
+    )
 }
 
 /// What became of a session whose viewer's socket went.
@@ -65,6 +75,9 @@ pub struct HeldParties {
     pub agent_id: ObjectId,
     pub tenant_id: ObjectId,
     pub controller_user_id: ObjectId,
+    /// When the hold ends unless the viewer rejoins; `None` for a session
+    /// that was never held.
+    pub held_until: Option<DateTime>,
 }
 
 impl Hub {
@@ -111,6 +124,7 @@ impl Hub {
         };
         s.controller_tx = None;
         s.controller_gen = s.controller_gen.wrapping_add(1);
+        s.held_until = Some(due_in(window));
         let (turn, attach_seq, user) = (s.controller_gen, s.attach_seq, s.controller_user_id);
         drop(s);
         self.arm_viewer_wait(session_id, turn, attach_seq, window);
@@ -165,6 +179,7 @@ impl Hub {
                 agent_id: s.agent_id,
                 tenant_id: s.tenant_id,
                 controller_user_id: s.controller_user_id,
+                held_until: s.held_until,
             }
         })
     }
@@ -203,7 +218,8 @@ impl Hub {
     /// FR-138 — a rejoin the gate refused: the viewer may no longer control
     /// the device. When this hub holds the session for that person it ends
     /// with `reason`, fenced at the number held (both ends told), and `tx`,
-    /// the socket that asked, is told too.
+    /// the socket that asked, is told too: once, when the end already told
+    /// it as the session's controller.
     pub fn refuse_rejoin(
         &self,
         session_id: ObjectId,
@@ -211,20 +227,29 @@ impl Hub {
         tx: &ClientTx,
         reason: EndReason,
     ) {
-        let theirs = self
+        let (theirs, bound) = self
             .inner
             .sessions
             .get(&session_id)
-            .is_some_and(|e| e.value().lock().controller_user_id == user_id);
+            .map(|e| {
+                let s = e.value().lock();
+                (
+                    s.controller_user_id == user_id,
+                    s.controller_tx.as_ref().is_some_and(|t| ptr_eq(t, tx)),
+                )
+            })
+            .unwrap_or((false, false));
         if theirs {
             info!(session = %session_id.to_hex(), %user_id, ?reason, "rc session rejoin refused by the gate — ending it");
             let _ = self.end_own(session_id, reason, None);
         }
-        let _ = tx.try_send(ServerMsg::Terminate {
-            session_id,
-            reason,
-            limit: None,
-        });
+        if !(theirs && bound) {
+            let _ = tx.try_send(ServerMsg::Terminate {
+                session_id,
+                reason,
+                limit: None,
+            });
+        }
     }
 
     /// FR-138 — `replaces` on a redial's `rc:session.request`: the held
@@ -463,10 +488,16 @@ mod tests {
         drain(&mut to_agent);
         drain(&mut to_other);
 
+        assert_eq!(hub.held_parties(held).unwrap().held_until, None);
         hub.unregister_controller(user, &tx);
 
         assert!(hub.session_snapshot(held).is_some(), "the live one is held");
         assert!(controller_of(&hub, held).is_none(), "with no controller");
+        // Until the window from now: what a rejoin the gate could not decide
+        // is told.
+        let until = hub.held_parties(held).unwrap().held_until.unwrap();
+        let left = until.timestamp_millis() - DateTime::now().timestamp_millis();
+        assert!((59_000..=60_000).contains(&left), "{left} ms");
         assert!(
             hub.session_snapshot(pending).is_none(),
             "the pending one ends"
@@ -620,6 +651,27 @@ mod tests {
             terminated(&drain(&mut asking_rx), sid),
             Some(EndReason::AdminTerminated)
         );
+    }
+
+    /// Each rejoin gets one answer: a refused rejoin from the socket the
+    /// session is already bound to is told by the end itself, once.
+    #[tokio::test]
+    async fn a_refused_rejoin_tells_a_bound_socket_once() {
+        let hub = hub().await;
+        let (agent, user) = (ObjectId::new(), ObjectId::new());
+        let _to_agent = device(&hub, agent, 2, Some(60));
+        let (tx, mut rx) = hub.register_controller(user);
+        let sid = ask(&hub, agent, user, &tx).unwrap();
+        live(&hub, sid).await;
+        drain(&mut rx);
+
+        hub.refuse_rejoin(sid, user, &tx, EndReason::AdminTerminated);
+        let told = drain(&mut rx);
+        let ends = told
+            .iter()
+            .filter(|m| matches!(m, ServerMsg::Terminate { session_id, .. } if *session_id == sid))
+            .count();
+        assert_eq!(ends, 1, "{told:?}");
     }
 
     /// The orphan reap spares a held session against another person's

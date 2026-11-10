@@ -4,20 +4,27 @@
 //! for it (`docs/fr/FR-138-the-session-outlives-its-control-socket.md` §4.4,
 //! §4.5), answered on the pod the viewer's new socket reached.
 //!
+//! Each rejoin gets exactly one answer, and it names the session:
+//! `rc:session.resumed`, `rc:session.detached {resume_by}` (ask again, in a
+//! second, until `resume_by`), or `rc:terminate`. Never an `rc:error`: the
+//! page asks again only after a `detached`, so a rejoin left unanswered
+//! would hold it until its own deadline.
+//!
 //! | Where the session is | Answer |
 //! |---|---|
 //! | held by this pod's hub, for this person | the gate a request runs, again; then bound here and `rc:session.resumed`, or ended `admin_terminated` |
 //! | the row names someone else, or nothing | `rc:terminate agent_disconnect`, the same as for no session: nothing leaks |
 //! | the row is ended | `rc:terminate` with the row's own reason |
 //! | the row is live, and the gate refuses | written to the row as `admin_terminated`, and published, as an admin's end; `rc:terminate admin_terminated` |
-//! | the gate cannot be run (a read failed), or the row cannot be read | no answer: the viewer asks again in a second, and nothing is written |
+//! | the gate cannot be run (a read failed) | nothing bound, nothing written: `rc:session.detached` with when the session ends if nobody claims it, so the viewer asks again |
+//! | the row cannot be read | `rc:session.detached` with the window from now: the viewer asks again, and the first answer that reads the row brings its deadline in |
 //! | detached by the device's side, inside `resume_by` | `rc:session.detached` with the row's `resume_by`: ask again |
 //! | detached, past `resume_by` | `rc:terminate agent_disconnect` |
 //! | live in the hub of the pod that holds the device's socket | relayed there (`rc.cmd`), bound there, answered through the relay |
 //! | live, but in no hub yet (the claim is not answered, or a pod died without a word) | `rc:session.detached` with when it would end, or `rc:terminate agent_disconnect` once that has passed |
 //!
 //! With the window at 0 the rejoin is dropped unanswered, as a server before
-//! FR-138 drops it, and the viewer's own deadline falls back to its redial.
+//! FR-138 drops it. No page sends one then: none was told `resume_secs`.
 
 use std::time::Duration;
 
@@ -59,6 +66,24 @@ fn detached(session_id: ObjectId, resume_by: DateTime) -> ServerMsg {
     }
 }
 
+/// `window_secs` after `from`.
+fn after(from: DateTime, window_secs: u32) -> DateTime {
+    DateTime::from_millis(
+        from.timestamp_millis()
+            .saturating_add(i64::from(window_secs).saturating_mul(1000)),
+    )
+}
+
+/// The answer while the session waits for its claim: ask again until `by`,
+/// and once `by` has passed, it is over.
+fn until(session_id: ObjectId, by: DateTime, now: DateTime) -> ServerMsg {
+    if by > now {
+        detached(session_id, by)
+    } else {
+        end(session_id, EndReason::AgentDisconnect)
+    }
+}
+
 /// Answer one `rc:session.rejoin` (the table above).
 pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
     let window =
@@ -78,22 +103,28 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
         .filter(|p| p.controller_user_id == v.user_id)
     {
         match resume_gate(state, v.user_id, p.tenant_id, p.agent_id).await {
-            ResumeGate::Allow { .. } => {
-                if let Err(e) = hub.rejoin(session_id, v.user_id, v.tx) {
-                    debug!(session = %session_id.to_hex(), %e, "rc:session.rejoin: not held any more");
-                    answer(end(session_id, EndReason::AgentDisconnect));
+            ResumeGate::Allow { .. } => match hub.rejoin(session_id, v.user_id, v.tx) {
+                Ok(()) => return,
+                // It ended, or may not be held: the row says how.
+                Err(e) => {
+                    debug!(session = %session_id.to_hex(), %e, "rc:session.rejoin: not held here any more; reading the row");
                 }
-            }
+            },
             ResumeGate::Deny(why) => {
                 info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
                 hub.refuse_rejoin(session_id, v.user_id, v.tx, EndReason::AdminTerminated);
+                return;
             }
-            // Decided nothing: unanswered, and the viewer asks again.
+            // Decided nothing: when the hold ends, and the viewer asks again.
             ResumeGate::Unknown(why) => {
-                warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run");
+                warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run; ask again");
+                let by = p
+                    .held_until
+                    .unwrap_or_else(|| after(DateTime::now(), window));
+                answer(detached(session_id, by));
+                return;
             }
         }
-        return;
     }
 
     // Not held here: the row, which must name this person.
@@ -108,8 +139,8 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
             return;
         }
         Err(e) => {
-            // Unanswered: the viewer asks again in a second.
-            warn!(session = %session_id.to_hex(), %e, "rc:session.rejoin: the row could not be read");
+            warn!(session = %session_id.to_hex(), %e, "rc:session.rejoin: the row could not be read; ask again");
+            answer(detached(session_id, after(DateTime::now(), window)));
             return;
         }
     };
@@ -124,31 +155,29 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
         answer(end(session_id, EndReason::AgentDisconnect));
         return;
     }
-    match resume_gate(state, v.user_id, row.tenant_id, row.agent_id).await {
-        ResumeGate::Allow { .. } => {}
+    let allowed = match resume_gate(state, v.user_id, row.tenant_id, row.agent_id).await {
+        ResumeGate::Allow { .. } => true,
         ResumeGate::Deny(why) => {
             info!(session = %session_id.to_hex(), user = %v.user_id, %why, "rc:session.rejoin: the viewer may no longer control the device");
             crate::row_end::revoked(state, &row).await;
             answer(end(session_id, EndReason::AdminTerminated));
             return;
         }
+        // Nothing is bound below; the deadline is answered, and the viewer
+        // asks again.
         ResumeGate::Unknown(why) => {
-            warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run");
-            return;
+            warn!(session = %session_id.to_hex(), %why, "rc:session.rejoin: the gate could not be run; ask again");
+            false
         }
-    }
-    let now = DateTime::now();
+    };
+    // Detached when the device's socket went, and not claimed yet.
     if let Some(by) = row.resume_by {
-        // Detached when the device's socket went, and not claimed yet.
-        if by > now {
-            answer(detached(session_id, by));
-        } else {
-            answer(end(session_id, EndReason::AgentDisconnect));
-        }
+        answer(until(session_id, by, DateTime::now()));
         return;
     }
     // Live in the hub of the pod that holds the device's socket: bound there.
-    if !hub.is_agent_online(row.agent_id)
+    if allowed
+        && !hub.is_agent_online(row.agent_id)
         && let Some(owner) = foreign_owner(state, row.agent_id).await
         && relay(state, &v, &owner, session_id).await
     {
@@ -156,10 +185,8 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
     }
     // In no hub yet: the device's claim is not answered, or the pod that held
     // it died without a word. The viewer may ask again until it would end.
-    match wait_until(state, &row, window).await {
-        by if by > now => answer(detached(session_id, by)),
-        _ => answer(end(session_id, EndReason::AgentDisconnect)),
-    }
+    let by = wait_until(state, &row, window).await;
+    answer(until(session_id, by, DateTime::now()));
 }
 
 /// The pod that holds the device's socket, when it is another one.
@@ -179,7 +206,8 @@ async fn foreign_owner(state: &RemoteState, agent_id: ObjectId) -> Option<String
 
 /// Relay the rejoin to `owner`, whose hub binds it to a proxy for this
 /// socket and answers through it. `true` when it was bound there. The gate
-/// already ran here, as it does for a relayed request.
+/// already ran here, as it does for a relayed request. Anything else (the
+/// owner's hub does not hold it, or the bus failed) is answered here.
 async fn relay(state: &RemoteState, v: &Viewer<'_>, owner: &str, session_id: ObjectId) -> bool {
     let Ok(frame) = serde_json::to_value(ClientMsg::SessionRejoin { session_id }) else {
         return false;
@@ -223,8 +251,43 @@ async fn wait_until(state: &RemoteState, row: &RemoteSession, window: u32) -> Da
         Ok(agent) => agent.last_seen_at.max(row_clock),
         Err(_) => row_clock,
     };
-    DateTime::from_millis(
-        from.timestamp_millis()
-            .saturating_add(i64::from(window).saturating_mul(1000)),
-    )
+    after(from, window)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(ms: i64) -> DateTime {
+        DateTime::from_millis(ms)
+    }
+
+    /// While the deadline is ahead the viewer is told it and asks again; at
+    /// it or past it the session is over, `agent_disconnect`.
+    #[test]
+    fn a_waiting_session_is_detached_until_its_deadline_then_ended() {
+        let sid = ObjectId::new();
+        match until(sid, at(10_000), at(9_999)) {
+            ServerMsg::SessionDetached {
+                session_id,
+                resume_by,
+            } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(resume_by, 10_000);
+            }
+            other => panic!("{other:?}"),
+        }
+        for now in [10_000, 10_001] {
+            assert!(matches!(
+                until(sid, at(10_000), at(now)),
+                ServerMsg::Terminate {
+                    reason: EndReason::AgentDisconnect,
+                    limit: None,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(after(at(1_000), 60), at(61_000));
+        assert_eq!(after(at(i64::MAX - 1), 60), at(i64::MAX), "saturates");
+    }
 }

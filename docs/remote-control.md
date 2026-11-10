@@ -3836,28 +3836,34 @@ in `kept_sessions`, and the pod it reaches answers each before the socket's read
 A session the claim rebuilds has no controller until its viewer rejoins, and waits for it for the window. Then the
 **registration read** ends every live row of the device created before this registration that the hello did not claim,
 dated by the row's own last clock (`detached_at`, else `stats_at`, else `started_at`) and marked `end_source:
-registration` (`registration_read`, `crates/modules/remote/src/resume.rs:391`).
+registration` (`registration_read`, `crates/modules/remote/src/resume.rs:391`). The read is indexed on `{agent_id,
+phase, created_at}` in the remote module's `index_plan` and bounded to 5 s (`READ_BUDGET`), so a roll's registrations
+never walk a device's whole history (P1b-1's review, L3).
 
 **The viewer's side** (P1b-2). The hub that holds a session keeps it through its viewer's socket loss when the viewer
 may hold it (told `resume_secs`, live, not external) and the device's connection there still holds a window: no
 controller, the device told nothing, the row untouched, until the viewer rejoins or the window ends, when it ends
-`controller_hangup` as the socket's loss ended it before (`viewer_gone`, `crates/modules/fleet/src/hub/hold.rs:77`;
-the wait, `arm_viewer_wait`, `:132`). The cross-pod relay's `rc.conn_closed` takes the same path, through
+`controller_hangup` as the socket's loss ended it before (`viewer_gone`, `crates/modules/fleet/src/hub/hold.rs:90`;
+the wait, `arm_viewer_wait`, `:146`). The cross-pod relay's `rc.conn_closed` takes the same path, through
 `unregister_controller`.
 
 `rc:session.rejoin` is answered on the pod the viewer's new socket reached (`rejoin`,
-`crates/modules/remote/src/rejoin.rs:63`):
+`crates/modules/remote/src/rejoin.rs:88`). Each rejoin gets exactly one answer, and it names its session:
+`rc:session.resumed`, `rc:session.detached {resume_by}` or `rc:terminate`, never an `rc:error`. The page asks again
+only after a `detached` (§11.17), so a rejoin left unanswered would hold it until its own deadline. Rejoins come
+once a second, on either pod, before the device's claim and after it.
 
 | Where the session is | Answer |
 |---|---|
-| held by that pod's hub, for this person | the gate again; then the new socket is bound and told `rc:session.resumed` (`Hub::rejoin`, `crates/modules/fleet/src/hub/hold.rs:180`), or the session ends `admin_terminated` |
+| held by that pod's hub, for this person | the gate again; then the new socket is bound and told `rc:session.resumed` (`Hub::rejoin`, `crates/modules/fleet/src/hub/hold.rs:195`), or the session ends `admin_terminated`. One that ended meanwhile is answered from its row |
 | the row names someone else, or nothing | `rc:terminate agent_disconnect`, as for no session at all |
 | the row is ended | `rc:terminate` with the row's own reason |
 | the row is live and the gate refuses | written to the row as `admin_terminated`, published as an admin's end is; `rc:terminate admin_terminated` |
 | detached at the device's socket loss, inside `resume_by` | `rc:session.detached` with the row's `resume_by`: ask again |
 | live in the hub of the pod that holds the device's socket | relayed there over `rc.cmd`, bound to a proxy for this socket, answered through it |
 | live in no hub yet: the claim is not answered, or a pod died without a word | `rc:session.detached` with the device's last word plus the window, or `rc:terminate agent_disconnect` once that has passed |
-| a read failed | no answer: the viewer asks again a second later |
+| the gate cannot be run (a read failed) | nothing bound, nothing written: `rc:session.detached` with when the session ends if nobody claims it, so the viewer asks again. On the pod that holds it that is the hold's own deadline (`held_until`), the same at every ask |
+| the row cannot be read | `rc:session.detached` with the window from now; the first answer that reads the row brings the page's deadline in, since the page only ever brings it closer after the first |
 
 A late unregistration of the socket the rejoin replaced finds another sender and changes nothing.
 
@@ -3865,9 +3871,10 @@ A late unregistration of the socket the rejoin replaced finds another sender and
 slot first (claimed before the hub's own dispatch), the pod that holds the device ends the session the redial names in
 `replaces`, and every session held for the same person on that device, and gives each one's slot back before it
 claims one (`before_request`, `crates/modules/remote/src/row_end.rs:178`; `Hub::end_replaced`,
-`crates/modules/fleet/src/hub/hold.rs:243`; `Hub::reap_held_for`, `:282`). The hub's own orphan reap spares a held
+`crates/modules/fleet/src/hub/hold.rs:268`; `Hub::reap_held_for`, `:307`). The hub's own orphan reap spares a held
 session against another person's request and never takes a session with no controller for an orphan
-(`crates/modules/fleet/src/hub.rs:1642`).
+(`crates/modules/fleet/src/hub.rs:1642`). A redial sends `replaces` again on every attempt until it is answered,
+so it may name a session that has already ended: that ends nothing and refuses nothing, and the request goes on.
 
 **An end while no pod holds the session** waits in the row, and the device's claim and the viewer's rejoin read it
 there (`crates/modules/remote/src/row_end.rs`). Each is written straight to the row, conditional on the row being live,
@@ -3879,7 +3886,7 @@ receives the event:
 | an admin's, `POST …/session/{id}/terminate` (`admin_end`, `:115`); the answer says `row_ended` | the route's org | the `terminate` control event, as before |
 | the controller's own `rc:terminate` (`controller_end`, `:142`) | the person | `controller_terminate`, which the holding pod applies only to that org and that person (`crates/modules/fleet/src/ctrl.rs:126`) |
 | a redial's `replaces` | the person and the device | `controller_terminate` |
-| the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:446`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:428`) |
+| the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:446`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:429`) |
 
 Each writes the audit's `session_ended` as its trail, which projects nothing onto the row
 (`AuditSink::record_trail`, `crates/remote_control/src/audit.rs:100`).

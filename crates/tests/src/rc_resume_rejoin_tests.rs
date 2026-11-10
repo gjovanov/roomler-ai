@@ -733,6 +733,84 @@ async fn a_viewer_removed_from_the_org_is_refused_at_its_rejoin() {
     assert_eq!(end_reason(&r), Some("admin_terminated"), "{r}");
 }
 
+/// Each rejoin gets one answer that names its session, even when the gate
+/// cannot be run: the page asks again only after `rc:session.detached`. The
+/// member's row in the org cannot be read (a document the server cannot
+/// decode), so the rejoin of the held session is answered
+/// `rc:session.detached` with when the hold ends, the same deadline at every
+/// ask; nothing is bound or ended, and the device is told nothing. Once the
+/// row reads again, the next rejoin resumes the session.
+#[tokio::test]
+async fn a_rejoin_the_gate_cannot_decide_is_told_to_ask_again() {
+    let app = one(WINDOW).await;
+    let seeded = app.seed_tenant("fr138vunk").await;
+    scope_all(&app).await;
+    give_member(&app, &seeded, "controller", REMOTE_CONTROL).await;
+    let (agent_id, token) = enroll(&app, &seeded, "fr138-vunk").await;
+    let mut agent = hello(&app, &token, &[RESUME], &[]).await;
+    let member = seeded.member.access_token.clone();
+    let (ctl, sid, _) = live_session(&app, &member, agent_id, &mut agent).await;
+    let dropped_at = now_ms();
+    drop_socket(ctl).await;
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        app.state.fleet().rc_hub.session_snapshot(sid).is_some(),
+        "held"
+    );
+
+    let mut ctl = controller(&app, &member).await;
+    let members = app.db.collection::<bson::Document>("tenant_members");
+    let filter = bson::doc! { "tenant_id": tenant_of(&seeded), "user_id": oid(&seeded.member.id) };
+    let kept = members
+        .find_one(filter.clone())
+        .await
+        .unwrap()
+        .expect("the member's row");
+    members
+        .update_one(
+            filter.clone(),
+            bson::doc! { "$set": { "role_ids": "unreadable" } },
+        )
+        .await
+        .unwrap();
+
+    let mut told = Vec::new();
+    for _ in 0..2 {
+        rejoin(&mut ctl, sid).await;
+        let answer = rejoin_answer(&mut ctl, sid, WITHIN)
+            .await
+            .expect("the rejoin is answered");
+        assert_eq!(answer["t"], "rc:session.detached", "{answer}");
+        told.push(answer["resume_by"].as_i64().expect("a resume_by"));
+    }
+    assert_eq!(told[0], told[1], "the same deadline at every ask");
+    let window_ms = i64::try_from(WINDOW).unwrap() * 1000;
+    assert!(
+        (dropped_at + window_ms - 1000..=now_ms() + window_ms).contains(&told[0]),
+        "the hold's own deadline: {told:?}"
+    );
+    assert!(
+        app.state.fleet().rc_hub.session_snapshot(sid).is_some(),
+        "nothing ends it"
+    );
+    assert!(
+        next_of(&mut agent, "rc:terminate", QUIET).await.is_none(),
+        "the device is told nothing"
+    );
+
+    members.replace_one(filter, kept).await.unwrap();
+    rejoin(&mut ctl, sid).await;
+    let answer = rejoin_answer(&mut ctl, sid, WITHIN)
+        .await
+        .expect("the rejoin is answered");
+    assert_eq!(answer["t"], "rc:session.resumed", "{answer}");
+    device_ice(&mut agent, sid).await;
+    assert!(
+        next_of(&mut ctl, "rc:ice", WITHIN).await.is_some(),
+        "the device's frames reach the rejoined socket"
+    );
+}
+
 /// Off is today. With the window at 0, the default, a session is never
 /// called resumable (`rc:session.created` carries no `resume_secs`), the
 /// viewer's socket loss ends it as `controller_hangup` at once with the device

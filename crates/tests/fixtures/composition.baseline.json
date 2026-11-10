@@ -2169,6 +2169,18 @@
         ]
       },
       {
+        "collection": "remote_sessions",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "phase": 1,
+              "created_at": 1
+            }
+          }
+        ]
+      },
+      {
         "collection": "roles",
         "indexes": [
           {
@@ -4126,6 +4138,18 @@
             "key": {
               "tenant_id": 1,
               "created_at": -1
+            }
+          }
+        ]
+      },
+      {
+        "collection": "remote_sessions",
+        "indexes": [
+          {
+            "key": {
+              "agent_id": 1,
+              "phase": 1,
+              "created_at": 1
             }
           }
         ]

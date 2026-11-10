@@ -144,6 +144,11 @@ pub struct LiveSession {
     /// hold: bumped when its socket goes and when it rejoins. The timer a
     /// departure arms ends the session only if nothing moved since.
     pub controller_gen: u32,
+
+    /// FR-138 — when the hold for the viewer ends unless it rejoins: set
+    /// when its socket goes and when a device's claim rebuilds the session.
+    /// A rejoin the gate could not decide is told it (`rc:session.detached`).
+    pub held_until: Option<DateTime>,
 }
 
 impl LiveSession {
@@ -186,6 +191,7 @@ impl LiveSession {
             attach_seq: 0,
             resume_secs: None,
             controller_gen: 0,
+            held_until: None,
         };
         (s, waiter)
     }
@@ -284,6 +290,7 @@ impl LiveSession {
             attach_seq,
             resume_secs: None,
             controller_gen: 0,
+            held_until: None,
         }
     }
 }

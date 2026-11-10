@@ -1982,8 +1982,8 @@ impl Hub {
         // FR-52 P5 — what a revocation ends (`terminate_external_of`).
         live.external = external.is_some();
         // FR-138 — its viewer may hold it through a socket's loss for the
-        // window the device's connection holds; never an external one (D3).
-        let resume_secs = agent_window.filter(|_| external.is_none());
+        // window the device's connection holds (a positive one); never external (D3).
+        let resume_secs = agent_window.filter(|&w| w > 0 && external.is_none());
         live.resume_secs = resume_secs;
         // Multi-region relay: freeze the session's region NOW — a load-aware
         // pick over the agent's home + its RTT-ordered prefs — so Ready/
