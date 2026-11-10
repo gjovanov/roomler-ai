@@ -152,6 +152,27 @@ pub async fn enroll_folded(
     fold(existing, fresh)
 }
 
+/// #3609 — the enroll alone, as the person at the screen: the server's answer
+/// for `machine_id`, not yet a config. The fold is the writer's
+/// (`machine_write::write`), in this process or in the administrator step that
+/// writes a background-service install's machine config.
+pub async fn enroll_issued(
+    machine_id: &str,
+    server: &str,
+    token: &str,
+    device_name: &str,
+    install: InstallInfo,
+) -> anyhow::Result<roomlerd::enrollment::Issued> {
+    roomlerd::enrollment::enroll_issued(EnrollInputs {
+        server_url: server,
+        enrollment_token: token,
+        machine_id,
+        machine_name: device_name,
+        install: Some(install),
+    })
+    .await
+}
+
 /// FR-129 B2 — enroll `device_name` with a machine id the caller chose, into
 /// no existing config: the macOS root half, whose id comes from the hardware
 /// (`machine::root_half_machine_id`) because the person cannot read the one

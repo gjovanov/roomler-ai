@@ -91,6 +91,13 @@ pub enum ServiceLogRole {
     /// session 0). Own basename: up to THREE SYSTEM processes may log at
     /// once (host + worker + netd).
     Netd,
+    /// #3609 — the per-Machine MSI's SystemContext commands
+    /// (`keep-system-context`, `enable-system-context`,
+    /// `disable-system-context`), run as SYSTEM by its custom actions.
+    /// `keep-system-context` repairs the machine tree before it reads the
+    /// attempt record, so an upgrade's first repair is its own: what it
+    /// changes is kept beside the service's log, not in the SYSTEM profile's.
+    Installer,
 }
 
 static SERVICE_ROLE: OnceLock<ServiceLogRole> = OnceLock::new();
@@ -108,6 +115,7 @@ fn log_basename() -> &'static str {
     match SERVICE_ROLE.get() {
         Some(ServiceLogRole::Host) => "roomlerd-service.log",
         Some(ServiceLogRole::Netd) => "roomlerd-netd.log",
+        Some(ServiceLogRole::Installer) => "roomlerd-installer.log",
         _ => "roomlerd.log",
     }
 }
@@ -889,6 +897,7 @@ fn prune_old_logs_at(dir: &Path, cutoff: SystemTime) {
         let lossy = name.to_string_lossy();
         let is_ours = lossy.starts_with("roomlerd.log")
             || lossy.starts_with("roomlerd-service.log")
+            || lossy.starts_with("roomlerd-installer.log")
             // RETIRED-NAME-ANCHOR: legacy rolled logs must still AGE OUT; dropping this
             // leaks them forever on an upgraded host. See docs/fr/FR-21.
             || lossy.starts_with("roomler-agent.log")

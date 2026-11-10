@@ -4444,11 +4444,13 @@ fn machine_tree_of(path: &std::path::Path) -> Option<crate::machine_tree::Machin
 /// #3609 — what an elevated save of the machine config (Setup's machine write,
 /// `roomlerd enroll --machine-global`) runs right before it [`save`]s at
 /// `path`: the machine folder is made if it is not there yet, as the save
-/// would make it, and taken for Administrators, its owner and nothing else
-/// (`machine_tree::adopt_machine_folder`), so that the save's own repair seals
-/// it. Never the daemon's: its saves and repairs take nothing over.
-/// `Ok(true)` when it was taken; `Ok(false)` at any other path, when there was
-/// nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+/// would make it, and it and its parent, `%ProgramData%\roomler`, are taken for
+/// Administrators (`machine_tree::adopt_machine_parent`, `::adopt_machine_folder`),
+/// so that the save's own repair seals the folder and the check takes the
+/// parent. A person's daemon may have made both to stage a received file before
+/// the service ever ran. Never the daemon's: its saves and repairs take nothing
+/// over. `Ok(true)` when either was taken; `Ok(false)` at any other path, when
+/// there was nothing to take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
 #[cfg(windows)]
 pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, String> {
     let Some(tree) = machine_tree_of(path) else {
@@ -4459,7 +4461,30 @@ pub fn take_machine_folder(path: &std::path::Path) -> std::result::Result<bool, 
     }
     std::fs::create_dir_all(tree.folder())
         .map_err(|e| format!("creating {}: {e}", tree.folder().display()))?;
-    crate::machine_tree::adopt_machine_folder(&tree)
+    let parent = crate::machine_tree::adopt_machine_parent(&tree);
+    let folder = crate::machine_tree::adopt_machine_folder(&tree);
+    match (parent, folder) {
+        (Ok(parent), Ok(folder)) => Ok(parent || folder),
+        (Err(e), Ok(_)) | (Ok(_), Err(e)) => Err(e),
+        (Err(parent), Err(folder)) => Err(format!("{parent}; {folder}")),
+    }
+}
+
+/// #3609 — the parent alone, `%ProgramData%\roomler`, for the machine config at
+/// `path` (`machine_tree::adopt_machine_parent`): what Setup's machine write runs
+/// before it seals the parent, so that the seal, which names it by path, finds a
+/// plain folder that belongs to Administrators. An `Err` for a parent that is
+/// not a plain folder. `Ok(false)` at any other path, when there was nothing to
+/// take, or with `ROOMLERD_MACHINE_TREE_REPAIR=0`.
+#[cfg(windows)]
+pub fn take_machine_parent(path: &std::path::Path) -> std::result::Result<bool, String> {
+    let Some(tree) = machine_tree_of(path) else {
+        return Ok(false);
+    };
+    if !crate::machine_tree::Switches::from_env().repair {
+        return Ok(false);
+    }
+    crate::machine_tree::adopt_machine_parent(&tree)
 }
 
 /// #3609 — keep the outgoing config at `path` as its `.prev`, through a new

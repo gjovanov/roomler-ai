@@ -21,8 +21,9 @@
 //!   channel made ── runas … --system-context 1 ──> stage, check, msiexec
 //!                    <── msi {code}                 (0 or 3010; otherwise it exits)
 //!   settle a reinstall's daemon
-//!   prepare ──>                                     the parent sealed; the config to
-//!                    <── prepared | failed          fold into read; its path probed
+//!   prepare ──>                                     the parent taken and sealed; the
+//!                    <── prepared | failed          config to fold into read; its
+//!                                                   path probed
 //!   enroll (network) → issued
 //!   write {issued, advanced} ──>                    fold, a fresh install's defaults,
 //!                    <── written | failed           the boxes, the folder taken, saved
@@ -58,7 +59,7 @@ pub enum Request {
     Prepare,
     /// The rest of it, once the enroll is done ([`write`]).
     Write {
-        issued: Issued,
+        issued: Box<Issued>,
         advanced: AdvancedOptions,
     },
 }
@@ -253,7 +254,7 @@ pub enum ConfigWriter {
     Local {
         config_path: PathBuf,
         is_system_context: bool,
-        existing: Option<AgentConfig>,
+        existing: Option<Box<AgentConfig>>,
     },
     /// The administrator step, over its channel: a limited wizard's
     /// background-service install.
@@ -282,9 +283,12 @@ impl ConfigWriter {
         is_system_context: bool,
         wizard_elevated: bool,
     ) -> Result<Self, Failure> {
-        // RED seam (#3609 follow-up): master's routing, the config always
-        // written in this process.
-        let _ = (link, wizard_elevated);
+        if let Some(link) = link {
+            return Ok(Self::Step(link));
+        }
+        if is_system_context && !wizard_elevated {
+            return Err(Failure::config(NO_STEP.to_string()));
+        }
         Ok(Self::Local {
             config_path: config_path.to_path_buf(),
             is_system_context,
@@ -306,7 +310,7 @@ impl ConfigWriter {
                 ..
             } => {
                 let found = prepare(config_path)?;
-                *existing = found.existing;
+                *existing = found.existing.map(Box::new);
                 Ok(found.prepared)
             }
             #[cfg(target_os = "windows")]
@@ -342,7 +346,7 @@ impl ConfigWriter {
                 existing,
             } => write(
                 config_path,
-                existing.take(),
+                existing.take().map(|cfg| *cfg),
                 issued,
                 advanced,
                 *is_system_context,
@@ -352,7 +356,7 @@ impl ConfigWriter {
             Self::Step(link) => {
                 let _ = flavour;
                 let request = Request::Write {
-                    issued,
+                    issued: Box::new(issued),
                     advanced: advanced.clone(),
                 };
                 match exchange(link, &request).await {
@@ -388,6 +392,71 @@ async fn exchange(link: &mut StepLink, request: &Request) -> std::io::Result<Ans
         })??;
     serde_json::from_str(&answer)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// rc.52, #3609: `%ProgramData%\roomler`, the parent of the machine config at
+/// `config_path`, as the process that writes that config leaves it (an
+/// elevated wizard, or the step): taken for Administrators first, by handle
+/// (`config::take_machine_parent`: a person's daemon may have made it), then
+/// its inheritance replaced by SYSTEM and Administrators
+/// (`orchestrator_agent::harden_machine_global_dir`). A parent that is not a
+/// plain folder is left for the service's check to refuse, never sealed
+/// through. The warnings, for the person.
+#[cfg(target_os = "windows")]
+pub(crate) fn seal_parent(config_path: &Path) -> Vec<String> {
+    if let Err(e) = roomlerd::config::take_machine_parent(config_path) {
+        return vec![format!(
+            "could not take the machine-global config directory's parent for Administrators ({e})"
+        )];
+    }
+    match crate::orchestrator_agent::harden_machine_global_dir(config_path) {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![format!(
+            "could not restrict permissions on the machine-global config directory ({e})"
+        )],
+    }
+}
+
+/// How long the step waits, once the installer ran, for the wizard to finish
+/// the enroll and hand it over: a reinstall's daemon settling (90 s), the
+/// enroll's network call, and room to spare.
+#[cfg(target_os = "windows")]
+const STEP_BUDGET: Duration = Duration::from_secs(20 * 60);
+
+/// The step's side once the installer ran (`code`, 0 or 3010) on the
+/// background-service role: reach the wizard's channel for `stage`, say the
+/// installer ran, and serve its two requests for the machine config
+/// (`machine_global_config_path`, never a path the wizard names). Its exit
+/// code: `code` once the config is written, otherwise one of
+/// `package_step::exit_code`'s codes for after the install. A watchdog ends the
+/// step after [`STEP_BUDGET`], never in the middle of the write.
+#[cfg(target_os = "windows")]
+pub fn hand_over(stage: &str, code: i32) -> i32 {
+    use crate::package_step::exit_code;
+    static GATE: Mutex<()> = Mutex::new(());
+    let name = wizard_shared::step_channel::pipe_name(stage);
+    let Ok(pipe) = wizard_shared::step_channel::connect(&name) else {
+        return exit_code::NO_WIZARD;
+    };
+    let Ok(read_half) = pipe.try_clone() else {
+        return exit_code::NO_WIZARD;
+    };
+    std::thread::spawn(|| {
+        std::thread::sleep(STEP_BUDGET);
+        let _gate = GATE.lock().unwrap_or_else(|e| e.into_inner());
+        std::process::exit(exit_code::TIMED_OUT);
+    });
+    let mut writer = pipe;
+    if send(&mut writer, &Answer::Msi { code }).is_err() {
+        return exit_code::NO_WIZARD;
+    }
+    let mut reader = std::io::BufReader::new(read_half);
+    let config_path = roomlerd::config::machine_global_config_path();
+    match serve(&mut reader, &mut writer, &config_path, &GATE) {
+        Served::Written => code,
+        Served::Failed => exit_code::WRITE_FAILED,
+        Served::HungUp | Served::Refused(_) => exit_code::NOT_WRITTEN,
+    }
 }
 
 /// The step's first word, from the wizard's side: wait for process `pid`, the
@@ -441,18 +510,12 @@ pub fn serve<R: BufRead, W: Write>(
         Err(end) => return end,
     }
     #[allow(unused_mut)]
-    let mut sealed = None;
-    // rc.52: the machine folder's parent sealed, as an elevated wizard does,
-    // here and only for the machine's own config.
+    let mut sealed = Vec::new();
+    // The parent taken and sealed, as an elevated wizard does, here and only
+    // for the machine's own config.
     #[cfg(target_os = "windows")]
     if config_path == roomlerd::config::machine_global_config_path().as_path() {
-        sealed = crate::orchestrator_agent::harden_machine_global_dir(config_path)
-            .err()
-            .map(|e| {
-                format!(
-                    "could not restrict permissions on the machine-global config directory ({e})"
-                )
-            });
+        sealed = seal_parent(config_path);
     }
     let found = match prepare(config_path) {
         Ok(found) => found,
@@ -467,7 +530,7 @@ pub fn serve<R: BufRead, W: Write>(
         return Served::HungUp;
     }
     let (issued, advanced) = match next_request(reader) {
-        Ok(Request::Write { issued, advanced }) => (issued, advanced),
+        Ok(Request::Write { issued, advanced }) => (*issued, advanced),
         Ok(Request::Prepare) => return Served::Refused("the config was read already".into()),
         Err(end) => return end,
     };
@@ -616,7 +679,7 @@ mod tests {
         let sent = serde_json::to_string(&Request::Prepare).unwrap();
         assert_eq!(sent, r#""prepare""#);
         let write = serde_json::to_string(&Request::Write {
-            issued: issued(),
+            issued: Box::new(issued()),
             advanced: advanced(),
         })
         .unwrap();
@@ -658,7 +721,7 @@ mod tests {
         let gate = Mutex::new(());
         let (_dir, path) = scratch();
         let write = line(&Request::Write {
-            issued: issued(),
+            issued: Box::new(issued()),
             advanced: advanced(),
         });
 
@@ -696,7 +759,7 @@ mod tests {
             "{}{}",
             line(&Request::Prepare),
             line(&Request::Write {
-                issued: issued(),
+                issued: Box::new(issued()),
                 advanced: advanced(),
             })
         );
@@ -736,7 +799,10 @@ mod tests {
             let talk = format!(
                 "{}{}",
                 line(&Request::Prepare),
-                line(&Request::Write { issued, advanced })
+                line(&Request::Write {
+                    issued: Box::new(issued),
+                    advanced,
+                })
             );
             let mut out = Vec::new();
             let served = serve(&mut talk.as_bytes(), &mut out, &path, &gate);
@@ -775,7 +841,7 @@ mod tests {
             "{}{}",
             line(&Request::Prepare),
             line(&Request::Write {
-                issued: with(|i| i.server_url = "http://roomler.ai/".into()),
+                issued: Box::new(with(|i| i.server_url = "http://roomler.ai/".into())),
                 advanced: advanced(),
             })
         );
@@ -818,12 +884,13 @@ mod tests {
     mod on_ntfs {
         use super::*;
         use roomler_node_core::machine_tree::test_support::{
-            USERS, elevated_or_skip, icacls, names, owner, sddl, sealed, set_dacl,
+            USERS, elevated_or_skip, icacls, local_guest, names, owner, sddl, sealed, set_dacl,
         };
         use roomler_node_core::machine_tree::{self, MachineTree};
 
         const ROOT: &str = "ROOMLER_TEST_MACHINE_WRITE_ROOT";
         const THIS_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setups_machine_enrollment_is_owned_by_administrators_and_sealed";
+        const PERSON_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setup_on_a_tree_a_person_made_comes_out_the_same";
         const CHECKED: &str = "MACHINE WRITE CHECKED";
 
         /// `%ProgramData%`'s own DACL: SYSTEM and Administrators full control,
@@ -852,26 +919,77 @@ mod tests {
                 return;
             }
             let root = tempfile::tempdir().unwrap();
-            let program_data = root.path().join("ProgramData");
-            std::fs::create_dir(&program_data).unwrap();
-            set_dacl(&program_data, PROGRAM_DATA);
             // What the service leaves on a fresh install, before Setup writes:
             // both folders Administrators', inheriting all they hold.
-            let parent = program_data.join("roomler");
-            let folder = parent.join("roomler");
-            std::fs::create_dir_all(&folder).unwrap();
-            for dir in [&parent, &folder] {
+            let program_data = stand_in(root.path());
+            for dir in [
+                program_data.join("roomler"),
+                program_data.join("roomler").join("roomler"),
+            ] {
                 assert!(
-                    icacls(dir, &["/setowner", "*S-1-5-32-544"]),
+                    icacls(&dir, &["/setowner", "*S-1-5-32-544"]),
                     "{}",
                     dir.display()
                 );
-                assert!(icacls(dir, &["/reset"]), "{}", dir.display());
+                assert!(icacls(&dir, &["/reset"]), "{}", dir.display());
             }
+            run_the_child(THIS_TEST, root.path(), &program_data);
+        }
+
+        /// G7, the same install on a host where a person's daemon staged a
+        /// received file before the service ever ran: the parent, the machine
+        /// folder and the staging folder are that person's. The step takes the
+        /// parent and the machine folder for Administrators, and the service's
+        /// check takes the result; what the person made below keeps its owner.
+        #[test]
+        fn a_limited_setup_on_a_tree_a_person_made_comes_out_the_same() {
+            if let Some(root) = std::env::var_os(ROOT) {
+                return the_wizard_and_its_step(Path::new(&root));
+            }
+            if !elevated_or_skip("Setup's machine write over a person's tree") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let program_data = stand_in(root.path());
+            let person = local_guest().unwrap_or_else(|| USERS.to_string());
+            let staging = program_data.join("roomler").join("roomler").join("staging");
+            std::fs::create_dir(&staging).unwrap();
+            for dir in [
+                program_data.join("roomler"),
+                program_data.join("roomler").join("roomler"),
+                staging.clone(),
+            ] {
+                assert!(
+                    icacls(&dir, &["/setowner", &format!("*{person}")]),
+                    "{}",
+                    dir.display()
+                );
+            }
+            let staging_owner = owner(&sddl(&staging));
+            run_the_child(PERSON_TEST, root.path(), &program_data);
+            assert_eq!(
+                owner(&sddl(&staging)),
+                staging_owner,
+                "the person's own folder"
+            );
+        }
+
+        /// `%ProgramData%`'s stand-in under `root`, with the parent and the
+        /// machine folder made below it, inheriting.
+        fn stand_in(root: &Path) -> PathBuf {
+            let program_data = root.join("ProgramData");
+            std::fs::create_dir(&program_data).unwrap();
+            set_dacl(&program_data, PROGRAM_DATA);
+            std::fs::create_dir_all(program_data.join("roomler").join("roomler")).unwrap();
+            program_data
+        }
+
+        /// Run `test` in a child process whose `%ProgramData%` is the stand-in.
+        fn run_the_child(test: &str, root: &Path, program_data: &Path) {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([THIS_TEST, "--exact", "--nocapture", "--test-threads=1"])
-                .env(ROOT, root.path())
-                .env("PROGRAMDATA", &program_data)
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ROOT, root)
+                .env("PROGRAMDATA", program_data)
                 .output()
                 .unwrap();
             let said = format!(
