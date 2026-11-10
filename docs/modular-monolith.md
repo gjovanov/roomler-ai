@@ -371,8 +371,11 @@ Three more shapes the registry carries:
   in `HOOK_ORDER` (fleet revokes every device; network releases every node and quarantines the
   block).
 - **A lost membership** is a `MembershipLifecycle` run, AFTER the row is gone: the host's member
-  route calls `core.hooks.org_member_removed`, chat's room leave `room_member_removed`, and
-  conference ends the call seats that membership admitted, on whichever pod holds them
+  route calls `core.hooks.org_member_removed`, chat's room leave `room_member_removed`. Network,
+  first in `HOOK_ORDER`, removes the tunnel clients the person owns in the org
+  (`crates/modules/network/src/membership.rs`); it never stops the cascade, since nothing after
+  it reads what it holds, and its operator prune ends what it could not. Conference ends the call
+  seats that membership admitted, on whichever pod holds them
   (`crates/modules/conference/src/revoke.rs`, the flow in `docs/real-time.md`). Then chat, the
   record owner and so later in `HOOK_ORDER`, drops the person's room memberships of an org they
   left (`crates/modules/chat/src/membership.rs`).

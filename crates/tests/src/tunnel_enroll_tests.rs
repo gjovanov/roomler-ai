@@ -575,11 +575,13 @@ async fn a_removed_tunnel_client_comes_back_only_through_a_device_manager() {
 /// The write holds the decision again: an owner's re-enrollment refreshes the
 /// row only while it is still live and theirs, so a removal that lands
 /// between the route's check and the write is not undone. A device manager's
-/// revives it, at the generation the removal set.
+/// revives it, at the generation the removal set, as the device manager's
+/// own; a device manager's re-enrollment of a live client keeps its owner.
 ///
-/// Negative control: with the `deleted_at` predicate taken out of
+/// Negative controls: with the `deleted_at` predicate taken out of
 /// `ReviveScope::LiveOwnedBy`'s filter this fails at "a removal that landed
-/// after the check" with the row revived.
+/// after the check" with the row revived; with the owner left out of the
+/// revival, at "a removed client comes back as its reviver's".
 #[tokio::test]
 async fn an_owners_re_enrollment_never_revives_a_client_removed_meanwhile() {
     use roomler_ai_remote_control::models::OsKind;
@@ -615,24 +617,36 @@ async fn an_owners_re_enrollment_never_revives_a_client_removed_meanwhile() {
         "nothing is written"
     );
 
-    // A device manager revives it, at the generation the removal set.
-    let revived = refresh(ReviveScope::LiveOrRemoved, "Race laptop 3")
+    // A device manager revives it, at the generation the removal set, as
+    // their own: the token the revival mints acts for them.
+    let manager = ObjectId::parse_str(&org.admin.id).unwrap();
+    let revived = refresh(ReviveScope::LiveOrRemoved(manager), "Race laptop 3")
         .await
         .expect("a device manager revives a removed client");
     assert!(revived.deleted_at.is_none());
     assert_eq!(revived.token_gen, 1);
-    assert_eq!(revived.owner_user_id, owner, "and it stays its owner's");
+    assert_eq!(
+        revived.owner_user_id, manager,
+        "a removed client comes back as its reviver's"
+    );
 
-    // Live again: its owner refreshes it, and nobody else's scope matches it.
+    // Live again: another device manager's re-enrollment keeps its owner.
+    let kept = refresh(ReviveScope::LiveOrRemoved(ObjectId::new()), "Race laptop 4")
+        .await
+        .expect("a device manager re-enrolls a live client");
+    assert_eq!(kept.owner_user_id, manager, "a live client keeps its owner");
+
+    // Its owner refreshes it, and nobody else's scope matches it: not even
+    // the owner it had before its removal.
     assert!(
-        refresh(ReviveScope::LiveOwnedBy(ObjectId::new()), "Not theirs")
+        refresh(ReviveScope::LiveOwnedBy(owner), "Not theirs any more")
             .await
             .is_none(),
-        "someone else's client"
+        "the owner before the removal"
     );
-    let refreshed = refresh(ReviveScope::LiveOwnedBy(owner), "Race laptop 4")
+    let refreshed = refresh(ReviveScope::LiveOwnedBy(manager), "Race laptop 5")
         .await
         .expect("the owner refreshes their live client");
-    assert_eq!(refreshed.name, "Race laptop 4");
+    assert_eq!(refreshed.name, "Race laptop 5");
     assert_eq!(refreshed.token_gen, 1);
 }

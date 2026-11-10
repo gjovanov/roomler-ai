@@ -19,8 +19,11 @@ pub enum ReviveScope {
     /// The owner re-enrolling their own client: the row, only while it is live
     /// and theirs.
     LiveOwnedBy(ObjectId),
-    /// A holder of `MANAGE_AGENTS`: the row, live or removed.
-    LiveOrRemoved,
+    /// A holder of `MANAGE_AGENTS`, the reviver: the row, live or removed. A
+    /// REMOVED row comes back as the reviver's (`owner_user_id`): its new token
+    /// acts for them, and a client whose owner left the org must not come back
+    /// owned by someone who is not a member. A LIVE row keeps its owner.
+    LiveOrRemoved(ObjectId),
 }
 
 impl TunnelClientDao {
@@ -88,8 +91,16 @@ impl TunnelClientDao {
     /// nothing is written (#3328).
     ///
     /// `name` refreshes ONLY while `name_admin_set` is unset — same
-    /// rehydrate-clobber protection as `AgentDao::rehydrate`. The owner,
-    /// `token_gen` and an admin's name, labels and status are left alone.
+    /// rehydrate-clobber protection as `AgentDao::rehydrate`. `token_gen` and
+    /// an admin's name, labels and status are left alone, and so is the owner,
+    /// except that a REMOVED row a device manager revives becomes theirs
+    /// ([`ReviveScope::LiveOrRemoved`]).
+    ///
+    /// One update, a pipeline, so the write itself reads whether the row is
+    /// removed: a removal or a revival that lands after the route's read can
+    /// neither hand a live client to the reviver nor leave a revived one with
+    /// its old owner. The strings the request sent are `$literal`s, never
+    /// read as field paths.
     pub async fn rehydrate(
         &self,
         client_id: ObjectId,
@@ -99,6 +110,12 @@ impl TunnelClientDao {
         scope: ReviveScope,
     ) -> DaoResult<Option<TunnelClient>> {
         let os_bson = bson::to_bson(&os).unwrap_or(bson::Bson::Null);
+        let mut set = doc! {
+            "os": { "$literal": os_bson },
+            "client_version": { "$literal": client_version },
+            "updated_at": DateTime::now(),
+            "deleted_at": bson::Bson::Null,
+        };
         let filter = match scope {
             // `deleted_at: null` (null OR absent), as every live read here.
             ReviveScope::LiveOwnedBy(owner) => doc! {
@@ -106,22 +123,21 @@ impl TunnelClientDao {
                 "deleted_at": null,
                 "owner_user_id": owner,
             },
-            ReviveScope::LiveOrRemoved => doc! { "_id": client_id },
+            ReviveScope::LiveOrRemoved(reviver) => {
+                // Read before this stage writes `deleted_at`: a stage's
+                // expressions all see the row as it was.
+                let live = doc! { "$eq": [{ "$ifNull": ["$deleted_at", bson::Bson::Null] }, bson::Bson::Null] };
+                set.insert(
+                    "owner_user_id",
+                    doc! { "$cond": [live, "$owner_user_id", reviver] },
+                );
+                doc! { "_id": client_id }
+            }
         };
         let matched = self
             .base
             .collection()
-            .update_one(
-                filter,
-                doc! {
-                    "$set": {
-                        "os": os_bson,
-                        "client_version": client_version,
-                        "updated_at": DateTime::now(),
-                        "deleted_at": bson::Bson::Null,
-                    }
-                },
-            )
+            .update_one(filter, vec![doc! { "$set": set }])
             .await?
             .matched_count;
         if matched == 0 {
@@ -159,6 +175,24 @@ impl TunnelClientDao {
     ) -> DaoResult<Vec<TunnelClient>> {
         self.base
             .find_many(doc! { "tenant_id": tenant_id, "deleted_at": null }, None)
+            .await
+    }
+
+    /// Every tunnel client `owner_user_id` owns in the tenant, LIVE AND
+    /// REMOVED, for the reader whose job includes the tombstones: the end of
+    /// that person's org membership (`roomler-ai-mod-network`'s
+    /// `membership`), which removes the live ones and releases an overlay
+    /// lease a removed one still holds. Never for an admin route or a write.
+    pub async fn list_owned_in_tenant(
+        &self,
+        tenant_id: ObjectId,
+        owner_user_id: ObjectId,
+    ) -> DaoResult<Vec<TunnelClient>> {
+        self.base
+            .find_many(
+                doc! { "tenant_id": tenant_id, "owner_user_id": owner_user_id },
+                Some(doc! { "_id": 1 }),
+            )
             .await
     }
 

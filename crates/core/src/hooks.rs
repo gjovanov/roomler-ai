@@ -180,9 +180,9 @@ pub trait FleetLifecycle: Send + Sync {
 ///
 /// The host owns org membership (`DELETE …/member/{user_id}`: removed by an
 /// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`).
-/// A module that admitted something on a membership withdraws it here:
-/// `conference` ends the call seats the person holds, because `media:join`
-/// admitted them as a member.
+/// A module that admitted something on a membership withdraws it here: `network`
+/// the person's tunnel clients in the org, `conference` the call seats they hold
+/// (`media:join` admitted them as a member), `chat` their room memberships.
 ///
 /// Invoked AFTER the membership is gone, so nothing can be admitted on it
 /// again while a holder withdraws what it admitted. Idempotent, like every

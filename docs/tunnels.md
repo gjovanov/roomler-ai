@@ -887,6 +887,51 @@ agent at 0.4.199 or older is left (FR-137 D8). The other surfaces FR-90 left
 reserved are listed in
 [retired-names.md](retired-names.md#reserved-after-fr-90-was-parked-fr-137).
 
+## What ends a tunnel client
+
+A tunnel client acts for the person whose enrollment token enrolled it, its
+`owner_user_id`: the gate above matches it as that person (`AllUsers`, their
+`UserId` grants), and its overlay node is a peer of the org's mesh. For a paired
+client that person is whoever approved the pairing, so an admin who mints the token
+for someone else's laptop, or approves its pairing, owns that client.
+
+Three things end one, all through one removal (`end_tunnel_client`,
+`crates/modules/network/src/routes/tunnel.rs`): the row is tombstoned and its
+`token_gen` advanced, THEN its overlay node is released, so the peers hear
+`removes` and the address goes back to the pool. Tombstone first, because from there
+a join on the socket the client still holds takes no address, and the release
+cannot be followed by a lease nothing would release.
+
+| What ends it | Where |
+|---|---|
+| A device manager removes it: `DELETE …/tunnel-client/{cid}` (`MANAGE_AGENTS`) | `delete_tunnel_client` |
+| Its owner stops being a member of the org: an admin removes them, or they leave | `network`'s `MembershipLifecycle` hook, `crates/modules/network/src/membership.rs` |
+| The org is archived (#3042) | `network`'s `TenantLifecycle` hook, `crates/modules/network/src/hooks.rs` |
+
+From the tombstone on, a reconnect is told `rc:tunnel.revoked` and stops, a renewal
+and the agent roster answer 401, and the client takes no address. Its open socket
+closes at the next 60 s revocation poll, on whichever pod holds it; until then it can
+still open forwards, the window a `DELETE` has always had.
+
+- **The membership hook never stops the removal's cascade.** It tries every client,
+  and logs one it could not finish at ERROR with `alert = membership_tunnel_end`: a
+  tunnel-client write that failed must not keep the person in a live call or on the
+  org's rooms, the holders after it in `HOOK_ORDER`. It also releases a lease one of
+  the person's already removed clients still holds, so a second run finishes a first
+  one that failed half-way.
+- **An enrollment token acts for the person it was minted for**, so once they are no
+  longer a member it enrolls nothing: 403, before the token is spent, nothing written.
+  A pairing's token is the approver's and is refused the same way. The enrollment asks
+  again after its write, so one that raced the removal leaves no row behind.
+- **Clients whose owner is no longer a member**, left by a removal before this or by
+  one the hook could not finish, are ended by
+  [`POST /api/admin/tunnel-clients/prune`](api.md#platform-admin-platform_admins-objectid-allowlist-404-on-miss),
+  an operator step that runs the removal's own cascade per (org, person).
+- **Devices the person enrolled are not removed with them.** A device is not a tunnel
+  client, and removing one stays a device manager's decision. A tunnel session a
+  device originates acts as the device's owner, so a `UserId` tunnel policy naming the
+  person still matches it; policies naming them are left in place.
+
 ## LocalAPI
 
 The on-host control surface — how `roomler`, `roomler-desktop`, and scripts talk
@@ -944,7 +989,8 @@ client's `machine_id` is a hash of `--name`, the host name, the OS and the
 architecture (`derive_machine_id`, `agents/roomler-cli/src/cli.rs:1213`), so running
 `enroll` again with the same name re-enrolls the same client. That takes a fresh token
 minted by the client's owner while the client is live, or by a holder of
-`MANAGE_AGENTS`, the only way a removed client comes back. Anyone else's token is
+`MANAGE_AGENTS`, the only way a removed client comes back (as the holder's own: the
+token acts for them). Anyone else's token is
 refused 409 with a sentence the CLI prints, nothing is written, and that token still
 enrolls the machine under a different `--name` as a new client. The server side is in
 [api.md](api.md#authentication) and [security-baseline.md](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328).
