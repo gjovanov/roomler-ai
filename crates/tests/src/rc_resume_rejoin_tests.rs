@@ -36,7 +36,7 @@ use crate::rc_resume_claim_tests::{
     next_of, now_ms, oid, one, open, pair, row, scope_all, tenant_of, urlencode, wait_row,
 };
 
-async fn send(ws: &mut Ws, v: Value) {
+pub(crate) async fn send(ws: &mut Ws, v: Value) {
     ws.send(Message::Text(v.to_string().into()))
         .await
         .expect("a frame is sent");
@@ -74,7 +74,7 @@ async fn one_slotted(window: u64) -> TestApp {
 }
 
 /// A viewer's socket on `app`, past its `connected` greeting.
-async fn controller(app: &TestApp, token: &str) -> Ws {
+pub(crate) async fn controller(app: &TestApp, token: &str) -> Ws {
     let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("controller ws");
     let _ = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
@@ -83,7 +83,7 @@ async fn controller(app: &TestApp, token: &str) -> Ws {
 
 /// Ask for a session to `agent_id`, naming `replaces` when it is set: the
 /// first `rc:session.created` or `rc:error` the viewer is sent.
-async fn request(ctl: &mut Ws, agent_id: ObjectId, replaces: Option<ObjectId>) -> Value {
+pub(crate) async fn request(ctl: &mut Ws, agent_id: ObjectId, replaces: Option<ObjectId>) -> Value {
     let mut msg = json!({
         "t": "rc:session.request",
         "agent_id": agent_id.to_hex(),
@@ -141,7 +141,7 @@ async fn drive_live(ctl: &mut Ws, agent: &mut Ws, sid: ObjectId) {
 
 /// A live session from a new viewer socket of `token`: the socket, the
 /// session id and the `rc:session.created` the viewer was sent.
-async fn live_session(
+pub(crate) async fn live_session(
     app: &TestApp,
     token: &str,
     agent_id: ObjectId,
@@ -155,7 +155,7 @@ async fn live_session(
     (ctl, sid, created)
 }
 
-async fn rejoin(ws: &mut Ws, sid: ObjectId) {
+pub(crate) async fn rejoin(ws: &mut Ws, sid: ObjectId) {
     send(
         ws,
         json!({ "t": "rc:session.rejoin", "session_id": sid.to_hex() }),
@@ -165,7 +165,7 @@ async fn rejoin(ws: &mut Ws, sid: ObjectId) {
 
 /// The answer to a rejoin of `sid`: the first `rc:session.resumed`,
 /// `rc:session.detached` or `rc:terminate` naming it, within `within`.
-async fn rejoin_answer(ws: &mut Ws, sid: ObjectId, within: Duration) -> Option<Value> {
+pub(crate) async fn rejoin_answer(ws: &mut Ws, sid: ObjectId, within: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + within;
     let hex = sid.to_hex();
     while tokio::time::Instant::now() < deadline {
@@ -220,7 +220,12 @@ async fn wait_bus(a: &TestApp, b: &TestApp) -> bool {
     true
 }
 
-async fn terminate_route(app: &TestApp, tenant: &str, sid: ObjectId, token: &str) -> Value {
+pub(crate) async fn terminate_route(
+    app: &TestApp,
+    tenant: &str,
+    sid: ObjectId,
+    token: &str,
+) -> Value {
     let resp = app
         .auth_post(
             &format!("/api/tenant/{tenant}/session/{sid}/terminate"),

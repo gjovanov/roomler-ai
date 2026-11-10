@@ -284,6 +284,13 @@ mod rc_request_ceiling_tests;
 /// the registration read's inferred ends, and off is today.
 #[cfg(test)]
 mod rc_resume_claim_tests;
+/// FR-138 — how a resumable session ends at the edges the reviews of P1b
+/// found: a session its viewer may not hold, a claim refused for no one's
+/// choice, two claims of one device racing, the device's own end after an
+/// inferred one, a hold nobody rejoins, and the first end over an inferred
+/// one.
+#[cfg(test)]
+mod rc_resume_ends_tests;
 /// FR-138 P1b-2 — the viewer's half of the server's resume: the hold through
 /// the viewer's own socket loss, the rejoin on either pod with the gate run
 /// again, the slot a held session never costs its own viewer (`replaces`
