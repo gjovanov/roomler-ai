@@ -317,6 +317,18 @@ that rather than show an error. Their predicate, `canReadDeviceDiagnostics`, fai
 renders before `/member/me` lands, and a refusal it lets through costs one
 explained dialog, not a broken page.
 
+The org's tunnel ACL is gated there too. Every `…/tunnel-policy` route is
+`MANAGE_AGENTS`, the reads included, as on the Overlay ACL beside it
+([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
+`fetchPolicies` (`ui/src/stores/tunnelPolicies.ts:152`) sends nothing for a caller
+the mask refuses and sets `refused`, and a server 403 lands in the same state; the
+Tunnel ACL tab then says who manages policies, with no editor and no "New policy".
+Its predicate, `canManageTunnelPolicies` (`ui/src/utils/permissions.ts:375`), fails
+**open** while the mask is unknown, like the diagnostics one: the store awaited the
+membership, so `null` means that fetch failed, and a holder must not lose the page
+over it. The Network pages are drawn for `REMOTE_CONTROL` too (`canSeeFleetNav`),
+which is not the bit, so a `moderator` reaches the tab and reads that explanation.
+
 ⚠️ The client gate is never the enforcement. Every route re-checks server-side;
 the UI only avoids offering what it already knows will be refused.
 
@@ -352,4 +364,4 @@ needs only `MANAGE_AGENTS` — revocation is not a grant.
 | error → wire | `crates/core/src/error.rs` |
 | client contract | `ui/src/api/client.ts` |
 | UI mirror + predicates | `ui/src/utils/permissions.ts` |
-| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts` |
+| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `crates/tests/src/tunnel_policy_permission_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts`, `ui/src/__tests__/stores/tunnelPolicies.spec.ts` |

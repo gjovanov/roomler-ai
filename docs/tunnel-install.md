@@ -98,11 +98,11 @@ sudo installer -pkg /tmp/roomlerd.pkg -target /
 
 ## 2. Enroll the agent
 
-In the Roomler admin UI:
+In the Roomler web app:
 
-1. **Admin → Tenant → Agents**.
-2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomlerd enroll …` command.
-3. Run that command on `AGENT-CORP` (the enrollment token is single-use, embedded in the command):
+1. **Devices → Enroll → Device (remote desktop + mesh)**.
+2. A 10-minute, single-use enrollment token appears, with a command per platform (the recommended one installs and enrolls in one step).
+3. To enroll an installed `roomlerd` by hand, run this on `AGENT-CORP` with that token:
 
 ```powershell
 roomlerd enroll `
@@ -125,7 +125,7 @@ roomlerd service install               # perUser scheduled task
 roomlerd service install --as-service  # SCM service, runs as LocalSystem (requires the perMachine MSI)
 ```
 
-Verify in **Admin → Tenant → Agents** that the row turned green (`status: online`).
+Verify on the **Devices** page that the row turned green (`status: online`).
 
 ---
 
@@ -211,10 +211,10 @@ roomler --version   # → roomler 0.4.16
 
 ## 4. Enroll the tunnel-client
 
-In the admin UI:
+In the web app:
 
-1. **Admin → Tenant → Tunnels**.
-2. Click **"Issue enrollment token"**. A 10-minute single-use JWT appears with a copy-pasteable `roomler enroll …` command.
+1. **Devices → Enroll → Tunnel client (CLI-only)**.
+2. A 10-minute, single-use enrollment token appears, with a command per platform.
 3. Paste-and-run on `OPERATOR-LAPTOP`:
 
 ```powershell
@@ -234,7 +234,7 @@ This writes the long-lived `TunnelClient` JWT to:
 - Linux: `~/.config/roomler-tunnel/config.toml`
 - macOS: `~/Library/Application Support/roomler-tunnel/config.toml`
 
-Verify in **Admin → Tenant → Tunnels** that the row appears.
+Verify on the **Devices** page, with the kind filter on **Tunnels**, that the row appears.
 
 ---
 
@@ -242,7 +242,9 @@ Verify in **Admin → Tenant → Tunnels** that the row appears.
 
 Server-side ACL is **default-deny** — without a matching policy, every `TcpForwardRequest` is rejected with `acl_denied`. Define what each subject (user / role / specific tunnel-client) is allowed to reach via which agents.
 
-**Admin → Tenant → Tunnel ACL → New policy.**
+**Network → ACL → Tunnel ACL → New policy.**
+
+Tunnel policies are read and written by people with the **Manage devices** permission (`MANAGE_AGENTS`): the organization's owner and admins. Anyone else sees a note saying so instead of the editor, and the server refuses them on every tunnel-policy route, the list included ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)). A policy is what lets a person reach a destination; nobody needs a permission of their own to use one.
 
 For an "ops team reaches the prod Postgres" policy:
 
@@ -389,7 +391,7 @@ longest-prefix LAN routing, transports): [tunnels.md](tunnels.md).
 
 ## 7. Audit + diagnostics
 
-**Admin → Tenant → Tunnels → click a tunnel-client → Audit** lists every `PeerOpen` / `TcpAccept` / `TcpReject` / `TcpDialFailed` / `TcpClosed` with timestamps, bytes-in/out, destination, and reject reason.
+Every decision is recorded in the `tunnel_audit` collection (kept 90 days): each `PeerOpen` / `TcpAccept` / `TcpReject` / `TcpDialFailed` / `TcpClosed`, with timestamps, bytes in/out, the destination and the reject reason. The web app has no page that lists them yet.
 
 **Per-flow debug logs on the tunnel-client:**
 
@@ -438,11 +440,11 @@ The HTTP listing from python's server should appear via the tunnel. Bytes flow: 
 
 **Stop the forward**: Ctrl-C on `roomler forward`. The agent's side closes automatically; audit row recorded.
 
-**Revoke a tunnel-client** (operator left the team, laptop lost, etc.): **Admin → Tenant → Tunnels → click client → Revoke**. The next WS read on that client gets a `rc:tunnel.revoked` message and the WS closes; further enrollment attempts with the same `machine_id` are rejected.
+**Revoke a tunnel-client** (operator left the team, laptop lost, etc.): **Devices** (kind filter **Tunnels**) **→ the client's ⋮ menu → Delete tunnel client** (Manage devices permission). Its live connection is told `rc:tunnel.revoked` by the 60 s revocation sweep and closes, and its overlay node is released. Enrolling the same `machine_id` again brings it back only with a token minted by someone with the Manage devices permission ([tunnels.md](tunnels.md#cli)).
 
-**Revoke an agent**: **Admin → Tenant → Agents → click agent → Revoke**. Same mechanism.
+**Revoke an agent**: **Devices → the device's ⋮ menu → Delete device**. A connected device is told on its socket at once, and stops.
 
-**Soft-delete a policy**: **Admin → Tenant → Tunnel ACL → click delete on the row**. Live tunnel sessions keep working until they close naturally; new `TcpForwardRequest`s that relied on that policy alone start being rejected with `acl_denied` from the next request onward.
+**Soft-delete a policy**: **Network → ACL → Tunnel ACL → delete on the row** (Manage devices permission). Live tunnel sessions keep working until they close naturally; new `TcpForwardRequest`s that relied on that policy alone start being rejected with `acl_denied` from the next request onward.
 
 ---
 

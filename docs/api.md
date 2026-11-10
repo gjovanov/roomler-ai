@@ -436,8 +436,8 @@ before it leaves the host.
 | GET | `…/tunnel-client` | List enrolled tunnel clients |
 | POST | `…/tunnel-client/enroll-token` | Mint a tunnel enrollment token (membership; 10 min, single-use). It acts for whoever minted it: their own new machine, or a machine id they may re-enroll ([rule](#authentication)). 403 for an **archived** org |
 | PUT/DELETE | `…/tunnel-client/{cid}` | Rename / relabel / re-tag a client · revoke it (releases its overlay node; a live session is kicked by the 60 s revocation sweep with `rc:tunnel.revoked`). Removal is final: from then on the client is a **404 on both routes** — PUT and a repeat DELETE — like the listing that no longer shows it. There is no GET by id; the listing is the only read |
-| GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny) |
-| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the forward gate's compile set — it is never served, edited or compiled again |
+| GET/POST | `…/tunnel-policy` | List / create ACL policies (default-deny). **`MANAGE_AGENTS` on every tunnel-policy route, the reads too**, as on `…/overlay-acl`: a policy is an access grant, and the list is the org's whole tunnel ACL. The bit is decided first, before the body is validated or a policy looked up, so a member without it gets one 403 `forbidden` whatever the id names or the body says, never `not_a_member` (someone outside the org still gets that) — see [security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included) |
+| GET/PUT/DELETE | `…/tunnel-policy/{pid}` | Policy CRUD, `MANAGE_AGENTS` as above. For a holder, another org's policy or an id that names nothing is a 404, and a deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the forward gate's compile set — it is never served, edited or compiled again. The forward itself reads no permission bit: the policy is the grant ([tunnels.md](tunnels.md#policy--two-independent-gates)) |
 
 ### Overlay network
 
@@ -447,7 +447,7 @@ before it leaves the host.
 | PUT | `…/overlay-node/{nid}/approved-routes` | `{approved_routes: ["10.0.0.0/24", …]}` — approve subnet-router routes (the data-plane signal) |
 | PUT | `…/overlay-node/{nid}/exit-node` | `{enabled: bool}` — designate an exit node (also adds `/0` to approved routes) |
 | DELETE | `…/overlay-node/{nid}` | Evict from the mesh + release the address back to the pool |
-| GET/POST | `…/overlay-acl` | Overlay L3 ACL policies |
+| GET/POST | `…/overlay-acl` | Overlay L3 ACL policies. `MANAGE_AGENTS` on every overlay-acl route, the reads and the mode too |
 | GET/PUT | `…/overlay-acl/mode` | Tenant posture: `off` (default) \| `warn` \| `enforce` |
 | GET/PUT | `…/overlay-retired-keys` | FR-40 P2: `{mode: "off" (default) \| "warn" \| "enforce"}` — whether a join or a DERP registration presenting a RETIRED overlay key (one a node moved away from) is refused `key_retired`. Under `enforce` a refused device that advertises `key-rotate` is ordered to rotate. `MANAGE_AGENTS` for both; a mode outside the three is a 400. Read per join, so a change disturbs no live session — see [overlay-key-rotation.md](overlay-key-rotation.md#retired-keys) |
 | GET/PUT/DELETE | `…/overlay-acl/{pid}` | ACL policy CRUD. A deleted policy is a **404 on all three** (GET, PUT, repeat DELETE), exactly as it is absent from the listing and from the netmap compiler's set — it is never served, edited (in particular never re-`enabled`) or compiled again, and a repeat DELETE re-fans nobody |
