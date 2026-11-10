@@ -27,6 +27,9 @@ pub mod diagnostics;
 /// #2338 — the enroll step every daemon pipeline shares: the fresh
 /// enrollment folded into the config already at its path.
 pub mod enroll_step;
+/// #3432 — the one failure an install ends with: its step, its kind (decided on
+/// the error's types), words a person can act on, and the whole cause chain.
+pub mod failure;
 /// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
 pub mod features;
 /// FR-129 C3 — the wizard's command line: what an elevated relaunch is
@@ -55,6 +58,9 @@ pub mod root_identity;
 /// FR-129 C — the gate on how the wizard's Windows path names a program.
 #[cfg(test)]
 mod spawn_gate;
+/// #3432 — the steps of an install, and the tracker each failure takes its
+/// step from.
+pub mod steps;
 /// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
 /// script, the halves' argv, the prompt tools, the exit codes, the private
 /// scratch directory.

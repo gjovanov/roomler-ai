@@ -48,7 +48,6 @@ use roomlerd::enrollment::Issued;
 use roomlerd::updater::WindowsInstallFlavour;
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostics::failed;
 use crate::orchestrator_agent::AdvancedOptions;
 
 /// The wizard's requests to the step, in this order, once each.
@@ -129,15 +128,16 @@ impl Failure {
         }
     }
 
-    /// Record it in the install's diagnostics, and hand back what the person
-    /// reads.
-    pub fn fail(self) -> String {
+    /// Record it in the install's diagnostics, as the failure of the step that
+    /// is open (#3432). Its words crossed the administrator step's channel as
+    /// text, so they are the step's own: a refusal in those words.
+    pub fn fail(self) -> crate::failure::Failure {
         let code = match self.kind {
             FailureKind::ConfigWrite => ErrorCode::ConfigWrite,
             FailureKind::AdvancedOptions => ErrorCode::AdvancedOptions,
             FailureKind::Enroll => ErrorCode::EnrollRejected,
         };
-        failed(code, self.message)
+        crate::steps::Steps::global().fail(code, crate::failure::Said(self.message))
     }
 }
 

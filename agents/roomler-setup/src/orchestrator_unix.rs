@@ -57,14 +57,17 @@ use std::ffi::OsString;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
+use anyhow::Context as _;
+use roomler_ai_remote_control::setup_diagnostics::ErrorCode;
 use tauri::ipc::Channel;
 use wizard_shared::progress::{ProgressEvent, replay_log};
 
 use crate::commands::{DoneReport, RootHalfReport};
-use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
+use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code};
+use crate::failure::{Failure, Said};
 use crate::orchestrator_agent::AdvancedOptions;
 use crate::role::{HostOs, Role, Scope, scope_for};
+use crate::steps::{OrFail, StepId, Steps};
 use crate::unix_daemon::{self as ud, Half, HalfOutcome, KeptEnrollment, Scratch, Tool};
 
 /// The `EnrollOk` kind of the macOS root half's enrollment: a device of its
@@ -85,15 +88,14 @@ pub async fn run_install(
     device_name: String,
     advanced: AdvancedOptions,
     on_event: Channel<ProgressEvent>,
-) -> Result<DoneReport, String> {
+) -> Result<DoneReport, Failure> {
     crate::INSTALL_IN_PROGRESS.store(true, Ordering::SeqCst);
     crate::CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     crate::ACTIVE_MSI_PID.store(0, Ordering::SeqCst);
     replay_log().reset();
 
-    let diag = Diagnostics::global();
-    diag.server_known(&crate::orchestrator_agent::diagnostics_server(&server));
-    diag.pipeline_started();
+    Diagnostics::global().server_known(&crate::orchestrator_agent::diagnostics_server(&server));
+    Steps::global().started();
 
     let outcome = run_install_inner(
         role,
@@ -108,20 +110,12 @@ pub async fn run_install(
 
     crate::INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
 
-    match outcome {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            diag.abandon(ErrorCode::Other, cancel_requested());
-            emit(
-                &on_event,
-                ProgressEvent::Error {
-                    step: "install".to_string(),
-                    message: e.clone(),
-                },
-            );
-            Err(e)
-        }
+    // #3432 — the terminal event names the step that failed, to the page,
+    // the replay log (a late-attached listener sees it) and the wizard's log.
+    if let Err(failure) = &outcome {
+        crate::failure::conclude(&on_event, failure);
     }
+    outcome
 }
 
 /// The overlay box's default for a role on this OS when the person never
@@ -275,40 +269,40 @@ async fn run_install_inner(
     device_name: String,
     advanced: AdvancedOptions,
     on_event: &Channel<ProgressEvent>,
-) -> Result<DoneReport, String> {
+) -> Result<DoneReport, Failure> {
     emit(on_event, ProgressEvent::Started);
-    let diag = Diagnostics::global();
+    let steps = Steps::global();
     let os = HostOs::current();
 
     // --- Step 1: preflight -----------------------------------------------
-    diag.begin(Step::Preflight);
+    steps.begin(StepId::Preflight);
     check_cancel()?;
     advanced
         .validate()
-        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
-    let scope = scope_for(os, role).ok_or_else(|| {
-        failed(
-            ErrorCode::UnsupportedPlatform,
-            format!("role {role:?} installs no daemon on {}", os.wire()),
-        )
-    })?;
+        .map_err(Said)
+        .or_fail(ErrorCode::AdvancedOptions)?;
+    let scope = scope_for(os, role)
+        .ok_or_else(|| Said(format!("role {role:?} installs no daemon on {}", os.wire())))
+        .or_fail(ErrorCode::UnsupportedPlatform)?;
     let root_half = root_token.is_some();
     if root_half && !(os == HostOs::Macos && scope == Scope::PerUser) {
-        return Err(failed(
+        return Err(steps.fail(
             ErrorCode::UnsupportedPlatform,
-            format!(
+            Said(format!(
                 "the root half is a macOS daemon install's; this is {} ({})",
                 os.wire(),
                 scope.wire()
-            ),
+            )),
         ));
     }
-    let tool = ud::elevation_tool(os).ok_or_else(|| {
-        failed(
-            ErrorCode::UnsupportedPlatform,
-            format!("no administrator prompt is known for {}", os.wire()),
-        )
-    })?;
+    let tool = ud::elevation_tool(os)
+        .ok_or_else(|| {
+            Said(format!(
+                "no administrator prompt is known for {}",
+                os.wire()
+            ))
+        })
+        .or_fail(ErrorCode::UnsupportedPlatform)?;
     emit(on_event, ProgressEvent::PreflightStarted);
     let detected = ud::detect(os);
     emit(
@@ -327,25 +321,25 @@ async fn run_install_inner(
     // the role).
     let features = crate::features::fetch(&server).await;
     if !features.daemon_offered(os) {
-        return Err(failed(
+        return Err(steps.fail(
             ErrorCode::UnsupportedPlatform,
-            format!(
+            Said(format!(
                 "{server} does not offer the daemon install from this wizard on {} (its setup \
                  features say so, or it is an older server). Install from a terminal with \
                  `curl -fsSL {}/api/setup/install.sh | sh -s -- --role daemon …`, pick the \
                  tunnel client, or choose another server.",
                 os.wire(),
                 server.trim_end_matches('/')
-            ),
+            )),
         ));
     }
-    diag.ok();
+    steps.ok();
 
+    // Between two steps, so a failure here is the preflight's (#3432), and
+    // the diagnostics record none, as before.
     let config_path = match scope {
         Scope::System => ud::system_config_path(),
-        Scope::PerUser => {
-            ud::per_user_config_path().map_err(|e| failed(ErrorCode::ConfigWrite, e))?
-        }
+        Scope::PerUser => ud::per_user_config_path().or_fail(ErrorCode::ConfigWrite)?,
     };
     let install_info = |scope: Scope| {
         let mut install = roomlerd::enrollment::InstallInfo::new(
@@ -355,7 +349,7 @@ async fn run_install_inner(
                 Scope::PerUser => roomlerd::enrollment::InstallScope::PerUser,
             },
         );
-        install.run = diag.run_id();
+        install.run = Diagnostics::global().run_id();
         install
     };
     // F5 — an earlier attempt's work, for the same server, name and scope.
@@ -420,7 +414,11 @@ async fn run_install_inner(
     let mut scratch: Option<Scratch> = None;
     let mut take: Vec<String> = Vec::new();
     if (scope == Scope::System || root_half) && !skip_privileged {
-        diag.begin(Step::Enroll);
+        steps.begin(if root_half {
+            StepId::RootHalf
+        } else {
+            StepId::Enroll
+        });
         if let Err(e) = check_cancel() {
             // A kept enrollment goes back for the next attempt: dropping its
             // scratch would shred a config whose token is already spent.
@@ -492,17 +490,17 @@ async fn run_install_inner(
         }
         take = root_options.touched_keys();
         scratch = Some(s);
-        diag.ok();
+        steps.ok();
     }
     let has_root_config = scratch.is_some();
     let scratch = match scratch {
         Some(s) => s,
-        None => Scratch::create().map_err(|e| failed(ErrorCode::ConfigWrite, e))?,
+        None => Scratch::create().or_fail(ErrorCode::ConfigWrite)?,
     };
 
     // --- Step 3: the privileged half, under ONE native prompt ------------
     if !skip_privileged {
-        diag.begin(Step::Msi);
+        steps.begin(StepId::Package);
         if let Err(e) = check_cancel() {
             keep_unplaced(scratch, &made);
             return Err(e);
@@ -538,23 +536,22 @@ async fn run_install_inner(
             placement_problem(has_root_config, ud::system_config_path().is_file())
         {
             keep_unplaced(scratch, &made);
-            return Err(failed(ErrorCode::MsiFatal, problem));
+            return Err(steps.fail(ErrorCode::MsiFatal, Said(problem)));
         }
-        diag.ok();
+        steps.ok();
         // Placed: the file has done its job.
         scratch.shred_config();
         // F1 — a cancel that came while the half ran (or the moment after):
         // it ran to its end, and the install stops here, saying so.
         if done.cancelled_late || cancel_requested() {
             keep_after_privileged(&made);
-            Diagnostics::global().cancelled();
-            return Err(cancelled_after_privileged(scope, root_half));
+            return Err(steps.cancelled_with(cancelled_after_privileged(scope, root_half)));
         }
     }
 
     // --- Step 4 (per-user): enroll in-process, as the person -------------
     if scope == Scope::PerUser {
-        diag.begin(Step::Enroll);
+        steps.begin(StepId::Enroll);
         if let Err(e) = check_cancel() {
             keep_after_privileged(&made);
             return Err(e);
@@ -568,14 +565,14 @@ async fn run_install_inner(
             Ok(existing) => existing,
             Err(said) => {
                 keep_after_privileged(&made);
-                return Err(failed(
+                return Err(steps.fail(
                     ErrorCode::ConfigWrite,
-                    format!(
+                    Said(format!(
                         "{said} It belongs to another account: give it back to yours (sudo chown \
                          \"$USER\" '{}') or remove it, then retry. Nothing was enrolled, and the \
                          enrollment token is still unused.",
                         config_path.display()
-                    ),
+                    )),
                 ));
             }
         };
@@ -611,10 +608,8 @@ async fn run_install_inner(
                     Ok(e) => e,
                     Err(e) => {
                         keep_after_privileged(&made);
-                        return Err(failed(
-                            enroll_error_code(&e),
-                            person_enroll_refusal(&e, root_half),
-                        ));
+                        let advice = enroll_advice(&e, root_half);
+                        return Err(steps.fail(enroll_error_code(&e), e).advise(advice));
                     }
                 };
                 let note = crate::enroll_step::finish(
@@ -624,7 +619,8 @@ async fn run_install_inner(
                     &device_options(os, &advanced),
                     overlay_default(os, scope),
                 )
-                .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
+                .map_err(Said)
+                .or_fail(ErrorCode::AdvancedOptions)?;
                 if let Some(message) = note {
                     warn(on_event, message);
                 }
@@ -637,9 +633,9 @@ async fn run_install_inner(
                 if let Some(message) = give_netstack_port(os, &mut cfg) {
                     warn(on_event, message);
                 }
-                roomlerd::config::save(&config_path, &cfg).map_err(|e| {
-                    failed(ErrorCode::ConfigWrite, format!("write config.toml: {e}"))
-                })?;
+                roomlerd::config::save(&config_path, &cfg)
+                    .context("write config.toml")
+                    .or_fail(ErrorCode::ConfigWrite)?;
                 // The device this install enrolled: on an org added beside the
                 // primary, that org's row, never the primary's.
                 let (agent_id, tenant_id) = roomlerd::enrollment::enrolled_identity(&cfg, &outcome);
@@ -647,24 +643,32 @@ async fn run_install_inner(
                 made.ids = Some((agent_id, tenant_id));
             }
         }
-        diag.ok();
-    }
-    let (agent_id, tenant_id) = made.ids.clone().ok_or_else(|| {
-        failed(
-            ErrorCode::Other,
-            "no enrollment was made (a bug: the pipeline reached the user half without one)"
-                .to_string(),
-        )
-    })?;
-    if root_half && made.root_half_ids.is_none() {
-        return Err(failed(
-            ErrorCode::Other,
-            "the root half was not enrolled (a bug: the pipeline reached the user half without it)"
-                .to_string(),
-        ));
+        steps.ok();
     }
 
     // --- Step 5: the user half, as the person ----------------------------
+    // (No diagnostics step of its own: #3432's tracker names it.)
+    steps.begin(StepId::UserSteps);
+    let (agent_id, tenant_id) = made
+        .ids
+        .clone()
+        .ok_or_else(|| {
+            Said(
+                "no enrollment was made (a bug: the pipeline reached the user half without one)"
+                    .to_string(),
+            )
+        })
+        .or_fail(ErrorCode::Other)?;
+    if root_half && made.root_half_ids.is_none() {
+        return Err(steps.fail(
+            ErrorCode::Other,
+            Said(
+                "the root half was not enrolled (a bug: the pipeline reached the user half \
+                 without it)"
+                    .to_string(),
+            ),
+        ));
+    }
     if let Err(e) = check_cancel() {
         keep_after_privileged(&made);
         return Err(e);
@@ -703,18 +707,22 @@ async fn run_install_inner(
         Ok(run) => run,
         Err(e) => {
             keep_after_privileged(&made);
-            return Err(failed(
-                ErrorCode::Other,
-                format!(
-                    "the user steps could not start: {e}. The daemon is installed and enrolled; run `sh {} --user-steps --role daemon{}` yourself.",
-                    scratch.script.display(),
-                    if scope == Scope::System {
-                        " --system"
-                    } else {
-                        ""
-                    }
-                ),
-            ));
+            let yourself = format!(
+                "The daemon is installed and enrolled; run `sh {} --user-steps --role daemon{}` \
+                 yourself.",
+                scratch.script.display(),
+                if scope == Scope::System {
+                    " --system"
+                } else {
+                    ""
+                }
+            );
+            return Err(steps
+                .fail(
+                    ErrorCode::Other,
+                    anyhow::Error::from(e).context("the user steps could not start"),
+                )
+                .advise(yourself.as_str()));
         }
     };
     match ud::classify(Tool::Sh, &run) {
@@ -735,25 +743,29 @@ async fn run_install_inner(
             );
             keep_after_privileged(&made);
             check_cancel()?;
-            return Err(failed(
+            return Err(steps.fail(
                 ErrorCode::Other,
-                format!(
+                Said(format!(
                     "the user steps failed (exit {code}): {}. The daemon is installed and enrolled; Retry runs the steps again without enrolling twice.",
                     last_line(&run.stderr_tail)
-                ),
+                )),
             ));
         }
         HalfOutcome::Cancelled | HalfOutcome::Unavailable(_) => {
             keep_after_privileged(&made);
             return Err(check_cancel().err().unwrap_or_else(|| {
-                failed(ErrorCode::Other, "the user steps did not run".to_string())
+                steps.fail(
+                    ErrorCode::Other,
+                    Said("the user steps did not run".to_string()),
+                )
             }));
         }
     }
+    steps.ok();
 
     // --- Done ------------------------------------------------------------
     emit(on_event, ProgressEvent::Done);
-    diag.done();
+    steps.done();
     ud::clear_kept();
     let binary = ud::daemon_binary(os);
     let tag = ud::installed_version(&binary)
@@ -805,8 +817,9 @@ async fn enroll_system(
     options: &AdvancedOptions,
     overlay_default: Option<bool>,
     on_event: &Channel<ProgressEvent>,
-) -> Result<(Scratch, (String, String)), String> {
-    let s = Scratch::create().map_err(|e| failed(ErrorCode::ConfigWrite, e))?;
+) -> Result<(Scratch, (String, String)), Failure> {
+    let steps = Steps::global();
+    let s = Scratch::create().or_fail(ErrorCode::ConfigWrite)?;
     // F3 — which device the root daemon here is, before the enroll makes one
     // (it may make ANOTHER: see below).
     let root = if ud::system_config_path().is_file() {
@@ -820,15 +833,16 @@ async fn enroll_system(
         mut cfg, outcome, ..
     } = crate::enroll_step::enroll_folded(config_path, None, server, token, device_name, install)
         .await
-        .map_err(|e| failed(enroll_error_code(&e), enroll_refusal(&e)))?;
+        .map_err(|e| {
+            let advice = enroll_advice(&e, false);
+            steps.fail(enroll_error_code(&e), e).advise(advice)
+        })?;
     crate::enroll_step::finish(&mut cfg, &outcome, false, options, overlay_default)
-        .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
-    roomlerd::config::save(&s.config_from(), &cfg).map_err(|e| {
-        failed(
-            ErrorCode::ConfigWrite,
-            format!("write the enrolled config: {e}"),
-        )
-    })?;
+        .map_err(Said)
+        .or_fail(ErrorCode::AdvancedOptions)?;
+    roomlerd::config::save(&s.config_from(), &cfg)
+        .context("write the enrolled config")
+        .or_fail(ErrorCode::ConfigWrite)?;
     if let Some(message) = root
         .as_ref()
         .and_then(|r| r.new_row_warning(&cfg.agent_id, &cfg.tenant_id))
@@ -857,8 +871,9 @@ async fn enroll_root_half(
     install: roomlerd::enrollment::InstallInfo,
     options: &AdvancedOptions,
     on_event: &Channel<ProgressEvent>,
-) -> Result<(Scratch, (String, String)), String> {
-    let s = Scratch::create().map_err(|e| failed(ErrorCode::ConfigWrite, e))?;
+) -> Result<(Scratch, (String, String)), Failure> {
+    let steps = Steps::global();
+    let s = Scratch::create().or_fail(ErrorCode::ConfigWrite)?;
     let id = roomlerd::machine::resolve_root_half_machine_id(
         roomlerd::machine::read_mac_hardware(),
         random_bytes,
@@ -874,14 +889,19 @@ async fn enroll_root_half(
     let crate::enroll_step::Enrolled { cfg, .. } =
         crate::enroll_step::enroll_fresh_as(server, token, &name, &id.machine_id, install)
             .await
-            .map_err(|e| failed(enroll_error_code(&e), root_half_refusal(&e)))?;
-    let cfg = root_half_config(cfg, options)?;
-    roomlerd::config::save(&s.config_from(), &cfg).map_err(|e| {
-        failed(
-            ErrorCode::ConfigWrite,
-            format!("write the root half's enrolled config: {e}"),
-        )
-    })?;
+            .map_err(|e| {
+                let advice = enroll_advice(&e, false);
+                steps
+                    .fail(enroll_error_code(&e), e)
+                    .advise(advice)
+                    .advise(ROOT_HALF_STOPPED)
+            })?;
+    let cfg = root_half_config(cfg, options)
+        .map_err(Said)
+        .or_fail(ErrorCode::AdvancedOptions)?;
+    roomlerd::config::save(&s.config_from(), &cfg)
+        .context("write the root half's enrolled config")
+        .or_fail(ErrorCode::ConfigWrite)?;
     let ids = (cfg.agent_id.clone(), cfg.tenant_id.clone());
     Ok((s, ids))
 }
@@ -903,8 +923,7 @@ fn root_half_config(
         false,
         options,
         Some(true),
-    )
-    .map_err(|e| failed(ErrorCode::AdvancedOptions, e))?;
+    )?;
     Ok(cfg)
 }
 
@@ -952,42 +971,35 @@ pub fn cancelled_after_privileged(scope: Scope, root_half: bool) -> String {
     }
 }
 
-/// The enroll's refusal, for the person: a token the server already took
-/// (a Retry of an attempt that spent it, a token used twice) needs a new one.
-fn enroll_refusal(e: &anyhow::Error) -> String {
-    let text = format!("{e:#}");
-    if text.contains("already been used") {
-        format!(
-            "enrollment: {text}. An enrollment token works once: get a new one (or pair again) and Retry."
-        )
-    } else {
-        format!("enrollment: {text}")
+/// What a refused enrollment adds to its words for this install (#3432).
+/// Keyed on the server's answer as a type (`EnrollRejected` and its status),
+/// never on its text; the server's own sentence is in the words already. A 401
+/// is the token: one works once (a Retry of an attempt that spent it, a token
+/// used twice) and expires. A 403 after a Mac's root half took a device is
+/// most likely the plan's device limit (FR-129 B2): a Mac is two devices, and
+/// the second may not fit.
+fn enroll_advice(e: &anyhow::Error, after_root_half: bool) -> Option<&'static str> {
+    let rejected = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<roomlerd::enrollment::EnrollRejected>())?;
+    match rejected.status {
+        reqwest::StatusCode::UNAUTHORIZED => Some(
+            "An enrollment token works once, and expires: get a new one (or pair again) and Retry.",
+        ),
+        reqwest::StatusCode::FORBIDDEN if after_root_half => Some(
+            "If it is the plan's device limit: this Mac is two devices, and its private-network \
+             half took the last free one. Remove a device or upgrade the plan, then Retry, which \
+             reuses the private network's enrollment.",
+        ),
+        _ => None,
     }
 }
 
 /// FR-129 B2 — the root half's enroll refused: said as the private network's,
 /// since it comes first — before the administrator steps, and before the
 /// person's own half is enrolled.
-fn root_half_refusal(e: &anyhow::Error) -> String {
-    format!(
-        "the private network's root half could not be enrolled — {}. The install stopped before the administrator steps.",
-        enroll_refusal(e)
-    )
-}
-
-/// The person's half refused. After a root half that WAS enrolled (FR-129
-/// B2) the plan's device limit is the likely cause and worth naming: a Mac is
-/// two devices, and the second may not fit.
-fn person_enroll_refusal(e: &anyhow::Error, root_half: bool) -> String {
-    let said = enroll_refusal(e);
-    if root_half && said.contains("Device limit") {
-        format!(
-            "{said} This Mac is two devices, and its private-network half took the last free one: remove a device or upgrade the plan, then Retry, which reuses the private network's enrollment."
-        )
-    } else {
-        said
-    }
-}
+const ROOT_HALF_STOPPED: &str =
+    "This was the private network's root half: the install stopped before the administrator steps.";
 
 /// What the privileged half did, when it did not fail.
 #[derive(Debug)]
@@ -1005,7 +1017,7 @@ async fn run_privileged(
     scope: Scope,
     root_half: bool,
     on_event: &Channel<ProgressEvent>,
-) -> Result<PrivilegedDone, String> {
+) -> Result<PrivilegedDone, Failure> {
     let files = scratch.half_files();
     let cmd = ud::prompt_command(tool, &files, args);
     emit(
@@ -1046,7 +1058,7 @@ async fn run_privileged(
                     code,
                 },
             );
-            // `failed` records a cancel when the flag is set; the message
+            // `fail` records a cancel when the flag is set; the message
             // says both, since the half ran on and failed regardless.
             let message = if cancelled_late || cancel_requested() {
                 format!(
@@ -1062,7 +1074,7 @@ async fn run_privileged(
                     "the privileged install steps failed (exit {code}) — see the lines above. Nothing was enrolled on this side that a Retry cannot reuse."
                 )
             };
-            Err(failed(ErrorCode::MsiFatal, message))
+            Err(Steps::global().fail(ErrorCode::MsiFatal, Said(message)))
         }
         HalfOutcome::Cancelled => {
             emit(
@@ -1071,12 +1083,11 @@ async fn run_privileged(
                     half: Half::Privileged.wire().to_string(),
                 },
             );
-            Diagnostics::global().cancelled();
-            Err(
+            Err(Steps::global().cancelled_with(
                 "cancelled at the administrator prompt — nothing was installed. Try again and \
                  enter your password, or pick the tunnel client, which needs none."
                     .to_string(),
-            )
+            ))
         }
         HalfOutcome::Unavailable(reason) => {
             terminal_fallback(args, reason, os, scope, root_half, on_event)
@@ -1098,7 +1109,8 @@ async fn terminal_fallback(
     scope: Scope,
     root_half: bool,
     on_event: &Channel<ProgressEvent>,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
+    let steps = Steps::global();
     let command = ud::terminal_command(args);
     tracing::warn!(%reason, "no administrator prompt; showing the terminal command");
     emit(
@@ -1118,19 +1130,22 @@ async fn terminal_fallback(
         tokio::select! {
             res = &mut confirmed => {
                 if res.is_err() {
-                    return Err(failed(ErrorCode::Other, "the terminal step was abandoned".to_string()));
+                    return Err(steps.fail(
+                        ErrorCode::Other,
+                        Said("the terminal step was abandoned".to_string()),
+                    ));
                 }
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 check_cancel()?;
                 if started.elapsed() > ud::TERMINAL_BUDGET {
-                    return Err(failed(
+                    return Err(steps.fail(
                         ErrorCode::Other,
-                        format!(
+                        Said(format!(
                             "no confirmation within {} minutes that the terminal command ran",
                             ud::TERMINAL_BUDGET.as_secs() / 60
-                        ),
+                        )),
                     ));
                 }
             }
@@ -1139,21 +1154,21 @@ async fn terminal_fallback(
     // Their word, checked.
     let binary = ud::daemon_binary(os);
     if !binary.is_file() {
-        return Err(failed(
+        return Err(steps.fail(
             ErrorCode::Other,
-            format!(
+            Said(format!(
                 "the daemon is not installed yet ({} is missing): run the command shown, then click Continue",
                 binary.display()
-            ),
+            )),
         ));
     }
     if (scope == Scope::System || root_half) && !ud::system_config_path().is_file() {
-        return Err(failed(
+        return Err(steps.fail(
             ErrorCode::Other,
-            format!(
+            Said(format!(
                 "the enrolled config was not placed ({} is missing): run the command shown, then click Continue",
                 ud::SYSTEM_CONFIG
-            ),
+            )),
         ));
     }
     emit(
@@ -1268,10 +1283,9 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     let _ = channel.send(event);
 }
 
-fn check_cancel() -> Result<(), String> {
+fn check_cancel() -> Result<(), Failure> {
     if crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
-        Diagnostics::global().cancelled();
-        Err("install cancelled by operator".to_string())
+        Err(Steps::global().cancelled())
     } else {
         Ok(())
     }
@@ -1695,19 +1709,49 @@ mod tests {
         assert!(!enrollment_in(None, "aid"), "no config: nothing kept");
     }
 
-    /// F5 — a spent token's refusal names the remedy.
+    /// The server's refusal, as the enroll raises it: a type.
+    fn rejected(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+        roomlerd::enrollment::EnrollRejected {
+            status,
+            body: body.to_string(),
+        }
+        .into()
+    }
+
+    /// F5 — a spent token's refusal names the remedy. #3432: the server's
+    /// typed answer decides, never its text: the same sentence as plain text
+    /// gets no advice.
     #[test]
     fn a_spent_token_names_the_remedy() {
-        let e = anyhow::anyhow!(
+        let e = rejected(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "This enrollment token has already been used",
+        );
+        let advice = enroll_advice(&e, false).expect("a 401 is the token");
+        assert!(
+            advice.contains("works once") && advice.contains("pair again"),
+            "{advice}"
+        );
+        let words = crate::failure::Failure::build(
+            crate::steps::StepId::Enroll,
+            ErrorCode::EnrollRejected,
+            false,
+            &e,
+        )
+        .advise(advice)
+        .words;
+        assert!(
+            words.contains("already been used") && words.ends_with(advice),
+            "{words}"
+        );
+        let as_text = anyhow::anyhow!(
             "enrollment rejected (status 401 Unauthorized): This enrollment token has already been used"
         );
-        let said = enroll_refusal(&e);
-        assert!(
-            said.contains("works once") && said.contains("pair again"),
-            "{said}"
+        assert_eq!(enroll_advice(&as_text, false), None);
+        assert_eq!(
+            enroll_advice(&anyhow::anyhow!("connection refused"), false),
+            None
         );
-        let other = enroll_refusal(&anyhow::anyhow!("connection refused"));
-        assert_eq!(other, "enrollment: connection refused");
     }
 
     /// FR-129 B2 — the refusals of a Mac's two enrollments. The root half's
@@ -1716,23 +1760,23 @@ mod tests {
     /// the likely reason, and the Retry reuses the root half.
     #[test]
     fn a_macs_two_refusals_say_which_half_and_why() {
-        let e = anyhow::anyhow!(
-            "enrollment rejected (status 403 Forbidden): Device limit reached for the Free plan (100 of 100 devices used). Upgrade the plan or remove a device first."
+        let e = rejected(
+            reqwest::StatusCode::FORBIDDEN,
+            "Device limit reached for the Free plan (100 of 100 devices used). Upgrade the plan or remove a device first.",
         );
-        let root = root_half_refusal(&e);
         assert!(
-            root.contains("private network's root half")
-                && root.contains("stopped before the administrator steps"),
-            "{root}"
+            ROOT_HALF_STOPPED.contains("private network's root half")
+                && ROOT_HALF_STOPPED.contains("stopped before the administrator steps"),
+            "{ROOT_HALF_STOPPED}"
         );
-        let person = person_enroll_refusal(&e, true);
+        let person = enroll_advice(&e, true).expect("a 403 after the root half");
         assert!(
             person.contains("two devices") && person.contains("reuses the private network"),
             "{person}"
         );
-        assert_eq!(person_enroll_refusal(&e, false), enroll_refusal(&e));
+        assert_eq!(enroll_advice(&e, false), None);
         let other = anyhow::anyhow!("connection refused");
-        assert_eq!(person_enroll_refusal(&other, true), enroll_refusal(&other));
+        assert_eq!(enroll_advice(&other, true), None);
         let note = two_devices_note("studio");
         assert!(
             note.contains("\"studio\"") && note.contains("\"studio-daemon\""),

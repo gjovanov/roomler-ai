@@ -373,6 +373,11 @@
       <div id="install-error" class="error" hidden>
         <h3 id="install-error-title">Install failed</h3>
         <p id="install-error-message"></p>
+        <!-- #3432: every cause under the words, outermost first. -->
+        <details id="install-error-details" hidden>
+          <summary>Details</summary>
+          <ol id="install-error-chain"></ol>
+        </details>
         <footer class="actions">
           <button id="install-retry" class="secondary">Retry</button>
           <button id="install-back-to-welcome">← Back to start</button>

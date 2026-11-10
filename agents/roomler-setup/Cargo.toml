@@ -96,6 +96,10 @@ toml = { workspace = true }
 roomler-ai-remote-control = { path = "../../crates/remote_control", default-features = false }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+# #3432 — a refused certificate is told by its type, `native_tls::Error`, the
+# error reqwest's default TLS (Schannel, OpenSSL, Secure Transport) raises in
+# the handshake. The same 0.2 reqwest already links: nothing new compiles.
+native-tls = "0.2"
 
 # FR-129 B1 — the Linux/macOS daemon pipeline's private scratch directory
 # (0700, the person's own) for the embedded `install.sh` and the
@@ -124,6 +128,10 @@ roomler-node-core = { path = "../../crates/agent-core", features = ["test-fixtur
 # its `cfg` applied, to see how each spawn names its program.
 syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
+# #3432 — the failure table's TLS server, with a certificate no one trusts.
+# Ring-only, as the rest of the tree resolves them (no aws-lc-rs).
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
 
 # #3609 — tests only: `machine_write`'s NTFS case runs the wizard's side with a
 # limited copy of the test's token (CreateRestrictedToken), as a

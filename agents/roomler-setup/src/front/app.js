@@ -111,6 +111,7 @@ const state = {
   rootTokenValidating: false,
   installError: null,
   installErrorStep: null, // step scope from the last Error event
+  installErrorChain: [],  // #3432: the failure's causes, outermost first
   installDone: null,   // DoneReport
   installInFlight: false,
   msiSpawned: false,   // relabels Cancel → Force-kill installer
@@ -1580,6 +1581,7 @@ function wireInstall() {
   document.getElementById("install-back-to-welcome").addEventListener("click", async () => {
     state.installError = null;
     state.installErrorStep = null;
+    state.installErrorChain = [];
     installRows = new Map();
     // FR-129: a failed paired install's token is dropped with the pairing —
     // the next pass through the Join step starts clean.
@@ -1593,6 +1595,7 @@ async function runInstall() {
   installRows = new Map();
   state.installError = null;
   state.installErrorStep = null;
+  state.installErrorChain = [];
   state.installDone = null;
   state.installInFlight = true;
   state.msiSpawned = false;
@@ -1677,7 +1680,10 @@ async function runInstall() {
     );
   } catch (err) {
     console.error("[runInstall] cmd_install threw:", err);
-    state.installError = String(err);
+    // #3432 — the install's failure: its step, its words and every cause.
+    state.installError = err?.words ?? String(err);
+    state.installErrorChain = Array.isArray(err?.chain) ? err.chain : [];
+    if (err?.step) state.installErrorStep = err.step;
     state.installInFlight = false;
     renderInstall();
   }
@@ -1816,6 +1822,16 @@ function renderInstall() {
     document.getElementById("install-error-title").textContent =
       state.installErrorStep ? `Install failed at: ${state.installErrorStep}` : "Install failed";
     document.getElementById("install-error-message").textContent = state.installError;
+    const chain = state.installErrorChain ?? [];
+    const chainEl = document.getElementById("install-error-chain");
+    chainEl.replaceChildren(
+      ...chain.map((cause) => {
+        const li = document.createElement("li");
+        li.textContent = cause;
+        return li;
+      }),
+    );
+    document.getElementById("install-error-details").hidden = chain.length === 0;
     cancelBtn.hidden = true;
   } else {
     errorEl.hidden = true;
@@ -1889,7 +1905,7 @@ function checklistLabel(event) {
   if (t === "AnchorSkipped") return `Not anchored: ${d.reason}`;
   if (t === "DaemonRestartOk" && d.pid) return `${base} (PID ${d.pid})`;
   if (t === "DaemonRestartSkipped") return `${base}: ${d.reason}`;
-  if (t === "Error") return `Error at ${d.step}: ${d.message}`;
+  if (t === "Error") return `Error at ${d.step}: ${d.words}`;
   if (t === "SystemContextError") {
     const stageLabel = {
       env_var_write: "Saving the service's lock-screen setting",

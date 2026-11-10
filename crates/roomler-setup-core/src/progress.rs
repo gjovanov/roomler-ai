@@ -200,10 +200,23 @@ pub enum ProgressEvent {
     /// Whole install finished. SPA transitions to the Done step.
     Done,
 
-    /// Fatal error at some step. SPA surfaces the recovery panel
-    /// scoped to `step` (`"preflight"` / `"resolve"` / `"download"` /
-    /// `"msi"` / `"extract"` / `"integration"` / `"enroll"`).
-    Error { step: String, message: String },
+    /// #3432 — the install stopped. `step` is the step that was running
+    /// (`"preflight"`, `"resolve"`, `"download"`, `"verify"`, `"package"`,
+    /// `"extract"`, `"integrate"`, `"root_half"`, `"enroll"`, `"restart"`,
+    /// `"user_steps"`, `"companion"`, `"anchor"`), `kind` what kind of
+    /// failure it was (decided on the error's types: `"connection_refused"`,
+    /// `"name_not_resolved"`, `"certificate_refused"`, `"timed_out"`,
+    /// `"status"` with its `status`, …), `words` what failed, why and what to
+    /// try, and `chain` every cause, outermost first. The wizard's own
+    /// `failure::Failure` fills it; this crate keeps plain fields so it stays
+    /// free of the app's types.
+    Error {
+        step: String,
+        kind: String,
+        status: Option<u16>,
+        words: String,
+        chain: Vec<String>,
+    },
 
     /// Daemon SystemContext role only: a WiX `EnableSystemContext` /
     /// `DisableSystemContext` custom action failed inside msiexec.
@@ -440,5 +453,34 @@ mod tests {
         let a = replay_log();
         let b = replay_log();
         assert!(std::ptr::eq(a, b));
+    }
+
+    /// #3432 — the terminal event carries the step, the kind, the status, the
+    /// words and the chain, and no `message`.
+    #[test]
+    fn error_carries_step_kind_words_and_chain() {
+        let event = ProgressEvent::Error {
+            step: "resolve".into(),
+            kind: "status".into(),
+            status: Some(503),
+            words: "Roomler Setup could not find the installer.".into(),
+            chain: vec!["GET https://roomler.ai/x answered 503 Service Unavailable".into()],
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "Error",
+                "data": {
+                    "step": "resolve",
+                    "kind": "status",
+                    "status": 503,
+                    "words": "Roomler Setup could not find the installer.",
+                    "chain": ["GET https://roomler.ai/x answered 503 Service Unavailable"],
+                },
+            })
+        );
+        let back: ProgressEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, event);
     }
 }

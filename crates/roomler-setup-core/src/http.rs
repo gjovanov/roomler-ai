@@ -117,8 +117,9 @@ impl HttpStatus {
     }
 }
 
-/// The first `SAID_MAX` characters of `body`, whitespace folded.
-fn said_of(body: &str) -> String {
+/// The first `SAID_MAX` characters of `body`, whitespace folded: what of a
+/// server's refusal is kept, wherever it is read.
+pub fn said_of(body: &str) -> String {
     let folded = body.split_whitespace().collect::<Vec<_>>().join(" ");
     match folded.char_indices().nth(SAID_MAX) {
         Some((cut, _)) => format!("{}…", &folded[..cut]),

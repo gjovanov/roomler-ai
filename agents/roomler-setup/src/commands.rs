@@ -653,8 +653,8 @@ pub async fn cmd_install(
     advanced: Option<crate::orchestrator_agent::AdvancedOptions>,
     use_paired: Option<bool>,
     on_event: tauri::ipc::Channel<wizard_shared::progress::ProgressEvent>,
-) -> Result<DoneReport, String> {
-    refuse_a_role_this_run_cannot_install(role)?;
+) -> Result<DoneReport, crate::failure::Failure> {
+    refuse_a_role_this_run_cannot_install(role).map_err(refused_before_the_run)?;
     let store = crate::pairing::PairStore::global();
     let root_half = crate::role::wants_root_half(
         crate::role::HostOs::current(),
@@ -663,7 +663,8 @@ pub async fn cmd_install(
     );
     let (tokens, paired) = resolve_install_tokens(
         store, role, &server, token, root_token, use_paired, root_half,
-    )?;
+    )
+    .map_err(refused_before_the_run)?;
     let crate::pairing::InstallTokens {
         main: token,
         root_half: root_token,
@@ -707,6 +708,20 @@ pub async fn cmd_install(
         store.finish();
     }
     report
+}
+
+/// #3432 — `cmd_install` refused before any step ran (a role this run cannot
+/// install, a token it cannot use): the preflight's failure, in the refusal's
+/// own words, and the same line in the wizard's log.
+fn refused_before_the_run(words: String) -> crate::failure::Failure {
+    let failure = crate::failure::Failure::build(
+        crate::steps::StepId::Preflight,
+        roomler_ai_remote_control::setup_diagnostics::ErrorCode::Preflight,
+        false,
+        &crate::failure::Said(words).into(),
+    );
+    failure.log();
+    failure
 }
 
 /// Which tokens `cmd_install` enrolls with: the pasted ones as given, or —
