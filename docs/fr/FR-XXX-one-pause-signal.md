@@ -1,6 +1,6 @@
 # FR-XXX: One pause signal — a host's sleep reads as a sleep on every OS, and every loop hears it the same way
 
-**Issue:** [#3539](https://github.com/gjovanov/roomler-ai/issues/3539) (the FR issue is opened at the claim) · **Status:** draft 2026-11-10, number not yet claimed; D1–D6 (§8) open; nothing built · **Owner:** the overlay runtime (tunnel-core), the agent's control and `/derp` WS loops, the agent's watchdog, FR-55's sleep hook · **Anchors:** master `0d0f55d55`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** #3539's triage re-spec of 2026-11-08, which also closed [#3540](https://github.com/gjovanov/roomler-ai/issues/3540) into it · **Builds on:** [FR-55](FR-55-always-reachable.md) P4 (the OS sleep hook), #3530 (`tunnel_core::frozen` and the watchdog-of-watchdog's late bound), the overlay's P8 (the clean slate after a resume) · **Related:** #3541 (the demote-follow), [FR-138](FR-138-the-session-outlives-its-control-socket.md) (which `ConnExit` a sleep produces), #3528 (a clock step and WireGuard)
+**Issue:** [#3539](https://github.com/gjovanov/roomler-ai/issues/3539) (the FR issue is opened at the claim) · **Status:** draft 2026-11-10, number not yet claimed; D1–D6 (§8) open; nothing built · **Owner:** the overlay runtime (tunnel-core), the agent's control and `/derp` WS loops, the agent's watchdog, FR-55's sleep hook · **Anchors:** master `814db2dd5`, a doc-level pin: every `file:line` below is at that commit, and a later PR does not shift them · **Opened by:** #3539's triage re-spec of 2026-11-08, which also closed [#3540](https://github.com/gjovanov/roomler-ai/issues/3540) into it · **Builds on:** [FR-55](FR-55-always-reachable.md) P4 (the OS sleep hook), #3530 (`tunnel_core::frozen` and the watchdog-of-watchdog's late bound), the overlay's P8 (the clean slate after a resume) · **Related:** #3541 (the demote-follow), [FR-138](FR-138-the-session-outlives-its-control-socket.md) (which `ConnExit` a sleep produces), #3528 (a clock step and WireGuard)
 
 ## Summary, for the operator
 
@@ -16,14 +16,15 @@ behave like Windows today.
 OS's sleep clock says how long the host slept wherever the OS keeps one. Where the clocks ran through the sleep, the
 sleep notice FR-55 already receives marks the late tick as a sleep. A late tick with no notice is a freeze, and a
 wall-clock jump that neither explains is a step. Each loop keeps its own policy: the overlay takes the clean slate
-after any real sleep, on every OS; the WS loops cycle at once; the async watchdog takes the pause off its pumps'
-ages; a step is logged and drops nothing.
+after any real sleep, on every OS, and the `/derp` WS cycles at once; the control WS ends a slept connection by
+FR-138's rule, so a remote session closes after a sleep of 120 s or more and is kept through a shorter one; the async
+watchdog takes the pause off its pumps' ages; a step is logged and drops nothing.
 
 **What it costs**: one module with three OS clock reads (no new crate), four readers, and a shadow phase that logs
 what each reader would do before any of them acts. Every reader ships dark behind its own switch, and one switch puts
-all of them back on today's rules. The six decisions (§8): the source model (D1), the sleep threshold (D2), the
-freeze policy (D3), the hook when FR-55's switches are off (D4), the clock step (D5), and where the Windows RED runs
-(D6).
+all of them back on today's rules. The six decisions (§8): the source model (D1), the overlay's sleep threshold (D2),
+the freeze policy (D3), the hook when FR-55's switches are off (D4), the clock step (D5), and where the Windows RED
+runs (D6). The line at which a sleep ends a remote session is not among them: it stays FR-138's (§4).
 
 ## 1. Goal
 
@@ -31,6 +32,9 @@ A pause of the process means the same thing to every loop that reads it, on ever
 
 - After any real sleep the overlay takes the same clean slate on Windows, Linux and macOS, with no strike and no
   penalty booked from the sleep's own silence, and the `/derp` WS reconnects at the wake.
+- A remote session ends at a sleep by FR-138's rule on every OS: at a sleep FR-55 announced, or after a measured
+  sleep of at least `RESUME_SKEW_MIN` (120 s), including one that starts while FR-138 keeps the session through its
+  gap. A shorter sleep keeps it, and so does a freeze.
 - A wall-clock step is not a sleep: it drops no carrier, cycles no socket and ends no remote session.
 - A freeze (SIGSTOP, a cgroup freeze, a VM pause, a debugger) is told apart from a sleep, and gets its own policy.
 - The async watchdog convicts no pump for time the process did not run (#3540's class).
@@ -50,7 +54,7 @@ A pause of the process means the same thing to every loop that reads it, on ever
 | the async watchdog | `agents/roomlerd/src/watchdog.rs:561` | a scan more than 5 + 60 s late resets every pump | nothing: neither the scan nor the pumps' ages saw the sleep | past 65 s every pump is reset; under it the pause counts against each pump's age | as the column before | nothing |
 | the watchdog-of-watchdog | `watchdog.rs:624` | a sleep that came back more than 10 s late takes a new baseline | nothing | a new baseline | a new baseline | nothing |
 
-Three things follow.
+Four things follow.
 
 - **The middle two columns are one column today.** Nothing in the daemon tells a Windows sleep or a VM's suspend
   from a freeze, so all three get a freeze's treatment: the sweep's convictions and the RX deadlines.
@@ -60,6 +64,11 @@ Three things follow.
   `crates/tunnel-core/src/overlay/lifecycle.rs:183`).
 - **A step ends remote sessions.** The control WS's cycle is `ResumeFromSuspend`, which FR-138 keeps terminal
   (`agents/roomlerd/src/session_table.rs:171-172`): every peer closes.
+- **A Windows sleep with no goodbye keeps the sessions FR-138 would close.** Where FR-55 said no goodbye (its
+  announcement off, or a sleep the OS did not announce), the control WS ends at the RX deadline as `RxDeadline`
+  (`signaling.rs:2357-2390`), however long the sleep. With FR-138's keep switch on (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`,
+  off by default, `session_table.rs:73-76`) that exit keeps every session. FR-138's owner found it in the review of
+  FR-138 P2a (its finding M2), and FR-138 plans the fix as P2a-2 (§4).
 
 ### 2.2 What the overlay loses after a Windows sleep [R]
 
@@ -92,7 +101,7 @@ not cleared. A wired desktop has no such event. Every cell in §6 says which cas
 
 ### 2.3 What the clocks count, per OS
 
-`docs/remote-control.md` § "Across a freeze or a suspend" (`:5290`) has the table, with its sources [R]. `Instant` is
+`docs/remote-control.md` § "Across a freeze or a suspend" (`:5295`) has the table, with its sources [R]. `Instant` is
 `QueryPerformanceCounter` on Windows, `CLOCK_MONOTONIC` on Linux and `CLOCK_UPTIME_RAW` on macOS. QPC counts a host
 sleep ("including the time when the machine was in a sleep state such as standby, hibernate, or connected standby");
 the other two stop. A timeout stops across a sleep on all three (on Windows since Windows 8), and all three count a
@@ -174,7 +183,7 @@ On the frozen end's pair to a lab node that kept running, which rode `/derp` in 
 #3540, closed into this FR on 2026-11-08: a 30–65 s freeze during a remote session forces an exit through the
 encoder's and the capture's 30 s thresholds, because the async watchdog resets its pumps only once a scan is more than
 5 + 60 = 65 s late (`watchdog.rs:561`); under that, the pause counts against each pump's age. On master both pumps
-are registered inactive (`agents/roomlerd/src/app.rs:4342-4343`) and nothing gates them on (only the signaling pump
+are registered inactive (`agents/roomlerd/src/app.rs:4432-4433`) and nothing gates them on (only the signaling pump
 is gated, `signaling.rs:816`, `:823`), so the class is dormant and no field RED is possible on the release. Its RED is
 a unit test at the pin with a 30 s pump gated on. Its proposal is P4 here: take the scan's own lateness off every
 pump's age, still catch a real stall at most one scan later, and pin both with an injected-clock test like
@@ -184,7 +193,7 @@ pump's age, still catch a real stall at most one scan later, and pin both with a
 
 - P8's doc comment says QPC stops across a sleep (`runtime.rs:559-562`). It counts it. P2 corrects the comment.
 - `ConnExit::ResumeFromSuspend`'s doc says "at least `RESUME_SKEW_MIN` napped" (`session_table.rs:99`). P3 rewords it.
-- `docs/remote-control.md` cited `RESUME_SKEW_MIN` at `signaling.rs:599` (`:5303`); it is at `:600`. Fixed in the
+- `docs/remote-control.md` cited `RESUME_SKEW_MIN` at `signaling.rs:599` (`:5308`); it is at `:600`. Fixed in the
   commit that adds this spec.
 - FR-55's `HOLD_MAX` doc says the sleep stops its clock on Linux and macOS (`sleep_notice.rs:300-303`). It does not on
   Windows, nor in FR-55's lab guest. Both paths reconnect, so it stays out of scope (§9).
@@ -208,7 +217,7 @@ flowchart LR
     WALL --> PAUSE
     PAUSE["tunnel_core::pause<br/>one Ticker per reader<br/>Gap: slept · frozen · step"]
     PAUSE --> OV["overlay<br/>clean slate"]
-    PAUSE --> CW["control WS<br/>cycle"]
+    PAUSE --> CW["control WS and its gap<br/>FR-138's line"]
     PAUSE --> DW["/derp WS<br/>cycle"]
     AWD["async watchdog<br/>its own lateness, from LATE_MIN"]
     WOW["watchdog-of-watchdog<br/>unchanged"]
@@ -266,6 +275,7 @@ impl Ticker {
 pub fn announced();                     // from sleep_notice's will_sleep
 pub fn woke();                          // from sleep_notice's woke(): the nudge
 pub fn wakes() -> watch::Receiver<u64>; // what a reader selects on
+pub fn sleeps() -> watch::Receiver<u64>; // each announced sleep: what FR-138's gap selects on (§3.4)
 ```
 
 Each reader's period is its own (the overlay's 5 s, the keepalives' 25 s), so its lateness reads against what that
@@ -273,21 +283,33 @@ reader expected.
 
 ### 3.4 The readers
 
-| reader | where | today | a sleep, from D2's bar | a freeze | a step | the nudge |
+| reader | where | today | a sleep | a freeze | a step | the nudge |
 |---|---|---|---|---|---|---|
-| the overlay | `runtime.rs:3067-3125`, before the sweep at `:3218`, as today | P8's skew rule | P8's clean slate, all four parts (§2.2), one line naming the source and the seconds | D3 | one line, nothing dropped (D5) | the fallback tick at once |
-| the control WS | `signaling.rs:2338-2356` | A5's skew rule | cycle at once as `ResumeFromSuspend` | today's RX deadline, `RxDeadline` | nothing | the keepalive at once |
-| the `/derp` WS | `derp.rs:421-436` | A5's skew rule | cycle at once | today's RX deadline | nothing | the keepalive at once |
+| the overlay | `runtime.rs:3067-3125`, before the sweep at `:3218`, as today | P8's skew rule | from D2's bar: P8's clean slate, all four parts (§2.2), one line naming the source and the seconds | D3 | one line, nothing dropped (D5) | the fallback tick at once |
+| the control WS | `signaling.rs:2338-2356` | A5's skew rule | from `RESUME_SKEW_MIN` (120 s), FR-138's line: end at once as `ResumeFromSuspend`, which closes every session FR-138 keeps. Under it nothing new: the RX deadline decides, as `RxDeadline`, which keeps them | today's RX deadline, `RxDeadline` | nothing | the keepalive at once |
+| the control WS's gap, while FR-138 keeps sessions and no connection exists | `run`'s backoff wait and its dial; FR-55's hold is read only before a dial (`signaling.rs:1206-1218`) | nothing: a sleep that starts in the gap closes nothing | an announced sleep closes the kept sessions as `Sleep`; a wake measured from `RESUME_SKEW_MIN` closes them as `ResumeFromSuspend` | nothing: kept | nothing | the gap reads the wake at once |
+| the `/derp` WS | `derp.rs:421-436` | A5's skew rule | from D2's bar: cycle at once | today's RX deadline | nothing | the keepalive at once |
 | the async watchdog | `watchdog.rs:537-577` | every pump reset past 65 s | the scan's own lateness, from `LATE_MIN`, taken off every pump's age | the same | nothing: it reads `Instant` | — |
 | the watchdog-of-watchdog | `watchdog.rs:599` | a new baseline past 10 s late | unchanged | unchanged | — | — |
 
 - **The async watchdog reads its own lateness**, on `Instant`, the clock its pumps' ages are on. That is right for a
   sleep and a freeze alike on every OS, so it shares `LATE_MIN` with the module rather than the module itself. A pump
   still stuck after the pause exits at its own threshold, one scan later at most.
-- **The control WS seldom has a socket to cycle after a sleep FR-55 announced.** The goodbye ended it at the sleep
-  (`ConnExit::Sleep`, `signaling.rs:2292`), and the reconnect waits in the hold. Its new arm matters where no goodbye
-  was said: no hook, or a sleep the OS did not announce. The `/derp` WS gets no goodbye, so it is the socket that
-  changes at every wake.
+- **The control WS ends a slept connection at FR-138's line, not at D2's.** After a sleep FR-55 announced it seldom
+  has a socket: the goodbye ended it at the sleep (`ConnExit::Sleep`, `signaling.rs:2292`), and the reconnect waits in
+  the hold. Its new arm matters where no goodbye was said: the announcement off, no hook, or a sleep the OS did not
+  announce. There a measured sleep of at least `RESUME_SKEW_MIN` ends the connection as `ResumeFromSuspend`, and a
+  shorter one leaves the RX deadline to decide, as today. The line is FR-138's (§4): under it FR-138 keeps a session
+  through the socket's loss on purpose, and over it the viewer's ICE consent has long failed. This is FR-138's
+  planned P2a-2, fed by the signal.
+- **FR-138's gap hears a sleep too** (FR-138's finding L12). While FR-138 keeps sessions and no connection exists,
+  `run` reads FR-55's hold only before a dial (`signaling.rs:1206-1218`). A sleep that starts in the backoff wait or
+  during a dial is over by the next look, unless that look falls in the seconds before the host sleeps, so it closes
+  nothing, and the kept sessions outlive it. The gap selects on `pause::sleeps()` and `pause::wakes()` wherever it
+  waits: an announced sleep closes the kept sessions as `Sleep`, as a connected loop's goodbye does, and a wake
+  measured from `RESUME_SKEW_MIN` closes them as `ResumeFromSuspend`.
+- **The `/derp` WS carries no session.** It gets no goodbye either, so it is the socket that changes at every wake,
+  from D2's bar, and cycling it costs a reconnect and nothing FR-138 keeps.
 - **The watchdog-of-watchdog already reads lateness** (#3530) and conforms. It is listed so the class is complete.
 
 ### 3.5 A wake, end to end
@@ -329,7 +351,7 @@ a penalty, and the `/derp` WS waits for its RX deadline at its next keepalive (�
 |---|---|---|
 | `ROOMLERD_PAUSE_SIGNAL` | on from P1 | the module samples and logs nothing, and every reader runs the release's rule, byte for byte |
 | `ROOMLERD_PAUSE_OVERLAY` | off as P2 ships; on once AC2–AC5 read GREEN | the overlay keeps P8's skew rule |
-| `ROOMLERD_PAUSE_WS` | off as P3 ships; on once AC3's `/derp` line and AC6 read GREEN | both WS loops keep A5's skew rule |
+| `ROOMLERD_PAUSE_WS` | off as P3 ships; on once AC3's `/derp` line, AC6 and AC10 read GREEN | both WS loops keep A5's skew rule (or FR-138's P2a-2, if it landed first), and FR-138's gap reads only the hold, as today |
 | `ROOMLERD_PAUSE_WATCHDOG` | off as P4 ships; on once AC8 reads GREEN | the async watchdog keeps its 65 s reset alone |
 | `ROOMLERD_PAUSE_FREEZE_SLATE` | off until F8 beats P0's baseline (D3) | a freeze takes no clean slate |
 
@@ -339,6 +361,7 @@ environment or its config file sets it. The skew rules stay in the code behind t
 ### 3.7 What does not change
 
 - FR-55's goodbye and its hold, and the control WS's `ConnExit::Sleep` at a sleep FR-55 announced.
+- FR-138's line, `RESUME_SKEW_MIN`, and which `ConnExit` kinds keep a session.
 - The sweep's deadlines, its conviction of a carrier that goes silent while the process runs, and the "did not run"
   wording (`frozen::did_not_run_for`).
 - The network-change lane: `on_network_changed`, its forced revalidation and its rebuild.
@@ -350,7 +373,7 @@ environment or its config file sets it. The skew rules stay in the code behind t
 | with | where the two meet | the line between them |
 |---|---|---|
 | #3541, the demote-follow (its own FR, being specced) | `PathMonitor` (`path.rs`), not one function | This FR calls `on_resume` (`:794`) unchanged, from a new trigger, and touches neither the demote-follow nor `on_peer_relayed_instead` (`:609`). `on_resume` leaves the relayed-instead holdoff (`:376-384`) as it is: whether a resume clears it is #3541's call. A clean slate on the slept side looks like a restart from the far end, so #3541's restart split can follow it until #3541's fix lands, and every cell in §6 names whether its build carries that fix. #3539's round 11 settled by demote-follow, at +64.8 s |
-| FR-138 | `ConnExit` (`session_table.rs:98-102`, `kind()` at `:168-178`; `docs/remote-control.md:3634`) | Today a Windows sleep that FR-55 did not announce ends the control WS as `RxDeadline`, which FR-138 P2a keeps, wrongly after a real sleep; with P3 it ends as `ResumeFromSuspend` and closes. A freeze stays `RxDeadline`. A step stops ending sessions. FR-138's owner is told at P3 |
+| FR-138 | `ConnExit` (`session_table.rs:98-102`, `kind()` at `:168-178`; `docs/remote-control.md:3639`), and `run`'s gap (`signaling.rs:1206-1218`) | **The line is FR-138's, as its owner set it on 2026-11-10:** a measured pause of at least `RESUME_SKEW_MIN` ends the control connection as `ResumeFromSuspend`, which closes the sessions FR-138 keeps, and a shorter pause stays transient, so they are kept. This FR measures the pause and does not move the line. (1) FR-138's finding M2 (§2.1): a Windows sleep with no goodbye ends as `RxDeadline` today, which P2a keeps however long the sleep. FR-138's P2a-2, not yet started, fixes it on the RX-deadline exit (`ResumeFromSuspend` when the measured pause is at least `RESUME_SKEW_MIN`) and may land first, as agent code in 0.4.209 or later; P3 here then swaps in the one signal without changing the outcome. (2) FR-138's finding L12: a sleep that starts during the gap closes nothing; P3's gap reader closes the kept sessions (§3.4). A freeze stays `RxDeadline`, and a step stops ending sessions. FR-138's owner reviews P3 |
 | FR-55 P4 | `sleep_notice.rs` | The hook stays listen-only. `will_sleep` and `woke()` gain one call each into the module, and the goodbye and the hold do not change. D4 decides whether the hook starts while both FR-55 switches are off |
 | #3528 (fixed by #3602) | the clean slate's handshakes | A forward step's false clean slate handshakes again at the stepped clock and raises every peer's replay mark. With D5 = A a step no longer does that |
 
@@ -360,13 +383,13 @@ Each phase ships dark and is proven RED first. Every phase is one PR, and its do
 
 | Phase | What | Lives in | Kill switch, default | RED | GREEN | Retires |
 |---|---|---|---|---|---|---|
-| **P0** | The reads, on the current release, no code: (a) the Windows wake half from `agent_logs`, bounded (§2.5, F1); (b) whether a lab Win11 guest can sleep (S3 by `virsh dompmsuspend --target mem`, else S4 by `shutdown /h` and a start 300 s later), whether it logs a Major net change at the wake, and whether the lab host's VM watchdog leaves a sleeping guest alone; (c) the REDs of §6 on the release: F2, F4, F5 and F7, and F3 with the operator's OK; (d) #3539's freeze loop again as the baseline (F8), because the release carries #3602 since 0.4.207; (e) a fresh daemon start's time back to LAN direct on F2's pair, which is AC3's bar | `scripts/fr<N>-pause-read.sh`, the field log | none: reads | — | — | — |
+| **P0** | The reads, on the current release, no code: (a) the Windows wake half from `agent_logs`, bounded (§2.5, F1); (b) whether a lab Win11 guest can sleep (S3 by `virsh dompmsuspend --target mem`, else S4 by `shutdown /h` and a start 300 s later), whether it logs a Major net change at the wake, and whether the lab host's VM watchdog leaves a sleeping guest alone; (c) the REDs of §6 on the release: F2, F4, F5, F7 and F11, and F3 with the operator's OK; (d) #3539's freeze loop again as the baseline (F8), because the release carries #3602 since 0.4.207; (e) a fresh daemon start's time back to LAN direct on F2's pair, which is AC3's bar | `scripts/fr<N>-pause-read.sh`, the field log | none: reads | — | — | — |
 | **P1** | The signal in shadow: `tunnel_core::pause` with the three OS clock pairs, `announced()` and `woke()` called from `sleep_notice`, and every reader logging one `pause (shadow)` line (`slept_s`, `by`, `frozen_s`, `step_s`, `would`) whenever one is non-zero. It changes nothing | `crates/tunnel-core/src/pause.rs` and one `windows-sys` feature, `sleep_notice.rs`, the four readers | `ROOMLERD_PAUSE_SIGNAL`, on | — (it acts on nothing) | AC1's cells | stays as the signal's off switch |
 | **P2** | The overlay reads it: P8's skew rule replaced (a sleep from D2's bar takes the clean slate and names its source, a step is one line, a freeze takes D3's arm), the nudge, P8's doc comment corrected | `runtime.rs` | `ROOMLERD_PAUSE_OVERLAY`, off, then on; `ROOMLERD_PAUSE_FREEZE_SLATE`, off | P0's F2, F4, F5 and F7 on the release | AC2–AC6 for the overlay, and AC7 once the freeze arm is tried | the skew rule, at P5 |
-| **P3** | The WS loops read it: both A5 skew rules replaced (a sleep cycles at once on every OS, a freeze keeps the RX deadline, a step does nothing), the nudge, `session_table.rs:99` reworded | `signaling.rs`, `derp.rs`, `session_table.rs` | `ROOMLERD_PAUSE_WS`, off, then on | P0's F2 and F7, their WS lines | AC3's `/derp` line, AC6, and AC9's `ConnExit` tests | the skew rules, at P5 |
+| **P3** | The WS loops read it: both A5 skew rules replaced (the `/derp` WS cycles at once from D2's bar; the control WS ends as `ResumeFromSuspend` from `RESUME_SKEW_MIN`, FR-138's line, on every OS, or feeds FR-138's P2a-2 arm the signal if that landed first; a freeze keeps the RX deadline; a step does nothing), FR-138's gap hears a sleep (L12), the nudge, `session_table.rs:99` reworded | `signaling.rs`, `derp.rs`, `session_table.rs` | `ROOMLERD_PAUSE_WS`, off, then on | P0's F2, F7 and F11, their WS lines; the gap's test at the pin | AC3's `/derp` line, AC6 and AC10 | the skew rules, at P5 |
 | **P4** | The async watchdog takes each scan's own lateness off its pumps' ages (#3540) | `watchdog.rs` | `ROOMLERD_PAUSE_WATCHDOG`, off, then on | the unit test at the pin (AC8) | AC8 | — |
-| **Docs** | AC10 | docs | none | — | written with each phase | — |
-| **P5** | After one release with every reader on and no regression: the skew rules retire, the step line stays, and the skew rule stays only where P1 found both other sources blind (D5) | the three skew readers | — | — | AC9 still holds | the skew rules |
+| **Docs** | AC11 | docs | none | — | written with each phase | — |
+| **P5** | After one release with every reader on and no regression: the skew rules retire, the step line stays, and the skew rule stays only where P1 found both other sources blind (D5) | the three skew readers | — | — | AC9 and AC10 still hold | the skew rules |
 
 ⚠️ **P1 before any reader acts.** Its shadow lines are the fleet-wide read of what each reader would have done, at
 every pause, on every OS the fleet runs. A reader whose shadow line fires where no pause happened does not ship.
@@ -389,6 +412,7 @@ change fired at the wake.
 | **F8** | freezes | a Linux lab guest pair, #3539's loop: the frozen end's pair on `/derp` as on 2026-11-07, and one direct pair | 10 rounds of `SIGSTOP`, 5 of `systemctl freeze`, 5 of `cgroup.freeze`, 70 s each | the baseline, per round: `overlay: resume from suspend` (expect 0), a `failed active revalidation` or an rx-stale conviction in the minute after the thaw (13 of 60 on 2026-11-07), and the seconds to settle | per D3; and the signal reads `frozen` with slept 0 (AC1) |
 | **F9** | the watchdog | unit tests at the pin; in the field, F8's loop on a lab desktop guest with a remote session live | an injected clock | the test fails at the pin: a scan 40 s late with a 30 s pump gated on exits | the test passes; 0 watchdog exits in the field loop |
 | **F10** | WSL2, read only | a Windows host running the daemon in WSL2, where one is reachable | the host asleep 300 s | — | P1 reads what the signal saw: D5's input |
+| **F11** | a sleep with no goodbye while a remote session is live: FR-138's line | F2's lab Win11 guest with FR-55's announcement off (`ROOMLERD_SLEEP_ANNOUNCE=0`: the hook still hears the OS, but says no goodbye) and FR-138's keep switch on (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH=1`), a remote session live from a lab browser | F2's sleep, for 90 s and for 300 s | the 300 s sleep: `no inbound WS frames within the RX deadline, but this agent did not run for ~` at the wake, and the session kept, its `remote_sessions` row not ended (M2). If FR-138's P2a-2 is in the release, the release already closes it, and the cell is P3's baseline instead of its RED | the 300 s sleep: the control WS's resume line, naming its source, at the wake, `ResumeFromSuspend`, and the session closed; the 90 s sleep: the session kept, and the viewer rejoins it |
 
 ## 7. Acceptance criteria
 
@@ -417,11 +441,16 @@ change fired at the wake.
   gated on does not exit, and a pump that stays stuck after the pause exits within one scan of its threshold; the
   first fails at the pin. In the field, F9: 0 watchdog exits.
 - [ ] **AC9, old and new.** With `ROOMLERD_PAUSE_SIGNAL=0` every reader behaves as on the release (a unit test per
-  reader), and with a reader's own switch off, that reader does. `ConnExit`: a Windows sleep gives
-  `ResumeFromSuspend`, which closes every peer; a freeze gives `RxDeadline`, which FR-138 keeps; a step gives none
-  (unit tests).
-- [ ] **AC10, docs.** `docs/remote-control.md` § "Across a freeze or a suspend" says which source each reader uses on
-  each OS, with the wake's sequence diagram and the switches; `docs/overlay-communication.md`'s PathMonitor section (`:283`) gains the resume path; `docs/power.md` §3
+  reader), and with a reader's own switch off, that reader does.
+- [ ] **AC10, a sleep ends remote sessions at FR-138's line** (§4). Unit tests on the control WS's exit: a measured
+  sleep of at least `RESUME_SKEW_MIN` gives `ResumeFromSuspend`, which closes every kept session, on every OS; a
+  shorter one keeps today's exit (`RxDeadline`, kept); a freeze gives `RxDeadline`; a step gives none. In FR-138's
+  gap (L12): an announced sleep closes the kept sessions as `Sleep`, and a wake measured from `RESUME_SKEW_MIN`
+  closes them as `ResumeFromSuspend`; the first fails at the pin. In the field, F11: the 300 s sleep closes the session
+  and the 90 s one keeps it, each read on the release first.
+- [ ] **AC11, docs.** `docs/remote-control.md` § "Across a freeze or a suspend" says which source each reader uses on
+  each OS, with the wake's sequence diagram and the switches, and its `ConnExit` table (`:3639`) says that the pause
+  is measured; `docs/overlay-communication.md`'s PathMonitor section (`:283`) gains the resume path; `docs/power.md` §3
   names the notice's second reader, and its §3.6 the switches; the `docs/README.md` rows of those pages say so, and
   any page added gets its row.
 
@@ -430,7 +459,7 @@ change fired at the wake.
 | # | Question | Options | Recommend | Why, and what it costs |
 |---|---|---|---|---|
 | **D1** | What says the host slept? | A: the OS's notice, as the re-spec has it: FR-55's hook publishes each wake with the sleep's length by the wall clock, lateness is a freeze, and the skew rule stays where there is no hook. B: the OS's sleep clock measures; the notice marks a late tick as a sleep where the clocks ran through it, and wakes every reader at once; lateness with no notice is a freeze (§3.2). C: the sleep clock alone | **B** | The notice cannot say how long: a cancelled sleep calls the same `woke()`, Windows may say it twice, and the wall clock between the two notices moves with a step. It is also absent wherever the hook does not run (no logind or D-Bus, a container, both FR-55 switches off). The clock alone missed FR-55's lab guest, whose suspend ran its monotonic clock (§2.3). B takes each source where it is right. Cost: two sources to reason about, and three OS clock reads (no new crate). If P1 finds Windows' clock blind to Modern Standby, the notice is that cell's witness, as it is on a VM |
-| **D2** | How long must a sleep be to take the clean slate and the WS cycle? | A: 120 s, today's bar. B: any sleep the signal measures, from `LATE_MIN` (10 s). C: 60 s, the direct rx-stale deadline | **B** | The bar sat at 120 s only to clear clock steps, which the signal no longer reads as sleeps. On Windows the sweep convicts once the silence passes 60 s, and up to 35 s of it may be the quiet before the sleep, so a sleep from about 25 s can be convicted: from 10 s no such sleep escapes the clean slate, and the sweep needs no change. Cost: a 10–60 s sleep whose carriers might have lived re-coordinates (P0 measures what that costs on a LAN pair), and each of a Mac's dark wakes takes a clean slate, as today's P8 already does past 120 s. A leaves Windows sleeps from about 25 s to 120 s convicting with penalties, and C those up to 60 s, unless the sweep also learns to discount the sleep |
+| **D2** | How long must a sleep be to take the overlay's clean slate and the `/derp` WS's cycle? (Not the control WS's: it ends a slept connection at FR-138's line, `RESUME_SKEW_MIN`, which is not open here, §4) | A: 120 s, today's bar. B: any sleep the signal measures, from `LATE_MIN` (10 s). C: 60 s, the direct rx-stale deadline | **B** | The bar sat at 120 s only to clear clock steps, which the signal no longer reads as sleeps. On Windows the sweep convicts once the silence passes 60 s, and up to 35 s of it may be the quiet before the sleep, so a sleep from about 25 s can be convicted: from 10 s no such sleep escapes the clean slate, and the sweep needs no change. The `/derp` WS carries no session, so its cycle costs a reconnect and nothing FR-138 keeps. Cost: a 10–60 s sleep whose carriers might have lived re-coordinates (P0 measures what that costs on a LAN pair), and each of a Mac's dark wakes takes a clean slate, as today's P8 already does past 120 s. A leaves Windows sleeps from about 25 s to 120 s convicting with penalties, and C those up to 60 s, unless the sweep also learns to discount the sleep. Revised 2026-11-10, after FR-138's owner answered on the seam: the first draft put the control WS's cycle under this bar too, which would have closed FR-138's kept sessions after a sleep of 10–120 s |
 | **D3** | Does a freeze take the clean slate? (the re-spec's question) | A: no, as today. B: a freeze of 60 s or more takes it without the plane rebuild, behind `ROOMLERD_PAUSE_FREEZE_SLATE`, off until F8 beats P0's baseline. C: as B, from 10 s | **B** | 60 s into our silence the far end convicts our direct carrier (`lifecycle.rs:183`), so after a longer freeze the carrier is dead at its end, while a shorter one may leave it alive, and a slate would only cost churn. The network did not move, so the plane is not rebuilt. The data has 70 s freezes only, and does not show that a slate fixes the unsettled minute (§2.4), so the arm stays off until F8 says so. Cost: one more switch, and a bound that is reasoned, not measured. C takes a slate at every 10 s stall |
 | **D4** | Does FR-55's hook start while both its switches are off? (the re-spec's question) | A: yes, listen-only (no inhibitor, no goodbye), whenever `ROOMLERD_PAUSE_SIGNAL` is on. B: no, as today | **B**, unless D1 = A, which forces A | Both switches off is FR-55's emergency stance, and off should keep meaning that the hook does not run. Under D1 = B the signal keeps the clock and lateness, and only a sleep the clocks ran through reads as a freeze, which D3's policy takes. Cost: in that stance a VM's suspend, and Modern Standby if P1 finds it so, reads as a freeze |
 | **D5** | What is a forward wall-clock step? | A: logged, and never a sleep, except where P1 finds the clock and the notice both blind (WSL2), which keeps today's skew rule. B: never a sleep, anywhere. C: today's rule everywhere | **A** | A step drops every carrier and ends every remote session today (§2.1). Where a step is a sleep's only witness, the skew rule is all there is. Cost: one host class keeps today's false positives. B leaves a WSL2 host's sleep unread; C keeps the false positives everywhere |
@@ -443,7 +472,9 @@ change fired at the wake.
 - **The watchdogs' thresholds**, and the watchdog-of-watchdog's guard (#3530, done).
 - **FR-55's goodbye and `HOLD_MAX`.** On Windows the hold's timer runs through the sleep, and both paths reconnect.
 - **A process that ends**: a restart, an update, a crash.
-- **FR-138's arms**, beyond which `ConnExit` a sleep, a freeze and a step produce.
+- **FR-138's arms and its line.** `RESUME_SKEW_MIN` stays FR-138's bar. This FR decides only which `ConnExit` a sleep,
+  a freeze and a step produce, from a measured pause, and reaches FR-138's gap only to close kept sessions at a sleep
+  (L12).
 - **Why a host slept, and holding it awake** (FR-55).
 
 ## 10. Field log
@@ -454,3 +485,4 @@ change fired at the wake.
 | 2026-11-01 | 0.4.190–0.4.194 | FR-55: three Windows laptops logged 11 goodbyes, the sleep half on Windows. The wake half was not read (§2.5) |
 | 2026-11-07 | 0.4.203 and a build of #3536, a Linux lab guest | #3539's 60 freeze rounds: 0 `resume from suspend`; 13 rounds with an unsettled minute on a `/derp` pair (§2.4) |
 | 2026-11-10 | — | Spec drafted at master `0d0f55d55`. P0 not run |
+| 2026-11-10 | — | FR-138's owner answered on the seam: a slept host's sessions close, at FR-138's line. D2 now covers the overlay and the `/derp` WS only; the control WS keeps `RESUME_SKEW_MIN`; FR-138's gap (L12) joined P3, with AC10 and F11. Anchors moved to master `814db2dd5` |
