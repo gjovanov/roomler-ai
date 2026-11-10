@@ -589,6 +589,36 @@ mod tests {
         .unwrap_or(false)
     }
 
+    /// #3656 — the signalling loop's own dial, as a server sees it: the token in
+    /// `Authorization: Bearer`, and a URL that names the role and the tenant only.
+    #[test]
+    fn the_control_socket_presents_its_token_in_a_header() {
+        // #3548 — the loop runs inside the probe's fixture: no probe test beside it.
+        let probe = loop_fixture();
+        probe.block_on(present_the_token_in_a_header(&probe));
+    }
+
+    async fn present_the_token_in_a_header(probe: &LoopFixture) {
+        use crate::ws_connect::test_front::{self, Verdict};
+        let (base, log) = test_front::start(|_| Verdict::Accept).await;
+        let server = base.replace("ws://", "http://");
+        let worker = spawn_worker_on(probe, &server, &format!("{base}/ws"), "s3cret", false).await;
+        wait_connected(&worker).await;
+        let dial = test_front::until_seen(&log, 1).await.remove(0);
+        let _ = worker.stop.send(true);
+        let _ = tokio::time::timeout(PATIENCE, worker.task).await;
+        assert!(dial.uri.starts_with("/ws?"), "{dial:?}");
+        assert!(!dial.uri.contains("token="), "{dial:?}");
+        assert!(!dial.uri.contains("s3cret"), "{dial:?}");
+        assert!(dial.uri.contains("role=agent"), "{dial:?}");
+        assert_eq!(dial.authorization.as_deref(), Some("Bearer s3cret"));
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
+    }
+
     /// The second gate: whatever holds the socket, an unenrolled worker takes no
     /// session off it. The control is the same server and the same offer with
     /// the switch off, which is answered, so the silence is the gate's.

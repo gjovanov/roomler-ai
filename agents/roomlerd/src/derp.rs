@@ -607,6 +607,59 @@ mod tests {
         );
     }
 
+    /// #3656 — the central dial's URL names the role and the tenant, never the
+    /// token: a request line is what access logs and inspecting proxies record.
+    #[test]
+    fn the_central_url_carries_no_credential() {
+        let slot = crate::token_slot::TokenSlot::new("first");
+        let url = central_url_per_attempt("wss://host/ws", slot, "t1")().unwrap();
+        assert!(!url.contains("token="), "{url}");
+        assert!(!url.contains("first"), "{url}");
+    }
+
+    /// #3656 — the dialer itself, central and regional: the credential rides
+    /// `Authorization: Bearer`, and the URL the front sees holds none. The front
+    /// is a newer server that refuses with a verdict, so no dial goes again.
+    #[tokio::test]
+    async fn every_derp_dial_presents_its_credential_in_a_header() {
+        use crate::ws_connect::test_front::{self, Verdict};
+        let refused = Verdict::Refuse(
+            401,
+            Some(roomler_ai_remote_control::upgrade_auth::CHALLENGE_REFUSED),
+        );
+
+        let (base, log) = test_front::start(move |_| refused).await;
+        let (mux, outbound_rx) = DerpMux::new([5u8; 32]);
+        spawn(
+            &format!("{base}/ws"),
+            crate::token_slot::TokenSlot::new("live-token"),
+            "t1",
+            &mux,
+            outbound_rx,
+        );
+        let central = test_front::until_seen(&log, 1).await.remove(0);
+        assert!(central.uri.starts_with("/derp?"), "{central:?}");
+        assert!(!central.uri.contains("token="), "{central:?}");
+        assert!(!central.uri.contains("live-token"), "{central:?}");
+        assert!(central.uri.contains("role=agent"), "{central:?}");
+        assert!(central.uri.contains("tid=t1"), "{central:?}");
+        assert_eq!(central.authorization.as_deref(), Some("Bearer live-token"));
+
+        let (base, log) = test_front::start(move |_| refused).await;
+        let (mux, outbound_rx) = DerpMux::new([6u8; 32]);
+        let ticket: DerpTicketSlot = Arc::new(std::sync::Mutex::new(Some((
+            "the-ticket".to_string(),
+            u64::MAX,
+        ))));
+        spawn_regional(&format!("{base}/derp"), ticket, "t1", &mux, outbound_rx);
+        let regional = test_front::until_seen(&log, 1).await.remove(0);
+        assert!(regional.uri.starts_with("/derp?"), "{regional:?}");
+        assert!(!regional.uri.contains("ticket="), "{regional:?}");
+        assert!(!regional.uri.contains("the-ticket"), "{regional:?}");
+        assert!(regional.uri.contains("tid=t1"), "{regional:?}");
+        assert_eq!(regional.authorization.as_deref(), Some("Bearer the-ticket"));
+    }
+
     /// #2512 — while the control socket's verdict on the token is "refused",
     /// the central relay is not dialled at all; the socket's next accepted
     /// upgrade, or a renewed token, brings the dial back.

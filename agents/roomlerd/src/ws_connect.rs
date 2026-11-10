@@ -189,6 +189,111 @@ fn host_port(url: &str) -> Option<(String, u16)> {
     Some((host, port))
 }
 
+/// #3656 — a loopback front for the dial tests. It records what each upgrade
+/// presented and answers it as the test says, so one test can stand in for a
+/// server or relay older than the header, a newer one, or one in between.
+#[cfg(test)]
+pub(crate) mod test_front {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    use tokio_tungstenite::tungstenite::http;
+
+    /// What one dial presented.
+    #[derive(Clone, Debug)]
+    pub(crate) struct Seen {
+        /// The request target, path and query.
+        pub(crate) uri: String,
+        /// The `Authorization` header, if any.
+        pub(crate) authorization: Option<String>,
+    }
+
+    /// How the front answers one dial.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Verdict {
+        Accept,
+        /// This status, with this `WWW-Authenticate` if any.
+        Refuse(u16, Option<&'static str>),
+    }
+
+    pub(crate) type Log = Arc<Mutex<Vec<Seen>>>;
+
+    /// Serve on loopback for the rest of the test: `ws://127.0.0.1:<port>`,
+    /// and the log of what each dial presented, in order.
+    pub(crate) async fn start(
+        decide: impl Fn(&Seen) -> Verdict + Send + Sync + 'static,
+    ) -> (String, Log) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("ws://{}", listener.local_addr().unwrap());
+        let log: Log = Arc::default();
+        let decide = Arc::new(decide);
+        let seen = log.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (seen, decide) = (seen.clone(), decide.clone());
+                tokio::spawn(async move {
+                    // tungstenite's handshake `Callback` fixes the closure's error type.
+                    #[allow(clippy::result_large_err)]
+                    let answer = |req: &Request,
+                                  resp: Response|
+                     -> Result<Response, ErrorResponse> {
+                        let this = Seen {
+                            uri: req.uri().to_string(),
+                            authorization: req
+                                .headers()
+                                .get(http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        };
+                        let verdict = decide(&this);
+                        seen.lock().unwrap().push(this);
+                        match verdict {
+                            Verdict::Accept => Ok(resp),
+                            Verdict::Refuse(status, challenge) => {
+                                let mut refused = ErrorResponse::new(None);
+                                *refused.status_mut() = http::StatusCode::from_u16(status).unwrap();
+                                if let Some(c) = challenge {
+                                    refused.headers_mut().insert(
+                                        http::header::WWW_AUTHENTICATE,
+                                        http::HeaderValue::from_static(c),
+                                    );
+                                }
+                                Err(refused)
+                            }
+                        }
+                    };
+                    if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, answer).await {
+                        while let Some(Ok(_)) = ws.next().await {}
+                    }
+                });
+            }
+        });
+        (base, log)
+    }
+
+    /// Every dial the front has seen so far.
+    pub(crate) fn seen(log: &Log) -> Vec<Seen> {
+        log.lock().unwrap().clone()
+    }
+
+    /// The dials the front has seen, once it has seen at least `n`.
+    pub(crate) async fn until_seen(log: &Log, n: usize) -> Vec<Seen> {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let now = seen(log);
+                if now.len() >= n {
+                    return now;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the front saw {:?}, wanted {n} dial(s)", seen(log)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

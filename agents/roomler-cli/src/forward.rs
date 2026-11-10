@@ -514,6 +514,111 @@ mod tests {
         );
     }
 
+    /// What one dial presented to [`front`]: the request target and the
+    /// `Authorization` header.
+    type Seen = (String, Option<String>);
+
+    /// #3656 — a loopback server that records what each upgrade presented and
+    /// answers it with `answer`: `None` upgrades, `Some((status, challenge))`
+    /// refuses.
+    async fn front(
+        answer: impl Fn(&Seen) -> Option<(u16, Option<&'static str>)> + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::Mutex<Vec<Seen>>>) {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        use tokio_tungstenite::tungstenite::http;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, answer) = (log.clone(), Arc::new(answer));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (seen, answer) = (seen.clone(), answer.clone());
+                tokio::spawn(async move {
+                    // tungstenite's handshake `Callback` fixes the closure's error type.
+                    #[allow(clippy::result_large_err)]
+                    let cb = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                        let this: Seen = (
+                            req.uri().to_string(),
+                            req.headers()
+                                .get(http::header::AUTHORIZATION)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string),
+                        );
+                        let verdict = answer(&this);
+                        seen.lock().unwrap().push(this);
+                        let Some((status, challenge)) = verdict else {
+                            return Ok(resp);
+                        };
+                        let mut refused = ErrorResponse::new(None);
+                        *refused.status_mut() = http::StatusCode::from_u16(status).unwrap();
+                        if let Some(c) = challenge {
+                            refused.headers_mut().insert(
+                                http::header::WWW_AUTHENTICATE,
+                                http::HeaderValue::from_static(c),
+                            );
+                        }
+                        Err(refused)
+                    };
+                    if let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, cb).await {
+                        while let Some(Ok(_)) = ws.next().await {}
+                    }
+                });
+            }
+        });
+        (server, log)
+    }
+
+    fn tunnel_cfg(server_url: &str, token: &str) -> TunnelConfig {
+        TunnelConfig {
+            server_url: server_url.to_string(),
+            tunnel_client_token: token.to_string(),
+            machine_name: "box".to_string(),
+            allow_plaintext_server: true,
+        }
+    }
+
+    /// #3656 — the tunnel-client socket's dial, as a server sees it: the token
+    /// in `Authorization: Bearer`, and a URL that names the role and the tenant
+    /// only. The front refuses with a verdict, so nothing dials again.
+    #[tokio::test]
+    async fn the_tunnel_client_socket_presents_its_token_in_a_header() {
+        let (server, log) = front(|_| {
+            Some((
+                401,
+                Some(roomler_ai_remote_control::upgrade_auth::CHALLENGE_REFUSED),
+            ))
+        })
+        .await;
+        let token = fake_jwt(r#"{"sub":"x","tenant_id":"64b1f0aa12cd34ef56ab78cd"}"#);
+        let cfg = tunnel_cfg(&server, &token);
+        let target = Target::Static {
+            host: "127.0.0.1".into(),
+            port: 9,
+        };
+        let refused = run_session(
+            &cfg,
+            ObjectId::new(),
+            0,
+            &target,
+            vec![TRANSPORT_WEBRTC_DC_V1.to_string()],
+            TRANSPORT_WEBRTC_DC_V1,
+        )
+        .await;
+        assert!(refused.is_err(), "a refused upgrade ends the session");
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "a verdict on the token is final: {seen:?}");
+        let (uri, authorization) = &seen[0];
+        assert!(uri.starts_with("/ws?"), "{uri}");
+        assert!(!uri.contains("token="), "{uri}");
+        assert!(!uri.contains(&token), "{uri}");
+        assert!(uri.contains("role=tunnel-client"), "{uri}");
+        assert!(uri.contains("tid=64b1f0aa12cd34ef56ab78cd"), "{uri}");
+        assert_eq!(
+            authorization.as_deref(),
+            Some(format!("Bearer {token}").as_str())
+        );
+    }
+
     #[test]
     fn tenant_id_from_jwt_rejects_non_oid_and_garbage() {
         // Non-hex / wrong length values are dropped (would 403 server-side).
