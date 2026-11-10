@@ -3352,11 +3352,16 @@ mod secondary_org_tests {
         .unwrap_or(false)
     }
 
-    #[tokio::test]
-    async fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
-        // #3548 — no lib test runs the real probe: the loop's probe thread finds
-        // this answer, and the loop does not wait for one.
-        crate::encode::caps::install_first_answer_for_tests();
+    #[test]
+    fn a_secondary_orgs_session_reaches_the_worker_only_on_one_row() {
+        // #3548 — the loop runs inside the probe's fixture, which puts its first
+        // answer in: no lib test runs the real probe, and no probe test runs
+        // beside a loop.
+        let probe = crate::encode::caps::loop_fixture();
+        probe.block_on(a_secondary_orgs_session_reaches_one_row());
+    }
+
+    async fn a_secondary_orgs_session_reaches_one_row() {
         for one_row in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let host = DelegateHost::new();

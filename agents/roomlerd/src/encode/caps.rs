@@ -59,6 +59,9 @@ pub(crate) struct ProbeState {
     first_is_news: std::sync::Once,
     /// #3439 — wakes every connection when [`generation`] moves ([`news`]).
     news: OnceLock<tokio::sync::watch::Sender<u64>>,
+    /// #3439 — the first probe's thread has started ([`start_probing`]): once per
+    /// process, so a second organization's loop finds it running.
+    started: std::sync::atomic::AtomicBool,
 }
 
 /// #3548 — the daemon's probe state: one per process, however many organizations
@@ -82,6 +85,7 @@ impl ProbeState {
             interim: OnceLock::new(),
             first_is_news: std::sync::Once::new(),
             news: OnceLock::new(),
+            started: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2500,8 +2504,7 @@ pub fn detect() -> AgentCaps {
 ///
 /// `false` when no thread could start: the caller probes in place, as before.
 pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::SeqCst) {
+    if PROCESS.started.swap(true, Ordering::SeqCst) {
         return true;
     }
     let spawned = std::thread::Builder::new()
@@ -2513,31 +2516,71 @@ pub fn start_probing(live: impl Fn() -> bool + Send + 'static) -> bool {
     match spawned {
         Ok(_) => true,
         Err(e) => {
-            STARTED.store(false, Ordering::SeqCst);
+            PROCESS.started.store(false, Ordering::SeqCst);
             tracing::warn!(%e, "caps probe: no thread for the probe; the start waits for it");
             false
         }
     }
 }
 
-/// #3548 — the first answer a lib test that runs the signalling loop in process
-/// installs before the loop starts, so that [`start_probing`]'s thread finds an
-/// answer and spawns no child, and the loop does not wait out
-/// [`FIRST_ANSWER_WAIT`]. It is what the probe answered such a test before: in a
-/// test binary the probe's child is the test harness, which prints no answer, so
-/// the probe fell back to the encoders that need no driver.
+/// #3548 — what a lib test that runs the signalling loop in process holds for as
+/// long as the loop runs ([`loop_fixture`]). The loop reads the process's probe
+/// state (the answer in force, its generation, the denylist in the environment)
+/// and writes some of it (a session's ask, [`session_asked`]), and the probe's
+/// own tests set and read that state under `DENY_ENV_LOCK`. A loop's ask landing
+/// in a retry test's quiet wait held that test, and the lock, for a minute. So a
+/// loop test holds the lock too, from before its loop starts until after its
+/// runtime has stopped: no probe test runs beside a loop.
 ///
-/// Idempotent. It moves the process's generation under `DENY_ENV_LOCK`, which
-/// every test that reads that generation holds, so none of them sees it move.
+/// Held by the test's own thread around the runtime ([`LoopFixture::block_on`]),
+/// never inside an async body: nothing on that runtime takes this lock.
 #[cfg(test)]
-pub(crate) fn install_first_answer_for_tests() {
-    let _guard = crate::encode::DENY_ENV_LOCK
+pub(crate) struct LoopFixture {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl LoopFixture {
+    /// A loop test's body, on the runtime `#[tokio::test]` builds, which stops
+    /// before this fixture is let go.
+    pub(crate) fn block_on<F: std::future::Future>(&self, body: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(body)
+    }
+}
+
+#[cfg(test)]
+impl Drop for LoopFixture {
+    fn drop(&mut self) {
+        // A session's ask is the loop's one write to the probe's state: the next
+        // test to hold the lock finds none, as the probe's own tests leave it.
+        *LAST_ASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// #3548 — the probe lock, with the process's first answer in and the probe
+/// marked as started, so that a loop started under it finds an answer, starts no
+/// probe thread and spawns no child, and does not wait out
+/// [`FIRST_ANSWER_WAIT`]. The answer is what the probe answered such a test
+/// before: in a test binary the probe's child is the test harness, which prints
+/// no answer, so the probe fell back to the encoders that need no driver.
+///
+/// Idempotent. The generation moves only under the lock, which every test that
+/// reads it holds, so none of them sees it move.
+#[cfg(test)]
+pub(crate) fn loop_fixture() -> LoopFixture {
+    let guard = crate::encode::DENY_ENV_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let _ = PROCESS.first.get_or_init(|| {
         assigned_by_the_daemon(compute_caps(false, false), &HostFacts::here(), &[], None)
     });
     PROCESS.first_is_news.call_once(|| PROCESS.answer_moved());
+    PROCESS.started.store(true, Ordering::SeqCst);
+    LoopFixture { _guard: guard }
 }
 
 /// #3548 — how many `caps-probe` children this test binary has tried to start.
@@ -10043,12 +10086,12 @@ mod tests {
     }
 
     /// #3548 — what a wait reads is its own instance's answer and nothing else.
-    /// Another thread fills the PROCESS's first answer, as `start_probing`'s
-    /// thread does in an in-process signalling-loop test, released at the moment
-    /// this wait begins: `join!` polls the wait first, so it has subscribed and
-    /// found no answer before the filler runs, and it is not polled again until
-    /// the fill is done. Before #3548 the two were one, and this wait reported
-    /// the process's answer every time.
+    /// Another thread fills the PROCESS's first answer, as an in-process
+    /// signalling-loop test's fixture does, released at the moment this wait
+    /// begins: `join!` polls the wait first, so it has subscribed and found no
+    /// answer before the filler runs, and it is not polled again until the fill
+    /// is done. Before #3548 the two were one, and this wait reported the
+    /// process's answer every time.
     #[test]
     fn a_wait_hears_nothing_of_the_process_answer() {
         let state = ProbeState::new();
@@ -10060,7 +10103,7 @@ mod tests {
         let (filled, was_filled) = std::sync::mpsc::channel::<()>();
         let filler = std::thread::spawn(move || {
             released.recv().expect("released");
-            install_first_answer_for_tests();
+            drop(loop_fixture());
             filled.send(()).expect("told");
         });
         let bound = Duration::from_millis(50);
