@@ -109,9 +109,10 @@ another pod — are where the design is unusual:
   every 30 s by the pod that holds the session, and freed within 90 s of a pod dying. A
   session FR-138 keeps through its device's socket loss keeps its slot until its
   `resume_by` plus 10 s, which its detach writes once ([remote-control.md §11.18](remote-control.md#1118-a-session-outlives-its-control-socket-the-servers-half-fr-138-p1b)).
-  It needs **Redis 7.0 or later**: a renewal only lengthens a lease (`ZADD … GT` and
-  `PEXPIRE … GT`), and on an older Redis every renewal fails and each lease lapses in
-  90 s. An org's own sessions and the external (FR-52) sessions its members run for it share its
+  It needs **Redis 7.0 or later**: a renewal and a restore only lengthen a lease (`ZADD … GT`,
+  `PEXPIRE … GT` and `PEXPIRE … NX`), and on an older Redis every renewal fails and each lease
+  lapses in 90 s, so a deployment that turns slots on with an older Redis upgrades it first.
+  An org's own sessions and the external (FR-52) sessions its members run for it share its
   slots: the outsider picks the org on `/connect`, from any of theirs, and no paid org is
   needed. An account in no org gets Free's one session, counted against the account. When
   Redis cannot answer, the hub's count decides, as before.
