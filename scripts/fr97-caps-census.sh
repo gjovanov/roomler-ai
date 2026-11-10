@@ -8,20 +8,28 @@
 # for one taken before P0c ships and one after the last phase, with no word
 # left on an OS that cannot serve it.
 #
-# Run on the build host, where kubectl reaches the cluster:
+# Run on mars, where kubectl reaches the cluster and docker runs, from a checkout
+# that has prod-mongo-read.sh beside this file:
 #   scripts/fr97-caps-census.sh [days]      # agents seen in the last N days (30)
 #
-# The database URL is read from the roomler2 pod's environment and handed to
-# mongosh in mongodb-0 over stdin: it is never printed, and it never appears in
-# an argument list on the build host. Only counts come out: no names, no ids.
+# mongosh runs OUTSIDE mongodb-0, through prod-mongo-read.sh (a port-forward and
+# a throwaway client container), so its memory never counts against the
+# database's limit. The runner reads the credentials from the secret into files:
+# they are never printed, and never in an argument list. Only counts come out:
+# no names, no ids.
 set -euo pipefail
 NS="${ROOMLER_NS:-roomler-ai}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 DAYS="${1:-30}"
 case "$DAYS" in '' | *[!0-9]*) echo "days must be a number" >&2; exit 2 ;; esac
+[ -f "$HERE/prod-mongo-read.sh" ] || { echo "missing $HERE/prod-mongo-read.sh" >&2; exit 2; }
+# The cluster is named, never this host's current context: the runner refuses a
+# host that has no production context, before any cluster call.
+KUBE_CONTEXT="$(bash "$HERE/prod-mongo-read.sh" --print-context)" || exit 2
+export ROOMLER_KUBE_CONTEXT="$KUBE_CONTEXT"
+kubectl() { command kubectl --context "$KUBE_CONTEXT" "$@"; }
 
-url="$(kubectl -n "$NS" exec deploy/roomler2 -- printenv ROOMLER__DATABASE__URL)"
 name="$(kubectl -n "$NS" exec deploy/roomler2 -- printenv ROOMLER__DATABASE__NAME)"
-[ -n "$url" ] || { echo "could not read the database URL" >&2; exit 3; }
 case "$name" in '' | *[!A-Za-z0-9_-]*) echo "unexpected database name" >&2; exit 3 ;; esac
 
 # The aggregation. Agents not tombstoned and seen within the window; one row per
@@ -65,7 +73,7 @@ for (const b of ["supports_clipboard", "supports_file_transfer", "has_input_perm
 EOF
 )"
 
-# First stdin line: the URL (read by sh, never echoed); the rest: the script.
-{ printf '%s\n' "$url"; printf '%s\n' "$js"; } |
-  kubectl -n "$NS" exec -i mongodb-0 -- sh -c 'IFS= read -r u; exec mongosh --quiet "$u" --file /dev/stdin' |
+# The script on stdin; the runner opens `db` on the app database.
+printf '%s\n' "$js" |
+  bash "$HERE/prod-mongo-read.sh" --kubectl --yes --db "$name" - |
   { printf 'list\tos\tword\tcount\n'; cat; }

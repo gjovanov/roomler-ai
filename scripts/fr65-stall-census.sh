@@ -5,10 +5,12 @@
 # usage: scripts/fr65-stall-census.sh --mars --yes [options]
 #
 # The census reads `agent_logs` in production Mongo, a fleet-wide server read:
-# nothing runs on a device. It runs INSIDE the Mongo container, as mongosh, with
-# the container's own credentials. It is bounded by construction; see `runMongosh`
-# in fr65-stall-census.cjs. An unbounded read inside that same container
-# OOM-killed production Mongo once (2026-10-26).
+# nothing runs on a device. Its mongosh runs OUTSIDE the Mongo container, through
+# prod-mongo-read.sh (a port-forward and a throwaway client container), so the
+# client's memory never counts against the database's limit. The read is still
+# bounded by construction; see `runMongosh` in fr65-stall-census.cjs. An unbounded
+# read whose client ran inside that container OOM-killed production Mongo once
+# (2026-10-26).
 #
 # It is the "same instrument" FR-65 AC7 asks for: the before of a change to the
 # watch is the build without it, the after is the build with it, over windows of
@@ -17,10 +19,11 @@
 #
 # TARGETS (pick one)
 #
-#   --kubectl --yes              where kubectl reaches namespace roomler-ai
-#                                (on mars, as gjovanov).
-#   --mars --yes                 from the dev box: ships both files to mars over
-#                                `roomler ssh` and runs --kubectl there.
+#   --kubectl --yes              where kubectl reaches namespace roomler-ai and
+#                                docker runs (on mars, as gjovanov).
+#   --mars --yes                 from the dev box: ships the census and
+#                                prod-mongo-read.sh to mars over one `roomler ssh`
+#                                and runs --kubectl there.
 #
 # OPTIONS
 #
@@ -34,7 +37,8 @@
 #   --canary                     the runtime canary beside the STALLs (FR-65 AC4)
 #
 # A production read is refused without --yes: it is a bounded read of the live
-# database. The mongodb pod's restart count is printed before and after it.
+# database. The mongodb pod's restart count and memory are printed before and
+# after it, and a restart fails the run (exit 3).
 
 set -euo pipefail
 
@@ -44,10 +48,8 @@ export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 JS="$HERE/fr65-stall-census.cjs"
-# Inside the pod the copy is named .js on purpose: mongosh runs a positional
-# argument as a script only when it ends in .js.
-NS="roomler-ai"
-POD="mongodb-0"
+# The client: a port-forward and a throwaway mongo:7 container, never mongodb-0.
+READ="$HERE/prod-mongo-read.sh"
 
 die() { echo "fr65-stall-census: $*" >&2; exit 1; }
 
@@ -70,7 +72,7 @@ while [ $# -gt 0 ]; do
     --probes)  ENVS+=("FR65_PROBES=1"); PASS+=("$1"); shift ;;
     --rekeys|--swaps|--canary)
                ENVS+=("FR65_MODE=${1#--}"); PASS+=("$1"); shift ;;
-    -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
     *)         die "unknown argument: $1 (--help)" ;;
   esac
 done
@@ -78,35 +80,25 @@ done
 
 [ -n "$TARGET" ] || die "pick a target: --kubectl --yes or --mars --yes (--help)"
 [ -f "$JS" ] || die "missing $JS"
+[ -f "$READ" ] || die "missing $READ"
 [ "$YES" = 1 ] || die "this reads PRODUCTION agent_logs; re-run with --yes to start it"
 
 case "$TARGET" in
   kubectl)
-    command -v kubectl >/dev/null || die "kubectl is not on PATH"
-    restarts() { kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].restartCount}'; }
-    before="$(restarts)"
-    echo "mongodb pod $POD: restarts=$before before the read"
-    kubectl -n "$NS" cp "$JS" "$POD:/tmp/fr65-stall-census.js" >/dev/null
-    rc=0
-    kubectl -n "$NS" exec "$POD" -- env "${ENVS[@]+"${ENVS[@]}"}" mongosh --nodb --quiet /tmp/fr65-stall-census.js || rc=$?
-    kubectl -n "$NS" exec "$POD" -- rm -f /tmp/fr65-stall-census.js || true
-    after="$(restarts)"
-    echo "mongodb pod $POD: restarts=$after after the read"
-    if [ "$after" != "$before" ]; then
-      echo "fr65-stall-census: ⚠️ the mongodb pod RESTARTED during the read — treat this run as harmful, not as data:" >&2
-      kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].lastState}' >&2 || true
-      echo >&2
-      exit 3
-    fi
-    exit "$rc"
+    # The runner prints the mongodb pod's restart count and memory before and
+    # after, and exits 3 when the pod restarted: treat that run as harmful, not
+    # as data.
+    EOPTS=()
+    for e in "${ENVS[@]+"${ENVS[@]}"}"; do EOPTS+=(--env "$e"); done
+    exec bash "$READ" --kubectl --yes "${EOPTS[@]+"${EOPTS[@]}"}" "$JS"
     ;;
 
   mars)
     command -v roomler >/dev/null || die "roomler is not on PATH"
-    # One `roomler ssh`, carrying both files on stdin: a device has a ceiling on
+    # One `roomler ssh`, carrying the files on stdin: a device has a ceiling on
     # SSH requests per caller, and four in a row meet it.
     rc=0
-    tar -C "$HERE" -cf - fr65-stall-census.cjs fr65-stall-census.sh |
+    tar -C "$HERE" -cf - fr65-stall-census.cjs fr65-stall-census.sh prod-mongo-read.sh |
       roomler ssh mars -- "D=\$(mktemp -d ~/fr65-census.XXXXXX) && tar -xf - -C \"\$D\" && { bash \"\$D/fr65-stall-census.sh\" --kubectl --yes $(printf '%q ' "${PASS[@]+"${PASS[@]}"}"); rc=\$?; rm -rf \"\$D\"; exit \$rc; }" || rc=$?
     exit "$rc"
     ;;
