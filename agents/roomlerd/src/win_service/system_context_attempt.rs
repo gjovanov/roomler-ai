@@ -170,9 +170,11 @@ pub fn record(attempt: &Attempt) -> std::io::Result<()> {
 /// is removed first and `create_new` refuses one that appears, because a write
 /// into it would keep that file's owner and DACL and the rename would make it
 /// the record. Before it takes the name it is given Administrators as its
-/// owner and SYSTEM and Administrators alone as its DACL, through its handle;
-/// a caller that may not (not SYSTEM, not elevated) leaves the DACL its folder
-/// hands down, and the next repair does the rest.
+/// owner and SYSTEM and Administrators as its DACL, with read for Users
+/// (`machine_tree::seal_new_record`: Setup reads it as the person who started
+/// it, after a failed install), through its handle; a caller that may not (not
+/// SYSTEM, not elevated) leaves the DACL its folder hands down, and the next
+/// repair does the rest.
 pub fn record_at(target: &std::path::Path, attempt: &Attempt) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = target.parent() {
@@ -184,7 +186,7 @@ pub fn record_at(target: &std::path::Path, attempt: &Attempt) -> std::io::Result
     let mut file = roomler_node_core::machine_tree::create_fresh(&tmp)?;
     let written = file.write_all(&json).and_then(|()| file.sync_all());
     if written.is_ok() {
-        let _ = roomler_node_core::machine_tree::seal_new_file(&file);
+        let _ = roomler_node_core::machine_tree::seal_new_record(&file);
     }
     drop(file);
     if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, target)) {
@@ -434,6 +436,30 @@ mod tests {
         );
         let last = read_last_at(&target).unwrap();
         assert!(last_switched_on(last.as_ref()));
+    }
+
+    /// The record is Administrators', SYSTEM and Administrators may change it,
+    /// and Users may read it: Setup reads it as the person who started it, to
+    /// say which stage of a failed background-service install failed.
+    #[test]
+    fn a_written_record_stays_readable_for_users() {
+        use roomler_node_core::machine_tree::test_support::*;
+        if !elevated_or_skip("the record's writer") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("last-system-context-attempt.json");
+        record_at(&target, &Attempt::ok(ENABLE_COMMAND)).unwrap();
+        let got = sddl(&target);
+        assert_eq!(owner(&got), "BA", "{got}");
+        assert!(protected(&got), "{got}");
+        let mut aces = aces(&got);
+        aces.sort();
+        assert_eq!(
+            aces,
+            ["A;;0x1200a9;;;BU", "A;;FA;;;BA", "A;;FA;;;SY"],
+            "{got}"
+        );
     }
 
     fn an_enable() -> Vec<u8> {

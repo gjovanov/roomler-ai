@@ -19,9 +19,10 @@
 //!   An entry for another account on the parent is cut to read and execute
 //!   ([`parent_cut`]); the machine folder, once it holds a machine config or a
 //!   save is writing one, becomes Administrators' with SYSTEM and
-//!   Administrators alone; the config, its `.prev`, the keys folder, the key
-//!   files and the attempt record get the same, not inheriting, so an entry
-//!   added to a folder above later does not reach them. An entry owned by a
+//!   Administrators alone; the config, its `.prev`, the keys folder and the key
+//!   files get the same, and the attempt record the same with read for Users
+//!   (Setup reads it as the person who started it), not inheriting, so an
+//!   entry added to a folder above later does not reach them. An entry owned by a
 //!   member of the computer's Administrators group, read from the computer's
 //!   own account database (an account of this computer directly or through a
 //!   group; a domain's only when the group names it directly), is given to the
@@ -37,9 +38,11 @@
 //! - The writers ([`create_fresh`], [`seal_new_file`]) make every file they
 //!   write: a file of that name made before them is never written into.
 //! - An elevated save of the machine config (Setup, `roomlerd enroll
-//!   --machine-global`) first takes the machine folder for Administrators, its
-//!   owner and nothing else ([`adopt_machine_folder`]); the repair never takes
-//!   over a folder another account owns. And an elevated writer folds a new
+//!   --machine-global`) first takes the machine folder and the parent for
+//!   Administrators, their owners and nothing else ([`adopt_machine_folder`],
+//!   [`adopt_machine_parent`], which derives what the parent inherits again for
+//!   its new owner); the repair never takes over an entry another account owns.
+//!   And an elevated writer folds a new
 //!   enrollment only into a config that passes the check after the repair
 //!   ([`may_fold`]); any other is replaced by a fresh one.
 //!
@@ -386,10 +389,17 @@ enum Role {
     /// The keys folder: SYSTEM and Administrators alone, `(OI)(CI)`, not
     /// inheriting.
     PrivateDir,
-    /// The config, `.prev`, a key file, the record: SYSTEM and Administrators
-    /// alone, not inheriting.
+    /// The config, `.prev`, a key file: SYSTEM and Administrators alone, not
+    /// inheriting.
     Private,
+    /// The attempt record: SYSTEM and Administrators, and read for Users, not
+    /// inheriting ([`record_aces`]).
+    Record,
 }
+
+/// `S-1-5-32-545`, the Users group.
+#[cfg(windows)]
+const USERS_GROUP: &str = "S-1-5-32-545";
 
 /// SYSTEM and Administrators with full control, `flags` on each.
 #[cfg(windows)]
@@ -410,13 +420,34 @@ fn sealed_aces(flags: u8) -> Vec<Ace> {
     ]
 }
 
+/// The attempt record's entries: SYSTEM and Administrators with full control,
+/// and Users read and execute. Setup reads the record as the person who
+/// started it, to say which stage of a failed background-service install
+/// failed; nothing in it is private, and no other account may change it.
+#[cfg(windows)]
+fn record_aces() -> Vec<Ace> {
+    let mut aces = sealed_aces(0);
+    aces.push(Ace {
+        kind: ACE_ALLOW,
+        flags: 0,
+        mask: READ_EXECUTE,
+        sid: USERS_GROUP.into(),
+    });
+    aces
+}
+
 /// Exactly [`sealed_aces`], in either order, and not inheriting.
 #[cfg(windows)]
 fn is_sealed(sd: &Sd, flags: u8) -> bool {
+    is_exactly(sd, &sealed_aces(flags))
+}
+
+/// Exactly `want`, in any order, and not inheriting.
+#[cfg(windows)]
+fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
     let Some(aces) = &sd.dacl else {
         return false;
     };
-    let want = sealed_aces(flags);
     sd.protected && aces.len() == want.len() && want.iter().all(|w| aces.contains(w))
 }
 
@@ -464,7 +495,7 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
         Ok(None) => {}
         Err(why) => out.left.push(why),
     }
-    repair_path(&tree.record(), win::Kind::File, Role::Private, &mut out);
+    repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
     repair_entry(tree.parent(), &parent, Role::Parent, &mut out);
     out
 }
@@ -534,6 +565,10 @@ fn repair_entry(path: &Path, entry: &win::Entry, role: Role, out: &mut Repairs) 
             (!is_sealed(&sd, flags)).then(|| (sealed_aces(flags), true))
         }
         Role::Private => (!is_sealed(&sd, 0)).then(|| (sealed_aces(0), true)),
+        Role::Record => {
+            let want = record_aces();
+            (!is_exactly(&sd, &want)).then_some((want, true))
+        }
     };
     if !take && dacl.is_none() {
         return;
@@ -549,6 +584,9 @@ fn repair_entry(path: &Path, entry: &win::Entry, role: Role, out: &mut Repairs) 
         (true, Some(_)) => "given to Administrators, and its DACL set",
         (true, None) => "given to Administrators",
         (false, _) if role == Role::Parent => "another account's entry cut to read and execute",
+        (false, _) if role == Role::Record => {
+            "its DACL set to SYSTEM and Administrators, and read for Users"
+        }
         (false, _) => "its DACL set to SYSTEM and Administrators alone",
     };
     match win::write_sd(
@@ -622,6 +660,61 @@ pub fn adopt_machine_folder(tree: &MachineTree) -> Result<bool, String> {
     win::set_sd(&entry.file, true, None)
         .map_err(|e| format!("{}: taking it for Administrators: {e}", folder.display()))?;
     Ok(true)
+}
+
+/// The same for `%ProgramData%\roomler`, the parent, which a person's daemon
+/// also makes when it stages a received file before the service ever ran: it
+/// is that person's, and the full control `%ProgramData%` hands its creator
+/// (its CREATOR OWNER entry) names them. The repair takes over nothing another
+/// account owns, so the check refuses such a parent, and an elevated save of
+/// the machine config takes it for Administrators first ([`adopt_machine_folder`]
+/// beside it, through `config::take_machine_folder`).
+///
+/// The owner, and what the parent inherits derived again for that owner, so
+/// the creator's entry names Administrators: its own entries and its
+/// protection stay as they are, and nothing below it changes hands. A plain
+/// folder only: anything else is an `Err` naming it, and is never taken over.
+/// `Ok(true)` when it was taken; `Ok(false)` when it is not there, or SYSTEM or
+/// Administrators own it. The daemon never calls this.
+#[cfg(windows)]
+pub fn adopt_machine_parent(tree: &MachineTree) -> Result<bool, String> {
+    let parent = tree.parent();
+    let Some(entry) = win::open(parent, win::Kind::Dir, false, true)? else {
+        return Ok(false);
+    };
+    let sd = win::read_sd(&entry.file)
+        .map_err(|e| format!("{}: reading its security: {e}", parent.display()))?;
+    if trusted(&sd.owner) {
+        return Ok(false);
+    }
+    if !entry.writable {
+        return Err(format!(
+            "{} is not taken for Administrators: this process may not change its owner",
+            parent.display()
+        ));
+    }
+    let taking =
+        |e: std::io::Error| format!("{}: taking it for Administrators: {e}", parent.display());
+    // The owner first: what is inherited is then derived for Administrators.
+    win::set_sd(&entry.file, true, None).map_err(taking)?;
+    if !sd.protected {
+        let own: Vec<Ace> = sd
+            .dacl
+            .iter()
+            .flatten()
+            .filter(|ace| ace.flags & INHERITED == 0)
+            .cloned()
+            .collect();
+        win::set_sd(&entry.file, false, Some((&own, false))).map_err(taking)?;
+    }
+    Ok(true)
+}
+
+/// W for the attempt record: [`seal_new_file`] with [`record_aces`], so Users
+/// may still read it.
+#[cfg(windows)]
+pub fn seal_new_record(file: &std::fs::File) -> std::io::Result<()> {
+    win::set_sd(file, true, Some((&record_aces(), true)))
 }
 
 /// B: may SYSTEM run the machine config under `tree`? `Ok` when the parent, the
@@ -759,12 +852,14 @@ pub fn may_fold(tree: &MachineTree, switches: Switches) -> Result<(), String> {
 }
 
 /// Log what a repair changed, once per change, and what it left, once until
-/// that changes: the host repairs at every tick while it waits.
+/// that changes: the host repairs at every tick while it waits. A change is a
+/// WARN, so the daemon's default filter keeps it: a repair changes something
+/// only when an entry drifted, and that is worth finding in the log.
 #[cfg(windows)]
 pub fn log_repairs(repairs: &Repairs) {
     static LEFT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     for line in &repairs.changed {
-        tracing::info!(%line, "machine tree: repaired");
+        tracing::warn!(%line, "machine tree: repaired");
     }
     let mut last = LEFT.lock().unwrap_or_else(|e| e.into_inner());
     for line in repairs.left.iter().filter(|l| !last.contains(l)) {
@@ -2725,6 +2820,166 @@ mod tests {
                 Ok(false),
                 "a folder Administrators own is left as it is"
             );
+        }
+
+        /// `%ProgramData%`'s own DACL, CREATOR OWNER's entry included: whoever
+        /// makes a folder below it gets full control of that folder.
+        const PROGRAM_DATA: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;FA;;;CO)\
+                                    (A;OICI;0x1200a9;;;BU)(A;CI;0x116;;;BU)";
+
+        /// The field's G7 tree: a person's daemon staged a received file before
+        /// the service ever ran, so the parent, the machine folder and the
+        /// staging folder are that person's, and the parent's entry from
+        /// CREATOR OWNER names whoever made it (this test's account, here).
+        fn a_tree_a_person_made(root: &std::path::Path, person: &str) -> MachineTree {
+            let program_data = root.join("ProgramData");
+            std::fs::create_dir(&program_data).unwrap();
+            set_dacl(&program_data, PROGRAM_DATA);
+            let parent = program_data.join("roomler");
+            let staging = parent.join("roomler").join("staging");
+            std::fs::create_dir_all(&staging).unwrap();
+            for dir in [&parent, &parent.join("roomler"), &staging] {
+                assert!(icacls(dir, &["/setowner", &format!("*{person}")]));
+            }
+            MachineTree::under(&parent)
+        }
+
+        /// G7: a parent a person made is refused, and the repair leaves it.
+        /// The elevated save of the machine config takes it for
+        /// Administrators, with the machine folder, before it writes: the
+        /// parent's entry from CREATOR OWNER then names Administrators, its
+        /// other entries stay, what the person made below keeps its owner, and
+        /// the check passes.
+        #[test]
+        fn an_elevated_save_takes_a_parent_a_person_made() {
+            if !elevated_or_skip("the parent taken by an elevated save") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let person = local_guest().unwrap_or_else(|| USERS.to_string());
+            let tree = a_tree_a_person_made(root.path(), &person);
+            let staging = tree.folder().join("staging");
+            let staging_owner = owner(&sddl(&staging));
+            // Full control for anyone but SYSTEM and Administrators (and the
+            // CREATOR OWNER entry that hands it down, which applies to nothing
+            // itself).
+            let full_for_another = |sddl: &str| {
+                aces(sddl).iter().any(|a| {
+                    a.contains(";FA;")
+                        && !a.ends_with(";SY")
+                        && !a.ends_with(";BA")
+                        && !a.ends_with(";CO")
+                })
+            };
+            // Where an administrator's new folders are its own (a client
+            // Windows' default), the entry names this test's account, as it
+            // names the person in the field. Where they are the group's
+            // (Windows Server's default), it names Administrators from the
+            // start, and the rest still holds.
+            if !full_for_another(&sddl(tree.parent())) {
+                eprintln!(
+                    "note: the creator's entry names Administrators here: {}",
+                    sddl(tree.parent())
+                );
+            }
+            std::fs::write(tree.config(), "agent_token = \"t\"\n").unwrap();
+            repair(&tree, true);
+            let why = check(&tree).expect_err("a parent a person made");
+            assert!(
+                why.contains(&tree.parent().display().to_string()),
+                "the reason names the parent: {why}"
+            );
+            let before = sddl(tree.parent());
+
+            assert_eq!(adopt_machine_parent(&tree), Ok(true));
+            assert_eq!(adopt_machine_folder(&tree), Ok(true));
+            let parent = sddl(tree.parent());
+            assert_eq!(owner(&parent), "BA", "{parent}");
+            assert!(
+                !full_for_another(&parent),
+                "the creator's entry names Administrators now: {parent}"
+            );
+            assert_eq!(protected(&parent), protected(&before), "{parent}");
+            assert!(
+                aces(&parent).iter().any(|a| a.ends_with(";BU")),
+                "what %ProgramData% hands Users stays: {parent}"
+            );
+            repair(&tree, true);
+            assert_eq!(check(&tree), Ok(()), "the service takes it");
+            assert_eq!(
+                owner(&sddl(&staging)),
+                staging_owner,
+                "what the person made below keeps its owner"
+            );
+            assert_eq!(adopt_machine_parent(&tree), Ok(false), "taken once");
+        }
+
+        /// The parent's adoption takes a plain folder only: one that leads
+        /// elsewhere is refused, naming it, and what it leads to keeps its
+        /// owner and DACL.
+        #[test]
+        fn a_parent_that_leads_elsewhere_is_never_taken_over() {
+            if !elevated_or_skip("a parent that leads elsewhere, taken over") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let program_data = root.path().join("ProgramData");
+            std::fs::create_dir(&program_data).unwrap();
+            set_dacl(&program_data, PROGRAM_DATA);
+            let elsewhere = root.path().join("elsewhere");
+            std::fs::create_dir_all(elsewhere.join("roomler")).unwrap();
+            let other = local_guest().unwrap_or_else(|| USERS.to_string());
+            assert!(icacls(&elsewhere, &["/setowner", &format!("*{other}")]));
+            let parent = program_data.join("roomler");
+            junction(&parent, &elsewhere);
+            let tree = MachineTree::under(&parent);
+            let target = sddl(&elsewhere);
+            let why = adopt_machine_parent(&tree).expect_err("never taken over");
+            assert!(
+                why.contains(&parent.display().to_string()),
+                "the reason names the entry: {why}"
+            );
+            assert_eq!(sddl(&elsewhere), target);
+        }
+
+        /// The attempt record stays readable for Users: Setup reads it as the
+        /// person who started it, after a background-service install failed,
+        /// to say which stage failed. Nobody but SYSTEM and Administrators may
+        /// change it, and `keep-system-context` still reads it.
+        #[test]
+        fn the_attempt_record_stays_readable_for_users() {
+            if !elevated_or_skip("the attempt record's readers") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = enrolled_tree(root.path());
+            std::fs::write(tree.record(), b"{}").unwrap();
+            assert!(icacls(&tree.record(), &["/grant", "*S-1-5-32-546:(F)"]));
+            repair(&tree, false);
+            let record = sddl(&tree.record());
+            assert!(protected(&record), "{record}");
+            let mut got = aces(&record);
+            got.sort();
+            let mut want = vec![
+                "A;;FA;;;SY".to_string(),
+                "A;;FA;;;BA".to_string(),
+                "A;;0x1200a9;;;BU".to_string(),
+            ];
+            want.sort();
+            assert_eq!(got, want, "{record}");
+            assert_eq!(
+                read_record(&tree, Switches::ON).unwrap().as_deref(),
+                Some(&b"{}"[..])
+            );
+            assert_eq!(repair(&tree, false), Repairs::default(), "left as it is");
+
+            let made = root.path().join("record.json");
+            let file = create_fresh(&made).unwrap();
+            seal_new_record(&file).unwrap();
+            drop(file);
+            let mut got = aces(&sddl(&made));
+            got.sort();
+            assert_eq!(got, want, "a record made new");
         }
 
         /// The adoption takes a plain folder only: a machine folder that

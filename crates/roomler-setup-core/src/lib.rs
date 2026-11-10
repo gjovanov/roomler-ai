@@ -25,6 +25,9 @@ pub mod held_file;
 pub mod integration;
 pub mod msi_runner;
 pub mod progress;
+/// #3609 — the pipe between a limited wizard and its administrator step, which
+/// writes the machine enrollment of a background-service install.
+pub mod step_channel;
 pub mod token_peek;
 pub mod tunnel_enroll;
 pub mod wizard_state;

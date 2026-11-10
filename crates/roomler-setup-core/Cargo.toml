@@ -79,6 +79,11 @@ tar = "0.4"
 #                      MessageBoxW) +
 #                      Win32_System_LibraryLoader (SetDefaultDllDirectories) +
 #                      Win32_Security (the token: can this user ever elevate?)
+#   step_channel.rs  → Win32_Security_Authorization (the pipe's descriptor from
+#                      SDDL) + Win32_System_Pipes (GetNamedPipeClientProcessId:
+#                      only the step's connection is taken) +
+#                      Win32_Storage_FileSystem (FILE_WRITE_DATA and
+#                      SECURITY_IDENTIFICATION for the step's open) — #3609
 # NB Win32_UI_WindowsAndMessaging was declared by NEITHER legacy
 # crate — it compiled there only via cargo feature-unification with
 # roomlerd's windows-sys features. This crate declares what it
@@ -87,8 +92,11 @@ tar = "0.4"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_Registry",
     "Win32_UI_Shell",

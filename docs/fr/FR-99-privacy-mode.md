@@ -285,16 +285,16 @@ locked from there, so no new process or token is needed.
 cells passed (0.4.139, §8 row 16). Now a **fresh Windows service install** is written with
 `lock_on_end = auto`. That covers the wizard's SystemContext flavour and `roomlerd enroll
 --machine-global` (`install.ps1 -Role daemon-system`). Both call one helper,
-[`enrollment.rs:863`](../../crates/agent-core/src/enrollment.rs#L863) `apply_service_install_defaults`,
+[`enrollment.rs:937`](../../crates/agent-core/src/enrollment.rs#L937) `apply_service_install_defaults`,
 from [`main.rs:2584`](../../agents/roomlerd/src/main.rs#L2584) and
-[`enroll_step.rs:208`](../../agents/roomler-setup/src/enroll_step.rs#L208):
+[`enroll_step.rs:229`](../../agents/roomler-setup/src/enroll_step.rs#L229):
 
 | Install | Starts at | Why |
 |---|---|---|
 | Windows service (SystemContext), fresh | `auto` | its worker is SYSTEM in the console session and reaches the secure desktop, so the next controller can lift the lock (§8 rows 12, 16) |
 | Windows per-user, or perMachine without SystemContext | `never` | the worker cannot reach the secure desktop: a lock at the end would leave the next session at a padlock nobody can lift remotely |
 | Linux root daemon | `never` | the operator's refinement named it, but no field cell has shown a remote unlock there yet (X11 and Wayland); the flip waits for one |
-| any install already in the field, re-enrolled | what it had | a refresh, a rebind or an appended org keeps the existing config ([`enrollment.rs:847`](../../crates/agent-core/src/enrollment.rs#L847) `takes_service_install_defaults`), and a config that lacks the key reads `never` |
+| any install already in the field, re-enrolled | what it had | a refresh, a rebind or an appended org keeps the existing config ([`enrollment.rs:921`](../../crates/agent-core/src/enrollment.rs#L921) `takes_service_install_defaults`), and a config that lacks the key reads `never` |
 
 The wizard always writes a fresh config, so a wizard install counts as new.
 

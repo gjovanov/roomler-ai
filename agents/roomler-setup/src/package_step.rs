@@ -20,6 +20,9 @@
 //! elevated step:  a new folder only administrators can write
 //!   -> copy the file in -> hold it open, refusing writers
 //!   -> digest + publisher through that handle -> msiexec on it -> exit code
+//!   -> on the background service, once installed: the machine enrollment,
+//!      over the channel the wizard made before the prompt (#3609,
+//!      `crate::machine_write`)
 //! ```
 //!
 //! An elevated wizard runs the same thing in its own process, on a download it
@@ -31,12 +34,16 @@
 //! The step takes nothing but a file and a yes-or-no. It builds `msiexec`'s
 //! arguments itself, so a limited process that starts it can pass no property and
 //! no transform, and it installs nothing we did not sign. It writes and deletes
-//! only inside its own new folder, and only reads what it was pointed at: an
-//! elevated write or delete under the person's `%TEMP%` would go wherever a link
-//! planted there says. The person's `%TEMP%` does not reach `msiexec` either.
+//! only inside its own new folder, and on the background-service role the
+//! machine config (`crate::machine_write`, which builds it from the server's
+//! answer alone), and only reads what it was pointed at: an elevated write or
+//! delete under the person's `%TEMP%` would go wherever a link planted there
+//! says. The person's `%TEMP%` does not reach `msiexec` either.
 //!
-//! The exit code is the one channel back, and a limited process cannot forge it:
-//! [`exit_code`] has what it says.
+//! The exit code is the channel back, and a limited process cannot forge it:
+//! [`exit_code`] has what it says. On the background-service role the step also
+//! speaks, once the installer ran, on the channel the wizard made before the
+//! prompt, and only to the wizard that started it (#3609).
 
 use std::path::{Path, PathBuf};
 
@@ -81,6 +88,37 @@ pub mod exit_code {
     pub const WRONG_PUBLISHER: i32 = REFUSED + 5;
     pub const COULD_NOT_CHECK: i32 = REFUSED + 6;
     pub const MSIEXEC_DID_NOT_START: i32 = REFUSED + 7;
+    /// #3609 — the base of what the step says once the installer has run on
+    /// the background-service role, when it did not write the machine
+    /// enrollment (`machine_write::hand_over`). The installer did run, so
+    /// neither `msiexec`'s words nor a refusal's ("nothing was installed") fit.
+    const AFTER_INSTALL: i32 = 0x5245_0000;
+    /// It found no channel to Roomler Setup to take the enrollment from.
+    pub const NO_WIZARD: i32 = AFTER_INSTALL + 1;
+    /// Roomler Setup hung up, or asked out of turn, before the write.
+    pub const NOT_WRITTEN: i32 = AFTER_INSTALL + 2;
+    /// The write failed, and Roomler Setup was told why.
+    pub const WRITE_FAILED: i32 = AFTER_INSTALL + 3;
+    /// Nothing came within the step's time.
+    pub const TIMED_OUT: i32 = AFTER_INSTALL + 4;
+}
+
+/// #3609 — what the person reads when the step's exit code says the installer
+/// ran on the background-service role but the machine enrollment was not
+/// written, and the step said nothing on its channel (one that did reach Setup
+/// said why there). Setup enrolls only once the step has answered, so the
+/// token is still unused.
+pub fn not_written(code: i32) -> Option<&'static str> {
+    use exit_code as c;
+    matches!(
+        code,
+        c::NO_WIZARD | c::NOT_WRITTEN | c::WRITE_FAILED | c::TIMED_OUT
+    )
+    .then_some(
+        "Roomler was installed, but its administrator step could not write this device's \
+         enrollment. Run Roomler Setup again: nothing was enrolled, and the enrollment token is \
+         still unused.",
+    )
 }
 
 /// Why an installer was not run. Every variant is a refusal, and all of them
@@ -432,7 +470,9 @@ fn fit_digest(value: &str) -> Option<&str> {
 /// One that failed does. A prompt declined or another install in the way wrote
 /// nothing worth keeping.
 pub fn keeps_log(code: i32) -> bool {
-    !matches!(code, 0 | 1602 | 1618 | 3010) && Refusal::from_step_exit(code).is_none()
+    !matches!(code, 0 | 1602 | 1618 | 3010)
+        && Refusal::from_step_exit(code).is_none()
+        && not_written(code).is_none()
 }
 
 /// Start `msiexec` on a package this process holds: full path, `TEMP` and `TMP`
@@ -473,6 +513,11 @@ pub struct Started {
     pub runner: MsiRunner,
     log: PathBuf,
     log_needs_administrator: bool,
+    /// #3609 — a limited wizard's background-service install: the channel its
+    /// step writes the machine enrollment through, made before the prompt
+    /// ([`wait_for_install`]).
+    #[cfg(target_os = "windows")]
+    channel: Option<wizard_shared::step_channel::Listener>,
 }
 
 impl Started {
@@ -527,6 +572,8 @@ pub async fn start_install(
         runner,
         log: PathBuf::from(format!("{}.log", staged.display())),
         log_needs_administrator: false,
+        #[cfg(target_os = "windows")]
+        channel: None,
     };
     #[cfg(target_os = "windows")]
     {
@@ -568,9 +615,26 @@ async fn start_step(
             staged.display()
         ))
     })?;
+    let stage = new_stage_name();
+    // #3609 — on the background-service role the step stays after the
+    // installer to write the machine enrollment, which this process enrolls in
+    // between: its channel is made first, before the prompt, so a name
+    // something else holds stops the run here, with nothing installed.
+    let channel = if system_context {
+        let name = wizard_shared::step_channel::pipe_name(&stage);
+        Some(
+            wizard_shared::step_channel::Listener::create(&name).map_err(|e| {
+                step_failed(format!(
+                    "its channel to Roomler Setup could not be made ({e})"
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
     let step = StepArgs {
         source: source.to_string(),
-        stage: new_stage_name(),
+        stage,
         digest: digest.map(str::to_string),
         system_context,
     };
@@ -595,7 +659,52 @@ async fn start_step(
         runner,
         log: stage_folder(&step.stage).join(format!("{name}.log")),
         log_needs_administrator: true,
+        channel,
     })
+}
+
+/// Wait up to `budget` for the install to end: `msiexec`'s exit code, as
+/// always, or on a limited wizard's background-service install the step's word
+/// on its channel that the installer ran, with that channel (#3609): the step
+/// then stays to write the machine enrollment at step 7
+/// (`machine_write::ConfigWriter`). A step that ends without that word (a
+/// refusal, a failed install) is read from its exit code.
+pub async fn wait_for_install(
+    started: &mut Started,
+    budget: std::time::Duration,
+) -> Result<
+    (
+        wizard_shared::msi_runner::MsiExitDecoded,
+        Option<crate::machine_write::StepLink>,
+    ),
+    wizard_shared::msi_runner::MsiRunnerError,
+> {
+    #[cfg(target_os = "windows")]
+    if let Some(listener) = started.channel.take() {
+        let accepted = crate::machine_write::accept_install(listener, started.runner.pid());
+        let exited = started.runner.wait_for_exit(budget);
+        tokio::pin!(accepted, exited);
+        tokio::select! {
+            biased;
+            got = &mut accepted => match got {
+                Ok((code, link)) => {
+                    let outcome = wizard_shared::msi_runner::decode_msi_exit(code);
+                    return Ok((outcome, Some(link)));
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "setup: the administrator step's channel failed; its exit code decides"
+                ),
+            },
+            outcome = &mut exited => return outcome.map(|outcome| (outcome, None)),
+        }
+        return exited.await.map(|outcome| (outcome, None));
+    }
+    started
+        .runner
+        .wait_for_exit(budget)
+        .await
+        .map(|outcome| (outcome, None))
 }
 
 /// #3246 — a zip carries no signature of its own, so what is inside decides, and
@@ -702,6 +811,12 @@ fn run_step(args: &[String]) -> i32 {
     };
     if keeps_log(code) {
         stage.keep_log_of(&copy);
+    }
+    // #3609 — the background service, installed: its machine enrollment is this
+    // step's to write, from what the wizard enrolls now (`machine_write`).
+    if step.system_context && matches!(code, 0 | 3010) {
+        drop(stage);
+        return crate::machine_write::hand_over(&step.stage, code);
     }
     code
 }
@@ -854,6 +969,35 @@ mod tests {
                 Refusal::from_step_exit(code),
                 Some(Refusal::StepFailed(_))
             ));
+        }
+    }
+
+    /// #3609 — the step's codes for after the install are neither `msiexec`'s
+    /// nor a refusal's: the installer ran, the machine enrollment was not
+    /// written, and the token is still unused. None keeps a log.
+    #[test]
+    fn after_the_install_the_step_says_the_enrollment_was_not_written() {
+        for code in [
+            exit_code::NO_WIZARD,
+            exit_code::NOT_WRITTEN,
+            exit_code::WRITE_FAILED,
+            exit_code::TIMED_OUT,
+        ] {
+            assert!(Refusal::from_step_exit(code).is_none(), "{code:#x}");
+            let words = not_written(code).expect("said");
+            assert!(words.contains("was installed"), "{words}");
+            assert!(words.contains("still unused"), "{words}");
+            assert!(!keeps_log(code), "{code:#x}");
+        }
+        for code in [
+            0,
+            3010,
+            1602,
+            1603,
+            exit_code::NOT_TRUSTED,
+            stage_failed(&std::io::Error::from_raw_os_error(5)),
+        ] {
+            assert!(not_written(code).is_none(), "{code:#x}");
         }
     }
 

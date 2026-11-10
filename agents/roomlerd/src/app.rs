@@ -1474,6 +1474,19 @@ async fn daemon_main() -> Result<()> {
         if matches!(cli.command, Some(Command::Netd)) {
             logging::set_service_logging(logging::ServiceLogRole::Netd);
         }
+        // #3609 — the per-Machine MSI's SystemContext commands log beside the
+        // service: `keep-system-context` repairs the machine tree first, and
+        // an upgrade's first repair is its own.
+        if matches!(
+            cli.command,
+            Some(
+                Command::KeepSystemContext { .. }
+                    | Command::EnableSystemContext { .. }
+                    | Command::DisableSystemContext { .. }
+            )
+        ) {
+            logging::set_service_logging(logging::ServiceLogRole::Installer);
+        }
         #[cfg(feature = "system-context")]
         if matches!(cli.command, Some(Command::Run { .. }) | None) {
             use roomlerd::system_context::worker_role;

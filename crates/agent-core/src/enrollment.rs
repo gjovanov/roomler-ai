@@ -183,7 +183,51 @@ pub fn resolve_install_from(
     Ok(InstallInfo::new(method, scope))
 }
 
+/// What one enrollment produced: the server's answer, and the machine values
+/// the enrollment was made with. It is everything [`enroll`] writes into a
+/// fresh config that is not a default, and [`Issued::into_config`] is that
+/// config.
+///
+/// The setup wizard enrolls a background-service install as the person at the
+/// screen and hands this to its administrator step, which writes the machine
+/// config from it: the step builds the config itself, so the wizard chooses
+/// no key beyond these.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Issued {
+    /// The server, as [`enroll`] posted to it (TLS unless loopback).
+    pub server_url: String,
+    pub agent_id: String,
+    pub tenant_id: String,
+    /// The long-lived agent token.
+    pub agent_token: String,
+    pub machine_id: String,
+    pub machine_name: String,
+    /// FR-51 — what the server minted.
+    pub ephemeral: bool,
+}
+
+/// Never prints the agent token.
+impl std::fmt::Debug for Issued {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Issued")
+            .field("server_url", &self.server_url)
+            .field("agent_id", &self.agent_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("agent_token", &"<redacted>")
+            .field("machine_id", &self.machine_id)
+            .field("machine_name", &self.machine_name)
+            .field("ephemeral", &self.ephemeral)
+            .finish()
+    }
+}
+
 pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
+    enroll_issued(inputs).await.map(Issued::into_config)
+}
+
+/// [`enroll`] up to the server's answer, before it becomes a config.
+pub async fn enroll_issued(inputs: EnrollInputs<'_>) -> Result<Issued> {
     // Promote http:// to https://. The production ingress 301-redirects
     // plaintext to TLS; reqwest then downgrades the POST to a GET (RFC
     // 7231 historical behavior for 301/302) so the second hop hits a
@@ -225,17 +269,47 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
 
     let body: EnrollResponse = resp.json().await.context("parsing enroll response")?;
 
-    Ok(AgentConfig {
+    Ok(Issued {
         server_url,
-        ws_url: None,
-        agent_token: body.agent_token,
         agent_id: body.agent_id,
         tenant_id: body.tenant_id,
+        agent_token: body.agent_token,
         machine_id: inputs.machine_id.to_string(),
         machine_name: inputs.machine_name.to_string(),
         // FR-51 — the server's answer, not the caller's flag: the credential
         // decides what was minted, and the config must not disagree.
         ephemeral: body.ephemeral,
+    })
+}
+
+impl Issued {
+    /// The fresh config of this enrollment: these values, and every other key
+    /// at what a new enrollment starts with.
+    pub fn into_config(self) -> AgentConfig {
+        fresh_config(self)
+    }
+}
+
+/// [`Issued::into_config`]: the one literal of a freshly enrolled config.
+fn fresh_config(issued: Issued) -> AgentConfig {
+    let Issued {
+        server_url,
+        agent_id,
+        agent_token,
+        tenant_id,
+        machine_id,
+        machine_name,
+        ephemeral,
+    } = issued;
+    AgentConfig {
+        server_url,
+        ws_url: None,
+        agent_token,
+        agent_id,
+        tenant_id,
+        machine_id,
+        machine_name,
+        ephemeral,
         encoder_preference: crate::config::EncoderPreferenceChoice::default(),
         update_check_interval_h: None,
         localapi_pipe_pool: None,
@@ -486,7 +560,7 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
         advertise_local_subnets: true,
         tunnel_routes: Vec::new(),
         orgs: Vec::new(),
-    })
+    }
 }
 
 /// FR-51 P3 — tell the server this EPHEMERAL device is leaving, so a clean
@@ -904,6 +978,61 @@ pub(crate) fn detect_os() -> OsKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn issued() -> Issued {
+        Issued {
+            server_url: "https://roomler.ai".into(),
+            agent_id: "6af285450d1b34b5d32ea7c1".into(),
+            tenant_id: "6a975e17971e2d55ddcdedb2".into(),
+            agent_token: "header.payload.signature".into(),
+            machine_id: "mid".into(),
+            machine_name: "Front desk".into(),
+            ephemeral: false,
+        }
+    }
+
+    /// The config an enrollment hands over is the one `enroll` writes: these
+    /// values, and every posture switch where a new enrollment starts it.
+    #[test]
+    fn an_issued_enrollment_becomes_a_fresh_config() {
+        let cfg = issued().into_config();
+        assert_eq!(cfg.server_url, "https://roomler.ai");
+        assert_eq!(cfg.agent_id, "6af285450d1b34b5d32ea7c1");
+        assert_eq!(cfg.tenant_id, "6a975e17971e2d55ddcdedb2");
+        assert_eq!(cfg.agent_token, "header.payload.signature");
+        assert_eq!(cfg.machine_id, "mid");
+        assert_eq!(cfg.machine_name, "Front desk");
+        assert!(!cfg.ephemeral);
+        assert!(cfg.ws_url.is_none());
+        assert!(!cfg.exec_enabled && !cfg.ssh_enabled && !cfg.remote_config_enabled);
+        assert!(!cfg.overlay_enabled && !cfg.allow_plaintext_server);
+        assert!(cfg.orgs.is_empty() && cfg.tunnel_routes.is_empty());
+        assert_eq!(
+            cfg.config_schema_version.as_deref(),
+            Some(crate::config::CURRENT_SCHEMA_VERSION)
+        );
+        let ephemeral = Issued {
+            ephemeral: true,
+            ..issued()
+        };
+        assert!(ephemeral.into_config().ephemeral);
+    }
+
+    /// What is handed over is logged without its token.
+    #[test]
+    fn an_issued_enrollment_never_prints_its_token() {
+        let shown = format!("{:?}", issued());
+        assert!(!shown.contains("header.payload.signature"), "{shown}");
+        assert!(shown.contains("6af285450d1b34b5d32ea7c1"), "{shown}");
+        let wire = serde_json::to_string(&issued()).unwrap();
+        let back: Issued = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, issued());
+        let extra = wire.replacen('{', r#"{"exec_enabled":true,"#, 1);
+        assert!(
+            serde_json::from_str::<Issued>(&extra).is_err(),
+            "no other key rides along"
+        );
+    }
 
     #[test]
     fn http_is_promoted_to_https() {
