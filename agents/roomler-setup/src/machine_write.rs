@@ -907,7 +907,7 @@ mod tests {
         /// A child process runs it, with `%ProgramData%` a stand-in under a
         /// temporary folder: the machine's folders are read once per process.
         /// In it the wizard's side runs on a thread with a limited copy of this
-        /// test's token (Administrators deny-only, no privileges, Medium), as a
+        /// test's token (Administrators deny-only, Medium integrity), as a
         /// Setup a person started has; the step's side runs with the test's own,
         /// elevated one.
         #[test]
@@ -1082,7 +1082,7 @@ mod tests {
         }
 
         /// Run `f` on a new thread with a limited copy of this process's
-        /// token: Administrators deny-only, no privileges, Medium integrity.
+        /// token: Administrators deny-only, Medium integrity.
         fn as_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
             use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
             use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -1125,8 +1125,8 @@ mod tests {
             }];
             let mut limited: HANDLE = std::ptr::null_mut();
             // SAFETY: a token opened for TOKEN_DUPLICATE; one SID to make
-            // deny-only; no privilege list (DISABLE_MAX_PRIVILEGE drops them
-            // all) and no restricting SIDs.
+            // deny-only, DISABLE_MAX_PRIVILEGE, nothing named to delete
+            // and no restricting SIDs.
             let made = unsafe {
                 CreateRestrictedToken(
                     token,
@@ -1172,7 +1172,7 @@ mod tests {
                 let on = unsafe { ImpersonateLoggedOnUser(limited) };
                 assert_ne!(on, 0, "{}", std::io::Error::last_os_error());
                 let out = f();
-                // SAFETY: this thread's own impersonation, and the handle.
+                // SAFETY: this thread's own token, and the handle.
                 unsafe {
                     RevertToSelf();
                     CloseHandle(limited);

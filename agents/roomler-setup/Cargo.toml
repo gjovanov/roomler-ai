@@ -126,7 +126,7 @@ syn = { version = "2", features = ["full", "visit"] }
 quote = "1"
 
 # #3609 — tests only: `machine_write`'s NTFS case runs the wizard's side with a
-# limited copy of the test's token (CreateRestrictedToken, impersonation), as a
+# limited copy of the test's token (CreateRestrictedToken), as a
 # Setup started by a person has. The app itself keeps every Win32 call in
 # roomler-setup-core.
 [target.'cfg(target_os = "windows")'.dev-dependencies]
