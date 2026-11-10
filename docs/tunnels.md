@@ -928,9 +928,8 @@ still open forwards, the window a `DELETE` has always had.
   [`POST /api/admin/tunnel-clients/prune`](api.md#platform-admin-platform_admins-objectid-allowlist-404-on-miss),
   an operator step that runs the removal's own cascade per (org, person).
 - **Devices the person enrolled are not removed with them.** A device is not a tunnel
-  client, and removing one stays a device manager's decision. A tunnel session a
-  device originates acts as the device's owner, so a `UserId` tunnel policy naming the
-  person still matches it; policies naming them are left in place.
+  client, and removing one stays a device manager's decision. Tunnel policies naming
+  the person are left in place for an admin to edit.
 
 ## LocalAPI
 

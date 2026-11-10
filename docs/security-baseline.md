@@ -561,11 +561,10 @@ seat and a room membership do ([§3](#the-media-socket-admits-only-the-calls-par
   approver's). The enrollment asks again after its write: a removal deletes the
   membership and then lists the person's clients, so a write that landed after that
   list is seen by the second read and removed.
-- **Devices the person enrolled are not removed with them.** Their rows keep the person
-  as owner, and a tunnel session a device originates acts as its owner, so a `UserId`
-  tunnel policy naming the person still matches that device's sessions. Policies naming
-  the person are left in place: through a tunnel client they match nobody now, and they
-  apply again if the person is added back.
+- **Devices the person enrolled are not removed with them**: a device belongs to the
+  org's fleet, and removing one stays a device manager's decision
+  (`DELETE …/agent/{id}`). Tunnel policies naming the person are left in place for an
+  admin to edit; they apply again if the person is added back.
 
 ### A removed thing answers nothing (#1821, #1829)
 
