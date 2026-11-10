@@ -329,6 +329,15 @@ membership, so `null` means that fetch failed, and a holder must not lose the pa
 over it. The Network pages are drawn for `REMOTE_CONTROL` too (`canSeeFleetNav`),
 which is not the bit, so a `moderator` reaches the tab and reads that explanation.
 
+The MagicDNS page is the other half of that rule. Reading the org's settings is any
+member's (every node receives them), changing them is `MANAGE_AGENTS`
+([security-baseline.md](security-baseline.md#the-orgs-magicdns-manage_agents-to-change-it-any-member-to-read-it)).
+So the gate is on the editor, not the page: `mayEditMagicDns`
+(`ui/src/stores/overlayRoutes.ts`) awaits the membership and asks `canEditMagicDns`
+(`ui/src/utils/permissions.ts:392`, fail-open the same way). A member without the bit
+sees the settings read-only with a note and no Save, and a save the server refuses
+turns the page read-only, never an error.
+
 ⚠️ The client gate is never the enforcement. Every route re-checks server-side;
 the UI only avoids offering what it already knows will be refused.
 
@@ -364,4 +373,4 @@ needs only `MANAGE_AGENTS` — revocation is not a grant.
 | error → wire | `crates/core/src/error.rs` |
 | client contract | `ui/src/api/client.ts` |
 | UI mirror + predicates | `ui/src/utils/permissions.ts` |
-| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `crates/tests/src/tunnel_policy_permission_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts`, `ui/src/__tests__/stores/tunnelPolicies.spec.ts` |
+| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `crates/tests/src/tunnel_policy_permission_tests.rs`, `crates/tests/src/magic_dns_permission_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts`, `ui/src/__tests__/stores/tunnelPolicies.spec.ts`, `ui/src/__tests__/stores/overlayRoutes.spec.ts` |

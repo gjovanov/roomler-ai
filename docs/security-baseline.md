@@ -296,6 +296,31 @@ roles do not.
 `crates/tests/src/tunnel_policy_permission_tests.rs` pins each point, the last one
 end to end through a member's own tunnel client.
 
+### The org's MagicDNS: `MANAGE_AGENTS` to change it, any member to read it
+
+The org's MagicDNS domain and upstream resolvers (`…/magic-dns`) are applied by every
+overlay node of the org: its resolver answers for the domain and forwards every other
+name upstream, and under an exit node the host's whole DNS goes there
+([magicdns.md](magicdns.md#who-sets-the-domain-and-the-upstreams)). Changing them
+changes every node's DNS, so **`PUT …/magic-dns` needs `MANAGE_AGENTS`**, like the
+overlay ACL's mode and the retired-key switch (`set_magic_dns`,
+`crates/modules/network/src/routes/overlay_route.rs:552`):
+
+- **Decided first**, before the body is normalized, the plan gate or the domain
+  checks run. A member without the bit gets one 403 `forbidden` whatever the body
+  says, never `not_a_member`; someone outside the org still gets `not_a_member`.
+  Switching MagicDNS off, or setting only the upstreams, is a change like any other.
+- **The read stays any member's**, unlike the tunnel ACL's above, and the difference
+  is the content: every node of the org receives the domain and the resolvers in its
+  netmap anyway, and a member reaches peers by `<node>.<domain>`. The tunnel ACL is a
+  map of everyone's grants that no member needs.
+- **The web app asks the mask first** (`canEditMagicDns`,
+  `ui/src/utils/permissions.ts:392`): a member without the bit sees the
+  current settings read-only with a note, and a save the server refuses turns the page
+  read-only rather than showing an error.
+
+`crates/tests/src/magic_dns_permission_tests.rs` pins each point.
+
 ### A 403 is an answer, not an expired credential (FR-82)
 
 Full treatment in [permissions.md](permissions.md). The two rules that bind new
