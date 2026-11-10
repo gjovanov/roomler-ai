@@ -152,10 +152,19 @@ answers a `/derp` initiation would break #2820. §3.4 keeps it working.
 
 - **A promotion, for the far end.** `promote_direct_probe` unregisters the old carrier's session at once
   (`wg.rs:2261`). Frames the peer still sends on the old carrier are lost until the peer moves too. The
-  grace's own doc measured that window at 4.2–7.4 s on a healthy LAN (`runtime.rs:542-547`).
+  grace's doc comment puts that window at 4.2–7.4 s on a healthy LAN (`runtime.rs:542-547`): the time
+  the far end took to run its own probe, latch and cutover. **P0 measured it on 0.4.207, and on a LAN
+  pair it is far shorter [M].** In 3 of 3 promotion cells (§9) the far end took the near end's handshake
+  as a probe (`inbound.rs:168`) and promoted it 10–15 ms after the near end. Within 3 s of the switch no
+  gap between its replies exceeded 0.19 s, so it lost at most one 0.1 s ping. What is left of this window
+  is on the other tiers and on a far end that does not answer the probe, which is where P3 has to find
+  its case (§3.8).
 - **The DERP→TURN regrade.** `maybe_regrade_derp` removes the peer's state first and requests TURN after
   (`establish.rs:1148`, `:1184`, `:1197`). A build that needs the server's grant "lands later via the alloc
-  queue" (`:1200`), and until then the pair has no carrier.
+  queue" (`:1200`), and until then the pair has no carrier. P0 caught one in a promotion cell (§9): B
+  logged the regrade (`:1179`) and removed A's state. A was pinging over `/derp`, so its next frame
+  arrived 10 ms later, and B followed it back onto `/derp` (`was=None`). That closed the gap and undid the
+  regrade: the TURN build never landed.
 
 ### 2.7 The stray frame, named in P0 [M]
 
@@ -388,7 +397,10 @@ so it gives an old peer nothing to follow by mistake.
   the old session registered, receive-only, until the peer's first packet arrives on the new carrier,
   capped at 15 s. This is make-before-break in reverse, and it closes §2.6's far-end window. With a
   drain, a peer still on the old relay delivers its frames there, so no `Unrouted` fires, and the grace
-  stops being needed for the race it was written for.
+  stops being needed for the race it was written for. P0 measured that window at one 0.1 s ping at most
+  on a LAN pair of 0.4.207 (§2.6). So P3 starts with a read: the same promotion cell on the srflx, TURN
+  and org-relay tiers and on a mixed-version pair. It builds the drain only where that read shows a window
+  worth closing.
 - **The DERP→TURN regrade as a probe (P4).** Build TURN beside the established DERP carrier, which is the
   stamp probe in reverse. Promote the TURN carrier on its latch, and keep DERP until then. A build that
   waits for the server's grant then waits with a working carrier.
@@ -439,7 +451,7 @@ Setting a switch to `0` restores today's behaviour byte for byte.
 
 | Phase | What | Lives in | Kill switch, default | RED | GREEN | Retires |
 |---|---|---|---|---|---|---|
-| **P0** | The lab rig and the restart cell as a script. The RED on the current release, 10 runs of §5's LAN cell. The stray frame named, with A at DEBUG; if the existing DEBUG lines cannot name it, one DEBUG line at the `/derp` send path naming each frame's kind (inert). The far-end loss window at a promotion measured, for P3. Each tier's topology proven to classify (`roomler peers` reads the tier) before its RED | `scripts/` (the cell), the lab | none: a read | — | The RED in §9 | — |
+| **P0** | The lab rig and the restart cell as a script. The RED on the current release, 10 runs of §5's LAN cell. The stray frame named, with A at DEBUG; if the existing DEBUG lines cannot name it, one DEBUG line at the `/derp` send path naming each frame's kind (inert). The far-end loss window at a promotion measured, for P3. Each tier's topology proven to classify (`roomler peers` reads the tier) before its RED. **As run (§9): the LAN pair only.** The RED, the named frame, three promotion cells and three reverse cells. The other tiers' topology proof and their REDs open P1's field read, in a lab that can route them | `scripts/` (the cell), the lab | none: a read | — | The RED in §9 | — |
 | **P1** | Verify, then follow, for a direct incumbent (§3.3). A plain make-before-break follow for a relay incumbent (§3.4). The strike only on a *moved* verdict (§3.7). The verdict line and counters (§3.11). A resume clears the holdoff, if D5 = A | `runtime/establish.rs`, `runtime.rs` (`PokeArm`), `relay_link.rs` (the probe variant of the follow), `wg.rs` (payload counted on a probe), `path.rs` | `ROOMLERD_OVERLAY_FOLLOW_MBB`, on (D4) | §5's LAN, public and srflx cells, and the mixed pair (old restarts, new is silent) | §6's AC1–AC3, AC5, AC6 | the switch, one release after the fleet read is GREEN |
 | **P2** | The restarted side sends no stray frame (§3.5) | `relay_link.rs` (`build_floor`), `runtime/establish.rs` (`install_ready`), the `/derp` mux's flush at registration | `ROOMLERD_OVERLAY_DERP_QUIET`, on (D4) | the mixed pair (new restarts, old is silent) | AC4 | as P1 |
 | **P3** | The drain after any switch (§3.8), if D1 = B | `wg.rs` (`promote_direct_probe`, `add_peer`), `carrier_plane.rs` | `ROOMLERD_OVERLAY_SWITCH_DRAIN`, on | P0's far-end window | AC7 | as P1 |
@@ -516,6 +528,7 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 | Mixed, old restarts | LAN, A on the release before the change, B new | as LAN | as LAN (P1) |
 | Mixed, new restarts | LAN, A new, B on the release before the change | as LAN | as LAN (P2) |
 | A real move | LAN, A's UDP to B blocked mid-session, both sending | no restart | B follows: an echo gap of at most 2 s plus one DERP round trip, a `moved` verdict, a strike booked |
+| Promotion (P3's baseline) | LAN, A's UDP to B blocked inside guest A until both ends read a relay, then lifted; both ends ping every 0.1 s | no restart | P0 read it on 0.4.207 (§2.6): the far end promotes 10–15 ms after the near end and loses at most one 0.1 s ping. P3 repeats it per tier |
 | The stamp probe | B holds A on TURN, DERP is the better relay | no restart | B's stamp probe commits, A follows make-before-break, no echo gap above one DERP round trip |
 
 ## 6. Acceptance criteria
@@ -577,3 +590,6 @@ Both ends read the pair direct on the cell's tier at +60 s. `roomler why` shows 
 | 2026-11-07 | 0.4.203, two Linux root daemons on one LAN | #3528's controls: 7 of 7 restarts where B held A on LAN and accepted its new initiation stalled 15.67–15.68 s. 0 of 4 stalled where B refused the initiation (a backward step), and 0 of 1 where B held A on a relay (§2.1) |
 | 2026-11-07 | 0.4.204, Windows ↔ Windows on one LAN | one restart: the peer demote-followed away from LAN and stayed on `/derp` at 81–167 ms for about 3 minutes, until a 9 ms probe brought the pair back (§2.2) |
 | 2026-11-10 | master `0d0f55d55`, agent 0.4.207 | spec drafted and claimed as FR-139 (#3618), every anchor verified at the pin. Nothing has touched the follow, the grace, `follow_peer_to_derp` or the relayed-instead holdoff since #3541's anchor `28a268086`, so 0.4.207 carries the same follow, and P0's RED is expected to reproduce on it |
+| 2026-11-10 | 0.4.207, two Linux root daemons on one LAN (P0, the restart cell of §5) | **The RED.** 9 of 10 restarts split the pair, with `first_reply` at 15.68–15.70 s; run 5 did not (0.00 s). B followed with `was=Some(Lan)` and booked a strike in every run, and its holdoff reached the 15 min cap from run 3 on, yet B read A on `lan` again before +60 s in every run. In the 9 split runs B's follow came 45.8–51.5 ms after A's LAN initiation reached it; in run 5 it came 7.8 ms before (B's capture against B's log). On #3618 |
+| 2026-11-10 | 0.4.207, the same pair, A's `tunnel_core` at DEBUG | **The frame named.** 3 runs, all split at 15.68–15.69 s. The stray frame is the first send of the DERP floor that A builds at birth: the permission bootstrap byte, then a WireGuard initiation, held in the `/derp` writer's queue until the WS registered 44.8–47.0 ms after A's LAN probe (§2.7). A server pin built a second DERP link that resent both frames about 3 ms later |
+| 2026-11-10 | 0.4.207, the same pair, A's UDP to B's LAN blocked inside guest A until both ends read `/derp`, then lifted | **Promotion cells, P3's baseline.** 3 of 3: the far end promoted 10–15 ms after the near end and lost at most one 0.1 s ping (§2.6). The pair returned to `lan` 31.8, 28.1 and 135.2 s after the lift. Cell 3 waited out a 3 min holdoff that A booked by following B 48.7 s into the hold, when its LAN path really was blocked. In cell 3, B also ran a DERP→TURN regrade that A's next `/derp` frame undid 10 ms later (§2.6) |

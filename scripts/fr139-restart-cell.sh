@@ -288,8 +288,8 @@ cmd_pre() {
 }
 
 cmd_a_cell() {
-  local L="$1" peer="$2" probe="${3:-60}" sample="${4:-200}"
-  local cur lp p0 p1 t0 first="" n=0 tp tpe pf pp smp spid end dur
+  local L="$1" peer="$2" probe="${3:-60}" sample="${4:-200}" idle="${5:-0}"
+  local cur lp p0 p1 t0 tq first="" n=0 tp tpe pf pp smp spid end dur
   mkdir -p "$D"
   cur="$(journalctl -u roomlerd -n 0 --show-cursor --no-pager 2>/dev/null | sed -n 's/^-- cursor: //p')"
   lp="$(logpos)"
@@ -302,12 +302,22 @@ cmd_a_cell() {
   ev restart_returned rc=$?
   p1="$(wait_up "$p0")" || ev UP_TIMEOUT
   ev daemon_up pid="$p0->$p1" rust_log="$(envof "$p1" RUST_LOG)"
-  # The probe: one echo at a time, every 0.2 s, until the first reply.
   t0="$(mono)"
+  # The idle variant: A sends nothing for IDLE seconds, so only the daemons'
+  # own timers move the pair. The cell's echo is data, and data is what makes
+  # A's WireGuard re-initiate after 15 s with nothing received.
+  if [ "$idle" != 0 ]; then
+    ev idle_start idle_s="$idle" "$(row "$peer")"
+    sleep "$idle"
+    ev idle_end from_s="$(sub "$(mono)" "$t0")" "$(row "$peer")"
+  fi
+  # The probe: one echo at a time, every 0.2 s, until the first reply. Its
+  # after_s counts from daemon_up, so an idle run's includes the idle.
+  tq="$(mono)"
   while :; do
     n=$((n + 1))
     if ping -n -c1 -W1 "$peer" >/dev/null 2>&1; then first="$(mono)"; break; fi
-    [ "$(older "$(mono)" "$t0" "$probe")" = 1 ] && break
+    [ "$(older "$(mono)" "$tq" "$probe")" = 1 ] && break
     sleep 0.2
   done
   if [ -n "$first" ]; then
@@ -545,7 +555,7 @@ cmd_run() {
       exit 4
     fi
     $FR139_B "sudo bash $gs b-start $L $FR139_A_LAN $FR139_A_OIP" > "$FR139_LOGS/$L.bstart.txt" 2>&1
-    $FR139_A "sudo bash $gs a-cell $L $FR139_B_OIP ${FR139_PROBE_S:-60} ${FR139_SAMPLE_S:-200}" > "$FR139_LOGS/$L.a.txt" 2>&1
+    $FR139_A "sudo bash $gs a-cell $L $FR139_B_OIP ${FR139_PROBE_S:-60} ${FR139_SAMPLE_S:-200} ${FR139_IDLE_S:-0}" > "$FR139_LOGS/$L.a.txt" 2>&1
     sleep 3
     $FR139_B "sudo bash $gs b-stop $L $FR139_A_LAN" > "$FR139_LOGS/$L.b.txt" 2>&1
     cmd_summary_one "$L"
@@ -601,13 +611,14 @@ nearest() {
 # One line per run. The +60 s and +180 s rows are the samples nearest to
 # daemon_up + 60 / + 180 s: A's by its own clock (from_s), B's by wall time.
 cmd_summary_one() {
-  local L="$1" a="$FR139_LOGS/$1.a.txt" b="$FR139_LOGS/$1.b.txt" up upe fr gaps cnt
+  local L="$1" a="$FR139_LOGS/$1.a.txt" b="$FR139_LOGS/$1.b.txt" up upe fr gaps cnt idl
   up="$(grep -m1 ' daemon_up ' "$a" | awk '{print $3}')"
   upe="$(date -u -d "$up" +%s.%3N 2>/dev/null || echo 0)"
   fr="$(grep -m1 -E ' (first_reply|NO_REPLY) ' "$a" | sed 's/^EV [^ ]* [^ ]* //')"
   gaps="$(grep -E '^EV - - (gap|ping_summary)' "$a" | sed 's/^EV - - //' | tr '\n' ';')"
   cnt="$(grep -m1 '^B count ' "$b" | sed 's/^B count //')"
-  echo "RUN $L up=$up $fr | $gaps | B: $cnt" \
+  idl="$(grep -m1 ' idle_end ' "$a" | sed 's/^EV [^ ]* [^ ]* idle_end //')"
+  echo "RUN $L up=$up $fr | $gaps | B: $cnt${idl:+ | A at idle_end: $idl}" \
        "| +60 A=$(nearest "$a" 60 'A rows for B' 'A log file') B=$(nearest "$b" "$(awk -v t="$upe" 'BEGIN{printf "%.3f", t+60}')" 'B rows for A' 'B log since')" \
        "| +180 A=$(nearest "$a" 180 'A rows for B' 'A log file') B=$(nearest "$b" "$(awk -v t="$upe" 'BEGIN{printf "%.3f", t+180}')" 'B rows for A' 'B log since')"
 }
