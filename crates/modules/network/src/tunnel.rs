@@ -1065,6 +1065,11 @@ async fn handle_forward_request(
     // Active policies for the agent's tenant. Server-side ACL is
     // the auth boundary; the agent runs its own minimal allowlist
     // as defence-in-depth (T2.6).
+    //
+    // ⚠️ No permission bit is read here, by design: the policy IS the grant,
+    // and it exists to let people who hold no management bit reach what it
+    // names. What keeps that sound is who may WRITE a policy: `MANAGE_AGENTS`
+    // (`routes::tunnel::tunnel_policy_manager`).
     let policies = match state
         .tunnel_policies
         .list_active_for_tenant(s.agent_tenant_id)

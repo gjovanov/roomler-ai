@@ -676,6 +676,43 @@ pub async fn delete_tunnel_client(
 // Tunnel policy CRUD (admin UI)
 // ────────────────────────────────────────────────────────────────────────────
 
+/// The gate on EVERY tunnel-policy route, the reads included: `MANAGE_AGENTS`
+/// in the path org, the bit the overlay ACL beside it already sits behind
+/// (`overlay_policy::gate`). A tunnel policy is an access grant: it names who
+/// may reach which `host:port` through which of the org's devices. Writing one
+/// is a device-management action, and the list is the org's whole ACL, its
+/// internal hosts and ports included. Membership alone authorizes neither
+/// (security-baseline.md §3).
+///
+/// Decided FIRST, before the policy id is parsed, the body validated or the
+/// policy looked up. A member without the bit therefore gets one 403
+/// `forbidden` whatever the id names (a policy of theirs, another org's,
+/// nothing) and whatever the body says. It is never `not_a_member`, the one 403
+/// the web app leaves the org on; someone outside the org still gets that,
+/// from the membership read inside `require_permission`.
+///
+/// ⚠️ The forward itself (`crate::tunnel::handle_forward_request`) reads no
+/// permission bit, and must not: the policy IS the grant. It exists to let
+/// people who hold no management bit reach what a holder named them for, so a
+/// bit there would either defeat it or repeat it.
+async fn tunnel_policy_manager(
+    state: &NetworkState,
+    tenant_id: &str,
+    auth: &AuthUser,
+) -> Result<ObjectId, ApiError> {
+    let tid = ObjectId::parse_str(tenant_id)
+        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    require_permission(
+        state,
+        tid,
+        auth.user_id,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await?;
+    Ok(tid)
+}
+
 /// Wire shape for create + update. `subjects`, `targets`, and
 /// `allowlist` re-use the BSON serde representation of the
 /// `roomler_ai_remote_control::models` types — adjacently-tagged
@@ -797,17 +834,15 @@ fn validate_policy_input(
 }
 
 /// POST /api/tenant/{tenant_id}/tunnel-policy — create a new policy.
+/// `MANAGE_AGENTS`, decided before the body is validated
+/// ([`tunnel_policy_manager`]).
 pub async fn create_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Json(body): Json<TunnelPolicyCreateRequest>,
 ) -> Result<(StatusCode, Json<TunnelPolicyResponse>), ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     validate_policy_input(&body.name, &body.subjects, &body.targets, &body.allowlist)?;
 
     let policy = state
@@ -826,18 +861,16 @@ pub async fn create_tunnel_policy(
 }
 
 /// GET /api/tenant/{tenant_id}/tunnel-policy — paginated list of live
-/// policies for the tenant. Soft-deleted rows are excluded.
+/// policies for the tenant. Soft-deleted rows are excluded. `MANAGE_AGENTS`
+/// like every route here: the list is the org's whole ACL
+/// ([`tunnel_policy_manager`]).
 pub async fn list_tunnel_policies(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path(tenant_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let page = state.tunnel_policies.list_for_tenant(tid, &params).await?;
     let items: Vec<TunnelPolicyResponse> = page.items.into_iter().map(Into::into).collect();
     Ok(Json(serde_json::json!({
@@ -850,18 +883,16 @@ pub async fn list_tunnel_policies(
 }
 
 /// GET /api/tenant/{tenant_id}/tunnel-policy/{policy_id} — fetch one.
+/// `MANAGE_AGENTS`, decided before the id is looked up
+/// ([`tunnel_policy_manager`]).
 pub async fn get_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<Json<TunnelPolicyResponse>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
     // LIVE: a deleted policy is a 404 here exactly as it is absent from the
     // listing and from the gate's compile set (#1829).
     let policy = state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
@@ -874,19 +905,18 @@ pub async fn get_tunnel_policy(
 /// A deleted policy is a 404 (#1829): the lookup below is live, and the
 /// write underneath it is live-scoped on its own, so neither a stale page nor
 /// a caller that skips the read can edit a tombstone back into service.
+///
+/// `MANAGE_AGENTS`, decided before the id is looked up or the body validated
+/// ([`tunnel_policy_manager`]): editing a policy's subjects is granting.
 pub async fn update_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
     Json(body): Json<TunnelPolicyUpdateRequest>,
 ) -> Result<Json<TunnelPolicyResponse>, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
     // Resolve the target LIVE before touching it — a removed policy is a 404
     // whatever the body says, like a bogus or foreign id.
     state.tunnel_policies.find_live_in_tenant(tid, pid).await?;
@@ -951,19 +981,16 @@ pub async fn update_tunnel_policy(
 /// soft-delete. Existing flows on live sessions are not killed; new
 /// `TcpForwardRequest`s using only this policy will start being
 /// denied at the next policy fetch (every request — there's no
-/// cache, see `list_active_for_tenant`).
+/// cache, see `list_active_for_tenant`). `MANAGE_AGENTS`, decided before
+/// the id is looked up ([`tunnel_policy_manager`]).
 pub async fn delete_tunnel_policy(
     State(state): State<NetworkState>,
     auth: AuthUser,
     Path((tenant_id, policy_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let tid = ObjectId::parse_str(&tenant_id)
-        .map_err(|_| ApiError::BadRequest("Invalid tenant_id".to_string()))?;
+    let tid = tunnel_policy_manager(&state, &tenant_id, &auth).await?;
     let pid = ObjectId::parse_str(&policy_id)
         .map_err(|_| ApiError::BadRequest("Invalid policy_id".to_string()))?;
-    if !state.tenants.is_member(tid, auth.user_id).await? {
-        return Err(ApiError::NotAMember);
-    }
     let deleted = state.tunnel_policies.soft_delete(tid, pid).await?;
     if !deleted {
         return Err(ApiError::NotFound("Tunnel policy not found".into()));
