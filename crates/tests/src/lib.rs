@@ -284,6 +284,10 @@ mod rc_resume_claim_tests;
 /// today.
 #[cfg(test)]
 mod rc_resume_rejoin_tests;
+/// FR-138 P1b-2, part two — the rest of the server's resume: the sweep, the
+/// re-announce on a scope change, and the dead-row close.
+#[cfg(test)]
+mod rc_resume_sweep_tests;
 /// FR-138 P1a — the session-resume wire, row and scope, all inert: the scope
 /// is a platform admin's, an audit listing reads the new kinds and an unknown
 /// one, and at the window's default of 0 the new wire changes nothing.
