@@ -166,6 +166,32 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
             );
         }
     };
+    claim_as_read(state, ctx, session_id, row).await;
+}
+
+/// Decide one claim on its row as the claim read it: everything after the
+/// read. Public for the integration tests, which hand it a row read before
+/// another claim of the same device committed: two claims racing is a case
+/// they cover, and no socket orders one on demand. A row that is not this
+/// device's, in its org, is refused as the read refuses it.
+#[doc(hidden)]
+pub async fn claim_as_read(
+    state: &RemoteState,
+    ctx: &AgentCtx,
+    session_id: ObjectId,
+    row: RemoteSession,
+) {
+    let agent = ctx.agent_id;
+    if row.agent_id != agent || row.tenant_id != ctx.tenant_id || row.id != Some(session_id) {
+        return refuse(
+            state,
+            ctx,
+            session_id,
+            EndReason::AgentDisconnect,
+            None,
+            None,
+        );
+    }
     // Ended while no pod held it (an admin's end, the controller's): its own
     // reason, and the row is left as it is.
     if row.ended_at.is_some() || row.phase == SessionPhase::Closed {
