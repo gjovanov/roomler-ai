@@ -253,6 +253,23 @@ Flakes fixed on 2026-10-30, and what each one teaches:
 > busy Windows runner once needed 35.3 s to start PowerShell and echo, so it now runs under a
 > deadline four times the others'.
 
+Fixed since:
+
+> [!WARNING]
+> **A lib test that runs the signalling loop in process holds the probe's fixture for the whole
+> run** (#3548). `signaling::run` starts the capability probe, and in a test binary the probe's
+> child is the test binary itself. So each such test ran the real probe, and its fallback answer
+> filled the process's first answer at a moment no other test controlled. Two probe tests failed
+> whenever it landed inside them. The probe's state is now one value, `ProbeState`, and a test
+> that asks whether there is an answer holds an instance of its own. A loop test is a plain
+> `#[test]` that takes `caps::loop_fixture()`
+> ([`caps.rs:2574`](../agents/roomlerd/src/encode/caps.rs#L2574)) and runs its body with the
+> fixture's `block_on`. The first answer is in, the probe counts as started (no thread, no
+> child), and `DENY_ENV_LOCK` is held, so no probe test runs beside the loop: unlocked, a loop's
+> session ask landed in a retry test's quiet wait and held that test, and the lock, for 60 s.
+> Each loop test ends by asserting that `caps_probe_spawns()` is zero. The pattern:
+> [`unenrolled.rs:479`](../agents/roomlerd/src/unenrolled.rs#L479).
+
 ## CI & special lanes
 
 | Lane | What it does |
@@ -709,7 +726,7 @@ cascades and `--name` are hardware by construction, so they always ask.
   is the device's record on the server (its hello's hardware encoders), which a fleet run joins
   to these rows. A row says what this build opened on this host when it ran. Read `video_cells`
   beside `hw_encoders` for that join: the legacy label is enumeration-only
-  (`agents/roomlerd/src/encode/caps.rs:4427`), so on Windows it says `mf-h264-hw` even where the
+  (`agents/roomlerd/src/encode/caps.rs:4579`), so on Windows it says `mf-h264-hw` even where the
   cascade lands on Microsoft's software MFT.
 - ⚠️ The bench does not drain an encoder at the end of a row, so a frame an encoder still holds
   is not counted in `out_kbps`.
