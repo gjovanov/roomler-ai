@@ -152,6 +152,29 @@ would then hand every regional PoP an empty value, and an empty value refuses to
 start. A node that serves some networks writes the list as a literal in its own
 `derp-relay` environment.
 
+## The admission ticket and the access log (#3656)
+
+`derp-relay` takes a node's ticket as `Authorization: Bearer <ticket>` and, for
+every daemon older than 0.4.210, from the query (`/derp?ticket=…`). When a dial
+carries both, the header decides. A refusal is a `401` whose
+`WWW-Authenticate: Bearer realm="roomler"` says whether a ticket arrived
+(`error="invalid_token"` when one did), so a newer daemon dials again with the
+query form only when it meets a relay older than the header (that one answers a
+header-only dial `400`, no challenge).
+
+The PoP's nginx logs `$uri`, never `$request`: the path without the query, and
+no request header (`log_format pop` in `nginx-pop.conf.tpl`). nginx's error log
+still names the whole request line when it cannot reach the relay, so a ticket
+in a URL can land there while `derp-relay` is down; a ticket lives 24 h.
+
+**Taking a new template or binary onto a PoP.** Copy the kit and the binary as in
+step 2 of the bring-up, then re-run `bash /opt/relay-pop/provision.sh`. It renders
+`nginx-pop.conf` again and, when the render changed, checks it with `nginx -t` and
+reloads nginx. A reload keeps the live DERP sockets and TURN-over-TLS splices on the
+old workers until they close. A new `derp-relay` binary takes effect with
+`docker compose -f docker-compose.pop.yml restart derp-relay`, which drops the
+PoP's DERP sockets; the nodes reconnect at once.
+
 ## Rollback
 
 A misbehaving region: set its spec `"enabled": false` (or drop it) and

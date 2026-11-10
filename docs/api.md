@@ -28,6 +28,11 @@ audience-checked token types — a token of one audience is rejected everywhere 
 | `TunnelEnrollment` | `POST /api/tunnel-client/enroll` | 10 min, single-use (`jti`) | pasted into CLI |
 | `TunnelClient` | `/ws?role=tunnel-client`, tunnel routes | long-lived | `roomler` CLI config |
 
+`/ws` (agent and tunnel-client roles) and `/derp` take the long-lived token as
+`Authorization: Bearer` too, like every other route. Clients older than 0.4.210
+send it in the query (`token=`), which keeps working; when both are present the
+header decides ([real-time.md](real-time.md#where-a-native-clients-credential-travels-3656)).
+
 ```mermaid
 sequenceDiagram
     participant B as Browser

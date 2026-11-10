@@ -79,6 +79,34 @@ the server still appends `#token=` for cached older bundles, and
 `OAuthCallbackView.vue`'s comments still describe accepting a query-string form
 the code no longer reads.
 
+### Native clients' credentials ride a header (#3656)
+
+The daemon's agent JWT, the tunnel CLI's TunnelClient JWT and a regional relay's
+admission ticket are long-lived bearer credentials, and a request line is what
+access logs and URL-logging proxies record. So `/ws` (agent and tunnel-client
+roles), `/derp` and `derp-relay` take them as `Authorization: Bearer`, the header
+every other native route already reads.
+
+- **The query form stays.** Every daemon and CLI before 0.4.210 sends `token=` (or
+  `ticket=`), and a device that cannot connect cannot update. It goes only when no
+  supported client sends it.
+- **The header decides.** With a Bearer header present the query is not read, so a
+  good query never rescues a refused header. Another scheme counts as no header.
+- **Only the carrier changed.** The credential reaches the same checks in both
+  forms: audience, `tid`, the device's row (deletion first) and its token
+  generation.
+- **A refusal says which it was.** `WWW-Authenticate: Bearer realm="roomler"`,
+  with `error="invalid_token"` when a credential arrived. A client tries the query
+  form only after a refusal without that `error`, so a refused credential is never
+  sent again in a URL.
+- **Not ambient.** A browser cannot put a header on a WebSocket handshake, so
+  reading one on the native roles opens nothing to a page; the browser role still
+  reads no header.
+- The relay PoP's nginx logs the path without its query
+  (`scripts/relay-pop/nginx-pop.conf.tpl`), as the pod's nginx logs neither
+  socket (`files/nginx-pod.conf`). The server's own spans drop a query that names a
+  token (`crates/api/src/lib.rs`).
+
 ### Open: user sessions are irrevocable
 
 `logout` only clears the cookie, there is **no password-change flow at all** (no
