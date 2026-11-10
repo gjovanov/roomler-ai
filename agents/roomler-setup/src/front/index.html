@@ -373,6 +373,11 @@
       <div id="install-error" class="error" hidden>
         <h3 id="install-error-title">Install failed</h3>
         <p id="install-error-message"></p>
+        <!-- #3432: every cause under the words, outermost first. -->
+        <details id="install-error-details" hidden>
+          <summary>Details</summary>
+          <ol id="install-error-chain"></ol>
+        </details>
         <footer class="actions">
           <button id="install-retry" class="secondary">Retry</button>
           <button id="install-back-to-welcome">← Back to start</button>
@@ -428,20 +433,22 @@
         shell. If it isn't found, run it directly via the path above.
       </div>
 
-      <div id="done-anchor-note" class="warning" hidden>
-        <strong>Not anchored for SYSTEM exec.</strong>
-        <p id="done-anchor-reason"></p>
-        <p>The install itself is complete. To anchor this device later, run this from an
-        elevated shell, with a fresh enrollment token from the dashboard:</p>
-        <pre class="code" id="done-anchor-command"></pre>
+      <!-- #3590: every warning the install raised, in the order it came, and
+           each once: why the device was not anchored (FR-104) and why the
+           service was not restarted onto the new enrollment (#3116) are
+           among them, with what to do. -->
+      <div id="done-warnings" class="warning" hidden>
+        <strong>What the install warned about</strong>
+        <ul id="done-warnings-list"></ul>
       </div>
 
-      <!-- #3116: a reinstall whose daemon was not restarted onto the new
-           enrollment. The config is written; the daemon takes it at its next
-           start. -->
-      <div id="done-restart-note" class="warning" hidden>
-        <strong>The Roomler service still runs the previous enrollment.</strong>
-        <p id="done-restart-reason"></p>
+      <!-- FR-104: the anchor step ran and did not anchor. Why is in the
+           warnings above; this is how to anchor the device later. -->
+      <div id="done-anchor-note" class="info" hidden>
+        <strong>To anchor this device for SYSTEM exec later</strong>
+        <p>The install itself is complete. Run this from an elevated shell, with a fresh
+        enrollment token from the dashboard:</p>
+        <pre class="code" id="done-anchor-command"></pre>
       </div>
 
       <!-- FR-129 B1: what the daemon on Linux / macOS still needs from the

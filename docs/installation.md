@@ -71,6 +71,114 @@ The server URL is kept either way. Before FR-129 C1 a finished run's role and
 name came back: a test run's tunnel-client role preselected the tunnel card on
 the operator's own machine, and its device name was offered again.
 
+### The install page: a list of steps, and a failure that says why (#3432, #3590)
+
+The Install page draws what Rust sends it and keeps nothing of its own about the
+run. Two models in the wizard make that hold: the checklist is the run's list of
+steps, and a failure is one typed value built in one place. Before them, a
+failed install read `resolve installer: GET <url>` for a refused connection, a
+name that does not resolve, a refused certificate, a timeout and a 503 alike,
+under a terminal event whose step was always `install`, and rows the page kept
+per event type stayed on the hourglass.
+
+```mermaid
+flowchart LR
+  S["a pipeline step"] -->|"begin and end marks, events"| T["Steps tracker (steps.rs)"]
+  S -->|"an error, .or_fail(code)"| T
+  T -->|"ProgressEvent::Steps, the whole checklist"| P["Install page (app.js)"]
+  T -->|"settle the rows, then Failure::build"| F["Failure (failure.rs)"]
+  F -->|"conclude: ProgressEvent::Error"| P
+  F -->|"the same line"| L["the wizard's log"]
+  T -->|"warnings()"| D["Done page"]
+```
+
+**The checklist.** Each pipeline starts the tracker with the steps every run of
+it takes (`Steps::started`, `agents/roomler-setup/src/steps.rs:377`): on Windows
+preflight, resolve, download, verify, package, enroll
+(`agents/roomler-setup/src/orchestrator_agent.rs:216`); for the tunnel client
+preflight, resolve, download, verify, extract, integrate, enroll
+(`agents/roomler-setup/src/orchestrator_tunnel.rs:81`); on Linux and macOS
+preflight, package, the person's steps
+(`agents/roomler-setup/src/orchestrator_unix.rs:99`). The begin and end marks
+the opt-in diagnostics already record move the rows (`Steps::begin`,
+`steps.rs:389`). A step the plan does not name (the service restart, the
+companion, the anchor, the root half) gets its row where the run is when it
+begins (`steps.rs:250`), and a pending row the run passes over is dropped: it
+did not apply. After every change the tracker sends the whole checklist as one
+`ProgressEvent::Steps { rows }` snapshot
+(`crates/roomler-setup-core/src/progress.rs:227`, each row a
+`StepRow { step, state, label, detail }`, `progress.rs:247`), and the page draws
+the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1635`;
+`renderInstall`, `app.js:1714`).
+
+| Row state | When | The page shows |
+|---|---|---|
+| `pending` | the plan names the step and the run has not reached it | ○ |
+| `running` | its begin mark came and its end has not | ⏳ |
+| `done` | the step ended well, or the next one began | ✓, with what the step's last event said |
+| `failed` | the run failed in it, or a best-effort step (the companion) failed and the run went on | ✗; "Cancelled" when the person cancelled |
+| `not_reached` | the run failed before it | –, dimmed |
+| `warning` | a warning-class event, a row of its own after the step it came in | ⚠ and its words |
+
+The looks are `agents/roomler-setup/src/front/styles.css:318-325`.
+
+Every event is placed in one exhaustive match (`seen`, `steps.rs:553`), so a new
+event does not compile until it says what it does to the checklist.
+`PreflightWarning`, `AnchorSkipped`, `DaemonRestartSkipped`, `CompanionAbsent`
+and `ElevationUnavailable` each keep a row of their own, in the order they came
+(`steps.rs:289`). A progress event (the version resolved, the checksum, the
+signer, the installer's exit, the preflight's words) replaces only its own
+step's words (`steps.rs:305`); the download's ticks and a script's lines have
+panels of their own. The daemon's and the companion's downloads are separate
+rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
+preflight says what is installed here already and what the install does to it,
+in a person's words (`label_existing`, `orchestrator_agent.rs:1878`,
+`orchestrator_unix.rs:1227`; `orchestrator_tunnel.rs:410`), for example
+"Roomler is installed for the whole computer (version 0.4.207): this install
+replaces it". A switch to the other kind is the switch's warning row to say.
+Done lists every warning the run raised, each once (`Steps::warnings`,
+`steps.rs:479`, into `DoneReport.warnings`,
+`agents/roomler-setup/src/commands.rs:602`; `renderDone`, `app.js:1803`): the
+anchor's note there carries only its manual command.
+
+**The failure.** An error site hands over the error itself (`.or_fail(code)`
+takes an error, never a `String`) and adds what it was doing with
+`.context(…)`, so no site can format the cause away. The tracker first settles
+every row (`steps.rs:324`: the open step fails and each pending row reads not
+reached) and sends them, then builds the failure (`fail_as`, `steps.rs:527`,
+which calls `Failure::build`, `agents/roomler-setup/src/failure.rs:129`, the one
+place the words are made). The step is the tracker's open step, never the
+site's say. One function sends the terminal
+`ProgressEvent::Error { step, kind, status, words, chain }`
+(`progress.rs:216`) to the page and the replay log and writes the same line to
+the wizard's log (`conclude`, `failure.rs:187`). The page titles it "Install
+failed at: ‹the failed row's label›" (`app.js:1757`), shows the words, and keeps
+the whole chain under Details.
+
+The kind (`Kind`, `failure.rs:46`) is decided by walking the error's causes and
+downcasting each, never by reading its text, and the words follow from it
+(`failure.rs:280`):
+
+| Kind | Decided on |
+|---|---|
+| `name_not_resolved` | `NameNotResolved`, from the wizard's own resolver (`crates/roomler-setup-core/src/http.rs:33`) |
+| `secure_connection_failed` | `native_tls::Error`, raised in the handshake: an untrusted certificate, or a handshake a middlebox cut, so the words name the usual cause rather than claim one (`failure.rs:293`) |
+| `connection_refused`, `timed_out` | the `io::Error` kind under a request, `reqwest::Error::is_timeout()` |
+| `status` | `HttpStatus` (`http.rs:83`), the enroll's `EnrollRejected`, `reqwest::Error::status()` |
+| `bad_answer`, `unreachable` | an answer that does not decode, any other request error |
+| `local_file` | an `io::Error` no request raised |
+| `refused` | a `package_step::Refusal`, or words with no cause under them (`Said`) |
+| `cancelled` | the person's cancel |
+
+Against local endpoints the wizard's own client reads, for a closed port, "could
+not reach 127.0.0.1: the connection was refused"; for a `.invalid` name, "could
+not find ‹name›: the name did not resolve"; for a self-signed certificate,
+"could not set up a secure connection to 127.0.0.1. The usual cause is a
+certificate this computer does not trust"; for a server that never answers,
+"it did not answer in time"; and for a 503, "answered 503 Service Unavailable,
+so it could not serve this right now". Each with the whole chain under it, from
+`GET <url>` to the operating system's own error.
+
 ## Enrollment — what every path does
 
 ```mermaid
@@ -135,13 +243,13 @@ new name. Two changes close it:
 | Where | What it does |
 |---|---|
 | the daemon's start (`agents/roomlerd/src/app.rs:3818`, `crates/agent-core/src/config.rs:4277`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:664`, `:990`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:673`, `:991`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** Once that config is there, the daemon keeps its folder to
 SYSTEM and Administrators (#3073, #3609), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1291`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1292`), and the
 install refuses it before anything is downloaded (`:295`). Before the enroll it
 also stops on a config it may not read (`agents/roomler-setup/src/machine_write.rs:157`,
 never reported as a damaged config) or a folder it may not write (`:160`). The
@@ -331,7 +439,7 @@ sequenceDiagram
 | who writes | `ConfigWriter::new` (`machine_write.rs:281`): the step's channel when there is one; an elevated wizard in its own process; and a limited wizard never, which stops the install instead (nothing enrolled, the token unused) |
 | a wizard that goes away | the step reads the end of the channel and exits without writing. The service is installed and waits for a machine enrollment ([the SystemContext checklist](operator-systemcontext-smoke.md), step 2a); Setup run again writes it |
 | a step that does not finish | it ends itself after 20 minutes, never in the middle of the write (`machine_write.rs:435`) |
-| the step's exit codes after the install | `0x5245_0001`-`0x5245_0004` (`agents/roomler-setup/src/package_step.rs:111`): the installer ran and the enrollment was not written, so Setup says to run it again with the same token |
+| the step's exit codes after the install | `0x5245_0001`-`0x5245_0004` (`agents/roomler-setup/src/package_step.rs:112`): the installer ran and the enrollment was not written, so Setup says to run it again with the same token |
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
 [growth-observability.md](growth-observability.md)): the device row records

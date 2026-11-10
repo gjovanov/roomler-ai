@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
-use roomler_ai_remote_control::setup_diagnostics::{ErrorCode, Step};
+use roomler_ai_remote_control::setup_diagnostics::ErrorCode;
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
 use wizard_shared::extract;
@@ -49,9 +49,11 @@ use wizard_shared::progress::{ProgressEvent, replay_log};
 use wizard_shared::tunnel_enroll::{self, EnrollResult};
 
 use crate::commands::DoneReport;
-use crate::diagnostics::{Diagnostics, cancel_requested, enroll_error_code, failed};
+use crate::diagnostics::{Diagnostics, enroll_error_code};
+use crate::failure::{Failure, Said};
 use crate::package_step;
 use crate::role::Role;
+use crate::steps::{OrFail, StepId, Steps};
 
 /// Drive a full tunnel-client install end-to-end. Streams
 /// ProgressEvent over the channel; mirrors every emit into the replay
@@ -63,7 +65,7 @@ pub async fn run_install(
     token: String,
     device_name: String,
     on_event: Channel<ProgressEvent>,
-) -> Result<DoneReport, String> {
+) -> Result<DoneReport, Failure> {
     // Reset state for a fresh run. CANCEL_REQUESTED stays cleared
     // unless the operator hits Cancel mid-flow.
     crate::INSTALL_IN_PROGRESS.store(true, Ordering::SeqCst);
@@ -74,32 +76,31 @@ pub async fn run_install(
     // below reads it (FR-101 P1b's TLS rule): the pages' buffered
     // boundaries flush to it and every step reports as it ends — only if
     // the Welcome box was ticked.
-    let diag = Diagnostics::global();
-    diag.server_known(&roomler_cli::config::enrollment_server_url(&server));
-    diag.pipeline_started();
+    Diagnostics::global().server_known(&roomler_cli::config::enrollment_server_url(&server));
+    // #3590: the steps every run takes.
+    Steps::global().started(
+        &[
+            StepId::Preflight,
+            StepId::Resolve,
+            StepId::Download,
+            StepId::Verify,
+            StepId::Extract,
+            StepId::Integrate,
+            StepId::Enroll,
+        ],
+        Some(crate::steps::to_page(&on_event)),
+    );
 
     let outcome = run_install_inner(role, server, token, device_name, &on_event).await;
 
     crate::INSTALL_IN_PROGRESS.store(false, Ordering::SeqCst);
 
-    match outcome {
-        Ok(r) => Ok(r),
-        Err(e) => {
-            // A step every error site closes itself; this catches one that
-            // did not, so the run's last step is never left unrecorded.
-            diag.abandon(ErrorCode::Other, cancel_requested());
-            // Echo terminal failures into both the channel + the
-            // replay log so a late-attached SPA listener sees them.
-            emit(
-                &on_event,
-                ProgressEvent::Error {
-                    step: "install".to_string(),
-                    message: e.clone(),
-                },
-            );
-            Err(e)
-        }
+    // #3432 — the terminal event names the step that failed, to the page,
+    // the replay log (a late-attached listener sees it) and the wizard's log.
+    if let Err(failure) = &outcome {
+        crate::failure::conclude(&on_event, failure);
     }
+    outcome
 }
 
 async fn run_install_inner(
@@ -108,12 +109,12 @@ async fn run_install_inner(
     token: String,
     device_name: String,
     on_event: &Channel<ProgressEvent>,
-) -> Result<DoneReport, String> {
+) -> Result<DoneReport, Failure> {
     emit(on_event, ProgressEvent::Started);
-    let diag = Diagnostics::global();
+    let steps = Steps::global();
 
     // --- Step 1: preflight -----------------------------------------------
-    diag.begin(Step::Preflight);
+    steps.begin(StepId::Preflight);
     check_cancel()?;
     emit(on_event, ProgressEvent::PreflightStarted);
     let existing_label = detect_existing_install_label();
@@ -123,20 +124,20 @@ async fn run_install_inner(
             existing: existing_label,
         },
     );
-    diag.ok();
+    steps.ok();
 
     // --- Step 2: resolve archive ---------------------------------------
-    diag.begin(Step::Resolve);
+    steps.begin(StepId::Resolve);
     check_cancel()?;
     let platform = asset_resolver::current_platform().to_string();
     if platform == "unsupported" {
-        return Err(failed(
+        return Err(steps.fail(
             ErrorCode::UnsupportedPlatform,
-            format!(
+            Said(format!(
                 "tunnel client is not supported on this OS+arch combination ({} / {})",
                 std::env::consts::OS,
                 std::env::consts::ARCH
-            ),
+            )),
         ));
     }
     emit(
@@ -152,7 +153,7 @@ async fn run_install_inner(
         crate::proxy::USER_AGENT,
     )
     .await
-    .map_err(|e| failed(ErrorCode::Resolve, format!("resolve installer: {e}")))?;
+    .or_fail(ErrorCode::Resolve)?;
     emit(
         on_event,
         ProgressEvent::AssetResolved {
@@ -161,10 +162,10 @@ async fn run_install_inner(
             digest: health.digest.clone(),
         },
     );
-    diag.ok();
+    steps.ok();
 
     // --- Step 3: download ----------------------------------------------
-    diag.begin(Step::Download);
+    steps.begin(StepId::Download);
     check_cancel()?;
     emit(
         on_event,
@@ -175,7 +176,8 @@ async fn run_install_inner(
     // #3246 — a name from the server becomes a path only if it is one plain name,
     // and on an elevated run only under a folder of its own.
     let staging = package_step::Staging::for_this_run()
-        .map_err(|e| failed(ErrorCode::Download, format!("staging folder: {e}")))?;
+        .context("making the staging folder")
+        .or_fail(ErrorCode::Download)?;
     let staged = staging
         .path_for(&health.tag, &health.filename)
         .map_err(package_step::Refusal::fail)?;
@@ -199,15 +201,15 @@ async fn run_install_inner(
         });
     })
     .await
-    .map_err(|e| failed(ErrorCode::Download, format!("download installer: {e}")))?;
-    diag.ok();
+    .or_fail(ErrorCode::Download)?;
+    steps.ok();
 
     // --- Step 4: verify the digest, and on Windows the publisher ---------
     //
     // #3246 — on Windows the program inside is signed, and that decides with or
     // without a digest. Elsewhere the digest is all there is, so no digest is a
     // refusal, as it is for the daemon there (FR-129 AC12).
-    diag.begin(Step::Verify);
+    steps.begin(StepId::Verify);
     check_cancel()?;
     let refuse = |refusal: package_step::Refusal| {
         let _ = std::fs::remove_file(&staged);
@@ -219,7 +221,8 @@ async fn run_install_inner(
         Some(digest) => {
             let sha256_match = held
                 .sha256_matches(digest)
-                .map_err(|e| failed(ErrorCode::Other, format!("sha256 verify: {e}")))?;
+                .context("sha256 verify")
+                .or_fail(ErrorCode::Other)?;
             emit(on_event, ProgressEvent::DownloadVerified { sha256_match });
             if !sha256_match {
                 drop(held);
@@ -257,10 +260,10 @@ async fn run_install_inner(
             }
         }
     }
-    diag.ok();
+    steps.ok();
 
     // --- Step 5: extract -------------------------------------------------
-    diag.begin(Step::Extract);
+    steps.begin(StepId::Extract);
     check_cancel()?;
     emit(
         on_event,
@@ -269,26 +272,30 @@ async fn run_install_inner(
         },
     );
     let install_root = default_install_root()
-        .map_err(|e| failed(ErrorCode::Extract, format!("install root: {e}")))?;
+        .context("install root")
+        .or_fail(ErrorCode::Extract)?;
     extract::extract_archive(&staged, &install_root)
-        .map_err(|e| failed(ErrorCode::Extract, format!("extract archive: {e}")))?;
+        .context("extract archive")
+        .or_fail(ErrorCode::Extract)?;
     drop(held);
     let tunnel_binary = extract::find_tunnel_binary(&install_root)
-        .map_err(|e| failed(ErrorCode::Extract, format!("locate tunnel binary: {e}")))?;
+        .context("locate tunnel binary")
+        .or_fail(ErrorCode::Extract)?;
     emit(
         on_event,
         ProgressEvent::ExtractDone {
             tunnel_binary: tunnel_binary.display().to_string(),
         },
     );
-    diag.ok();
+    steps.ok();
 
     // --- Step 6: integrate + enroll -------------------------------------
-    diag.begin(Step::Integrate);
+    steps.begin(StepId::Integrate);
     check_cancel()?;
     emit(on_event, ProgressEvent::IntegrationStarted);
     let integration_report = integration::integrate(&install_root, &tunnel_binary)
-        .map_err(|e| failed(ErrorCode::Integrate, format!("integrate: {e}")))?;
+        .context("integrate")
+        .or_fail(ErrorCode::Integrate)?;
     emit(
         on_event,
         ProgressEvent::IntegrationDone {
@@ -296,9 +303,9 @@ async fn run_install_inner(
             shortcut_created: integration_report.shortcut_created,
         },
     );
-    diag.ok();
+    steps.ok();
 
-    diag.begin(Step::Enroll);
+    steps.begin(StepId::Enroll);
     check_cancel()?;
     emit(on_event, ProgressEvent::EnrollStarted);
     // FR-101 P1b — the token travels over TLS, as `roomler enroll` sends it:
@@ -315,9 +322,10 @@ async fn run_install_inner(
         crate::proxy::USER_AGENT,
     )
     .await
-    .map_err(|e| failed(enroll_error_code(&e), format!("enrollment: {e}")))?;
+    .map_err(|e| steps.fail(enroll_error_code(&e), e))?;
     let config_path = write_config(&result, None)
-        .map_err(|e| failed(ErrorCode::ConfigWrite, format!("write config: {e}")))?;
+        .context("write config")
+        .or_fail(ErrorCode::ConfigWrite)?;
     emit(
         on_event,
         ProgressEvent::EnrollOk {
@@ -326,13 +334,14 @@ async fn run_install_inner(
             tenant_id: result.tenant_id.clone(),
         },
     );
-    diag.ok();
+    steps.ok();
 
     // --- Step 7: done ----------------------------------------------------
     emit(on_event, ProgressEvent::Done);
-    diag.done();
+    steps.done();
 
     Ok(DoneReport {
+        warnings: Steps::global().warnings(),
         principal_kind: "tunnel_client".to_string(),
         principal_id: result.tunnel_client_id,
         tenant_id: result.tenant_id,
@@ -381,36 +390,45 @@ fn emit(channel: &Channel<ProgressEvent>, event: ProgressEvent) {
     // cmd_install_progress_replay; channel send is best-effort
     // (errs only when the receiver has been closed = SPA moved on).
     replay_log().push(event.clone());
+    // #3590: the checklist hears it (a warning gets its row, a step its words).
+    Steps::global().saw(&event);
     let _ = channel.send(event);
 }
 
-fn check_cancel() -> Result<(), String> {
+fn check_cancel() -> Result<(), Failure> {
     if crate::CANCEL_REQUESTED.load(Ordering::SeqCst) {
         // P3b — the step that was about to run (opened just before this
         // check) ends `cancelled`.
-        Diagnostics::global().cancelled();
-        Err("install cancelled by operator".to_string())
+        Err(Steps::global().cancelled())
     } else {
         Ok(())
     }
 }
 
-/// Probe the tunnel CLI's config path to surface "clean" vs "already
-/// installed" on the Welcome step.
+/// The preflight row's words: whether the tunnel client is enrolled here
+/// already (its config is there), and that this install replaces it.
 fn detect_existing_install_label() -> String {
+    let not_yet = || "The tunnel client is not installed here yet".to_string();
     let Ok(path) = roomler_cli::config::default_config_path() else {
-        return "clean".to_string();
+        return not_yet();
     };
     if path.exists() {
         match std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| toml::from_str::<roomler_cli::config::TunnelConfig>(&s).ok())
         {
-            Some(cfg) => format!("installed ({} @ {})", cfg.machine_name, path.display()),
-            None => format!("installed (config at {} unreadable)", path.display()),
+            Some(cfg) => format!(
+                "The tunnel client is installed here, enrolled as “{}”: this install replaces it",
+                cfg.machine_name
+            ),
+            None => format!(
+                "A tunnel client's config is here but cannot be read ({}): this install \
+                 replaces it",
+                path.display()
+            ),
         }
     } else {
-        "clean".to_string()
+        not_yet()
     }
 }
 
@@ -543,12 +561,14 @@ mod tests {
     fn detect_existing_install_label_returns_clean_or_installed() {
         // Test box may have a real %APPDATA%\roomler\roomler-tunnel\
         // config.toml from a prior run; we can't unconditionally
-        // assert "clean" here. The contract is just "returns a non-
-        // empty human label" — and the value falls into the small set
-        // of expected prefixes.
+        // assert "not installed" here. The contract is just "returns a
+        // person's words" — and the value falls into the small set of
+        // expected prefixes.
         let label = detect_existing_install_label();
         assert!(
-            label == "clean" || label.starts_with("installed ("),
+            label == "The tunnel client is not installed here yet"
+                || label.starts_with("The tunnel client is installed here, enrolled as “")
+                || label.starts_with("A tunnel client's config is here but cannot be read"),
             "unexpected label: {label:?}"
         );
     }
