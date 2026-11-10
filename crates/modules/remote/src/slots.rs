@@ -21,9 +21,12 @@
 //!   FR-138 (review 1, M5) — above window 0 a session no hub holds may be
 //!   detached, waiting for its device's claim, and its lease is its slot: the
 //!   holder's row is read first (once per such holder, only when the set is
-//!   full), and the lease is dropped only when the row says the session is
-//!   over (ended, not live, past its `resume_by`, or gone). At window 0
-//!   nothing is read, as before.
+//!   full), and the lease is kept only while the row can still be resumed
+//!   (PR D's review, MEDIUM 1): live with a `resume_by` no more than 10 s
+//!   past, or live with no `resume_by` on a device in the resume scope, whose
+//!   detach may not have reached the row yet. Anything else is dropped as
+//!   before, so a dead pod's lease of a device outside the scope frees its
+//!   org at once. At window 0 nothing is read, as before.
 
 use std::sync::LazyLock;
 
@@ -100,27 +103,52 @@ async fn stale_holders(
 }
 
 /// Review 1, M5 — whether the session behind a lease no hub here holds is
-/// over, by its row: ended, not live, past its `resume_by`, or no row in
-/// the org. A row that cannot be read is no evidence either way, and its
-/// lease is kept. An account in no org runs only external sessions, which a
-/// device never keeps (D3): over, with no read.
+/// over, by its row. It may still be resumed only while it is live and
+/// either detached, with a `resume_by` no more than [`SLOT_KEEP_PAST_RESUME_MS`]
+/// past (a claim that began before the deadline may commit just after it;
+/// PR D's review, LOW 4), or has no `resume_by` while its device is in the
+/// resume scope: a detach whose write has not reached the row yet (PR D's
+/// review, MEDIUM 1). Everything else is over and dropped, as before FR-138:
+/// ended, not live, past the grace, no row in the org, or live with no
+/// deadline on a device outside the scope (a session of a pod that died
+/// without writing its ends, which nothing will resume). A row or a scope
+/// that cannot be read is no evidence either way, and its lease is kept. An
+/// account in no org runs only external sessions, which a device never keeps
+/// (D3): over, with no read.
 async fn over(state: &RemoteState, scope: SlotScope, session: ObjectId) -> bool {
     let SlotScope::Org(tenant_id) = scope else {
         return true;
     };
-    match state
+    let row = match state
         .remote_sessions
         .find_in_tenant(tenant_id, session)
         .await
     {
-        Ok(row) => {
-            row.ended_at.is_some()
-                || row.phase != SessionPhase::Active
-                || row.resume_by.is_some_and(|by| by <= DateTime::now())
-        }
-        Err(DaoError::NotFound) => true,
+        Ok(row) => row,
+        Err(DaoError::NotFound) => return true,
         Err(e) => {
             warn!(?scope, %session, %e, "session slot: the row of a lease this pod no longer holds could not be read; the lease is kept");
+            return false;
+        }
+    };
+    if row.ended_at.is_some() || row.phase != SessionPhase::Active {
+        return true;
+    }
+    if let Some(by) = row.resume_by {
+        return by
+            .timestamp_millis()
+            .saturating_add(SLOT_KEEP_PAST_RESUME_MS)
+            <= DateTime::now().timestamp_millis();
+    }
+    match state
+        .fleet
+        .rc_resume_scope
+        .covers(tenant_id, row.agent_id)
+        .await
+    {
+        Ok(covered) => !covered,
+        Err(e) => {
+            warn!(?scope, %session, %e, "session slot: the resume scope could not be read for a lease this pod no longer holds; the lease is kept");
             false
         }
     }

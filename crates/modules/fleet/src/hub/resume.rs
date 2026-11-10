@@ -20,9 +20,10 @@
 //!   gate, and answers it here: it rebuilds the session
 //!   ([`Hub::resume_claimed`]) and then confirms it ([`Hub::confirm_resumed`])
 //!   or, when an end won the race, drops it ([`Hub::drop_resumed`]); or it
-//!   refuses it ([`Hub::refuse_claim`]). Whatever is still unanswered once
-//!   the hello's lifecycles have run is refused by the socket
-//!   ([`Hub::refuse_unanswered_claims`]).
+//!   refuses it ([`Hub::refuse_claim`]), after its commit too when another
+//!   session took the org's slot during the gap ([`Hub::refuse_resumed`]).
+//!   Whatever is still unanswered once the hello's lifecycles have run is
+//!   refused by the socket ([`Hub::refuse_unanswered_claims`]).
 //! * **An end for a session no hub holds** ([`Hub::record_end`]): the claim's
 //!   refusals and the registration read write the row through it.
 //!
@@ -106,6 +107,11 @@ pub struct ResumedSession {
     /// session so an FR-52 revocation still finds it. Never true behind D3
     /// today: the claim refuses a row marked external.
     pub external: bool,
+    /// The FR-115 lease the claim took again under the session's own id,
+    /// once its commit had won. It enters this hub with the session (PR D's
+    /// review, MEDIUM 2), so whatever takes the session out of the hub finds
+    /// it there: a detach keeps it, an end gives it back.
+    pub slot: Option<Lease>,
     /// The window announced to the connection that claimed it, in seconds:
     /// how long the rebuilt session waits for its viewer to rejoin (P1b-2).
     pub resume_secs: u32,
@@ -425,21 +431,19 @@ impl Hub {
             .is_some_and(|a| ptr_eq(&a.tx, conn) && a.pending_claims.contains(&session_id))
     }
 
-    /// FR-115 — hold `lease` for `session_id` from here, unless the session
-    /// ended meanwhile (P1b-1's review, L13). An end takes the session out of
-    /// the map BEFORE it takes the lease out of `slotted`, so a lease put in
-    /// after that end would never be given back, and this pod's renewal round
-    /// would keep the org's slot taken for good. Checked after the insert:
-    /// whichever of the two removes the lease gives it back, exactly once.
-    ///
-    /// The claim calls it once its commit has won and the slot is taken
-    /// again (`refuse_claim`'s race): a claim that loses never touches it.
-    pub fn hold_lease(&self, session_id: ObjectId, lease: Lease) {
+    /// FR-115 — hold `lease` for a copy already in the map (a re-attach),
+    /// unless the copy left the map meanwhile (P1b-1's review, L13). Whatever
+    /// takes a session out of the map (an end, a detach) takes it out BEFORE
+    /// its lease, so a lease put in after that would never leave, and this
+    /// pod's renewal round would keep the org's slot taken for good. Checked
+    /// after the insert: a lease the remover did not find is taken back out
+    /// here, and left in Redis as the remover left the session's lease (PR
+    /// D's review, MEDIUM 2: a detach keeps it, and a release here would give
+    /// away the slot of the session it just kept; an end gave it back).
+    fn hold_slot(&self, session_id: ObjectId, lease: Lease) {
         self.inner.slotted.insert(session_id, lease);
-        if !self.inner.sessions.contains_key(&session_id)
-            && let Some((_, lease)) = self.inner.slotted.remove(&session_id)
-        {
-            self.release_slot(lease);
+        if !self.inner.sessions.contains_key(&session_id) {
+            self.inner.slotted.remove(&session_id);
         }
     }
 
@@ -497,20 +501,80 @@ impl Hub {
         );
     }
 
-    /// `refuse_claim`'s race — a session the claim rebuilt, once its commit
-    /// had won, whose org slot another session took during the gap: it ends
-    /// here, fenced at the number the claim committed, and its device is
-    /// told `reason`.
-    pub fn refuse_resumed(&self, session_id: ObjectId, reason: EndReason) {
-        let _ = self.end_own(session_id, reason, None);
+    /// `refuse_claim`'s race — a claim whose commit won, refused before this
+    /// hub rebuilt anything because another session took the org's slot
+    /// during the gap (PR D's review, MEDIUM 2). As [`Self::refuse_claim`],
+    /// with every end fenced at `attach_seq`, the number the commit wrote:
+    /// the device is told `reason` and the row ends at that number. A copy
+    /// this hub still held for the device's earlier connection is below it
+    /// (the commit superseded it), so it is moved to `attach_seq`, as a
+    /// re-attach would have moved it, and ends there. A copy at that number
+    /// or later is another claim's, and is left alone (PR D's review, LOW 3:
+    /// an end a hub decides is fenced at the number it holds). `false` when
+    /// the claim is no longer this connection's to answer: nothing is ended.
+    pub fn refuse_resumed(
+        &self,
+        agent_id: ObjectId,
+        conn: &ClientTx,
+        session_id: ObjectId,
+        attach_seq: u32,
+        reason: EndReason,
+    ) -> bool {
+        let Some(tenant_id) = self.take_claim(agent_id, conn, session_id, false) else {
+            return false;
+        };
+        info!(session = %session_id.to_hex(), %agent_id, attach_seq, ?reason, "rc session claim refused after its commit");
+        if let Some(arc) = self.held_for(session_id, agent_id) {
+            let held_seq = arc.lock().attach_seq;
+            if held_seq >= attach_seq {
+                // Only a newer claim can have made it, and it holds the
+                // session now: nothing is sent or written for this one.
+                warn!(session = %session_id.to_hex(), %agent_id, held_seq, attach_seq, "rc session claim refused after its commit: a copy at its number or later is held here, and left alone");
+                return true;
+            }
+            // Taken out of the map exactly as read: a copy an end removed
+            // meanwhile is that end's.
+            if let Some((_, arc)) = self
+                .inner
+                .sessions
+                .remove_if(&session_id, |_, v| Arc::ptr_eq(v, &arc))
+            {
+                arc.lock().attach_seq = attach_seq;
+                // Never counted on this connection: counted now, so that its
+                // end gives back what it takes.
+                if let Some(mut a) = self.inner.agents.get_mut(&agent_id) {
+                    a.active_sessions = a.active_sessions.saturating_add(1);
+                }
+                self.end_removed(session_id, &arc, reason, None, EndWrite::Own);
+                return true;
+            }
+        }
+        let _ = conn.try_send(ServerMsg::Terminate {
+            session_id,
+            reason,
+            limit: None,
+        });
+        self.record_end(
+            session_id,
+            agent_id,
+            tenant_id,
+            reason,
+            None,
+            RowEnd::fenced(attach_seq),
+        );
+        true
     }
 
     /// FR-138 — a claim committed: rebuild the session on this hub, counted
     /// in the device's capacity from here (its place moves from the claims),
-    /// and its maximum length armed again from `started_at`. Nothing is sent
-    /// yet: the caller reads the row once more, takes the org's slot again
-    /// ([`Self::hold_lease`]), and then confirms or drops it, so an end that
-    /// landed meanwhile wins.
+    /// and its maximum length armed again from `started_at`. The org's slot,
+    /// which the caller took again once the commit had won, enters the hub
+    /// with the session (`r.slot`; PR D's review, MEDIUM 2): a rebuilt
+    /// session's lease is in place before the session is, and a re-attached
+    /// copy holds it from here ([`Self::hold_slot`]), so whatever takes the
+    /// session out of the hub next finds its lease. Nothing is sent yet: the
+    /// caller reads the row once more, and then confirms or drops it, so an
+    /// end that landed meanwhile wins.
     pub fn resume_claimed(
         &self,
         agent_id: ObjectId,
@@ -554,6 +618,9 @@ impl Hub {
                 if let Some(turn) = rearm {
                     self.arm_viewer_wait(r.session_id, turn, r.attach_seq, r.resume_secs);
                 }
+                if let Some(lease) = r.slot {
+                    self.hold_slot(r.session_id, lease);
+                }
                 Resumed::Reattached
             }
             None => {
@@ -573,6 +640,12 @@ impl Hub {
                 live.resume_secs = Some(r.resume_secs);
                 live.held_until = Some(super::hold::due_in(r.resume_secs));
                 live.external = r.external;
+                // FR-115 — the lease first: from the session's insert on, a
+                // detach or an end may take it out of the map, and each takes
+                // the lease with it (PR D's review, MEDIUM 2).
+                if let Some(lease) = r.slot {
+                    self.inner.slotted.insert(r.session_id, lease);
+                }
                 self.inner
                     .sessions
                     .insert(r.session_id, Arc::new(Mutex::new(live)));
@@ -860,6 +933,16 @@ mod tests {
         })
     }
 
+    /// The org slot lease a claim of `session` took.
+    fn lease_of(tenant: ObjectId, session: ObjectId, user: ObjectId, device: ObjectId) -> Lease {
+        Lease {
+            scope: roomler_core::cluster::session_slots::SlotScope::Org(tenant),
+            session,
+            user,
+            device,
+        }
+    }
+
     #[test]
     fn claims_are_held_only_under_a_window_once_each_and_up_to_the_capacity() {
         let ids: Vec<ObjectId> = (0..4).map(|_| ObjectId::new()).collect();
@@ -1041,6 +1124,7 @@ mod tests {
             attach_seq: 1,
             max_duration: None,
             external: false,
+            slot: None,
             resume_secs: 60,
         };
         assert_eq!(
@@ -1109,6 +1193,7 @@ mod tests {
         );
         assert!(drain(&mut ctl).is_empty(), "the claimed one is spared");
 
+        let lease = lease_of(tenant, sid, user, agent);
         let r = ResumedSession {
             session_id: sid,
             tenant_id: tenant,
@@ -1119,11 +1204,17 @@ mod tests {
             attach_seq: 1,
             max_duration: None,
             external: false,
+            slot: Some(lease.clone()),
             resume_secs: 60,
         };
         assert_eq!(
             hub.resume_claimed(agent, &second.tx, r),
             Resumed::Reattached
+        );
+        assert_eq!(
+            hub.inner.slotted.get(&sid).map(|l| l.value().clone()),
+            Some(lease),
+            "the re-attached copy holds the lease the claim took"
         );
         assert!(hub.confirm_resumed(agent, &second.tx, sid, 1));
         assert!(
@@ -1213,30 +1304,93 @@ mod tests {
         );
     }
 
-    /// P1b-1's review, L13 — the copy this hub held for the device's earlier
-    /// connection ended before the claim was answered. The claim reads the
-    /// hub only once it has taken the claim, so it rebuilds the session rather
-    /// than re-attaching a copy no longer in the map: the session is held,
-    /// counted once, and its lease renewed from here only while it is held.
+    /// PR D's review, LOW 3 — a claim refused after its commit ends only what
+    /// it may. A displaced connection's refusal ends nothing. A copy still
+    /// held for the device's earlier connection, below the number committed,
+    /// moves up to it and ends there, and the device's count stays right. A
+    /// copy at that number or later is another claim's, and is left alone.
     #[tokio::test]
-    async fn a_held_copy_that_ended_before_the_claim_is_rebuilt_and_counted_once() {
-        use roomler_core::cluster::session_slots::SlotScope;
+    async fn a_claim_refused_after_its_commit_ends_only_a_copy_below_its_number() {
         let hub = hub().await;
         let (agent, tenant, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
-        let _first = register(&hub, agent, tenant, 2, hello(Some(60), Vec::new()));
-        let (sid, _ctl) = open(&hub, agent, user);
+        let first = register(&hub, agent, tenant, 1, hello(Some(60), Vec::new()));
+        let (sid, mut ctl) = open(&hub, agent, user);
         live(&hub, sid).await;
-        let second = register(&hub, agent, tenant, 2, hello(Some(60), vec![sid]));
-        assert!(second.reaped.is_empty(), "the claimed copy is spared");
-        hub.terminate(sid, EndReason::AdminTerminated).unwrap();
-        assert!(hub.session_snapshot(sid).is_none());
+        drain(&mut ctl);
+        let mut second = register(&hub, agent, tenant, 1, hello(Some(60), vec![sid]));
+        let held_at = hub.with_session(sid, |s| Ok(s.attach_seq)).unwrap();
 
-        let lease = Lease {
-            scope: SlotScope::Org(tenant),
-            session: sid,
-            user,
-            device: agent,
-        };
+        assert!(
+            !hub.refuse_resumed(
+                agent,
+                &first.tx,
+                sid,
+                held_at + 1,
+                EndReason::AgentDisconnect
+            ),
+            "not the displaced connection's to answer"
+        );
+        assert!(hub.session_snapshot(sid).is_some(), "nothing ended");
+        assert!(drain(&mut ctl).is_empty());
+
+        assert!(hub.refuse_resumed(
+            agent,
+            &second.tx,
+            sid,
+            held_at + 1,
+            EndReason::AgentDisconnect
+        ));
+        assert!(hub.session_snapshot(sid).is_none(), "the copy below ended");
+        assert_eq!(
+            terminated(&drain(&mut ctl), sid),
+            Some(EndReason::AgentDisconnect)
+        );
+        assert_eq!(
+            terminated(&drain(&mut second.rx), sid),
+            Some(EndReason::AgentDisconnect)
+        );
+        let count = |hub: &Hub| hub.inner.agents.get(&agent).map(|a| a.active_sessions);
+        assert_eq!(count(&hub), Some(0), "the count stays right");
+        assert!(
+            !hub.refuse_resumed(
+                agent,
+                &second.tx,
+                sid,
+                held_at + 1,
+                EndReason::AgentDisconnect
+            ),
+            "answered once"
+        );
+
+        // A copy at the number committed: another claim's, left alone.
+        let (other, mut other_ctl) = open(&hub, agent, user);
+        live(&hub, other).await;
+        drain(&mut other_ctl);
+        let mut third = register(&hub, agent, tenant, 1, hello(Some(60), vec![other]));
+        hub.with_session(other, |s| {
+            s.attach_seq = 5;
+            Ok(())
+        })
+        .unwrap();
+        assert!(hub.refuse_resumed(agent, &third.tx, other, 5, EndReason::AgentDisconnect));
+        assert!(hub.session_snapshot(other).is_some(), "left alone");
+        assert_eq!(hub.with_session(other, |s| Ok(s.attach_seq)).unwrap(), 5);
+        assert!(drain(&mut other_ctl).is_empty(), "nobody told");
+        assert_eq!(terminated(&drain(&mut third.rx), other), None);
+    }
+
+    /// PR D's review, MEDIUM 2 — the lease a claim took enters the hub with
+    /// the session it rebuilds, before the session does. So a drop of the
+    /// device's connection right after the rebuild (during the claim's second
+    /// read) finds the lease with the session and takes it out with it, kept
+    /// with the detach, never left behind for a later hold to release.
+    #[tokio::test]
+    async fn a_rebuilt_sessions_lease_enters_the_hub_with_it_and_leaves_with_its_detach() {
+        let hub = hub().await;
+        let (agent, tenant, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let sid = ObjectId::new();
+        let reg = register(&hub, agent, tenant, 2, hello(Some(60), vec![sid]));
+        let lease = lease_of(tenant, sid, user, agent);
         let r = ResumedSession {
             session_id: sid,
             tenant_id: tenant,
@@ -1247,11 +1401,58 @@ mod tests {
             attach_seq: 1,
             max_duration: None,
             external: false,
+            slot: Some(lease.clone()),
+            resume_secs: 60,
+        };
+        assert_eq!(hub.resume_claimed(agent, &reg.tx, r), Resumed::Rebuilt);
+        assert_eq!(
+            hub.inner.slotted.get(&sid).map(|l| l.value().clone()),
+            Some(lease),
+            "held with the session"
+        );
+
+        assert!(hub.unregister_agent(agent, Some(&reg.tx)));
+        assert!(hub.session_snapshot(sid).is_none(), "detached");
+        assert!(
+            !hub.inner.slotted.contains_key(&sid),
+            "its lease left with it"
+        );
+        assert!(hub.slot_leases().is_empty(), "nothing left to renew");
+    }
+
+    /// P1b-1's review, L13 — the copy this hub held for the device's earlier
+    /// connection ended before the claim was answered. The claim reads the
+    /// hub only once it has taken the claim, so it rebuilds the session rather
+    /// than re-attaching a copy no longer in the map: the session is held,
+    /// counted once, and its lease renewed from here only while it is held.
+    #[tokio::test]
+    async fn a_held_copy_that_ended_before_the_claim_is_rebuilt_and_counted_once() {
+        let hub = hub().await;
+        let (agent, tenant, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let _first = register(&hub, agent, tenant, 2, hello(Some(60), Vec::new()));
+        let (sid, _ctl) = open(&hub, agent, user);
+        live(&hub, sid).await;
+        let second = register(&hub, agent, tenant, 2, hello(Some(60), vec![sid]));
+        assert!(second.reaped.is_empty(), "the claimed copy is spared");
+        hub.terminate(sid, EndReason::AdminTerminated).unwrap();
+        assert!(hub.session_snapshot(sid).is_none());
+
+        // The claim takes the slot again once its commit has won, and hands
+        // it in with the session.
+        let r = ResumedSession {
+            session_id: sid,
+            tenant_id: tenant,
+            controller_user_id: user,
+            permissions: Permissions::VIEW,
+            created_at: DateTime::now(),
+            started_at: DateTime::now(),
+            attach_seq: 1,
+            max_duration: None,
+            external: false,
+            slot: Some(lease_of(tenant, sid, user, agent)),
             resume_secs: 60,
         };
         assert_eq!(hub.resume_claimed(agent, &second.tx, r), Resumed::Rebuilt);
-        // The claim takes the slot again once its commit has won.
-        hub.hold_lease(sid, lease);
         assert!(hub.session_snapshot(sid).is_some(), "held here now");
         assert!(
             hub.inner.slotted.contains_key(&sid),

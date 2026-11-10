@@ -757,6 +757,7 @@ mod tests {
                 attach_seq: 1,
                 max_duration: None,
                 external: false,
+                slot: None,
                 resume_secs: 60,
             },
         );
@@ -886,6 +887,7 @@ mod tests {
                 attach_seq: 1,
                 max_duration: None,
                 external: false,
+                slot: None,
                 resume_secs: 1,
             },
         );

@@ -20,14 +20,16 @@
 //! | the org's maximum length, counted from `started_at` | `idle_timeout`, limit `max_duration` |
 //!
 //! A claim that passes commits with one conditional update that bumps the
-//! fencing number ([`RemoteSessionDao::commit_resume`]); the hub rebuilds the
-//! session and counts it; the row is read once more, so an end that landed
-//! meanwhile wins; the FR-115 slot is taken again under the session's own id,
-//! only now that the commit has won (PR C's deferred race: a claim that loses
-//! never renews or retags the winner's lease), and a session whose slot
-//! another took during the gap ends, fenced at the number committed; and only
-//! then does the device hear `rc:session.resumed`. A claim whose connection
-//! was gone once it had committed writes the detach back (review 1, L2).
+//! fencing number ([`RemoteSessionDao::commit_resume`]). Only then is the
+//! FR-115 slot taken again under the session's own id (PR C's deferred race:
+//! a claim that loses never renews or retags the winner's lease), and before
+//! the hub rebuilds anything (PR D's review, MEDIUM 2): a session whose slot
+//! another took during the gap is refused there, fenced at the number
+//! committed, and otherwise its lease enters the hub with the session the
+//! hub rebuilds and counts. The row is read once more, so an end that landed
+//! meanwhile wins, and only then does the device hear `rc:session.resumed`.
+//! A claim whose connection was gone once it had committed, or whose refusal
+//! nobody hears, writes the detach back (review 1, L2; `write_back`).
 //! Consent is the one check not re-run. A commit that matched nothing is
 //! decided from the row read again (`commit`): the device's NEWEST
 //! connection tries once more at the row's number while the row is still
@@ -339,6 +341,35 @@ pub async fn claim_as_read(
     };
     let next = committed + 1;
 
+    // FR-115 — the org's slot, taken again under the session's own id now
+    // that the commit has won: its own lease when it outlived the gap (the
+    // detach kept it), a new one when the org has room. Taken BEFORE the hub
+    // rebuilds anything (PR D's review, MEDIUM 2), so the lease enters the
+    // hub with the session, and a drop of the device's connection from then
+    // on keeps it with the session rather than finding none. When another
+    // session took the slot during the gap, the claim is refused here,
+    // fenced at the number committed, before any copy is rebuilt.
+    let slot = match reclaim_slot(state, &row, session_id, org_session_cap).await {
+        Ok(slot) => slot,
+        Err(()) => {
+            info!(%agent, session = %session_id, attach_seq = next, "rc session claim: the org's slots are taken — the resumed session ends");
+            if !state.fleet.rc_hub.refuse_resumed(
+                agent,
+                &ctx.tx,
+                session_id,
+                next,
+                EndReason::AgentDisconnect,
+            ) {
+                // The connection is gone, so nobody hears the refusal and
+                // nothing ends: the detach is written back, as below, and the
+                // server decides again at the device's next claim, whose own
+                // deadline for the peer it kept bounds any repeat.
+                write_back(state, ctx, session_id, next).await;
+            }
+            return;
+        }
+    };
+
     let built = state.fleet.rc_hub.resume_claimed(
         agent,
         &ctx.tx,
@@ -352,28 +383,18 @@ pub async fn claim_as_read(
             attach_seq: next,
             max_duration,
             external: row.external,
+            slot: slot.clone(),
             // P1b-2 — how long the rebuilt session waits for its viewer.
             resume_secs: ctx.resume.window_secs,
         },
     );
+    // No longer pending: the hub holds the lease with the session, or the
+    // detach written back below keeps it.
+    if let Some(lease) = &slot {
+        crate::slots::settle(lease);
+    }
     if built == Resumed::NotPending {
-        // Review 1, L2 — displaced or closed after the commit, which cleared
-        // the row's deadline: no pod holds the session, so the detach is
-        // written back, fenced at the number committed, with a deadline a
-        // window from now and the slot kept to match. Whichever connection
-        // of the device claims it next resumes it at that number, and the
-        // sweep ends it if none does.
-        let resume_by = DateTime::from_millis(
-            DateTime::now()
-                .timestamp_millis()
-                .saturating_add(i64::from(ctx.resume.window_secs).saturating_mul(1000)),
-        );
-        info!(%agent, session = %session_id, attach_seq = next, "rc session claim: the connection that made it is gone after its commit — the detach written back");
-        state
-            .fleet
-            .rc_hub
-            .record_detach(session_id, agent, ctx.tenant_id, next, resume_by);
-        crate::slots::keep(state, ctx.tenant_id, session_id, resume_by).await;
+        write_back(state, ctx, session_id, next).await;
         return;
     }
 
@@ -387,7 +408,13 @@ pub async fn claim_as_read(
         Ok(r) if r.ended_at.is_some() => {
             let reason = r.end_reason.unwrap_or(EndReason::AgentDisconnect);
             info!(%agent, session = %session_id, ?reason, "rc session claim: an end landed before the resume — ended");
+            // The rebuilt copy's lease goes with it. PR D's review, LOW 6 —
+            // and the lease goes back by the session's id too, for one the
+            // hub never held (a claim that fell back on a Redis error while
+            // the detach's kept lease lived on): the row is ended, so nobody
+            // holds it.
             state.fleet.rc_hub.drop_resumed(session_id, reason);
+            crate::slots::release_ended(state, ctx.tenant_id, session_id).await;
             return;
         }
         Ok(_) => {}
@@ -395,30 +422,38 @@ pub async fn claim_as_read(
             debug!(%agent, session = %session_id, %e, "rc session claim: the second read failed; the resume stands");
         }
     }
-    // FR-115 — the org's slot, taken again under the session's own id now
-    // that the commit has won: its own lease when it outlived the gap (the
-    // detach kept it), a new one when the org has room. When another session
-    // took it during the gap, the rebuilt session ends here, fenced at the
-    // number committed.
-    match reclaim_slot(state, &row, session_id, org_session_cap).await {
-        Ok(Some(lease)) => {
-            state.fleet.rc_hub.hold_lease(session_id, lease.clone());
-            crate::slots::settle(&lease);
-        }
-        Ok(None) => {}
-        Err(()) => {
-            info!(%agent, session = %session_id, attach_seq = next, "rc session claim: the org's slots are taken — the resumed session ends");
-            state
-                .fleet
-                .rc_hub
-                .refuse_resumed(session_id, EndReason::AgentDisconnect);
-            return;
-        }
-    }
     state
         .fleet
         .rc_hub
         .confirm_resumed(agent, &ctx.tx, session_id, next);
+}
+
+/// Review 1, L2 — a claim committed, and its connection was gone before the
+/// hub rebuilt the session or heard its refusal: the commit cleared the row's
+/// deadline and no pod holds the session, so the detach is written back,
+/// fenced at the number committed (`attach_seq`), and its slot kept to match.
+/// The deadline is a fresh window from now. The device never heard the
+/// resume, so it still holds the session as kept, to the deadline it set at
+/// its first drop: that deadline, which may come first, bounds when it claims
+/// again, and a server that waits longer only tells the viewer `detached`
+/// and keeps the slot that much longer. Whichever connection of the device
+/// claims it next resumes it at that number, and the sweep ends it if none
+/// does. A write a newer claim's commit overtook lands nowhere.
+async fn write_back(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId, attach_seq: u32) {
+    let resume_by = DateTime::from_millis(
+        DateTime::now()
+            .timestamp_millis()
+            .saturating_add(i64::from(ctx.resume.window_secs).saturating_mul(1000)),
+    );
+    info!(agent = %ctx.agent_id, session = %session_id, attach_seq, "rc session claim: the connection that made it is gone after its commit — the detach written back");
+    state.fleet.rc_hub.record_detach(
+        session_id,
+        ctx.agent_id,
+        ctx.tenant_id,
+        attach_seq,
+        resume_by,
+    );
+    crate::slots::keep(state, ctx.tenant_id, session_id, resume_by).await;
 }
 
 /// How long the claim waits on the device's presence: as the rejoin's relay

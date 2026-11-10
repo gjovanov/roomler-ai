@@ -25,13 +25,12 @@
 //! until the session's `resume_by` plus [`SLOT_KEEP_PAST_RESUME_MS`]
 //! ([`SessionSlots::keep`]): a window longer than what was left of the lease
 //! (up to 120 s against 60-90 s) no longer loses the slot, and the pod that
-//! detached the session may die meanwhile. One edge is left: a claim sets its
-//! set's expiry to a lease (90 s), so above an 80 s window, another session
-//! of the org claimed early in the gap, and then neither renewed nor followed
-//! by a later claim, can take the kept lease with the set up to `window - 80`
-//! seconds early. At D1's 60 s window it cannot happen. A window above 80 s
-//! needs the `CLAIM` script to read the set's expiry first (or write it `NX`, then
-//! `GT`) BEFORE such a window is set.
+//! detached the session may die meanwhile. Every writer only lengthens a key's
+//! expiry (PR D's review, LOW 5): the claim reads `PTTL` before it writes one,
+//! and a restore writes `PEXPIRE … NX`, then `GT`. So another session's claim
+//! in the org, or a restore after Redis lost a lease, never takes a kept lease
+//! away with its set before its deadline, at any window up to the 120 s cap.
+//! A keep never revives a lease that has already lapsed (LOW 7).
 //!
 //! The holder record names the claiming pod. A caller refused by a full set
 //! may drop a holder that ITS OWN pod claimed but no longer holds (a release
@@ -102,7 +101,12 @@ pub struct Lease {
 /// KEYS[1] = the payer's set, KEYS[2] = this session's holder hash.
 /// ARGV: now_ms, ttl_ms, cap, session, user, device, the holder-key prefix,
 /// the claiming pod. A full set answers every live holder (at most 64: a cap
-/// past that is never one a refusal has to name).
+/// past that is never one a refusal has to name). Both keys' expiries only
+/// lengthen (FR-138, PR D's review, LOW 5): the set may hold a lease a detach
+/// kept past a lease's TTL, and the claim of another session must not take it
+/// away with the set early. The score is the claimed lease's own: a claim
+/// that renews its own session's lease sets it to a full lease from now, and
+/// the hub that holds the session renews it from there.
 const CLAIM: &str = r#"
 local now = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
@@ -110,9 +114,9 @@ redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)
 local mine = redis.call('ZSCORE', KEYS[1], ARGV[4])
 if mine or redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
   redis.call('ZADD', KEYS[1], now + ttl, ARGV[4])
-  redis.call('PEXPIRE', KEYS[1], ttl)
+  if redis.call('PTTL', KEYS[1]) < ttl then redis.call('PEXPIRE', KEYS[1], ttl) end
   redis.call('HSET', KEYS[2], 'user', ARGV[5], 'device', ARGV[6], 'pod', ARGV[8])
-  redis.call('PEXPIRE', KEYS[2], ttl)
+  if redis.call('PTTL', KEYS[2]) < ttl then redis.call('PEXPIRE', KEYS[2], ttl) end
   if mine then return {'renewed'} end
   return {'claimed'}
 end
@@ -129,10 +133,12 @@ return out
 
 /// FR-138 (L5) — KEYS[1] = the payer's set, KEYS[2] = the session's holder
 /// hash. ARGV: the session, keep-until ms, now ms. Only lengthens, and only
-/// a lease that still exists: a session released meanwhile stays released.
+/// a lease that is still live: a session released meanwhile stays released,
+/// and a lease that lapsed but no claim has purged yet stays lapsed (PR D's
+/// review, LOW 7), since its holder record may be gone with it.
 const KEEP: &str = r#"
 local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
-if not cur then return 0 end
+if not cur or tonumber(cur) <= tonumber(ARGV[3]) then return 0 end
 local keep = tonumber(ARGV[2])
 if tonumber(cur) < keep then redis.call('ZADD', KEYS[1], 'XX', keep, ARGV[1]) end
 local left = keep - tonumber(ARGV[3])
@@ -148,6 +154,22 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Give `key` an expiry of at least `ttl_ms` without ever shortening one:
+/// `NX` sets it when the key has none, `GT` raises a shorter one. (`GT`
+/// alone treats a key with no expiry as infinite and leaves it so.)
+fn lengthen(pipe: &mut redis::Pipeline, key: &str, ttl_ms: u64) {
+    pipe.cmd("PEXPIRE")
+        .arg(key)
+        .arg(ttl_ms)
+        .arg("NX")
+        .ignore()
+        .cmd("PEXPIRE")
+        .arg(key)
+        .arg(ttl_ms)
+        .arg("GT")
+        .ignore();
 }
 
 /// The slot record, scoped to one database so two deployments (or two
@@ -277,6 +299,13 @@ impl SessionSlots {
 
     /// Put back the slots of sessions `pod`'s hub still holds but Redis lost
     /// (an upsert). Only for sessions the caller has just seen live.
+    ///
+    /// FR-138 (PR D's review, LOW 5) — and it only lengthens: the score is
+    /// written `GT` (a missing lease is added, a live one never lowered), and
+    /// each key's expiry `NX`, then `GT` (set when it has none, raised when it
+    /// is shorter), so a round that answered a kept lease as missing, or put
+    /// back another lease of the org, never cuts a kept lease or its set back
+    /// to 90 s. Redis 7.0, the floor the renewal already needs.
     pub async fn restore(&self, leases: &[Lease], pod: &str) -> Result<(), redis::RedisError> {
         if leases.is_empty() {
             return Ok(());
@@ -289,14 +318,12 @@ impl SessionSlots {
             let holder = self.holder_key(l.session);
             pipe.cmd("ZADD")
                 .arg(&slots)
+                .arg("GT")
                 .arg(until)
                 .arg(l.session.to_hex())
-                .ignore()
-                .cmd("PEXPIRE")
-                .arg(&slots)
-                .arg(ttl_ms)
-                .ignore()
-                .cmd("HSET")
+                .ignore();
+            lengthen(&mut pipe, &slots, ttl_ms);
+            pipe.cmd("HSET")
                 .arg(&holder)
                 .arg("user")
                 .arg(l.user.to_hex())
@@ -304,11 +331,8 @@ impl SessionSlots {
                 .arg(l.device.to_hex())
                 .arg("pod")
                 .arg(pod)
-                .ignore()
-                .cmd("PEXPIRE")
-                .arg(&holder)
-                .arg(ttl_ms)
                 .ignore();
+            lengthen(&mut pipe, &holder, ttl_ms);
         }
         let mut conn = self.conn.clone();
         pipe.query_async::<()>(&mut conn).await
