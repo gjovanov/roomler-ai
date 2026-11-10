@@ -405,22 +405,30 @@ fn check_cancel() -> Result<(), Failure> {
     }
 }
 
-/// Probe the tunnel CLI's config path to surface "clean" vs "already
-/// installed" on the Welcome step.
+/// The preflight row's words: whether the tunnel client is enrolled here
+/// already (its config is there), and that this install replaces it.
 fn detect_existing_install_label() -> String {
+    let not_yet = || "The tunnel client is not installed here yet".to_string();
     let Ok(path) = roomler_cli::config::default_config_path() else {
-        return "clean".to_string();
+        return not_yet();
     };
     if path.exists() {
         match std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| toml::from_str::<roomler_cli::config::TunnelConfig>(&s).ok())
         {
-            Some(cfg) => format!("installed ({} @ {})", cfg.machine_name, path.display()),
-            None => format!("installed (config at {} unreadable)", path.display()),
+            Some(cfg) => format!(
+                "The tunnel client is installed here, enrolled as “{}”: this install replaces it",
+                cfg.machine_name
+            ),
+            None => format!(
+                "A tunnel client's config is here but cannot be read ({}): this install \
+                 replaces it",
+                path.display()
+            ),
         }
     } else {
-        "clean".to_string()
+        not_yet()
     }
 }
 
@@ -553,12 +561,14 @@ mod tests {
     fn detect_existing_install_label_returns_clean_or_installed() {
         // Test box may have a real %APPDATA%\roomler\roomler-tunnel\
         // config.toml from a prior run; we can't unconditionally
-        // assert "clean" here. The contract is just "returns a non-
-        // empty human label" — and the value falls into the small set
-        // of expected prefixes.
+        // assert "not installed" here. The contract is just "returns a
+        // person's words" — and the value falls into the small set of
+        // expected prefixes.
         let label = detect_existing_install_label();
         assert!(
-            label == "clean" || label.starts_with("installed ("),
+            label == "The tunnel client is not installed here yet"
+                || label.starts_with("The tunnel client is installed here, enrolled as “")
+                || label.starts_with("A tunnel client's config is here but cannot be read"),
             "unexpected label: {label:?}"
         );
     }

@@ -339,6 +339,77 @@ mod front_tests {
         );
     }
 
+    /// Why the device was not anchored and why the service was not restarted
+    /// are warnings like the rest: Done says each once, in its warnings, and
+    /// no note of its own repeats one. The anchor's manual command stays: it
+    /// is what to do, not why.
+    #[test]
+    fn the_done_page_says_each_warning_once() {
+        let html = include_str!("front/index.html");
+        let js = include_str!("front/app.js");
+        for repeat in [
+            "done-anchor-reason",
+            "done-restart-note",
+            "done-restart-reason",
+            "anchorSkipReason",
+            "restartSkipReason",
+        ] {
+            assert!(
+                !html.contains(repeat) && !js.contains(repeat),
+                "Done repeats a warning: {repeat}"
+            );
+        }
+        assert!(html.contains("id=\"done-anchor-command\""));
+    }
+
+    /// The preflight row says what is installed here already and what the
+    /// install does to it (`PreflightOk`'s words, the row's detail), in a
+    /// person's words: whatever is found, never a flavour's name.
+    #[test]
+    fn the_preflight_says_what_is_installed_in_a_persons_words() {
+        use roomlerd::install_detect::{ExistingInstall, InstallInfo};
+        let info = |version: Option<&str>| InstallInfo {
+            version: version.map(str::to_string),
+            install_location: None,
+        };
+        for requested in ["peruser", "permachine", "permachine-systemcontext"] {
+            for found in [
+                ExistingInstall::Clean,
+                ExistingInstall::PerUser(info(Some("0.4.207"))),
+                ExistingInstall::PerMachine(info(None)),
+                ExistingInstall::Ambiguous {
+                    peruser: info(Some("0.4.1")),
+                    permachine: info(Some("0.4.2")),
+                },
+            ] {
+                let words = crate::orchestrator_agent::label_existing(&found, requested);
+                assert!(words.starts_with("Roomler is "), "{words:?}");
+                let lower = words.to_lowercase();
+                for flavour in [
+                    "peruser",
+                    "permachine",
+                    "systemcontext",
+                    "per-user",
+                    "clean",
+                ] {
+                    assert!(!lower.contains(flavour), "{words:?} says {flavour}");
+                }
+                assert_eq!(
+                    words.ends_with("this install replaces it"),
+                    matches!(
+                        (&found, requested),
+                        (ExistingInstall::PerUser(_), "peruser")
+                            | (
+                                ExistingInstall::PerMachine(_),
+                                "permachine" | "permachine-systemcontext"
+                            )
+                    ),
+                    "{words:?} for {requested}"
+                );
+            }
+        }
+    }
+
     /// `literal` with each `${…}` taken out.
     fn without_interpolations(literal: &str) -> String {
         let mut shown = String::new();

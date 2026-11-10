@@ -1219,22 +1219,33 @@ fn give_netstack_port(os: HostOs, cfg: &mut roomlerd::config::AgentConfig) -> Op
     }
 }
 
-/// The Welcome page's words for what is here. On macOS the root config is
-/// the root half's (FR-129 B2).
+/// The preflight row's words: what is here already and what this install
+/// does to it, as a person reads them. The package is replaced; an
+/// enrollment of the other scope stays beside it, which
+/// [`other_scope_warning`] says. On macOS the root config is the root
+/// half's (FR-129 B2).
 pub fn label_existing(d: &ud::UnixDetect, os: HostOs) -> String {
-    let version = d.daemon_version.as_deref().unwrap_or("unknown version");
+    let version = match d.daemon_version.as_deref() {
+        Some(v) => format!("version {v}"),
+        None => "version unknown".to_string(),
+    };
     let root = if os == HostOs::Macos {
-        "its root half (the private network)"
+        "in its root half (the private network)"
     } else {
         "as a system daemon"
     };
-    match (d.daemon_installed, d.per_user_config, d.system_config) {
-        (false, false, false) => "clean".to_string(),
-        (false, _, _) => "an enrollment without the daemon (the package was removed)".to_string(),
-        (true, true, true) => format!("daemon {version}, enrolled per-user AND {root}"),
-        (true, true, false) => format!("daemon {version}, enrolled per-user"),
-        (true, false, true) => format!("daemon {version}, enrolled {root}"),
-        (true, false, false) => format!("daemon {version}, not enrolled"),
+    let enrolled = match (d.per_user_config, d.system_config) {
+        (true, true) => format!("enrolled for you and {root}"),
+        (true, false) => "enrolled for you".to_string(),
+        (false, true) => format!("enrolled {root}"),
+        (false, false) => "not enrolled".to_string(),
+    };
+    match (d.daemon_installed, d.per_user_config || d.system_config) {
+        (false, false) => "Roomler is not installed here yet".to_string(),
+        (false, true) => format!("Roomler was removed from here, but it is still {enrolled}"),
+        (true, _) => {
+            format!("Roomler is installed here ({version}), {enrolled}: this install replaces it")
+        }
     }
 }
 
@@ -1319,7 +1330,10 @@ mod tests {
     #[test]
     fn existing_label_and_other_scope_warning() {
         let clean = ud::UnixDetect::default();
-        assert_eq!(label_existing(&clean, HostOs::Linux), "clean");
+        assert_eq!(
+            label_existing(&clean, HostOs::Linux),
+            "Roomler is not installed here yet"
+        );
         assert!(other_scope_warning(&clean, Scope::System, HostOs::Linux).is_none());
         let per_user = ud::UnixDetect {
             daemon_installed: true,
@@ -1329,7 +1343,17 @@ mod tests {
         };
         assert_eq!(
             label_existing(&per_user, HostOs::Linux),
-            "daemon 0.4.181, enrolled per-user"
+            "Roomler is installed here (version 0.4.181), enrolled for you: this install replaces it"
+        );
+        let removed = ud::UnixDetect {
+            daemon_installed: false,
+            daemon_version: None,
+            per_user_config: true,
+            system_config: false,
+        };
+        assert_eq!(
+            label_existing(&removed, HostOs::Linux),
+            "Roomler was removed from here, but it is still enrolled for you"
         );
         assert!(
             other_scope_warning(&per_user, Scope::System, HostOs::Linux)
@@ -1345,7 +1369,8 @@ mod tests {
         };
         assert_eq!(
             label_existing(&system, HostOs::Linux),
-            "daemon unknown version, enrolled as a system daemon"
+            "Roomler is installed here (version unknown), enrolled as a system daemon: this \
+             install replaces it"
         );
         assert!(
             other_scope_warning(&system, Scope::PerUser, HostOs::Linux)
@@ -1367,7 +1392,8 @@ mod tests {
         };
         assert_eq!(
             label_existing(&both, HostOs::Macos),
-            "daemon 0.4.183, enrolled per-user AND its root half (the private network)"
+            "Roomler is installed here (version 0.4.183), enrolled for you and in its root half \
+             (the private network): this install replaces it"
         );
         assert!(other_scope_warning(&both, Scope::PerUser, HostOs::Macos).is_none());
         assert!(other_scope_warning(&both, Scope::PerUser, HostOs::Linux).is_some());

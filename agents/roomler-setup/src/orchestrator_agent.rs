@@ -48,7 +48,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use roomler_ai_remote_control::setup_diagnostics::ErrorCode;
-use roomlerd::install_detect::{ExistingInstall, detect_existing_install};
+use roomlerd::install_detect::{ExistingInstall, InstallInfo, detect_existing_install};
 use roomlerd::updater::WindowsInstallFlavour;
 use tauri::ipc::Channel;
 use wizard_shared::asset_resolver;
@@ -302,7 +302,7 @@ async fn run_install_inner(
 
     emit(on_event, ProgressEvent::PreflightStarted);
     let detected = detect_existing_install();
-    let existing_label = label_existing(&detected);
+    let existing_label = label_existing(&detected, &flavour_str);
     emit(
         on_event,
         ProgressEvent::PreflightOk {
@@ -1870,24 +1870,40 @@ fn check_cancel() -> Result<(), Failure> {
     }
 }
 
-fn label_existing(detected: &ExistingInstall) -> String {
+/// The preflight row's words: what is installed here already and what this
+/// install does to it, as a person reads them, never a flavour's name.
+/// `requested` is the flavour from [`Role::msi_flavour`]: an install of the
+/// same kind is replaced, and a switch to the other kind is
+/// [`cross_flavour_warning`]'s to say.
+pub(crate) fn label_existing(detected: &ExistingInstall, requested: &str) -> String {
+    let version = |info: &InstallInfo| match info.version.as_deref() {
+        Some(v) => format!("version {v}"),
+        None => "version unknown".to_string(),
+    };
+    let replaced = ": this install replaces it";
     match detected {
-        ExistingInstall::Clean => "clean".to_string(),
+        ExistingInstall::Clean => "Roomler is not installed here yet".to_string(),
         ExistingInstall::PerUser(info) => format!(
-            "perUser {}",
-            info.version.as_deref().unwrap_or("(unknown version)")
+            "Roomler is installed for this user only ({}){}",
+            version(info),
+            if requested == "peruser" { replaced } else { "" }
         ),
         ExistingInstall::PerMachine(info) => format!(
-            "perMachine {}",
-            info.version.as_deref().unwrap_or("(unknown version)")
+            "Roomler is installed for the whole computer ({}){}",
+            version(info),
+            if requested.starts_with("permachine") {
+                replaced
+            } else {
+                ""
+            }
         ),
         ExistingInstall::Ambiguous {
             peruser,
             permachine,
         } => format!(
-            "ambiguous (perUser {} + perMachine {})",
-            peruser.version.as_deref().unwrap_or("?"),
-            permachine.version.as_deref().unwrap_or("?"),
+            "Roomler is installed twice: for this user only ({}) and for the whole computer ({})",
+            version(peruser),
+            version(permachine),
         ),
     }
 }
@@ -2043,24 +2059,39 @@ mod tests {
         assert!(w.unwrap().contains("installed twice"));
     }
 
+    /// The preflight row says what is here and what the install does to it.
     #[test]
-    fn label_existing_renders_each_variant() {
-        assert_eq!(label_existing(&ExistingInstall::Clean), "clean");
+    fn label_existing_says_what_is_here_and_what_happens_to_it() {
         assert_eq!(
-            label_existing(&ExistingInstall::PerUser(info("0.3.0-rc.26"))),
-            "perUser 0.3.0-rc.26"
+            label_existing(&ExistingInstall::Clean, "permachine"),
+            "Roomler is not installed here yet"
         );
         assert_eq!(
-            label_existing(&ExistingInstall::PerMachine(info("0.3.0-rc.26"))),
-            "perMachine 0.3.0-rc.26"
+            label_existing(&ExistingInstall::PerUser(info("0.4.207")), "peruser"),
+            "Roomler is installed for this user only (version 0.4.207): this install replaces it"
         );
-    }
-
-    #[test]
-    fn label_existing_handles_missing_version() {
         assert_eq!(
-            label_existing(&ExistingInstall::PerUser(InstallInfo::default())),
-            "perUser (unknown version)"
+            label_existing(
+                &ExistingInstall::PerMachine(info("0.4.207")),
+                "permachine-systemcontext"
+            ),
+            "Roomler is installed for the whole computer (version 0.4.207): this install replaces it"
+        );
+        // A switch to the other kind: the warning row says what happens.
+        assert_eq!(
+            label_existing(&ExistingInstall::PerUser(info("0.4.207")), "permachine"),
+            "Roomler is installed for this user only (version 0.4.207)"
+        );
+        assert_eq!(
+            label_existing(
+                &ExistingInstall::Ambiguous {
+                    peruser: info("0.4.1"),
+                    permachine: InstallInfo::default(),
+                },
+                "peruser"
+            ),
+            "Roomler is installed twice: for this user only (version 0.4.1) and for the whole \
+             computer (version unknown)"
         );
     }
 

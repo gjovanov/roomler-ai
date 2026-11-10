@@ -554,6 +554,9 @@ fn seen(event: &ProgressEvent) -> Option<Seen> {
     use ProgressEvent as E;
     let detail = |words: String| Some(Seen::Detail(words));
     match event {
+        // What is installed here already and what the install does to it,
+        // in a person's words (each pipeline's `label_existing`).
+        E::PreflightOk { existing } => detail(existing.clone()),
         E::PreflightWarning { message } => Some(Seen::Warning(message.clone())),
         E::AnchorSkipped { reason } => Some(Seen::Warning(format!("Not anchored: {reason}"))),
         E::DaemonRestartSkipped { reason } => Some(Seen::Warning(format!(
@@ -618,12 +621,11 @@ fn seen(event: &ProgressEvent) -> Option<Seen> {
         E::ScriptHalfDone { code: 0, .. } => detail("Finished".into()),
         E::ScriptHalfDone { code, .. } => detail(format!("Exited with {code}")),
         E::ElevationCancelled { .. } => detail("Cancelled at the administrator prompt".into()),
-        // `AssetResolving` names the MSI flavour and `PreflightOk` the flavour
-        // found, so neither is a row's words. `SystemContextError` has a panel
-        // of its own, and the package step fails right after it.
+        // `AssetResolving` names the MSI flavour, so it is no row's words.
+        // `SystemContextError` has a panel of its own, and the package step
+        // fails right after it.
         E::Started
         | E::PreflightStarted
-        | E::PreflightOk { .. }
         | E::AssetResolving { .. }
         | E::DownloadStarted { .. }
         | E::DownloadProgress { .. }
@@ -1032,13 +1034,24 @@ pub(crate) mod tests {
 
     #[test]
     fn no_row_names_an_msi_flavour() {
+        use roomlerd::install_detect::{ExistingInstall, InstallInfo};
         let (steps, _) = tracker();
         steps.started(PLAN, None);
         steps.begin(StepId::Preflight);
+        // The words the agent pipeline sends for an install found here: the
+        // preflight's row says them, so a person knows what is there.
+        let existing = crate::orchestrator_agent::label_existing(
+            &ExistingInstall::PerUser(InstallInfo {
+                version: Some("0.4.100".into()),
+                install_location: None,
+            }),
+            "peruser",
+        );
         steps.saw(&ProgressEvent::PreflightOk {
-            existing: "perUser 0.4.100".into(),
+            existing: existing.clone(),
         });
         steps.ok();
+        assert_eq!(steps.rows()[0].detail.as_deref(), Some(existing.as_str()));
         steps.begin(StepId::Resolve);
         for artifact in ["permachine", "peruser", "systemcontext"] {
             steps.saw(&ProgressEvent::AssetResolving {

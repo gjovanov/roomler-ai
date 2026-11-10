@@ -122,9 +122,6 @@ const state = {
                        // only — deliberately NOT in the persisted
                        // WizardState, so a relaunch re-derives it from the
                        // role instead of replaying a stale click.
-  anchorSkipReason: null, // FR-104: why the anchor step did not anchor
-  restartSkipReason: null, // #3116: why the daemon was not restarted onto
-                       // a reinstall's new enrollment
   systemContextNeedsElevation: false, // #3116: a limited wizard on a device
                        // whose pre-logon service config it cannot write (a
                        // reinstall); from cmd_system_context_needs_elevation
@@ -1545,7 +1542,6 @@ async function runInstall() {
   state.totalBytes = 0;
   state.scriptLines = [];
   state.elevation = null;
-  state.restartSkipReason = null;
   document.getElementById("install-systemcontext-error").hidden = true;
   document.getElementById("force-kill-confirm").hidden = true;
   await gotoStep("install");
@@ -1668,15 +1664,6 @@ function handleProgress(event, live) {
 
   if (type === "MsiSpawned") {
     state.msiSpawned = true;
-  }
-
-  // FR-104 — kept for the Done page's note.
-  if (type === "AnchorSkipped") {
-    state.anchorSkipReason = data.reason ?? null;
-  }
-  // #3116 — likewise.
-  if (type === "DaemonRestartSkipped") {
-    state.restartSkipReason = data.reason ?? null;
   }
 
   // FR-129 B1 — a line a half printed: the output panel, not a row.
@@ -1852,7 +1839,8 @@ function renderDone() {
   }
   document.getElementById("done-lead").textContent = lead;
 
-  // #3590: every warning the install raised, readable here too.
+  // #3590: every warning the install raised, readable here too, and only
+  // here: the anchor's and the restart's reasons are warnings like the rest.
   const warnings = Array.isArray(done.warnings) ? done.warnings : [];
   document.getElementById("done-warnings-list").replaceChildren(
     ...warnings.map((words) => {
@@ -1863,25 +1851,16 @@ function renderDone() {
   );
   document.getElementById("done-warnings").hidden = warnings.length === 0;
 
-  // FR-104 — the anchor step ran and did not anchor: the manual command,
-  // with a placeholder where a fresh token goes (the one pasted here is
-  // spent, and is never shown again).
+  // FR-104 — the anchor step ran and did not anchor (why is in the warnings
+  // above): the manual command, with a placeholder where a fresh token goes
+  // (the one pasted here is spent, and is never shown again).
   const anchorFailed = !isTunnel && done.anchored === false;
   document.getElementById("done-anchor-note").hidden = !anchorFailed;
   if (anchorFailed) {
-    document.getElementById("done-anchor-reason").textContent = state.anchorSkipReason ?? "";
     const server = (state.server || "https://roomler.ai").replace(/\/+$/, "");
     document.getElementById("done-anchor-command").textContent =
       `roomlerd anchor create --server ${server} --token <fresh token> ` +
       `--device ${done.principalId ?? "<device id>"}`;
-  }
-
-  // #3116 — a reinstall's daemon that was not restarted onto the new
-  // enrollment: it takes it at its next start, and the reason says how.
-  const restartSkipped = !isTunnel && !!state.restartSkipReason;
-  document.getElementById("done-restart-note").hidden = !restartSkipped;
-  if (restartSkipped) {
-    document.getElementById("done-restart-reason").textContent = state.restartSkipReason;
   }
 
   document.getElementById("done-principal-label").textContent =

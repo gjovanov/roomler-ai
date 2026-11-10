@@ -46,8 +46,11 @@ pub enum ProgressEvent {
 
     /// Pre-flight probe (registry and/or config-file) began.
     PreflightStarted,
-    /// Pre-flight finished. `existing` is a human-readable detection
-    /// summary, e.g. `"clean"` / `"Detected: perUser 0.3.0-rc.194"`.
+    /// Pre-flight finished. `existing` says what is installed here already
+    /// and what this install does to it, in a person's words (never a
+    /// flavour's name): the preflight row shows it, e.g. `"Roomler is
+    /// installed for the whole computer (version 0.4.207): this install
+    /// replaces it"`.
     #[serde(rename_all = "camelCase")]
     PreflightOk { existing: String },
     /// Non-fatal warning surfaced during pre-flight (cross-flavour
