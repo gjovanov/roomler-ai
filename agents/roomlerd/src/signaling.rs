@@ -596,8 +596,11 @@ async fn next_major_netchange(rx: &mut Option<NetDeltaRx>) -> String {
 /// keepalive tick (mirrors the overlay runtime's `RESUME_SKEW_THRESHOLD`).
 /// Below this it's scheduler jitter; above it the host slept and the WS is
 /// cycled proactively instead of trusting a possibly-dead socket for up to
-/// another RX-deadline window.
-const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
+/// another RX-deadline window. FR-138 P2a-2 (M2) — also the pause at the RX
+/// deadline that ends the connection as a resume from suspend
+/// (`ConnExit::after_rx_deadline`): FR-138's line, past which a session is
+/// not kept.
+pub(crate) const RESUME_SKEW_MIN: Duration = Duration::from_secs(120);
 
 /// A5 — a control-WS outage this long (or longer) triggers an immediate
 /// update check on reconnect: the standing fleet-heal path for an agent
@@ -1868,8 +1871,12 @@ async fn connect_once(
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     // FR-138 — the switch, read once for this connection: with it on, the
-    // hello says `rc-resume` and claims what the last connection kept.
-    let survive = crate::session_table::survive_enabled();
+    // hello says `rc-resume` and claims what the last connection kept. P2a-2
+    // (L11): a loop that holds the delegation host keeps nothing until P2b.
+    let survive = crate::session_table::connection_keeps(
+        crate::session_table::survive_enabled(),
+        delegation.host().is_some(),
+    );
     let kept_sessions = peers.begin_connection(survive).await;
     let mut hello_caps = stub_caps(cfg.overlay_multi_org, ctx.is_primary);
     crate::session_table::apply_resume_word(&mut hello_caps.rpc, survive);
@@ -1960,7 +1967,17 @@ async fn connect_once(
         // back. Empty unless the switch is on and a window was announced.
         kept_sessions,
     };
-    send_msg(&mut ws, &hello).await.context("sending hello")?;
+    // FR-138 P2a-2 (L8) — the send can take `WS_SEND_TIMEOUT`, and what the
+    // last connection kept is served meanwhile: its deadlines, its ends.
+    serving_kept(
+        send_msg(&mut ws, &hello),
+        peers,
+        kill_rx,
+        idle_rx,
+        &indicator,
+    )
+    .await
+    .context("sending hello")?;
     // rc.58: explicit tick on hello — the 25 s keepalive timer hasn't
     // fired yet, and a slow first server response (no inbound frame
     // for 30+ s) would otherwise leave the pump's `last_tick` at the
@@ -2047,25 +2064,32 @@ async fn connect_once(
     // runtime sends its `ClientMsg`s back through `outbound_tx`, like any
     // peer, and tears down when this connection's `overlay_evt_tx` drops.
     // #2551 — a re-attach to a persistent runtime awaits that runtime's
-    // event channel, unbounded.
+    // event channel, unbounded. FR-138 P2a-2 (L8) — so what the last
+    // connection kept is served meanwhile, as at the dial.
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
     watchdog::stage(ctx.pump, "setup.overlay");
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
-    let mut overlay_evt_tx = crate::overlay::maybe_start(
-        cfg,
-        ctx.token.clone(),
-        outbound_tx.clone(),
-        overlay_view_tx.clone(),
-        derp_ticket_slot.clone(),
-        crate::ssh::SessionServices {
-            power_activity: Some(crate::power::shared_activity().clone()),
-            asker: crate::ssh::Asker::Here {
-                broker: consent_broker.clone(),
-                indicator: indicator.clone(),
-                companion: crate::companion::Companion::System,
+    let mut overlay_evt_tx = serving_kept(
+        crate::overlay::maybe_start(
+            cfg,
+            ctx.token.clone(),
+            outbound_tx.clone(),
+            overlay_view_tx.clone(),
+            derp_ticket_slot.clone(),
+            crate::ssh::SessionServices {
+                power_activity: Some(crate::power::shared_activity().clone()),
+                asker: crate::ssh::Asker::Here {
+                    broker: consent_broker.clone(),
+                    indicator: indicator.clone(),
+                    companion: crate::companion::Companion::System,
+                },
+                activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
             },
-            activity: crate::ssh::ActivitySink::new(cfg, outbound_tx.clone()),
-        },
+        ),
+        peers,
+        kill_rx,
+        idle_rx,
+        &indicator,
     )
     .await;
     #[cfg(any(feature = "overlay-l3", feature = "overlay-netstack"))]
@@ -2376,7 +2400,11 @@ async fn connect_once(
                              (middlebox still ACKs our pings); reconnecting"
                         ),
                     }
-                    peers.end_connection(ConnExit::RxDeadline).await;
+                    // FR-138 P2a-2 (M2) — Windows' monotonic clock counts a
+                    // sleep, so a resume from suspend lands here, not in the
+                    // wall-clock check above: a pause that long ends the
+                    // connection as the resume it is.
+                    peers.end_connection(ConnExit::after_rx_deadline(paused)).await;
                     close_all_tunnel_peers(&mut tunnel_peers).await;
                     park_survived_quic_peers(&mut tunnel_quic_peers, &cfg.tenant_id).await;
                     let why = format!("ws rx deadline: no inbound frames for {} s", silent.as_secs());
@@ -2886,8 +2914,9 @@ async fn connect_once(
             Some((sid, end)) = device_end(kill_rx, idle_rx) => {
                 let _stage = watchdog::enter(ctx.pump, "device_end");
                 // #3245 — a pump with no encoder asks through the kill channel too,
-                // and its end says something else.
-                let no_video = peers.get(&sid).is_some_and(AgentPeer::no_video);
+                // and its end says something else. FR-138 P2a-2 (L10): a kept
+                // session's pump too.
+                let no_video = peers.no_video(&sid);
                 let end = if no_video { DeviceEnd::NoVideo } else { end };
                 // FR-101 P4b-2 — a hand-back from an idle watcher races the
                 // session's own end; one this connection no longer holds has
@@ -3823,7 +3852,8 @@ async fn handle_server_msg(
                     held = peers.len(),
                     "rc:session.request refused as busy: kept sessions hold this device's capacity (FR-138)"
                 );
-                let _ = outbound_tx.try_send(ClientMsg::Terminate {
+                // P2a-2 (L7) — never lost to a full queue.
+                peers.queue_end(ClientMsg::Terminate {
                     session_id,
                     reason: EndReason::AgentHangup,
                     limit: None,
@@ -4968,7 +4998,19 @@ async fn handle_server_msg(
                 {
                     debug!(%session_id, %e, "final session stats send failed");
                 }
-                close_within_budget(peer.close(), session_id, "terminate").await;
+                // FR-138 P2a-2 (C1) — with the switch on, the viewer hears the
+                // end peer to peer before the peer goes: it may not have
+                // rejoined since a resume, and a bare close reads to it as a
+                // drop, which it redials. Off, closed here as before.
+                peers
+                    .close_terminated(
+                        peer,
+                        session_id,
+                        &reason,
+                        limit.as_deref(),
+                        host_disconnect_grace(),
+                    )
+                    .await;
             }
             // 2026-07-27 — last session gone → release the GPU-clock pin
             // (Drop resets the locked clocks).
@@ -5066,15 +5108,11 @@ async fn handle_server_msg(
         }
         // FR-138 — the server accepted a kept session's claim: it goes on
         // under its own id, every sender it holds pointed at this connection.
-        // One its deadline already closed is said to be gone.
+        // One its deadline already closed, or whose peer died, is said to be
+        // gone: by the table, which never loses the answer to a full queue
+        // (P2a-2, M1 and L7).
         ServerMsg::SessionResumed { session_id } if peers.keeps_sessions() => {
-            if !peers.resume(session_id, outbound_tx).await {
-                let _ = outbound_tx.try_send(ClientMsg::Terminate {
-                    session_id,
-                    reason: EndReason::AgentDisconnect,
-                    limit: None,
-                });
-            }
+            peers.resume(session_id, outbound_tx).await;
             crate::gpu_clock::on_sessions_changed(peers.len());
         }
 
@@ -7088,6 +7126,13 @@ fn end_in_gap(
     end: DeviceEnd,
     indicator: &ViewerIndicator,
 ) {
+    // #3245 — a kept session's pump with no encoder asks through the kill
+    // channel too, and its end is `no_video`, not the person's (P2a-2, L10).
+    let end = if table.no_video(&sid) {
+        DeviceEnd::NoVideo
+    } else {
+        end
+    };
     if table.end_kept_by_device(
         sid,
         end.terminate(sid),

@@ -24,20 +24,24 @@
 //! agent spawned. A kept peer that is dropped is exactly the leak that once ate
 //! a host's ephemeral port range. So every path out of `kept` closes, the table
 //! closes what it holds even when it is dropped, and a peer is kept only when
-//! three things hold: the device's switch is on ([`survive_enabled`]), the
-//! server this connection spoke to announced a window above 0, and the session
-//! was live.
+//! four things hold: the device's switch is on ([`survive_enabled`]) and this
+//! loop holds no delegation host ([`connection_keeps`]), the server this
+//! connection spoke to announced a window above 0, and the session was live,
+//! its peer not dead.
 //!
-//! Off is today: with the switch off, or no window announced, every exit closes
-//! every peer as `close_all_peers` did, the same order, label and line.
+//! Off is today: with the switch off, or no window ever announced, every exit
+//! closes every peer as `close_all_peers` did, the same order, label and line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bson::oid::ObjectId;
-use roomler_ai_remote_control::{models::RpcCap, signaling::ClientMsg};
+use roomler_ai_remote_control::{
+    models::{EndReason, RpcCap},
+    signaling::ClientMsg,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
@@ -58,12 +62,15 @@ const NETCHANGE_LOOK_EVERY: Duration = Duration::from_millis(250);
 /// The connection's size (`PEER_OUTBOUND_CAP`).
 const LINK_CAP: usize = 64;
 
-/// A kept session's own end, reported by its link. One a session at most.
-const ENDED_CAP: usize = 32;
+/// What kept sessions' links hand the table: a session's own end, once, and
+/// the activity its recording and its curtain report for the audit (L9).
+const ENDED_CAP: usize = 64;
 
-/// Ends said at the device during a gap, waiting for the next connection. No
-/// more than the device's capacity can be live, so this is generous.
-const PENDING_ENDS_CAP: usize = 16;
+/// What the server must hear and that waits for room: an end, or a kept
+/// session's report, on the current connection or the next one. No more than
+/// the device's capacity can be live, so this is generous. Full, a report
+/// goes before an end does.
+const PENDING_CAP: usize = 64;
 
 /// How long `rc:ended` may take on the control channel before the close goes
 /// ahead without it: the idle warning's bound.
@@ -74,6 +81,23 @@ const SAY_BUDGET: Duration = Duration::from_secs(2);
 /// pushable: `DesiredConfig` has no such field. Read once per connection.
 pub(crate) fn survive_enabled() -> bool {
     tunnel_core::env::flag("RC_SESSIONS_SURVIVE_REATTACH", false)
+}
+
+/// P2a-2 (L11) — whether this connection builds sessions it may keep: the
+/// switch, and no delegation host held by this org's loop. A supervised Mac's
+/// delegated sessions live in its GUI worker, which keeps nothing until P2b,
+/// and a server's end for a session the daemon itself kept would cross to that
+/// worker (`DelegateHost::send_to_worker` hands over a `Terminate` for any
+/// session no org handed over). So until P2b such a loop keeps nothing and
+/// says no `rc-resume`, whatever the switch.
+pub(crate) fn connection_keeps(switch_on: bool, delegation_host: bool) -> bool {
+    if switch_on && delegation_host {
+        info!(
+            "rc: this loop holds the delegation host (a supervised Mac), so it keeps no session \
+             through the control socket's loss until P2b; the switch is on (FR-138)"
+        );
+    }
+    switch_on && !delegation_host
 }
 
 /// `rc-resume` in the hello's `AgentCaps.rpc`, and in every heartbeat that
@@ -96,7 +120,9 @@ pub(crate) enum ConnExit {
     Shutdown,
     /// The computer is going to sleep (FR-55 P4).
     Sleep,
-    /// A resume from suspend, at least `RESUME_SKEW_MIN` napped.
+    /// A resume from suspend, at least `RESUME_SKEW_MIN` napped: read by the
+    /// wall-clock check, or measured at the RX deadline where the monotonic
+    /// clock counts the sleep ([`ConnExit::after_rx_deadline`]).
     ResumeFromSuspend,
     /// No inbound frame within the RX deadline.
     RxDeadline,
@@ -209,6 +235,28 @@ impl ConnExit {
             ConnExit::KeyRotated => "key_rotated",
         }
     }
+
+    /// P2a-2 (M2) — the exit the RX deadline's arm takes, from the pause its
+    /// late keepalive tick measured (`tunnel_core::frozen::did_not_run_for`).
+    /// Windows' monotonic clock counts a sleep, so there a resume from suspend
+    /// never trips the wall-clock check (#3530): the RX deadline trips at the
+    /// first keepalive after the wake instead. A pause of at least
+    /// `RESUME_SKEW_MIN` is that resume, terminal as the wall-clock one is,
+    /// since the viewer's ICE consent has long failed. A shorter pause, or
+    /// none, stays the transient RX deadline.
+    ///
+    /// ⚠️ The seam FR-140 (#3619) plugs into: it swaps the signal that
+    /// measures `paused`, and this rule, FR-138's line, stays. Today's measure
+    /// reads a freeze (SIGSTOP, a VM pause) that long as a pause too, after
+    /// which the viewer's ICE consent has failed all the same.
+    pub(crate) fn after_rx_deadline(paused: Option<Duration>) -> ConnExit {
+        match paused {
+            Some(paused) if paused >= crate::signaling::RESUME_SKEW_MIN => {
+                ConnExit::ResumeFromSuspend
+            }
+            _ => ConnExit::RxDeadline,
+        }
+    }
 }
 
 /// What the table needs of a peer: [`AgentPeer`] in the daemon, a counting
@@ -223,6 +271,11 @@ pub(crate) trait TablePeer: Send + Sync + 'static {
     fn is_connected(&self) -> bool;
     /// Say `text` on the session's control channel: best effort and bounded.
     fn say_on_control(&self, text: String) -> impl Future<Output = ()> + Send + '_;
+    /// Whether the peer's connection is `Failed` or `Closed`: it cannot come
+    /// back (M1).
+    fn is_dead(&self) -> bool;
+    /// Whether its RTP pump asked for its end for want of an encoder (#3245).
+    fn no_video(&self) -> bool;
 }
 
 impl TablePeer for AgentPeer {
@@ -236,6 +289,14 @@ impl TablePeer for AgentPeer {
 
     fn is_connected(&self) -> bool {
         AgentPeer::is_connected(self)
+    }
+
+    fn is_dead(&self) -> bool {
+        AgentPeer::is_dead(self)
+    }
+
+    fn no_video(&self) -> bool {
+        AgentPeer::no_video(self)
     }
 
     fn say_on_control(&self, text: String) -> impl Future<Output = ()> + Send + '_ {
@@ -289,8 +350,9 @@ pub(crate) fn real_end_hook(indicator: crate::indicator::ViewerIndicator) -> End
 /// `privacy` reporter. A task forwards what they send to the connection the
 /// table points the link at, and the table points it at each new connection.
 /// While the session is kept the link drops what it is given and never waits,
-/// except the session's own `Terminate`, which it hands to the table: the
-/// table closes the peer and queues the end for the next connection.
+/// except what the server must hear anyway, which it hands to the table: the
+/// session's own `Terminate` (the table closes the peer and queues the end),
+/// and its recording's and curtain's activity (queued for the audit, L9).
 pub(crate) struct SessionLink {
     tx: mpsc::Sender<ClientMsg>,
     route: watch::Sender<Route>,
@@ -336,10 +398,22 @@ fn is_own_end(msg: &ClientMsg, session_id: ObjectId) -> bool {
     matches!(msg, ClientMsg::Terminate { session_id: s, .. } if *s == session_id)
 }
 
+/// P2a-2 (L9) — what a kept session says that the server must still hear: its
+/// own end, and the activity its recording and its curtain report for the
+/// audit. The server keeps the host's claims apart from its own decisions, so
+/// a report dropped in a gap is a hole in that record.
+fn heard_while_kept(msg: &ClientMsg, session_id: ObjectId) -> bool {
+    is_own_end(msg, session_id)
+        || matches!(
+            msg,
+            ClientMsg::RecordingActivity { .. } | ClientMsg::PrivacyActivity { .. }
+        )
+}
+
 /// The link's task. While attached it waits for room on the connection's queue
 /// as a direct send did, and moves the moment the route does, so a send that was
-/// waiting on a connection that died is never stuck. While kept it drops
-/// everything at once.
+/// waiting on a connection that died is never stuck. While kept it never waits:
+/// what the server must hear goes to the table, and the rest is dropped.
 async fn forward(
     session_id: ObjectId,
     mut rx: mpsc::Receiver<ClientMsg>,
@@ -355,10 +429,15 @@ async fn forward(
             let to = route.borrow_and_update().clone();
             match to {
                 Route::Kept => {
-                    if is_own_end(&msg, session_id) {
-                        // Never waits: a full queue costs the report, and the
-                        // deadline still closes the peer.
-                        let _ = ended.try_send((session_id, msg));
+                    // Never waits: a full queue costs the report, and the
+                    // deadline still closes the peer.
+                    if heard_while_kept(&msg, session_id)
+                        && ended.try_send((session_id, msg)).is_err()
+                    {
+                        debug!(
+                            session_id = %session_id,
+                            "rc: a kept session's report met a full table queue; dropped (FR-138)"
+                        );
                     }
                 }
                 Route::To(tx) if movable => tokio::select! {
@@ -396,11 +475,27 @@ fn ended_text(terminate: &ClientMsg) -> Option<String> {
     let ClientMsg::Terminate { reason, limit, .. } = terminate else {
         return None;
     };
+    Some(ended_json(reason, limit.as_deref()))
+}
+
+/// The `rc:ended` frame itself, `{"t":"rc:ended","reason":…,"limit"?:…}`, as
+/// the viewer parses it (`parseControlInbound`, `useRemoteControl.ts`).
+fn ended_json(reason: &EndReason, limit: Option<&str>) -> String {
     let mut said = serde_json::json!({ "t": "rc:ended", "reason": reason });
     if let Some(limit) = limit {
-        said["limit"] = serde_json::Value::from(limit.as_str());
+        said["limit"] = serde_json::Value::from(limit);
     }
-    Some(said.to_string())
+    said.to_string()
+}
+
+/// An end for the server about a session the table no longer holds: gone at
+/// its deadline, or dead (M1).
+fn gone(session_id: ObjectId, reason: EndReason) -> ClientMsg {
+    ClientMsg::Terminate {
+        session_id,
+        reason,
+        limit: None,
+    }
 }
 
 fn millis(d: Duration) -> u64 {
@@ -435,6 +530,11 @@ pub(crate) enum TableEvent {
     Deadline,
     /// A kept session's peer said its own end (it failed).
     Ended(ObjectId, Box<ClientMsg>),
+    /// A kept session reported activity for the audit (L9).
+    Report(Box<ClientMsg>),
+    /// This connection's queue has room for what waits (L7). `None`: the
+    /// queue closed, and what waits goes on the next connection.
+    Room(Option<mpsc::OwnedPermit<ClientMsg>>),
     /// Time to look at the peers kept after a net change.
     Look,
 }
@@ -443,8 +543,11 @@ pub(crate) enum TableEvent {
 pub(crate) struct SessionTable<P: TablePeer = AgentPeer> {
     attached: HashMap<ObjectId, Live<P>>,
     kept: HashMap<ObjectId, Kept<P>>,
-    /// Ends the device said while no connection was up, for the next one.
-    pending_ends: Vec<ClientMsg>,
+    /// What the server must hear and that waits for room on this
+    /// connection's queue, or for the next connection, in order (L7): ends
+    /// said at the device, a kept session's own end and its reports, the
+    /// answer for a claim the device can no longer honour.
+    pending_ends: VecDeque<ClientMsg>,
     /// This connection's switch.
     survive: bool,
     /// The window the server this connection speaks to announced, capped;
@@ -468,7 +571,7 @@ impl<P: TablePeer> SessionTable<P> {
         Self {
             attached: HashMap::new(),
             kept: HashMap::new(),
-            pending_ends: Vec::new(),
+            pending_ends: VecDeque::new(),
             survive: false,
             window: None,
             current: None,
@@ -503,9 +606,7 @@ impl<P: TablePeer> SessionTable<P> {
     /// again.
     pub(crate) fn connected(&mut self, outbound: &mpsc::Sender<ClientMsg>) {
         self.current = Some(outbound.clone());
-        for msg in std::mem::take(&mut self.pending_ends) {
-            self.queue_end(msg);
-        }
+        self.flush_pending();
     }
 
     /// Whether this connection builds sessions it may keep: its switch.
@@ -562,6 +663,59 @@ impl<P: TablePeer> SessionTable<P> {
         self.attached.get(session_id).map(|l| &l.peer)
     }
 
+    /// #3245 — the session's RTP pump asked for its end for want of an
+    /// encoder, through the Disconnect channel. Attached or kept (L10), so an
+    /// end in the gap is recorded as `no_video`, not as the person's
+    /// `host_disconnect`.
+    pub(crate) fn no_video(&self, session_id: &ObjectId) -> bool {
+        self.attached
+            .get(session_id)
+            .map(|l| &l.peer)
+            .or_else(|| self.kept.get(session_id).map(|k| &k.peer))
+            .is_some_and(TablePeer::no_video)
+    }
+
+    /// P2a-2 (C1) — close a session the server ended, its `rc:terminate` (a
+    /// kick, the maximum length, a refused claim), once the caller took it out
+    /// ([`Self::take`]). Attached or kept, its viewer may not have rejoined
+    /// since a resume, and to a viewer a peer that just dies reads as a drop,
+    /// which it redials; on an owner's or an auto-consent device that undoes
+    /// the kick. So control stops at once, the end is said on the control
+    /// channel (`rc:ended`, which the viewer reads as it reads `rc:terminate`:
+    /// the first of the two wins), and the peer closes after `grace`, on a task
+    /// of its own, so the loop waits for neither.
+    ///
+    /// Off is today: with the switch off it closes here, within the budget,
+    /// and says nothing.
+    pub(crate) async fn close_terminated(
+        &self,
+        peer: P,
+        session_id: ObjectId,
+        reason: &EndReason,
+        limit: Option<&str>,
+        grace: Duration,
+    ) {
+        if !self.survive {
+            close_within_budget(peer.close(), session_id, "terminate").await;
+            return;
+        }
+        peer.stop_serving();
+        info!(
+            session_id = %session_id,
+            ?reason,
+            ?limit,
+            grace_ms = millis(grace),
+            "rc: the server's end is said on the session's control channel; the peer closes \
+             after the grace (FR-138)"
+        );
+        let said = ended_json(reason, limit);
+        tokio::spawn(async move {
+            peer.say_on_control(said).await;
+            tokio::time::sleep(grace).await;
+            close_within_budget(peer.close(), session_id, "terminate").await;
+        });
+    }
+
     /// The attached sessions, the ones this connection serves.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&ObjectId, &P)> {
         self.attached.iter().map(|(s, l)| (s, &l.peer))
@@ -616,8 +770,11 @@ impl<P: TablePeer> SessionTable<P> {
     }
 
     /// The server accepted the claim: the session goes on, its senders pointed
-    /// at this connection. `false` when the table no longer holds it, its
-    /// deadline having come first: the caller tells the server.
+    /// at this connection. `false` when it cannot: the table no longer holds
+    /// it (its deadline came first), its deadline passed, or its peer died
+    /// meanwhile (M1). The table closes what it still held and tells the
+    /// server itself, reliably (L7): `agent_disconnect`, or `error` for a peer
+    /// that died.
     pub(crate) async fn resume(
         &mut self,
         session_id: ObjectId,
@@ -630,13 +787,23 @@ impl<P: TablePeer> SessionTable<P> {
         let Some(kept) = self.kept.remove(&session_id) else {
             info!(
                 session_id = %session_id,
-                "rc:session.resumed for a session this device no longer holds (FR-138)"
+                "rc:session.resumed for a session this device no longer holds; telling the \
+                 server it is gone (FR-138)"
             );
+            self.queue_end(gone(session_id, EndReason::AgentDisconnect));
             return false;
         };
-        if Instant::now() >= kept.deadline {
+        let refused = if kept.peer.is_dead() {
+            Some(("dead_at_claim", EndReason::Error))
+        } else if Instant::now() >= kept.deadline {
+            Some(("claim_late", EndReason::AgentDisconnect))
+        } else {
+            None
+        };
+        if let Some((why, reason)) = refused {
             self.kept.insert(session_id, kept);
-            self.close_kept(session_id, "claim_late").await;
+            self.close_kept(session_id, why).await;
+            self.queue_end(gone(session_id, reason));
             return false;
         }
         kept.link.point_at(outbound.clone());
@@ -656,25 +823,47 @@ impl<P: TablePeer> SessionTable<P> {
         true
     }
 
-    /// The connection ended by `exit`. A terminal exit, the switch off or no
-    /// window closes every peer, kept ones included. Otherwise every attached
-    /// session that can be kept is kept until its deadline, and the rest close.
+    /// The connection ended by `exit`. A terminal exit or the switch off
+    /// closes every peer, kept ones included. With no window announced on
+    /// this connection, what it built closes as before, and what the last one
+    /// kept keeps its own deadline (M3). Otherwise every attached session that
+    /// can be kept is kept until its deadline, and the rest close.
     pub(crate) async fn end_connection(&mut self, exit: ConnExit) {
         self.current = None;
         let kind = exit.kind();
-        let window = match self.window {
-            Some(window) if self.survive && kind != ExitKind::Terminal => window,
-            _ => return self.close_all(exit.label()).await,
+        if kind == ExitKind::Terminal || !self.survive {
+            return self.close_all(exit.label()).await;
+        }
+        let Some(window) = self.window else {
+            // M3 — the window comes after the hello, so a connection can end
+            // before it: its server never said whether it keeps sessions.
+            if !self.kept.is_empty() {
+                info!(
+                    kept = self.kept.len(),
+                    exit = exit.label(),
+                    "rc: the connection ended before its server announced a window; the kept \
+                     sessions keep their deadlines (FR-138)"
+                );
+            }
+            return self.close_attached().await;
         };
         let now = Instant::now();
         let netchange = kind == ExitKind::NetChange;
         let mut closing: Vec<(ObjectId, P, &'static str)> = Vec::new();
+        let mut dead: Vec<ObjectId> = Vec::new();
         let attached: Vec<(ObjectId, Live<P>)> = self.attached.drain().collect();
         for (session_id, live) in attached {
             let Some(link) = live.link else {
                 closing.push((session_id, live.peer, "ws_disconnect"));
                 continue;
             };
+            // M1 — dead: it cannot come back, and its own `Terminate`, sent
+            // once on `Failed`, may have gone with the connection that died.
+            if live.peer.is_dead() {
+                closing.push((session_id, live.peer, "dead"));
+                dead.push(session_id);
+                continue;
+            }
             if self.kept.len() >= self.capacity {
                 closing.push((session_id, live.peer, "over_capacity"));
                 continue;
@@ -719,35 +908,46 @@ impl<P: TablePeer> SessionTable<P> {
             );
             close_within_budget(peer.close(), session_id, why).await;
         }
+        // The server detached these with the rest, so it hears their end on
+        // the next connection.
+        for session_id in dead {
+            self.queue_end(gone(session_id, EndReason::Error));
+        }
     }
 
     /// Close every peer, attached and kept: a terminal exit, a refused token,
     /// the loop's end. The attached half is `close_all_peers` as it was, the same
     /// order, label and line.
+    pub(crate) async fn close_all(&mut self, why: &'static str) {
+        self.close_attached().await;
+        let kept: Vec<ObjectId> = self.kept.keys().copied().collect();
+        for session_id in kept {
+            self.close_kept(session_id, why).await;
+        }
+    }
+
+    /// The attached half of [`Self::close_all`], `close_all_peers` as it was.
     ///
     /// rc.24 — each real end takes its banner down: before, the indicator hid
     /// only on `rc:terminate`, which never comes when the socket itself drops,
     /// and after a web deploy the "Being viewed by" frame stayed painted while
     /// the controller could not reconnect ("agent capacity exceeded"). A kept
     /// session's banner stays up, because its session is still live.
-    pub(crate) async fn close_all(&mut self, why: &'static str) {
+    async fn close_attached(&mut self) {
         self.current = None;
-        if !self.attached.is_empty() {
-            let count = self.attached.len();
-            let attached: Vec<(ObjectId, Live<P>)> = self.attached.drain().collect();
-            for (session_id, live) in attached {
-                (self.on_end)(session_id, RealEnd::Ended);
-                close_within_budget(live.peer.close(), session_id, "ws_disconnect").await;
-            }
-            info!(
-                count,
-                "torn down peers + hid indicator overlays on ws disconnect"
-            );
+        if self.attached.is_empty() {
+            return;
         }
-        let kept: Vec<ObjectId> = self.kept.keys().copied().collect();
-        for session_id in kept {
-            self.close_kept(session_id, why).await;
+        let count = self.attached.len();
+        let attached: Vec<(ObjectId, Live<P>)> = self.attached.drain().collect();
+        for (session_id, live) in attached {
+            (self.on_end)(session_id, RealEnd::Ended);
+            close_within_budget(live.peer.close(), session_id, "ws_disconnect").await;
         }
+        info!(
+            count,
+            "torn down peers + hid indicator overlays on ws disconnect"
+        );
     }
 
     /// A connection ended without its exit arm (a `?`, such as a failed send
@@ -806,38 +1006,75 @@ impl<P: TablePeer> SessionTable<P> {
         true
     }
 
-    /// An end for the server: on the current connection, or the next one.
+    /// What the server must hear (an end, or a kept session's report): on the
+    /// current connection, or the next one. In order, and never lost to a full
+    /// queue (L7): what does not fit waits, and goes the moment the queue has
+    /// room ([`TableEvent::Room`]). Never waits itself.
     pub(crate) fn queue_end(&mut self, msg: ClientMsg) {
-        let msg = match &self.current {
-            Some(tx) => match tx.try_send(msg) {
-                Ok(()) => return,
-                Err(e) => e.into_inner(),
-            },
-            None => msg,
-        };
-        if self.pending_ends.len() >= PENDING_ENDS_CAP {
-            let dropped = self.pending_ends.remove(0);
+        self.pending_ends.push_back(msg);
+        while self.pending_ends.len() > PENDING_CAP {
+            // A report goes before an end does.
+            let at = self
+                .pending_ends
+                .iter()
+                .position(|m| !matches!(m, ClientMsg::Terminate { .. }))
+                .unwrap_or(0);
+            let dropped = self.pending_ends.remove(at);
             warn!(
                 ?dropped,
-                "rc: too many ends queued for the next connection; dropping the oldest"
+                "rc: too much waits for room for the server; dropping one (FR-138)"
             );
         }
-        self.pending_ends.push(msg);
+        self.flush_pending();
+    }
+
+    /// Hand what waits to this connection's queue, in order, while it has
+    /// room. The rest waits for [`TableEvent::Room`], or the next connection.
+    fn flush_pending(&mut self) {
+        let Some(tx) = self.current.clone() else {
+            return;
+        };
+        while let Some(msg) = self.pending_ends.pop_front() {
+            match tx.try_send(msg) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(msg)) => {
+                    self.pending_ends.push_front(msg);
+                    return;
+                }
+                Err(mpsc::error::TrySendError::Closed(msg)) => {
+                    self.pending_ends.push_front(msg);
+                    self.current = None;
+                    return;
+                }
+            }
+        }
     }
 
     /// The next thing the table must act on: a deadline, a kept peer's own
-    /// end, a look at the peers kept after a net change. Pends while nothing is
-    /// kept. Cancel-safe, for a `select!` arm.
+    /// end or report, a look at the peers kept after a net change, room on
+    /// this connection's queue for what waits. Pends while nothing is kept and
+    /// nothing waits. Cancel-safe, for a `select!` arm.
     pub(crate) async fn next_event(&mut self) -> TableEvent {
         let deadline = self.kept.values().map(|k| k.deadline).min();
         let look = self
             .next_look
             .filter(|_| self.kept.values().any(|k| k.netchange));
+        let room = self
+            .current
+            .clone()
+            .filter(|_| !self.pending_ends.is_empty());
         tokio::select! {
             biased;
-            Some((session_id, msg)) = self.ended_rx.recv() => TableEvent::Ended(session_id, Box::new(msg)),
+            Some((session_id, msg)) = self.ended_rx.recv() => {
+                if is_own_end(&msg, session_id) {
+                    TableEvent::Ended(session_id, Box::new(msg))
+                } else {
+                    TableEvent::Report(Box::new(msg))
+                }
+            }
             () = sleep_until(deadline) => TableEvent::Deadline,
             () = sleep_until(look) => TableEvent::Look,
+            permit = room_on(room) => TableEvent::Room(permit),
         }
     }
 
@@ -855,6 +1092,17 @@ impl<P: TablePeer> SessionTable<P> {
                     self.queue_end(*msg);
                 }
             }
+            // L9 — ends nothing: the audit hears it on this connection, or the
+            // next.
+            TableEvent::Report(msg) => self.queue_end(*msg),
+            TableEvent::Room(Some(permit)) => {
+                if let Some(msg) = self.pending_ends.pop_front() {
+                    permit.send(msg);
+                }
+                self.flush_pending();
+            }
+            // The queue closed under it: the connection is ending.
+            TableEvent::Room(None) => self.current = None,
             TableEvent::Look => {
                 let left: Vec<ObjectId> = self
                     .kept
@@ -910,6 +1158,15 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
+/// Room on `to`, a connection's queue that something waits for. `None` when
+/// it closed. Pends with nothing to wait for.
+async fn room_on(to: Option<mpsc::Sender<ClientMsg>>) -> Option<mpsc::OwnedPermit<ClientMsg>> {
+    match to {
+        Some(tx) => tx.reserve_owned().await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
 /// The backstop: a table dropped while it holds a peer still closes it, within
 /// the budget, on a task of its own. Every return of the org loop closes the
 /// table first, so this reads as a WARN when it ever runs.
@@ -947,7 +1204,7 @@ impl<P: TablePeer> Drop for SessionTable<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roomler_ai_remote_control::models::EndReason;
+    use roomler_ai_remote_control::models::{PrivacyActivityKind, RecordingActivityKind};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -960,6 +1217,10 @@ mod tests {
         closes: AtomicUsize,
         stopped: AtomicBool,
         connected: AtomicBool,
+        /// Its connection `Failed` or `Closed` (M1).
+        dead: AtomicBool,
+        /// Its pump asked for its end for want of an encoder (L10).
+        no_video: AtomicBool,
         said: Mutex<Vec<String>>,
     }
 
@@ -971,6 +1232,15 @@ mod tests {
         }
         fn set_connected(&self, on: bool) {
             self.0.connected.store(on, Ordering::SeqCst);
+        }
+        /// `Failed` (or `Closed`), with no word from it: the report that
+        /// would have said so went with a connection that died.
+        fn set_dead(&self) {
+            self.set_connected(false);
+            self.0.dead.store(true, Ordering::SeqCst);
+        }
+        fn set_no_video(&self) {
+            self.0.no_video.store(true, Ordering::SeqCst);
         }
         fn closes(&self) -> usize {
             self.0.closes.load(Ordering::SeqCst)
@@ -1001,6 +1271,12 @@ mod tests {
         }
         async fn say_on_control(&self, text: String) {
             self.0.said.lock().unwrap().push(text);
+        }
+        fn is_dead(&self) -> bool {
+            self.0.dead.load(Ordering::SeqCst)
+        }
+        fn no_video(&self) -> bool {
+            self.0.no_video.load(Ordering::SeqCst)
         }
     }
 
@@ -1125,6 +1401,56 @@ mod tests {
         }
     }
 
+    fn recording_activity(session_id: ObjectId) -> ClientMsg {
+        ClientMsg::RecordingActivity {
+            session_id,
+            kind: RecordingActivityKind::Started,
+            name: None,
+            bytes: None,
+            duration_ms: None,
+            reason: None,
+        }
+    }
+
+    fn privacy_activity(session_id: ObjectId) -> ClientMsg {
+        ClientMsg::PrivacyActivity {
+            session_id,
+            kind: PrivacyActivityKind::On,
+            reason: None,
+        }
+    }
+
+    /// Serve the table's events for `d`, as the loop does wherever it waits.
+    /// On a paused clock the wait passes at once.
+    async fn serve_for(table: &mut SessionTable<Fake>, d: Duration) {
+        let _ = tokio::time::timeout(d, async {
+            loop {
+                let event = table.next_event().await;
+                table.serve(event).await;
+            }
+        })
+        .await;
+    }
+
+    /// The signalling loop's code without its tests and with every blank
+    /// removed, so a check reads the same however rustfmt wraps a line.
+    fn signaling_code() -> String {
+        include_str!("signaling.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// `connect_once` from its start to its select loop: the setup.
+    fn connection_setup(code: &str) -> &str {
+        code.split("asyncfnconnect_once(")
+            .nth(1)
+            .and_then(|rest| rest.split("drop(setup_stage);").next())
+            .expect("connect_once and the end of its setup")
+    }
+
     // ─── The seventeen arms (spec §2.2) ─────────────────────────────────────
     //
     // Each runs the arm with the switch on and a 60 s window announced, two
@@ -1227,19 +1553,28 @@ mod tests {
 
     /// Every arm of the connection ends through the table, under its own name,
     /// and nothing else closes the connection's peers: the per-arm tests above
-    /// are the arms the loop runs.
+    /// are the arms the loop runs. The RX deadline's arm takes its name from
+    /// the pause it measured (M2), so it names no exit itself.
     #[test]
     fn every_arm_of_the_connection_ends_through_the_table() {
         let src = include_str!("signaling.rs");
         let code = src.split("\nmod tests {").next().unwrap();
         for exit in ConnExit::ALL {
             let call = format!("end_connection(ConnExit::{exit:?})");
+            let arms = usize::from(exit != ConnExit::RxDeadline);
             assert_eq!(
                 code.matches(&call).count(),
-                1,
+                arms,
                 "{call} must be the arm's one call"
             );
         }
+        assert_eq!(
+            signaling_code()
+                .matches("end_connection(ConnExit::after_rx_deadline(paused))")
+                .count(),
+            1,
+            "the RX deadline's arm ends as the pause it measured says (M2)"
+        );
         assert!(
             !code.contains("close_all_peers("),
             "a connection's peers close only through the session table"
@@ -1804,5 +2139,345 @@ mod tests {
             serde_json::json!({"t": "rc:ended", "reason": "idle_timeout", "limit": "idle"})
         );
         assert_eq!(ended_text(&ice(id)), None);
+    }
+
+    // ─── P2a-2: the review's device findings ────────────────────────────────
+
+    /// C1 — the server ended a session the table holds: a kick, the maximum
+    /// length, a refused claim. Its viewer may not have rejoined since a
+    /// resume, and to it a peer that just dies reads as a drop, which it
+    /// redials; on an owner's or an auto-consent device that undoes the kick.
+    /// So control stops at once, the end is said on the control channel, and
+    /// the peer closes after the grace, attached or kept alike.
+    #[tokio::test(start_paused = true)]
+    async fn the_servers_end_is_said_peer_to_peer_before_the_close() {
+        for kept in [false, true] {
+            let mut r = rig(true, Some(60), 1).await;
+            let id = r.sessions[0].id;
+            let peer = r.sessions[0].peer.clone();
+            if kept {
+                r.table.end_connection(ConnExit::ReadError).await;
+            }
+            let taken = r.table.take(&id, "terminate").expect("the table holds it");
+            r.table
+                .close_terminated(
+                    taken,
+                    id,
+                    &EndReason::IdleTimeout,
+                    Some("max_duration"),
+                    Duration::from_secs(1),
+                )
+                .await;
+            assert!(peer.stopped(), "kept={kept}: control ends at once");
+            assert_eq!(
+                peer.closes(),
+                0,
+                "kept={kept}: the close waits for the grace"
+            );
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            assert_eq!(
+                peer.said(),
+                vec![serde_json::json!(
+                    {"t": "rc:ended", "reason": "idle_timeout", "limit": "max_duration"}
+                )],
+                "kept={kept}: the viewer hears why, peer to peer"
+            );
+            assert_eq!(
+                peer.closes(),
+                1,
+                "kept={kept}: closed once, after the grace"
+            );
+            assert!(!r.table.holds(&id));
+        }
+    }
+
+    /// C1, off is today: the server's end closes the peer at once and says
+    /// nothing on its channel.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_switch_off_the_servers_end_closes_at_once() {
+        let mut r = rig(false, None, 1).await;
+        let id = r.sessions[0].id;
+        let taken = r.table.take(&id, "terminate").expect("attached");
+        r.table
+            .close_terminated(
+                taken,
+                id,
+                &EndReason::AdminTerminated,
+                None,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(r.closes(), 1, "closed before the call returns");
+        assert!(
+            r.sessions[0].peer.said().is_empty(),
+            "nothing said on the channel"
+        );
+    }
+
+    /// M1 — a peer that failed while attached said so only on the connection
+    /// that died with it. Kept, it would wait out the window dead, and a claim
+    /// could resume it. It closes at the exit instead, and its end goes to the
+    /// next connection; a live peer beside it is kept.
+    #[tokio::test]
+    async fn a_dead_peer_is_closed_at_the_exit_and_its_end_said_next() {
+        let mut r = rig(true, Some(60), 2).await;
+        let (dead, live) = (r.sessions[0].id, r.sessions[1].id);
+        r.sessions[0].peer.set_dead();
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert_eq!(
+            r.sessions[0].peer.closes(),
+            1,
+            "a dead peer is closed, never kept"
+        );
+        assert_eq!(r.sessions[1].peer.closes(), 0, "the live one is kept");
+        assert_eq!(r.ends.all(), vec![(dead, RealEnd::Ended)]);
+        let (claim, _tx2, mut conn2) = reconnect(&mut r.table).await;
+        assert_eq!(claim, vec![live], "the dead one is not claimed");
+        match conn2.try_recv() {
+            Ok(ClientMsg::Terminate {
+                session_id,
+                reason: EndReason::Error,
+                limit: None,
+            }) => assert_eq!(session_id, dead),
+            other => panic!("the next connection says the dead one's end: {other:?}"),
+        }
+        r.table.close_all("test_end").await;
+    }
+
+    /// M1 — one that dies between the claim and its answer is not resumed:
+    /// the answer closes it, and the server hears it is gone.
+    #[tokio::test]
+    async fn a_kept_peer_that_died_is_not_resumed() {
+        let mut r = rig(true, Some(60), 1).await;
+        let id = r.sessions[0].id;
+        r.table.end_connection(ConnExit::ReadError).await;
+        let (claim, tx2, mut conn2) = reconnect(&mut r.table).await;
+        assert_eq!(claim, vec![id]);
+        r.sessions[0].peer.set_dead();
+        assert!(
+            !r.table.resume(id, &tx2).await,
+            "a dead peer is not resumed"
+        );
+        assert_eq!(r.closes(), 1);
+        assert!(!r.table.holds(&id));
+        match conn2.try_recv() {
+            Ok(ClientMsg::Terminate {
+                session_id,
+                reason: EndReason::Error,
+                ..
+            }) => assert_eq!(session_id, id),
+            other => panic!("the server hears it is gone: {other:?}"),
+        }
+    }
+
+    /// M2 — Windows' monotonic clock counts a sleep, so a resume from suspend
+    /// there never trips the wall-clock check: the RX deadline trips at the
+    /// first keepalive instead, with the pause the late tick measured. A pause
+    /// that long ends the connection as the resume it is, which is terminal;
+    /// a shorter one, or none, stays the transient RX deadline. A pure
+    /// function of the pause: FR-140 swaps the signal, not the rule.
+    #[test]
+    fn the_rx_deadline_reads_a_long_pause_as_a_resume_from_suspend() {
+        let secs = Duration::from_secs;
+        for (paused, exit) in [
+            (Some(secs(120)), ConnExit::ResumeFromSuspend),
+            (Some(secs(3600)), ConnExit::ResumeFromSuspend),
+            (Some(secs(119)), ConnExit::RxDeadline),
+            (Some(secs(30)), ConnExit::RxDeadline),
+            (None, ConnExit::RxDeadline),
+        ] {
+            assert_eq!(ConnExit::after_rx_deadline(paused), exit, "{paused:?}");
+        }
+    }
+
+    /// M3 — a connection that ends before its server announced a window
+    /// closes what it built, as before. What the last connection kept keeps
+    /// its own deadline, and the next connection claims it.
+    #[tokio::test]
+    async fn a_connection_that_ends_before_its_window_leaves_the_kept_ones() {
+        let mut r = rig(true, Some(60), 1).await;
+        let id = r.sessions[0].id;
+        r.table.end_connection(ConnExit::ReadError).await;
+        let (claim, tx2, _conn2) = reconnect(&mut r.table).await;
+        assert_eq!(claim, vec![id]);
+        let fresh = attach(&mut r.table, &tx2).await;
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert_eq!(r.closes(), 0, "the kept one keeps its deadline");
+        assert!(r.table.holds(&id));
+        assert_eq!(
+            fresh.peer.closes(),
+            1,
+            "what this connection built closes, as before"
+        );
+        let (claim, _tx3, _conn3) = reconnect(&mut r.table).await;
+        assert_eq!(claim, vec![id], "the next connection claims it");
+        r.table.close_all("test_end").await;
+        assert_eq!(r.closes(), 1);
+    }
+
+    /// L7 — the answer to a claim the device can no longer honour reaches the
+    /// server even when the connection's queue is full at that moment;
+    /// dropped, the server would keep a session the device closed.
+    #[tokio::test(start_paused = true)]
+    async fn the_no_longer_held_answer_waits_for_room() {
+        let ends = Ends::default();
+        let mut table: SessionTable<Fake> = SessionTable::new(8, ends.hook());
+        let (tx, mut conn) = mpsc::channel(1);
+        table.begin_connection(true).await;
+        table.connected(&tx);
+        table.set_window(60);
+        tx.try_send(ice(ObjectId::new())).unwrap();
+        let gone = ObjectId::new();
+        assert!(!table.resume(gone, &tx).await, "not held");
+        assert!(
+            matches!(conn.recv().await, Some(ClientMsg::Ice { .. })),
+            "the loop reads its queue"
+        );
+        serve_for(&mut table, Duration::from_secs(1)).await;
+        match conn.try_recv() {
+            Ok(ClientMsg::Terminate {
+                session_id,
+                reason: EndReason::AgentDisconnect,
+                ..
+            }) => assert_eq!(session_id, gone),
+            other => panic!("the answer goes out once there is room: {other:?}"),
+        }
+    }
+
+    /// L7 — an end that meets this connection's queue full waits for room on
+    /// this connection, in order, and not for the next connection.
+    #[tokio::test(start_paused = true)]
+    async fn an_end_that_meets_a_full_queue_goes_out_on_this_connection() {
+        let mut r = rig(true, Some(60), 2).await;
+        let (a, b) = (r.sessions[0].id, r.sessions[1].id);
+        r.table.end_connection(ConnExit::ReadError).await;
+        // The next connection's queue: one slot, full.
+        let (tx2, mut conn2) = mpsc::channel(1);
+        r.table.begin_connection(true).await;
+        r.table.connected(&tx2);
+        tx2.try_send(ice(ObjectId::new())).unwrap();
+        for id in [a, b] {
+            let said = terminate(id, EndReason::HostDisconnect, None);
+            assert!(
+                r.table
+                    .end_kept_by_device(id, said, "host_disconnect", Duration::ZERO)
+            );
+        }
+        assert!(
+            matches!(conn2.recv().await, Some(ClientMsg::Ice { .. })),
+            "the loop reads its queue: room for one"
+        );
+        for want in [a, b] {
+            serve_for(&mut r.table, Duration::from_secs(1)).await;
+            match conn2.try_recv() {
+                Ok(ClientMsg::Terminate {
+                    session_id,
+                    reason: EndReason::HostDisconnect,
+                    ..
+                }) => assert_eq!(session_id, want, "in order"),
+                other => {
+                    panic!("the end goes out on this connection once there is room: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// L8 — between a connection's start and its loop the setup waits on the
+    /// hello's send (up to `WS_SEND_TIMEOUT`) and on the overlay's start
+    /// (unbounded). Both run inside `serving_kept`, so a kept session's
+    /// deadline and an end at the device are served meanwhile (spec §4.9).
+    #[test]
+    fn the_setup_serves_what_was_kept_while_it_waits() {
+        let code = signaling_code();
+        let setup = connection_setup(&code);
+        assert!(
+            setup.contains("serving_kept(send_msg(&mutws,&hello),"),
+            "the hello is sent while the kept sessions are served"
+        );
+        assert!(
+            setup.contains("serving_kept(crate::overlay::maybe_start("),
+            "the overlay starts while the kept sessions are served"
+        );
+    }
+
+    /// L9 — what a kept session reports for the audit while no connection is
+    /// up (its recording's and its curtain's activity) goes out on the next
+    /// one, as its end would. Its ICE is still dropped, and a report ends
+    /// nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_sessions_activity_reaches_the_next_connection() {
+        let mut r = rig(true, Some(60), 1).await;
+        let id = r.sessions[0].id;
+        let held = r.sessions[0].held.clone();
+        r.table.end_connection(ConnExit::ReadError).await;
+        held.send(recording_activity(id)).await.unwrap();
+        held.send(ice(id)).await.unwrap();
+        held.send(privacy_activity(id)).await.unwrap();
+        settled(&held).await;
+        serve_for(&mut r.table, Duration::from_millis(100)).await;
+        let (claim, _tx2, mut conn2) = reconnect(&mut r.table).await;
+        assert_eq!(claim, vec![id], "a report ends nothing");
+        assert!(
+            matches!(conn2.try_recv(), Ok(ClientMsg::RecordingActivity { session_id, .. }) if session_id == id),
+            "the recording's activity reaches the audit"
+        );
+        assert!(
+            matches!(conn2.try_recv(), Ok(ClientMsg::PrivacyActivity { session_id, .. }) if session_id == id),
+            "the curtain's activity reaches the audit"
+        );
+        assert!(conn2.try_recv().is_err(), "the ICE was dropped");
+        assert_eq!(r.closes(), 0);
+        r.table.close_all("test_end").await;
+    }
+
+    /// L10 — a pump with no encoder asks for its end through the Disconnect
+    /// channel. A kept peer reads so too, so its end in the gap is recorded as
+    /// `no_video`, not as the person's `host_disconnect`.
+    #[tokio::test]
+    async fn a_kept_peer_without_video_reads_as_such() {
+        let mut r = rig(true, Some(60), 2).await;
+        let (blind, seeing) = (r.sessions[0].id, r.sessions[1].id);
+        r.sessions[0].peer.set_no_video();
+        assert!(r.table.no_video(&blind), "attached");
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert!(r.table.no_video(&blind), "kept: the gap's end reads it too");
+        assert!(!r.table.no_video(&seeing));
+        assert!(!r.table.no_video(&ObjectId::new()), "not held");
+        r.table.close_all("test_end").await;
+    }
+
+    /// L11 — a supervised Mac's delegated sessions live in its GUI worker,
+    /// which keeps nothing yet (P2b), and a server's end for a session the
+    /// daemon kept would cross to that worker. Until P2b, a loop that holds
+    /// the delegation host keeps nothing and says no `rc-resume`, whatever
+    /// the switch.
+    #[test]
+    fn a_loop_that_holds_the_delegation_host_keeps_nothing() {
+        assert!(connection_keeps(true, false));
+        assert!(!connection_keeps(true, true), "the host holds it off");
+        assert!(!connection_keeps(false, false));
+        assert!(!connection_keeps(false, true));
+        assert!(
+            signaling_code().contains(
+                "letsurvive=crate::session_table::connection_keeps(\
+                 crate::session_table::survive_enabled(),delegation.host().is_some()"
+            ),
+            "each connection reads its switch through it"
+        );
+    }
+
+    /// The loop asks the table: a server's end closes through it (C1), and
+    /// both device-end paths read `no_video` off it (L10).
+    #[test]
+    fn the_signalling_loop_asks_the_table() {
+        let code = signaling_code();
+        assert!(
+            code.contains("peers.close_terminated(peer,session_id,"),
+            "C1: the server's end closes through the table"
+        );
+        assert!(
+            code.contains("peers.no_video(&sid)") && code.contains("table.no_video(&sid)"),
+            "L10: the loop's device end and the gap's both read the table"
+        );
     }
 }

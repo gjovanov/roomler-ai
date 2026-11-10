@@ -13861,6 +13861,18 @@ impl AgentPeer {
             RTCPeerConnectionState::Connected
         )
     }
+
+    /// P2a-2 (M1) — whether this peer's connection is `Failed` or `Closed`: it
+    /// cannot come back. Its state handler says `Terminate` once, on `Failed`,
+    /// and the watchdog stops watching there, so a peer that died while its
+    /// control socket was dying told only that socket. The table closes such
+    /// a peer instead of keeping it, and never resumes it.
+    pub(crate) fn is_dead(&self) -> bool {
+        matches!(
+            self.pc.connection_state(),
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
+        )
+    }
 }
 
 #[cfg(test)]
