@@ -401,6 +401,21 @@ cascade's guarantees while replacing its reactive counters:
   burst, the first burst after the 60 s quiet, the material add and the Major.
   The add's poke is no later with the gate; on both builds netstate took
   about 2.3 s to publish the add.
+
+  On the release, 2026-11-10: 7 days on 0.4.199 to 0.4.208, every device, read
+  by the census's `--rekeys` mode ([`stall-watch.md`](stall-watch.md) §7.1).
+
+  | Every device, 7 days | Before: 2026-10-27 .. 11-03 | On the release |
+  |---|---:|---:|
+  | Forced pokes | 208,210 | 75,857 |
+  | Worst minute on any device | 150 | 32 |
+  | The three busiest hosts, peak per minute | 150 / 120 / 80 | 26 / 20 / 32 |
+  | Failed revalidations, direct / relay | 1,399 / 786 | 809 / 451 |
+
+  A host whose interfaces chatter around the clock now sweeps its direct peers
+  about once a minute: the chattiest made 7,486 sweeps in 7,482 distinct
+  minutes. A host on two orgs has a gate per org runtime, so it sweeps up to
+  once a minute for each.
 - **Demote-follow (#27) — the other end.** Fast conviction on ONE end is not
   enough, because a transition's outage is `max(both ends)`, not `min`. The end
   whose network did **not** change gets no Major, so it has no fast lane at all

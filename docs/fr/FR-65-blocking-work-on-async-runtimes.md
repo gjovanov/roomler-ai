@@ -1,6 +1,6 @@
 # FR-65 — Blocking work on async runtimes: measure first, then remove
 
-**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **3 of 8 criteria ticked** — AC1, AC2, and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. The census is a fleet-wide server read since 2026-11-03 (#3372). Next: AC7's after-read on or after 2026-11-15, then AC3, AC5 and AC4. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
+**Issue:** [#1255](https://github.com/gjovanov/roomler-ai/issues/1255) · **Status:** **P0 complete in code, its field after-read owed** — the watch (0.4.55, 100 ms bar, #1259), `open_ms`/`other_ms` (#1279), the `work_us` decision + off-thread encoder open (#1284), the verdict as a pure tested type (#1304), and (#3138, 2026-10-30) its bookkeeping as one tested type, `PassWatch`, with the two defects a 14-day census of its own output found fixed — the heartbeat's window reset blinded it to every stall longer than 2 s, and the FR-79 gate lost the heartbeat pass's own stall — six more regions named, and **its own cost measured: 0.035 % of the frame budget on NEO16 (AC1)**. **4 of 8 criteria ticked** — AC1, AC2, AC5 (forced rekeys bounded on the release that carries P3's gate, read 2026-11-10) and AC6 (the caps-probe respawn, measured gone on four hosts) — AC8 (docs) `[~]`. AC4's read (2026-11-10) shows the runtime starved at times, so AC4 waits for attribution and a fix. The census is a fleet-wide server read since 2026-11-03 (#3372). Next: AC7's after-read on or after 2026-11-15, AC4's attribution, then AC3. Manual: [`docs/stall-watch.md`](../stall-watch.md). · **Parent:** the FR-62/63/64 rate-control arc (plan `immutable-doodling-neumann`)
 
 ## Goal
 
@@ -192,6 +192,17 @@ OLD geometry. The viewer must never see a geometry change before its
 
 ### P2 — the per-frame encode call
 
+> **Status 2026-11-10 — read on the release: the runtime is starved at times, and
+> the canary cannot say what starves it.** Seven days on 0.4.199–0.4.208, every device
+> ([#1255](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-6775222002)):
+> 6,383 of 790 million wakes came more than 100 ms late, in 7.7 % of the 10-minute
+> windows, most of them on Windows desktops and laptops; 27 of 47 devices never had
+> one. On three hosts the pump's STALLs sit in late windows far above those hosts'
+> base rate. One timer on the runtime reads a worker held inside the process and a
+> process the OS did not schedule as the same late wake, so the next step is
+> attribution: a reference timer on its own OS thread beside the canary. AC4 stays
+> open until the cause is found, fixed and read again.
+>
 > **Status 2026-11-03 — the canary is built; the question it answers changed.**
 > FR-70 M1 moved capture, scale and encode onto their own OS thread
 > (`media_thread`, on since 0.4.70), so the encode call below no longer runs on
@@ -229,6 +240,16 @@ stall count fell.
 
 ### P3 — overlay guard cadence and rekey storms
 
+> **Status 2026-11-10 — bounded on the release; AC5 met.** Seven days on
+> 0.4.199–0.4.208, every device
+> ([#1255](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-6775222002)):
+> 75,857 forced rekeys against 208,210 the week before, the worst minute on any
+> device 32 against 150, and the three busiest hosts at 26, 20 and 32 a minute,
+> where the replay had predicted 46, 17 and 35. Of the 19 devices that poked, 15
+> match the replay exactly. On the other four the shortfall is the replay's: two of
+> those hosts run a gate per org runtime into one log, and gated sweeps under
+> continuous chatter land on the replay's 60 s boundary (the manual's §7.1).
+>
 > **Status 2026-11-03 — measured; the poke gate is built and A/B-tested on a
 > lab guest; the 7-day read on a release is owed.**
 > Read from production `agent_logs`, 7 days, every device: the guard waves are
@@ -406,7 +427,20 @@ of each is to produce a number.
       share. The read is a 7-day window wholly on the first release that
       carries the canary, beside the STALL census; no released build has its
       lines yet.*
-- [~] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
+      *2026-11-10, read on the release (7 days on 0.4.199–0.4.208, every device,
+      [#1255](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-6775222002)):
+      **starvation is shown, so this stays open.** 7.7 % of the canary's 10-minute
+      windows saw a wake more than 100 ms late (6,383 of 790 million wakes), most of
+      them on Windows desktops and laptops, up to a third of one corporate laptop's
+      windows. 27 of 47 devices never had one, and the median window's p99 is 5 ms or
+      less on every device that logged all week. 731 STALLs were covered by a summary
+      and 139 (19 %) sat in a late window, on three hosts far above their base rate
+      (25 of 27 against 34 %, 38 of 70 against 3 %, 60 of 152 against 12 %). Encode
+      has been off the runtime since FR-70 M1, and one timer cannot tell a worker held
+      inside the process from a process the OS did not schedule. Next: attribution
+      (a reference timer on its own OS thread beside the canary), the fix, then this
+      read again with frame age.*
+- [x] **AC5** — overlay guard waves and forced rekeys/min are measured at idle and
       under a VPN flap, and bounded; no rekey storm.
       **Measured 2026-11-03, not yet bounded** (production `agent_logs`, 7 days,
       every device; P3's status block). At idle the waves stay under their 3 s
@@ -418,6 +452,15 @@ of each is to produce a number.
       convicted inside a minute. The gate's A/B is done (2026-11-03, a Win11
       lab guest: 30 sweeps in the storm on 0.4.197, 4 on the gate; P3's status
       block). Open: the 7-day read on the release that carries it.
+      ✅ **Bounded on the release, 2026-11-10** (7 days on 0.4.199–0.4.208, every
+      device, [#1255](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-6775222002)):
+      75,857 forced rekeys against 208,210 the week before; the worst minute on any
+      device 32 against 150; the three busiest hosts at 26, 20 and 32 a minute, where
+      the replay had predicted 46, 17 and 35. Majors still poke at once (128 Majors,
+      33 Major sweeps), and the guard waves keep their 3 s floor (18,758 in the week).
+      15 of the 19 devices that poked match `gate_replay_keeps` exactly; the other
+      four show the replay's two blind spots, not a gate that let more through (the
+      manual's §7.1).
 - [x] **AC6** — caps-probe spawns at steady state are 0/hour on a measured host.
       ✅ **Measured 2026-10-30, four hosts** (`scripts/fr65-stall-census.sh
       --probes`, #3138): **0 steady-state probe runs** on CORPLAP-1/-2/-3 over
@@ -459,7 +502,7 @@ of each is to produce a number.
       there; P4 needed no fix (AC6). P3's gate is documented beside the
       net-change machinery it changes,
       [`docs/overlay-nat-traversal.md`](../overlay-nat-traversal.md), "The
-      net-change gate". Still owed: P2, P5.*
+      net-change gate". P2's canary is the manual's §10 (#3381). Still owed: P5.*
 
 ## Open decisions
 
@@ -503,6 +546,27 @@ path), FR-63 #1243, FR-64 #1244, #1237 (the sibling route war).
 ## Field-verification log
 
 _(every entry must carry a before/after from the stall watch.)_
+
+- **2026-11-10 — the 7-day reads on the release: AC5 met, AC4 read.** The census's
+  `--rekeys` and `--canary` over 2026-11-03 17:50Z .. 11-10 17:50Z, every device, the
+  latest full week `agent_logs` holds. 0.4.199, the first release with P3's gate and
+  P2's canary, was published at 12:49Z that first day, and the releases after it left
+  both unchanged. Per-device tables:
+  [#1255](https://github.com/gjovanov/roomler-ai/issues/1255#issuecomment-6775222002).
+  - **Uptake.** 73 of the 75 devices that logged in the window logged no older build
+    in it. The other two are lab guests that run old builds on purpose, and builds
+    that are not releases ran only on lab guests. So every number counts released
+    builds, and no device's window crosses an older one.
+  - **The database.** Both reads ran their client outside the pod (#3637), 11 s each:
+    `mongodb-0` restarts 1 → 1 and `oom_kill` 0 → 0 on both, `memory.current` 75.5 →
+    77.0 % and 77.0 → 77.1 % of its limit.
+  - **AC5 (P3).** Before (2026-10-27 .. 11-03, the same read): 208 210 pokes, worst
+    minute 150, the three busiest hosts at 150 / 120 / 80 a minute. After: 75 857, 32,
+    and 26 / 20 / 32. Failed revalidations, direct / relay: 1 399 / 786 → 809 / 451.
+  - **AC4 (P2).** 14 986 ten-minute summaries, 1 159 of them (7.7 %) with a wake more
+    than 100 ms late; 747 STALLs, 731 covered, 139 `runtime_late`. There is no before:
+    no build before 0.4.199 has the canary. Starvation is shown and its cause is not;
+    see the criterion.
 
 - **2026-11-03 — the census reads AC3, AC4 and AC5 too.** `--swaps`, `--canary` and
   `--rekeys` are modes of the same bounded server read (the manual's §7.1), so

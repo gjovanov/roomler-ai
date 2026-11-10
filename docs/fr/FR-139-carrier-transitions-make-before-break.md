@@ -136,7 +136,7 @@ been measured.
 
 Before the follow, a network change on one end left the other end dark. On 2026-08-24 the end whose network
 changed demoted in 2.3 s, its peer took **67 s**, and the pair was dark in both directions for the whole
-gap (`docs/overlay-nat-traversal.md:404-418`). The follow made a `/derp` frame a signal, on this premise:
+gap (`docs/overlay-nat-traversal.md:419-433`). The follow made a `/derp` frame a signal, on this premise:
 "a peer only relays once it has demoted".
 
 **A restart breaks that premise.** The restarted end sends a `/derp` frame without having demoted. Every
