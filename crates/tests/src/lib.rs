@@ -212,6 +212,10 @@ mod invite_tests;
 mod keep_busy_tests;
 #[cfg(test)]
 mod key_rotation_tests;
+/// An org's MagicDNS settings are changed under `MANAGE_AGENTS`, the bit
+/// decided before the body is read, and read by any member.
+#[cfg(test)]
+mod magic_dns_permission_tests;
 /// FR-115 P5 — the meeting-length cap: warned at 55, ended at 60, once.
 #[cfg(test)]
 mod meeting_cap_tests;
@@ -374,6 +378,11 @@ mod transfer_activity_tests;
 /// holder of `MANAGE_AGENTS`.
 #[cfg(test)]
 mod tunnel_enroll_tests;
+/// An org's tunnel policies are read and written under `MANAGE_AGENTS`, the
+/// bit decided before the policy or the body is read; the forward itself is
+/// the policy's to decide.
+#[cfg(test)]
+mod tunnel_policy_permission_tests;
 #[cfg(test)]
 mod tunnel_tests;
 /// FR-115 P4b — coturn's per-allocation totals into `turn_bytes`, for the

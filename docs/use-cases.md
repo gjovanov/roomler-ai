@@ -128,7 +128,7 @@ including how the seeded roles are kept up to date and what a `403` means, is
 | 21 | `MANAGE_MEETINGS` | Start/end conferences |
 | 22 | `MANAGE_DOCUMENTS` | File management |
 | 23 | `ADMINISTRATOR` | Bypasses **every** check — `has()` short-circuits on it, so this grants bits 24–30 too |
-| 24 | `MANAGE_AGENTS` | Enroll/manage devices, tunnel policies, overlay approvals |
+| 24 | `MANAGE_AGENTS` | Enroll/manage devices, tunnel policies, overlay approvals and ACL, MagicDNS settings |
 | 25 | `REMOTE_CONTROL` | Open remote-desktop sessions |
 | 26 | `VIEW_REMOTE_AUDIT` | Read session audit |
 | 27 | `EXEC_DEVICE` | Fleet RPC — deliberately **not** in the default admin set |

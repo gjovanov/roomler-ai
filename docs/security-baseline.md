@@ -258,6 +258,69 @@ all**, so anyone could join any private room in any org and receive its WS
 fan-out. `room::update`/`delete` now require `MANAGE_CHANNELS` (they were
 member-only, so any guest could archive or cascade-delete a channel).
 
+### A tunnel policy is a grant: `MANAGE_AGENTS`, reads included
+
+A tunnel policy names who may reach which `host:port` through which of the org's
+devices, so writing one is granting access. Every `…/tunnel-policy` route needs
+**`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:698`; the
+overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:139`).
+The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
+roles do not.
+
+- **Membership authorizes no grant.** The rule above is about ids; a route that
+  creates a grant has no id to resolve, and `is_member` is still not enough for it.
+  Being someone a policy may name does not make you someone who may write one.
+- **The reads too.** The list is the org's whole tunnel ACL: every subject, every
+  target device, and the internal hosts, ranges and ports behind them. A member
+  learns what they may reach by reaching it; a refused forward says `acl_denied`.
+- **The bit is decided first**, before the policy id is parsed, the body validated or
+  a policy looked up. A member without it gets one 403 `forbidden` whatever the id
+  names (a policy of their org, another org's, nothing) or the body says, so the
+  refusal says nothing about which policies exist. It is never `not_a_member`, the
+  one 403 the web app leaves the org on; someone outside the org is still told
+  `not_a_member`. For a holder, another org's policy or an id that names nothing is
+  a 404.
+- ⚠️ **The forward itself reads no permission bit, and must not.**
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:994`) asks only
+  the policies: default deny, first match. The policy IS the grant. It exists to let
+  people who hold no management bit reach what a holder named them for, so a bit on
+  the forward would either defeat it or repeat it. What keeps the chain sound is who
+  may write the policy, and the exit device's own `forward_acl` stays its last word
+  ([tunnels.md](tunnels.md#policy--two-independent-gates)).
+- **The web app asks the mask first** (`canManageTunnelPolicies`,
+  `ui/src/utils/permissions.ts:375`). The store sends nothing for a caller without
+  the bit, a server 403 lands in the same state, and the Tunnel ACL tab then says who
+  manages policies instead of drawing an editor ([permissions.md](permissions.md) §5).
+
+`crates/tests/src/tunnel_policy_permission_tests.rs` pins each point, the last one
+end to end through a member's own tunnel client.
+
+### The org's MagicDNS: `MANAGE_AGENTS` to change it, any member to read it
+
+The org's MagicDNS domain and upstream resolvers (`…/magic-dns`) are applied by every
+overlay node of the org: its resolver answers for the domain and forwards every other
+name upstream, and under an exit node the host's whole DNS goes there
+([magicdns.md](magicdns.md#who-sets-the-domain-and-the-upstreams)). Changing them
+changes every node's DNS, so **`PUT …/magic-dns` needs `MANAGE_AGENTS`**, like the
+overlay ACL's mode and the retired-key switch (`set_magic_dns`,
+`crates/modules/network/src/routes/overlay_route.rs:552`):
+
+- **Decided first**, before the body is normalized, the plan gate or the domain
+  checks run. A member without the bit gets one 403 `forbidden` whatever the body
+  says, never `not_a_member`; someone outside the org still gets `not_a_member`.
+  Switching MagicDNS off, or setting only the upstreams, is a change like any other.
+- **The read stays any member's**, unlike the tunnel ACL's above, and the difference
+  is the content: every node of the org receives the domain and the resolvers in its
+  netmap anyway, and a member reaches peers by `<node>.<domain>`. The tunnel ACL is a
+  map of everyone's grants that no member needs.
+- **The web app asks the mask first** (`canEditMagicDns`,
+  `ui/src/utils/permissions.ts:392`): a member without the bit sees the
+  current settings read-only with a note, and a save the server refuses turns the page
+  read-only rather than showing an error.
+
+`crates/tests/src/magic_dns_permission_tests.rs` pins each point.
+
 ### A 403 is an answer, not an expired credential (FR-82)
 
 Full treatment in [permissions.md](permissions.md). The two rules that bind new

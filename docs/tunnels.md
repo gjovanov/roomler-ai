@@ -849,8 +849,15 @@ Locked by lib tests, each shown red with a one-line negative control:
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
    as *subject* (user / tunnel client / agent) ×
-   *target* (agent) × *destination* (`host:port`, protocol). Managed in the
-   admin UI; every decision lands in `tunnel_audit` (90 d). A device the org
+   *target* (agent) × *destination* (`host:port`, protocol). Read and written
+   only by holders of `MANAGE_AGENTS` (the org's owner and admins), on the
+   **Network → ACL** page's Tunnel ACL tab, as the overlay ACL is; every route, the
+   list included, refuses a member without it 403 `forbidden`
+   ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
+   The forward itself reads no permission bit: the policy is the grant, made to let
+   people who hold no management bit reach what a holder named them for
+   (`crates/modules/network/src/tunnel.rs:1069`). Every decision lands in
+   `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
    before its row comes back, because it comes back as a new device (#3627). A

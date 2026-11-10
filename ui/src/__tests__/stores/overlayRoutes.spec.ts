@@ -18,6 +18,7 @@ import {
   type OverlayNode,
 } from '@/stores/overlayRoutes'
 import { api } from '@/api/client'
+import { useTenantStore } from '@/stores/tenant'
 
 const mockApi = vi.mocked(api)
 const TENANT_ID = 'ten_1'
@@ -115,5 +116,53 @@ describe('useOverlayRoutesStore', () => {
 
     await expect(store.evictNode(TENANT_ID, 'n1')).rejects.toThrow('forbidden')
     expect(store.nodes.map((n) => n.id)).toEqual(['n1', 'n2'])
+  })
+})
+
+// Changing the org's MagicDNS is MANAGE_AGENTS on the server; reading it is
+// any member's. `mayEditMagicDns` is what the settings page asks first.
+describe('mayEditMagicDns', () => {
+  const MANAGE_AGENTS = 1 << 24
+  const REMOTE_CONTROL = 1 << 25
+
+  /** The caller's mask for TENANT_ID, already known (`ensureMyMembership`
+   *  returns at once); `null` with the tenant set is a failed fetch. */
+  function asCaller(mask: number | null, isOwner = false) {
+    const t = useTenantStore()
+    t.isOwner = isOwner
+    t.myPermissions = mask
+    t.myPermissionsTenantId = TENANT_ID
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it('a holder of MANAGE_AGENTS, and the owner, may change it', async () => {
+    asCaller(MANAGE_AGENTS)
+    expect(await useOverlayRoutesStore().mayEditMagicDns(TENANT_ID)).toBe(true)
+    asCaller(0, true)
+    expect(await useOverlayRoutesStore().mayEditMagicDns(TENANT_ID)).toBe(true)
+  })
+
+  it('a member without it may not, remote control included, and nothing is sent', async () => {
+    asCaller(REMOTE_CONTROL)
+    expect(await useOverlayRoutesStore().mayEditMagicDns(TENANT_ID)).toBe(false)
+    expect(mockApi.get).not.toHaveBeenCalled()
+    expect(mockApi.put).not.toHaveBeenCalled()
+  })
+
+  it('an unknown mask fails open: the server decides on save', async () => {
+    asCaller(null)
+    expect(await useOverlayRoutesStore().mayEditMagicDns(TENANT_ID)).toBe(true)
+  })
+
+  it('reading the settings is not gated: any member fetches them', async () => {
+    asCaller(0)
+    mockApi.get.mockResolvedValue({ magic_dns_domain: 'corp.example', magic_dns_nameservers: [] })
+    const s = await useOverlayRoutesStore().fetchMagicDns(TENANT_ID)
+    expect(mockApi.get).toHaveBeenCalledWith(`/tenant/${TENANT_ID}/magic-dns`)
+    expect(s.magic_dns_domain).toBe('corp.example')
   })
 })

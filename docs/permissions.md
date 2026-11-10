@@ -317,6 +317,27 @@ that rather than show an error. Their predicate, `canReadDeviceDiagnostics`, fai
 renders before `/member/me` lands, and a refusal it lets through costs one
 explained dialog, not a broken page.
 
+The org's tunnel ACL is gated there too. Every `…/tunnel-policy` route is
+`MANAGE_AGENTS`, the reads included, as on the Overlay ACL beside it
+([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
+`fetchPolicies` (`ui/src/stores/tunnelPolicies.ts:152`) sends nothing for a caller
+the mask refuses and sets `refused`, and a server 403 lands in the same state; the
+Tunnel ACL tab then says who manages policies, with no editor and no "New policy".
+Its predicate, `canManageTunnelPolicies` (`ui/src/utils/permissions.ts:375`), fails
+**open** while the mask is unknown, like the diagnostics one: the store awaited the
+membership, so `null` means that fetch failed, and a holder must not lose the page
+over it. The Network pages are drawn for `REMOTE_CONTROL` too (`canSeeFleetNav`),
+which is not the bit, so a `moderator` reaches the tab and reads that explanation.
+
+The MagicDNS page is the other half of that rule. Reading the org's settings is any
+member's (every node receives them), changing them is `MANAGE_AGENTS`
+([security-baseline.md](security-baseline.md#the-orgs-magicdns-manage_agents-to-change-it-any-member-to-read-it)).
+So the gate is on the editor, not the page: `mayEditMagicDns`
+(`ui/src/stores/overlayRoutes.ts`) awaits the membership and asks `canEditMagicDns`
+(`ui/src/utils/permissions.ts:392`, fail-open the same way). A member without the bit
+sees the settings read-only with a note and no Save, and a save the server refuses
+turns the page read-only, never an error.
+
 ⚠️ The client gate is never the enforcement. Every route re-checks server-side;
 the UI only avoids offering what it already knows will be refused.
 
@@ -352,4 +373,4 @@ needs only `MANAGE_AGENTS` — revocation is not a grant.
 | error → wire | `crates/core/src/error.rs` |
 | client contract | `ui/src/api/client.ts` |
 | UI mirror + predicates | `ui/src/utils/permissions.ts` |
-| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts` |
+| tests | `crates/tests/src/role_reconcile_tests.rs`, `crates/tests/src/device_diagnostics_tests.rs`, `crates/tests/src/tunnel_policy_permission_tests.rs`, `crates/tests/src/magic_dns_permission_tests.rs`, `ui/src/__tests__/api/client.spec.ts`, `ui/src/__tests__/stores/agents.spec.ts`, `ui/src/__tests__/stores/tunnelPolicies.spec.ts`, `ui/src/__tests__/stores/overlayRoutes.spec.ts` |

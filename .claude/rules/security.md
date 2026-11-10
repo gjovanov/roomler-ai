@@ -33,6 +33,15 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   existence. ⚠️ A handler keyed by `message_id` must use the **message** guard — the
   two ids are decoupled. ⚠️ Never re-fetch with a bare `find_by_id` after a
   tenant-scoped write.
+- **Membership authorizes no grant.** A route that writes an access grant (a tunnel or
+  overlay ACL policy, a route or exit-node approval), or a setting every node of the
+  org applies (`PUT …/magic-dns`), needs a management bit decided FIRST, before the id
+  is looked up or the body read; a create route has no id to resolve and `is_member`
+  is still not enough. Every `…/tunnel-policy` and `…/overlay-acl` route is
+  `MANAGE_AGENTS`, the reads too: the list is the org's whole ACL. `GET …/magic-dns`
+  stays any member's: every node receives it anyway. ⚠️ The forward reads no bit, and
+  must not: the policy IS the grant, made for people who hold none
+  (security-baseline.md §3).
 - **A removed thing answers nothing** (#3327). `BaseDao::find_by_id_in_tenant`
   answers live rows only, and a soft delete matches a live row only. The
   tombstone-inclusive `find_any_by_id_in_tenant` is a `disallowed-methods` entry in

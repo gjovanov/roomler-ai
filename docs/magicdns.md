@@ -20,6 +20,24 @@ never bound is *worse than nothing*: on Windows the NRPT is registry-global, so
 it blackholes the magic domain **host-wide**. That asymmetry is why the steer is
 gated on the bind, never the reverse.
 
+## Who sets the domain and the upstreams
+
+The org's MagicDNS domain and its upstream resolvers are the org's settings
+(`…/magic-dns`, the web app's **Network → MagicDNS** page), and every overlay node of
+the org applies them: its resolver answers for the domain and forwards every other
+name upstream, and under an exit node the host's whole DNS goes there (`dns.rs:621`).
+
+| Route | Who | Why |
+|---|---|---|
+| `GET …/magic-dns` | any member | every node of the org receives both in its netmap, and a member reaches peers by `<node>.<domain>` |
+| `PUT …/magic-dns` | **`MANAGE_AGENTS`**, decided first | it changes every node's DNS, a device-management action like the overlay ACL's mode and the retired-key switch |
+
+⚠️ The bit is decided before the body is read, so a member without it gets one 403
+`forbidden` whatever the body says (a valid domain, one the route would refuse 400,
+or switching MagicDNS off), never `not_a_member`. The page shows such a member the
+current settings read-only, and a save the server refuses turns it read-only rather
+than showing an error ([security-baseline.md](security-baseline.md#the-orgs-magicdns-manage_agents-to-change-it-any-member-to-read-it)).
+
 ## Bring-up
 
 ```mermaid

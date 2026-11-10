@@ -76,7 +76,7 @@ export const PERMISSION_FLAGS: PermissionFlag[] = [
     label: 'Manage devices',
     group: 'Remote control',
     description:
-      'Enroll, rename, delete, reassign and set policy for remote-control devices, and read their crash reports and uploaded logs.',
+      'Enroll, rename, delete, reassign and set policy for remote-control devices, read their crash reports and uploaded logs, and manage the network ACLs (tunnel and overlay).',
   },
   {
     key: 'REMOTE_CONTROL',
@@ -355,6 +355,41 @@ export function canQueryAnalytics(mask: number | null, isOwner: boolean): boolea
  * refusal, and the dialogs explain a refusal rather than show it as an error.
  */
 export function canReadDeviceDiagnostics(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
+ * May this caller read and write the org's tunnel policies (the Tunnel ACL tab,
+ * `…/tunnel-policy`)? Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass
+ * included) on every route, the reads too, as on the Overlay ACL beside it. A
+ * policy is an access grant, and the list is the org's whole ACL: who may reach
+ * which device, and which hosts and ports behind it.
+ *
+ * Deliberately FAIL-OPEN on `mask === null`, like
+ * {@link canReadDeviceDiagnostics}: the store awaits the membership first, so
+ * `null` means that fetch failed, and a holder must not lose the page over it.
+ * The server then decides, and its 403 lands in the same refused state.
+ */
+export function canManageTunnelPolicies(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
+ * May this caller CHANGE the org's MagicDNS domain and upstream resolvers
+ * (`PUT …/magic-dns`)? Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass
+ * included): every overlay node of the org applies them, its whole DNS under an
+ * exit node. Reading them stays any member's (`GET …/magic-dns`), so this gates
+ * the editor, not the page.
+ *
+ * FAIL-OPEN on `mask === null`, like {@link canManageTunnelPolicies}: the page
+ * awaited the membership, so `null` means that fetch failed; the server then
+ * decides, and its 403 turns the editor read-only rather than erroring.
+ */
+export function canEditMagicDns(mask: number | null, isOwner: boolean): boolean {
   if (isOwner) return true
   if (mask === null) return true
   return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
