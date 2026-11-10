@@ -444,19 +444,24 @@ mod tests {
 
     /// A viewer's socket loss keeps the live session its viewer may hold (no
     /// controller, the device told nothing) and ends, as before, one that is
-    /// not live yet. The viewer is told `resume_secs` at the creation.
+    /// not live yet. The viewer is told `resume_secs` at the creation. The
+    /// pending one is on a second device: a second request on the same
+    /// socket to the same device is #1045's duplicate, coalesced.
     #[tokio::test]
     async fn a_viewers_socket_loss_holds_a_live_session_and_ends_the_rest() {
         let hub = hub().await;
-        let (agent, user) = (ObjectId::new(), ObjectId::new());
+        let (agent, other_agent, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
         let mut to_agent = device(&hub, agent, 4, Some(60));
+        let mut to_other = device(&hub, other_agent, 4, Some(60));
         let (tx, mut rx) = hub.register_controller(user);
         let held = ask(&hub, agent, user, &tx).unwrap();
         live(&hub, held).await;
-        let pending = ask(&hub, agent, user, &tx).unwrap();
+        let pending = ask(&hub, other_agent, user, &tx).unwrap();
+        assert_ne!(pending, held);
         let told = drain(&mut rx);
         assert_eq!(created_resume_secs(&told, held), Some(Some(60)), "{told:?}");
         drain(&mut to_agent);
+        drain(&mut to_other);
 
         hub.unregister_controller(user, &tx);
 
@@ -469,7 +474,7 @@ mod tests {
         let to_agent = drain(&mut to_agent);
         assert_eq!(terminated(&to_agent, held), None, "{to_agent:?}");
         assert_eq!(
-            terminated(&to_agent, pending),
+            terminated(&drain(&mut to_other), pending),
             Some(EndReason::ControllerHangup)
         );
     }
