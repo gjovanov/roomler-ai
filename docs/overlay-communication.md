@@ -131,9 +131,9 @@ plan doc is retired):
   front accepts genuine ATYP=IPv6 targets when they are derived-ULA (v4-mapped
   unwraps; any other v6 is host-unreachable by design).
 
-**Removal releases the lease.** All three removal paths — `DELETE …/agent/{id}`,
-`DELETE …/overlay-node/{id}` (admin evict), `DELETE …/tunnel-client/{id}` — go
-through one writer, and the order is load-bearing:
+**Removal releases the lease.** Every removal path (`DELETE …/agent/{id}`, `DELETE …/overlay-node/{id}`
+(admin evict), `DELETE …/tunnel-client/{id}`, an archived org, a tunnel client whose owner left the
+org) goes through one writer, and the order is load-bearing:
 
 1. read the peer list while the node is still live;
 2. **compare-and-swap** the node's `deleted_at` (winning that CAS is the release
