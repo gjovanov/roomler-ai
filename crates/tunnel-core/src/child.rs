@@ -239,6 +239,31 @@ pub fn inherit_only_stdio_async(cmd: &mut tokio::process::Command) -> &mut tokio
     }
 }
 
+/// Mark `fd` close-on-exec, keeping its other descriptor flags, so no program
+/// this process execs from now on inherits it.
+///
+/// For a descriptor that something else created without the flag (a library
+/// call that takes no `O_CLOEXEC`), called on the line after the creation.
+/// It is not atomic: a child forked on another thread in between still gets
+/// a copy, which is why the children that matter also sweep
+/// ([`inherit_only_stdio`]). Where the flag can be asked for at creation,
+/// ask for it there instead.
+pub fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: `F_GETFD` on a caller's number; one that is not open answers
+    // EBADF, which is returned.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::FD_CLOEXEC == 0 {
+        // SAFETY: `fd` is open: `F_GETFD` just answered for it.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// The sweep's upper bound, read in the parent: the soft `RLIMIT_NOFILE`,
 /// kept within [`SWEEP_FLOOR`]..=[`SWEEP_CAP`].
 fn sweep_ceiling() -> libc::c_int {
@@ -467,6 +492,46 @@ mod tests {
         inherit_only_stdio_async(&mut cmd);
         let out = cmd.output().await.expect("ran");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "closed");
+    }
+
+    /// Whether a program this process execs, with no sweep, still has `fd`
+    /// open. Asked through `/dev/fd`, which names the asking process's own
+    /// descriptors on Linux and macOS alike, and works for any number (a
+    /// shell's `>&N` takes a single digit only in some shells).
+    fn open_in_a_plain_child(fd: RawFd) -> String {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!(
+            "if [ -e /dev/fd/{fd} ]; then echo open; else echo closed; fi"
+        ));
+        let out = output_bounded(&mut cmd, Duration::from_secs(10)).expect("ran");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// `/dev/null`, opened WITHOUT close-on-exec, as a library that does not
+    /// ask for the flag leaves a descriptor.
+    fn inheritable_dev_null() -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a NUL-terminated path; the result is checked before use.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "open /dev/null: {}", io::Error::last_os_error());
+        // SAFETY: `fd` was just returned by open and is owned by nothing else.
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn set_cloexec_keeps_a_descriptor_from_every_program_started_after_it() {
+        let fd = inheritable_dev_null();
+        let n = fd.as_raw_fd();
+        // The control: without the flag, a plain child keeps it.
+        assert_eq!(open_in_a_plain_child(n), "open");
+
+        set_cloexec(n).expect("set_cloexec");
+        // SAFETY: `n` is open: `fd` owns it.
+        let flags = unsafe { libc::fcntl(n, libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "flags {flags:#x}");
+        assert_eq!(open_in_a_plain_child(n), "closed");
+        // Idempotent.
+        set_cloexec(n).expect("a second set_cloexec");
     }
 
     #[test]

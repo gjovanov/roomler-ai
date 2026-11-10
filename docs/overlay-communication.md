@@ -1093,6 +1093,22 @@ rebuild WARN now says so (`overlay: relay carrier's WireGuard handshake expired
 (`crates/tunnel-core/src/overlay/runtime/establish.rs:634`, `:750`, and the
 direct carrier's line at `:713`).
 
+### Only the daemon holds the TUN device
+
+The OS TUN's descriptor is close-on-exec, so no program the daemon starts
+holds the device, and a device that is not persistent goes away with the
+daemon that made it. The next daemon's bring-up finds the name free even while
+an installer the old daemon started is still running.
+
+| Platform | How | Window in which a fork on another thread gets a copy |
+|---|---|---|
+| Linux | the daemon opens `/dev/net/tun` itself, close-on-exec in the `open`, attaches it with `TUNSETIFF`, and hands the descriptor to the `tun` crate, then applies the address, netmask, MTU and up as tun's own create would (`create_device`, `crates/tunnel-core/src/overlay/tun.rs:2670`) | none |
+| macOS | a utun is a socket, and macOS takes no close-on-exec flag at `socket()`, so the descriptor is marked on the line after the create | create → mark. The long-lived children and every child that runs a caller's code sweep everything above stderr ([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)) |
+| Windows | Wintun has no descriptor to inherit | — |
+
+`tun_kernel_tests` (`agents/roomlerd/src/overlay.rs:1394`) checks it against a
+real kernel in CI, as root.
+
 ---
 
 ## 9. Configuration reference

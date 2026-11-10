@@ -2653,6 +2653,121 @@ mod system {
         escalated: std::sync::Mutex<std::collections::HashSet<Ipv4Addr>>,
     }
 
+    /// Create the OS device `config` describes, named `name` where the OS
+    /// lets the caller name it.
+    ///
+    /// The device's descriptor is close-on-exec, so a program the daemon
+    /// starts does not hold the device:
+    /// - **Linux, from the `open` on.** The `tun` crate opens `/dev/net/tun`
+    ///   without the flag, so the open and `TUNSETIFF` happen here and tun
+    ///   gets the descriptor (`raw_fd`). Given a descriptor, tun neither
+    ///   attaches nor configures, so the address, netmask, MTU and up are
+    ///   applied here too, as tun's own create applies them.
+    /// - **macOS, on the next line.** A utun is a socket, and macOS takes no
+    ///   close-on-exec flag at `socket()`. A child forked on another thread
+    ///   in between gets a copy; the long-lived children sweep
+    ///   ([`crate::child::inherit_only_stdio`]).
+    fn create_device(
+        config: &tun::Configuration,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] name: &str,
+    ) -> std::io::Result<tun::AsyncDevice> {
+        let tun_err = |e: tun::Error| std::io::Error::other(e.to_string());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::IntoRawFd;
+            let node = open_tun_node()?;
+            let name = tun_set_iff(&node, name)?;
+            let mut config = config.clone();
+            config.tun_name(&name).raw_fd(node.into_raw_fd());
+            // tun owns the descriptor from here (`close_fd_on_drop` defaults
+            // to true), so every failure below closes it, and the device goes.
+            let mut dev = tun::create_as_async(&config).map_err(tun_err)?;
+            tun::AbstractDevice::configure(&mut *dev, &config).map_err(tun_err)?;
+            Ok(dev)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let dev = tun::create_as_async(config).map_err(tun_err)?;
+            crate::child::set_cloexec(dev.as_raw_fd())?;
+            Ok(dev)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            tun::create_as_async(config).map_err(tun_err)
+        }
+    }
+
+    /// Linux: the TUN clone device, opened read-write. std opens every file
+    /// close-on-exec, in the `open` itself.
+    #[cfg(target_os = "linux")]
+    fn open_tun_node() -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+    }
+
+    /// Linux: attach `node` to the layer-3 TUN `name` (`TUNSETIFF`, no packet
+    /// information, one queue: what tun's own create asks for), and answer
+    /// the name the kernel gave it.
+    #[cfg(target_os = "linux")]
+    fn tun_set_iff(node: &std::fs::File, name: &str) -> std::io::Result<String> {
+        use std::os::fd::AsRawFd;
+        let bytes = name.as_bytes();
+        if bytes.len() >= libc::IFNAMSIZ || bytes.contains(&0) {
+            return Err(std::io::Error::other(format!(
+                "TUN name {name:?} must be under {} bytes, with no NUL",
+                libc::IFNAMSIZ
+            )));
+        }
+        // SAFETY: an all-zero `ifreq` is a valid value of a plain C struct.
+        let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (dst, src) in req.ifr_name.iter_mut().zip(bytes) {
+            *dst = libc::c_char::from_ne_bytes([*src]);
+        }
+        req.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        // SAFETY: `node` is an open TUN clone device; `req` is a valid
+        // `ifreq` that the kernel reads and writes back.
+        if unsafe { libc::ioctl(node.as_raw_fd(), libc::TUNSETIFF, &mut req) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the kernel answers a NUL-terminated name within IFNAMSIZ.
+        let given = unsafe { std::ffi::CStr::from_ptr(req.ifr_name.as_ptr()) };
+        Ok(given.to_string_lossy().into_owned())
+    }
+
+    /// The descriptor half of the Linux TUN, which needs no privilege: the
+    /// clone device opens close-on-exec. Creating a device (`TUNSETIFF`)
+    /// needs `CAP_NET_ADMIN`; that half runs in roomlerd's `tun_kernel_tests`.
+    #[cfg(all(test, target_os = "linux"))]
+    mod tun_node_tests {
+        use std::os::fd::AsRawFd;
+
+        #[test]
+        fn the_tun_clone_device_opens_close_on_exec() {
+            let node = match super::open_tun_node() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "SKIPPED overlay::tun::system::tun_node_tests::\
+                         the_tun_clone_device_opens_close_on_exec: /dev/net/tun cannot be \
+                         opened here ({e})"
+                    );
+                    return;
+                }
+            };
+            // SAFETY: F_GETFD on a descriptor `node` owns.
+            let flags = unsafe { libc::fcntl(node.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD: {}", std::io::Error::last_os_error());
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "the TUN descriptor must be close-on-exec from its open on (flags {flags:#x})"
+            );
+        }
+    }
+
     /// rc.209 — bounded retry-with-backoff around a fallible create. Returns the
     /// first `Ok`; otherwise the LAST `Err` after `attempts` tries. Sleeps
     /// `backoff` between attempts (never after the final one), and calls
@@ -3874,6 +3989,14 @@ mod system {
             &self.if_name
         }
 
+        /// The device's descriptor, for the tests that ask what a child can
+        /// inherit.
+        #[cfg(all(test, target_os = "macos"))]
+        pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+            use std::os::fd::AsRawFd;
+            self.dev.as_raw_fd()
+        }
+
         /// Multi-org v2 — the derived-ULA on-link prefix length this device
         /// was brought up with (96 for the legacy single-adapter identity;
         /// 96 + the org block's v4 plen for a per-org adapter).
@@ -4105,7 +4228,7 @@ mod system {
             let dev = retry_create(
                 CREATE_ATTEMPTS,
                 std::time::Duration::from_millis(400),
-                || tun::create_as_async(&config).map_err(|e| std::io::Error::other(e.to_string())),
+                || create_device(&config, &opts.name),
                 |attempt, e| {
                     tracing::warn!(
                         attempt,
@@ -6984,6 +7107,35 @@ mod macos_kernel_tests {
         haystack
             .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == ':'))
             .any(|t| t == needle)
+    }
+
+    /// The utun's descriptor is close-on-exec, so a program started after the
+    /// bring-up, with no sweep of its own, does not hold it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_utun_reaches_no_child() {
+        if std::env::var("ROOMLER_TUN_KERNEL_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping: set ROOMLER_TUN_KERNEL_TEST=1 (needs root)");
+            return;
+        }
+        let tun =
+            SystemTun::up(Ipv4Addr::new(100, 65, 0, 9), MASK_22, 1280).expect("utun bring-up");
+        let fd = tun.raw_fd();
+        // SAFETY: F_GETFD on the descriptor `tun` owns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+            "utun fd {fd} is not close-on-exec (flags {flags:#x})"
+        );
+        let probe = sh(
+            "/bin/sh",
+            &[
+                "-c",
+                &format!("if [ -e /dev/fd/{fd} ]; then echo open; else echo closed; fi"),
+            ],
+        );
+        assert_eq!(probe.trim(), "closed", "a plain child holds utun fd {fd}");
+        drop(tun);
     }
 
     #[tokio::test]

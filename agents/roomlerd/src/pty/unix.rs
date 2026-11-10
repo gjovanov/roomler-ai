@@ -1,16 +1,24 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! The Unix half of [`crate::pty`] — `openpty`, a login shell, and two pumps.
+//! The Unix half of [`crate::pty`] — a pty pair, a login shell, and two pumps.
 //!
-//! # Why `openpty` and not `posix_openpt`
+//! # A session's descriptors stay with the session
 //!
-//! The `posix_openpt` + `grantpt` + `unlockpt` + `ptsname_r` sequence needs a
-//! platform split: `ptsname_r` does not exist on macOS. `openpty` is one call,
-//! is declared for both Linux and Apple in `libc`, and on glibc ≥ 2.34 lives in
-//! `libc.so.6` itself so no `-lutil` link flag is needed (our Linux targets are
-//! ubuntu-22.04 / glibc 2.35 and newer). Fewer moving parts across a platform
-//! boundary that CI compiles only at release-tag time — and one of the two
-//! remaining `libc` calls here still managed to differ (see `open_pty`).
+//! Both ends of the pty are close-on-exec, so no program the daemon starts
+//! holds them, and the shell keeps its terminal on 0-2 and nothing else.
+//!
+//! - **Linux** asks for the flag in the calls that create the ends:
+//!   `posix_openpt(O_CLOEXEC)`, then the slave through `TIOCGPTPEER`, or by
+//!   its `ptsname_r` path where the kernel predates 4.13 (glibc's own
+//!   `openpty` order). No other thread can fork in between.
+//! - **macOS** has no `ptsname_r`, and its `ptsname` answers in a static
+//!   buffer that two sessions opening at once would share. So it keeps
+//!   `openpty`, one call declared for both platforms, and marks both ends on
+//!   the next line. A child forked on another thread in between gets copies
+//!   of them, unless it sweeps.
+//! - The shell sweeps ([`tunnel_core::child::inherit_only_stdio_async`]), as
+//!   every child that runs a caller's code does, so it holds nothing above
+//!   stderr whatever the parent's other threads were doing.
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -38,7 +46,51 @@ pub struct PtyProcess {
     pgid: libc::pid_t,
 }
 
-/// Open a pty pair. Returns `(master, slave)` as owned fds.
+/// Open a pty pair. Returns `(master, slave)` as owned fds, both
+/// close-on-exec in the calls that create them.
+#[cfg(target_os = "linux")]
+fn open_pty(size: WinSize) -> io::Result<(OwnedFd, OwnedFd)> {
+    let size = size.sane();
+    let ws = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: opens a new pty master; the result is checked before use.
+    let fd = unsafe { libc::posix_openpt(flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by posix_openpt and is owned by nothing else.
+    let master = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: both take the live master and touch nothing else.
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0
+        || unsafe { libc::unlockpt(master.as_raw_fd()) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // The slave through the master itself (Linux 4.13 and later), with the
+    // same flags; by its path where the kernel has no `TIOCGPTPEER`, which is
+    // glibc's own `openpty` order.
+    // SAFETY: an ioctl on the live master; the result is checked before use.
+    let fd = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCGPTPEER, flags) };
+    let slave = if fd >= 0 {
+        // SAFETY: `fd` was just returned by the ioctl and is owned by nothing else.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    } else {
+        open_slave_by_path(&master)?
+    };
+    // The geometry, as `openpty` sets it, and like it, best-effort.
+    // SAFETY: `ws` is a valid winsize the kernel only reads.
+    unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+    Ok((master, slave))
+}
+
+/// Open a pty pair. Returns `(master, slave)` as owned fds, both marked
+/// close-on-exec on the line after `openpty`.
+#[cfg(not(target_os = "linux"))]
 fn open_pty(size: WinSize) -> io::Result<(OwnedFd, OwnedFd)> {
     let size = size.sane();
     // ⚠️ `mut`, and `*mut` pointers below, because the two platforms declare
@@ -79,7 +131,34 @@ fn open_pty(size: WinSize) -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: openpty succeeded, so both are fresh fds this process owns.
-    Ok(unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) })
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    tunnel_core::child::set_cloexec(master.as_raw_fd())?;
+    tunnel_core::child::set_cloexec(slave.as_raw_fd())?;
+    Ok((master, slave))
+}
+
+/// Linux: open `master`'s slave by its path, close-on-exec.
+#[cfg(target_os = "linux")]
+fn open_slave_by_path(master: &OwnedFd) -> io::Result<OwnedFd> {
+    let mut path: [libc::c_char; 64] = [0; 64];
+    // SAFETY: `path` is valid for `path.len()` bytes; `ptsname_r` writes a
+    // NUL-terminated name into it or answers an error number.
+    let rc = unsafe { libc::ptsname_r(master.as_raw_fd(), path.as_mut_ptr(), path.len()) };
+    if rc != 0 {
+        return Err(io::Error::from_raw_os_error(rc));
+    }
+    // SAFETY: `path` holds a NUL-terminated name.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by open and is owned by nothing else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Which shell to run when the client asked for a login shell.
@@ -185,6 +264,12 @@ impl PtyProcess {
 
         // FR-97 P5b — a person's shell starts in their home, as sshd's does.
         crate::exec::apply_run_as_at_home(&mut cmd, run_as)?;
+
+        // The shell keeps its terminal on 0-2 and nothing else: in the child,
+        // after every step above, each descriptor above stderr is marked
+        // close-on-exec. It marks and never closes, so it cannot undo the
+        // drop, and std's exec-error pipe still works.
+        tunnel_core::child::inherit_only_stdio_async(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -519,5 +604,157 @@ mod tests {
             err.contains("console_user"),
             "the refusal must name the mode, got {err:?}"
         );
+    }
+
+    /// What a session's descriptors reach. The daemon's own ends of a pty are
+    /// close-on-exec, so no program it starts holds a session's terminal, and
+    /// a session's shell keeps its terminal on 0-2 and nothing else.
+    mod descriptors {
+        use super::*;
+        use crate::exec::RunAs;
+
+        fn cloexec(fd: RawFd) -> bool {
+            // SAFETY: F_GETFD on a number; one that is not open answers -1.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0
+        }
+
+        /// `/dev/null`, opened WITHOUT close-on-exec: a descriptor some other
+        /// part of the daemon left inheritable.
+        fn inheritable_dev_null() -> OwnedFd {
+            // SAFETY: a NUL-terminated path; the result is checked before use.
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0, "open /dev/null: {}", io::Error::last_os_error());
+            // SAFETY: `fd` was just returned by open and is owned by nothing else.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+
+        const SIZE: WinSize = WinSize { cols: 80, rows: 24 };
+
+        /// Run `script` as a session's command; what its terminal printed.
+        async fn session_output(script: &str) -> String {
+            let mut pty = PtyProcess::spawn(Some(script), "xterm", SIZE, &RunAs::Daemon)
+                .expect("a pty session");
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                match pty.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = pty.wait().await;
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        #[test]
+        fn both_ends_of_a_new_pty_are_close_on_exec() {
+            let (master, slave) = open_pty(SIZE).expect("a pty pair");
+            assert!(cloexec(master.as_raw_fd()), "the master");
+            assert!(cloexec(slave.as_raw_fd()), "the slave");
+        }
+
+        /// A descriptor the daemon holds without close-on-exec does not reach
+        /// a session's shell: the shell sweeps everything above stderr.
+        #[tokio::test]
+        async fn a_session_s_shell_does_not_inherit_a_stray_descriptor() {
+            let stray = inheritable_dev_null();
+            let n = stray.as_raw_fd();
+            let out = session_output(&format!(
+                "if [ -e /dev/fd/{n} ]; then echo FD-OPEN; else echo FD-CLOSED; fi"
+            ))
+            .await;
+            drop(stray);
+            assert!(
+                out.contains("FD-CLOSED") && !out.contains("FD-OPEN"),
+                "the shell must not hold fd {n}: {out:?}"
+            );
+        }
+
+        /// `(fd, target)` for every descriptor `pid` holds.
+        #[cfg(target_os = "linux")]
+        fn fd_targets(pid: u32) -> Vec<(i32, String)> {
+            let dir = format!("/proc/{pid}/fd");
+            let mut held = Vec::new();
+            for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir}: {e}")) {
+                let entry = entry.expect("a /proc fd entry");
+                let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    held.push((fd, target.to_string_lossy().into_owned()));
+                }
+            }
+            held
+        }
+
+        /// A pty master, under either devpts layout.
+        #[cfg(target_os = "linux")]
+        fn is_master(target: &str) -> bool {
+            target == "/dev/ptmx" || target == "/dev/pts/ptmx"
+        }
+
+        /// While a session is open, a program the daemon starts with no sweep
+        /// of its own holds neither end of that session's terminal.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_plain_child_started_during_a_session_holds_no_pty() {
+            let mut session = PtyProcess::spawn(Some("sleep 30"), "xterm", SIZE, &RunAs::Daemon)
+                .expect("a pty session");
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("a plain child");
+            let held = fd_targets(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            session.kill_group();
+            let _ = session.wait().await;
+            let ptys: Vec<_> = held
+                .iter()
+                .filter(|(_, t)| is_master(t) || t.starts_with("/dev/pts/"))
+                .collect();
+            assert!(ptys.is_empty(), "the plain child holds {ptys:?}");
+        }
+
+        /// A second session's shell holds its own terminal on 0-2 and nothing
+        /// else: no master, of its own or of the session already open.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn a_second_session_holds_nothing_of_the_first() {
+            let mut first = PtyProcess::spawn(Some("sleep 30"), "xterm", SIZE, &RunAs::Daemon)
+                .expect("the first session");
+            let listing = session_output("ls -l /proc/self/fd").await;
+            first.kill_group();
+            let _ = first.wait().await;
+            let mut seen = 0;
+            for line in listing.lines() {
+                let Some((lhs, target)) = line.trim_end().split_once(" -> ") else {
+                    continue;
+                };
+                let fd: i32 = lhs
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("no fd number in {line:?}"));
+                seen += 1;
+                assert!(!is_master(target), "fd {fd} is a pty master:\n{listing}");
+                if target.starts_with("/dev/pts/") {
+                    assert!((0..=2).contains(&fd), "fd {fd} is a terminal:\n{listing}");
+                }
+            }
+            assert!(seen >= 3, "no listing came back:\n{listing}");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn the_slave_opened_by_its_path_is_close_on_exec() {
+            let (master, _slave) = open_pty(SIZE).expect("a pty pair");
+            let slave = open_slave_by_path(&master).expect("the slave, by its path");
+            assert!(cloexec(slave.as_raw_fd()));
+        }
     }
 }

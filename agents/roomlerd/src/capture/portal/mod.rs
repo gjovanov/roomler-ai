@@ -1377,6 +1377,8 @@ pub mod helper {
                 )));
             }
         }
+        // It keeps its stdio and nothing else of the daemon's.
+        tunnel_core::child::inherit_only_stdio(&mut cmd);
         cmd.spawn()
             .map_err(|e| SpawnError::Other(format!("spawning the portal helper: {e}")))
     }

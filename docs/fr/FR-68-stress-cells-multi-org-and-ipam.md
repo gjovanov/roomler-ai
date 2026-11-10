@@ -75,7 +75,7 @@ nothing on prod cluster nodes.
 ### Why each cell lands on the lane it does
 
 - **Multi-org ⇒ win11.** `defend_self_route` is **Windows-only**
-  (`crates/tunnel-core/src/overlay/tun.rs:2663-2719`; no-op default at `tun.rs:95`). An
+  (`crates/tunnel-core/src/overlay/tun.rs:2778-2834`; no-op default at `tun.rs:95`). An
   Ubuntu cell would pass vacuously.
 - **IPAM ⇒ ubuntu.** The pre-P5d degradation is in NAT *scope* — which CIDRs get a
   MASQUERADE rule (`crates/tunnel-core/src/overlay/nat.rs:119-133`) — which is

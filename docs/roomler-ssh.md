@@ -367,10 +367,28 @@ operator-consent gate, and process-group teardown.
 
 Mechanics worth knowing:
 
-- **`openpty`, not `posix_openpt`.** The latter needs `ptsname_r`, which does
-  not exist on macOS. `openpty` is one call, declared for both platforms, and on
-  glibc ≥ 2.34 needs no `-lutil`. Fewer moving parts across a boundary CI never
-  compiles — macOS builds only at release-tag time.
+- **A session's descriptors stay with the session.** Both ends of the pty are
+  close-on-exec, so no other program the daemon starts holds either end, and
+  the shell keeps its terminal on 0-2 and nothing else
+  (`agents/roomlerd/src/pty/unix.rs:52`, `:94`):
+
+  | Platform | How the ends are opened | Window in which a fork on another thread gets a copy |
+  |---|---|---|
+  | Linux | `posix_openpt(O_CLOEXEC)`, then the slave through `TIOCGPTPEER` with the same flags, or by its `ptsname_r` path with `O_CLOEXEC` on a kernel older than 4.13 (glibc's own `openpty` order) | none |
+  | macOS | `openpty`, then both ends marked on the next line (`tunnel_core::child::set_cloexec`). macOS has no `ptsname_r`, and its `ptsname` answers in one static buffer that two sessions opening at once would share | `openpty` → the mark, covered by the sweep below |
+
+  The macOS lane compiles this code on every PR that changes code
+  (`cargo check -p roomlerd --lib --features ssh-server`). Its tests do not
+  run on a Mac in CI: the Mac test build carries no `ssh-server`.
+- **The shell sweeps.** In the child, after the privilege drop, every
+  descriptor above stderr is marked close-on-exec
+  (`tunnel_core::child::inherit_only_stdio_async`,
+  `crates/tunnel-core/src/child.rs:231`; registered at
+  `agents/roomlerd/src/pty/unix.rs:272`). It marks and never closes, so it
+  cannot undo the drop. A one-shot command and a Fleet RPC command
+  (`agents/roomlerd/src/exec.rs:1816`) and `sftp-server`
+  (`agents/roomlerd/src/ssh.rs:1250`) sweep the same way. The overlay's TUN
+  device is close-on-exec too ([overlay-communication.md](overlay-communication.md)).
 - **The parent must close the slave** after spawning, or reads on the master
   never see EOF and a session whose shell exited would hang forever.
 - **Linux reports `EIO`, not EOF**, on a master whose slave has been closed.
@@ -411,6 +429,14 @@ Three things cost real debugging time and are commented where they live:
   whoever inherits a write end keeps its owner's reader from ever seeing EOF.
   A second `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` attribute names exactly the two
   handles. Take both or neither.
+- **The ends the daemon keeps are never inheritable.** Both pipes are created
+  non-inheritable, so the input's write end and the output's read end, which
+  the daemon holds for the whole session, reach no child of any spawn.
+  The console's two ends are made inheritable only for the handle list, just
+  before `CreateProcess*`, and are closed right after it. A process that
+  another thread starts with unbounded inheritance inside that window gets
+  those two, never the daemon's ends. `CreatePseudoConsole` itself needs no
+  inheritable handle: it duplicates the two it is given.
 - ⚠️ **The HPCON is passed BY VALUE**, not as a pointer. Get it wrong and
   `CreateProcess` *succeeds*, then the child dies instantly with `0xC0000142`
   (`STATUS_DLL_INIT_FAILED`) because its console never initialised — visible
@@ -1028,7 +1054,7 @@ Now the window is the TTL from **arrival**, on the device's monotonic clock:
 
 | side | where | what it does |
 |---|---|---|
-| the device | `record_grant` ([`ssh.rs:3004`](../agents/roomlerd/src/ssh.rs#L3004)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3036-3045`), so a skewed clock stays visible |
+| the device | `record_grant` ([`ssh.rs:3008`](../agents/roomlerd/src/ssh.rs#L3008)) | holds the grant `GRANT_TTL_SECS` (60 s) from the moment it arrives, whatever the timestamp says. It logs the timestamp's reading by its own clock as `server_expiry_in_ms` on `ssh: grant recorded`, and warns when that is already past (`:3040-3049`), so a skewed clock stays visible |
 | the server | `decide` ([`agent_ssh.rs:435`](../crates/modules/network/src/routes/agent_ssh.rs#L435)) | tells the TARGET `expires_at_ms` = mint + 60 s + `DEVICE_EXPIRY_SLACK_SECS` (10 min, [`models.rs:2575`](../crates/remote_control/src/models.rs#L2575)), on `rc:ssh.grant` (`agent_ssh.rs:455`) and in the FR-105 `ssh_pending` row the service claims (`:481`). The caller's copy stays mint + 60 s |
 
 The slack is for agents released before #3511, which still take
@@ -1061,7 +1087,7 @@ server's. These bounds hold whatever the device's clock says:
    `agents/roomlerd/src/signaling.rs:65`, checked at `:2381`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
-   (`agents/roomlerd/src/ssh.rs:2951`), and no window longer than 60 s from
+   (`agents/roomlerd/src/ssh.rs:2955`), and no window longer than 60 s from
    arrival.
 
 One case is left: a caller of the HTTP route who keeps a reusable key after a
@@ -1122,7 +1148,7 @@ global, `consent::set_shared`, whose absence the server had to treat as a
 denial; "no broker ⇒ deny" is now unrepresentable rather than documented.)
 
 ⚠️ **Armed before it is shown (#3442).** The device registers the question with
-the broker first (`ask_here`, [`ssh.rs:2382`](../agents/roomlerd/src/ssh.rs#L2382)), then puts it up: the native panel, the
+the broker first (`ask_here`, [`ssh.rs:2386`](../agents/roomlerd/src/ssh.rs#L2386)), then puts it up: the native panel, the
 `.pending` marker the companion and `roomlerd consent --list` read, a companion
 it may have to start (up to 3 s), a notification. An answer counts from the
 moment anything shows the question. Until #3442 the question was armed last,
@@ -1134,7 +1160,7 @@ first the same way ([`signaling.rs:4278`](../agents/roomlerd/src/signaling.rs#L4
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
-[`ssh.rs:2248`](../agents/roomlerd/src/ssh.rs#L2248)).** Channels of one session can ask at once: a command waits in a
+[`ssh.rs:2252`](../agents/roomlerd/src/ssh.rs#L2252)).** Channels of one session can ask at once: a command waits in a
 task of its own, so a second channel can ask while the first waits. A channel
 that asks what a question already standing for its grant asks (the same
 activity: "run a command", "open an interactive shell", "transfer files over
@@ -1143,7 +1169,7 @@ it. A different activity is a different question: the question names the
 activity (FR-27), so an Allow given for a command never opens a shell. Each
 question is filed under a fresh object id, never the grant's, and the daemon
 logs the two side by side. A channel that joins a standing question logs that
-question's id ([`ssh.rs:2266`](../agents/roomlerd/src/ssh.rs#L2266)), and the answer's line carries the grant ([`:2460`](../agents/roomlerd/src/ssh.rs#L2460)), so a
+question's id ([`ssh.rs:2270`](../agents/roomlerd/src/ssh.rs#L2270)), and the answer's line carries the grant ([`:2464`](../agents/roomlerd/src/ssh.rs#L2464)), so a
 joiner is matched to the answer it took by id, not by timing.
 
 **One Allow settles every channel of the grant that asks about the same

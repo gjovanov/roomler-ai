@@ -810,21 +810,26 @@ fn spawn_xorg(xorg: &Path, dpy: &str, w: u32, h: u32) -> Result<Child> {
 
 /// Place a child at the head of a NEW process group (`setpgid(0, 0)` before
 /// exec). Linux-only; a no-op elsewhere (the desktop is never started there).
+/// Like every child of the desktop, it keeps its stdio and nothing else of
+/// the daemon's.
 #[cfg(target_os = "linux")]
 fn lead_new_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     cmd.process_group(0);
+    tunnel_core::child::inherit_only_stdio(cmd);
 }
 #[cfg(not(target_os = "linux"))]
 fn lead_new_group(_cmd: &mut Command) {}
 
 /// Place a child INTO the desktop's process group, if we have one. Linux-only.
+/// It keeps its stdio and nothing else of the daemon's.
 #[cfg(target_os = "linux")]
 fn join_group(cmd: &mut Command, pgid: Option<i32>) {
     use std::os::unix::process::CommandExt as _;
     if let Some(g) = pgid.filter(|g| *g > 1) {
         cmd.process_group(g);
     }
+    tunnel_core::child::inherit_only_stdio(cmd);
 }
 #[cfg(not(target_os = "linux"))]
 fn join_group(_cmd: &mut Command, _pgid: Option<i32>) {}

@@ -516,13 +516,14 @@ fn write_script(key: &str, body: &str) -> Result<PathBuf> {
 /// deadline is launched. Either way the child is waited for, so a launch never
 /// leaves a zombie behind.
 fn run_launcher<S: AsRef<OsStr>>(program: &str, args: &[S]) -> Result<()> {
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("starting {program}"))?;
+        .stderr(Stdio::piped());
+    // What it launches keeps its stdio and nothing else of the daemon's.
+    tunnel_core::child::inherit_only_stdio(&mut cmd);
+    let mut child = cmd.spawn().with_context(|| format!("starting {program}"))?;
     // Read stderr on its own thread: the first 4 KB go back over a channel, and
     // the rest is drained, so a chatty long-running program never blocks on a
     // full pipe. ⚠️ Never joined: a program that leaves a child of its own
