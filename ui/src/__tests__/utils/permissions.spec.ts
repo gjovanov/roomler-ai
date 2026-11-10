@@ -20,6 +20,7 @@ import {
   canViewExternalAudit,
   canBarExternalPerson,
   canLetBackExternalPerson,
+  canManageTunnelPolicies,
   canQueryAnalytics,
   canReadDeviceDiagnostics,
   canSeeFleetNav,
@@ -283,6 +284,28 @@ describe('canReadDeviceDiagnostics (crash reports + uploaded logs)', () => {
     expect(canReadDeviceDiagnostics(DEFAULT_MEMBER, false)).toBe(false)
     expect(canReadDeviceDiagnostics(maskUnion(DEFAULT_MEMBER, REMOTE_CONTROL), false)).toBe(false)
     expect(canReadDeviceDiagnostics(0, false)).toBe(false)
+  })
+})
+
+describe('canManageTunnelPolicies (the Tunnel ACL tab, reads included)', () => {
+  const MANAGE_AGENTS = 1 << 24
+  const REMOTE_CONTROL = 1 << 25
+
+  it('fails OPEN while the mask is unknown: the server decides, the tab explains', () => {
+    expect(canManageTunnelPolicies(null, false)).toBe(true)
+  })
+
+  it('MANAGE_AGENTS, ADMINISTRATOR, the managed admin role or the owner may', () => {
+    expect(canManageTunnelPolicies(MANAGE_AGENTS, false)).toBe(true)
+    expect(canManageTunnelPolicies(ADMINISTRATOR, false)).toBe(true)
+    expect(canManageTunnelPolicies(DEFAULT_ADMIN, false)).toBe(true)
+    expect(canManageTunnelPolicies(0, true)).toBe(true)
+  })
+
+  it('a plain member may not, nor may remote control alone (it draws the Network pages)', () => {
+    expect(canManageTunnelPolicies(DEFAULT_MEMBER, false)).toBe(false)
+    expect(canManageTunnelPolicies(maskUnion(DEFAULT_MEMBER, REMOTE_CONTROL), false)).toBe(false)
+    expect(canManageTunnelPolicies(0, false)).toBe(false)
   })
 })
 
