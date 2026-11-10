@@ -110,7 +110,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 The row comes back, but not what the removed device was allowed. Before #3627 a revive cleared `deleted_at` and nothing else, so the row came back with its SSH, exec and access policies, the org-relay and External access approvals, its connect code, approved routes, owner and labels, a pending config (pushed to the machine again on its first connect) and a standing key-rotation order, and the org's tunnel policies that named it applied to it again.
 
-`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:366`):
+`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:496`):
 
 | The row for `(tenant_id, machine_id)` | What the enrollment does |
 |---|---|

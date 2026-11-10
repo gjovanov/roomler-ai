@@ -191,9 +191,9 @@ duplicate-delivery race below. Any report about a *different* order, and any
 ## The state the dashboard shows
 
 Resolved **once, server-side**, from the order, the claim and the proof
-(`crates/modules/fleet/src/agent.rs:755-839`); the grid only names the states
+(`crates/modules/fleet/src/agent.rs:885-969`); the grid only names the states
 (`AgentsSection.vue:2102-2203`). The device row also carries `overlay_public_key` and
-`overlay_key_epoch` straight from the proof (`agent.rs:1906-1914`), so an operator
+`overlay_key_epoch` straight from the proof (`agent.rs:2036-2044`), so an operator
 can *see* the key change instead of trusting a chip.
 
 ```mermaid
@@ -221,14 +221,14 @@ flowchart TD
 | `delivered` | pushed to a live socket, no answer for **this** order yet | *rotating key…* | wait a few seconds |
 | `rotating` | the device claims `rotated` (≤ 60 s ago) but its last join still shows the previous key | *rotating key…* | wait — it is re-joining |
 | `rotated` | the join proves it (key ≠ `public_key_before` after the order), **or** the claim's `new_public_key` is what the device joined with | *key rotated · e⟨epoch⟩* | done |
-| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:982`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
+| `reported_not_joined` | claimed `rotated` > 60 s ago (`KEY_ROTATION_REJOIN_GRACE_SECS`, `agent.rs:1112`), still joined under another key | *key not re-joined* | the re-join failed — read the device log |
 | `refused` | the device answered `disabled`, `rate_limited` or `unsupported` | *key rotation refused (⟨outcome⟩)*, tooltip = `report.detail` | fix the stated thing |
 | `failed` | mint or persist failed; identity unchanged | *key rotation failed* | `report.detail` says why |
 | `unsupported` | an order stands, no answer, and the device's hello lacks `key-rotate` | *agent too old for key rotation* | update the device; the order stays queued and runs on the first connect that advertises the verb |
 
 ⚠️ **Compare `request_id`s, never outcomes alone.** A report about an earlier order
 says nothing about this one — the remote-configuration lesson, applied here
-(`agent.rs:993`).
+(`agent.rs:1123`).
 
 ⚠️ **`unsupported` is a state an *offline* order reaches.** An online pre-feature
 device never gets an order recorded — the route refuses it 409 up front. The state
@@ -440,7 +440,7 @@ The server cannot see the device switch, so a switched-off device is still order
 | report ingest | `crates/modules/network/src/agent_socket.rs:175` → `agent_arms.rs:81-125` |
 | identity stamp at the join | `crates/modules/network/src/overlay.rs:649-672`; `crates/services/src/dao/agent.rs:1189` |
 | the conditional report write | `crates/services/src/dao/agent.rs:1154-1184` |
-| state resolver + grid view | `crates/modules/fleet/src/agent.rs:913-1074`, `:1910-1918` |
+| state resolver + grid view | `crates/modules/fleet/src/agent.rs:1043-1204`, `:2040-2048` |
 | audit DAO + index plan | `crates/services/src/dao/key_rotation_audit.rs`; `crates/modules/network/src/lib.rs:829-837` |
 | device handler · re-send · ceiling · adoption on reconnect | `agents/roomlerd/src/signaling.rs:6234-6376`, `:3551-3593`, `:3595-3616`, `:1406-1430` |
 | mint · persist | `agents/roomlerd/src/key_rotation.rs`; `agents/roomlerd/src/remote_config.rs:656-688` |
