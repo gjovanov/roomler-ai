@@ -58,7 +58,7 @@ The two incidents differ, and the difference matters for what this change fixes:
 
 | Date | What ran inside the container | What filled the cgroup | Outcome |
 |---|---|---|---|
-| 2026-10-26 | a version histogram written as `find({deleted_at: null}).toArray()` over every collection with that field, which included the per-flow audit log | **the client's heap**: every document held in mongosh at once | mongod OOM-killed (exit 137), about 80 s with no database. Every database-backed request failed while `/health` stayed 200. It recovered on its own, and no data was lost |
+| 2026-10-26 | a version histogram written as `find({deleted_at: null}).toArray()` over every `tunnel` collection that carried a version field, which included the per-flow audit log | **the client's heap**: every document held in mongosh at once | mongod OOM-killed (exit 137), about 80 s with no database. Every database-backed request failed while `/health` stayed 200. It recovered on its own, and no data was lost |
 | 2026-11-10 | two `countDocuments({$text: {$search: '"…"'}})` phrase counts over `agent_logs` | mostly **the server's page cache**: a phrase of common words pulled most of the collection through it | `memory.current` reached 2,145,165,312 of 2,147,483,648 (99.9 %). Nothing was killed, and it fell back within seconds |
 
 Moving the client out removes the first kind entirely: a runaway client now meets its own 1 GiB
@@ -120,8 +120,8 @@ The same as inside `mongodb-0`, so a read written for that runs unchanged:
 | `process.env.MONGO_INITDB_ROOT_USERNAME` / `_PASSWORD` / `MONGO_INITDB_DATABASE` | the pod's `envFrom: mongodb-secret` | the same secret, read into the client container's environment |
 | The server | `127.0.0.1:27017`, mongod itself | `127.0.0.1:27017`, the forward |
 | `db` | none (`--nodb`): the script connects itself | already open on `roomler2` (`--db NAME` for another), and a script that connects itself still can |
-| How mongosh takes the script | on stdin, as a REPL, line by line | as a FILE (`mongosh --nodb --quiet preamble.js script.js`) |
-| A setting such as `FR65_SINCE` | `--env` on the exec | `--env NAME=VALUE` on the runner. `MONGO_*` and `PMR_*` are refused, and a value is a docker argument on mars, so never a secret |
+| How mongosh takes the script | on stdin, as a REPL, line by line (the by-hand recipes), or as a file copied into the pod (the census, the shadow report) | always as a FILE (`mongosh --nodb --quiet preamble.js script.js`) |
+| A setting such as `FR65_SINCE` | `env NAME=VALUE mongosh …` inside the exec | `--env NAME=VALUE` on the runner. `MONGO_*` and `PMR_*` are refused, and a value is a docker argument on mars, so never a secret |
 
 Reading the script as a file removes a trap of the stdin recipe. mongosh fed on stdin evaluates
 line by line, so a line that parses on its own runs on its own. A `.replace(…)` or `.limit()`
