@@ -1708,7 +1708,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 150
     # #3352 — the first failing command fails the step; see windows-overlay-clippy.
     defaults:
       run:
@@ -1779,7 +1779,31 @@ jobs:
       # here — never the whole suite serial.
       - name: Agent unit tests on Windows (the whole --lib suite)
         run: |
-          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
+          # TEMPORARY (#3548 AC7): this lane's exact command, 20 runs in a row. Reverted before merge.
+          set +e
+          cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-run || exit 1
+          PROBE='encode::caps::tests::(not_probed_never_triggers_a_probe|the_wait_for_a_first_answer_ends_at_its_bound|a_wait_hears_nothing_of_the_process_answer)'
+          LOOP='unenrolled::tests::(a_worker_with_no_enrollment_answers_a_delegated_offer|an_offer_off_the_socket_is_dropped|the_worker_ends_with_the_listener)|delegate::secondary_org_tests::a_secondary_orgs_session_reaches_the_worker_only_on_one_row'
+          fails=0
+          probe_fails=0
+          for i in $(seq 1 20); do
+            t0=$(date +%s)
+            cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast > run.log 2>&1
+            rc=$?
+            t1=$(date +%s)
+            result=$(grep -m1 '^test result:' run.log)
+            slow=$(grep -c 'has been running for over 60 seconds' run.log)
+            echo "AC7 run $i/20: exit=$rc wall=$((t1 - t0))s over60=$slow ${result:-NO RESULT LINE}"
+            grep -E "^test ($PROBE|$LOOP) " run.log | sed 's/^/    /'
+            if grep -qE "^test $PROBE \.\.\. FAILED" run.log; then probe_fails=$((probe_fails + 1)); fi
+            if [ "$rc" != 0 ]; then
+              fails=$((fails + 1))
+              sed -n '/^failures:$/,/^test result:/p' run.log
+              [ -n "$result" ] || tail -n 80 run.log
+            fi
+          done
+          echo "AC7: $fails of 20 runs failed; a probe test failed in $probe_fails"
+          [ "$fails" = 0 ]
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.
