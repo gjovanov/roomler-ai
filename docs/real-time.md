@@ -7,8 +7,8 @@ blocked in both directions. *As of 0.3.0-rc.381.*
 ```mermaid
 flowchart TB
     subgraph endpoints["wss endpoints"]
-        WS["/ws?token=…&role=…"]
-        DERP["/derp?token=…"]
+        WS["/ws?role=…&tid=…"]
+        DERP["/derp?role=agent&tid=…"]
     end
 
     U["Browser (user)"] -->|"no role / role=user<br/>Access JWT"| WS
@@ -26,6 +26,32 @@ Each role is validated against its own JWT audience — a user token cannot open
 agent socket and vice-versa. An optional `tid=<tenant-hex>` query parameter lets the
 front load balancer hash tenant-affine connections onto one pod; tokens must match
 the claimed tenant (membership-checked for users).
+
+### Where a native client's credential travels (#3656)
+
+The agent and tunnel-client roles and `/derp` take the device's JWT as
+`Authorization: Bearer <jwt>`, as the daemon's HTTP routes always have: a request
+line is what access logs and URL-logging proxies record, and a request header is
+not. `role` and `tid` stay in the query, because the load balancer hashes on `tid`.
+The daemon and the CLI move to the header in 0.4.210; every earlier one sends the
+JWT in the query (`token=`), and that keeps working. The browser role reads no
+header: it takes the session cookie, or a query token from an older bundle.
+
+| Dial carries | Judged on |
+|---|---|
+| `Authorization: Bearer <jwt>` | the header |
+| `?token=<jwt>` only | the query, as before |
+| both | the header; the query is not read, so a refused header is not rescued by a good query |
+| `Authorization` with another scheme (Basic, NTLM, Negotiate) | the query, as if no header came |
+| neither | refused |
+
+Every check after that is the same for both forms: the audience, the `tid` claim,
+the device's row (`refusal_reason`, deletion first) and its token generation. A
+refusal of these upgrades is a `401` with `WWW-Authenticate: Bearer
+realm="roomler"`, and `error="invalid_token"` when a credential arrived in either
+form. A client tries the query form only on a refusal without that `error`: one
+from a server older than the header, or one whose header was dropped on the way.
+The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 
 Delivery across pods: WS sessions are pod-local; chat, presence, and notification
 events fan out through Redis pub/sub so every pod pushes to its own sockets.
@@ -199,7 +225,7 @@ The gate checks membership once, at `media:join`. The seat it admits lasts only 
 that membership: when someone is removed from the org or leaves it, or leaves the room, any
 seat they hold in a call of that org or room goes at once, on whichever pod serves the call.
 The membership's owner tells `conference` through core's `MembershipLifecycle` hook
-(`crates/core/src/hooks.rs:191`), after the membership row is gone, so nothing can be
+(`crates/core/src/hooks.rs:192`), after the membership row is gone, so nothing can be
 admitted on it again while the seats are withdrawn.
 
 ```mermaid
@@ -222,7 +248,7 @@ sequenceDiagram
 
 | Trigger | Told by | What ends |
 |---|---|---|
-| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:229`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:111`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
+| Removed from the org by an admin, or left it (`DELETE …/member/{user_id}`) | `crates/api/src/routes/user.rs:231`, `org_member_removed` | every call of the org they may sit in: the rooms they belong to whose call is live, and any where they still hold an open call session (`dao/room.rs:1141` `call_rooms_of_member`), plus any room on the pod where they sit (`revoke.rs:111`). Their open call sessions close through the hang-up path, `finalize_call_leave_db` |
 | Left the room (`POST …/room/{room_id}/leave`) | `crates/modules/chat/src/room.rs:238`, `room_member_removed` | their seats in that room's call (`revoke.rs:88`). The membership row held their call sessions, so the leave itself drops the call's count (`dao/room.rs:526`), and a call they were the last one in ends (`call.rs:312` `settle_call_after_departure`) |
 
 - The seats close on the pod that holds them (`revoke.rs:180` `withdraw_seats_here`), reached
@@ -559,15 +585,20 @@ sequenceDiagram
 
 ## DERP
 
-`GET /derp?token=<agent-jwt>` upgrades to a minimal frame relay for overlay pairs
-where **both** sides are UDP-blocked:
+`GET /derp?role=agent&tid=<tenant>` with `Authorization: Bearer <agent-jwt>` (or,
+from a daemon older than 0.4.210, `?token=<agent-jwt>`; [above](#where-a-native-clients-credential-travels-3656))
+upgrades to a minimal frame relay for overlay pairs where **both** sides are
+UDP-blocked:
 
 - Frames are `[dst_pubkey(32) || payload]` client→server, rewritten to
   `[src_pubkey(32) || payload]` on delivery.
 - Hard tenant/network isolation; the payload is WireGuard ciphertext the relay
   cannot read.
 - Standalone regional PoPs (`crates/derp-relay`) run the same protocol DB-free,
-  authenticated by Ed25519 tickets minted over `rc:relay.derp_ticket_request`.
+  authenticated by Ed25519 tickets minted over `rc:relay.derp_ticket_request`. A
+  ticket travels like the JWT: `Authorization: Bearer <ticket>`, or `?ticket=` from
+  an older daemon, with the same precedence and the same challenge
+  ([scripts/relay-pop/README.md](../scripts/relay-pop/README.md#the-admission-ticket-and-the-access-log-3656)).
 
 ## Connection hygiene
 

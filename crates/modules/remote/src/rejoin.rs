@@ -14,7 +14,7 @@
 //! |---|---|
 //! | held by this pod's hub, for this person | the gate a request runs, again; then bound here and `rc:session.resumed`, or ended `admin_terminated` |
 //! | the row names someone else, or nothing | `rc:terminate agent_disconnect`, the same as for no session: nothing leaks |
-//! | the row is ended | `rc:terminate` with the row's own reason |
+//! | the row is ended | `rc:terminate` with the row's own reason, except `controller_hangup`, answered `agent_disconnect` (`rejoin_end_reason`) |
 //! | the row is live, and the gate refuses | written to the row as `admin_terminated`, and published, as an admin's end; `rc:terminate admin_terminated` |
 //! | the gate cannot be run (a read failed) | nothing bound, nothing written: `rc:session.detached` with when the session ends if nobody claims it, so the viewer asks again |
 //! | the row cannot be read | `rc:session.detached` with the window from now: the viewer asks again, and the first answer that reads the row brings its deadline in |
@@ -72,6 +72,21 @@ fn after(from: DateTime, window_secs: u32) -> DateTime {
         from.timestamp_millis()
             .saturating_add(i64::from(window_secs).saturating_mul(1000)),
     )
+}
+
+/// Review 2, N9 — the reason a rejoin is told when it finds the row ended.
+/// The page that rejoins never hung up: its socket went. So a row ended
+/// `controller_hangup` was ended by the hold's window running out (a rejoin
+/// that lands just after it, before the device's close reaches the page) or
+/// by the same person's other request reaping it, and the page reads
+/// `controller_hangup` as its own hangup and stops. It is told
+/// `agent_disconnect` instead, which it redials on, as a page before FR-138
+/// redialed after every drop. Every other reason is the row's own.
+fn rejoin_end_reason(row_reason: Option<EndReason>) -> EndReason {
+    match row_reason {
+        None | Some(EndReason::ControllerHangup) => EndReason::AgentDisconnect,
+        Some(reason) => reason,
+    }
 }
 
 /// The answer while the session waits for its claim: ask again until `by`,
@@ -145,10 +160,7 @@ pub async fn rejoin(state: &RemoteState, v: Viewer<'_>, session_id: ObjectId) {
         }
     };
     if row.ended_at.is_some() || row.phase == SessionPhase::Closed {
-        answer(end(
-            session_id,
-            row.end_reason.unwrap_or(EndReason::AgentDisconnect),
-        ));
+        answer(end(session_id, rejoin_end_reason(row.end_reason)));
         return;
     }
     if row.phase != SessionPhase::Active {
@@ -289,5 +301,27 @@ mod tests {
         }
         assert_eq!(after(at(1_000), 60), at(61_000));
         assert_eq!(after(at(i64::MAX - 1), 60), at(i64::MAX), "saturates");
+    }
+
+    /// Review 2, N9 — a page that rejoins never hung up, so a row ended
+    /// `controller_hangup` (its hold ran out) answers a reason the page
+    /// redials on; a row with no reason does too, and every other reason is
+    /// the row's own.
+    #[test]
+    fn a_rejoin_that_finds_its_hold_ended_is_told_a_reason_it_redials_on() {
+        assert_eq!(
+            rejoin_end_reason(Some(EndReason::ControllerHangup)),
+            EndReason::AgentDisconnect
+        );
+        assert_eq!(rejoin_end_reason(None), EndReason::AgentDisconnect);
+        for reason in [
+            EndReason::AgentDisconnect,
+            EndReason::AdminTerminated,
+            EndReason::HostDisconnect,
+            EndReason::IdleTimeout,
+            EndReason::Error,
+        ] {
+            assert_eq!(rejoin_end_reason(Some(reason)), reason, "{reason:?}");
+        }
     }
 }

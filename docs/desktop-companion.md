@@ -601,7 +601,7 @@ flowchart TD
 |---|---|---|
 | Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:235-262`), chosen by `fs_as_for` (`:279`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:276`), never from a name, which can name another account's folder |
 | How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:349`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
-| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:411`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). The status card takes it as it is and probes nothing |
+| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:411`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:5330`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:5836`): never the machine-global folder |
 | The staging | `stager_for` (`:1391`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
 | The end | `place_across` (`:1828`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
 | A resume | `resume_incoming_as` (`:2013`), `PartialMeta::person_sid` (`:727`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
@@ -609,6 +609,8 @@ flowchart TD
 - **A locked screen keeps its user**, so a file sent then lands in their Downloads.
 - **Nobody signed in** (before sign-in, after sign-out): the upload is refused with the reason
   above, which the viewer shows. File transfer never writes as LocalSystem.
+- **The viewer says where the file landed**, by path, local or on a share: "Uploaded report.pdf
+  to `\\server\share\…\Downloads`" ([`remote-control.md`](remote-control.md) §18.2).
 - `files_dir` and a folder the viewer chose keep FR-84 D4's rule (inside the person's profile), and
   are checked and written as the person.
 - `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the service's own identity, as on Linux.

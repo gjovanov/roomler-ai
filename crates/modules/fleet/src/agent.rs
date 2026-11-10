@@ -31,7 +31,7 @@ use crate::FleetState;
 pub(crate) const ENROLLMENT_TTL_SECS: u64 = 600; // 10 minutes per §11.1
 
 /// Require a `role::permissions` bit for `user_id` in `tenant_id`. Doubles as
-/// the membership check — `get_member_permissions` returns `Forbidden` for a
+/// the membership check — `get_member_permissions` answers `NotAMember` for a
 /// non-member. `owner` always passes via the `ADMINISTRATOR` bypass in `has`.
 ///
 /// `pub(crate)` so the sibling device-management surfaces in the same subsystem
@@ -111,6 +111,119 @@ pub async fn org_accepts_enrollment(tenants: &TenantDao, tid: ObjectId) -> Resul
         Ok(_) | Err(DaoError::NotFound) => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// What the enroll and anchor routes answer for a single-use enrollment token
+/// whose issuer may no longer enroll devices in its org ([`issuer_may_enroll`]).
+pub const TOKEN_ISSUER_CANNOT_ENROLL: &str = "This enrollment token was issued by someone who no \
+     longer manages this organization's devices, so it cannot be used. Ask someone who manages \
+     the organization's devices for a new enrollment token.";
+
+/// What the enroll route answers for such an ephemeral enrollment key.
+pub const KEY_ISSUER_CANNOT_ENROLL: &str = "This enrollment key was minted by someone who no \
+     longer manages this organization's devices, so it enrolls nothing. Mint a new key from an \
+     account that manages the organization's devices.";
+
+/// Why a credential's issuer may no longer enroll devices in its org. It goes
+/// on the log line, never to the holder: one sentence answers both, so the
+/// credential tells whoever holds it nothing more about its issuer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssuerLost {
+    /// No longer a member of the org: removed, or left.
+    Membership,
+    /// Still a member, without `MANAGE_AGENTS`: a role taken away, or a
+    /// role's bits edited.
+    Permission,
+}
+
+impl IssuerLost {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            IssuerLost::Membership => "not_a_member",
+            IssuerLost::Permission => "no_permission",
+        }
+    }
+}
+
+/// An enrollment credential acts for the person who minted it (its `sub`):
+/// the device it enrolls is theirs, and an anchor records them. So each use
+/// asks again what its mint asked, whether that person may enroll devices in
+/// the org: [`require_permission`] with `MANAGE_AGENTS`, which the org's
+/// owner and an `ADMINISTRATOR` role pass, and which nobody passes outside the
+/// org.
+///
+/// `Ok(None)`: they may. `Ok(Some(why))`: they may not, and the caller
+/// refuses with a plain `Forbidden`, never `NotAMember` (the code a page
+/// leaves the org on: these doors are a device's), before it spends or
+/// claims anything. `Err`: the read failed, a 500 that spends nothing either,
+/// so the caller can retry.
+pub(crate) async fn issuer_may_enroll(
+    state: &FleetState,
+    tid: ObjectId,
+    issuer: ObjectId,
+) -> Result<Option<IssuerLost>, ApiError> {
+    match require_permission(
+        state,
+        tid,
+        issuer,
+        permissions::MANAGE_AGENTS,
+        "MANAGE_AGENTS",
+    )
+    .await
+    {
+        Ok(()) => Ok(None),
+        Err(ApiError::NotAMember) => Ok(Some(IssuerLost::Membership)),
+        Err(ApiError::Forbidden(_)) => Ok(Some(IssuerLost::Permission)),
+        Err(e) => Err(e),
+    }
+}
+
+/// The refusal of an enrollment whose credential's issuer may no longer
+/// enroll devices in the org ([`issuer_may_enroll`]).
+///
+/// A key whose minter is no longer a member is also revoked here, the way the
+/// membership's end revokes their keys (`crate::membership`): this is a key
+/// that end did not reach (a removal from before the hook, or one whose write
+/// failed), and revoking it keeps a later re-add from bringing it back. A
+/// failed revoke is logged; the refusal stands either way. A key whose minter
+/// only lost the permission is not revoked: it works again if they regain it.
+async fn refuse_lost_issuer(
+    state: &FleetState,
+    tid: ObjectId,
+    issuer: ObjectId,
+    lost: IssuerLost,
+    credential: &EnrollmentCredential,
+) -> ApiError {
+    let jti = credential.claims().jti.as_str();
+    let EnrollmentCredential::EphemeralKey(_) = credential else {
+        tracing::info!(
+            tenant_id = %tid, %issuer, jti, reason = lost.as_str(),
+            "enroll: refused: the token's issuer may no longer enroll devices here"
+        );
+        return ApiError::Forbidden(TOKEN_ISSUER_CANNOT_ENROLL.to_string());
+    };
+    tracing::info!(
+        tenant_id = %tid, %issuer, jti, reason = lost.as_str(),
+        "fr-51: ephemeral enrollment key refused: its minter may no longer enroll devices here"
+    );
+    if lost == IssuerLost::Membership {
+        match state
+            .enrollment_keys
+            .revoke_minted_by(tid, issuer, Some(jti))
+            .await
+        {
+            Ok(0) => {}
+            Ok(_) => tracing::warn!(
+                tenant = %tid, user = %issuer, jti, reason = "minter_not_a_member",
+                "fr-51: ephemeral enrollment key revoked"
+            ),
+            Err(e) => tracing::error!(
+                tenant = %tid, user = %issuer, jti, %e, alert = crate::membership::ALERT,
+                "fr-51: could not revoke the key of a minter who is no longer a member"
+            ),
+        }
+    }
+    ApiError::Forbidden(KEY_ISSUER_CANNOT_ENROLL.to_string())
 }
 
 /// POST /api/tenant/{tenant_id}/agent/enroll-token — admin issues an enrollment
@@ -202,6 +315,10 @@ pub struct EnrollResponse {
 /// enrollment token instead. Creates or rehydrates the Agent row and returns
 /// a long-lived agent JWT.
 ///
+/// The enrollment acts for the person who minted the credential: a new row is
+/// theirs. So it proceeds only while they may still enroll devices in the org
+/// ([`issuer_may_enroll`], 403 otherwise, before anything is spent).
+///
 /// FR-51 P2 — the SAME route also accepts an ephemeral enrollment KEY
 /// (`TokenType::EphemeralEnrollment`); which path runs is decided by the
 /// CREDENTIAL's audience, never by anything in the request body (a body that
@@ -223,6 +340,19 @@ pub async fn enroll_agent(
     // Checked before the single-use claim so a refused enrollment does not also
     // burn the token.
     org_accepts_enrollment(&state.tenants, tid).await?;
+
+    // The credential acts for the person who minted it, so it enrolls only
+    // while they may still enroll devices in this org. Before the token's
+    // spend and the key's claim: a refusal costs the credential nothing.
+    //
+    // Nothing is asked again after the write. Devices a person enrolled stay
+    // theirs when they leave the org, so an enrollment that passed here just
+    // before a removal ends like one that finished before it; and the key's
+    // claim filter (`revoked_at: null`) arbitrates with the removal's revoke
+    // on the key row itself.
+    if let Some(lost) = issuer_may_enroll(&state, tid, admin_uid).await? {
+        return Err(refuse_lost_issuer(&state, tid, admin_uid, lost, &credential).await);
+    }
 
     // #3328 — a single-use token arrives UNSPENT: it reads claims and mints
     // nothing until the spend below. An ephemeral key's row decides each of

@@ -226,8 +226,50 @@ pub async fn enroll(inputs: EnrollInputs<'_>) -> Result<AgentConfig> {
     enroll_issued(inputs).await.map(Issued::into_config)
 }
 
+/// [`enroll`] on a client the caller built.
+pub async fn enroll_with(
+    client: &reqwest::Client,
+    inputs: EnrollInputs<'_>,
+) -> Result<AgentConfig> {
+    enroll_issued_with(client, inputs)
+        .await
+        .map(Issued::into_config)
+}
+
 /// [`enroll`] up to the server's answer, before it becomes a config.
 pub async fn enroll_issued(inputs: EnrollInputs<'_>) -> Result<Issued> {
+    enroll_issued_with(&reqwest::Client::new(), inputs).await
+}
+
+/// The server answered the enrollment, and refused it. A type (#3432), so the
+/// setup wizard can tell an answer from a failure to get one; it reads as the
+/// `bail!` it replaces did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrollRejected {
+    pub status: reqwest::StatusCode,
+    /// What the server said.
+    pub body: String,
+}
+
+impl std::fmt::Display for EnrollRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "enrollment rejected (status {}): {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for EnrollRejected {}
+
+/// [`enroll_issued`] on a client the caller built: the setup wizard's, whose
+/// resolver fails with a type of its own (#3432). The daemon's own enroll is
+/// [`enroll_issued`], on `reqwest::Client::new()` as before.
+pub async fn enroll_issued_with(
+    client: &reqwest::Client,
+    inputs: EnrollInputs<'_>,
+) -> Result<Issued> {
     // Promote http:// to https://. The production ingress 301-redirects
     // plaintext to TLS; reqwest then downgrades the POST to a GET (RFC
     // 7231 historical behavior for 301/302) so the second hop hits a
@@ -247,7 +289,7 @@ pub async fn enroll_issued(inputs: EnrollInputs<'_>) -> Result<Issued> {
         "posting enrollment"
     );
 
-    let resp = reqwest::Client::new()
+    let resp = client
         .post(&url)
         .json(&EnrollRequest {
             enrollment_token: inputs.enrollment_token,
@@ -264,7 +306,7 @@ pub async fn enroll_issued(inputs: EnrollInputs<'_>) -> Result<Issued> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("enrollment rejected (status {status}): {body}");
+        return Err(EnrollRejected { status, body }.into());
     }
 
     let body: EnrollResponse = resp.json().await.context("parsing enroll response")?;

@@ -53,7 +53,8 @@ use roomlerd::updater::WindowsInstallFlavour;
 use wizard_shared::held_file::HeldFile;
 use wizard_shared::msi_runner::MsiRunner;
 
-use crate::diagnostics::failed;
+use crate::failure::Failure;
+use crate::steps::{OrFail, Steps};
 
 /// The first argument of the elevated step.
 pub const RUN_PACKAGE_FLAG: &str = "--run-package";
@@ -216,12 +217,31 @@ impl Refusal {
         }
     }
 
-    /// Record this in the install's diagnostics, and hand back what the person
-    /// reads.
-    pub fn fail(self) -> String {
-        failed(self.error_code(), self.words())
+    /// Record this in the install's diagnostics, as the failure of the step
+    /// that is open: a [`crate::failure::Kind::Refused`] in these words.
+    pub fn fail(self) -> Failure {
+        Steps::global().fail(self.error_code(), self)
     }
+}
 
+/// #3432 — a refusal is an error of its own, so a [`Failure`] is built from it
+/// like from any other: in its words ([`Refusal::words`]), as `refused`.
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.words())
+    }
+}
+
+impl std::error::Error for Refusal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Refusal::StageFailed(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl Refusal {
     /// This refusal said of one file inside an archive, which it names: the
     /// person downloaded the archive and never saw what is in it.
     #[cfg(any(target_os = "windows", test))]
@@ -567,7 +587,7 @@ pub async fn start_install(
     flavour: WindowsInstallFlavour,
     system_context: bool,
     staging: &Staging,
-) -> Result<Started, String> {
+) -> Result<Started, Failure> {
     let beside = |runner| Started {
         runner,
         log: PathBuf::from(format!("{}.log", staged.display())),
@@ -596,8 +616,11 @@ pub async fn start_install(
 
 /// A handle to follow a process by id. By now it is running, so this says it
 /// could not be followed and not that nothing happened.
-fn follow(pid: u32) -> Result<MsiRunner, String> {
-    MsiRunner::attach(pid).map_err(|e| failed(ErrorCode::MsiWait, format!("attach msiexec: {e}")))
+fn follow(pid: u32) -> Result<MsiRunner, Failure> {
+    use anyhow::Context as _;
+    MsiRunner::attach(pid)
+        .context("attach msiexec")
+        .or_fail(ErrorCode::MsiWait)
 }
 
 /// The one prompt, on this EXE, for [`run_step`].
@@ -606,7 +629,7 @@ async fn start_step(
     staged: &Path,
     digest: Option<&str>,
     system_context: bool,
-) -> Result<Started, String> {
+) -> Result<Started, Failure> {
     use wizard_shared::elevation::{ElevationError, run_elevated_and_follow};
     let step_failed = |why: String| Refusal::StepFailed(why).fail();
     let source = staged.to_str().and_then(fit_source).ok_or_else(|| {
@@ -647,9 +670,9 @@ async fn start_step(
     let runner = match answer {
         Ok(runner) => runner,
         Err(ElevationError::Cancelled) => {
-            return Err(failed(
+            return Err(Steps::global().fail(
                 ErrorCode::MsiUserCancel,
-                declined_words(system_context).to_string(),
+                crate::failure::Said(declined_words(system_context).to_string()),
             ));
         }
         Err(ElevationError::Failed(why)) => return Err(step_failed(why)),

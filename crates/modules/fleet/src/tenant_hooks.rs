@@ -57,8 +57,9 @@ impl TenantLifecycle for FleetTenantHooks {
     }
 }
 
-/// What fleet registers with the core registry: the tenant cascade only —
-/// fleet is the CALLER of the agent cascade, never a holder.
+/// Fleet's tenant-cascade hook. `FleetState::hooks` registers it beside the
+/// membership hook (`crate::membership`); fleet is the CALLER of the agent
+/// cascade, never a holder.
 pub fn hooks(state: &FleetState) -> roomler_core::Hooks {
     roomler_core::Hooks {
         tenant: Some(Arc::new(FleetTenantHooks {

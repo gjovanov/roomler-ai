@@ -211,8 +211,9 @@ roomlerd anchor remove            # this machine stops offering SYSTEM exec
   belongs to the user who made it, and `machine_id` hashes that user's config
   path, so "re-enroll this machine" from another account mints another device.
 - The enrollment token is single use and burned only once every check passes
-  (live device, same org, Windows, host name matches the device unless
-  `--force`).
+  (the org is not archived, the admin who minted the token may still enroll
+  devices there, live device, same org, Windows, host name matches the device
+  unless `--force`).
 - The anchor lives in `%ProgramData%\roomler\roomler\exec-service\anchor.json`
   (Administrators-only). The worker learns from the service, every 30 s,
   which device it is anchored for, and offers the `exec-system` capability on

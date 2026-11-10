@@ -8,15 +8,16 @@ Every enrolled device and every `roomler` tunnel client holds a long-lived crede
 
 | Credential | Issued by | Lives | Renewed by | Ends when | Where it is kept |
 |---|---|---|---|---|---|
-| **Enrollment token** | an admin (`POST /api/tenant/{tid}/agent/enroll-token`) | 10 min, **single use** | — | used, or 10 min pass | pasted once; never stored |
-| **Tunnel enrollment token** | a member (`POST /api/tenant/{tid}/tunnel-client/enroll-token`) | 10 min, **single use** (#3328) | — | used, or 10 min pass | pasted once into `roomler enroll`; never stored |
+| **Enrollment token** | an admin (`POST /api/tenant/{tid}/agent/enroll-token`) | 10 min, **single use** | — | used, or 10 min pass; refused, unspent, while its admin may not enroll devices in the org | pasted once; never stored |
+| **Ephemeral enrollment key** (FR-51) | an admin (`POST /api/tenant/{tid}/agent/enroll-key`) | 30 days by default, at most 90; 100 uses by default, at most 10 000 | — | revoked, expired or used up, or its admin leaves the org; refused while they may not enroll devices there | a CI secret store; shown once, never stored by the server ([`ephemeral-nodes.md`](ephemeral-nodes.md#ephemeral-enrollment-keys)) |
+| **Tunnel enrollment token** | a member (`POST /api/tenant/{tid}/tunnel-client/enroll-token`) | 10 min, **single use** (#3328) | — | used, or 10 min pass; refused, unspent, once its member has left the org | pasted once into `roomler enroll`; never stored |
 | **Agent token** (`aud = agent`) | `POST /api/agent/enroll` | 365 days (`rc.agent_token_ttl_secs`) | **the device** (`POST /api/agent/self/renew`) | the device is removed (generation), or it lapses past the grace | the daemon's `config.toml` (`agent_token`, or `[[orgs]].agent_token`) |
 | **Tunnel-client token** (`aud = tunnel-client`) | `POST /api/tunnel-client/enroll` | 365 days | **the `roomler` CLI** (`POST /api/tunnel-client/renew`) | the client is removed (generation), or it lapses past the grace | the CLI's `config.toml`, `0600` |
 | **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | `%ProgramData%\roomler\roomler\exec-service\anchor.json`, SYSTEM + Administrators only |
 
 FR-104 adds one variation on the first row: an enrollment token minted with `anchor: true` may also anchor the device it enrolled, once ([`fleet-rpc.md`](fleet-rpc.md) § Anchoring).
 
-Both enrollment tokens are spent on the `used_tokens` ledger by the route that redeems them, and the mints that turn one into the long-lived credential take only the spent token ([`security-baseline.md`](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328), #3328). A tunnel enrollment token acts for the member who minted it: it re-enrolls a known machine id only for that client's owner while the client is live, or for a holder of `MANAGE_AGENTS`.
+Both enrollment tokens are spent on the `used_tokens` ledger by the route that redeems them, and the mints that turn one into the long-lived credential take only the spent token ([`security-baseline.md`](security-baseline.md#an-enrollment-token-is-spent-once-through-one-owner-3328), #3328). An enrollment token and an ephemeral key act for the admin who minted them: once that person has left the org or no longer manages its devices, `POST /api/agent/enroll` refuses either one, and `POST /api/agent/anchor` a token, with 403 before anything is spent, and a removal revokes the person's live keys ([`security-baseline.md`](security-baseline.md#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)). A tunnel enrollment token acts for the member who minted it: it enrolls nothing once that member has left the org, and it re-enrolls a known machine id only for that client's owner while the client is live, or for a holder of `MANAGE_AGENTS`.
 
 ## 2. The lifecycle of an agent token
 
@@ -110,7 +111,7 @@ Enrollment **revives** a removed row in place for the same `(tenant_id, machine_
 
 The row comes back, but not what the removed device was allowed. Before #3627 a revive cleared `deleted_at` and nothing else, so the row came back with its SSH, exec and access policies, the org-relay and External access approvals, its connect code, approved routes, owner and labels, a pending config (pushed to the machine again on its first connect) and a standing key-rotation order, and the org's tunnel policies that named it applied to it again.
 
-`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:366`):
+`POST /api/agent/enroll` now decides by what the row **is** when its write lands (`enroll_row`, `crates/modules/fleet/src/agent.rs:496`):
 
 | The row for `(tenant_id, machine_id)` | What the enrollment does |
 |---|---|
@@ -224,6 +225,7 @@ A first `roomlerd enroll` ends the same way, by naming the step that connects th
 ## 7. Related
 
 - [`fleet-rpc.md`](fleet-rpc.md) — the anchor and the service credential.
+- [`ephemeral-nodes.md`](ephemeral-nodes.md) — the FR-51 ephemeral enrollment key.
 - [`security-baseline.md`](security-baseline.md) — the device plane.
 - [`multi-org.md`](multi-org.md) — one token per enrollment.
 - `docs/fr/FR-103-device-credentials-renew-themselves.md` — the spec, decisions and field log.

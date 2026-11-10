@@ -71,22 +71,31 @@ pub async fn resolve(
     version: &str,
     user_agent: &str,
 ) -> Result<ArtifactHealth> {
-    let url = format!("{base}/{target}/health?version={version}");
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(30))
         .build()
         .context("building reqwest client")?;
+    resolve_on(&client, base, target, version).await
+}
+
+/// [`resolve`] on a client the caller built (#3432: a test's, with a short
+/// timeout). A refusal is a [`crate::http::HttpStatus`], a type, so the wizard
+/// can say the server answered and what.
+pub async fn resolve_on(
+    client: &reqwest::Client,
+    base: &str,
+    target: &str,
+    version: &str,
+) -> Result<ArtifactHealth> {
+    let url = format!("{base}/{target}/health?version={version}");
     let resp = client
         .get(&url)
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
     if !resp.status().is_success() {
-        return Err(anyhow!(
-            "installer-health GET {url} returned {}",
-            resp.status()
-        ));
+        return Err(crate::http::HttpStatus::of("GET", resp).await.into());
     }
     let health: ArtifactHealth = resp.json().await.context("parsing installer-health JSON")?;
     Ok(health)
@@ -129,7 +138,7 @@ pub async fn download<F: FnMut(u64)>(
             .with_context(|| format!("creating staging dir {}", parent.display()))?;
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .user_agent(spec.user_agent)
         .timeout(Duration::from_secs(15 * 60)) // 15 min for slow corp networks
         .build()
@@ -140,12 +149,7 @@ pub async fn download<F: FnMut(u64)>(
         .await
         .with_context(|| format!("GET {}", spec.url))?;
     if !resp.status().is_success() {
-        return Err(anyhow!(
-            "{} GET {} returned {}",
-            spec.artifact_label,
-            spec.url,
-            resp.status()
-        ));
+        return Err(crate::http::HttpStatus::of("GET", resp).await.into());
     }
 
     use futures::StreamExt;
@@ -220,7 +224,7 @@ pub async fn find_release_asset(
     suffix: &str,
     user_agent: &str,
 ) -> Result<Option<ReleaseAsset>> {
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(30))
         .build()
@@ -231,10 +235,7 @@ pub async fn find_release_asset(
         .await
         .with_context(|| format!("GET {latest_release_url}"))?;
     if !resp.status().is_success() {
-        return Err(anyhow!(
-            "GET {latest_release_url} returned {}",
-            resp.status()
-        ));
+        return Err(crate::http::HttpStatus::of("GET", resp).await.into());
     }
     let releases: Vec<RelListEntry> = resp.json().await.context("parse latest-release list")?;
     let nc = name_contains.to_ascii_lowercase();

@@ -27,6 +27,9 @@ pub mod diagnostics;
 /// #2338 — the enroll step every daemon pipeline shares: the fresh
 /// enrollment folded into the config already at its path.
 pub mod enroll_step;
+/// #3432 — the one failure an install ends with: its step, its kind (decided on
+/// the error's types), words a person can act on, and the whole cause chain.
+pub mod failure;
 /// FR-129 B1 — `GET /api/setup/features`, read fail-closed.
 pub mod features;
 /// FR-129 C3 — the wizard's command line: what an elevated relaunch is
@@ -55,6 +58,9 @@ pub mod root_identity;
 /// FR-129 C — the gate on how the wizard's Windows path names a program.
 #[cfg(test)]
 mod spawn_gate;
+/// #3432 — the steps of an install, and the tracker each failure takes its
+/// step from.
+pub mod steps;
 /// FR-129 B1 — the mechanics under `orchestrator_unix`: the embedded
 /// script, the halves' argv, the prompt tools, the exit codes, the private
 /// scratch directory.
@@ -250,6 +256,158 @@ mod front_tests {
             ["a", "b", "c ${d}"]
         );
         assert_eq!(without_interpolations("a ${perUserWord} b ${c}"), "a  b ");
+    }
+
+    /// The text of `function name(…) { … }` in `js`: from its head to the
+    /// first brace at the start of a line, which ends it.
+    fn function_body<'a>(js: &'a str, name: &str) -> &'a str {
+        let start = js
+            .find(&format!("function {name}("))
+            .unwrap_or_else(|| panic!("app.js has no function {name}"));
+        let end = js[start..].find("\n}").map_or(js.len(), |at| start + at);
+        &js[start..end]
+    }
+
+    /// #3590 — the checklist is the wizard's list of steps. The page draws the
+    /// last `Steps` snapshot the tracker sent and keeps no row of its own: no
+    /// row keyed by an event's type (a failure left those running), and no
+    /// label made from an event's fields (`AssetResolving`'s `artifact` named
+    /// the MSI flavour).
+    #[test]
+    fn the_checklist_draws_the_steps_snapshot_and_nothing_else() {
+        let js = include_str!("front/app.js");
+        assert!(
+            function_body(js, "handleProgress").contains("type === \"Steps\""),
+            "the page does not read the Steps snapshot"
+        );
+        assert!(
+            function_body(js, "renderInstall").contains("for (const row of state.installSteps)"),
+            "renderInstall does not draw the snapshot's rows"
+        );
+        for own in [
+            "installRows",
+            "STEP_LABELS",
+            "checklistLabel",
+            "checklistClass",
+        ] {
+            assert!(!js.contains(own), "app.js keeps rows of its own: {own}");
+        }
+        for field in ["artifact", "existing"] {
+            assert!(
+                !js.contains(&format!("d.{field}")) && !js.contains(&format!("data.{field}")),
+                "app.js draws an event's {field}"
+            );
+        }
+    }
+
+    /// #3590 — every state a row can be in has a look of its own, and the page
+    /// maps each wire state to it.
+    #[test]
+    fn every_row_state_has_a_look_of_its_own() {
+        let css = include_str!("front/styles.css");
+        let js = include_str!("front/app.js");
+        for (state, class) in [
+            ("pending", "pending"),
+            ("running", "running"),
+            ("done", "ok"),
+            ("failed", "error"),
+            ("not_reached", "not-reached"),
+            ("warning", "warning"),
+        ] {
+            assert!(
+                css.contains(&format!(".checklist li.{class} .icon::before")),
+                "styles.css has no look for {class}"
+            );
+            assert!(
+                js.contains(&format!("{state}: \"{class}\"")),
+                "app.js maps no class for {state}"
+            );
+        }
+    }
+
+    /// #3590 — a warning the install raised can still be read on Done.
+    #[test]
+    fn the_done_page_lists_the_warnings() {
+        let html = include_str!("front/index.html");
+        assert!(
+            html.contains("id=\"done-warnings\"") && html.contains("id=\"done-warnings-list\""),
+            "Done has no place for the warnings"
+        );
+        assert!(
+            function_body(include_str!("front/app.js"), "renderDone").contains("done.warnings"),
+            "renderDone does not list the report's warnings"
+        );
+    }
+
+    /// Why the device was not anchored and why the service was not restarted
+    /// are warnings like the rest: Done says each once, in its warnings, and
+    /// no note of its own repeats one. The anchor's manual command stays: it
+    /// is what to do, not why.
+    #[test]
+    fn the_done_page_says_each_warning_once() {
+        let html = include_str!("front/index.html");
+        let js = include_str!("front/app.js");
+        for repeat in [
+            "done-anchor-reason",
+            "done-restart-note",
+            "done-restart-reason",
+            "anchorSkipReason",
+            "restartSkipReason",
+        ] {
+            assert!(
+                !html.contains(repeat) && !js.contains(repeat),
+                "Done repeats a warning: {repeat}"
+            );
+        }
+        assert!(html.contains("id=\"done-anchor-command\""));
+    }
+
+    /// The preflight row says what is installed here already and what the
+    /// install does to it (`PreflightOk`'s words, the row's detail), in a
+    /// person's words: whatever is found, never a flavour's name.
+    #[test]
+    fn the_preflight_says_what_is_installed_in_a_persons_words() {
+        use roomlerd::install_detect::{ExistingInstall, InstallInfo};
+        let info = |version: Option<&str>| InstallInfo {
+            version: version.map(str::to_string),
+            install_location: None,
+        };
+        for requested in ["peruser", "permachine", "permachine-systemcontext"] {
+            for found in [
+                ExistingInstall::Clean,
+                ExistingInstall::PerUser(info(Some("0.4.207"))),
+                ExistingInstall::PerMachine(info(None)),
+                ExistingInstall::Ambiguous {
+                    peruser: info(Some("0.4.1")),
+                    permachine: info(Some("0.4.2")),
+                },
+            ] {
+                let words = crate::orchestrator_agent::label_existing(&found, requested);
+                assert!(words.starts_with("Roomler is "), "{words:?}");
+                let lower = words.to_lowercase();
+                for flavour in [
+                    "peruser",
+                    "permachine",
+                    "systemcontext",
+                    "per-user",
+                    "clean",
+                ] {
+                    assert!(!lower.contains(flavour), "{words:?} says {flavour}");
+                }
+                assert_eq!(
+                    words.ends_with("this install replaces it"),
+                    matches!(
+                        (&found, requested),
+                        (ExistingInstall::PerUser(_), "peruser")
+                            | (
+                                ExistingInstall::PerMachine(_),
+                                "permachine" | "permachine-systemcontext"
+                            )
+                    ),
+                    "{words:?} for {requested}"
+                );
+            }
+        }
     }
 
     /// `literal` with each `${…}` taken out.

@@ -15559,21 +15559,24 @@ export function uploadLandedIn(path: string, destPath: string): boolean {
 
 /** The folder a file landed in, for a person to read: `path` without the
  *  `name` it was uploaded as (a folder upload's name is its relative path,
- *  so its whole tree comes off). */
+ *  so its whole tree comes off) and without a verbatim prefix: `\\?\C:\x`
+ *  reads `C:\x`, `\\?\UNC\srv\sh\x` reads `\\srv\sh\x`. A root keeps its
+ *  separator: `/`, `C:\`. */
 function uploadLandingFolder(path: string, name: string): string {
-  const shown = path.replace(/^(\\\\|\/\/)\?[\\/]/, '')
+  const shown = path.replace(/^(\\\\|\/\/)\?([\\/])UNC[\\/]/i, '$2$2').replace(/^(\\\\|\/\/)\?[\\/]/, '')
   let cut = shown.length
   for (let depth = name.split('/').filter(Boolean).length || 1; depth > 0; depth--) {
     const at = Math.max(shown.lastIndexOf('/', cut - 1), shown.lastIndexOf('\\', cut - 1))
     if (at < 0) return shown
-    cut = at === 0 ? 1 : at
+    cut = at === 0 || (at === 2 && shown[1] === ':') ? at + 1 : at
   }
   return shown.slice(0, cut)
 }
 
 /** What the viewer tells the person when `uploadFiles` returns. Before
  *  #2930 a file the host had put in Downloads, instead of the folder the
- *  person chose, was reported as a plain success. */
+ *  person chose, was reported as a plain success; before #3048 a success
+ *  did not say where the file landed. */
 export function uploadOutcomeMessage(
   results: UploadOutcome[],
   requested: number,
@@ -15608,9 +15611,15 @@ export function uploadOutcomeMessage(
           : `${ok.length} files, ${elsewhere.length} of them to ${folder}`
     return { level: 'warning', text: `Uploaded ${what} instead: the host refused ${destPath}` }
   }
+  // #3048 — where it landed, by path. On a machine-wide Windows install that
+  // is the signed-in person's Downloads, which may be on a share.
+  const folders = ok.map((r) => uploadLandingFolder(r.path, r.name)).filter(Boolean)
+  const count = new Set(folders.map(comparableHostPath)).size
+  const where =
+    count === 0 ? '' : count === 1 ? ` to ${folders[0]}` : ` to ${count} folders (first: ${folders[0]})`
   return {
     level: 'success',
-    text: ok.length === 1 ? `Uploaded ${ok[0].name}` : `Uploaded ${ok.length} files`,
+    text: ok.length === 1 ? `Uploaded ${ok[0].name}${where}` : `Uploaded ${ok.length} files${where}`,
   }
 }
 

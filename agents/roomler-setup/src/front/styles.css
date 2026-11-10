@@ -319,6 +319,10 @@ button.secondary:hover:not(:disabled) {
 .checklist li.ok .icon::before { content: "✓"; color: var(--success-fg); }
 .checklist li.error .icon::before { content: "✗"; color: var(--error-fg); }
 .checklist li.warning .icon::before { content: "⚠"; color: var(--warning-fg); }
+/* #3590: a step still to come, and one the install stopped before. */
+.checklist li.pending .icon::before { content: "○"; }
+.checklist li.not-reached { opacity: 0.6; }
+.checklist li.not-reached .icon::before { content: "–"; }
 
 /* Progress bar */
 .progress-bar {

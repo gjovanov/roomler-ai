@@ -15,7 +15,7 @@
 //! | the row exists in the device's tenant and names this device | `agent_disconnect`, nothing written |
 //! | the row is live and not ended | the row's own end reason (an admin's end written during the gap reads `admin_terminated`), nothing written |
 //! | `resume_by` has not passed, when the row has one | `agent_disconnect`, the row ended as inferred |
-//! | the gate a request runs, run again (`controller::resume_gate`) | `admin_terminated`; a read that failed decides nothing: `agent_disconnect`, nothing written |
+//! | the gate a request runs, run again (`controller::resume_gate`) | `admin_terminated`; a read that failed decides nothing: `agent_disconnect`, and the session is over, so the device's newest connection ends the row as inferred |
 //! | the org's maximum length, counted from `started_at` | `idle_timeout`, limit `max_duration` |
 //! | the FR-115 slot, taken again under the session's own id | `agent_disconnect` |
 //!
@@ -23,7 +23,12 @@
 //! fencing number ([`RemoteSessionDao::commit_resume`]); the hub rebuilds the
 //! session and counts it; the row is read once more, so an end that landed
 //! meanwhile wins; and only then does the device hear `rc:session.resumed`.
-//! Consent is the one check not re-run.
+//! Consent is the one check not re-run. A commit that matched nothing is
+//! decided from the row read again (`commit`): the device's NEWEST
+//! connection tries once more at the row's number while the row is still
+//! live and inside its window (an older connection's claim of the same
+//! device committed first), or ends the row it refuses; an older
+//! connection's claim does neither, and leaves the slot alone.
 //!
 //! **The registration read.** Then every live row of the device created
 //! before this registration that the hello does not claim (and the hub did
@@ -166,6 +171,32 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
             );
         }
     };
+    claim_as_read(state, ctx, session_id, row).await;
+}
+
+/// Decide one claim on its row as the claim read it: everything after the
+/// read. Public for the integration tests, which hand it a row read before
+/// another claim of the same device committed: two claims racing is a case
+/// they cover, and no socket orders one on demand. A row that is not this
+/// device's, in its org, is refused as the read refuses it.
+#[doc(hidden)]
+pub async fn claim_as_read(
+    state: &RemoteState,
+    ctx: &AgentCtx,
+    session_id: ObjectId,
+    row: RemoteSession,
+) {
+    let agent = ctx.agent_id;
+    if row.agent_id != agent || row.tenant_id != ctx.tenant_id || row.id != Some(session_id) {
+        return refuse(
+            state,
+            ctx,
+            session_id,
+            EndReason::AgentDisconnect,
+            None,
+            None,
+        );
+    }
     // Ended while no pod held it (an admin's end, the controller's): its own
     // reason, and the row is left as it is.
     if row.ended_at.is_some() || row.phase == SessionPhase::Closed {
@@ -222,17 +253,33 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
             );
         }
         // P1b-2 (P1b-1's review, H1) — a read failed, so nothing was
-        // decided: not resumed, and nothing written. The viewer's redial
+        // decided: not resumed, and no verdict written. The viewer's redial
         // runs the whole gate again, consent included.
+        //
+        // Review 2, N4 — but the device is told to close the session, so it
+        // is over, and its row ends with it rather than reading live while
+        // the device stays connected: `agent_disconnect` at the row's own
+        // last clock, marked inferred (no one decided it), fenced at the
+        // number read. Only the device's newest connection writes it: an
+        // older connection's claim must not end the session the newest one
+        // may be resuming.
         ResumeGate::Unknown(why) => {
-            warn!(%agent, session = %session_id, %why, "rc session claim: the gate could not be run — refused, the row left as it is");
+            let end = if newest_connection(state, ctx, session_id).await {
+                warn!(%agent, session = %session_id, %why, "rc session claim: the gate could not be run — refused, and the row ended as inferred");
+                let at = inferred_end(&row);
+                note_registration_end(state, ctx, session_id, Some(at));
+                Some(RowEnd::inferred(seq, at, EndSource::Registration))
+            } else {
+                warn!(%agent, session = %session_id, %why, "rc session claim: the gate could not be run on an older connection's claim — refused, the row left to the newest");
+                None
+            };
             return refuse(
                 state,
                 ctx,
                 session_id,
                 EndReason::AgentDisconnect,
                 None,
-                None,
+                end,
             );
         }
     };
@@ -275,31 +322,12 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
         );
     };
 
-    // The commit: at the number read, still live, its window still open.
-    let committed = state
-        .remote_sessions
-        .commit_resume(ctx.tenant_id, agent, session_id, seq, now)
-        .await;
-    if !matches!(committed, Ok(true)) {
-        if let Some(lease) = &slot {
-            crate::slots::release_unused(state, lease, None).await;
-        }
-        if let Err(e) = &committed {
-            warn!(%agent, session = %session_id, %e, "rc session claim: the commit failed — refused");
-        }
-        // Someone ended it, another pod resumed it, or its window closed:
-        // read it again and answer from what is there.
-        let reason = match state
-            .remote_sessions
-            .find_in_tenant(ctx.tenant_id, session_id)
-            .await
-        {
-            Ok(r) if r.ended_at.is_some() => r.end_reason.unwrap_or(EndReason::AgentDisconnect),
-            _ => EndReason::AgentDisconnect,
-        };
-        return refuse(state, ctx, session_id, reason, None, None);
-    }
-    let next = seq + 1;
+    // The commit: at the number read, still live, its window still open; one
+    // that matched nothing is decided from the row read again.
+    let Some(committed) = commit(state, ctx, session_id, seq, now, slot.as_ref()).await else {
+        return;
+    };
+    let next = committed + 1;
 
     let built = state.fleet.rc_hub.resume_claimed(
         agent,
@@ -350,6 +378,174 @@ async fn claim(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) {
         .fleet
         .rc_hub
         .confirm_resumed(agent, &ctx.tx, session_id, next);
+}
+
+/// How long the claim waits on the device's presence: as the rejoin's relay
+/// waits on it. Past this, the presence counts as unreadable.
+const PRESENCE_READ_BUDGET: Duration = Duration::from_millis(250);
+
+/// The claim's commit (spec §4.4, "Fencing"), at the number read (`seq`,
+/// `now`). `Some(n)`: committed at `n`, and the session resumes at `n + 1`.
+/// `None`: refused, and answered.
+///
+/// A commit that matched nothing (or failed) is decided from the row read
+/// again. Before P1b-1's review it was always refused with no write, and its
+/// slot given back by the session's id (M4, L1; review 2, N4):
+///
+/// | The row read again | Answer | Slot |
+/// |---|---|---|
+/// | cannot be read | `agent_disconnect`, nothing written | left alone |
+/// | ended | its own reason, nothing written | given back: nobody holds it |
+/// | this is not the device's newest connection | `agent_disconnect`, nothing written | left alone: the newest may hold it |
+/// | live, names the device, inside any `resume_by`, not yet tried again | committed once more, at the row's number | as committed |
+/// | anything else | `agent_disconnect`, the row ended as inferred, fenced at the number last tried | given back when that end lands |
+///
+/// The second try is the case M4 found: an older connection's claim of the
+/// same device read the row first and committed first, then found its
+/// connection gone, and the row waits at its number for whichever connection
+/// claims it next. Refused, the live connection closed a session nobody
+/// ended. Only the newest connection tries again ([`newest_connection`]),
+/// and only once: an older one could take the fencing number from the live
+/// one. The end in the last row is fenced at the number last TRIED, never
+/// the number read again, so it lands nowhere if another claim resumed the
+/// session since.
+async fn commit(
+    state: &RemoteState,
+    ctx: &AgentCtx,
+    session_id: ObjectId,
+    mut seq: u32,
+    mut now: DateTime,
+    slot: Option<&Lease>,
+) -> Option<u32> {
+    let agent = ctx.agent_id;
+    let mut retried = false;
+    loop {
+        match state
+            .remote_sessions
+            .commit_resume(ctx.tenant_id, agent, session_id, seq, now)
+            .await
+        {
+            Ok(true) => return Some(seq),
+            Ok(false) => {}
+            Err(e) => {
+                warn!(%agent, session = %session_id, %e, "rc session claim: the commit failed; reading the row again");
+            }
+        }
+        let row = match state
+            .remote_sessions
+            .find_in_tenant(ctx.tenant_id, session_id)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(%agent, session = %session_id, %e, "rc session claim: the commit missed and the row could not be read again — refused, nothing written");
+                if let Some(lease) = slot {
+                    crate::slots::settle(lease);
+                }
+                refuse(
+                    state,
+                    ctx,
+                    session_id,
+                    EndReason::AgentDisconnect,
+                    None,
+                    None,
+                );
+                return None;
+            }
+        };
+        if row.ended_at.is_some() || row.phase == SessionPhase::Closed {
+            let reason = row.end_reason.unwrap_or(EndReason::AgentDisconnect);
+            info!(%agent, session = %session_id, ?reason, "rc session claim: it ended before the commit — refused");
+            if let Some(lease) = slot {
+                crate::slots::release_unused(state, lease, None).await;
+            }
+            refuse(state, ctx, session_id, reason, None, None);
+            return None;
+        }
+        if !newest_connection(state, ctx, session_id).await {
+            info!(%agent, session = %session_id, "rc session claim: an older connection of the device lost its commit — refused; the row and its slot are the newest connection's");
+            if let Some(lease) = slot {
+                crate::slots::settle(lease);
+            }
+            refuse(
+                state,
+                ctx,
+                session_id,
+                EndReason::AgentDisconnect,
+                None,
+                None,
+            );
+            return None;
+        }
+        now = DateTime::now();
+        let claimable = row.phase == SessionPhase::Active
+            && row.agent_id == agent
+            && row.resume_by.is_none_or(|by| by > now);
+        if claimable && !retried {
+            info!(%agent, session = %session_id, lost_at = seq, at = row.attach_seq, "rc session claim: the commit lost to another claim of the device — tried once more");
+            seq = row.attach_seq;
+            retried = true;
+            continue;
+        }
+        // Nobody resumes it through this claim, and the device is told to
+        // close it: its row ends with it, at its own last clock. Written only
+        // when it lands (the row is still at the number tried): an end of a
+        // session another claim resumed since would be a false entry in the
+        // audit, and writes nothing to the row anyway.
+        let lands = row.attach_seq == seq;
+        if let Some(lease) = slot {
+            if lands {
+                crate::slots::release_unused(state, lease, None).await;
+            } else {
+                crate::slots::settle(lease);
+            }
+        }
+        let end = lands.then(|| {
+            let at = inferred_end(&row);
+            note_registration_end(state, ctx, session_id, Some(at));
+            RowEnd::inferred(seq, at, EndSource::Registration)
+        });
+        info!(%agent, session = %session_id, at = seq, ended = lands, "rc session claim: it can no longer be resumed — refused");
+        refuse(
+            state,
+            ctx,
+            session_id,
+            EndReason::AgentDisconnect,
+            None,
+            end,
+        );
+        return None;
+    }
+}
+
+/// P1b-1's review, M4 — whether `ctx` is the device's NEWEST connection: its
+/// claim of `session_id` is still pending in this pod's hub (no later
+/// connection displaced it here, and nothing answered it), and the device's
+/// presence names no other pod (a later connection to another pod sets the
+/// presence before its hello's claims run, `roomler-ai-mod-fleet`'s socket).
+/// Only the newest connection may try a lost commit again or end the row it
+/// refuses. A presence that cannot be read counts as another pod's: the
+/// claim is then refused writing nothing, as before the review.
+async fn newest_connection(state: &RemoteState, ctx: &AgentCtx, session_id: ObjectId) -> bool {
+    if !state
+        .fleet
+        .rc_hub
+        .claim_pending(ctx.agent_id, &ctx.tx, session_id)
+    {
+        return false;
+    }
+    // One pod: no other can hold a connection of the device.
+    let Some(redis) = state.redis_pubsub.as_ref() else {
+        return true;
+    };
+    matches!(
+        tokio::time::timeout(
+            PRESENCE_READ_BUDGET,
+            redis.agent_presence_foreign(&ctx.agent_id.to_hex()),
+        )
+        .await,
+        Ok(Ok(None))
+    )
 }
 
 /// FR-115 — the session's slot taken again under its own id: its own lease,
@@ -440,9 +636,15 @@ async fn registration_read(state: &RemoteState, ctx: &AgentCtx) {
 /// (`host_disconnect`, `idle_timeout` with `limit: idle`, `error`) replaces
 /// the inferred `agent_disconnect` on the row, which then reads as an end
 /// that was seen: `end_source` cleared, `ended_at` still the row's own last
-/// clock, since the frame carries no time (`replace_inferred_end`). `false`
-/// when it is not such a session, and the hub's dispatch takes the frame as
-/// before.
+/// clock, since the frame carries no time (`replace_inferred_end`).
+///
+/// Review 2, N5 — so does an end inferred BEFORE this connection, which left
+/// it no note: the sweep's, once the device had been away past the window,
+/// or an earlier connection's registration read's, when the device came back
+/// more than once before it could report (`earlier_inferred_end`).
+///
+/// `false` when it is not such a session, and the hub's dispatch takes the
+/// frame as before.
 pub async fn device_end(
     state: &RemoteState,
     ctx: &AgentCtx,
@@ -454,12 +656,12 @@ pub async fn device_end(
         .registration_ends
         .get(&ctx.conn_id)
         .and_then(|ended| ended.get(&session_id).copied());
-    let Some(inferred_at) = noted else {
-        return false;
-    };
     // As the hub takes an agent's end: the reason as sent, and a limit only
     // where the device may name one.
     let limit = roomler_ai_mod_fleet::hub::device_end_limit(Role::Agent, reason, limit);
+    let Some(inferred_at) = noted else {
+        return earlier_inferred_end(state, ctx, session_id, reason, limit).await;
+    };
     match state
         .remote_sessions
         .replace_inferred_end(
@@ -496,6 +698,49 @@ pub async fn device_end(
         }
     }
     true
+}
+
+/// Review 2, N5 — the device's own end of a session of its own whose end was
+/// inferred before this connection (`RemoteSessionDao::replace_earlier_inferred_end`):
+/// its reason replaces the inferred `agent_disconnect`, `end_source` is
+/// cleared, and `ended_at` stays the row's own last clock, which dates the
+/// audit's trail. `false` when no such row matched (a seen end, another
+/// device's row, the one-time close's): the hub's dispatch takes the frame.
+async fn earlier_inferred_end(
+    state: &RemoteState,
+    ctx: &AgentCtx,
+    session_id: ObjectId,
+    reason: EndReason,
+    limit: Option<&'static str>,
+) -> bool {
+    match state
+        .remote_sessions
+        .replace_earlier_inferred_end(ctx.tenant_id, ctx.agent_id, session_id, reason)
+        .await
+    {
+        Ok(Some(ended_at)) => {
+            info!(
+                agent = %ctx.agent_id,
+                session = %session_id,
+                ?reason,
+                "rc session ended at the device during an earlier gap: its own reason replaces the inferred one"
+            );
+            state.fleet.rc_hub.record_end(
+                session_id,
+                ctx.agent_id,
+                ctx.tenant_id,
+                reason,
+                limit,
+                RowEnd::written(Some(ended_at)),
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            warn!(agent = %ctx.agent_id, session = %session_id, %e, "rc session the device ended: an earlier inferred end could not be replaced");
+            false
+        }
+    }
 }
 
 /// P1b-2 — the connection closed: what its registration ended is no longer

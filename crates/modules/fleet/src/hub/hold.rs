@@ -11,7 +11,9 @@
 //!   still holds a window outlives the viewer's socket. The hub keeps it with
 //!   no controller, tells the device nothing and writes nothing to the row,
 //!   until the viewer rejoins or the window ends, when it ends as the socket's
-//!   loss ended it before: `controller_hangup`.
+//!   loss ended it before: `controller_hangup`, marked `limit: hold_expired`
+//!   ([`LIMIT_HOLD_EXPIRED`]) so a reader can tell a resume its viewer never
+//!   rejoined from a hangup.
 //! * **The rejoin** ([`Hub::rejoin`]): the viewer's new socket is bound to the
 //!   session. The caller has checked the row names that person and run the
 //!   gate a request runs. A late call for the socket it replaced finds a
@@ -41,6 +43,16 @@ use roomler_core::cluster::session_slots::Lease;
 use tracing::info;
 
 use super::{EndWrite, Hub, ptr_eq};
+
+/// Review 2, N17 — the `limit` a held session ends with when its window ends
+/// with no rejoin, on the device's `rc:terminate` and in the audit's
+/// `session_ended`. The reason stays `controller_hangup`, as the viewer's
+/// socket loss ended it before FR-138; the mark is what tells a resume lost
+/// this way (a cached page that never rejoins, a session re-attached on
+/// another pod) from a person's hangup, and AC7's read counts it
+/// (`scripts/fr138-roll-read.sh`). Not an `end_source`: the session's time is
+/// real, not inferred, so its hours count. The device only logs a limit.
+pub(super) const LIMIT_HOLD_EXPIRED: &str = "hold_expired";
 
 /// A session its viewer may hold through the loss of the viewer's own socket:
 /// its viewer was told `resume_secs` (or a device's claim rebuilt it), it is
@@ -166,7 +178,11 @@ impl Hub {
                     window_secs,
                     "rc session held for its viewer: the window ended with no rejoin — ending it"
                 );
-                let _ = hub.end_own(session_id, EndReason::ControllerHangup, None);
+                let _ = hub.end_own(
+                    session_id,
+                    EndReason::ControllerHangup,
+                    Some(LIMIT_HOLD_EXPIRED),
+                );
             }
         });
     }
@@ -337,7 +353,7 @@ impl Hub {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DispatchCtx, OrgPolicy, ResumeHello, ResumedSession};
+    use super::super::{DispatchCtx, OrgPolicy, ResumeHello, Resumed, ResumedSession};
     use super::*;
     use bson::DateTime;
     use mongodb::Client;
@@ -820,6 +836,67 @@ mod tests {
         assert_eq!(
             terminated(&drain(&mut to_agent), next),
             Some(EndReason::ControllerHangup)
+        );
+    }
+
+    /// Review 2, N8 — the viewer's socket goes and the session is held; then
+    /// the device is displaced here, on the same pod, and its claim
+    /// re-attaches the session at the next number. The wait the viewer's
+    /// departure armed is void once the number moves, so the claim arms the
+    /// hold again: a page that never rejoins does not keep the session, its
+    /// place and its slot for good, and the hold still ends at the window.
+    #[tokio::test]
+    async fn a_claim_that_reattaches_a_held_session_arms_its_hold_again() {
+        let hub = hub().await;
+        let (agent, tenant, user) = (ObjectId::new(), ObjectId::new(), ObjectId::new());
+        let connect = |kept: Vec<ObjectId>| {
+            hub.register_agent_resuming(
+                agent,
+                tenant,
+                ObjectId::new(),
+                OsKind::Linux,
+                2,
+                true,
+                false,
+                ResumeHello {
+                    advertised: true,
+                    window: Some(1),
+                    kept,
+                },
+            )
+        };
+        let _first = connect(Vec::new());
+        let (tx, _rx) = hub.register_controller(user);
+        let sid = ask(&hub, agent, user, &tx).unwrap();
+        live(&hub, sid).await;
+        hub.unregister_controller(user, &tx);
+        assert!(controller_of(&hub, sid).is_none(), "held for its viewer");
+
+        let second = connect(vec![sid]);
+        let resumed = hub.resume_claimed(
+            agent,
+            &second.tx,
+            ResumedSession {
+                session_id: sid,
+                tenant_id: tenant,
+                controller_user_id: user,
+                permissions: Permissions::VIEW,
+                created_at: DateTime::now(),
+                started_at: DateTime::now(),
+                attach_seq: 1,
+                max_duration: None,
+                slot: None,
+                resume_secs: 1,
+            },
+        );
+        assert_eq!(resumed, Resumed::Reattached);
+        assert!(hub.confirm_resumed(agent, &second.tx, sid, 1));
+        assert!(controller_of(&hub, sid).is_none(), "still no viewer");
+
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        assert!(
+            hub.session_snapshot(sid).is_none(),
+            "the hold ends at the window"
         );
     }
 }

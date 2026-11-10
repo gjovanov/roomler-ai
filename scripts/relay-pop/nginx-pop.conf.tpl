@@ -26,6 +26,16 @@ stream {
 }
 
 http {
+    # The path, never the query. A daemon older than 0.4.210 dials
+    # `/derp?ticket=<its admission ticket>`, and nginx's default `combined`
+    # format logs the whole request line. `$uri` is the path alone, and no
+    # request header is logged, so a ticket in `Authorization: Bearer` never
+    # is either. (nginx's error log still names the full request line when
+    # the relay is unreachable; only the header form keeps a ticket out of it.)
+    log_format pop '$remote_addr [$time_local] "$request_method $uri $server_protocol" '
+                   '$status $body_bytes_sent $request_time "$http_user_agent"';
+    access_log /var/log/nginx/access.log pop;
+
     # DERP TLS termination -> the derp-relay binary (plain WS on 8443).
     server {
         listen 127.0.0.1:8444 ssl;

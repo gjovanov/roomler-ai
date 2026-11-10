@@ -125,6 +125,11 @@ mod device_list_tests;
 mod device_naming_tests;
 #[cfg(test)]
 mod enroll_key_tests;
+/// An enrollment credential works only while the person who minted it may
+/// still enroll devices in its org: the redemption asks again, and a removal
+/// revokes the person's keys.
+#[cfg(test)]
+mod enrollment_issuer_tests;
 #[cfg(test)]
 mod ephemeral_tests;
 #[cfg(test)]
@@ -284,6 +289,13 @@ mod rc_request_ceiling_tests;
 /// the registration read's inferred ends, and off is today.
 #[cfg(test)]
 mod rc_resume_claim_tests;
+/// FR-138 — how a resumable session ends at the edges the reviews of P1b
+/// found: a session its viewer may not hold, a claim refused for no one's
+/// choice, two claims of one device racing, the device's own end after an
+/// inferred one, a hold nobody rejoins, and the first end over an inferred
+/// one.
+#[cfg(test)]
+mod rc_resume_ends_tests;
 /// FR-138 P1b-2 — the viewer's half of the server's resume: the hold through
 /// the viewer's own socket loss, the rejoin on either pod with the gate run
 /// again, the slot a held session never costs its own viewer (`replaces`
@@ -399,6 +411,10 @@ mod tunnel_tests;
 mod turn_usage_tests;
 #[cfg(test)]
 mod tutorial_tests;
+/// #3656 — a native client's credential in an `Authorization: Bearer` header
+/// on `/ws` and `/derp`, beside the query form released clients send.
+#[cfg(test)]
+mod upgrade_credential_tests;
 #[cfg(test)]
 mod usage_ledger_tests;
 #[cfg(test)]

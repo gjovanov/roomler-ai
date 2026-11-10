@@ -16,10 +16,10 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-// FR-69 P7b — what every upgrade shares moved to core: the query shape, the
-// affinity check and the "say why, then close" refusal. Re-exported so the
-// paths in this crate read as before.
+// FR-69 P7b — what every upgrade shares moved to core: the query shape, the affinity
+// check and the "say why, then close" refusal, re-exported so paths here read as before.
 pub use roomler_core::ws::upgrade::{WsParams, send_goodbye_and_close, tid_matches_claim};
+use roomler_core::ws::upgrade::{native_credential, with_challenge};
 
 pub async fn ws_upgrade(
     State(state): State<AppState>,
@@ -32,20 +32,20 @@ pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
 ) -> Response {
     match params.role.as_deref() {
-        // Native clients. They have no cookie jar, so the URL is the only
-        // place their credential can be — and accepting a cookie for these
-        // roles would mean a logged-in browser could open an AGENT socket.
+        // Native clients. No cookie jar: the credential is `Authorization: Bearer` from
+        // 0.4.210 or `?token=` from older ones, a Bearer header deciding (#3656) — and a
+        // cookie accepted for these roles would let a logged-in browser open an AGENT socket.
         // FR-69 P7b — the upgrades are their owners': the agent socket is
         // fleet's, the tunnel-client socket is network's. The host keeps the
         // `/ws` route and this role gate; a role whose module is not mounted
         // is refused with 503 rather than silently dropped.
-        Some("agent") => match params.token {
-            Some(t) => state.modules.agent_upgrade(t, params.tid, ws).await,
-            None => unauthorized("agent role requires ?token="),
+        Some("agent") => match native_credential(&headers, params.token) {
+            Some(t) => with_challenge(state.modules.agent_upgrade(t, params.tid, ws).await, true),
+            None => with_challenge(unauthorized("agent role: no credential"), false),
         },
-        Some("tunnel-client") => match params.token {
-            Some(t) => state.modules.tunnel_client_upgrade(t, params.tid, ws),
-            None => unauthorized("tunnel-client role requires ?token="),
+        Some("tunnel-client") => match native_credential(&headers, params.token) {
+            Some(t) => with_challenge(state.modules.tunnel_client_upgrade(t, params.tid, ws), true),
+            None => with_challenge(unauthorized("tunnel-client role: no credential"), false),
         },
         _ => {
             // Browser. Prefer the query token while older bundles are still

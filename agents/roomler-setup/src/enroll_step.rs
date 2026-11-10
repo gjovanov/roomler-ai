@@ -141,15 +141,29 @@ pub async fn enroll_folded(
         }
         None => roomlerd::machine::derive_machine_id(config_path),
     };
-    let fresh = roomlerd::enrollment::enroll(EnrollInputs {
-        server_url: server,
-        enrollment_token: token,
-        machine_id: &machine_id,
-        machine_name: device_name,
-        install: Some(install),
-    })
+    let fresh = roomlerd::enrollment::enroll_with(
+        &client()?,
+        EnrollInputs {
+            server_url: server,
+            enrollment_token: token,
+            machine_id: &machine_id,
+            machine_name: device_name,
+            install: Some(install),
+        },
+    )
     .await?;
     fold(existing, fresh)
+}
+
+/// #3432 — the wizard's client for an enroll: the one its other requests use
+/// (`wizard_shared::http`), whose resolver fails with a type of its own, so a
+/// name that does not resolve is told from a refused connection. No timeout
+/// and no User-Agent, as `reqwest::Client::new()` had before.
+fn client() -> anyhow::Result<reqwest::Client> {
+    use anyhow::Context as _;
+    wizard_shared::http::builder()
+        .build()
+        .context("building the enroll's HTTP client")
 }
 
 /// #3609 — the enroll alone, as the person at the screen: the server's answer
@@ -163,13 +177,16 @@ pub async fn enroll_issued(
     device_name: &str,
     install: InstallInfo,
 ) -> anyhow::Result<roomlerd::enrollment::Issued> {
-    roomlerd::enrollment::enroll_issued(EnrollInputs {
-        server_url: server,
-        enrollment_token: token,
-        machine_id,
-        machine_name: device_name,
-        install: Some(install),
-    })
+    roomlerd::enrollment::enroll_issued_with(
+        &client()?,
+        EnrollInputs {
+            server_url: server,
+            enrollment_token: token,
+            machine_id,
+            machine_name: device_name,
+            install: Some(install),
+        },
+    )
     .await
 }
 
@@ -187,13 +204,16 @@ pub async fn enroll_fresh_as(
     install: InstallInfo,
 ) -> anyhow::Result<Enrolled> {
     tracing::info!(%machine_id, "enrolling with the machine fingerprint the caller chose");
-    let fresh = roomlerd::enrollment::enroll(EnrollInputs {
-        server_url: server,
-        enrollment_token: token,
-        machine_id,
-        machine_name: device_name,
-        install: Some(install),
-    })
+    let fresh = roomlerd::enrollment::enroll_with(
+        &client()?,
+        EnrollInputs {
+            server_url: server,
+            enrollment_token: token,
+            machine_id,
+            machine_name: device_name,
+            install: Some(install),
+        },
+    )
     .await?;
     fold(None, fresh)
 }

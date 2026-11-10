@@ -110,6 +110,17 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   `Ok` even when a client could not be ended (logged, `alert = membership_tunnel_end`):
   an `Err` would stop the cascade before the call seats and room rows; what it leaves is
   `POST /api/admin/tunnel-clients/prune`'s. Devices the person enrolled are out of it.
+- **An enrollment credential ends with its issuer's right to enroll devices.** A daemon
+  enrollment token and an FR-51 ephemeral key act for the admin who minted them, so
+  `POST /api/agent/enroll` and `POST /api/agent/anchor` ask the mint's own gate again
+  (`fleet::agent::issuer_may_enroll`, `require_permission` with `MANAGE_AGENTS` for the
+  `sub`) after the archived gate and before the spend or `claim_use`. ⚠️ The refusal is a
+  plain 403 `forbidden`, never `NotAMember`: it is about someone other than the caller.
+  ⚠️ A failed read is a 500 that spends nothing. fleet's membership hook revokes the live
+  keys the person minted there (`revoke_minted_by`, under the claim's liveness filter) and
+  answers `Ok` on a failed write (`alert = membership_key_revoke`); a key no removal
+  reached is revoked at its first use refused for not-a-member. Losing the permission
+  while a member pauses a credential, never revokes it. Nothing is asked after the write.
 - **A removed device that enrolls again starts from a new device's settings** (#3627).
   `AgentDao::revive` REPLACES the tombstone with `new_row` for the request and keeps
   only `_id`, `tenant_id`, `machine_id`, `created_at`, `enrolled_by`, `token_gen`,
