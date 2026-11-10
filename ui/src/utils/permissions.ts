@@ -379,6 +379,23 @@ export function canManageTunnelPolicies(mask: number | null, isOwner: boolean): 
 }
 
 /**
+ * May this caller CHANGE the org's MagicDNS domain and upstream resolvers
+ * (`PUT …/magic-dns`)? Server gate: `MANAGE_AGENTS` (owner/ADMINISTRATOR bypass
+ * included): every overlay node of the org applies them, its whole DNS under an
+ * exit node. Reading them stays any member's (`GET …/magic-dns`), so this gates
+ * the editor, not the page.
+ *
+ * FAIL-OPEN on `mask === null`, like {@link canManageTunnelPolicies}: the page
+ * awaited the membership, so `null` means that fetch failed; the server then
+ * decides, and its 403 turns the editor read-only rather than erroring.
+ */
+export function canEditMagicDns(mask: number | null, isOwner: boolean): boolean {
+  if (isOwner) return true
+  if (mask === null) return true
+  return hasPermission(mask, byKeys(['MANAGE_AGENTS']))
+}
+
+/**
  * Nav gate for the Invites surface (sidebar item + dashboard card).
  * Deliberately FAIL-CLOSED on `mask === null`, like {@link canQueryAnalytics}
  * and unlike {@link canSeeFleetNav}: `list_invites` requires INVITE_MEMBERS,
