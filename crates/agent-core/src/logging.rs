@@ -43,12 +43,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use roomler_ai_remote_control::upgrade_auth;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layered, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{
-    EnvFilter, filter::Directive, filter::LevelFilter, fmt, fmt::writer::MakeWriterExt,
+    EnvFilter, Registry, filter::Directive, filter::FilterFn, filter::LevelFilter, fmt,
+    fmt::writer::MakeWriterExt,
 };
 
 use crate::logs_upload::{LogLine, LogUploadLayer};
@@ -253,16 +255,14 @@ pub fn init() {
         // stack's level TRACE (`init_keeps_the_level_of_the_default_filter`).
         let console = std::io::stdout.with_filter(|meta| meta.target() != STEP_TARGET);
         let stdout = stdout.with_writer(console);
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
+        let _ = filtered(env_filter)
             .with((!quiet).then_some(stdout))
             .with(file)
             .with(upload_layer)
             .try_init();
         install_panic_hook(d.to_path_buf());
     } else {
-        let _ = tracing_subscriber::registry()
-            .with(env_filter)
+        let _ = filtered(env_filter)
             .with(stdout)
             .with(upload_layer)
             .try_init();
@@ -386,6 +386,24 @@ fn open_log_appender<A>(
 /// The filter this binary's logs are kept by: [`init`]'s.
 pub fn filter() -> EnvFilter {
     filter_for(std::env::var("RUST_LOG").ok().as_deref())
+}
+
+/// What [`filtered`] builds.
+type Filtered = Layered<FilterFn<fn(&tracing::Metadata<'_>) -> bool>, Layered<EnvFilter, Registry>>;
+
+/// [`init`]'s subscriber before its outputs: `env_filter`, then #3656's cap
+/// ([`upgrade_auth::may_log`]): tungstenite writes a client's whole upgrade
+/// request at TRACE, the credential's `Authorization` header included, and no
+/// spec may reach those lines, `trace` and a span-scoped TRACE directive
+/// included. The cap is a global layer with a fixed verdict per callsite and
+/// no level of its own, like the output layers, so it leaves the level the
+/// filter sets (`init_keeps_the_level_of_the_default_filter`) and every other
+/// callsite's interest as they were.
+fn filtered(env_filter: EnvFilter) -> Filtered {
+    let cap: fn(&tracing::Metadata<'_>) -> bool = upgrade_auth::may_log;
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::filter::filter_fn(cap))
 }
 
 /// [`filter`] under the given `RUST_LOG`, or with none set.
@@ -1387,13 +1405,69 @@ mod tests {
         }
     }
 
-    /// Whether [`filter_for`] under `rust_log` keeps what `check` asks about,
-    /// on a dispatcher of the test's own. Making one rebuilds every callsite's
-    /// cached interest, so no other test's filter answers for this one.
+    /// Whether [`init`]'s filtering under `rust_log` keeps what `check` asks
+    /// about, on a dispatcher of the test's own. Making one rebuilds every
+    /// callsite's cached interest, so no other test's filter answers for this one.
     fn kept(rust_log: Option<&str>, check: impl FnOnce() -> bool) -> bool {
-        let dispatch =
-            tracing::Dispatch::new(tracing_subscriber::registry().with(filter_for(rust_log)));
+        let dispatch = tracing::Dispatch::new(filtered(filter_for(rust_log)));
         tracing::dispatcher::with_default(&dispatch, check)
+    }
+
+    /// #3656 — tungstenite writes a client's whole upgrade request at TRACE,
+    /// the credential's header included. No spec reaches those lines: not
+    /// `trace`, not a directive naming the crate or the module, and not a
+    /// span-scoped TRACE directive, which `EnvFilter` lets win over every
+    /// target directive. Their DEBUG lines and every other target keep what
+    /// the spec gives them, and the level the stack runs at is the filter's.
+    #[test]
+    fn no_spec_writes_a_clients_upgrade_request() {
+        use tracing::Level;
+        const REQUEST: &str = "tungstenite::handshake::client";
+        for rust_log in [
+            "trace",
+            "tungstenite=trace,tokio_tungstenite=trace",
+            "info,tungstenite::handshake::client=trace",
+        ] {
+            let on = |check: fn() -> bool| kept(Some(rust_log), check);
+            assert!(
+                !on(|| tracing::enabled!(target: REQUEST, Level::TRACE)),
+                "{rust_log}"
+            );
+            assert!(
+                !on(|| tracing::enabled!(target: "tokio_tungstenite::compat", Level::TRACE)),
+                "{rust_log}"
+            );
+            assert!(
+                on(|| tracing::enabled!(target: REQUEST, Level::DEBUG)),
+                "{rust_log}"
+            );
+        }
+        let in_org_span = |check: fn() -> bool| {
+            kept(Some("info,[org]=trace"), || {
+                let _org = tracing::info_span!("org", label = "acme").entered();
+                check()
+            })
+        };
+        assert!(in_org_span(|| tracing::enabled!(
+            target: "roomlerd::ws_connect",
+            Level::TRACE
+        )));
+        assert!(!in_org_span(
+            || tracing::enabled!(target: REQUEST, Level::TRACE)
+        ));
+        assert!(kept(Some("trace"), || tracing::enabled!(
+            target: "roomlerd::ws_connect",
+            Level::TRACE
+        )));
+        assert!(!kept(
+            None,
+            || tracing::enabled!(target: REQUEST, Level::DEBUG)
+        ));
+        assert_eq!(
+            tracing::Subscriber::max_level_hint(&filtered(filter_for(None))),
+            Some(LevelFilter::INFO),
+            "the cap leaves the stack at the default filter's level"
+        );
     }
 
     #[test]

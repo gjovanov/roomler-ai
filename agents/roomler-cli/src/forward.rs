@@ -3,7 +3,9 @@
 //! `roomler forward` — open one TCP forward through an enrolled
 //! agent. The TeamViewer-shaped flow:
 //!
-//! 1. WS-connect to `wss://<server>/ws?role=tunnel-client&token=<jwt>`.
+//! 1. WS-connect to `wss://<server>/ws?role=tunnel-client&tid=<tenant>`, the
+//!    JWT in `Authorization: Bearer` (#3656; [`dial`] has the one-time
+//!    query-form fallback for a server older than the header).
 //! 2. `rc:tunnel.hello { role: TunnelClient, version, supported_transports }`.
 //! 3. `rc:tunnel.open { agent_id, transport: "webrtc-dc-v1" }`.
 //!    Wait for `rc:tunnel.opened` → carries `session_id` + `ice_servers`.
@@ -30,9 +32,18 @@ use async_trait::async_trait;
 use bson::oid::ObjectId;
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
+use roomler_ai_remote_control::upgrade_auth::{self, Carrier};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio::time::error::Elapsed;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::{Request, Response};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async, tungstenite, tungstenite::Message,
+};
 use tracing::{debug, info, warn};
 use tunnel_core::driver::{SessionOutcome, SessionParams, Target, run_tunnel_session};
 use tunnel_core::signaling_link::{TunnelSignalingSink, TunnelSignalingSource};
@@ -73,9 +84,7 @@ const RECONNECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_sec
 
 /// Read half of the signaling WebSocket. Aliased so [`WsSource`] can name the
 /// concrete `SplitStream` it wraps.
-type WsReadHalf = futures::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
->;
+type WsReadHalf = futures::stream::SplitStream<Ws>;
 
 /// The CLI's [`TunnelSignalingSink`]: every outbound `ClientMsg` the driver
 /// emits is pushed onto the single outbound mpsc a lone writer task drains
@@ -281,17 +290,19 @@ async fn run_session(
     // tunnel-hub is pod-local). Extracted from our own JWT; the server
     // re-validates against the verified claims, and pre-S6 servers
     // ignore the param.
+    // #3656 — the token is not in the URL: `dial` presents it in a header.
     let tid_param = tenant_id_from_jwt(&cfg.tunnel_client_token)
         .map(|t| format!("&tid={t}"))
         .unwrap_or_default();
-    let ws_url = format!(
-        "{ws_base}?role=tunnel-client&token={}{tid_param}",
-        urlencoding_lite(&cfg.tunnel_client_token)
-    );
+    let ws_url = format!("{ws_base}?role=tunnel-client{tid_param}");
     info!(%ws_base, "connecting websocket");
-    let (ws_stream, _resp) = connect_async(&ws_url)
-        .await
-        .with_context(|| format!("WS connect to {ws_base}"))?;
+    let (ws_stream, _resp) = match dial(&ws_url, &cfg.tunnel_client_token).await {
+        Ok(answer) => answer.with_context(|| format!("WS connect to {ws_base}"))?,
+        Err(_) => bail!(
+            "WS connect to {ws_base} timed out after {}s",
+            WS_DIAL_TIMEOUT.as_secs()
+        ),
+    };
     info!("websocket connected");
     let (mut ws_sink, ws_source) = ws_stream.split();
 
@@ -389,6 +400,86 @@ pub(crate) fn parse_remote(s: &str) -> Result<(String, u16)> {
         .parse()
         .with_context(|| format!("invalid port {port_str}"))?;
     Ok((host.to_string(), port))
+}
+
+/// One upgrade attempt's limit, the daemon's (`WS_CONNECT_TIMEOUT`): a TLS
+/// handshake that hangs behind a middlebox must not hold the session forever.
+const WS_DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+type Answer = Result<Result<(Ws, Response), tungstenite::Error>, Elapsed>;
+
+/// #3656 — the upgrade request for the tunnel-client socket at `url` with
+/// `token` in `carrier`: an `Authorization: Bearer` header whose value is
+/// marked sensitive, or the query form a server older than the header reads.
+/// Never both.
+fn ws_request(url: &str, token: &str, carrier: Carrier) -> Result<Request, tungstenite::Error> {
+    match carrier {
+        Carrier::Header => {
+            let mut request = url.into_client_request()?;
+            let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))?;
+            bearer.set_sensitive(true);
+            request.headers_mut().insert(header::AUTHORIZATION, bearer);
+            Ok(request)
+        }
+        Carrier::Query => {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}token={}", urlencoding_lite(token)).into_client_request()
+        }
+    }
+}
+
+/// #3656 — dial with the token in a header, each attempt bounded by
+/// [`WS_DIAL_TIMEOUT`], and hand back the last answer. The daemon's rule
+/// (`roomlerd::ws_connect::dial`): ONE redial in the query form after a
+/// refusal with no verdict on the credential (a server older than the header,
+/// or a header dropped on the way), and an endpoint where that redial
+/// upgraded keeps the query form for [`upgrade_auth::QUERY_FORM_FOR`]. A
+/// refusal that names an error never puts the token into a URL.
+async fn dial(url: &str, token: &str) -> Answer {
+    let notes = upgrade_auth::query_form_notes();
+    let endpoint = upgrade_auth::endpoint_of(url);
+    let first = notes.carrier_for(endpoint);
+    let answer = dial_with(url, token, first).await;
+    if first == Carrier::Query || !asks_for_query_form(&answer) {
+        return answer;
+    }
+    debug!(
+        %endpoint,
+        "upgrade refused with no verdict on the credential (a server older than the header, \
+         or a header dropped on the way); dialling once more with it in the query"
+    );
+    let again = dial_with(url, token, Carrier::Query).await;
+    if matches!(again, Ok(Ok(_))) {
+        notes.note_query_form(endpoint);
+        info!(
+            %endpoint,
+            "this endpoint took the token only in the query: its dials carry it there \
+             for the next 6 h (#3656)"
+        );
+    }
+    again
+}
+
+async fn dial_with(url: &str, token: &str, carrier: Carrier) -> Answer {
+    match ws_request(url, token, carrier) {
+        Ok(request) => tokio::time::timeout(WS_DIAL_TIMEOUT, connect_async(request)).await,
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+/// Whether a dial's answer is a refusal [`upgrade_auth::asks_for_query_form`]
+/// reads as a request for the query form.
+fn asks_for_query_form(answer: &Answer) -> bool {
+    let Ok(Err(tungstenite::Error::Http(refused))) = answer else {
+        return false;
+    };
+    let challenges = refused.headers().get_all(header::WWW_AUTHENTICATE);
+    upgrade_auth::asks_for_query_form(
+        refused.status().as_u16(),
+        challenges.iter().filter_map(|v| v.to_str().ok()),
+    )
 }
 
 /// S6 — best-effort extraction of the `tenant_id` claim from OUR OWN
@@ -616,6 +707,58 @@ mod tests {
         assert_eq!(
             authorization.as_deref(),
             Some(format!("Bearer {token}").as_str())
+        );
+    }
+
+    /// #3656 — each carrier puts the token in one place only: a sensitive
+    /// header with the URL unchanged, or the URL alone.
+    #[test]
+    fn each_carrier_puts_the_token_in_one_place_only() {
+        let url = "wss://roomler.ai/ws?role=tunnel-client&tid=t1";
+        let header_form = ws_request(url, "a.b c", Carrier::Header).unwrap();
+        assert_eq!(header_form.uri().to_string(), url);
+        let bearer = header_form.headers().get(header::AUTHORIZATION).unwrap();
+        assert_eq!(bearer, "Bearer a.b c");
+        assert!(bearer.is_sensitive());
+        assert!(
+            !format!("{header_form:?}").contains("a.b c"),
+            "{header_form:?}"
+        );
+        let query_form = ws_request(url, "a.b c", Carrier::Query).unwrap();
+        assert_eq!(query_form.uri().to_string(), format!("{url}&token=a.b%20c"));
+        assert!(query_form.headers().get(header::AUTHORIZATION).is_none());
+    }
+
+    /// #3656 — a server older than the header answers a bare 401: ONE redial
+    /// in the query form with no header, and the endpoint's next dial goes
+    /// straight to the query form. A redial refused too would note nothing.
+    #[tokio::test]
+    async fn a_server_older_than_the_header_hears_the_token_in_the_query() {
+        let (server, log) =
+            front(|(uri, _)| (!uri.contains("token=")).then_some((401, None))).await;
+        let url = format!(
+            "{}/ws?role=tunnel-client",
+            server.replace("http://", "ws://")
+        );
+        dial(&url, "tok")
+            .await
+            .unwrap()
+            .expect("the query form upgrades");
+        dial(&url, "tok")
+            .await
+            .unwrap()
+            .expect("the noted endpoint upgrades");
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "/ws?role=tunnel-client".to_string(),
+                    Some("Bearer tok".to_string())
+                ),
+                ("/ws?role=tunnel-client&token=tok".to_string(), None),
+                ("/ws?role=tunnel-client&token=tok".to_string(), None),
+            ]
         );
     }
 
