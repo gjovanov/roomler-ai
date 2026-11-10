@@ -491,9 +491,11 @@ The rules each door keeps:
 
 - **Every refusal that must leave the token usable runs before the spend**: an archived
   org, a tunnel token whose subject is no longer a member of its org
-  ([below](#a-tunnel-client-ends-with-its-owners-membership)), the plan's cap, a tunnel
-  re-enrollment the token's subject may not make, a read that failed. **The spend runs
-  before anything is written.**
+  ([below](#a-tunnel-client-ends-with-its-owners-membership)), a daemon or anchor token
+  whose issuer may no longer enroll devices in its org
+  ([below](#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)), the
+  plan's cap, a tunnel re-enrollment the token's subject may not make, a read that
+  failed. **The spend runs before anything is written.**
 - **Two answers, never one.** A token spent before is 401 `This enrollment token has
   already been used`. A ledger that cannot answer is a retryable 503 and the token stays
   valid. "Already used" sends a person looking for whoever used the token, so a ledger
@@ -565,6 +567,57 @@ seat and a room membership do ([§3](#the-media-socket-admits-only-the-calls-par
   org's fleet, and removing one stays a device manager's decision
   (`DELETE …/agent/{id}`). Tunnel policies naming the person are left in place for an
   admin to edit; they apply again if the person is added back.
+
+### An enrollment credential ends with its issuer's right to enroll devices
+
+A single-use enrollment token and an FR-51 ephemeral key act for the admin who minted
+them (the token's `sub`, the key's `created_by`): the device they enroll is that
+person's, and an anchor records them as `anchored_by`. So every use asks again what the
+mint asked, whether that person holds `MANAGE_AGENTS` in the credential's org
+(`issuer_may_enroll`, `crates/modules/fleet/src/agent.rs:160`, the mint's own
+`require_permission`, which nobody outside the org passes):
+
+- **Both doors ask it**: `POST /api/agent/enroll`, for a token and a key alike
+  (`crates/modules/fleet/src/agent.rs:353`), and `POST /api/agent/anchor`
+  (`crates/modules/fleet/src/exec_service.rs:151`). They ask after the archived-org
+  gate and before the token's spend or the key's claim
+  ([above](#an-enrollment-token-is-spent-once-through-one-owner-3328)). A token a
+  pairing delivered acts for the approver, and a join-org push's token for the admin
+  who pushed it.
+- **A refusal is a plain 403 `forbidden`**, with one sentence whether the issuer left
+  the org or no longer manages its devices, so the credential tells whoever holds it
+  nothing more about its issuer; the log line keeps the reason. It is never
+  `not_a_member`, the code that sends a page out of the org
+  ([§3](#a-403-is-an-answer-not-an-expired-credential-fr-82)): these doors are a
+  device's. The token stays unspent, the key's `uses` stay as they were, and nothing is
+  written. A read that failed is a 500 that spends nothing.
+- **Removed from the org, or leaving it, revokes the live keys the person minted
+  there**, the way `DELETE …/agent/enroll-key/{key_id}` revokes one. This is `fleet`'s
+  `MembershipLifecycle` hook (`crates/modules/fleet/src/membership.rs`), after
+  `network` in `HOOK_ORDER`. It is one write under the claim's own liveness filter
+  (`EnrollmentKeyDao::revoke_minted_by`), so a use racing it either claimed first or is
+  refused, and a key that expired or was used up keeps how it ended. The key list shows
+  the revoked keys as revoked, and a second run changes nothing.
+- **That hook never stops the cascade either.** It logs a write that failed
+  (`alert = membership_key_revoke`) and answers `Ok`. A key it could not revoke still
+  enrolls nothing while its minter is not a member, and its first refused use revokes
+  it, as it does any key whose minter's membership ended without the hook. Until then
+  the key is listed as active, and it works again once its minter is back in the org
+  with Manage devices: revoke such a key by hand to end it for good.
+- **Losing Manage devices while staying a member pauses a credential**, whether a role
+  was taken away or a role's bits were edited. The credential is refused but not
+  revoked, the key list still shows the key as active, and it works again if the person
+  regains the permission. A single-use token is never revoked: it lives ten minutes,
+  and each use asks.
+- **Nothing is asked after the write.** Devices the person enrolled stay theirs when
+  they leave, so an enrollment that passed the check just before a removal ends like
+  one that finished before it. For a key, the claim and the removal's revoke arbitrate
+  on the key row itself.
+- **What an issuer's departure leaves as it was**: the devices they enrolled (an
+  ephemeral one still ends by its own TTL), who owns a device that enrolls again
+  ([#3627](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)),
+  and the anchors they set. A join-org push asks for `MANAGE_AGENTS` in both orgs at
+  the click; at enrollment its token is asked about in the target org only.
 
 ### A removed thing answers nothing (#1821, #1829)
 

@@ -257,15 +257,62 @@ pub async fn ask(server: &str) -> Asked {
     }
 }
 
-/// [`ask`], for a caller that decides on the switches alone: an install that is
-/// about to run refuses on "off", whichever way it came to be off.
-pub async fn fetch(server: &str) -> SetupFeatures {
-    ask(server).await.features
+/// #3432 — the switches, for the install that is about to run, through the
+/// wizard's own client: the server's answer (an older server's reads as every
+/// switch off, which the install refuses), or the failure with its cause when
+/// there was no answer, so a network that is down never reads as "this server
+/// does not offer it". [`ask`], for the Welcome page, still never fails.
+pub async fn fetch(server: &str) -> anyhow::Result<SetupFeatures> {
+    use anyhow::Context as _;
+    let url = features_url(server);
+    let client = wizard_shared::http::builder()
+        .user_agent(crate::proxy::USER_AGENT)
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .context("no HTTP client")?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() && !older_server(status) {
+        return Err(wizard_shared::http::HttpStatus::of("GET", resp)
+            .await
+            .into());
+    }
+    let body = resp.bytes().await.with_context(|| format!("GET {url}"))?;
+    Ok(parse(status, &body))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3432 — the install's request for the switches fails with its cause
+    /// when nothing answered, never as "every switch off", which read as
+    /// "this server does not offer the daemon install".
+    #[tokio::test]
+    async fn the_install_hears_why_the_server_could_not_be_asked() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = fetch(&format!("http://127.0.0.1:{port}"))
+            .await
+            .expect_err("nothing listens there");
+        let failure = crate::failure::Failure::build(
+            crate::steps::StepId::Preflight,
+            roomler_ai_remote_control::setup_diagnostics::ErrorCode::Preflight,
+            false,
+            &err,
+        );
+        assert_eq!(
+            failure.kind,
+            crate::failure::Kind::ConnectionRefused,
+            "{failure:?}"
+        );
+    }
 
     const ON: SetupFeatures = SetupFeatures {
         pairing: true,

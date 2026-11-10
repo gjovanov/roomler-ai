@@ -263,7 +263,7 @@ the installer and does not read the service's `Environment`: there, both are on.
 > without elevation, `agents/roomler-setup/src/machine_write.rs:407`) first gives
 > the folder to Administrators by handle, refusing a link
 > (`crates/agent-core/src/machine_tree.rs:680`). Its `icacls` step
-> (`agents/roomler-setup/src/orchestrator_agent.rs:1747`)
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1748`)
 > takes `%ProgramData%\roomler` for Administrators, then drops its inheritance
 > and grants in one `icacls` call, and stops if it cannot take it.
 

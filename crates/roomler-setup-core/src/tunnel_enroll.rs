@@ -112,7 +112,7 @@ pub async fn enroll(
         "client_version": client_version,
     });
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(30))
         .build()
@@ -124,10 +124,9 @@ pub async fn enroll(
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("enrollment failed (HTTP {status}): {body}"));
+    if !resp.status().is_success() {
+        // #3432 — the server's answer as a type: its status and what it said.
+        return Err(crate::http::HttpStatus::of("POST", resp).await.into());
     }
     let parsed: EnrollResponse = resp
         .json()

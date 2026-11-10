@@ -143,7 +143,7 @@ plus `probe_ms` and `probe_cached`.
 | AV1, AMF, VideoToolbox and Media Foundation are never asked for 4:4:4 | `av1_nvenc` hard-errors on it and every other AV1 backend lists 4:2:0 only; AMF has no 4:4:4 surface; VideoToolbox HEVC has only Main / Main10 / Main42210; `*_mf` takes NV12 — locked by a test against the vocabulary |
 
 What the fleet advertised on 0.4.88 (server records, 2026-09-08; the D3D12 and
-Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
+Vulkan cells are FR-78's; the two arm64 rows are FR-122's, on 0.4.189 and 0.4.208):
 
 | Host | Cells | Probe |
 |---|---|---|
@@ -155,6 +155,7 @@ Vulkan cells are FR-78's; the arm64 row is FR-122's, on 0.4.189):
 | the WSL sibling (RTX through WSL's libcuda) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — its four software Vulkan ICDs open and refuse | 5.9 s |
 | mars (no GPU, Linux) | `h264/openh264` · `vp9/libvpx` | 0.5 s |
 | a rented DGX Spark (NVIDIA GB10, arm64 Linux, driver 580; 2026-10-30) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `av1/nvenc` · `h264/nvenc` 4:2:0+4:4:4 · `vp9/libvpx` — sessions proven on `h264/nvenc` 4:4:4 and `av1/nvenc` | 3.0 s |
+| an AWS g5g (NVIDIA T4G, arm64 Linux, driver 595; 2026-11-10, on 0.4.208) | `h264/openh264` · `hevc/nvenc` 4:2:0+4:4:4 · `hevc/vulkan` · `h264/nvenc` 4:2:0+4:4:4 · `h264/vulkan` · `vp9/libvpx` — no AV1: the T4G has no AV1 encoder, and `av1_vulkan` is on the denylist. Sessions proven on `hevc/nvenc` and on `h264/nvenc`, each in 4:2:0 and in 4:4:4; the two Vulkan cells opened and no session ran on them | 2.9 s (18.9 s on the box's first start, 16.3 s of it opening `hevc_vulkan`) |
 
 The probe's cost grew with the device walk (the dev box 4.3 → 6.1 s, WSL 2.5 →
 5.9 s); the cache pays it once per build, driver and hardware.

@@ -65,8 +65,8 @@
 //             and build: per minute at the peak and at p99, the sweeps they came
 //             in, the route waves and network deltas beside them, the carriers
 //             that failed their revalidation, and what P3's gate would have kept
-//             of a build without it (a replay, so a build with the gate reads
-//             kept = pokes).
+//             of a build without it (a replay; a build with the gate reads kept =
+//             pokes, except in the two cases docs/stall-watch.md §7.1 names).
 //   --swaps   AC3: what a capture-size change costs the pump, from its heartbeats,
 //             by encoder and constrained: a window whose `dims_swaps` rose
 //             (a downscale-tier change or its undo) and a window whose size moved

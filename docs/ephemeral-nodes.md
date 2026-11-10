@@ -81,6 +81,20 @@ org switch needs `MANAGE_TENANT` — deciding the credential class exists is an
 org-owner decision, minting within it is fleet administration). The response's
 `key` is shown **exactly once** and is not stored; the list can never return it.
 
+A key acts for the admin who minted it: every device it enrolls is theirs. So
+each use asks again whether that person may still enroll devices in the org
+(`MANAGE_AGENTS`, the mint's own check):
+
+- **They leave the org, or are removed from it**: their live keys there are
+  revoked, and the list shows them revoked.
+- **They stay a member but lose Manage devices**: their keys are refused but
+  not revoked, and work again if they regain it.
+- A refused use answers **403** and enrolls nothing, and the key's `uses` stay
+  as they were. Mint a new key from an account that manages the org's devices.
+
+The devices a key already enrolled are not touched, and each still ends by its
+own TTL ([`security-baseline.md`](security-baseline.md#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)).
+
 The ephemeral property **rides the credential, never the request body**: a
 device cannot declare itself permanent (and evade the reaper), and a permanent
 device cannot be flipped ephemeral (and be scheduled for silent deletion) by

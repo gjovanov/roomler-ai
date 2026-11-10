@@ -22,6 +22,9 @@ pub mod elevation;
 pub mod extract;
 /// #3246 — a staged artifact, held open from the check to the run.
 pub mod held_file;
+/// #3432 — the wizard's HTTP client: names resolved with a failure of our own
+/// type, and a server's refusal as a type too.
+pub mod http;
 pub mod integration;
 pub mod msi_runner;
 pub mod progress;

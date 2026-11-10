@@ -181,8 +181,9 @@ pub trait FleetLifecycle: Send + Sync {
 /// The host owns org membership (`DELETE …/member/{user_id}`: removed by an
 /// admin, or left), `chat` owns room membership (`POST …/room/{room_id}/leave`).
 /// A module that admitted something on a membership withdraws it here: `network`
-/// the person's tunnel clients in the org, `conference` the call seats they hold
-/// (`media:join` admitted them as a member), `chat` their room memberships.
+/// the person's tunnel clients in the org, `fleet` the enrollment keys they
+/// minted there, `conference` the call seats they hold (`media:join` admitted
+/// them as a member), `chat` their room memberships.
 ///
 /// Invoked AFTER the membership is gone, so nothing can be admitted on it
 /// again while a holder withdraws what it admitted. Idempotent, like every
@@ -690,7 +691,7 @@ mod tests {
 
     /// The membership cascade reaches the holder with the ids it needs, a
     /// failing holder is named in the error, and a module that registers no
-    /// membership hook (fleet's tenant-only `Hooks`) is skipped.
+    /// membership hook (here a bare `Hooks::default()`) is skipped.
     #[tokio::test]
     async fn a_lost_membership_reaches_its_holders() {
         let reg = HookRegistry::default();

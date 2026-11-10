@@ -80,6 +80,7 @@ pub mod external_access;
 pub mod hub;
 pub mod install_trace;
 pub mod keep_busy;
+pub mod membership;
 pub mod nudge;
 pub mod pairing;
 pub mod pairing_notice;
@@ -424,10 +425,17 @@ impl Module for FleetState {
         settings.modules.fleet
     }
 
-    /// Fleet's side of the tenant cascade (device revocation on archive).
-    /// Fleet is the CALLER of the agent cascade, never a holder of it.
+    /// Fleet's side of the tenant cascade (device revocation on archive) and
+    /// of the membership cascade (the enrollment keys a person minted end with
+    /// their org membership, `membership`). Fleet is the CALLER of the agent
+    /// cascade, never a holder of it.
     fn hooks(&self) -> roomler_core::Hooks {
-        tenant_hooks::hooks(self)
+        roomler_core::Hooks {
+            membership: Some(Arc::new(membership::FleetMembershipHooks {
+                state: self.clone(),
+            })),
+            ..tenant_hooks::hooks(self)
+        }
     }
 
     fn capabilities(&self, _tenant: &TenantCtx) -> Capabilities {
