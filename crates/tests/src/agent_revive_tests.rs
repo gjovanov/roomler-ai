@@ -30,8 +30,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bson::{DateTime, doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
 use roomler_ai_remote_control::models::{
-    AccessPolicy, Agent, ConsentMode, DesiredConfig, ExecMode, ExecPolicy, ExternalAccessPolicy,
-    KeyRotationRequest, OsKind, PeerRelayPolicy, PolicySubject, PolicyTarget, SshMode, SshPolicy,
+    AccessPolicy, Agent, AgentStatus, ConsentMode, DesiredConfig, ExecMode, ExecPolicy,
+    ExternalAccessPolicy, KeyRotationRequest, OsKind, PeerRelayPolicy, PolicySubject, PolicyTarget,
+    SshMode, SshPolicy,
 };
 use roomler_ai_services::dao::base::DaoError;
 use serde_json::{Value, json};
@@ -796,4 +797,36 @@ async fn a_revive_that_read_an_earlier_removal_writes_nothing() {
     let revived = revive(current).await.expect("the current removal revives");
     assert!(revived.deleted_at.is_none());
     assert_eq!(revived.token_gen, 2);
+}
+
+/// A quarantine is a restriction, not a grant: a removed device that was also
+/// quarantined is still quarantined when its machine enrolls again, so a
+/// re-enrollment is never the way to lift one. Nothing in the product
+/// quarantines a device; an operator does, in the database.
+#[tokio::test]
+async fn a_quarantine_outlives_a_revive() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("revive5").await;
+    let tid = oid(&seeded.tenant_id);
+    let (agent_id, _) = enroll(&app, &seeded, "mach-quarantine", "quarantined box").await;
+    let aid = oid(&agent_id);
+    app.db
+        .collection::<bson::Document>("agents")
+        .update_one(
+            doc! { "_id": aid },
+            doc! { "$set": { "status": "quarantined" } },
+        )
+        .await
+        .unwrap();
+    let agents = &app.state.fleet().agents;
+    assert!(agents.soft_delete(tid, aid).await.unwrap());
+
+    let (again, _) = enroll(&app, &seeded, "mach-quarantine", "quarantined box").await;
+    assert_eq!(again, agent_id);
+    let row = agents.find_live_in_tenant(tid, aid).await.unwrap();
+    assert_eq!(
+        row.status,
+        AgentStatus::Quarantined,
+        "a revive must not lift a quarantine"
+    );
 }

@@ -392,7 +392,8 @@ route enforces `exp`.
 - **A removed device that enrolls again starts from a new device's settings**
   (#3627). The revive replaces the row with what a new enrollment writes and keeps
   only its identity and history (`_id`, `machine_id`, `created_at`,
-  `enrolled_by`), `token_gen` and the desired-config revision counter, so nothing
+  `enrolled_by`), `token_gen`, the desired-config revision counter and a quarantine
+  (a restriction, which a re-enrollment never lifts), so nothing
   the removed device was allowed comes back: policies, approvals, the connect code,
   approved routes, a pending config, the owner. Before the row is live, `network`
   takes the device out of the org's tunnel policies and releases a lease its

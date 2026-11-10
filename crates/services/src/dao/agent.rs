@@ -304,9 +304,11 @@ impl AgentDao {
     /// hang off it), `tenant_id` and `machine_id` (the unique key),
     /// `created_at` and `enrolled_by` (when and by whom the row was first
     /// enrolled), `token_gen` (FR-103: the removal advanced it, so every token
-    /// minted before the removal stays refused) and `desired_config.revision`
+    /// minted before the removal stays refused), `desired_config.revision`
     /// (a counter, so the next save is one above every revision this row has
-    /// used). Everything else is a new enrollment's: the SSH, exec and access
+    /// used) and a `Quarantined` status (a restriction, not a grant: enrolling
+    /// the machine again must not be the way to lift it). Everything else is a
+    /// new enrollment's: the SSH, exec and access
     /// policies, the org-relay and External access approvals, the connect
     /// code, approved routes, the pending config, the key-rotation order, the
     /// owner (now `owner_user_id`, the enroller), labels, and what the removed
@@ -350,6 +352,9 @@ impl AgentDao {
         row.enrolled_by = tombstone.enrolled_by;
         row.token_gen = tombstone.token_gen;
         row.desired_config.revision = tombstone.desired_config.revision;
+        if tombstone.status == AgentStatus::Quarantined {
+            row.status = AgentStatus::Quarantined;
+        }
         let matched = self
             .base
             .collection()

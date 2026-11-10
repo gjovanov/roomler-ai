@@ -94,8 +94,9 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   write (`ReviveScope`).
 - **A removed device that enrolls again starts from a new device's settings** (#3627).
   `AgentDao::revive` REPLACES the tombstone with `new_row` for the request and keeps
-  only `_id`, `tenant_id`, `machine_id`, `created_at`, `enrolled_by`, `token_gen` and
-  `desired_config.revision`; `agent_revived` (network) first drops the device from the
+  only `_id`, `tenant_id`, `machine_id`, `created_at`, `enrolled_by`, `token_gen`,
+  `desired_config.revision` and a `Quarantined` status (a restriction is never lifted by
+  re-enrolling); `agent_revived` (network) first drops the device from the
   org's tunnel policies and releases a leftover lease. ⚠️ Never turn the revive back
   into a field-by-field `$set`: a grant field added later would come back with the
   machine id. ⚠️ `rehydrate` is live-only (`NotFound` on a tombstone), so a removal

@@ -90,7 +90,7 @@ Either earns one prompt retry. A refusal straight after a recovery waits out the
 
 Enrollment **revives** a removed row in place for the same `(tenant_id, machine_id)`, so a revived row used to accept every token it had ever issued (#2133's shape). A removed tunnel client is revived only by an enrollment token minted for a holder of `MANAGE_AGENTS` (#3328).
 
-- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1304`; tunnel clients `crates/services/src/dao/tunnel_client.rs:335`). From then on only tokens minted after the removal are accepted.
+- **`token_gen`** is the fix. Each token carries the row's generation (`gen`), and removing a device increments it in the same atomic update that tombstones the row (`soft_delete`, `crates/services/src/dao/agent.rs:1309`; tunnel clients `crates/services/src/dao/tunnel_client.rs:335`). From then on only tokens minted after the removal are accepted.
 - **Where it is checked**, at all five sites, each of which already loads the row:
 
 | Site | Where |
@@ -116,7 +116,7 @@ The row comes back, but not what the removed device was allowed. Before #3627 a 
 |---|---|
 | none | a new device (`AgentDao::create`), after the plan cap |
 | live: a device nobody removed (a lost token, a reinstall, `roomlerd re-enroll`) | refreshes it (`AgentDao::rehydrate`): os, version, the name unless an admin renamed it, the install method if the request says. **Everything it was allowed stays** |
-| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:324`) |
+| removed | the holders drop what names the removed device, then the row comes back as a **new device** (`AgentDao::revive`, `crates/services/src/dao/agent.rs:326`) |
 
 What a revive keeps, and nothing else:
 
@@ -126,6 +126,7 @@ What a revive keeps, and nothing else:
 | `created_at`, `enrolled_by` | when and by whom the row was first enrolled |
 | `token_gen` | the removal advanced it, so every token from before the removal stays refused ([above](#4-a-removal-ends-every-earlier-token)) |
 | `desired_config.revision` | a counter, so the next config saved for the device is one above every revision the row has used. The config itself is gone: nothing is requested |
+| a `Quarantined` status | a restriction, not a grant: enrolling the machine again must not be the way to lift a quarantine (nothing in the product sets one on a device; an operator does, in the database) |
 
 Everything else is what a new enrollment writes: every policy and approval at its closed default, no connect code, no approved routes, no key-rotation order, the machine's own name with no admin label or tag, and as owner the person whose enrollment token revived it. The device's own reports (capabilities, host key, device key, power, keep busy) wait for its first hello, as a new device's do. This holds by construction: the revive **replaces** the document with the one `AgentDao::new_row` builds for a new enrollment, so a field added later resets too.
 
