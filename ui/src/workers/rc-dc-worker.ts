@@ -73,6 +73,7 @@ import { createDecoderColorSpace, frameColorSpace, rcDecoderConfig } from './rc-
 import { createDecodeRecovery } from './rc-decode-recovery'
 import { createViewerMediaRecorder } from './rc-media-window'
 import { createDeliveryGapClock, type VideoChannelMessage } from './rc-video-channel'
+import { PAINT_GAP_CLOSED, PAINT_GAP_MARK, PAINT_GAP_MARKED, createPaintGapMark } from './rc-paint-gap'
 import {
   calBandMs,
   clockCalPong,
@@ -166,6 +167,9 @@ type ClockOffsetMessage = { type: 'clock-offset'; offsetUs: number | null }
 type BenchArmMessage = { type: 'bench-arm'; seq: number }
 /** FR-135 R0c — the agent announced a capture hold (`rc:media-waiting`). */
 type MediaHoldMessage = { type: 'media-hold' }
+/** FR-138 — the page started to hold its session: the cut `rc.resume`'s
+ *  `gap_ms` is measured across (`rc-paint-gap.ts`). */
+type PaintGapMarkMessage = { type: typeof PAINT_GAP_MARK }
 type CloseMessage = { type: 'close' }
 type IncomingMessage =
   | InitCanvasMessage
@@ -178,6 +182,7 @@ type IncomingMessage =
   | ClockCalMessage
   | BenchArmMessage
   | MediaHoldMessage
+  | PaintGapMarkMessage
   | CloseMessage
 
 const HEADER_BYTES = 13
@@ -215,6 +220,10 @@ const decodeRecovery = createDecodeRecovery()
 /** FR-135 R0 — the window of media numbers the page carries to the agent on
  *  `rc:decodestat` (`rc-media-window.ts`). Records only. */
 const mediaWindow = createViewerMediaRecorder()
+
+/** FR-138 — the gap in the painted frames across a held session's cut
+ *  (`rc-paint-gap.ts`). Says nothing unless the page marks a cut. */
+const paintGap = createPaintGapMark()
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
@@ -561,6 +570,10 @@ workerScope.onmessage = (e) => {
   } else if (msg.type === 'media-hold') {
     // FR-135 R0c — the agent announced a capture hold: its gap is no freeze.
     mediaWindow.onHold()
+  } else if (msg.type === PAINT_GAP_MARK) {
+    // FR-138 — the page holds its session from here: say when this worker
+    // last painted, and the gap at the first frame it paints next.
+    workerScope.postMessage({ type: PAINT_GAP_MARKED, sinceMs: paintGap.mark(performance.now()) })
   } else if (msg.type === 'bench-arm') {
     bench.arm(msg.seq)
   } else if (msg.type === 'render-mode') {
@@ -841,6 +854,9 @@ function initDecoder() {
       paintStats.add(paintT1 - paintT0)
       // FR-135 R0 (N9, N11, N12, N16) — a frame on the canvas.
       if (drew) mediaWindow.onPainted(paintT1, paintT1 - paintT0, wireTsUs)
+      // FR-138 — the first frame painted after a held session's cut.
+      const gapClosed = drew ? paintGap.painted(paintT1) : null
+      if (gapClosed) workerScope.postMessage({ type: PAINT_GAP_CLOSED, gapMs: gapClosed.gapMs })
       // #3566 — the page times the probe from its own clock, so the paint
       // stamp goes back on it.
       if (benchClone) bench.settle(benchClone, toPageEpochMs(epochNowMs(), pageSkewMs))
@@ -1201,6 +1217,7 @@ function teardown(): void {
   pageSkewBandMs = 0
   outGapMaxMs = 0
   mediaWindow.reset()
+  paintGap.reset()
   // P7 — release the GL renderer; a fresh session re-creates lazily and
   // gets a fresh unavailability verdict (a new tab/GPU state may differ).
   fsr?.dispose()
