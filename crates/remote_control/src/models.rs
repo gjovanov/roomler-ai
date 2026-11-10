@@ -6129,6 +6129,10 @@ pub enum EndSource {
     /// The sweep found it detached past `resume_by`, or its device offline for
     /// longer than the window.
     Sweep,
+    /// P1b-2 — the one-time close of a row a pod that died before FR-138 left
+    /// open (`POST /api/admin/rc-sessions/close-dead`), dated by the row's own
+    /// last clock. An older image reads it as [`Self::Unknown`].
+    Backfill,
     /// A source a newer server wrote: the row still reads.
     #[serde(other)]
     Unknown,
@@ -11130,6 +11134,15 @@ mod fr138_resume_tests {
         d.insert("end_source", "registration");
         let back: RemoteSession = bson::from_document(d).unwrap();
         assert_eq!(back.end_source, Some(EndSource::Registration));
+        // P1b-2 — the one-time close of the rows a dead pod left open.
+        let mut d = doc.clone();
+        d.insert("end_source", "backfill");
+        let back: RemoteSession = bson::from_document(d).unwrap();
+        assert_eq!(back.end_source, Some(EndSource::Backfill));
+        assert_eq!(
+            bson::to_bson(&EndSource::Backfill).unwrap(),
+            bson::Bson::String("backfill".into())
+        );
         let mut d = doc;
         d.insert("end_source", "a_later_source");
         let back: RemoteSession = bson::from_document(d).unwrap();

@@ -274,6 +274,22 @@ pub fn apply_rc_ctrl(hub: &Hub, ctrl: &serde_json::Value) {
                 info!(agent = %aid, revision, "rc ctrl: desired config pushed from another pod");
             }
         }
+        // FR-138 P1b-2 — `resume_scope` needs this pod's own window, which
+        // the hub does not hold: [`apply_rc_ctrl_on`] takes it.
         _ => {}
+    }
+}
+
+/// C-2 — [`apply_rc_ctrl`], with the module's state at hand for the events
+/// that need more than the hub. FR-138 P1b-2: a change to the resume scope
+/// made on another pod is re-announced here under THIS pod's own window
+/// ([`crate::resume_scope::apply_scope_event`]), never the sender's, so the
+/// setting stays each pod's ceiling and its off while a roll changes it.
+pub fn apply_rc_ctrl_on(state: &crate::FleetState, ctrl: &serde_json::Value) {
+    if ctrl.get("evt").and_then(|v| v.as_str()) == Some("resume_scope") {
+        let own = crate::resume_scope::capped_window(state.settings.rc.session_resume_secs);
+        crate::resume_scope::apply_scope_event(&state.rc_hub, own, ctrl);
+    } else {
+        apply_rc_ctrl(&state.rc_hub, ctrl);
     }
 }

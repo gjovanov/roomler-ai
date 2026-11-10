@@ -1689,6 +1689,14 @@ struct RemoteFacts {
     per_org_day: HashMap<ObjectId, (i64, i64)>,
 }
 
+/// FR-138 — whether a session row's hours count in the hour-weighted sums:
+/// not when its end was inferred (`end_source`: the registration read, the
+/// sweep, the dead-row close), whose `ended_at` is only the row's own last
+/// clock.
+fn counts_hours(d: &Document) -> bool {
+    matches!(d.get("end_source"), None | Some(Bson::Null))
+}
+
 async fn read_remote_usage(
     state: &AppState,
     w: &Windows,
@@ -1703,7 +1711,7 @@ async fn read_remote_usage(
             "$or": [ { "ended_at": Bson::Null }, { "ended_at": { "$gte": w.start_dt(Span::D28) } } ],
             "tenant_id": { "$nin": excluded_ids(&set.tenants) },
         },
-        doc! { "tenant_id": 1, "started_at": 1, "ended_at": 1 },
+        doc! { "tenant_id": 1, "started_at": 1, "ended_at": 1, "end_source": 1 },
     )
     .await?;
     let mut started = Vec::new();
@@ -1716,15 +1724,21 @@ async fn read_remote_usage(
         };
         let e = dt_ms(d, "ended_at").unwrap_or(now_ms).max(s);
         started.push(s);
+        // FR-138 — an end nobody saw (`end_source`) is the row's own last
+        // clock, not when the session ended: its hours are left out of the
+        // sums. The session still counts as started.
+        let hours = counts_hours(d);
         for (i, span) in [Span::Day, Span::D7, Span::D28].into_iter().enumerate() {
             let (lo, hi) = w.range(span);
-            ms[i] += overlap_ms(s, e, lo, hi);
+            if hours {
+                ms[i] += overlap_ms(s, e, lo, hi);
+            }
         }
         if super::value::rc_session_is_value(s, e) {
             value.add(w, s, tenant);
         }
         let (lo, hi) = w.range(Span::Day);
-        let day_ms = overlap_ms(s, e, lo, hi);
+        let day_ms = if hours { overlap_ms(s, e, lo, hi) } else { 0 };
         if day_ms > 0 || w.contains(Span::Day, s) {
             let entry = per_org_day.entry(tenant).or_insert((0, 0));
             entry.0 += day_ms;
@@ -3771,6 +3785,18 @@ mod tests {
 
     fn d(s: &str) -> NaiveDate {
         parse_day(s).unwrap()
+    }
+
+    /// FR-138 — a row whose end was inferred (`end_source`) adds no hours:
+    /// its `ended_at` is only its own last clock. A row whose end was seen,
+    /// or a row from before the field, counts as it always has.
+    #[test]
+    fn an_inferred_end_adds_no_hours() {
+        assert!(counts_hours(&doc! { "ended_at": DateTime::now() }));
+        assert!(counts_hours(&doc! { "end_source": Bson::Null }));
+        for source in ["registration", "sweep", "backfill", "a_later_source"] {
+            assert!(!counts_hours(&doc! { "end_source": source }), "{source}");
+        }
     }
 
     #[test]

@@ -196,6 +196,16 @@ impl RowEnd {
             ended_at: None,
         }
     }
+
+    /// P1b-2 — the same end, whose row the caller has already written itself
+    /// with a condition the projection does not know (the sweep's `resume_by`,
+    /// the dead-row close's own checks): the audit keeps it as the trail.
+    pub fn already_written(self) -> Self {
+        Self {
+            written: true,
+            ..self
+        }
+    }
 }
 
 /// Split a hello's claims into the ones the hub holds a place for and the
@@ -324,6 +334,18 @@ impl Hub {
         a.resume_window = (secs > 0).then_some(secs);
         let _ = a.tx.try_send(ServerMsg::AgentResumeWindow { secs });
         true
+    }
+
+    /// FR-138 P1b-2 — every device connection on this pod that advertises
+    /// `rc-resume`: the device, its org and the window it holds. What the
+    /// re-announce on a scope change walks.
+    pub fn resume_connections(&self) -> Vec<(ObjectId, ObjectId, Option<u32>)> {
+        self.inner
+            .agents
+            .iter()
+            .filter(|a| a.advertises_resume)
+            .map(|a| (a.agent_id, a.tenant_id, a.resume_window))
+            .collect()
     }
 
     /// FR-138 — the window announced to the device's connection on this pod.

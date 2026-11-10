@@ -480,11 +480,178 @@ impl RemoteSessionDao {
             .await?;
         Ok(res.matched_count == 1)
     }
+
+    /// FR-138 P1b-2 — the sweep's first read: live rows that were detached
+    /// when their device's socket went and whose `resume_by` has passed,
+    /// oldest first, at most `limit`. Only a detach writes `resume_by`.
+    pub async fn detached_past(&self, now: DateTime, limit: i64) -> DaoResult<Vec<RemoteSession>> {
+        let rows = self
+            .base
+            .collection()
+            .find(doc! {
+                "phase": bson::to_bson(&SessionPhase::Active)?,
+                "ended_at": bson::Bson::Null,
+                "resume_by": { "$lte": now },
+            })
+            .sort(doc! { "created_at": 1 })
+            .limit(limit)
+            .max_time(READ_BUDGET)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(rows)
+    }
+
+    /// FR-138 P1b-2 — the sweep's second read: live rows with no `resume_by`
+    /// whose own clock (`stats_at`, else `started_at`) is older than
+    /// `quiet_since`, oldest first, at most `limit`. Candidates only: a row a
+    /// pod that died without a word left open. The sweep checks each one's
+    /// device before it ends anything.
+    pub async fn unclaimed_quiet(
+        &self,
+        quiet_since: DateTime,
+        limit: i64,
+    ) -> DaoResult<Vec<RemoteSession>> {
+        let rows = self
+            .base
+            .collection()
+            .find(doc! {
+                "phase": bson::to_bson(&SessionPhase::Active)?,
+                "ended_at": bson::Bson::Null,
+                "resume_by": bson::Bson::Null,
+                "$or": [
+                    { "stats_at": { "$lt": quiet_since } },
+                    { "stats_at": bson::Bson::Null, "started_at": { "$lt": quiet_since } },
+                ],
+            })
+            .sort(doc! { "created_at": 1 })
+            .limit(limit)
+            .max_time(READ_BUDGET)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(rows)
+    }
+
+    /// FR-138 P1b-2 — the sweep's end of a row, as it read it (spec §4.4):
+    /// only while it is still live, still at the fencing number read AND
+    /// still carrying the `resume_by` and the `stats_at` read (absent matches
+    /// absent: an abandoned row has no `resume_by`), so a claim that resumed
+    /// it meanwhile (which bumps the one and clears the other) is never
+    /// undone, nor a session whose own clock moved. `agent_disconnect`, dated
+    /// `at` (the row's own last clock) and marked `end_source: sweep`.
+    /// `false` = it matched nothing.
+    pub async fn end_swept(&self, row: &RemoteSession, at: DateTime) -> DaoResult<bool> {
+        self.end_inferred_as_read(row, at, EndSource::Sweep).await
+    }
+
+    /// FR-138 P1b-2 — the one-time close's read (`POST
+    /// /api/admin/rc-sessions/close-dead`): live rows created before
+    /// `older_than` whose own clock has not moved since (`stats_at` absent or
+    /// older), oldest first, at most `limit`. The caller keeps only those on
+    /// a device that has had a session since ([`Self::has_later_row`]).
+    pub async fn dead_candidates(
+        &self,
+        older_than: DateTime,
+        limit: i64,
+    ) -> DaoResult<Vec<RemoteSession>> {
+        let rows = self
+            .base
+            .collection()
+            .find(doc! {
+                "phase": bson::to_bson(&SessionPhase::Active)?,
+                "ended_at": bson::Bson::Null,
+                "created_at": { "$lt": older_than },
+                "$or": [
+                    { "stats_at": bson::Bson::Null },
+                    { "stats_at": { "$lt": older_than } },
+                ],
+            })
+            .sort(doc! { "created_at": 1 })
+            .limit(limit)
+            .max_time(READ_BUDGET)
+            .await?
+            .try_collect()
+            .await?;
+        Ok(rows)
+    }
+
+    /// FR-138 P1b-2 — whether `agent_id` has a session row created after
+    /// `created_at`, in its org: the device came back and was used since.
+    pub async fn has_later_row(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        created_at: DateTime,
+    ) -> DaoResult<bool> {
+        let later = self
+            .base
+            .collection()
+            .clone_with_type::<bson::Document>()
+            .find_one(doc! {
+                "agent_id": agent_id,
+                "tenant_id": tenant_id,
+                "created_at": { "$gt": created_at },
+            })
+            .projection(doc! { "_id": 1 })
+            .max_time(READ_BUDGET)
+            .await?;
+        Ok(later.is_some())
+    }
+
+    /// FR-138 P1b-2 — the one-time close of a row a pod that died before
+    /// FR-138 left open: only while it is still live, at the fencing number
+    /// and with the `resume_by` and `stats_at` read, `agent_disconnect`, dated
+    /// `at` (the row's own last clock) and marked `end_source: backfill`.
+    /// `false` = it matched nothing (it ended, was resumed or detached, or its
+    /// own clock moved, meanwhile).
+    pub async fn close_dead(&self, row: &RemoteSession, at: DateTime) -> DaoResult<bool> {
+        self.end_inferred_as_read(row, at, EndSource::Backfill)
+            .await
+    }
+
+    /// The sweep's and the dead-row close's write: `agent_disconnect` at
+    /// `at`, marked `source`, on the row only as it was read. Never an end
+    /// over an end: the row must still be live.
+    async fn end_inferred_as_read(
+        &self,
+        row: &RemoteSession,
+        at: DateTime,
+        source: EndSource,
+    ) -> DaoResult<bool> {
+        let Some(session_id) = row.id else {
+            return Ok(false);
+        };
+        let as_read = |t: Option<DateTime>| t.map_or(bson::Bson::Null, bson::Bson::DateTime);
+        let res = self
+            .base
+            .collection()
+            .update_one(
+                doc! {
+                    "_id": session_id,
+                    "phase": bson::to_bson(&SessionPhase::Active)?,
+                    "ended_at": bson::Bson::Null,
+                    "attach_seq": roomler_ai_remote_control::audit::at_seq(row.attach_seq),
+                    "resume_by": as_read(row.resume_by),
+                    "stats_at": as_read(row.stats_at),
+                },
+                doc! { "$set": {
+                    "phase": bson::to_bson(&SessionPhase::Closed)?,
+                    "ended_at": at,
+                    "end_reason": bson::to_bson(&EndReason::AgentDisconnect)?,
+                    "end_source": bson::to_bson(&source)?,
+                }},
+            )
+            .await?;
+        Ok(res.matched_count == 1)
+    }
 }
 
 /// FR-138 P1b-2 (P1b-1's review, L3) — the longest a background read of the
 /// resume waits on the database: an answer that has not come by then is a
-/// failed read, which each caller already handles. The read is indexed
-/// (`{agent_id, phase, created_at}`, the remote module's `index_plan`), so
-/// this only bounds a database in trouble.
+/// failed read, which each caller already handles. Each read is indexed in
+/// the remote module's `index_plan` (the registration read by `{agent_id,
+/// phase, created_at}`; the sweep and the dead-row close by `{phase,
+/// created_at}`, and the close's later-row check by `{agent_id, created_at}`),
+/// so this only bounds a database in trouble.
 const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
