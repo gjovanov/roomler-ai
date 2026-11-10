@@ -11,7 +11,7 @@
 //! next use. This is the same arbitrate-with-the-database shape as the
 //! overlay block allocator and the `used_tokens` single-use claim.
 
-use bson::{DateTime, doc, oid::ObjectId};
+use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use mongodb::Database;
 use mongodb::options::ReturnDocument;
 use roomler_ai_remote_control::models::{EnrollmentKey, EnrollmentKeyUse};
@@ -47,6 +47,17 @@ impl KeyRefusal {
             KeyRefusal::Exhausted => "exhausted",
         }
     }
+}
+
+/// `filter`, narrowed to keys that can still enroll something: not revoked,
+/// not expired, and under their ceiling. What [`EnrollmentKeyDao::claim_use`]
+/// claims, and so what a revocation must reach.
+fn live(mut filter: Document, now: DateTime) -> Document {
+    filter.insert("revoked_at", Bson::Null);
+    filter.insert("expires_at", doc! { "$gt": now });
+    // Field-vs-field comparison needs $expr.
+    filter.insert("$expr", doc! { "$lt": ["$uses", "$max_uses"] });
+    filter
 }
 
 impl EnrollmentKeyDao {
@@ -118,15 +129,9 @@ impl EnrollmentKeyDao {
             .base
             .collection()
             .find_one_and_update(
-                doc! {
-                    "tenant_id": tenant_id,
-                    "jti": jti,
-                    "revoked_at": null,
-                    "expires_at": { "$gt": now },
-                    // Field-vs-field comparison needs $expr; the ceiling is
-                    // checked and the counter bumped in ONE operation.
-                    "$expr": { "$lt": ["$uses", "$max_uses"] },
-                },
+                // The ceiling is checked and the counter bumped in ONE
+                // operation.
+                live(doc! { "tenant_id": tenant_id, "jti": jti }, now),
                 doc! {
                     "$inc": { "uses": 1 },
                     "$set": { "last_used_at": now, "updated_at": now },
@@ -166,6 +171,29 @@ impl EnrollmentKeyDao {
                 doc! { "_id": key_id, "tenant_id": tenant_id, "revoked_at": null },
                 doc! { "$set": { "revoked_at": DateTime::now(), "updated_at": DateTime::now() } },
             )
+            .await
+    }
+
+    /// Revoke the live keys `created_by` minted in the org, all of them or
+    /// only the one `jti` names: that person is no longer a member there (the
+    /// membership's end, or a use refused for it). One write, under
+    /// [`Self::claim_use`]'s own liveness conditions, so a use racing it
+    /// either claimed first or is refused, and an expired or used-up key
+    /// keeps how it ended. Idempotent: a second call matches nothing.
+    /// Returns how many keys it revoked.
+    pub async fn revoke_minted_by(
+        &self,
+        tenant_id: ObjectId,
+        created_by: ObjectId,
+        jti: Option<&str>,
+    ) -> DaoResult<u64> {
+        let now = DateTime::now();
+        let mut filter = doc! { "tenant_id": tenant_id, "created_by": created_by };
+        if let Some(jti) = jti {
+            filter.insert("jti", jti);
+        }
+        self.base
+            .update_many(live(filter, now), doc! { "$set": { "revoked_at": now } })
             .await
     }
 

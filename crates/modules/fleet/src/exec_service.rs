@@ -115,6 +115,8 @@ pub struct AnchorResponse {
 /// What it checks, in order:
 /// - the token is a single-use enrollment token, and the org is not
 ///   archived;
+/// - the admin who minted it may still enroll devices in that org
+///   (`agent::issuer_may_enroll`, 403 otherwise): the anchor records them;
 /// - the device is LIVE in that same org, and is Windows;
 /// - the host name matches the device, unless `force`.
 ///
@@ -132,16 +134,27 @@ pub async fn anchor(
     let admin_uid = ObjectId::parse_str(&claims.sub)
         .map_err(|_| ApiError::BadRequest("Invalid admin user id claim".to_string()))?;
 
-    if state
-        .tenants
-        .base
-        .find_by_id(tid)
-        .await
-        .map(|t| t.is_archived)
-        .unwrap_or(false)
-    {
+    // A failed read refuses (500, nothing spent), as `agent::org_accepts_enrollment` does.
+    match state.tenants.base.find_by_id(tid).await {
+        Ok(t) if t.is_archived => {
+            return Err(ApiError::Forbidden(
+                "This organization is archived and anchors no devices".to_string(),
+            ));
+        }
+        Ok(_) | Err(roomler_ai_services::dao::base::DaoError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // The token acts for the admin who minted it (`anchored_by` below), so it
+    // anchors only while they may still enroll devices in this org: the
+    // enroll route's own question, asked before either spend.
+    if let Some(lost) = crate::agent::issuer_may_enroll(&state, tid, admin_uid).await? {
+        tracing::info!(
+            tenant_id = %tid, issuer = %admin_uid, jti = %claims.jti, reason = lost.as_str(),
+            "fleet-rpc: anchor refused: the token's issuer may no longer enroll devices here"
+        );
         return Err(ApiError::Forbidden(
-            "This organization is archived and anchors no devices".to_string(),
+            crate::agent::TOKEN_ISSUER_CANNOT_ENROLL.to_string(),
         ));
     }
 

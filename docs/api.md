@@ -77,9 +77,10 @@ daemon's `POST /api/agent/enroll`, `POST /api/tunnel-client/enroll`, and the anc
 refusal that must leave the token usable and before it writes anything. Spent before,
 it answers **401** `This enrollment token has already been used`; a ledger that cannot
 answer gives a retryable **503** (`Could not verify this enrollment token is unused;
-please retry`), and the token stays valid. The archived-org 403, the plan's cap and a
-refused tunnel re-enrollment (409, below) come before the spend, so they cost the token
-nothing. FR-51's ephemeral keys are reusable by design and are counted on their own row.
+please retry`), and the token stays valid. The archived-org 403, the issuer's 403
+(below), the plan's cap and a refused tunnel re-enrollment (409, below) come before the
+spend, so they cost the token nothing. FR-51's ephemeral keys are reusable by design and
+are counted on their own row.
 
 A tunnel enrollment token acts for the person who minted it, since the enroll request
 carries no user session: a new `machine_id` becomes their tunnel client, and a known one
@@ -90,6 +91,16 @@ person its new token acts for); a live client a holder re-enrolls keeps its owne
 Anyone else gets **409** with a sentence the CLI prints, and nothing is written: no row,
 no ledger entry, no overlay change. Once the person a token was minted for is no longer
 a member of its org, it enrolls nothing (**403**, before the spend).
+
+A daemon enrollment token and an FR-51 ephemeral key act for the admin who minted them:
+the device they enroll is that person's, and an anchor records them. So
+`POST /api/agent/enroll` and `POST /api/agent/anchor` ask again what the mint asked,
+whether that person holds `MANAGE_AGENTS` in the org, after the archived-org gate and
+before the spend or the key's claim. When they no longer do (they left the org, or lost
+the permission), the answer is **403** `forbidden`, never `not_a_member`, with a sentence
+the daemon and the wizard print. The token stays unspent, the key's `uses` stay as they
+were, and nothing is written
+([security-baseline.md](security-baseline.md#an-enrollment-credential-ends-with-its-issuers-right-to-enroll-devices)).
 
 Since FR-129 A1 the installer can obtain the same `Enrollment` (or `TunnelEnrollment`)
 token **without anyone copying it**: `POST /api/pair/start` → the person types the
@@ -179,7 +190,7 @@ capability URLs, webhook signatures).
 | POST | `/api/sendgrid/webhook` | FR-102 P5 (`saas`): SendGrid's Event Webhook — ECDSA P-256 signed, verified **before the body is parsed** (401), the empty 404 without `ROOMLER__NEWSLETTER__EVENT_WEBHOOK_PUBLIC_KEY`; records `delivered` · `bounce` · `dropped` · `spamreport` of newsletter messages on their ledger rows (never opens or clicks); un-governed ([growth-observability.md](growth-observability.md#the-newsletter-delivery-per-issue-tags-and-unsubscribes-p5)) |
 | POST | `/api/pair/start` | FR-129 A1: an installer starts a **device pairing** instead of asking for a pasted token — `{machine_name, os, arch, role: daemon\|tunnel, halves?, client, client_version}` → `{device_code, user_code: "BCDF-GHJK", verification_uri, expires_in, interval}`. The `device_code` is the installer's secret (stored only as a hash, in no other response); the `user_code` is what the person types on `/pair`. Per-address ceiling (429 `rate_limited`); 415 unless the body declares `application/json` (every `/api/pair/*` route — a cross-site `text/plain` form cannot reach the cookie-authenticated routes without a preflight); 400 `network_unmounted` for a tunnel role on a server without the network module; the **empty 404** while `ROOMLER__PAIRING__ENABLED=false` ([the spec](fr/FR-129-guided-cross-platform-installer.md#the-pairing-api)) |
 | POST | `/api/pair/poll` | FR-129 A1: `{device_code}` → `{status: authorization_pending \| slow_down (+interval) \| access_denied \| expired_token \| approved (+tokens[], org_name, org_slug, approver_name, approver_username)}` — the installer shows the two unique handles beside the display names before it installs. The device code **is** the auth; an unknown, delivered or expired code answers `expired_token` alike. The first poll after an approval mints the ordinary single-use enrollment token(s) behind the approver's gate, re-checked — delivery is once |
-| POST | `/api/agent/enroll` | Exchange enrollment token → agent credential |
+| POST | `/api/agent/enroll` | Exchange enrollment token (or an FR-51 ephemeral key) → agent credential. 403 for an archived org, or for a credential whose admin may no longer enroll devices in it, before anything is spent (above) |
 | GET | `/api/agent/latest-release` | Agent release manifest (cached GitHub proxy) |
 | GET | `/api/agent/installer/{flavour}` (+`/health`) | Stream the MSI/installer through roomler.ai (`peruser` \| `permachine`) |
 | POST | `/api/agent/crash` | Crash-report ingest (agent JWT in-handler). Every string of the report is scrubbed again on the way in, as a log line's is ([security-baseline.md](security-baseline.md#device-diagnostics-manage_agents-and-a-second-scrub)) |
@@ -323,7 +334,7 @@ permissions (24-bit bitfield — see [use-cases.md](use-cases.md#permission-syst
 | GET | `/api/tenant/{tid}` | Tenant detail |
 | POST | `…/archive` · `…/unarchive` | Owner-only; archiving revokes every device enrollment and releases the mesh |
 | GET | `…/member` · POST `…/member` | List / add members |
-| DELETE | `…/member/{user_id}` | Remove a member (`KICK_MEMBERS`), or leave (yourself, no bit); the owner cannot be removed (409), and someone who is not a member is a 404. What the membership admitted ends with it, in `HOOK_ORDER` once the row is gone: the tunnel clients the person owns in the org ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)), their call seats, their room memberships. Answers `{removed: true}` whatever the hooks report; a failure there is logged. Devices the person enrolled stay |
+| DELETE | `…/member/{user_id}` | Remove a member (`KICK_MEMBERS`), or leave (yourself, no bit); the owner cannot be removed (409), and someone who is not a member is a 404. What the membership admitted ends with it, in `HOOK_ORDER` once the row is gone: the tunnel clients the person owns in the org ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)), the live enrollment keys they minted there ([ephemeral-nodes.md](ephemeral-nodes.md#ephemeral-enrollment-keys)), their call seats, their room memberships. Answers `{removed: true}` whatever the hooks report; a failure there is logged. Devices the person enrolled stay |
 | GET | `…/member/me` | My membership + permissions |
 | GET/POST | `…/role` | List / create roles |
 | PUT/DELETE | `…/role/{role_id}` | Update / delete a role |
