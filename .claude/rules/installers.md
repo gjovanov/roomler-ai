@@ -92,8 +92,10 @@ pairs first and meets the refusal after.
 
 ⚠️ **The wizard never refuses a server-issued timestamp on the device's own clock (#3523).** A
 pasted token's `exp` is judged on the configured server's clock: `server_clock.rs` keeps the `Date`
-of the server's answer to `features::ask`, carries it forward on the monotonic clock (a wall-clock
-step does not move it), and retires it after 5 minutes by either clock. Expired by the server's clock
+of the server's own answer to `features::ask` (a 2xx JSON object from the origin asked; a redirect's
+target, a proxy's or a captive portal's page and an older server's 404 leave the clock unknown),
+carries it forward on the monotonic clock (a wall-clock step does not move it), and retires it after
+5 minutes by either clock. Expired by the server's clock
 blocks; expired by this device's clock alone, or with the server's clock unknown, only warns, for the
 first token and the macOS second one: the server checks the token at enrollment anyway. A fresh
 enrollment token lives 10 minutes and a cloned Windows VM boots about 3 h ahead, so the device-clock

@@ -1442,26 +1442,40 @@ mod tests {
             .as_secs() as i64
     }
 
-    /// A server on a loopback port that answers the setup-features request
-    /// with `{}` and a `Date` of `server_unix`.
-    async fn server_with_clock(server_unix: i64) -> String {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// A server on a loopback port that answers every request with `status`,
+    /// the header lines `headers` (each ending in CRLF) and `body`. It lives as
+    /// long as the test process, so no later test's server takes over its port
+    /// and, with it, the clock reading kept for its origin.
+    fn server_answering(status: &'static str, headers: String, body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let date = httpdate::fmt_http_date(
-            std::time::UNIX_EPOCH + std::time::Duration::from_secs(server_unix as u64),
-        );
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
                 let mut request = [0u8; 4096];
-                let _ = stream.read(&mut request).await;
+                let _ = stream.read(&mut request);
                 let answer = format!(
-                    "HTTP/1.1 200 OK\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
-                let _ = stream.write_all(answer.as_bytes()).await;
+                let _ = stream.write_all(answer.as_bytes());
             }
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// A `Date` header line saying `unix`.
+    fn date_line(unix: i64) -> String {
+        let date = httpdate::fmt_http_date(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix as u64),
+        );
+        format!("Date: {date}\r\n")
+    }
+
+    /// A server on a loopback port that answers the setup-features request
+    /// with `{}` and a `Date` of `server_unix`.
+    fn server_with_clock(server_unix: i64) -> String {
+        server_answering("200 OK", date_line(server_unix), "{}")
     }
 
     /// #3523 — RED before the fix, which judged on this device's clock alone:
@@ -1471,7 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn device_clock_ahead_and_a_fresh_token_does_not_block() {
         let server_now = device_now() - 3 * 3600;
-        let server = server_with_clock(server_now).await;
+        let server = server_with_clock(server_now);
         let token = enrollment_jwt_expiring_at(server_now + 600);
         let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
         assert_eq!(
@@ -1488,7 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn device_clock_behind_and_a_token_the_server_reads_expired_blocks() {
         let server_now = device_now() + 3 * 3600;
-        let server = server_with_clock(server_now).await;
+        let server = server_with_clock(server_now);
         let token = enrollment_jwt_expiring_at(server_now - 60);
         let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
         assert_eq!(v.expiry, TokenExpiry::Expired);
@@ -1507,6 +1521,63 @@ mod tests {
         let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
         assert_eq!(v.expiry, TokenExpiry::DeviceClockOnly);
         assert_eq!(v.clock_offset_secs, None);
+    }
+
+    /// The server answers, but with no `Date` or one that does not parse: its
+    /// clock is unknown, and this device's clock alone only warns.
+    #[tokio::test]
+    async fn an_answer_with_no_date_or_a_bad_one_leaves_the_clock_unknown() {
+        for headers in ["", "Date: yesterday\r\n"] {
+            let server = server_answering("200 OK", headers.to_string(), "{}");
+            let token = enrollment_jwt_expiring_at(device_now() - 60);
+            let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
+            assert_eq!(v.expiry, TokenExpiry::DeviceClockOnly, "{headers:?}");
+            assert_eq!(v.clock_offset_secs, None, "{headers:?}");
+        }
+    }
+
+    /// A token this device reads fresh, judged against `server`. The answers
+    /// below say the server's clock runs 3 h ahead, which would block it; none
+    /// of them is the configured server's own answer, so the clock stays
+    /// unknown and the token passes.
+    async fn judged_against(server: String) -> TokenValidation {
+        let token = enrollment_jwt_expiring_at(device_now() + 600);
+        cmd_validate_token(token, None, Some(server)).await.unwrap()
+    }
+
+    /// The configured server redirects to another origin: the answer there is
+    /// not the configured server's, and neither is its `Date`.
+    #[tokio::test]
+    async fn a_redirect_to_another_origin_does_not_set_the_servers_clock() {
+        let elsewhere = server_answering("200 OK", date_line(device_now() + 3 * 3600), "{}");
+        let location = format!("Location: {elsewhere}/api/setup/features\r\n");
+        let server = server_answering("302 Found", location, "");
+        let v = judged_against(server).await;
+        assert_eq!(
+            v.clock_offset_secs, None,
+            "the redirect target's Date was kept"
+        );
+        assert_eq!(v.expiry, TokenExpiry::Valid);
+    }
+
+    /// Pages that are not the server's answer to the route: an ingress's (or an
+    /// older server's) 404, a captive portal's sign-in page, a proxy's error.
+    #[tokio::test]
+    async fn a_page_that_is_not_the_servers_answer_does_not_set_its_clock() {
+        let ahead = date_line(device_now() + 3 * 3600);
+        for (status, body) in [
+            ("404 Not Found", "404 page not found"),
+            (
+                "200 OK",
+                "<html><body>Sign in to this network</body></html>",
+            ),
+            ("502 Bad Gateway", "<html><body>Bad gateway</body></html>"),
+        ] {
+            let server = server_answering(status, ahead.clone(), body);
+            let v = judged_against(server).await;
+            assert_eq!(v.clock_offset_secs, None, "{status}: its Date was kept");
+            assert_eq!(v.expiry, TokenExpiry::Valid, "{status}");
+        }
     }
 
     #[test]

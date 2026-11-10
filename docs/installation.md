@@ -81,9 +81,13 @@ ahead) used to refuse tokens the server would still accept. The server verifies 
 token at enrollment either way.
 
 - **The reading** is the `Date` header of the server's answer to the setup-features
-  request the page sends when it opens (`agents/roomler-setup/src/features.rs:220`). It is
-  kept with the monotonic time it arrived (`agents/roomler-setup/src/server_clock.rs:50`) and
-  carried forward on that clock, so a wall-clock step does not move it. It is used for 5
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:242`). It
+  counts only when the answer is the server's own: a 2xx JSON object from the origin that
+  was asked (`agents/roomler-setup/src/features.rs:197`, `tells_the_servers_clock`). The
+  target of a redirect to another origin, a proxy's or a captive portal's page, and an
+  older server's 404 leave the clock unknown. A reading is kept with the monotonic time it
+  arrived (`agents/roomler-setup/src/server_clock.rs:50`) and carried forward on that
+  clock, so a wall-clock step does not move it. It is used for 5
   minutes by either clock; after that the check asks the server again
   (`agents/roomler-setup/src/server_clock.rs:112`).
 - **The verdict** (`agents/roomler-setup/src/commands.rs:525`, `judge_expiry`):
@@ -91,7 +95,7 @@ token at enrollment either way.
 | The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
 |---|---|---|---|
 | known | **blocks**: "This token has already expired" | warns with the gap ("3 h ahead of the server's"); Continue stays enabled | continues |
-| unknown: no answer, or no `Date` that parses | (cannot be known) | warns; Continue stays enabled | continues |
+| unknown: no answer, no `Date` that parses, or an answer that is not the server's own | (cannot be known) | warns; Continue stays enabled | continues |
 
 A token with no `exp` blocks, as before. The macOS second token follows the same rule
 (`agents/roomler-setup/src/front/app.js:1035`, `rootTokenProblem`). The expiry the page shows

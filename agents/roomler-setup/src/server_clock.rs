@@ -217,4 +217,40 @@ mod tests {
         assert!((SERVER..SERVER + 5).contains(&now), "{now}");
         assert_eq!(held("https://other.invalid"), None);
     }
+
+    /// Only the configured server's own answer to the route, from the origin
+    /// that was asked, is a reading of its clock ([`crate::features::ask`]).
+    #[test]
+    fn only_the_servers_own_answer_from_the_asked_origin_is_a_reading() {
+        use crate::features::tells_the_servers_clock as tells;
+        let asked = "https://roomler.example/api/setup/features";
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let same = url(asked);
+        assert!(tells(asked, &same, 200, b"{}"));
+        assert!(tells(asked, &same, 200, br#"{"pairing": true}"#));
+        let within = url("https://roomler.example/api/setup/features/");
+        assert!(
+            tells(asked, &within, 200, b"{}"),
+            "a redirect within the origin"
+        );
+        for elsewhere in [
+            "https://portal.example/login",
+            "http://roomler.example/api/setup/features",
+            "https://roomler.example:8443/api/setup/features",
+        ] {
+            assert!(!tells(asked, &url(elsewhere), 200, b"{}"), "{elsewhere}");
+        }
+        let not_its_answer: [(u16, &[u8]); 7] = [
+            (404, b"404 page not found"),
+            (404, b"{}"),
+            (400, b"{}"),
+            (200, b"<html>Sign in to this network</html>"),
+            (200, b"[]"),
+            (200, b""),
+            (502, b"{}"),
+        ];
+        for (status, body) in not_its_answer {
+            assert!(!tells(asked, &same, status, body), "{status}");
+        }
+    }
 }
