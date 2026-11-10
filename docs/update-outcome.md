@@ -51,7 +51,7 @@ reading was wrong about which mattered:
 | `note` | the watcher's own sentence: the probe's answer, the exit code, on Windows the service settle's verdict (`service Roomler: running (0 starts; seen Running)`) |
 
 `<log_dir>` is `logging::resolve_log_dir`'s
-(`crates/agent-core/src/logging.rs:1009`): the process's per-user data dir plus
+(`crates/agent-core/src/logging.rs:1027`): the process's per-user data dir plus
 `logs`, except a Windows process with a service role, which logs under
 `%PROGRAMDATA%\Roomler\roomler\service-logs`: the SCM host, the SystemContext
 worker, `netd` and the per-Machine MSI's own steps (`ServiceLogRole`;
@@ -258,7 +258,7 @@ $ roomler status
 - **P5 — the fleet answer.** No wire message carries the verdict yet; the
   server still infers success from a changed `agent_version` on the next
   hello. The shape that fits is P7's: stamp `last_install` into the caps at
-  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:6926`,
+  every announcement (`stub_caps`, `agents/roomlerd/src/signaling.rs:6916`,
   where `update_mode` is stamped), additive `#[serde(default)]` on
   `AgentCaps`, stored wholesale by `AgentDao::update_capabilities`. One thing
   P7's shape does not cover: on Windows the first hello after an update carries

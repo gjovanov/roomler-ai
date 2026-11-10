@@ -22,9 +22,18 @@
 //! - [`asks_for_query_form`]: how a client reads a refusal. A server or a
 //!   relay older than the header answers a header-only dial with no Bearer
 //!   challenge, and only then does the client try the query form.
+//! - [`QueryFormNotes`]: what a client remembers when that redial upgraded,
+//!   so its next dials to that endpoint go straight to the query form for
+//!   [`QUERY_FORM_FOR`] instead of paying a refused dial each time.
+//! - [`may_log`]: never a TRACE line of the crates that print a client's
+//!   whole upgrade request, header and all ([`writes_the_request`]).
 //!
 //! Nothing here reads a credential's value beyond finding it: every audience,
 //! tenant and device check stays with the upgrade that verifies it.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Where an upgrade found its credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +151,99 @@ fn bearer_verdict(value: &str) -> Option<bool> {
     None
 }
 
+/// How long a client keeps dialling an endpoint in the query form after a
+/// redial there upgraded where the header was refused. A server or relay
+/// older than the header then costs one refused dial per endpoint every six
+/// hours, and one updated meanwhile hears the header again the same day.
+pub const QUERY_FORM_FOR: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The endpoint a client's [`QueryFormNotes`] are keyed by: the URL before its
+/// query or fragment, so `role` and `tid` never make one server two.
+pub fn endpoint_of(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
+/// A client's memory of the endpoints that took its credential only in the
+/// query form, each for [`QUERY_FORM_FOR`] from when the redial upgraded.
+///
+/// A redial that was refused too notes nothing, so a credential refused in
+/// both carriers keeps being offered in the header first. The `_at` forms
+/// take the time, for tests.
+#[derive(Debug, Default)]
+pub struct QueryFormNotes {
+    noted: Mutex<BTreeMap<String, Instant>>,
+}
+
+impl QueryFormNotes {
+    pub const fn new() -> Self {
+        Self {
+            noted: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Where the next dial to `endpoint` carries the credential.
+    pub fn carrier_for(&self, endpoint: &str) -> Carrier {
+        self.carrier_for_at(endpoint, Instant::now())
+    }
+
+    pub fn carrier_for_at(&self, endpoint: &str, now: Instant) -> Carrier {
+        let mut noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
+        match noted.get(endpoint) {
+            Some(at) if now.saturating_duration_since(*at) < QUERY_FORM_FOR => Carrier::Query,
+            Some(_) => {
+                noted.remove(endpoint);
+                Carrier::Header
+            }
+            None => Carrier::Header,
+        }
+    }
+
+    /// A redial of `endpoint` in the query form upgraded after its header
+    /// was refused.
+    pub fn note_query_form(&self, endpoint: &str) {
+        self.note_query_form_at(endpoint, Instant::now());
+    }
+
+    pub fn note_query_form_at(&self, endpoint: &str, now: Instant) {
+        self.noted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(endpoint.to_string(), now);
+    }
+}
+
+/// This process's [`QueryFormNotes`], which every dial it makes shares.
+pub fn query_form_notes() -> &'static QueryFormNotes {
+    static NOTES: QueryFormNotes = QueryFormNotes::new();
+    &NOTES
+}
+
+/// The log targets that write a client's whole upgrade request at TRACE.
+/// tungstenite prints the request it sends, `Authorization` header included,
+/// and marking the header's value sensitive does not hide it there. Every
+/// native client's log filter drops their TRACE lines, whatever it was asked.
+pub const WRITES_THE_REQUEST: [&str; 2] = ["tungstenite", "tokio_tungstenite"];
+
+/// Whether an event's `target` belongs to [`WRITES_THE_REQUEST`]: one of those
+/// crates or a module under it.
+pub fn writes_the_request(target: &str) -> bool {
+    WRITES_THE_REQUEST.iter().any(|krate| {
+        target
+            .strip_prefix(krate)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+    })
+}
+
+/// A native client's log keeps a line only if this says so: never a TRACE line
+/// of [`WRITES_THE_REQUEST`]. Each client's subscriber applies it as a global
+/// filter (`tracing_subscriber::filter::filter_fn`) beside its `EnvFilter`, and
+/// not as a directive inside it: a directive would either raise the level the
+/// spec gives these crates or lose to a span-scoped TRACE directive, which
+/// `EnvFilter` lets win over every target directive.
+pub fn may_log(meta: &tracing::Metadata<'_>) -> bool {
+    *meta.level() != tracing::Level::TRACE || !writes_the_request(meta.target())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +357,69 @@ mod tests {
             assert_eq!(asks_for_query_form(status, [c]), falls_back, "{c}");
         }
         assert!(CHALLENGE.contains(REALM));
+    }
+
+    #[test]
+    fn an_endpoint_is_the_url_before_its_query() {
+        assert_eq!(
+            endpoint_of("wss://roomler.ai/ws?role=agent&tid=t1"),
+            "wss://roomler.ai/ws"
+        );
+        assert_eq!(
+            endpoint_of("wss://relay.example/derp#x"),
+            "wss://relay.example/derp"
+        );
+        assert_eq!(
+            endpoint_of("wss://roomler.ai/derp"),
+            "wss://roomler.ai/derp"
+        );
+    }
+
+    /// The header first, the query form for six hours after a redial needed
+    /// it, then the header again, and one endpoint's note is its own.
+    #[test]
+    fn a_noted_endpoint_takes_the_query_form_for_six_hours() {
+        let notes = QueryFormNotes::new();
+        let t0 = Instant::now();
+        assert_eq!(notes.carrier_for_at("wss://a/ws", t0), Carrier::Header);
+        notes.note_query_form_at("wss://a/ws", t0);
+        assert_eq!(notes.carrier_for_at("wss://a/ws", t0), Carrier::Query);
+        let almost = t0 + QUERY_FORM_FOR - Duration::from_secs(1);
+        assert_eq!(notes.carrier_for_at("wss://a/ws", almost), Carrier::Query);
+        assert_eq!(
+            notes.carrier_for_at("wss://a/derp", almost),
+            Carrier::Header
+        );
+        assert_eq!(notes.carrier_for_at("wss://b/ws", almost), Carrier::Header);
+        let over = t0 + QUERY_FORM_FOR;
+        assert_eq!(notes.carrier_for_at("wss://a/ws", over), Carrier::Header);
+        assert_eq!(
+            notes.carrier_for_at("wss://a/ws", almost),
+            Carrier::Header,
+            "an expired note is gone, not hidden"
+        );
+        notes.note_query_form_at("wss://a/ws", over);
+        assert_eq!(notes.carrier_for_at("wss://a/ws", over), Carrier::Query);
+    }
+
+    #[test]
+    fn only_the_websocket_crates_count_as_writing_the_request() {
+        for target in [
+            "tungstenite",
+            "tungstenite::handshake::client",
+            "tokio_tungstenite",
+            "tokio_tungstenite::compat",
+        ] {
+            assert!(writes_the_request(target), "{target}");
+        }
+        for target in [
+            "tungstenite_x",
+            "tokio",
+            "roomlerd::ws_connect",
+            "",
+            "tunnel_core",
+        ] {
+            assert!(!writes_the_request(target), "{target}");
+        }
     }
 }

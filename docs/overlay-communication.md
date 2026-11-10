@@ -267,7 +267,7 @@ each socket's `rb`. Linux reports twice the request, so a carrier socket shows
 daemon logs the granted sizes once per socket (*"overlay: carrier socket
 buffers"*) whatever `RUST_LOG` says. The packaged Linux units set
 `RUST_LOG=roomlerd=info,warn`, which drops `tunnel_core` INFO, so the logger
-appends this one target on its own (`crates/agent-core/src/logging.rs:441`). On
+appends this one target on its own (`crates/agent-core/src/logging.rs:459`). On
 Windows that line is the only evidence of the size.
 
 ⚠️ **A per-user Linux install gains nothing until the host allows it.** It runs
@@ -457,7 +457,7 @@ sequenceDiagram
 
     Note over A,B: neither advertises srflx ⇒ both UDP-blocked<br/>both advertise supports_derp ⇒ relay_strategy = Derp
 
-    A->>D: WSS connect ?token=<agent JWT>&role=agent
+    A->>D: WSS connect ?role=agent&tid=<tenant>, Authorization: Bearer <agent JWT>
     A->>D: frame 1 = own 32-byte WG pubkey
     Note over D: validate == overlay_nodes.wg_public_key<br/>register (network_id, pubkeyA) → conn
     B->>D: WSS connect + register pubkeyB
@@ -702,15 +702,15 @@ flowchart LR
 
 | Lever | Where | What it does |
 |---|---|---|
-| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:503` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
-| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:76`), called once per connect (`:384`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:39`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
-| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:416`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:471`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
+| Age bound | `crates/tunnel-core/src/transport/derp.rs:72` (`queue_max_age`), checked by the WS writer at `agents/roomlerd/src/derp.rs:511` | The writer drops a frame that waited longer than `ROOMLERD_DERP_QUEUE_MAX_AGE_MS` (default 100) instead of sending it. That bounds the queue in time whatever the link rate: 512 frames are 33 ms at 160 Mbit/s and 1.8 s at 3 Mbit/s. `0` turns the check off, the behaviour before FR-18 |
+| Send-buffer cap | `cap_send_buffer` (`agents/roomlerd/src/derp.rs:77`), called once per connect (`:392`) | Asks for `SO_SNDBUF` = 256 KiB (`DERP_SNDBUF_BYTES`, `:40`), above the bandwidth-delay product of these paths (3 Mbit/s × 200 ms is about 75 KB) and far below the megabytes that autotuning grows. Without it, a frame the age check let through could still sit for seconds in the kernel. The cap has no switch of its own |
+| Counter | `DerpMux::note_stale_drop` (`crates/tunnel-core/src/transport/derp.rs:416`) | `dropped_stale` counts what the age bound shed. The keepalive tick logs it when it changed (`agents/roomlerd/src/derp.rs:479`): *"overlay derp: shed stale carrier frames (queue age bound)"* |
 
 ⚠️ **A successful set is not a cap.** The OS may apply less than was asked and
 still return success, so the daemon reads the size back with
 `getsockopt(SO_SNDBUF)` right after the set
-(`cap_tcp`, `agents/roomlerd/src/derp.rs:95`) and judges it in the request's
-units (`SndbufCap::read_back`, `agents/roomlerd/src/derp.rs:140`). This is
+(`cap_tcp`, `agents/roomlerd/src/derp.rs:96`) and judges it in the request's
+units (`SndbufCap::read_back`, `agents/roomlerd/src/derp.rs:141`). This is
 FR-18's AC4. In a Linux 6.6 container at stock sysctls (2026-10-30), a 262144
 request returned `Ok`, and the kernel then reported 425984: **212992 in
 force**. The daemon used to assume 256 KiB.
@@ -719,12 +719,12 @@ How each OS answers, from its documentation or source:
 
 | OS | `getsockopt` returns | What can change the request | Why one read is enough |
 |---|---|---|---|
-| Linux | **twice** the size in force, for kernel bookkeeping (socket(7)). The daemon halves it (`KERNEL_DOUBLES_SNDBUF`, `agents/roomlerd/src/derp.rs:109`) | `net.core.wmem_max` clamps it **without an error**. The default was 212992 until Linux 6.18 raised it to 4 MiB, so a stock older kernel holds 208 KiB of the 256 asked | The set takes `SOCK_SNDBUF_LOCK`, so TCP neither grows nor shrinks the buffer afterwards (`tcp_should_expand_sndbuf`, `sk_stream_moderate_sndbuf`) |
+| Linux | **twice** the size in force, for kernel bookkeeping (socket(7)). The daemon halves it (`KERNEL_DOUBLES_SNDBUF`, `agents/roomlerd/src/derp.rs:110`) | `net.core.wmem_max` clamps it **without an error**. The default was 212992 until Linux 6.18 raised it to 4 MiB, so a stock older kernel holds 208 KiB of the 256 asked | The set takes `SOCK_SNDBUF_LOCK`, so TCP neither grows nor shrinks the buffer afterwards (`tcp_should_expand_sndbuf`, `sk_stream_moderate_sndbuf`) |
 | Windows | the size in force | Winsock "can succeed even if the implementation did not provide the whole amount requested" and tells the caller to check with `getsockopt` | Dynamic send buffering "is enabled unless an application sets the SO_SNDBUF socket option" |
 | macOS | the size in force (`sb_hiwat`) | `kern.ipc.maxsockbuf` (8 MiB by default) clamps a larger request, far above this one | The set clears `SB_AUTOSIZE`, which TCP's send-buffer growth and trim both require. The MSS rounding runs only on a SYN, before the cap |
 
 Every connect logs one line, and every message opens with *"overlay derp: send
-buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:170`). It carries
+buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:171`). It carries
 `relay`, `requested` and, where it was read, `applied` in the request's units:
 
 | Read-back | Level | Message |
@@ -737,11 +737,11 @@ buffer"* (`SndbufCap::log`, `agents/roomlerd/src/derp.rs:170`). It carries
 | no TCP socket under the WebSocket | WARN | *"… left at the OS default — unrecognised TLS wrapper"* |
 
 The verdict per OS and the line's fields are pinned by unit tests
-(`agents/roomlerd/src/derp.rs:968`, `:1134`). Two more use a real loopback
+(`agents/roomlerd/src/derp.rs:1033`, `:1199`). Two more use a real loopback
 socket. In one, the cap reaches the socket under the WebSocket and reads back
-as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:1046`).
+as the kernel under the test applies it (`agents/roomlerd/src/derp.rs:1111`).
 In the other, a socket filled until the kernel takes no more keeps the size its
-cap read back (`agents/roomlerd/src/derp.rs:1074`). CI runs them on Linux and
+cap read back (`agents/roomlerd/src/derp.rs:1139`). CI runs them on Linux and
 Windows.
 
 ⚠️ **To read the cap on a host, grep its log for `overlay derp: send buffer`.**
@@ -824,14 +824,14 @@ long-lived sockets on the wrong pod after a roll.
 
 ⚠️ **The downtime is mostly Kubernetes, the image and the agent's ladder.** The binary listens
 under 0.4 s after its container starts. The rest is scheduling (about 1.5 s), the image pull
-(3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:49`), which is
+(3–4 s), and the wait for the next backoff step (`agents/roomlerd/src/derp.rs:50`), which is
 why per-roll medians land on 7.5, 15 and 25 s.
 
 **Two levers go at that wait** ([FR-28](fr/FR-28-derp-drain-on-pod-roll.md#p2-the-flat-redial)):
 
 | Lever | What it changes | Switch |
 |---|---|---|
-| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:60`), up to 30 times an outage. Every other failure keeps the ladder | `ws_flat_redial`, default OFF |
+| Flat redial | On a 502 at the upgrade, the control socket and the central `/derp` socket redial every 0.5 to 1 s instead of waiting out the next step (`agents/roomlerd/src/ws_connect.rs:75`), up to 30 times an outage. Every other failure keeps the ladder | `ws_flat_redial`, default OFF |
 | Pre-pull | With #3320, a promote puts the image on both nodes 30 s before the roll, so a replacement starts without pulling ([deployment.md](deployment.md)) | The deploy repo's DaemonSet file |
 
 ⚠️ **A server that accepts and drops must still climb** (#2221), or a fleet reconnects to it every second. So only a

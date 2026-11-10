@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::StreamExt;
+use roomler_ai_remote_control::upgrade_auth;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http;
@@ -159,13 +160,26 @@ async fn serve(stream: TcpStream, secret: String) {
     // tungstenite's handshake `Callback` fixes the closure's error type.
     #[allow(clippy::result_large_err)]
     let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
-        if offers_secret(req.uri().query(), &secret) {
-            Ok(resp)
-        } else {
-            let mut refused = ErrorResponse::new(None);
-            *refused.status_mut() = http::StatusCode::UNAUTHORIZED;
-            Err(refused)
+        let authorization = req
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+        let offered = presented(authorization, req.uri().query());
+        if offered.is_some_and(|token| crate::delegate::secret_eq(&secret, token)) {
+            return Ok(resp);
         }
+        // #3656 — refused as the server refuses: the challenge says whether a
+        // credential arrived, so the loop never redials a wrong secret in the
+        // query, and one whose header was lost gets the query form.
+        let mut refused = ErrorResponse::new(None);
+        *refused.status_mut() = http::StatusCode::UNAUTHORIZED;
+        if let Some(challenge) = upgrade_auth::challenge_for(401, offered.is_some()) {
+            refused.headers_mut().insert(
+                http::header::WWW_AUTHENTICATE,
+                http::HeaderValue::from_static(challenge),
+            );
+        }
+        Err(refused)
     };
     let handshake = tokio_tungstenite::accept_hdr_async(stream, check);
     let Ok(Ok(mut ws)) = tokio::time::timeout(HANDSHAKE_DEADLINE, handshake).await else {
@@ -174,14 +188,16 @@ async fn serve(stream: TcpStream, secret: String) {
     while let Some(Ok(_)) = ws.next().await {}
 }
 
-/// Does this query string carry the secret as its `token`, as `connect_once`
-/// sends it? The secret is hex, so the URL encoding leaves it unchanged.
-fn offers_secret(query: Option<&str>, secret: &str) -> bool {
-    query
+/// The secret a dial offers, read as the server reads a token (#3656): a
+/// Bearer `Authorization` header first, else the query's `token`, as a loop
+/// on its query-form redial sends it. The secret is hex, so the URL encoding
+/// leaves it unchanged.
+fn presented<'a>(authorization: Option<&'a str>, query: Option<&'a str>) -> Option<&'a str> {
+    let token = query
         .into_iter()
         .flat_map(|q| q.split('&'))
-        .filter_map(|pair| pair.strip_prefix("token="))
-        .any(|token| crate::delegate::secret_eq(secret, token))
+        .find_map(|pair| pair.strip_prefix("token="));
+    upgrade_auth::presented(authorization, token).map(|(offered, _)| offered)
 }
 
 #[cfg(test)]
@@ -200,19 +216,33 @@ mod tests {
     /// How long a test waits for something that should happen.
     const PATIENCE: Duration = Duration::from_secs(30);
 
-    fn dial_url(stand_in: &StandIn, token: &str) -> String {
-        format!("{}?token={token}&role=agent&tid=", stand_in.ws_url())
+    /// The dial `connect_once` makes to the stand-in with `token`.
+    fn control_dial(stand_in: &StandIn, token: &str) -> crate::ws_connect::Dial {
+        signaling::control_dial(&stand_in.ws_url(), "", token)
     }
 
     #[test]
-    fn only_the_token_field_with_the_secret_passes() {
-        assert!(offers_secret(Some("token=s3&role=agent&tid="), "s3"));
-        assert!(offers_secret(Some("role=agent&token=s3"), "s3"));
-        assert!(!offers_secret(Some("token=s4&role=agent"), "s3"));
-        assert!(!offers_secret(Some("xtoken=s3"), "s3"));
-        assert!(!offers_secret(Some("token="), "s3"));
-        assert!(!offers_secret(Some(""), "s3"));
-        assert!(!offers_secret(None, "s3"));
+    fn a_header_is_read_first_and_the_query_token_without_one() {
+        assert_eq!(presented(Some("Bearer s3"), None), Some("s3"));
+        assert_eq!(
+            presented(Some("Bearer s3"), Some("token=s4")),
+            Some("s3"),
+            "the header wins"
+        );
+        assert_eq!(
+            presented(None, Some("token=s3&role=agent&tid=")),
+            Some("s3")
+        );
+        assert_eq!(presented(None, Some("role=agent&token=s3")), Some("s3"));
+        assert_eq!(
+            presented(Some("Basic czM="), Some("token=s3")),
+            Some("s3"),
+            "another scheme is no header"
+        );
+        assert_eq!(presented(None, Some("xtoken=s3")), None);
+        assert_eq!(presented(None, Some("token=")), Some(""));
+        assert_eq!(presented(None, Some("")), None);
+        assert_eq!(presented(None, None), None);
     }
 
     /// Dialled as `connect_once` dials: it upgrades, answers the loop's keepalive
@@ -220,9 +250,11 @@ mod tests {
     #[tokio::test]
     async fn it_takes_its_secret_answers_pings_and_discards_the_rest() {
         let stand_in = StandIn::start().await.unwrap();
-        let (mut ws, _) = crate::ws_connect::connect(&dial_url(&stand_in, stand_in.secret()))
-            .await
-            .expect("the secret opens it");
+        let (mut ws, _) =
+            crate::ws_connect::dial(&control_dial(&stand_in, stand_in.secret()), PATIENCE)
+                .await
+                .expect("in time")
+                .expect("the secret opens it");
         ws.send(Message::Text("{\"t\":\"rc:agent.hello\"}".into()))
             .await
             .unwrap();
@@ -237,17 +269,45 @@ mod tests {
         assert_eq!(next, Message::Pong(b"keepalive".to_vec().into()));
     }
 
-    /// Another local process that finds the port gets a 401 and no socket.
+    /// Another local process that finds the port gets a 401 and no socket. #3656
+    /// — and the challenge says whether it offered anything, so the loop never
+    /// redials a refused secret in the query.
     #[tokio::test]
     async fn anyone_without_the_secret_gets_a_401() {
+        use crate::ws_connect::{connect, request};
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use upgrade_auth::Carrier;
         let stand_in = StandIn::start().await.unwrap();
-        for url in [dial_url(&stand_in, "not-the-secret"), stand_in.ws_url()] {
-            match crate::ws_connect::connect(&url).await {
+        let wrong = control_dial(&stand_in, "not-the-secret");
+        for (what, req, challenge) in [
+            (
+                "a wrong secret in the header",
+                request(&wrong, Carrier::Header).unwrap(),
+                upgrade_auth::CHALLENGE_REFUSED,
+            ),
+            (
+                "a wrong secret in the query",
+                request(&wrong, Carrier::Query).unwrap(),
+                upgrade_auth::CHALLENGE_REFUSED,
+            ),
+            (
+                "nothing",
+                stand_in.ws_url().into_client_request().unwrap(),
+                upgrade_auth::CHALLENGE,
+            ),
+        ] {
+            match connect(req).await {
                 Err(tungstenite::Error::Http(resp)) => {
-                    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED, "{url}")
+                    assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED, "{what}");
+                    let said = resp.headers().get(http::header::WWW_AUTHENTICATE);
+                    assert_eq!(
+                        said.and_then(|v| v.to_str().ok()),
+                        Some(challenge),
+                        "{what}"
+                    );
                 }
-                Err(e) => panic!("{url}: refused some other way: {e}"),
-                Ok(_) => panic!("{url}: upgraded with no secret"),
+                Err(e) => panic!("{what}: refused some other way: {e}"),
+                Ok(_) => panic!("{what}: upgraded with no secret"),
             }
         }
     }
@@ -587,6 +647,36 @@ mod tests {
         })
         .await
         .unwrap_or(false)
+    }
+
+    /// #3656 — the signalling loop's own dial, as a server sees it: the token in
+    /// `Authorization: Bearer`, and a URL that names the role and the tenant only.
+    #[test]
+    fn the_control_socket_presents_its_token_in_a_header() {
+        // #3548 — the loop runs inside the probe's fixture: no probe test beside it.
+        let probe = loop_fixture();
+        probe.block_on(present_the_token_in_a_header(&probe));
+    }
+
+    async fn present_the_token_in_a_header(probe: &LoopFixture) {
+        use crate::ws_connect::test_front::{self, Verdict};
+        let (base, log) = test_front::start(|_| Verdict::Accept).await;
+        let server = base.replace("ws://", "http://");
+        let worker = spawn_worker_on(probe, &server, &format!("{base}/ws"), "s3cret", false).await;
+        wait_connected(&worker).await;
+        let dial = test_front::until_seen(&log, 1).await.remove(0);
+        let _ = worker.stop.send(true);
+        let _ = tokio::time::timeout(PATIENCE, worker.task).await;
+        assert!(dial.uri.starts_with("/ws?"), "{dial:?}");
+        assert!(!dial.uri.contains("token="), "{dial:?}");
+        assert!(!dial.uri.contains("s3cret"), "{dial:?}");
+        assert!(dial.uri.contains("role=agent"), "{dial:?}");
+        assert_eq!(dial.authorization.as_deref(), Some("Bearer s3cret"));
+        assert_eq!(
+            crate::encode::caps::caps_probe_spawns(),
+            0,
+            "a lib test started a caps-probe child (#3548)"
+        );
     }
 
     /// The second gate: whatever holds the socket, an unenrolled worker takes no

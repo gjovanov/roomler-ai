@@ -48,7 +48,7 @@ sequenceDiagram
     A->>A: the sweep logs hard-errored and carriers rebuild
 ```
 
-The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3329-3336`)
+The agent closes every peer on any control-WS close (`agents/roomlerd/src/signaling.rs:3319-3326`)
 and the Hub ends the agent's sessions when it unregisters (`crates/modules/fleet/src/hub.rs:1199-1259`).
 `docs/multi-pod-scale-out.md:182` records this; the 08-29 spec missed it.
 
@@ -67,10 +67,10 @@ Almost all of the wait is Kubernetes and the image: the pull took 3–4 s, and t
 under 0.4 s after its container started.
 
 ⚠️ **The per-roll `/derp` p50 measures the agent's timer as much as the pods.** It sits on the
-backoff ladder (1, 2, 4, 8, 10 s; `agents/roomlerd/src/derp.rs:49`, `:571`): 3.4 s in one roll,
+backoff ladder (1, 2, 4, 8, 10 s; `agents/roomlerd/src/derp.rs:50`, `:579`): 3.4 s in one roll,
 7.5–7.7 s in ten, 15.2–15.8 s in two, 25.9 s in one. A replacement that listens just after a step
 waits for the next one. The control WS doubles the same way, up to 60 s
-(`agents/roomlerd/src/signaling.rs:1522`).
+(`agents/roomlerd/src/signaling.rs:1523`).
 
 A device in two orgs holds one socket per org, each pinned by its own tenant, so it can lose a
 socket in each wave. That accounts for the 6–8 hosts per roll that log two closes: on the roll of
@@ -102,7 +102,7 @@ socket in each wave. That accounts for the 6–8 hosts per roll that log two clo
 ### What an old agent does with an unknown frame
 
 For whoever puts the next frame on this socket: agents back to 0.4.48, the oldest version in these
-logs, ignore a Text frame (the `Some(Ok(_))` arm, `agents/roomlerd/src/derp.rs:537`) and drop a Binary frame
+logs, ignore a Text frame (the `Some(Ok(_))` arm, `agents/roomlerd/src/derp.rs:545`) and drop a Binary frame
 under 32 bytes (`crates/tunnel-core/src/transport/derp.rs:515-518`). A Binary frame of 32 bytes or
 more reads as a peer's frame and raises `Unrouted`. So a server-to-agent signal needs no capability
 gate as long as it is Text. This was read at the tags `agent-v0.4.48` and `agent-v0.4.154`, not run.
@@ -172,10 +172,10 @@ flowchart TD
 | A connection that lived 30 s | Restarts at 1 s | Back to 30 |
 | A major network change (only the control socket listens for one) | Restarts at 1 s | Back to 30 |
 
-The code: `FlatRedial` (`agents/roomlerd/src/ws_connect.rs:60`) with its allowance and wait (`:33`, `:38`), the
-control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1531`, `:1262`), and `/derp`'s
-(`agents/roomlerd/src/derp.rs:557`, `:551`). Regional relays keep their ladder
-(`agents/roomlerd/src/derp.rs:332`): no pod rolls under one.
+The code: `FlatRedial` (`agents/roomlerd/src/ws_connect.rs:75`) with its allowance and wait (`:48`, `:53`), the
+control loop's decision and refill (`agents/roomlerd/src/signaling.rs:1532`, `:1263`), and `/derp`'s
+(`agents/roomlerd/src/derp.rs:565`, `:559`). Regional relays keep their ladder
+(`agents/roomlerd/src/derp.rs:339`): no pod rolls under one.
 
 ⚠️ **#2221's rule binds.** A server that accepts and drops must climb, or a fleet reconnects to it every second.
 So only a 502 is flat, and an accepted socket that does not last refills nothing. Otherwise a crash-looping pod
@@ -211,12 +211,12 @@ this size it is a number to measure first. The flip is a staged rollout and the 
 
 ### Found, not changed
 
-- `/derp`'s ladder restarts on any accepted upgrade (`agents/roomlerd/src/derp.rs:375`), so a server that accepts
+- `/derp`'s ladder restarts on any accepted upgrade (`agents/roomlerd/src/derp.rs:383`), so a server that accepts
   and drops gets one dial a second for good. #2221 fixed only the control socket. It stays as it is with the
   switch on too: climbing there would slow the floor on any path whose middlebox kills young sockets, on exactly
   the hosts with no other carrier. That change needs its own read.
 - A clean close on the control socket redials with no wait at all (the `Ok(())` arm,
-  `agents/roomlerd/src/signaling.rs:1266`). A roll does not take that arm: 22 of 22 hosts on the 12:43Z roll below
+  `agents/roomlerd/src/signaling.rs:1267`). A roll does not take that arm: 22 of 22 hosts on the 12:43Z roll below
   read `Connection reset without closing handshake`.
 
 ## P3: the pre-pull
@@ -429,7 +429,7 @@ the `DerpConn`→WS path"* (`transport/derp.rs:332-337`). Carriers hang off the 
 off the socket, so a socket swap need not be visible to them at all.
 
 What makes today's reconnect visible is `mark_down()` — the agent's WS loop
-(`agents/roomlerd/src/derp.rs:329-372`) is shaped
+(`agents/roomlerd/src/derp.rs:336-379`) is shaped
 `loop { connect; register; mark_up; inner select; mark_down; backoff }`, and every
 iteration owns one `tx`/`rx` pair. `mark_down` is what withholds carrier builds and
 ultimately drives the freeze.

@@ -65,6 +65,9 @@ hex.workspace = true
 tempfile = { workspace = true }
 tokio-test = "0.4"
 tokio-tungstenite = "0.26"
+# #3656 — `upgrade_credential_tests` drive the tunnel CLI's own dial against the
+# real server. roomlerd already builds this crate, so it adds no compile.
+roomler-cli = { path = "../../agents/roomler-cli" }
 futures.workspace = true
 # #2552 — a test lifecycle on the agent socket holds a teardown at one step.
 async-trait.workspace = true

@@ -821,6 +821,23 @@ fn daemon_exe(origin: Origin) -> Option<PathBuf> {
     Some(PathBuf::from(name))
 }
 
+/// The standalone CLI's log subscriber: `env_filter`, then #3656's cap
+/// (`upgrade_auth::may_log`). tungstenite writes the tunnel token's upgrade
+/// request at TRACE, `Authorization` header included, and no `RUST_LOG` may
+/// reach those lines. An embedded `roomlerd cli` logs through the daemon's
+/// subscriber, which carries the same cap.
+fn log_subscriber(
+    env_filter: tracing_subscriber::EnvFilter,
+) -> impl tracing::Subscriber + Send + Sync + 'static {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .finish()
+        .with(tracing_subscriber::filter::filter_fn(
+            roomler_ai_remote_control::upgrade_auth::may_log,
+        ))
+}
+
 /// Entry point for the standalone `roomler` binary — parses the process's
 /// own argv.
 pub async fn run() -> Result<()> {
@@ -853,12 +870,9 @@ where
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::util::SubscriberInitExt::try_init(log_subscriber(env_filter));
 
     let cli = Cli::parse_from(args);
     match cli.command {
@@ -1247,6 +1261,26 @@ fn hostname_lossy() -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// #3656 — no `RUST_LOG` writes the tunnel token's upgrade request, and
+    /// everything else keeps what the spec gives it.
+    #[test]
+    fn no_rust_log_writes_the_upgrade_request() {
+        use tracing::Level;
+        let trace = tracing_subscriber::EnvFilter::new("trace");
+        let dispatch = tracing::Dispatch::new(log_subscriber(trace));
+        tracing::dispatcher::with_default(&dispatch, || {
+            assert!(!tracing::enabled!(
+                target: "tungstenite::handshake::client",
+                Level::TRACE
+            ));
+            assert!(tracing::enabled!(
+                target: "tungstenite::handshake::client",
+                Level::DEBUG
+            ));
+            assert!(tracing::enabled!(target: "roomler_cli::forward", Level::TRACE));
+        });
+    }
 
     #[test]
     fn parses_forward() {

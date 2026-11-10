@@ -1299,7 +1299,7 @@ conhost left at Normal, the exit-DNS purge's 10 s bound logged its warning 40.1 
 
 | What the worker writes | Since #3438 | Why |
 |---|---|---|
-| tracing | The rolling log only (`crates/agent-core/src/logging.rs:258`) | The file has every line, and a console write waits for its conhost |
+| tracing | The rolling log only (`crates/agent-core/src/logging.rs:259`) | The file has every line, and a console write waits for its conhost |
 | stderr | The rolling log, the same dated file tracing writes, from the end of `init` (`:245`); `NUL` past 256 MiB in a day, as for the per-user daemon (#3292) | The watchdog's last words (`say_on_stderr`), a panic, a stack overflow and FFmpeg print only there |
 | stdout, other than tracing | The console, as before | Only tracing's lines were measured waiting there |
 
@@ -1314,7 +1314,7 @@ them. The worker says so once at its start: `logging: this console has no window
 every line goes to the log file, stderr's too (#3438)`.
 
 `a_console_with_no_window_gets_no_line_and_stderr_reaches_the_log`
-(`crates/agent-core/src/logging.rs:2268`) pins it. It runs its own test binary again with
+(`crates/agent-core/src/logging.rs:2342`) pins it. It runs its own test binary again with
 `CREATE_NO_WINDOW`, hands the child that console as its stdout and stderr, and reads the
 console's text back; a control line proves the console is read at all. It runs in the
 Windows lane's `logging::tests::stderr_capture` step.
@@ -1339,7 +1339,7 @@ LocalSystem itself, from a scheduled task, in LocalSystem's
 ([#3230](https://github.com/gjovanov/roomler-ai/issues/3230#issuecomment-6775283704)). An upgrade
 by the updater, where msiexec runs as LocalSystem, was not run. Each step now logs into
 `%PROGRAMDATA%\Roomler\roomler\service-logs\roomlerd-installer.log`, beside the service's
-own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:120`):
+own log (`ServiceLogRole::Installer`, `crates/agent-core/src/logging.rs:122`):
 
 | Custom action | The verb | When it runs |
 |---|---|---|
@@ -1372,17 +1372,17 @@ this log once that step's build has #3230. Which step writes it is read from the
 seen in the field: on a clean lab guest no step had anything to repair, so none wrote it.
 
 What a step writes, in order. Its own lines have the target `roomler_node_core::logging::step`
-(`crates/agent-core/src/logging.rs:566`), which the filter keeps at INFO under any `RUST_LOG`:
+(`crates/agent-core/src/logging.rs:584`), which the filter keeps at INFO under any `RUST_LOG`:
 
 | Line | Fields | Written by |
 |---|---|---|
-| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:588`), right after `logging::init` (`agents/roomlerd/src/app.rs:1569`) |
+| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:606`), right after `logging::init` (`agents/roomlerd/src/app.rs:1569`) |
 | everything the verb logs | as the verb logs it | the verb |
-| each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:606`): on stdout as before, and inside a step in the log |
-| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:625`), from `main` (`agents/roomlerd/src/app.rs:1375`) |
+| each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:624`): on stdout as before, and inside a step in the log |
+| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:643`), from `main` (`agents/roomlerd/src/app.rs:1375`) |
 | `installer step failed: roomlerd <verb and arguments>`, ERROR | `exit_code`, `elapsed_ms`, `error` (the whole cause chain) | the same |
 
-`end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:657`). It drops the
+`end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:675`). It drops the
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
@@ -1403,7 +1403,7 @@ has no `--as-service`, and its cleanup is `--target-flavour perUser`
 
 Run by hand in a terminal, a step shows what it always showed: its answer once, and the
 verb's lines. The start and end lines go to the file only: the console's writer drops them
-(`crates/agent-core/src/logging.rs:254`). A per-layer filter on the console instead would leave the
+(`crates/agent-core/src/logging.rs:256`). A per-layer filter on the console instead would leave the
 whole stack with no level, which tracing reads as TRACE in every daemon that keeps its console,
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
@@ -1412,21 +1412,21 @@ write, the console keeps them too. One line moved:
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
-and `basename` (`crates/agent-core/src/logging.rs:108`, `:115`), and the appender, the prune
-(`rolling_basenames`, `crates/agent-core/src/logging.rs:1039`) and the `--source` reader
-(`newest_service_log`, `crates/agent-core/src/logging.rs:966`) all read it, so netd's dated
+and `basename` (`crates/agent-core/src/logging.rs:110`, `:117`), and the appender, the prune
+(`rolling_basenames`, `crates/agent-core/src/logging.rs:1057`) and the `--source` reader
+(`newest_service_log`, `crates/agent-core/src/logging.rs:984`) all read it, so netd's dated
 files age out too. Two transports do not return this log yet, and each needs a wire change:
 the RC data channel's `logs:fetch` reads only the serving process's own `roomlerd.log*`
 (`agents/roomlerd/src/logs_fetch.rs:52`), and an installer step starts no log upload (a
 follow-up of #3230).
 
-`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1705`) pins the folder and
+`logging::tests::installer_log` (`crates/agent-core/src/logging.rs:1779`) pins the folder and
 the names, the prune and the source. It runs a failing step in a child with stdout on `NUL`,
 as under msiexec, and finds its start line, all 20,000 of its lines, its answer and its whole
-error chain in the file (`crates/agent-core/src/logging.rs:1879`); run with a console, the same
-step shows what it always showed (`crates/agent-core/src/logging.rs:1909`). A daemon's `init`,
+error chain in the file (`crates/agent-core/src/logging.rs:1953`); run with a console, the same
+step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
-INFO, not TRACE (`crates/agent-core/src/logging.rs:1952`). The Windows lane runs the module
+INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1645`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7790`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7823`)

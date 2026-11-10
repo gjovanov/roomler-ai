@@ -8552,6 +8552,7 @@ dependencies = [
  "roomler-ai-mod-saas",
  "roomler-ai-remote-control",
  "roomler-ai-services",
+ "roomler-cli",
  "roomler-core",
  "roomlerd",
  "serde",

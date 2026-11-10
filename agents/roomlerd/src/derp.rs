@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::relay_probe::DerpTicketSlot;
+use crate::ws_connect::{Credential, Dial};
 use tunnel_core::transport::derp::DerpMux;
 
 /// Hard upper bound on a single `/derp` connect attempt (mirrors the control
@@ -229,20 +230,20 @@ fn derp_url_from_ws(ws_url: &str) -> String {
 /// The central `/derp` URL for one dial. S6 — `tid` = tenant-affinity key for
 /// the front LB. DERP relays are pod-local, so both mesh peers must land on
 /// the SAME pod; hashing every /derp socket by tenant guarantees it. Pre-S6
-/// servers ignore the param.
-fn central_url(derp_base: &str, token: &str, tenant_id: &str) -> String {
+/// servers ignore the param. #3656 — the token is not in it: it rides the
+/// dial's `Authorization` header (`ws_connect::dial`).
+fn central_url(derp_base: &str, tenant_id: &str) -> String {
     format!(
-        "{derp_base}?token={}&role=agent&tid={}",
-        crate::signaling::urlencode(token),
+        "{derp_base}?role=agent&tid={}",
         crate::signaling::urlencode(tenant_id)
     )
 }
 
-/// FR-103 — the central URL, built per ATTEMPT from the live token: the WS
-/// owner outlives the connection that spawned it, and a URL fixed at spawn
-/// would keep dialling with a token renewed since.
+/// FR-103 — the central dial, built per ATTEMPT from the live token: the WS
+/// owner outlives the connection that spawned it, and a dial fixed at spawn
+/// would keep presenting a token renewed since.
 ///
-/// #2512 — and NO URL while the control socket's verdict on that token is
+/// #2512 — and NO dial while the control socket's verdict on that token is
 /// "refused" (`TokenSlot::is_refused`): a dial then is a request the server
 /// will only 401, and a device whose row was gone re-dialled every 10 s,
 /// forever. `run` backs off (≤ `DERP_BACKOFF_MAX`) and asks again, so a new
@@ -254,13 +255,16 @@ fn central_url_per_attempt(
     ws_url: &str,
     token: crate::token_slot::TokenSlot,
     tenant_id: &str,
-) -> Box<dyn Fn() -> Option<String> + Send> {
-    let (base, tenant_id) = (derp_url_from_ws(ws_url), tenant_id.to_string());
+) -> Box<dyn Fn() -> Option<Dial> + Send> {
+    let url = central_url(&derp_url_from_ws(ws_url), tenant_id);
     Box::new(move || {
         if token.is_refused() {
             return None;
         }
-        Some(central_url(&base, &token.get(), &tenant_id))
+        Some(Dial {
+            url: url.clone(),
+            credential: Credential::token(token.get()),
+        })
     })
 }
 
@@ -289,9 +293,10 @@ pub fn spawn(
 }
 
 /// Multi-region DERP: like [`spawn`] but for a REGIONAL relay authenticated by
-/// an admission ticket. The URL is rebuilt per connect attempt from the ticket
+/// an admission ticket. The dial is rebuilt per connect attempt from the ticket
 /// slot, so a refreshed ticket takes effect on the next reconnect; while the
-/// slot is empty the owner just backs off (ticket still in flight).
+/// slot is empty the owner just backs off (ticket still in flight). #3656 —
+/// the ticket rides the dial's `Authorization` header, never the URL.
 pub fn spawn_regional(
     derp_url: &str,
     ticket_slot: DerpTicketSlot,
@@ -299,8 +304,12 @@ pub fn spawn_regional(
     mux: &Arc<DerpMux>,
     outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
 ) {
-    let base = derp_url.to_string();
-    // Host part only — the ticket query string must never reach a log line.
+    let sep = if derp_url.contains('?') { '&' } else { '?' };
+    let url = format!(
+        "{derp_url}{sep}tid={}",
+        crate::signaling::urlencode(tenant_id)
+    );
+    // Host part only, as it always was.
     let label = derp_url
         .trim_start_matches("wss://")
         .trim_start_matches("ws://")
@@ -308,7 +317,6 @@ pub fn spawn_regional(
         .next()
         .unwrap_or(derp_url)
         .to_string();
-    let tid = crate::signaling::urlencode(tenant_id);
     let reg_frame = mux.registration_frame();
     let weak = Arc::downgrade(mux);
     tokio::spawn(run(
@@ -319,11 +327,10 @@ pub fn spawn_regional(
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .map(|(t, _)| t.clone())?;
-            let sep = if base.contains('?') { '&' } else { '?' };
-            Some(format!(
-                "{base}{sep}ticket={}&tid={tid}",
-                crate::signaling::urlencode(&ticket)
-            ))
+            Some(Dial {
+                url: url.clone(),
+                credential: Credential::ticket(ticket),
+            })
         }),
         reg_frame,
         weak,
@@ -335,7 +342,7 @@ pub fn spawn_regional(
 
 async fn run(
     relay: String,
-    url_for_attempt: Box<dyn Fn() -> Option<String> + Send>,
+    dial_for_attempt: Box<dyn Fn() -> Option<Dial> + Send>,
     reg_frame: Vec<u8>,
     mux: Weak<DerpMux>,
     mut outbound_rx: mpsc::Receiver<tunnel_core::transport::derp::OutboundFrame>,
@@ -359,7 +366,7 @@ async fn run(
         // retry (the signaling loop fills the slot within seconds). #2512 —
         // the central relay: the server refuses this enrollment's token, as
         // the control socket heard it (`central_url_per_attempt`).
-        let Some(url) = url_for_attempt() else {
+        let Some(dial) = dial_for_attempt() else {
             debug!(
                 %relay,
                 "overlay derp: no usable credential (no admission ticket yet, or the server \
@@ -370,7 +377,8 @@ async fn run(
             continue;
         };
         // #2187 — the relay's address comes from `ctl_dns`, as the control WS's does.
-        match tokio::time::timeout(DERP_CONNECT_TIMEOUT, crate::ws_connect::connect(&url)).await {
+        // #3656 — the credential in a header, with the one-time query fallback.
+        match crate::ws_connect::dial(&dial, DERP_CONNECT_TIMEOUT).await {
             Ok(Ok((ws, _))) => {
                 backoff = Duration::from_secs(1);
                 let connected_at = std::time::Instant::now();
@@ -595,16 +603,74 @@ mod tests {
     #[test]
     fn each_dial_carries_the_token_in_use_now() {
         let slot = crate::token_slot::TokenSlot::new("first");
-        let url = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=first&role=agent&tid=t1")
-        );
+        let dial = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
+        assert_eq!(dial(), Some(central_dial("first")));
         slot.set("renewed".into());
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=renewed&role=agent&tid=t1")
+        assert_eq!(dial(), Some(central_dial("renewed")));
+    }
+
+    /// The central dial `central_url_per_attempt("wss://host/ws", …, "t1")`
+    /// makes with `token`.
+    fn central_dial(token: &str) -> Dial {
+        Dial {
+            url: "wss://host/derp?role=agent&tid=t1".into(),
+            credential: Credential::token(token),
+        }
+    }
+
+    /// #3656 — the central dial's URL names the role and the tenant, never the
+    /// token: a request line is what access logs and inspecting proxies record.
+    #[test]
+    fn the_central_url_carries_no_credential() {
+        let slot = crate::token_slot::TokenSlot::new("first");
+        let url = central_url_per_attempt("wss://host/ws", slot, "t1")()
+            .unwrap()
+            .url;
+        assert!(!url.contains("token="), "{url}");
+        assert!(!url.contains("first"), "{url}");
+    }
+
+    /// #3656 — the dialer itself, central and regional: the credential rides
+    /// `Authorization: Bearer`, and the URL the front sees holds none. The front
+    /// is a newer server that refuses with a verdict, so no dial goes again.
+    #[tokio::test]
+    async fn every_derp_dial_presents_its_credential_in_a_header() {
+        use crate::ws_connect::test_front::{self, Verdict};
+        let refused = Verdict::Refuse(
+            401,
+            Some(roomler_ai_remote_control::upgrade_auth::CHALLENGE_REFUSED),
         );
+
+        let (base, log) = test_front::start(move |_| refused).await;
+        let (mux, outbound_rx) = DerpMux::new([5u8; 32]);
+        spawn(
+            &format!("{base}/ws"),
+            crate::token_slot::TokenSlot::new("live-token"),
+            "t1",
+            &mux,
+            outbound_rx,
+        );
+        let central = test_front::until_seen(&log, 1).await.remove(0);
+        assert!(central.uri.starts_with("/derp?"), "{central:?}");
+        assert!(!central.uri.contains("token="), "{central:?}");
+        assert!(!central.uri.contains("live-token"), "{central:?}");
+        assert!(central.uri.contains("role=agent"), "{central:?}");
+        assert!(central.uri.contains("tid=t1"), "{central:?}");
+        assert_eq!(central.authorization.as_deref(), Some("Bearer live-token"));
+
+        let (base, log) = test_front::start(move |_| refused).await;
+        let (mux, outbound_rx) = DerpMux::new([6u8; 32]);
+        let ticket: DerpTicketSlot = Arc::new(std::sync::Mutex::new(Some((
+            "the-ticket".to_string(),
+            u64::MAX,
+        ))));
+        spawn_regional(&format!("{base}/derp"), ticket, "t1", &mux, outbound_rx);
+        let regional = test_front::until_seen(&log, 1).await.remove(0);
+        assert!(regional.uri.starts_with("/derp?"), "{regional:?}");
+        assert!(!regional.uri.contains("ticket="), "{regional:?}");
+        assert!(!regional.uri.contains("the-ticket"), "{regional:?}");
+        assert!(regional.uri.contains("tid=t1"), "{regional:?}");
+        assert_eq!(regional.authorization.as_deref(), Some("Bearer the-ticket"));
     }
 
     /// #2512 — while the control socket's verdict on the token is "refused",
@@ -613,26 +679,27 @@ mod tests {
     #[test]
     fn a_refused_token_is_never_dialled() {
         let slot = crate::token_slot::TokenSlot::new("dead");
-        let url = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
+        let dial = central_url_per_attempt("wss://host/ws", slot.clone(), "t1");
         assert!(slot.mark_refused("dead"));
-        assert_eq!(url(), None);
+        assert_eq!(dial(), None);
         assert!(slot.mark_accepted("dead"));
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=dead&role=agent&tid=t1")
-        );
+        assert_eq!(dial(), Some(central_dial("dead")));
         assert!(slot.mark_refused("dead"));
-        assert_eq!(url(), None);
+        assert_eq!(dial(), None);
         assert!(slot.set("renewed".into()));
-        assert_eq!(
-            url().as_deref(),
-            Some("wss://host/derp?token=renewed&role=agent&tid=t1")
-        );
+        assert_eq!(dial(), Some(central_dial("renewed")));
     }
 
-    /// A loopback server that answers every upgrade with a plain 401, as
-    /// `/derp` does for a gone row and for any lookup error. Returns its
-    /// `ws://…/ws` base and a count of the dials it has seen.
+    /// The status line and challenge `/derp` refuses a presented token with,
+    /// for a gone row and for any lookup error alike. #3656 — the challenge
+    /// names an error, so no dialer redials it in the query form; the bare
+    /// 401 of a server older than that is `ws_connect`'s to test.
+    const REFUSED_TOKEN: &str =
+        "401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"roomler\", error=\"invalid_token\"";
+
+    /// A loopback server that refuses every upgrade as `/derp` refuses a token
+    /// ([`REFUSED_TOKEN`]). Returns its `ws://…/ws` base and a count of the
+    /// dials it has seen.
     async fn refusing_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -645,12 +712,10 @@ mod tests {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = s.read(&mut buf).await;
-                    let _ = s
-                        .write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\
-                              Connection: close\r\n\r\n",
-                        )
-                        .await;
+                    let reply = format!(
+                        "HTTP/1.1 {REFUSED_TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = s.write_all(reply.as_bytes()).await;
                 });
             }
         });
@@ -881,7 +946,7 @@ mod tests {
     async fn only_a_502_is_redialled_flat() {
         let mut runs = Vec::new();
         for line in [
-            "401 Unauthorized",
+            REFUSED_TOKEN,
             "500 Internal Server Error",
             "503 Service Unavailable",
             "504 Gateway Time-out",
