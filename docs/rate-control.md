@@ -1077,7 +1077,7 @@ whether the bar is right, and whether to flip, stay the operator's calls.
 flowchart LR
     HB["DC pump heartbeat<br/>(FFmpeg ≈2 s · VP9-444 ≈1 s)<br/>target_bps + six shadow_*"] -->|"INFO line"| DISK["the host's rolling log<br/>roomlerd.log.* · 14 days"]
     HB -->|"uploader · 5 s batches"| AL[("agent_logs<br/>every daemon and RC worker,<br/>every org · 7-day TTL")]
-    AL -->|"FLEET read: mongosh inside the Mongo pod<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 14 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
+    AL -->|"FLEET read: mongosh outside the Mongo pod, via a port-forward<br/>$match created_at (index) → $filter msg →<br/>$unwind → $project 14 fields"| CORE["ShadowReport<br/>counters + sparse histograms"]
     DISK -->|"HOST read: node over text<br/>(evidence about that host only)"| CORE
     CORE --> OUT["per-class table · the criterion<br/>MET / NOT MET / INCONCLUSIVE<br/>· B1's invariants<br/>· what the encoder spent"]
 ```
@@ -1210,7 +1210,9 @@ console-session worker, `roomlerd run --supervisor scm`, which uploads like the 
 does).
 
 **The fleet read is bounded by construction**, because an unbounded read inside the
-Mongo container OOM-killed production Mongo once (2026-10-26):
+Mongo container OOM-killed production Mongo once (2026-10-26). Its client now runs outside
+that container, through `scripts/prod-mongo-read.sh` ([production-mongo-reads.md](production-mongo-reads.md)),
+and the server still runs the query inside it:
 
 | bound | how |
 |---|---|
@@ -1218,8 +1220,8 @@ Mongo container OOM-killed production Mongo once (2026-10-26):
 | plan | `$match` on `created_at` + `$sort` served by an index — `IXSCAN created_at_1` for the fleet, `tenant_id_1_source_1_created_at_-1` (backward) for one org; `explain` shows no blocking SORT |
 | memory | only streaming stages after the index scan, `allowDiskUse: false`; mongosh holds one row at a time and folds it into counters and sparse histograms. 2,000,000 synthetic rows over 2,000 sessions peak at 14 MiB of heap |
 | data | only 14 fields are projected — never an address, a name or another line |
-| credentials | read from the container's own environment, never argv |
-| consent | `--kubectl` / `--mars` refuse without `--yes`; the mongodb pod's restart count is printed before and after, and a restart fails the run (exit 3) |
+| credentials | from the database's secret into mode-600 files that the client container reads into its own environment: never argv, never `docker inspect`, never the output |
+| consent | `--kubectl` / `--mars` refuse without `--yes`; the mongodb pod's restart count and its container's memory are printed before and after, and a restart or an OOM kill fails the run (exit 3) |
 
 **Rehearsed, not assumed.** `--to-ejson` turns real log text into `agent_logs` batches
 exactly as the uploader stores them (an integer an Int64, a `?Debug` value its printed

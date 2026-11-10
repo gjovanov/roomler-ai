@@ -310,7 +310,7 @@ only the hosts it can reach, a biased sample
 flowchart LR
   L[STALL and heartbeat lines] -->|every event| U[uploader, 5 s batches]
   U --> A[(agent_logs, 7 days)]
-  A -->|one day per query, streaming| C[fr65-stall-census.cjs under mongosh]
+  A -->|one day per query, streaming| C[fr65-stall-census.cjs under mongosh, outside the Mongo pod]
   L -->|rolling log file| F[--from-logs, under Node]
   C --> R[one row per class, per device, per build]
   F --> R
@@ -331,9 +331,11 @@ totals before and after 0.4.192. A week of the whole fleet takes about 10 s.
 - **It is bounded by construction**, because an unbounded read inside the Mongo
   container once OOM-killed production: at most 8 days, one day per query, each
   with `maxTimeMS` and `allowDiskUse: false`, streaming stages only, and the fold
-  keeps counters and each session's last heartbeat. `--yes` is required, and
-  the Mongo pod's restart count is printed before and after. A count that moved
-  makes the run exit 3, and the run is harm, not data.
+  keeps counters and each session's last heartbeat. Its client runs outside that
+  container, through `scripts/prod-mongo-read.sh`
+  ([production-mongo-reads.md](production-mongo-reads.md)). `--yes` is required,
+  and the Mongo pod's restart count and memory are printed before and after. A
+  restart or an OOM kill makes the run exit 3, and the run is harm, not data.
 - **`--rows` also carries, for a `reset` line, the heartbeat just before it**,
   where the lost attribution can still be read. Keep the output of a read you
   mean to compare later: the lines expire in 7 days and the rows do not.

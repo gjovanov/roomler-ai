@@ -518,3 +518,15 @@ roll — verify one by its tag, `git ls-remote origin 'refs/tags/setup-v<V>^{}'`
 (the agent-v<V> commit), and `gh release view setup-v<V> --json assets`. The
 recipe, the re-run after a failure, and why the release no longer records a
 `targetCommitish` (#2013) are in the `ship-it` skill §6.
+
+## Reading production Mongo
+
+⚠️ **Never `kubectl exec -i mongodb-0 -- mongosh`.** A client started inside the
+database container counts against mongod's own 2 GiB limit. Run that way, an
+unbounded read OOM-killed production Mongo on 2026-10-26. Every read goes through
+`scripts/prod-mongo-read.sh`, which keeps the client in a throwaway container on
+the build host and reaches `mongodb-0` through a `kubectl port-forward`. It
+prints the pod's restart count and cgroup memory before and after, and proves its
+teardown. The method, why it was chosen over a client pod, the query bounds the
+server still needs, and every reader that uses it are in
+[production-mongo-reads.md](production-mongo-reads.md).

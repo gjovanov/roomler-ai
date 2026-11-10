@@ -3,12 +3,14 @@
 // docs/encoders.md holds the baseline. The debt on #3272 retires against this read,
 // until `rc:session.stats` carries the transport and the encoder itself.
 //
-// Runs inside the Mongo container, where its memory counts against the database's
-// own limit, so it is bounded by construction: the text index picks the batches,
-// $limit caps them, $filter keeps the matching lines, $group folds them server-side.
+// Its client runs OUTSIDE the Mongo container, through scripts/prod-mongo-read.sh (a
+// port-forward and a throwaway client container), so its memory never counts against
+// the database's own limit (docs/production-mongo-reads.md). The server still runs the
+// query inside that limit, so it is bounded by construction: the text index picks the
+// batches, $limit caps them, $filter keeps the matching lines, $group folds them
+// server-side.
 //
-//   roomler ssh mars -- 'kubectl -n roomler-ai exec -i mongodb-0 -- mongosh --nodb --quiet' \
-//     < scripts/rtp-reach-read.cjs | grep -o 'OUT .*'
+//   scripts/prod-mongo-read.sh --mars --yes scripts/rtp-reach-read.cjs | grep -o 'OUT .*'
 //
 // Prints one line per RTP session, then the totals. `agent_logs` keeps 7 days.
 // A session is RTP if its pump logged the RTP heartbeat: the DataChannel pumps name
@@ -21,9 +23,10 @@
 // session whose request line was lost falls back to its first heartbeat.
 // The totals cover the 7 days, which mix releases, so `OUT version` splits them.
 //
-// ⚠️ mongosh reads stdin as a REPL, so a line that parses alone runs alone. Keep
-// `coll.aggregate([` together and `.forEach` on the closing line: split them and
-// every line errors, and the only output left is a misleading total of 0.
+// ⚠️ The runner hands mongosh this file whole. Fed on stdin instead, mongosh reads it
+// as a REPL, so a line that parses alone runs alone. Keep `coll.aggregate([` together
+// and `.forEach` on the closing line: split them and every line errors, and the only
+// output left is a misleading total of 0.
 const HOURS = 168;
 const MAX_BATCHES = 5000;
 const MIN_RATE_SECS = 5;

@@ -1994,8 +1994,10 @@ field, or ended before the observation landed — is `unknown`, **never read as 
 
 ### Field verification (owed after the promote)
 
-For one closed day, by hand from `mongodb-0`, read-only, exclusions as the digest's footer counts
-them — the frozen `*` row (`growth_quality_daily`, scope `external`) and the Quality tab must equal:
+For one closed day, by hand through `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` (its client
+runs outside `mongodb-0`, and `db` is already open: [production-mongo-reads.md](production-mongo-reads.md)),
+read-only, exclusions as the digest's footer counts them — the frozen `*` row
+(`growth_quality_daily`, scope `external`) and the Quality tab must equal:
 
 ```js
 // Sessions requested that day, by outcome (D = the day's 00:00Z, E = the next):

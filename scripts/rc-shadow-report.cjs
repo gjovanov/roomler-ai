@@ -19,10 +19,11 @@
 //
 // TWO READS, ONE CORE
 //
-//   1. The FLEET read, the one AC2 is judged by. Run under mongosh inside the
-//      Mongo container, over `agent_logs`: every daemon and every RC worker
-//      uploads its INFO lines there (7-day TTL), across every org. That is the
-//      only unbiased population. An exec sweep of host logs reaches only
+//   1. The FLEET read, the one AC2 is judged by. Run under mongosh OUTSIDE the
+//      Mongo container (scripts/prod-mongo-read.sh,
+//      docs/production-mongo-reads.md), over `agent_logs`: every daemon and
+//      every RC worker uploads its INFO lines there (7-day TTL), across every
+//      org. That is the only unbiased population. An exec sweep of host logs reaches only
 //      exec-enabled, online hosts of one org, and the criterion is a fleet-wide
 //      PROPORTION. `GET …/agent/{id}/logs` cannot serve it either: it takes
 //      only `limit` (<= 500 recent batches per agent, roughly 40 minutes of a
@@ -842,17 +843,19 @@ function renderSpend(r, L) {
 // ---------------------------------------------------------------- mongosh runner
 
 /**
- * The fleet read. Runs inside the Mongo container (the mars recipe in
- * scripts/rc-shadow-report.sh) and prints the report. Bounded by
- * construction, because an unbounded read inside that container once
- * OOM-killed production Mongo (2026-10-26):
+ * The fleet read. Runs through scripts/prod-mongo-read.sh, its client OUTSIDE
+ * the Mongo container (the mars recipe in scripts/rc-shadow-report.sh), and
+ * prints the report. Bounded by construction, because the server still runs it
+ * inside that container, and an unbounded read there once OOM-killed
+ * production Mongo (2026-10-26):
  *   - a time window of at most 8 days (`agent_logs` keeps 7), read one day per
  *     query, each with `maxTimeMS` and `allowDiskUse: false`;
  *   - only streaming stages after the index-backed `$match` + `$sort`, so the
  *     server holds no result set and mongosh holds one row at a time;
  *   - only the FIELDS above are projected; the fold keeps counters and sparse
  *     histograms, never the rows;
- *   - credentials come from the container's own environment, never argv.
+ *   - credentials come from the secret through the runner's files into the
+ *     client container's environment, never argv.
  */
 function runMongosh() {
   const env = typeof process !== 'undefined' && process.env ? process.env : {};
@@ -932,7 +935,7 @@ function connectDb(dbName, env) {
     ).getDB(dbName);
   }
   if (typeof db !== 'undefined' && db) return db.getSiblingDB(dbName);
-  throw new Error('no connection: pass RC_SHADOW_URI, or run inside the Mongo container (its env has the credentials)');
+  throw new Error('no connection: pass RC_SHADOW_URI, or run through scripts/prod-mongo-read.sh (it sets the credentials)');
 }
 
 // ---------------------------------------------------------------- self-test

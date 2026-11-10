@@ -4216,8 +4216,8 @@ message text or hostname can enter the record — locked by
 route by `browser_connect_timing_record_parses` (`agent_log.rs:459`), because a
 422 is swallowed like every other failure and would look like nobody connecting.
 
-**Mining it** (`roomler2`, in the `mongodb-0` pod — credentials from the
-`mongodb-secret`, never on a transcript). Retention is the collection's **7 d
+**Mining it** (`roomler2`, through `scripts/prod-mongo-read.sh`, whose client runs outside
+`mongodb-0` and never prints a credential: [production-mongo-reads.md](production-mongo-reads.md)). Retention is the collection's **7 d
 TTL** (`crates/modules/fleet/src/lib.rs:859`, `crates/db/src/models/agent_log.rs:115`) — the same window
 as the agent's own logs, and the pod log is shorter still — so a stall must be
 mined within the week; `remote_audit` keeps its three marks for 90 d.

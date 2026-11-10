@@ -15,8 +15,9 @@
 //
 // TWO READS, ONE CORE
 //
-//   1. The FLEET read: under mongosh inside the Mongo container, over
-//      `agent_logs`. scripts/fr65-stall-census.sh carries the recipe.
+//   1. The FLEET read: under mongosh OUTSIDE the Mongo container, over
+//      `agent_logs`. scripts/fr65-stall-census.sh carries the recipe, through
+//      scripts/prod-mongo-read.sh (docs/production-mongo-reads.md).
 //   2. The HOST read: under Node, `--from-logs FILE...`, the rolling log text of
 //      a host whose files you already hold. It exists to prove read 1: the same
 //      classifier over the same lines, from the two ends of the upload.
@@ -832,17 +833,19 @@ function renderFor(mode, r, labels, probes) {
 // ---------------------------------------------------------------- mongosh runner
 
 /**
- * The fleet read. Runs inside the Mongo container (the recipe in
- * scripts/fr65-stall-census.sh) and prints the report. Bounded by construction,
- * because an unbounded read inside that container once OOM-killed production
- * Mongo (2026-10-26):
+ * The fleet read. Runs through scripts/prod-mongo-read.sh, its client OUTSIDE
+ * the Mongo container (the recipe in scripts/fr65-stall-census.sh), and prints
+ * the report. Bounded by construction, because the server still runs it inside
+ * that container, and an unbounded read there once OOM-killed production Mongo
+ * (2026-10-26):
  *   - a window of at most 8 days, read one day per query, each with `maxTimeMS`
  *     and `allowDiskUse: false`;
  *   - only streaming stages after the index-backed `$match` + `$sort`, so the
  *     server holds no result set and mongosh holds one row at a time;
  *   - only the FIELDS above are projected, and the fold keeps counters, each
  *     session's last heartbeat and the stamps of the probe lines;
- *   - credentials come from the container's own environment, never argv.
+ *   - credentials come from the secret through the runner's files into the
+ *     client container's environment, never argv.
  */
 function runMongosh() {
   const env = typeof process !== 'undefined' && process.env ? process.env : {};
@@ -955,7 +958,7 @@ function connectDb(dbName, env) {
       'mongodb://' + encodeURIComponent(u) + ':' + encodeURIComponent(p) + '@127.0.0.1:27017/?authSource=admin',
     ).getDB(dbName);
   }
-  throw new Error('no connection: pass FR65_URI, or run inside the Mongo container (its env has the credentials)');
+  throw new Error('no connection: pass FR65_URI, or run through scripts/prod-mongo-read.sh (it sets the credentials)');
 }
 
 // ---------------------------------------------------------------- host read
