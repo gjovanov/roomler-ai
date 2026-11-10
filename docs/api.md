@@ -60,7 +60,7 @@ sequenceDiagram
     A-->>D: token handed to installer / wizard
     D->>S: POST /api/agent/enroll {enrollment_token, machine_id, machine_name, os, agent_version}
     S-->>D: {agent_id, tenant_id, agent_token}
-    D->>S: GET /ws?role=agent&token=<agent_token>  (always-on control link)
+    D->>S: GET /ws?role=agent&tid=<tenant_id>, Authorization: Bearer <agent_token>  (always-on control link)
 ```
 
 `machine_id` is a stable hardware-derived hash, unique per `(tenant_id, machine_id)`

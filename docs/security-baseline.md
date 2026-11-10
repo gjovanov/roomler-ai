@@ -112,6 +112,13 @@ every other native route already reads.
   load balancer, an API still booting behind the pod's nginx, a PoP whose
   `derp-relay` is down. A client that still puts its credential in the URL can
   land there, whatever the access log says.
+- **The clients send the header (0.4.210) and fall back once.** A redial in the
+  query form follows only a refusal with no verdict on the credential, and an
+  endpoint where that redial upgraded keeps the query form for 6 h, in memory
+  ([real-time.md](real-time.md#how-the-daemon-and-the-cli-dial-3656)).
+- **No client log writes the request.** tungstenite writes a client's whole upgrade
+  request at TRACE, the `Authorization` line included; the daemon's and the CLI's
+  subscribers drop those lines whatever `RUST_LOG` asks (`upgrade_auth::may_log`).
 
 ### Open: user sessions are irrevocable
 
@@ -893,7 +900,7 @@ An accepted change is logged with the peer's uid (`crates/localapi/src/lib.rs:38
 beside the daemon's own `config key updated` line, which carries the value. Its target,
 `roomler_localapi`, sits below the packaged units' `RUST_LOG=roomlerd=info,warn` and the
 default filter, so the daemon's filter keeps that crate at INFO under any spec that would
-leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:475`, #3525). A
+leave it coarser (`keep_info_targets`, `crates/agent-core/src/logging.rs:493`, #3525). A
 spec that names the crate keeps its say: `RUST_LOG=debug` keeps its DEBUG lines, and
 `roomler_localapi=off` silences it. Only root sets a root daemon's `RUST_LOG`, so the
 person at the device cannot turn the record off.

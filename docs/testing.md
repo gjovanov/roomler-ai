@@ -268,7 +268,7 @@ Fixed since:
 > child), and `DENY_ENV_LOCK` is held, so no probe test runs beside the loop: unlocked, a loop's
 > session ask landed in a retry test's quiet wait and held that test, and the lock, for 60 s.
 > Each loop test ends by asserting that `caps_probe_spawns()` is zero. The pattern:
-> [`unenrolled.rs:479`](../agents/roomlerd/src/unenrolled.rs#L479).
+> [`unenrolled.rs:539`](../agents/roomlerd/src/unenrolled.rs#L539).
 
 ## CI & special lanes
 

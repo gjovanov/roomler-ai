@@ -27,9 +27,9 @@ twice (2026-08-07 and 2026-08-09); the verb existed both times.
 
 **What reaches that log.** The daemon keeps lines by `RUST_LOG` when its environment
 sets one, and otherwise by its default: `roomlerd` and `tunnel_core` at INFO,
-everything else at WARN (`crates/agent-core/src/logging.rs:392`). Either way it then
+everything else at WARN (`crates/agent-core/src/logging.rs:410`). Either way it then
 keeps INFO from two targets that no shipped unit names
-(`crates/agent-core/src/logging.rs:475`, #1928):
+(`crates/agent-core/src/logging.rs:493`, #1928):
 
 | Target | Its INFO lines |
 |---|---|
@@ -42,8 +42,8 @@ directive for the target, for a module under it or for any prefix of its name
 `RUST_LOG=debug` still logs both at DEBUG, and `roomler_localapi=off` keeps the crate
 silent. An empty or wholly invalid `RUST_LOG` is left alone too: `EnvFilter` then
 logs ERROR from every target. Two directives are added whatever the spec says:
-`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:430`) and
-`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:441`).
+`turn::client::relay_conn=error` (`crates/agent-core/src/logging.rs:448`) and
+`tunnel_core::overlay::sockbuf=info` (`crates/agent-core/src/logging.rs:459`).
 
 ## Transport
 
@@ -372,7 +372,7 @@ run the command as root:
 | The policy `PUT` | `console_user` off Windows needs the agent's stored `console-user` word | [`agent_exec.rs:965`](../crates/modules/fleet/src/agent_exec.rs#L965) |
 | Every command (`authorize`) | the connection on this pod advertises `console-user`, else `run_as_unavailable` | [`agent_exec.rs:361`](../crates/modules/fleet/src/agent_exec.rs#L361) |
 | The push itself | the hub refuses a frame carrying `run_as` to a connection without the word, whoever the caller | [`hub.rs:3206`](../crates/modules/fleet/src/hub.rs#L3206) |
-| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5771`](../agents/roomlerd/src/signaling.rs#L5771) |
+| The device | `run_as` is honoured through `exec_service::run_as_of`; an unknown word is refused before the consent prompt | [`signaling.rs:5761`](../agents/roomlerd/src/signaling.rs#L5761) |
 
 The word is kept per connection, never read from the stored row, for the reason
 `ssh-grant-ack` is: after a rollback the row still promises what the running

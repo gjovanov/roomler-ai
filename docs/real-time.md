@@ -53,6 +53,43 @@ form. A client tries the query form only on a refusal without that `error`: one
 from a server older than the header, or one whose header was dropped on the way.
 The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 
+#### How the daemon and the CLI dial (#3656)
+
+From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
+header whose value is marked sensitive: the daemon's control socket
+(`agents/roomlerd/src/signaling.rs:1794`), its central and regional DERP sockets
+(`agents/roomlerd/src/derp.rs:381`) and the CLI's tunnel-client socket. The URL
+names the role and the tenant only. The rule is one function in each client
+(`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
+
+| The header-only dial hears | The client |
+|---|---|
+| `101` | is connected |
+| `401` with `error="invalid_token"` (a server that read the credential and refused it) | stops: the daemon's FR-103 recovery and auth ladder take it from there, the CLI reports it |
+| a bare `401` (a server older than the header) or a bare `400` (a regional relay older than it) | dials ONCE more with the credential in the query: `token=`, or `ticket=` for a relay |
+| `401` with a challenge and no `error` (our server saw no credential: the header was dropped on the way) | dials once more in the query, the same way |
+| `403`, `5xx`, a timeout or anything else | handles it as before, with no second dial |
+
+A redial that upgrades notes its endpoint (the URL before its `?`), and the
+client's dials there take the query form for 6 h (`QUERY_FORM_FOR`,
+`crates/remote_control/src/upgrade_auth.rs:158`): a server or relay older than the
+header costs one refused dial per endpoint every six hours, and one updated
+meanwhile hears the header again the same day. The note is in memory, per
+process. A redial refused too notes nothing, so a refused credential is offered in
+the header first again next time. Each dial has its own 30 s limit
+(`WS_CONNECT_TIMEOUT`, `DERP_CONNECT_TIMEOUT`, and the CLI's `WS_DIAL_TIMEOUT`,
+new: the CLI's dial had none), so a dial that falls back can take two.
+
+tungstenite writes a client's whole upgrade request at TRACE, the `Authorization`
+line included, and marking the value sensitive does not reach that line. The
+daemon's and the CLI's subscribers drop those lines whatever `RUST_LOG` asks
+(`upgrade_auth::may_log`, `crates/remote_control/src/upgrade_auth.rs:243`), with a
+global `filter_fn` beside the `EnvFilter` (`crates/agent-core/src/logging.rs:402`,
+`agents/roomler-cli/src/cli.rs:829`). Not a directive, on purpose: a fixed
+`tungstenite=debug` would raise those crates above the default `warn`, and any
+target directive loses to a span-scoped one such as `[org]=trace`, which
+`EnvFilter` lets win.
+
 Delivery across pods: WS sessions are pod-local; chat, presence, and notification
 events fan out through Redis pub/sub so every pod pushes to its own sockets.
 
@@ -603,8 +640,7 @@ UDP-blocked:
 ## Connection hygiene
 
 - Agents keep one outbound WSS control link: WS ping every 25 s,
-  `rc:agent.heartbeat` every 30 s, exponential reconnect capped at 60 s; a 401 on
-  upgrade is fatal (re-enroll).
+  `rc:agent.heartbeat` every 30 s, exponential reconnect capped at 60 s.
   - The ladder restarts at 1 s when a connection that sent its hello lived ≥ 30 s
     and then dropped (#2221). Before that, a successful reconnect kept the
     ladder where the outage left it, so the next ordinary drop waited out the
@@ -612,6 +648,13 @@ UDP-blocked:
   - A server that accepts and drops at once still climbs the ladder. That 30 s
     bar is what keeps a flapping server from drawing a fleet-wide reconnect
     every second.
+- A `401` on upgrade (after [the one query-form redial](#how-the-daemon-and-the-cli-dial-3656)
+  where that applies) is not fatal. It closes the sessions the agent kept, and
+  FR-103 looks for a newer token in the config file, else renews this one, and
+  retries once (`agents/roomlerd/src/signaling.rs:1284`). Otherwise the agent
+  waits 30 s, 60 s, 5 min, then an hour between tries
+  (`agents/roomlerd/src/signaling.rs:1595`), and the third refusal in a row raises
+  the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
   alive.
@@ -651,7 +694,7 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2292`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2282`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
 | `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |
