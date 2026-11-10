@@ -412,10 +412,25 @@ flowchart TD
 ```
 
 On a build without the gate it says what the gate would shed. On a build with it,
-every poke already passed the gate, so `gate_replay_keeps` should equal `pokes`;
-a shortfall is a disagreement between the replay and the gate. The replay reads
-stamps at the server's millisecond: its 60 s quiet ends on a sweep of the 3 s
-chatter itself, and the file's microseconds flipped 19 of the verdicts below.
+every poke already passed the gate, so `gate_replay_keeps` should equal `pokes`,
+and on most devices it does. Two shortfalls are the replay's, not the gate's; the
+first read of the release found both (2026-11-10, below):
+
+- **Two gates in one log.** A host on two orgs runs a per-org overlay runtime for
+  each, each with its own gate, and one process uploads one log. The replay models
+  one gate per device, so it keeps about one sweep a minute where the host made one
+  per gate. Tell: more than one sweep per active minute (1.6–1.7 on the two such
+  hosts).
+- **The 60 s boundary.** The gate starts its quiet when the network event arrives
+  and pokes on the next 5 s carrier-health tick (`FALLBACK_TICK`), so under chatter
+  that never stops, two gated sweeps land exactly twelve ticks apart, a few ms
+  either side of the replay's 60 000 ms. Tell: one sweep per active minute, with
+  nearly every minute active.
+
+A shortfall with neither tell is a disagreement between the replay and the gate.
+The replay reads stamps at the server's millisecond: its 60 s quiet ends on a sweep
+of the 3 s chatter itself, and the file's microseconds flipped 19 of the verdicts
+below.
 
 `--canary` covers a STALL when a summary of the same device follows it within its
 10 minutes with no `agent starting` between. A build without the canary covers
@@ -433,6 +448,13 @@ The first fleet read on `--rekeys`, 2026-10-27 04:10Z .. 2026-11-03 04:10Z, ever
 device: 208 210 pokes, of which the gate would have kept 64 138; 33 710 route
 waves; 1 399 direct and 786 relay revalidations failed. It ran in about 11 s, and
 the Mongo pod's restart count read 1 before and after. That is P3's before.
+
+P3's after, 2026-11-10: 7 days on 0.4.199 to 0.4.208, every device, the same read.
+75 857 pokes, 58 015 of them kept by the replay; the worst minute on any device 32,
+and the three busiest hosts at 26, 20 and 32 a minute; 809 direct and 451 relay
+revalidations failed. 15 of the 19 devices that poked match the replay exactly, and
+each of the other four carries one of the tells above. It ran in 11 s, the pod's
+restart count read 1 before and after, and `oom_kill` stayed 0 (FR-65 AC5).
 
 ## 8. What the watch costs (FR-65 AC1)
 
@@ -579,3 +601,16 @@ starved that long is the watchdog's to catch (its budgets are 30–90 s).
 canary WARN within the same second is the runtime's; a STALL with a dominant
 phase and an on-time canary is the pump's own work. A fleet read of both is
 what AC4 asks for.
+
+**The first fleet read, 2026-11-10** (`--canary`, 7 days on 0.4.199 to 0.4.208,
+every device; FR-65 AC4). Most windows read like an idle runtime: the median
+window's p99 is 5 ms or less on every device that logged all week, and 27 of the 47
+devices with summaries never had a wake more than 100 ms late. The rest did: 6 383
+of 790 million wakes, in 7.7 % of the windows, mostly on Windows desktops and
+laptops (a third of one corporate laptop's windows; the Linux servers at most
+0.7 %). Of 731 covered STALLs, 139 sat in a late window, and on three hosts far
+above their base rate. Encode left the runtime with FR-70 M1, so this is something
+else, and one timer on the runtime cannot say what: a worker held inside the
+process and a process the OS did not schedule both read as a late wake. A reference
+timer on its own OS thread beside this one would split them: both late is the host,
+only this one late is the process.
