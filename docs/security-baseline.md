@@ -263,7 +263,7 @@ member-only, so any guest could archive or cascade-delete a channel).
 A tunnel policy names who may reach which `host:port` through which of the org's
 devices, so writing one is granting access. Every `…/tunnel-policy` route needs
 **`MANAGE_AGENTS` in the path org**, the bit the overlay ACL beside it sits behind
-(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:698`; the
+(`tunnel_policy_manager`, `crates/modules/network/src/routes/tunnel.rs:800`; the
 overlay twin is `gate`, `crates/modules/network/src/routes/overlay_policy.rs:139`).
 The org's owner and admins hold it; the managed `moderator`, `member` and `guest`
 roles do not.
@@ -490,8 +490,10 @@ year-long credential per replay. It is a type now (`crates/services/src/auth/sin
 The rules each door keeps:
 
 - **Every refusal that must leave the token usable runs before the spend**: an archived
-  org, the plan's cap, a tunnel re-enrollment the token's subject may not make, a read
-  that failed. **The spend runs before anything is written.**
+  org, a tunnel token whose subject is no longer a member of its org
+  ([below](#a-tunnel-client-ends-with-its-owners-membership)), the plan's cap, a tunnel
+  re-enrollment the token's subject may not make, a read that failed. **The spend runs
+  before anything is written.**
 - **Two answers, never one.** A token spent before is 401 `This enrollment token has
   already been used`. A ledger that cannot answer is a retryable 503 and the token stays
   valid. "Already used" sends a person looking for whoever used the token, so a ledger
@@ -516,10 +518,53 @@ for (its `sub`), with their permissions read at enrollment time.
   `crates/services/src/dao/tunnel_client.rs`): an owner's re-enrollment refreshes the row
   only while it is still live and theirs, so a removal that lands between the check and
   the write is not undone. That race is the one case where a refused token is spent.
-- An allowed re-enrollment behaves as it always did: it changes neither the owner nor
-  `token_gen` (a removed client's revival mints at the generation its removal set, so
-  its old tokens stay dead), and it leaves the overlay alone; the client takes a lease
-  when it joins.
+- An allowed re-enrollment changes no `token_gen` (a removed client's revival mints at
+  the generation its removal set, so its old tokens stay dead), and it leaves the
+  overlay alone; the client takes a lease when it joins. It keeps a live client's owner.
+  **A removed client a device manager brings back becomes theirs** (`owner_user_id` =
+  the reviver, the person its new token acts for, as a removed device enrolled again
+  takes its enroller, #3627), so a client whose owner left the org does not come back
+  owned by someone who is not a member. One pipeline update reads the tombstone and
+  writes the owner (`TunnelClientDao::rehydrate`), so a removal or revival racing the
+  route's read cannot get it wrong.
+
+### A tunnel client ends with its owner's membership
+
+A tunnel client acts for the person whose enrollment token enrolled it
+(`owner_user_id`; for a paired client, whoever approved the pairing): the forward gate
+matches it as that person, `AllUsers` included, and its overlay node is a peer of the
+org's mesh. So it lasts only as long as that person's membership of the org, as a call
+seat and a room membership do ([§3](#the-media-socket-admits-only-the-calls-participants)):
+
+- **Removed from the org, or leaving it, removes the person's tunnel clients there**,
+  the way a device manager's `DELETE …/tunnel-client/{cid}` removes one
+  (`end_tunnel_client`, `crates/modules/network/src/routes/tunnel.rs`): the row is
+  tombstoned and its `token_gen` advanced, THEN the overlay node is released (the peers
+  hear `removes`, the address is pooled). From the tombstone on, a reconnect, a renewal,
+  the agent roster and an overlay join refuse it, and its open socket closes at the next
+  60 s poll ([below](#a-removed-thing-answers-nothing-1821-1829)). This is `network`'s
+  `MembershipLifecycle` hook (`crates/modules/network/src/membership.rs`), first in
+  `HOOK_ORDER`.
+- **That hook never stops the cascade.** The cascade stops on a failing holder because
+  `chat` must not drop the room rows `conference` reads to find the person's calls;
+  nothing after `network` reads what it holds, so it tries every client, logs one it
+  could not finish (`alert = membership_tunnel_end`), and answers `Ok`. A tunnel-client
+  write that failed must not keep the person in a live call or on the org's rooms.
+- **What a removal left is an operator step's**: `POST /api/admin/tunnel-clients/prune`
+  ends the tunnel clients, and the overlay leases of removed ones, whose owner is no
+  longer a member: platform operators only, a dry run by default that lists each client
+  a real run would end, bounded per call, the membership re-read per pair, the removal's
+  own cascade per pair, and nothing found on a second run.
+- **An enrollment token acts for the person it was minted for**, so once they are no
+  longer a member it enrolls nothing: **403** before the spend, nothing written, for a
+  new machine, their own removed client, and a token a pairing delivered (the
+  approver's). The enrollment asks again after its write: a removal deletes the
+  membership and then lists the person's clients, so a write that landed after that
+  list is seen by the second read and removed.
+- **Devices the person enrolled are not removed with them**: a device belongs to the
+  org's fleet, and removing one stays a device manager's decision
+  (`DELETE …/agent/{id}`). Tunnel policies naming the person are left in place for an
+  admin to edit; they apply again if the person is added back.
 
 ### A removed thing answers nothing (#1821, #1829)
 

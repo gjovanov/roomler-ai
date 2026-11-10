@@ -110,6 +110,13 @@ pub const REMOVED_TUNNEL_CLIENT: &str = "This machine's tunnel client was remove
      organization, and only someone with the Manage devices permission can bring it back. Ask \
      an organization administrator for an enrollment token.";
 
+/// What an enrollment answers (403) when the person its token was minted for
+/// is no longer a member of the token's org: the token acts for them, and a
+/// tunnel client ends with its owner's membership (`crate::membership`).
+pub const ENROLLER_LEFT_THE_ORG: &str = "This enrollment token was issued to someone who is no \
+     longer a member of this organization, so it cannot enroll a tunnel client. Ask a member of \
+     the organization for a new enrollment token.";
+
 /// POST /api/tunnel-client/enroll — public (no user JWT);
 /// authenticates via the tunnel-enrollment token and returns a
 /// long-lived TunnelClient JWT. Rehydrates an existing
@@ -123,14 +130,21 @@ pub const REMOVED_TUNNEL_CLIENT: &str = "This machine's tunnel client was remove
 /// #3328 — the order is the contract:
 /// 1. the token is verified, and comes back unspent;
 /// 2. the archived-org gate (#3042);
-/// 3. a known machine id re-enrolls only for its owner, while the client
+/// 3. the person the token was minted for is still a member of its org
+///    (403 [`ENROLLER_LEFT_THE_ORG`] otherwise): a tunnel client acts for
+///    them, and ends with their membership (`crate::membership`);
+/// 4. a known machine id re-enrolls only for its owner, while the client
 ///    is live, or for a holder of `MANAGE_AGENTS` ([`revive_scope`], 409
 ///    otherwise); a new one meets the plan's tunnel-client cap (403);
-/// 4. the token is spent on the used-token ledger: 401 if it was spent
+/// 5. the token is spent on the used-token ledger: 401 if it was spent
 ///    before, a retryable 503 if the ledger cannot answer;
-/// 5. the row is written and the client's token minted from the spent token.
+/// 6. the row is written; the membership is asked again (a removal that
+///    lands between steps 3 and 6 has already listed the person's clients
+///    and would not see this row, so a row written for someone who is no
+///    longer a member is removed here and refused like step 3); and the
+///    client's token is minted from the spent token.
 ///
-/// Every refusal before step 4 leaves the token unspent and writes nothing.
+/// Every refusal before step 5 leaves the token unspent and writes nothing.
 pub async fn enroll_tunnel_client(
     State(state): State<NetworkState>,
     Json(body): Json<TunnelEnrollRequest>,
@@ -146,6 +160,19 @@ pub async fn enroll_tunnel_client(
 
     // #3042 — before the row below: this is the door that revives a tombstone.
     org_accepts_enrollment(&state.tenants, tid).await?;
+
+    // The token acts for the person it was minted for (a pairing's: its
+    // approver), so it enrolls nothing once they are no longer a member: the
+    // membership's end removed their clients, and this must not write a new
+    // one. A plain `Forbidden`, never `NotAMember` (the code a page leaves the
+    // org on): this door is an installer's.
+    if !state.tenants.is_member(tid, enroller).await? {
+        tracing::info!(
+            tenant_id = %tid, %enroller,
+            "tunnel-client: enrollment refused: the token's person is no longer a member"
+        );
+        return Err(ApiError::Forbidden(ENROLLER_LEFT_THE_ORG.to_string()));
+    }
 
     let existing = state
         .tunnel_clients
@@ -218,6 +245,37 @@ pub async fn enroll_tunnel_client(
     let client_id = client
         .id
         .ok_or_else(|| ApiError::Internal("tunnel client missing _id".to_string()))?;
+    // The membership again, now that the row exists. A removal deletes the
+    // membership and THEN lists the person's clients to remove them: a write
+    // that landed after that list landed after the delete, so this read sees
+    // it, and the row is removed the way the removal would have removed it.
+    // A read that fails mints: the check above passed a moment ago, and a
+    // row the race and a fault left behind is what the operator step finds.
+    match state.tenants.is_member(tid, enroller).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                tenant_id = %tid, %enroller, %client_id,
+                "tunnel-client: the token's person stopped being a member during the enrollment; removing the row"
+            );
+            if let Err(e) =
+                end_tunnel_client(&state, tid, client_id, &client.machine_id, ENROLLER_LEFT).await
+            {
+                tracing::error!(
+                    tenant_id = %tid, %client_id, %e,
+                    alert = crate::membership::ALERT,
+                    "tunnel-client: could not remove a row written for a non-member; the operator step will find it"
+                );
+            }
+            return Err(ApiError::Forbidden(ENROLLER_LEFT_THE_ORG.to_string()));
+        }
+        Err(e) => {
+            tracing::warn!(
+                tenant_id = %tid, %enroller, %client_id, %e,
+                "tunnel-client: could not read the membership again after the write; minting on the first read"
+            );
+        }
+    }
     // FR-103 — at the row's CURRENT generation, so a client revived after a
     // removal gets a token that is accepted, and its old ones are not. The
     // mint takes the spent token (#3328), and reads the org and the owner
@@ -240,16 +298,18 @@ pub async fn enroll_tunnel_client(
 /// machine id that already has a tunnel client in the org? Its owner may,
 /// while the client is live. A holder of `MANAGE_AGENTS` may, live or
 /// removed: a removed client comes back only through one, its owner
-/// included. Anyone else is refused 409, here, before the token is spent,
-/// so nothing is written and the token can still enroll a machine of its own.
+/// included, and comes back as theirs (the reviver owns it, as its new token
+/// acts for them; a live client keeps its owner). Anyone else is refused 409,
+/// here, before the token is spent, so nothing is written and the token can
+/// still enroll a machine of its own.
 ///
 /// The answer is also the scope the write holds (`ReviveScope`), so a
 /// removal that lands between this read and that write is not undone.
 ///
 /// The permission is read only when it decides something, so an owner
-/// re-enrolling their own live client costs no extra read. A member who has
-/// left the org holds nothing in it. A read that FAILED refuses as the
-/// archived-org gate does (500), and the token stays unspent.
+/// re-enrolling their own live client costs no extra read: the enroll route
+/// asked whether they are still a member before this. A read that FAILED
+/// refuses as the archived-org gate does (500), and the token stays unspent.
 async fn revive_scope(
     state: &NetworkState,
     tid: ObjectId,
@@ -266,7 +326,7 @@ async fn revive_scope(
         Err(e) => return Err(e.into()),
     };
     if manages_devices {
-        return Ok(ReviveScope::LiveOrRemoved);
+        return Ok(ReviveScope::LiveOrRemoved(enroller));
     }
     tracing::info!(
         tenant_id = %tid, tunnel_client_id = ?row.id, %enroller, removed,
@@ -612,14 +672,68 @@ pub async fn update_tunnel_client(
     })))
 }
 
+/// The reason a removal of a row an enrollment wrote for a non-member is
+/// logged with (the overlay release's `reason`).
+const ENROLLER_LEFT: &str = "enroller_left";
+
+/// What removing one tunnel client did ([`end_tunnel_client`]).
+pub(crate) struct EndedTunnelClient {
+    /// This call tombstoned the row; `false` when it was removed already.
+    pub tombstoned: bool,
+    /// The overlay lease this call released, if the client held one.
+    pub released: Option<crate::overlay::ReleasedNode>,
+}
+
+/// Remove one tunnel client, in the order every removal needs: tombstone the
+/// row (`deleted_at`, and `token_gen` advanced so every token it holds is
+/// refused), THEN release its overlay node (peers get a `removes` delta, its
+/// address returns to the tenant pool).
+///
+/// The tombstone first: from there a join on the socket the client still
+/// holds is refused (`handle_overlay_join`), so the release cannot be
+/// followed by a fresh lease that nothing would release. The release reads
+/// the node, not the row, and logs a failure rather than returning it
+/// (`release_overlay_node`). A LIVE connection is closed by the 60 s
+/// `spawn_revocation_check` sweep in `ws::tunnel`, which sees `deleted_at`.
+///
+/// The one way a tunnel client is removed: a device manager's DELETE, and
+/// the end of its owner's org membership (`crate::membership`), both come
+/// here.
+pub(crate) async fn end_tunnel_client(
+    state: &NetworkState,
+    tenant_id: ObjectId,
+    client_id: ObjectId,
+    machine_id: &str,
+    reason: &str,
+) -> Result<EndedTunnelClient, DaoError> {
+    let tombstoned = state
+        .tunnel_clients
+        .soft_delete(tenant_id, client_id)
+        .await?;
+    let released = crate::overlay::release_overlay_node_for(
+        state,
+        tenant_id,
+        machine_id,
+        &NodeRef::TunnelClient {
+            tunnel_client_id: client_id,
+        },
+        reason,
+    )
+    .await;
+    Ok(EndedTunnelClient {
+        tombstoned,
+        released,
+    })
+}
+
 /// DELETE /api/tenant/{tenant_id}/tunnel-client/{client_id} — remove a tunnel
 /// client from the fleet.
 ///
-/// The mirror of `remote_control::delete_agent`: evicts the client's overlay
-/// node (peers get a `removes` delta, its address returns to the tenant pool)
-/// and soft-deletes the client row. Revocation of a LIVE connection rides the
-/// existing 60 s `spawn_revocation_check` sweep in `ws::tunnel`, which closes
-/// the socket once it sees `deleted_at`.
+/// The mirror of `remote_control::delete_agent`: soft-deletes the client row,
+/// then evicts its overlay node (peers get a `removes` delta, its address
+/// returns to the tenant pool), through [`end_tunnel_client`]. Revocation of a
+/// LIVE connection rides the existing 60 s `spawn_revocation_check` sweep in
+/// `ws::tunnel`, which closes the socket once it sees `deleted_at`.
 ///
 /// Gated on `MANAGE_AGENTS` — the device-management bit; there is no separate
 /// tunnel-client permission and minting one would mean a role migration.
@@ -649,26 +763,14 @@ pub async fn delete_tunnel_client(
     // someone else did. 404 is the one answer that leaves the state alone.
     let client = state.tunnel_clients.find_live_in_tenant(tid, cid).await?;
 
-    // Tombstone first: from here a join on the socket it still holds is refused
-    // (`handle_overlay_join`), so the release below cannot be followed by a fresh
-    // lease that nothing would release. The release reads the node, not this row.
-    state.tunnel_clients.soft_delete(tid, cid).await?;
-
-    let released = crate::overlay::release_overlay_node_for(
-        &state,
-        tid,
-        &client.machine_id,
-        &NodeRef::TunnelClient {
-            tunnel_client_id: cid,
-        },
-        "tunnel_client_delete",
-    )
-    .await;
+    // Tombstone first, then the release: the order `end_tunnel_client` keeps.
+    let ended =
+        end_tunnel_client(&state, tid, cid, &client.machine_id, "tunnel_client_delete").await?;
 
     Ok(Json(serde_json::json!({
         "deleted": true,
-        "overlay_released": released.is_some(),
-        "overlay_ip": released.as_ref().map(|r| r.overlay_ip.clone()),
+        "overlay_released": ended.released.is_some(),
+        "overlay_ip": ended.released.as_ref().map(|r| r.overlay_ip.clone()),
     })))
 }
 

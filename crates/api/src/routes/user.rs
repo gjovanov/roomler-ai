@@ -180,10 +180,10 @@ pub async fn list_members(
 ///
 /// First consumer of `KICK_MEMBERS`. The tenant OWNER cannot be removed
 /// (409 — ownership transfer is a different operation); removing YOURSELF is
-/// allowed and simply means leaving. Room-membership rows are left in place:
-/// tenant `is_member` is the access gate on every read/write path, so a
-/// removed user loses access structurally. What the membership admitted
-/// before that, a seat in a live call, ends through the membership hook.
+/// allowed and simply means leaving. What the membership admitted ends with
+/// it, through the membership hook once the row is gone: the tunnel clients
+/// the person owns in the org (`network`), their seats in the org's calls
+/// (`conference`) and their room memberships (`chat`).
 pub async fn remove_member(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -222,10 +222,10 @@ pub async fn remove_member(
         return Err(ApiError::NotFound("Not a member".to_string()));
     }
     tracing::info!(admin = %auth.user_id, tenant = %tid, user = %target, "member removed");
-    // What the membership admitted ends with it: a seat in one of the org's
-    // calls (`conference`'s hook), told once the row is gone. The removal has
-    // happened whatever the hook says, so a failure there is logged, not
-    // answered.
+    // What the membership admitted ends with it, told once the row is gone:
+    // tunnel clients, call seats and room memberships, in `HOOK_ORDER`. The
+    // removal has happened whatever the hooks say, so a failure there is
+    // logged, not answered.
     if let Err(e) = state.core.hooks.org_member_removed(tid, target).await {
         tracing::error!(tenant = %tid, user = %target, %e, "member removal: ending what the membership admitted failed");
     }

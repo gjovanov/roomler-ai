@@ -85,7 +85,7 @@ staged by the mode.
 | Limit | Checked at | Refusal |
 |---|---|---|
 | devices | enrollment (`crates/modules/fleet/src/agent.rs:256`) | 403, before the single-use token is claimed |
-| tunnel clients | `crates/modules/network/src/routes/tunnel.rs:168` | 403, before the single-use token is claimed (#3328) |
+| tunnel clients | `crates/modules/network/src/routes/tunnel.rs:195` | 403, before the single-use token is claimed (#3328) |
 | members | invite and admin add (`crates/api/src/routes/invite.rs:199`) | 403 naming the counts |
 | storage | upload (`crates/modules/chat/src/file.rs:312`) | 403; the check is `current + incoming`, so a file that exactly fills the quota fits |
 | meeting participants | `media:join` on the owner pod (`crates/modules/conference/src/ws_media.rs:414`) | `media:error`; a rejoining participant keeps their seat |

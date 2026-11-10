@@ -43,6 +43,10 @@ mod file_tests;
 /// ends the rows an org membership left before that.
 #[cfg(test)]
 mod membership_end_tests;
+/// A person's tunnel clients end with their org membership: the hook, the
+/// enrollment that re-asks, and the operator step for what removals left.
+#[cfg(test)]
+mod membership_tunnel_tests;
 #[cfg(test)]
 mod message_tests;
 #[cfg(test)]

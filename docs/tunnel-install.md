@@ -440,7 +440,7 @@ The HTTP listing from python's server should appear via the tunnel. Bytes flow: 
 
 **Stop the forward**: Ctrl-C on `roomler forward`. The agent's side closes automatically; audit row recorded.
 
-**Revoke a tunnel-client** (operator left the team, laptop lost, etc.): **Devices** (kind filter **Tunnels**) **→ the client's ⋮ menu → Delete tunnel client** (Manage devices permission). Its live connection is told `rc:tunnel.revoked` by the 60 s revocation sweep and closes, and its overlay node is released. Enrolling the same `machine_id` again brings it back only with a token minted by someone with the Manage devices permission ([tunnels.md](tunnels.md#cli)).
+**Revoke a tunnel-client** (laptop lost, etc.): **Devices** (kind filter **Tunnels**) **→ the client's ⋮ menu → Delete tunnel client** (Manage devices permission). Its live connection is told `rc:tunnel.revoked` by the 60 s revocation sweep and closes, and its overlay node is released. A person removed from the org, or leaving it, loses the tunnel clients they own there the same way, with no one deleting them ([tunnels.md](tunnels.md#what-ends-a-tunnel-client)). Enrolling the same `machine_id` again brings it back only with a token minted by someone with the Manage devices permission, and as theirs ([tunnels.md](tunnels.md#cli)).
 
 **Revoke an agent**: **Devices → the device's ⋮ menu → Delete device**. A connected device is told on its socket at once, and stops.
 

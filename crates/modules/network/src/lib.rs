@@ -58,6 +58,7 @@ pub mod derp_cluster;
 pub mod derp_types;
 pub mod ephemeral;
 pub mod hooks;
+pub mod membership;
 pub mod org_relay;
 pub mod overlay;
 pub mod relay_allowance;
@@ -622,6 +623,9 @@ impl Module for NetworkState {
                 "/admin/overlay-network/orphans",
                 post(routes::overlay_block::orphans),
             )
+            // Platform operators: end the tunnel clients that outlived their
+            // owner's org membership (a dry run unless asked).
+            .route("/admin/tunnel-clients/prune", post(membership::prune))
             .with_state(self.clone())
     }
 
@@ -905,9 +909,10 @@ impl Module for NetworkState {
 
     /// The inverse edges: the agent cascade (the overlay lease release BEFORE
     /// the row delete and the kick, the MagicDNS rename propagation, the
-    /// tunnel-busy answer to fleet's nudge) and the tenant cascade (release
-    /// every mesh node, quarantine the block) — registered under this
-    /// module's id, run in `HOOK_ORDER`.
+    /// tunnel-busy answer to fleet's nudge), the tenant cascade (release
+    /// every mesh node, quarantine the block) and the membership cascade (a
+    /// person's tunnel clients end with their org membership) — registered
+    /// under this module's id, run in `HOOK_ORDER`.
     fn hooks(&self) -> Hooks {
         Hooks {
             fleet: Some(Arc::new(hooks::NetworkHooks {
@@ -916,7 +921,9 @@ impl Module for NetworkState {
             tenant: Some(Arc::new(hooks::NetworkTenantHooks {
                 state: self.clone(),
             })),
-            membership: None,
+            membership: Some(Arc::new(membership::MembershipHooks {
+                state: self.clone(),
+            })),
         }
     }
 

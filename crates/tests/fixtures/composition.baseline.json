@@ -197,6 +197,10 @@
       "methods": "GET,HEAD"
     },
     {
+      "path": "/api/admin/tunnel-clients/prune",
+      "methods": "POST"
+    },
+    {
       "path": "/api/agent/anchor",
       "methods": "POST"
     },

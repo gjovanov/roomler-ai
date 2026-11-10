@@ -100,7 +100,16 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   apart: 401 "already used" vs a retryable 503 when the ledger cannot answer.
   ⚠️ A tunnel client's known `machine_id` re-enrolls only for its owner (live) or a
   `MANAGE_AGENTS` holder (live or removed): decided before the spend, held again by the
-  write (`ReviveScope`).
+  write (`ReviveScope`). A removed client the holder brings back becomes the holder's
+  (`owner_user_id`, read and written in one pipeline update); a live one keeps its owner.
+- **A tunnel client ends with its owner's org membership.** The member route's
+  `MembershipLifecycle` cascade removes the person's tunnel clients in that org through
+  `end_tunnel_client`, the manual DELETE's own path (tombstone, THEN the overlay release),
+  and a tunnel enrollment token whose subject is no longer a member enrolls nothing (403
+  before the spend, asked again after the write). ⚠️ network's membership hook answers
+  `Ok` even when a client could not be ended (logged, `alert = membership_tunnel_end`):
+  an `Err` would stop the cascade before the call seats and room rows; what it leaves is
+  `POST /api/admin/tunnel-clients/prune`'s. Devices the person enrolled are out of it.
 - **A removed device that enrolls again starts from a new device's settings** (#3627).
   `AgentDao::revive` REPLACES the tombstone with `new_row` for the request and keeps
   only `_id`, `tenant_id`, `machine_id`, `created_at`, `enrolled_by`, `token_gen`,
