@@ -1330,6 +1330,44 @@ mod tests {
         );
     }
 
+    /// FR-138 (review 2, N12) — a row whose end was inferred (`end_source`:
+    /// the registration read, the sweep, the dead-row close) adds no
+    /// duration, since its `ended_at` is only its own last clock, and its end
+    /// is counted as `inferred`, never as the `agent_disconnect` failure a
+    /// pod saw. It still went live. The projection reads the field.
+    #[test]
+    fn an_inferred_end_adds_no_duration_and_no_failure() {
+        let at = |s: &str| DateTime::from_millis(ms(s));
+        let inferred = session_row(&doc! {
+            "_id": ObjectId::new(), "agent_id": ObjectId::new(),
+            "created_at": at("2026-10-15T10:00:00Z"),
+            "started_at": at("2026-10-15T10:00:02Z"),
+            "ended_at": at("2026-10-15T10:40:02Z"),
+            "end_reason": "agent_disconnect", "end_source": "sweep",
+        })
+        .unwrap();
+        let q = session_quality([&inferred]);
+        assert_eq!((q.requested, q.reached_active), (1, 1));
+        assert_eq!(q.duration_ms.n, 0, "{:?}", q.duration_ms);
+        assert!(
+            q.by_carrier.iter().all(|c| c.duration_ms.n == 0),
+            "{:?}",
+            q.by_carrier
+        );
+        assert!(
+            q.by_end_reason
+                .iter()
+                .all(|c| c.reason != "agent_disconnect"),
+            "{:?}",
+            q.by_end_reason
+        );
+        assert!(
+            session_projection().contains_key("end_source"),
+            "{}",
+            session_projection()
+        );
+    }
+
     /// The session's own logs win, then the device's logs of the day (the
     /// newest when it updated), then the device row; releases compare as
     /// numbers, not strings.
