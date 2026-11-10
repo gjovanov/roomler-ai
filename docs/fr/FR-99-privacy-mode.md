@@ -287,7 +287,7 @@ cells passed (0.4.139, §8 row 16). Now a **fresh Windows service install** is w
 --machine-global` (`install.ps1 -Role daemon-system`). Both call one helper,
 [`enrollment.rs:863`](../../crates/agent-core/src/enrollment.rs#L863) `apply_service_install_defaults`,
 from [`main.rs:2584`](../../agents/roomlerd/src/main.rs#L2584) and
-[`enroll_step.rs:196`](../../agents/roomler-setup/src/enroll_step.rs#L196):
+[`enroll_step.rs:208`](../../agents/roomler-setup/src/enroll_step.rs#L208):
 
 | Install | Starts at | Why |
 |---|---|---|

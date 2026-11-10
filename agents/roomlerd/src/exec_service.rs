@@ -1196,8 +1196,7 @@ mod win {
     //! Windows: the anchor's DACL rules, the doorbell pipe, elevation.
 
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::fs::MetadataExt as _;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -1211,15 +1210,13 @@ mod win {
         SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
-        ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
-        GetAce, GetAclInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+        DACL_SECURITY_INFORMATION, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-        SetFileSecurityW, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        SetFileSecurityW, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_WRITE_DATA, OPEN_EXISTING,
-        READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+        FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
 
     use super::{Anchor, AnchorAction, DoorbellReply, DoorbellRequest, RingLimiter};
@@ -1237,25 +1234,6 @@ mod win {
     /// integrity nothing may write to it.
     const PIPE_SDDL: &str =
         "O:SYD:P(A;;GA;;;SY)(A;;0x12008b;;;BA)(A;;0x12008b;;;IU)S:(ML;;NW;;;ME)";
-
-    /// Access bits that let a holder change a file's content, its name, its
-    /// DACL or its owner, or a directory's entries.
-    const WRITE_LIKE: u32 = 0x2 // FILE_WRITE_DATA / FILE_ADD_FILE
-        | 0x4 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
-        | 0x10 // FILE_WRITE_EA
-        | 0x40 // FILE_DELETE_CHILD
-        | 0x100 // FILE_WRITE_ATTRIBUTES
-        | 0x1_0000 // DELETE
-        | 0x4_0000 // WRITE_DAC
-        | 0x8_0000 // WRITE_OWNER
-        | 0x1000_0000 // GENERIC_ALL
-        | 0x4000_0000; // GENERIC_WRITE
-    /// ACE types (`winnt.h`), stable ABI; the `SystemServices` feature that
-    /// names them is not one this crate enables.
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-    const ACCESS_DENIED_ACE_TYPE: u8 = 1;
-    /// `INHERIT_ONLY_ACE`: applies to children only, never to the object.
-    const INHERIT_ONLY_ACE: u8 = 0x08;
 
     /// A security descriptor from SDDL, and the `SECURITY_ATTRIBUTES` that
     /// hand it to a directory or a pipe instance. Freed on drop.
@@ -1319,106 +1297,6 @@ mod win {
         !sid.is_null() && unsafe { IsWellKnownSid(sid, kind) } != 0
     }
 
-    fn is_trusted_sid(sid: PSID) -> bool {
-        is_well_known(sid, WinLocalSystemSid) || is_well_known(sid, WinBuiltinAdministratorsSid)
-    }
-
-    /// The owner and DACL of the object behind `handle`: owned by SYSTEM or
-    /// Administrators, and no allow-ACE that lets anyone else write. A NULL
-    /// DACL (everyone, everything) and any ACE this does not recognise are
-    /// refusals: this is the trust root of SYSTEM exec, and it fails closed.
-    fn check_private(handle: HANDLE, what: &str) -> Result<(), String> {
-        let mut owner: PSID = std::ptr::null_mut();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: a live handle opened with READ_CONTROL; the out-params point
-        // into `psd`, freed below.
-        let rc = unsafe {
-            GetSecurityInfo(
-                handle,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut psd,
-            )
-        };
-        if rc != 0 {
-            return Err(format!("{what}: reading its security: Win32 error {rc}"));
-        }
-        let verdict = (|| {
-            if !is_trusted_sid(owner) {
-                return Err(format!(
-                    "{what} is not owned by SYSTEM or Administrators (made by someone else \
-                     first?)"
-                ));
-            }
-            if dacl.is_null() {
-                return Err(format!("{what} has no DACL: everyone may write it"));
-            }
-            let mut info = ACL_SIZE_INFORMATION {
-                AceCount: 0,
-                AclBytesInUse: 0,
-                AclBytesFree: 0,
-            };
-            // SAFETY: `dacl` is a valid ACL inside `psd`; `info` is sized.
-            let ok = unsafe {
-                GetAclInformation(
-                    dacl,
-                    (&raw mut info).cast(),
-                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-                    AclSizeInformation,
-                )
-            };
-            if ok == 0 {
-                return Err(format!("{what}: reading its DACL failed"));
-            }
-            for i in 0..info.AceCount {
-                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-                // SAFETY: `i` < AceCount; `ace` points into the ACL.
-                if unsafe { GetAce(dacl, i, &mut ace) } == 0 || ace.is_null() {
-                    return Err(format!("{what}: reading its DACL failed"));
-                }
-                // SAFETY: every ACE starts with an ACE_HEADER.
-                let header = unsafe { &*(ace as *const ACE_HEADER) };
-                if header.AceFlags & INHERIT_ONLY_ACE != 0 {
-                    continue;
-                }
-                match header.AceType {
-                    ACCESS_DENIED_ACE_TYPE => continue,
-                    ACCESS_ALLOWED_ACE_TYPE => {
-                        // ACCESS_ALLOWED_ACE: header (4), mask (4), then the
-                        // SID, which `GetAce` guarantees fits in AceSize.
-                        // SAFETY: the type says this is the layout.
-                        let mask = unsafe {
-                            std::ptr::read_unaligned((ace as *const u8).add(4) as *const u32)
-                        };
-                        // SAFETY: the SID starts 8 bytes in, inside the ACE.
-                        let sid = unsafe { (ace as *mut u8).add(8) } as PSID;
-                        if mask & WRITE_LIKE != 0 && !is_trusted_sid(sid) {
-                            return Err(format!(
-                                "{what} lets someone other than SYSTEM or Administrators \
-                                 change it"
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "{what} carries an access rule of a kind this check does not \
-                             read (type {other})"
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        })();
-        // SAFETY: the descriptor GetSecurityInfo allocated.
-        unsafe { LocalFree(psd as _) };
-        verdict
-    }
-
     pub fn load_anchor(dir: &Path, path: &Path) -> Result<Option<Anchor>, String> {
         let Some(text) = read_private(dir, path, "the anchor file", 64 * 1024)? else {
             return Ok(None);
@@ -1431,63 +1309,16 @@ mod win {
 
     /// Read `path`, a file in the anchor's directory `dir`, if both are
     /// private: owned by SYSTEM or Administrators and writable by nobody
-    /// else. `Ok(None)` = not there. `what` names it in errors.
+    /// else. `Ok(None)` = not there. `what` names it in errors. #3609 — the
+    /// reader moved to `roomler_node_core::machine_tree`, where the machine
+    /// config's check is the same rule (`machine_tree::verdict`).
     pub(crate) fn read_private(
         dir: &Path,
         path: &Path,
         what: &str,
         max_len: u64,
     ) -> Result<Option<String>, String> {
-        if let Some(link) = roomler_node_core::recording_dir::link_component(path) {
-            return Err(format!("{} is a link", link.display()));
-        }
-        let dir_handle = match std::fs::OpenOptions::new()
-            .access_mode(READ_CONTROL)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(dir)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("{}: {e}", dir.display())),
-        };
-        let meta = dir_handle
-            .metadata()
-            .map_err(|e| format!("{}: {e}", dir.display()))?;
-        if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(format!("{} is not a plain directory", dir.display()));
-        }
-        check_private(
-            dir_handle.as_raw_handle() as HANDLE,
-            "the anchor's directory",
-        )?;
-        let file = match std::fs::OpenOptions::new()
-            .access_mode(GENERIC_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        };
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(format!("{} is not a plain file", path.display()));
-        }
-        if meta.len() > max_len {
-            return Err(format!("{what} is too large to be one"));
-        }
-        // Checked on the handle the content is read from, not by name: a name
-        // can be swapped between a check and a read; an open file cannot.
-        check_private(file.as_raw_handle() as HANDLE, what)?;
-        use std::io::Read as _;
-        let mut text = String::new();
-        let mut bounded = (&file).take(max_len);
-        bounded
-            .read_to_string(&mut text)
-            .map_err(|e| format!("reading {what}: {e}"))?;
-        Ok(Some(text))
+        roomler_node_core::machine_tree::read_private(dir, path, what, max_len)
     }
 
     /// Make the anchor's directory private, or take over the plain directory

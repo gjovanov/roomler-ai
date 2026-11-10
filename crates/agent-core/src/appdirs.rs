@@ -46,7 +46,7 @@ const NEW_APP: &str = "roomler";
 // RETIRED-NAME-ANCHOR: a pre-rename host resolves its ENROLLED config through this
 // segment. Renaming it orphans that config -- the device drops off the mesh and
 // re-enrolls as a stranger. See docs/fr/FR-21.
-const OLD_APP: &str = "roomler-agent";
+pub(crate) const OLD_APP: &str = "roomler-agent";
 
 /// True if a NEW-segment `ProjectDirs` tree is present on disk.
 fn tree_exists(app: &str) -> bool {
@@ -243,7 +243,7 @@ pub fn machine_global_dir() -> PathBuf {
 /// host in the fleet is post-rename, so that proof was not available; this makes
 /// it a test instead.
 #[cfg(target_os = "windows")]
-fn resolve_machine_global(base: &Path) -> PathBuf {
+pub(crate) fn resolve_machine_global(base: &Path) -> PathBuf {
     let new = base.join(NEW_APP);
     let old = base.join(OLD_APP);
     if !new.exists() && old.exists() {
