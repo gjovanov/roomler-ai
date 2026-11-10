@@ -39,7 +39,7 @@ additionally refuses a registration whose pubkey is not the row's (`derp.rs:339-
 | piece | where | note |
 |---|---|---|
 | primary key mint | `agents/roomlerd/src/main.rs:3439-3446` | lazy, at daemon start, `WgKeypair::generate()` → `config::save`; the ONLY primary mint |
-| secondary-org mint | `crates/agent-core/src/enrollment.rs:629-630` | at enroll-append; never copied from the primary (cross-org correlation) |
+| secondary-org mint | `crates/agent-core/src/enrollment.rs:703-704` | at enroll-append; never copied from the primary (cross-org correlation) |
 | storage | `crates/agent-core/src/config.rs:1900` (primary), `:2030` (`OrgEntry`), `for_org` at `:2164-2192` | the key is **per org** — `for_org` scopes it, unlike `exec_enabled`/`ssh_*` which are host-global |
 | atomic save | `config.rs:3586` | tmp + `sync_all` + 0600/ACL + `.prev` + rename, under the daemon-wide write lock (`org_join.rs:48`) |
 | how a session gets its key | `agents/roomlerd/src/signaling.rs:480-485`, `:961-963`; `overlay.rs:210-217` | from the in-memory `AgentConfig` snapshot taken at start — **never re-read from disk per session** |

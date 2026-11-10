@@ -93,7 +93,7 @@ the design:
 
 | # | Fact | Evidence | Consequence |
 |---|---|---|---|
-| 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4328`) and `merge_unknown_keys` (`:4457`), locked by `:4994` | Removing the 23 keys strands nothing, and a rollback finds them again. |
+| 1 | The agent config keeps keys it doesn't know, through every save. | no `deny_unknown_fields` (`crates/agent-core/src/config.rs:24`); `unknown_keys` (`:4328`) and `merge_unknown_keys` (`:4459`), locked by `:5019` | Removing the 23 keys strands nothing, and a rollback finds them again. |
 | 2 | The server's settings ignore unknown env. | no `deny_unknown_fields` (`crates/config/src/settings.rs:15`); env read at `:1839`, deserialized at `:1959`; `config` 0.14.1 maps `ROOMLER__HIVE__X` to `hive.x` and serde ignores it | `ROOMLER__HIVE__*` and its siblings stay harmless, but **an absent tenant list means every organization** (Hive `crates/config/src/settings.rs:52-53`, vault `:56-58`, knowhow `:61-62`), so a rollback must never meet a switch that is on without its list (D3). |
 | 3 | While the wire is unchanged, a 0.4.199 Hive frame still parses on a server with no Hive module. | owner routing at `crates/modules/fleet/src/socket.rs:605`; no handler (`:612`); then `warn!("unexpected msg for role {role:?}: {:?}", msg)` (`crates/modules/fleet/src/hub.rs:4411`) and `crates/modules/fleet/src/socket.rs:801` | Without a stub, P1 would log **two WARNs per frame with the frame dumped**, which includes a device's account map. Hence S-A1. |
 | 4 | An agent drops a frame it can't parse and keeps the socket. | `agents/roomlerd/src/signaling.rs:3104`, `:3109`, "Deliberately not fatal" (`:3101`) | The agent needs no stub variant. |
@@ -149,7 +149,7 @@ flowchart LR
   `inventory-C.md`.
 
 No CI job checks that a doc anchor points at a live line (the doc audits are `fr-registry`,
-`anchor-ranges` and `mermaid-sequences`, at `.github/workflows/ci.yml:2295` and `:2320`). So P1 and P2
+`anchor-ranges` and `mermaid-sequences`, at `.github/workflows/ci.yml:2301` and `:2326`). So P1 and P2
 cannot turn CI red through the docs they leave stale. Each still follows the house gate: it shifts the
 anchors of surviving non-Hive docs that point into the files it edits, and skips the six docs P3 deletes.
 
@@ -184,8 +184,8 @@ anchors of surviving non-Hive docs that point into the files it edits, and skips
 | **S-B2**: a hidden `roomler hive hook` that exits 0 | `agents/roomler-cli/src/cli.rs` | Adopted terminals' Claude Code hooks call it on every session event (`agents/roomler-cli/src/hive_hooks.rs:34`). Their contract is "prints nothing and always exits 0" (`:17`). | Those accounts are unadopted (D6). |
 | **S-B3**: `SshRequest.ssh_ticket` and `TunnelOpen.net_grant` stay on the wire, parse-only and refused | `crates/remote_control/src/signaling.rs` | fact 5 | The last ≤0.4.199 agent is gone (D8). |
 | **S-B4**: `RETIRED_RPC_VERBS` (the 21 spellings) and a test that guards them, the tag families `rc:hive.`, `rc:vault.`, `rc:knowhow.`, the user socket's `hive:` and the module ids | `crates/remote_control/src/models.rs` | B-I5 | Never. |
-| **S-B6**: the agent config's unknown-key merge, unchanged | `crates/agent-core/src/config.rs:4328`, `:4457` | fact 1 | Never; and never add `deny_unknown_fields` to `AgentConfig`. |
-| **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4562` | Every host carries them (§2.2). | — (D11) |
+| **S-B6**: the agent config's unknown-key merge, unchanged | `crates/agent-core/src/config.rs:4328`, `:4459` | fact 1 | Never; and never add `deny_unknown_fields` to `AgentConfig`. |
+| **S-B7** (optional): the 23 retired keys exempt from the once-per-start WARN | `crates/agent-core/src/config.rs:4587` | Every host carries them (§2.2). | — (D11) |
 | **S-B8**: FR-90's refactors of shipped code: SOCKS5 `negotiate()`, `flow_listener::bind()`, `TempDir::named`, `within_ngroups_max`, the Windows Job Object code, shared `windows-sys` features and deps | `inventory-B.md` §B1 | Shipped paths now run on them. | Never. |
 
 Two decisions also keep lines that name Hive. They are not stubs, and AC1's read classes them here
@@ -357,7 +357,7 @@ Each field check is run **RED first** on the current deploy, then GREEN.
 ### 4.3 P3: what proves it
 
 - `fr-registry`, `anchor-ranges`, `mermaid-sequences` and the docs-site build all pass
-  (`.github/workflows/ci.yml:2609`).
+  (`.github/workflows/ci.yml:2615`).
 - FR-90's row (`docs/fr/README.md:188`) links the branch by full URL and holds no `|` in its prose.
 - No surviving doc links a deleted doc.
 - `CLAUDE.md`, `.claude/rules/modular-monolith.md` and `docs/README.md` keep no Hive text beyond the

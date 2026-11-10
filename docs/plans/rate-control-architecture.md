@@ -84,7 +84,7 @@ MaxKbps). Fix the existing NVENC bug: :1615 writes `rc_buffer_size = target` whi
 targets when `|Δ| ≥ 3 %` (a QSV Reset flushes the pipeline). Kill switch `encoder_inplace_rate`
 (env `ROOMLERD_ENCODER_INPLACE_RATE`), **default OFF in the PR, ON after A0 passes on CORPLAP-1**
 (six places: `config_surface.rs` KEYS near :630 / get :877 / set :1290; `config.rs` field :879,
-default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:203`; parity test :1935).
+default :1996, `env_bridge_bools` :2122 array 72→73; `enrollment.rs:247`; parity test :1935).
 Counters `rate_moves, rebuilds, idr_count` on `FfmpegEncoder` → heartbeat (`peer.rs:10276–10463`) with
 `rate_mode`; read `idr_count` against `keyframe_requests` (`session_telemetry.rs:30`). A startup
 `probe_and_cache_rate_reconfig` (like `VP9_QSV_IDR_VERDICT`, encoder.rs:71): open 640×480, change
