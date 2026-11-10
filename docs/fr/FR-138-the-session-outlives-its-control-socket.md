@@ -421,7 +421,9 @@ and to claim its session back.
   `rc:session.rejoin {session_id}`. The server checks the row names this person, then re-runs the request's gate.
   `rc:session.resumed` clears the chip. `rc:terminate` ends the session with its reason, as today, and a retryable
   reason starts today's ladder. A rejoin that arrives before the device's claim is answered `rc:session.detached`
-  again, and the page asks once a second until `resume_by`.
+  again, and the page asks once a second until `resume_by`. Each rejoin gets exactly one of those three answers,
+  naming its session, and never an `rc:error`: one the server cannot decide (a read failed) is answered
+  `rc:session.detached`, so the page asks again (`docs/remote-control.md` §11.18).
 - **Fall back.** A transport signal during the hold keeps today's meaning: the peer failed, so the page redials. With
   no answer by `resume_by` plus 5 s the page closes its peer and starts today's ladder. That is the viewer's
   deadline, and an older server that never answers costs no more than it. A dying pod may never send

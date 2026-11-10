@@ -149,6 +149,36 @@ impl AgentMsgHandler for RemoteAgentSocket {
                 }
                 None
             }
+            // FR-138 P1b-2 — the device's own end of a session no hub here
+            // holds, which this connection's registration ended without
+            // seeing its end (it ended at the device during the gap): its
+            // reason replaces the inferred one (`resume::device_end`).
+            // Anything else reaches the Hub's dispatch as before, and only a
+            // connection announced a window ever gets here.
+            ClientMsg::Terminate {
+                session_id,
+                reason,
+                limit,
+            } if ctx.resume.window_secs > 0
+                && self
+                    .state
+                    .fleet
+                    .rc_hub
+                    .session_snapshot(session_id)
+                    .is_none() =>
+            {
+                if crate::resume::device_end(&self.state, ctx, session_id, reason, limit.as_deref())
+                    .await
+                {
+                    None
+                } else {
+                    Some(ClientMsg::Terminate {
+                        session_id,
+                        reason,
+                        limit,
+                    })
+                }
+            }
             other => Some(other),
         }
     }
@@ -430,5 +460,11 @@ impl RemoteAgentLifecycle {
 impl AgentSocketLifecycle for RemoteAgentLifecycle {
     async fn hello(&self, ctx: &AgentCtx) {
         crate::resume::on_hello(&self.state, ctx).await;
+    }
+
+    /// P1b-2 — what this connection's registration ended is no longer its
+    /// to replace.
+    async fn closing(&self, ctx: &AgentCtx) {
+        crate::resume::forget_connection(&self.state, ctx);
     }
 }

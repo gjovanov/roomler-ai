@@ -35,34 +35,36 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
 
-type Ws =
+// FR-138 P1b-2 — the helpers below are shared with `rc_resume_rejoin_tests`,
+// the viewer's half, which drives the same two pods.
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// The window these tests run under, in seconds (D1's 60).
-const WINDOW: u64 = 60;
+pub(crate) const WINDOW: u64 = 60;
 /// The verb a device advertises to be announced a window.
-const RESUME: &str = "rc-resume";
+pub(crate) const RESUME: &str = "rc-resume";
 /// How long any one step may take; also AC4's bound on a claim's answer.
-const WITHIN: Duration = Duration::from_secs(5);
+pub(crate) const WITHIN: Duration = Duration::from_secs(5);
 /// How long a frame that must NOT come is waited for.
-const QUIET: Duration = Duration::from_millis(800);
+pub(crate) const QUIET: Duration = Duration::from_millis(800);
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
         .replace('=', "%3D")
 }
 
-fn oid(hex: &str) -> ObjectId {
+pub(crate) fn oid(hex: &str) -> ObjectId {
     ObjectId::parse_str(hex).expect("a 24-hex id")
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     DateTime::now().timestamp_millis()
 }
 
 /// Two pods over one database, each with the window `window`.
-async fn pair(window: u64) -> (TestApp, TestApp) {
+pub(crate) async fn pair(window: u64) -> (TestApp, TestApp) {
     TestApp::spawn_pair(move |s| {
         s.rc.session_resume_secs = window;
     })
@@ -70,7 +72,7 @@ async fn pair(window: u64) -> (TestApp, TestApp) {
 }
 
 /// One pod with the window `window`.
-async fn one(window: u64) -> TestApp {
+pub(crate) async fn one(window: u64) -> TestApp {
     TestApp::spawn_with_settings(move |s| {
         s.rc.session_resume_secs = window;
     })
@@ -79,7 +81,7 @@ async fn one(window: u64) -> TestApp {
 
 /// Make the resume scope exactly `entries` (shared by every pod: it is a
 /// collection).
-async fn scope(app: &TestApp, entries: &[(ResumeScopeKind, Option<ObjectId>)]) {
+pub(crate) async fn scope(app: &TestApp, entries: &[(ResumeScopeKind, Option<ObjectId>)]) {
     let rows: Vec<ResumeScopeEntry> = entries
         .iter()
         .map(|(kind, id)| ResumeScopeEntry {
@@ -98,19 +100,34 @@ async fn scope(app: &TestApp, entries: &[(ResumeScopeKind, Option<ObjectId>)]) {
         .expect("the scope saves");
 }
 
-async fn scope_all(app: &TestApp) {
+pub(crate) async fn scope_all(app: &TestApp) {
     scope(app, &[(ResumeScopeKind::All, None)]).await;
 }
 
 /// Enroll a device in `seeded`'s org, owned by its admin: (id, token).
-async fn enroll(app: &TestApp, seeded: &SeededTenant, machine: &str) -> (ObjectId, String) {
+pub(crate) async fn enroll(
+    app: &TestApp,
+    seeded: &SeededTenant,
+    machine: &str,
+) -> (ObjectId, String) {
     let (id, token) = crate::agent_presence_tests::enroll(app, seeded, machine).await;
     (oid(&id), token)
 }
 
 /// Open the device's control socket on `app` and say hello, advertising
 /// `rpc` and claiming back `kept`.
-async fn hello(app: &TestApp, token: &str, rpc: &[&str], kept: &[ObjectId]) -> Ws {
+pub(crate) async fn hello(app: &TestApp, token: &str, rpc: &[&str], kept: &[ObjectId]) -> Ws {
+    hello_with(app, token, rpc, kept, 2).await
+}
+
+/// [`hello`], for a device that allows `max_sessions` sessions at once.
+pub(crate) async fn hello_with(
+    app: &TestApp,
+    token: &str,
+    rpc: &[&str],
+    kept: &[ObjectId],
+    max_sessions: u8,
+) -> Ws {
     let url = format!("ws://{}/ws?token={}&role=agent", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("agent ws");
     let mut hello = json!({
@@ -122,7 +139,7 @@ async fn hello(app: &TestApp, token: &str, rpc: &[&str], kept: &[ObjectId]) -> W
         "caps": {
             "hw_encoders": [], "codecs": ["h264"], "has_input_permission": true,
             "supports_clipboard": true, "supports_file_transfer": true,
-            "max_simultaneous_sessions": 2, "input": ["arbiter"], "rpc": rpc,
+            "max_simultaneous_sessions": max_sessions, "input": ["arbiter"], "rpc": rpc,
         },
     });
     if !kept.is_empty() {
@@ -135,7 +152,7 @@ async fn hello(app: &TestApp, token: &str, rpc: &[&str], kept: &[ObjectId]) -> W
 }
 
 /// The next frame of type `t` on `ws` within `within`, or `None`.
-async fn next_of(ws: &mut Ws, t: &str, within: Duration) -> Option<Value> {
+pub(crate) async fn next_of(ws: &mut Ws, t: &str, within: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + within;
     while tokio::time::Instant::now() < deadline {
         let Ok(Some(Ok(Message::Text(text)))) =
@@ -155,7 +172,7 @@ async fn next_of(ws: &mut Ws, t: &str, within: Duration) -> Option<Value> {
 
 /// The server's answer to a claim on `sid`: the first `rc:session.resumed` or
 /// `rc:terminate` naming it, within `within`.
-async fn answer_for(ws: &mut Ws, sid: ObjectId, within: Duration) -> Option<Value> {
+pub(crate) async fn answer_for(ws: &mut Ws, sid: ObjectId, within: Duration) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + within;
     let hex = sid.to_hex();
     while tokio::time::Instant::now() < deadline {
@@ -179,7 +196,12 @@ async fn answer_for(ws: &mut Ws, sid: ObjectId, within: Duration) -> Option<Valu
 /// Open a session as `token` and drive it LIVE the way the two ends do: the
 /// agent consents and answers the controller's offer. The controller's
 /// socket and the session id.
-async fn go_live(app: &TestApp, token: &str, agent_id: ObjectId, agent: &mut Ws) -> (Ws, ObjectId) {
+pub(crate) async fn go_live(
+    app: &TestApp,
+    token: &str,
+    agent_id: ObjectId,
+    agent: &mut Ws,
+) -> (Ws, ObjectId) {
     let url = format!("ws://{}/ws?token={}", app.addr, urlencode(token));
     let (mut ctl, _) = connect_async(&url).await.expect("controller ws");
     let _ = tokio::time::timeout(Duration::from_millis(200), ctl.next()).await;
@@ -237,7 +259,7 @@ async fn go_live(app: &TestApp, token: &str, agent_id: ObjectId, agent: &mut Ws)
 }
 
 /// The session's row as stored (empty when there is none).
-async fn row(app: &TestApp, sid: ObjectId) -> Document {
+pub(crate) async fn row(app: &TestApp, sid: ObjectId) -> Document {
     app.db
         .collection::<Document>("remote_sessions")
         .find_one(doc! { "_id": sid })
@@ -247,7 +269,7 @@ async fn row(app: &TestApp, sid: ObjectId) -> Document {
 }
 
 /// The row once `pred` holds, within [`WITHIN`]; panics with `what` otherwise.
-async fn wait_row(
+pub(crate) async fn wait_row(
     app: &TestApp,
     sid: ObjectId,
     what: &str,
@@ -266,7 +288,7 @@ async fn wait_row(
 
 /// The row's fencing number: absent reads 0, whichever integer type a write
 /// left it in.
-fn attach_seq(r: &Document) -> i64 {
+pub(crate) fn attach_seq(r: &Document) -> i64 {
     match r.get("attach_seq") {
         None | Some(Bson::Null) => 0,
         Some(Bson::Int32(n)) => i64::from(*n),
@@ -275,25 +297,25 @@ fn attach_seq(r: &Document) -> i64 {
     }
 }
 
-fn ended(r: &Document) -> bool {
+pub(crate) fn ended(r: &Document) -> bool {
     !matches!(r.get("ended_at"), None | Some(Bson::Null))
 }
 
 /// Live: Active and not ended.
-fn open(r: &Document) -> bool {
+pub(crate) fn open(r: &Document) -> bool {
     r.get_str("phase") == Ok("active") && !ended(r)
 }
 
-fn detached(r: &Document) -> bool {
+pub(crate) fn detached(r: &Document) -> bool {
     open(r) && r.get_datetime("detached_at").is_ok() && r.get_datetime("resume_by").is_ok()
 }
 
-fn end_reason(r: &Document) -> Option<&str> {
+pub(crate) fn end_reason(r: &Document) -> Option<&str> {
     r.get_str("end_reason").ok()
 }
 
 /// The `event` of every audit row of `sid`, oldest first.
-async fn audit(app: &TestApp, sid: ObjectId) -> Vec<Document> {
+pub(crate) async fn audit(app: &TestApp, sid: ObjectId) -> Vec<Document> {
     let mut cursor = app
         .db
         .collection::<Document>("remote_audit")
@@ -310,7 +332,7 @@ async fn audit(app: &TestApp, sid: ObjectId) -> Vec<Document> {
     out
 }
 
-fn kinds(events: &[Document]) -> Vec<String> {
+pub(crate) fn kinds(events: &[Document]) -> Vec<String> {
     events
         .iter()
         .map(|e| e.get_str("kind").unwrap_or("?").to_string())
@@ -318,7 +340,7 @@ fn kinds(events: &[Document]) -> Vec<String> {
 }
 
 /// Poll until the audit of `sid` holds an event of `kind`; its events then.
-async fn wait_audit(app: &TestApp, sid: ObjectId, kind: &str) -> Vec<Document> {
+pub(crate) async fn wait_audit(app: &TestApp, sid: ObjectId, kind: &str) -> Vec<Document> {
     let deadline = Instant::now() + WITHIN;
     loop {
         let events = audit(app, sid).await;
@@ -335,18 +357,18 @@ async fn wait_audit(app: &TestApp, sid: ObjectId, kind: &str) -> Vec<Document> {
 }
 
 /// Close the device's control socket the way a dropped link ends it.
-async fn drop_socket(mut ws: Ws) {
+pub(crate) async fn drop_socket(mut ws: Ws) {
     let _ = ws.close(None).await;
     drop(ws);
 }
 
-fn tenant_of(seeded: &SeededTenant) -> ObjectId {
+pub(crate) fn tenant_of(seeded: &SeededTenant) -> ObjectId {
     oid(&seeded.tenant_id)
 }
 
 /// A row an earlier connection left open, as a pod that died writes none of
 /// its end: Active, no `ended_at`, `extra` on top.
-fn leftover(
+pub(crate) fn leftover(
     sid: ObjectId,
     agent: ObjectId,
     tenant: ObjectId,
@@ -372,7 +394,7 @@ fn leftover(
     d
 }
 
-async fn insert(app: &TestApp, row: Document) {
+pub(crate) async fn insert(app: &TestApp, row: Document) {
     app.db
         .collection::<Document>("remote_sessions")
         .insert_one(row)
@@ -382,7 +404,7 @@ async fn insert(app: &TestApp, row: Document) {
 
 /// A role carrying `mask`, given to the org's member (as
 /// `remote_recording_tests` does).
-async fn give_member(app: &TestApp, seeded: &SeededTenant, name: &str, mask: u64) {
+pub(crate) async fn give_member(app: &TestApp, seeded: &SeededTenant, name: &str, mask: u64) {
     let role: Value = app
         .auth_post(
             &format!("/api/tenant/{}/role", seeded.tenant_id),
@@ -410,7 +432,7 @@ async fn give_member(app: &TestApp, seeded: &SeededTenant, name: &str, mask: u64
     assert_eq!(resp.status().as_u16(), 200, "assign {name}");
 }
 
-const REMOTE_CONTROL: u64 = 1 << 25;
+pub(crate) const REMOTE_CONTROL: u64 = 1 << 25;
 
 /// The org's maximum session length, written straight into its row: the
 /// route accepts a minute at the least, and a test should not wait one.
@@ -640,13 +662,14 @@ async fn a_claim_for_another_devices_session_is_refused() {
     assert_eq!(attach_seq(&row(&app2, sid).await), 1);
 }
 
-/// AC4 — an end written to the row while no pod holds the session (an
-/// admin's, as P1b-2's terminate route writes it on whichever pod takes the
-/// request) is enforced at the claim: pod 2 answers `rc:terminate` with the
-/// row's reason within 5 s, holds nothing, and leaves the row's end as it
-/// was. An end wins over a resume.
+/// AC4 — an admin's end while no pod holds the session, through the real
+/// `POST …/session/{id}/terminate` on pod 2, during the gap: the route writes
+/// the end to the row (no hub on pod 2 holds the session), and the claim then
+/// enforces it: pod 2 answers `rc:terminate` with the row's reason within
+/// 5 s, holds nothing, and leaves the row's end as the route wrote it. An end
+/// wins over a resume.
 #[tokio::test]
-async fn an_end_written_to_the_row_during_the_gap_ends_the_session_at_the_claim() {
+async fn an_admins_end_during_the_gap_ends_the_session_at_the_claim() {
     let (app1, app2) = pair(WINDOW).await;
     let seeded = app1.seed_tenant("fr138kick").await;
     scope_all(&app1).await;
@@ -658,20 +681,28 @@ async fn an_end_written_to_the_row_during_the_gap_ends_the_session_at_the_claim(
     drop_socket(agent).await;
     wait_row(&app1, sid, "the row records the detach", detached).await;
 
-    // The admin's end, on pod 2, during the gap: the session's row ends.
-    let ended_at = DateTime::now();
-    app2.db
-        .collection::<Document>("remote_sessions")
-        .update_one(
-            doc! { "_id": sid, "ended_at": Bson::Null },
-            doc! { "$set": {
-                "phase": "closed",
-                "ended_at": ended_at,
-                "end_reason": "admin_terminated",
-            }},
+    // The admin's end, on pod 2, during the gap, through the route.
+    let before = now_ms();
+    let resp = app2
+        .auth_post(
+            &format!("/api/tenant/{}/session/{}/terminate", seeded.tenant_id, sid),
+            &seeded.admin.access_token,
         )
+        .send()
         .await
         .unwrap();
+    assert_eq!(resp.status().as_u16(), 200, "the admin's end is taken");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["terminated"], false, "no hub on pod 2 held it: {body}");
+    assert_eq!(body["row_ended"], true, "the route ended its row: {body}");
+    let after = now_ms();
+    let r = wait_row(&app2, sid, "the route ends the row", ended).await;
+    assert_eq!(end_reason(&r), Some("admin_terminated"), "{r}");
+    let ended_at = *r.get_datetime("ended_at").unwrap();
+    assert!(
+        (before..=after).contains(&ended_at.timestamp_millis()),
+        "the end is dated when the admin asked: {r}"
+    );
 
     let claimed_at = Instant::now();
     let mut agent2 = hello(&app2, &token, &[RESUME], &[sid]).await;
