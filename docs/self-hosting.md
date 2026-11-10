@@ -300,13 +300,15 @@ It starts coturn if it is not running, watches it for 30 seconds, then drives th
 image's own TURN client through the published port, with credentials minted the way
 the server mints them. It exits non-zero and names what failed. Each run leaves 9 relay
 ports held for up to 13 minutes, because the client does not end what it allocates over UDP.
+Measured once on a fresh install of this file with coturn 4.18.0: the run left 9, and the last
+of them came free 12 min 53 s after it ended.
 
 | It says | What is wrong |
 |---|---|
 | `coturn is not staying up` | A crash loop. See below. |
 | `coturn is running outside the roomler service's namespace` | The server's process died moments ago, and coturn has not found its way back yet. See [if the server's process dies](#if-the-servers-process-dies). |
 | `no relay allocation` | Nothing answers on 3478. Check the `roomler` service's ports, and that it is running. |
-| `coturn has no free relay port` | Under any line. Allocations hold all 101 ports, so no client can get a relay until one ends. See [relay ports](#relay-ports). |
+| `coturn has no free relay port` | Under any line. Allocations hold all 101 ports, so no client can get a relay until one ends, and coturn logs `create_relay_ioa_sockets: no available ports` as it refuses them. A relayed Chrome participant holds up to 4 for each network, and a Firefox one 6, relayed or not, so about 16 to 25 participants at once fill them. A client that vanished can keep its ports for up to an hour. See [sizing the range](#sizing-the-range) and [when the range is full](#when-the-range-is-full). |
 | `coturn hands out … but its --external-ip is …` | The relay address is not the public address. Clients would be told the wrong place. |
 | `CreatePermission to the public address … is refused` | No call can use this relay: every browser asks for this first. coturn logs `A peer IP … denied in the range`, because it rewrites the public address to its own before the deny list reads it. An edited file has lost the `--allowed-peer-ip` line. |
 | `relay to relay carried nothing` | Two relayed clients cannot reach each other. |
@@ -442,10 +444,15 @@ which is the peer's own loopback. Set both to an address clients can reach, as i
 A LAN address works for `ROOMLER_PUBLIC_IP`, although the deny list covers it, because
 coturn rewrites it to its own before the check.
 
-⚠️ The server hands out more TURN URLs than this coturn serves: it adds
-`turn:…:443?transport=udp` and three `turns:` variants, and this file opens only 3478
-over UDP and TCP, with no TLS. A failed allocation that names port 443 or 5349 is
-expected here and costs a client time, not the relay.
+⚠️ The server hands out more TURN URLs than this coturn serves, and this file opens only
+3478, over UDP and TCP, with no TLS. A call's browsers get four
+(`VariantCaps::media`, `crates/remote_control/src/turn_url.rs:68`): `turn:…:3478`,
+`turn:…:443?transport=udp`, `turn:…:3478?transport=tcp` and
+`turns:…:5349?transport=tcp`. Remote control, the overlay and tunnels get six
+(`VariantCaps::default`, `turn_url.rs:53`): the same, plus `turns:` on 443 over UDP and
+over TCP. A failed allocation that names port 443 or 5349 is expected here and costs a
+client time, not the relay: nothing answers there, so nothing is allocated and no
+[relay port](#relay-ports) is held.
 
 ### What the relay refuses
 
@@ -479,11 +486,184 @@ The relay still carries UDP to public addresses. That is what a TURN relay does.
 
 The file gives coturn 101 ports, 49152 to 49252. Each allocation holds one until its client
 ends it or its lifetime runs out, and a client that vanishes leaves it to run out. With
-all 101 held, coturn answers 508 to the next allocation, and that client gets no relay.
+all 101 held, coturn answers 508 to the next allocation, and that client gets no relay:
+see [when the range is full](#when-the-range-is-full).
 
-To widen the range, change `--min-port`, `--max-port` and the `49152-49252` line under
-`roomler`'s `ports:` together. To free it now, `restart coturn` ends every allocation,
-including those of calls in progress.
+A browser in a call opens two peer connections, one that sends and one that receives, and
+each asks the relay for one allocation for every TURN URL that answers. On this file two
+answer: 3478 over UDP and 3478 over TCP. Media rides a UDP allocation, and the TCP one is
+held unused.
+
+Every number from here to the end of this chapter was measured in November 2026 on a fresh
+install of this file, done as the [Quickstart](#quickstart) says, on a Linux VM: Ubuntu
+24.04, 4 vCPUs, 4 GiB, Docker 29.1.3, Compose 2.40.3 and coturn 4.18.0. The browsers ran on a
+second Linux VM on the same LAN, about 0.2 ms away, on one network unless a row says
+otherwise: Chromium 151 and Firefox 153, headless, as Playwright 1.62 ships them, so Chrome
+here means Chromium 151. The relay was forced, with `ROOMLER__TURN__FORCE_RELAY: "true"` in
+the `roomler` service's environment, unless a row says otherwise. The ports held were counted
+on the server every 2 s, from coturn's own relay sockets. What one participant held:
+
+| Participant | Relayed | On a direct path that works |
+|---|---|---|
+| Chrome 151 | up to 4 for each network that reaches the server while the call sets up, then 2 to 4 for each from about 45 s in | none |
+| Firefox 153 | 6 | 6 |
+
+| Call | Relay | Relay ports held: while it set up, then from about 45 s in |
+|---|---|---|
+| 2 × Chrome | forced | 8, then 7 |
+| 2 × Chrome, over a 40 ms round trip | forced | 8, then 6 |
+| 2 × Chrome, each with a second network | forced | 12, then 9 and 10, in two calls |
+| 3 × Chrome | forced | 12, then 7 and 10, in two calls |
+| 2 × Firefox | forced | 12 throughout, in three calls, one with a second network |
+| 2 × Firefox | not forced | 12 throughout, in two calls |
+| 2 × Chrome and 1 × Firefox | forced | 14, until two of them left 30 s in |
+| 2 × Chrome and 2 × Firefox | forced | 20 throughout |
+| 4 × Firefox | forced | 24, until they left 30 s in |
+| 2 × Chrome, on the LAN and over a 40 ms round trip | not forced | 0, in two calls |
+
+Hanging up gives them all back within 3 s. The counts differ for three reasons:
+
+- **Chrome stops asking once its first path connects.** An allocation still on its way at
+  that moment is one it no longer wants, and it is freed about 45 s into the call. That is
+  most often a TCP one, so a Chrome participant settles at 2 to 4 for each network. When its
+  direct path works, that path connects first and Chrome holds no allocation at all: over a
+  LAN and over a 40 ms round trip alike.
+- **Firefox asks for everything at once and keeps it**, relayed or not: 6 for the whole
+  call, two more than its two connections account for, and it reports only 4 of them.
+- **Chrome allocates from every network that reaches the server.** A second one adds its
+  UDP allocations again: measured with a second interface, and with Docker's bridge on a
+  Linux machine that runs a container, whose traffic leaves through the first network.
+  Firefox did not use the second interface in the same test.
+
+Safari was not measured: there was no macOS machine in the test.
+
+### Sizing the range
+
+Add up what the calls in progress hold, and what clients that vanished still hold
+([below](#what-a-vanished-client-leaves-behind)). A term of "2 to 4" gives the sum a low end
+and a high end. Size the range for the high end: that is what a Chrome participant holds
+while its call sets up.
+
+```
+relay ports =  2 to 4 × relayed Chrome participants × their networks
+            +       6 × Firefox participants, relayed or not
+            +       2 × Chrome participants who closed the tab or the browser, or whose
+                        browser died, in the last 10 minutes × their networks
+            +  2 to 4 × Chrome participants whose machine dropped off the network
+                        in the last 10 minutes × their networks
+            +       3 × Firefox participants whose browser died in the last hour
+            +       6 × Firefox participants whose machine dropped off the network
+                        in the last hour
+            +       9 × runs of the check in the last 13 minutes
+```
+
+It was checked against calls it was not drawn from, with its prediction written down before
+each call. For three relayed Chrome participants it gives up to 12 while the call sets up,
+then 6 to 12: the call held 12, then 7, and nothing 3 s after the last of them hung up. For
+two Firefox participants it gives 12: two calls held 12 from start to end, one with the relay
+forced and one without.
+
+Sized at the high end, the 101 ports hold 25 relayed Chrome participants at once, each on one
+network, or 16 on Firefox. ⚠️ Firefox users use up the range even on direct calls, so about
+16 Firefox participants at once, in all calls together, is this file's real ceiling: a
+meeting of 17 on Firefox fills it while nobody's media is relayed.
+
+The sum counts calls and the check. Remote desktop, the overlay and tunnels use the same
+relay, and what they hold was not measured here.
+
+⚠️ A Firefox participant whose machine drops off the network holds its 6 relay ports for up
+to an hour: measured, they came free 3600 s after they were allocated, 59 minutes after the
+machine dropped. A Chrome one holds up to 4 for each network for up to 10 minutes. So the
+range can be full after a meeting has ended, if its network went down under it.
+
+### When the range is full
+
+No participant is told. Only coturn's log says so, at this file's own log level:
+`create_relay_ioa_sockets: no available ports`, one line for each allocation it refuses.
+Measured with coturn narrowed to 6 ports in a lab copy of this file, the relay forced, and
+three Chrome participants joining one after another: the range filled while the second
+joined, coturn refused 6 allocations within half a second, and each connection that asked
+after that got no relay at all.
+
+| Participant | Sending | Receiving | What it had |
+|---|---|---|---|
+| first | relayed | no relay | its picture reached the second, and it saw nobody |
+| second | relayed | relayed | it saw the first, and nobody could see it |
+| third | no relay | no relay | nothing either way |
+
+Which connections get the last ports follows the order their requests reach coturn. In two
+earlier runs of the same call, with the browsers on the server's own machine, the range
+filled as the third joined, and the second participant could receive but not send.
+
+All three stayed in the call, every page with a tile for every participant, blank where no
+media arrived, and no page showed an error. Nothing recovered: 2 ports came free 45 s in
+and nobody took them, and when the first participant left and freed its last one, the other
+two were as they had been 60 s later. A connection that gathered no relay never asks again,
+and the app does not restart one: both transports only log the change
+(`ui/src/stores/conference.ts:272` for sending, `:318` for receiving). Joining the call again
+makes new connections, and they ask the relay again.
+
+### What a vanished client leaves behind
+
+Hanging up gives every port back within 3 s, and so does Firefox when its tab or the whole
+browser is closed. Every other way out leaves ports held until their lifetime runs out: what
+the client asked for, capped by coturn's `--max-allocate-lifetime` (3600 s by default, in
+coturn 4.18.0's own `--help`; the file does not set it). A TCP allocation ends when its
+connection does, so it outlives its client only when the client's machine is gone from the
+network. Measured with the relay forced, in a four-party call once on Chrome and once on
+Firefox, each participant leaving a different way, and in a three-party call of two Chrome
+participants and one Firefox participant, where a Chrome one and the Firefox one closed the
+call's tab and left the browser running. For a machine gone from the network, its network
+was cut both ways and its browser killed behind the cut, so coturn never heard from it
+again. The Firefox call was sampled for 66 minutes:
+
+| How the participant left | Chrome 151 | Firefox 153 |
+|---|---|---|
+| hung up | all freed within 3 s | all freed within 3 s |
+| closed the tab, the browser still running | TCP freed within 1 s, UDP held: 2 for each network | all freed within 3 s |
+| closed the browser | TCP freed at once, UDP held: 2 for each network | all freed within 3 s |
+| browser killed | TCP freed at once, UDP held: 2 for each network | TCP freed at once, its 3 UDP held |
+| machine gone from the network | all held: up to 4 for each network | all 6 held |
+| held for | 600 s after its last refresh, so 1 to 10 minutes: it asks for 600 s and refreshes every 540 s | 3600 s after its last refresh, so up to an hour: it asks for 3600 s |
+| measured | every port left behind was freed 600 s after it was allocated | every port left behind was freed 3600 s after it was allocated, 59 minutes after the browser was killed or the machine dropped |
+
+### Widening the range
+
+Change `--min-port`, `--max-port` and the `49152-49252` line under `roomler`'s `ports:`
+together, then run the check. To free the range now instead, `restart coturn` ends every
+allocation, including those of calls in progress.
+
+The file keeps 101 on purpose: every port more costs every install memory and start time.
+Docker sets up every published port each time the server starts, and unless its userland
+proxy is off it runs two `docker-proxy` processes for each, one for IPv4 and one for IPv6.
+Measured on a fresh install with 4 vCPUs and 4 GiB, Docker 29.1.3 and Compose 2.40.3, each
+size started from `down`, with the whole machine's memory in use as `free` reports it:
+
+| Relay ports | Docker's userland proxy | `docker-proxy` processes | Memory in use | `up -d` | Server restart to `/health` | Docker restart to `/health` |
+|---|---|---|---|---|---|---|
+| 101, this file | on, Docker's default | 336 | 1.2 GiB | 14 s | 9 s | 10 s |
+| 501 | on | 1,136 | 2.3 GiB | 22 s | 33 s | 57 s |
+| 1001 | on | 2,136 | 3.6 GiB, 192 MiB left | 37 s | 73 s | 106 s |
+| 101 | off | 0 | 0.7 GiB | 13 s | 10 s | 11 s |
+| 1001 | off | 0 | 0.7 GiB | 35 s | 90 s | 133 s |
+| 3001 | off | 0 | 0.8 GiB | 163 s | 488 s | 687 s |
+
+The 336 are two for each of the file's 168 published ports: the relay's 101, the SFU's 32
+over UDP and 32 over TCP, 3478 over UDP and over TCP, and the HTTP port. With the proxy on,
+each relay port costs two processes and about 2.8 MiB, so each 100 ports more cost about
+280 MiB and hold about 25 more relayed Chrome participants on one network each, or 16 on
+Firefox. The time grows faster than the range: a server restart took 9 s at 101 ports, 33 s
+at 501, 73 to 90 s at 1001 and 8 minutes at 3001.
+
+The userland proxy is a setting of the whole engine, for every container on the host:
+`{ "userland-proxy": false }` in `/etc/docker/daemon.json`, then
+`systemctl restart docker`. Docker then runs no process per port. That takes the memory
+away, not the time: the restart time grows with the range either way.
+
+⚠️ A server restart is also what a crash costs. The healing numbers in
+[if the server's process dies](#if-the-servers-process-dies), coturn back within 20 s and a
+server that has run for 12 s healing wherever its crash falls, were measured at 101 ports. A
+wider range makes every restart slower, so measure them again after widening.
 
 ---
 
