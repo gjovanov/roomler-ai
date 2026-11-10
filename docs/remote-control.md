@@ -3835,7 +3835,7 @@ sequenceDiagram
 **The device's side** (P1b-1). When an announced device's socket goes, each live session its viewer may hold (told
 `resume_secs`, not external) leaves the hub without ending: its row gets `detached_at` and `resume_by`, written at the
 fencing number `attach_seq` the hub held, and its viewer is told `rc:session.detached` (`detach_agent_sessions`,
-`crates/modules/fleet/src/hub/resume.rs:246`). A session still waiting for consent or its offer, an external one, and
+`crates/modules/fleet/src/hub/resume.rs:256`). A session still waiting for consent or its offer, an external one, and
 one that began before its device was announced a window end as before. The last is review 2's N3: a device that
 enters the scope mid-session is told the window, but that session's viewer was never told `resume_secs`, ignores the
 `detached` and never rejoins, so a session kept for it waited a whole window for nobody and then ended anyway. The next
@@ -3867,7 +3867,7 @@ The second try is the race M4 found: an older connection's claim of the same dev
 first and then found its connection gone, so the row waits at its number for whichever connection claims it next.
 Refused, the live connection closed a session nobody had ended. **Only the device's newest connection** tries a lost
 commit again or ends a row it refuses: its claim is still pending in this pod's hub (`Hub::claim_pending`,
-`crates/modules/fleet/src/hub/resume.rs:392`) and the device's Redis presence names no other pod (`newest_connection`,
+`crates/modules/fleet/src/hub/resume.rs:414`) and the device's Redis presence names no other pod (`newest_connection`,
 `crates/modules/remote/src/resume.rs:529`). The socket sets the presence before the hello's claims run, and a
 connection's teardown removes it only while it still owns it, so a later connection to another pod always wins this
 check. A presence that cannot be read counts as another pod's, and the claim is then refused writing nothing, as
@@ -3877,9 +3877,9 @@ session it is resuming.
 A session the claim rebuilds has no controller until its viewer rejoins, and waits for it for the window. So does one
 the claim re-attaches on the pod that still held it for the device's earlier connection, when its viewer had gone:
 the wait armed when the viewer left is void once the number moves, so the claim arms it again (`resume_claimed`,
-`crates/modules/fleet/src/hub/resume.rs:419`; review 2, N8). The claim reads the copy that pod held only after it has
+`crates/modules/fleet/src/hub/resume.rs:441`; review 2, N8). The claim reads the copy that pod held only after it has
 taken the claim, and holds the session's lease from there only while the session is still in the hub
-(`hold_lease`, `crates/modules/fleet/src/hub/resume.rs:405`), so an end that ran in between gives the lease back
+(`hold_lease`, `crates/modules/fleet/src/hub/resume.rs:427`), so an end that ran in between gives the lease back
 rather than leaving it to this pod's renewal round for good (P1b-1's review, L13). Then the **registration read** ends
 every live row of the device created before this registration that the hello did not claim, dated by the row's own
 last clock (`detached_at`, else `stats_at`, else `started_at`) and marked `end_source: registration`
@@ -3936,8 +3936,8 @@ receives the event:
 | an admin's, `POST …/session/{id}/terminate` (`admin_end`, `:115`); the answer says `row_ended` | the route's org | the `terminate` control event, as before |
 | the controller's own `rc:terminate` (`controller_end`, `:142`) | the person | `controller_terminate`, which the holding pod applies only to that org and that person (`crates/modules/fleet/src/ctrl.rs:126`) |
 | a redial's `replaces` | the person and the device | `controller_terminate` |
-| the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:648`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:473`) |
-| the device's own, for a session whose end was inferred BEFORE this connection: by the sweep, or by an earlier connection's registration (review 2, N5; `earlier_inferred_end`, `crates/modules/remote/src/resume.rs:709`) | the device, and an end inferred as `registration` or `sweep` | none: as above (`replace_earlier_inferred_end`, `crates/services/src/dao/remote_session.rs:419`). Never the one-time close's rows, whose `ended_at` is `started_at`, a bound a seen end must not carry |
+| the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:648`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:477`) |
+| the device's own, for a session whose end was inferred BEFORE this connection: by the sweep, or by an earlier connection's registration (review 2, N5; `earlier_inferred_end`, `crates/modules/remote/src/resume.rs:709`) | the device, and an end inferred as `registration` or `sweep` | none: as above (`replace_earlier_inferred_end`, `crates/services/src/dao/remote_session.rs:423`). Never the one-time close's rows (`backfill`): that end is an operator's, taken only once the row's own clock has stood still for an hour at least and its device has had a session since, long after any device stopped keeping the session (a window is 120 s at most), and no inference from the device's connection going |
 
 Each writes the audit's `session_ended` as its trail, which projects nothing onto the row
 (`AuditSink::record_trail`, `crates/remote_control/src/audit.rs:100`).
@@ -3951,7 +3951,7 @@ Each writes the audit's `session_ended` as its trail, which projects nothing ont
 | live with no `resume_by`, quiet for longer than the window, on a device in the scope that the presence sweep found offline for longer than the window, or that was removed: the pod that held it died without a word, and the device has not come back | only with the window on | `stats_at`, else `started_at` |
 
 Each is `agent_disconnect` with `end_source: sweep`, written only on the row as the sweep read it: still live, at the
-`attach_seq`, the `resume_by` and the `stats_at` read (`end_swept`, `crates/services/src/dao/remote_session.rs:552`). A
+`attach_seq`, the `resume_by` and the `stats_at` read (`end_swept`, `crates/services/src/dao/remote_session.rs:609`). A
 claim that resumed the session meanwhile bumps the one and clears the other, and a session whose own clock moved is
 alive, so neither is undone. Its FR-115 slot is given back. A row outside the scope with no `resume_by` stays as it is
 until the scope reaches its device.
@@ -4026,7 +4026,7 @@ already ended (a half-open socket kept it), whose reason and `now` would rewrite
 it. An asked end still replaces an earlier SEEN end, as every end did before FR-138, and at window 0 that is
 load-bearing: FR-27 audits a device with no prompt surface as `consent_timeout` and then ends it `no_prompt_surface`
 on the same row (`crates/modules/fleet/src/hub.rs:2253`), and the growth digest's `by_end_reason` reads the second
-(`crates/api/src/growth/digest.rs:2342`). A filter of `ended_at: null` (first end wins) would turn every such row into
+(`crates/api/src/growth/digest.rs:2357`). A filter of `ended_at: null` (first end wins) would turn every such row into
 `consent_timeout`.
 
 | Off is today | What happens |

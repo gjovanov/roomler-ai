@@ -413,9 +413,13 @@ impl RemoteSessionDao {
     /// inference, the device's reason replaces `agent_disconnect` and
     /// `end_source` is cleared, in the device's tenant and only for a row
     /// naming the device; `ended_at` stays the row's own last clock. Not the
-    /// one-time close's rows: it dates an end at `started_at`, a bound and not
-    /// a clock, which a seen end must not carry. When it matched, the row's
-    /// `ended_at` (for the audit's trail); `None` = nothing matched.
+    /// one-time close's rows (`backfill`): that end is an operator's, taken
+    /// only once the row's own clock has stood still for an hour at least and
+    /// its device has had a session since, long after any device stopped
+    /// keeping the session (a window is 120 s at most). It is no inference
+    /// from the device's connection going, which is what the device's word
+    /// corrects. When it matched, the row's `ended_at` (for the audit's
+    /// trail); `None` = nothing matched.
     pub async fn replace_earlier_inferred_end(
         &self,
         tenant_id: ObjectId,
@@ -740,7 +744,8 @@ fn after_filter((created_at, id): RowCursor) -> bson::Document {
 
 /// FR-138 (review 2, N5) — the inferred ends a device's own end may replace:
 /// the registration read's and the sweep's. Both ended a session because its
-/// device's connection went, and both are dated by the row's own last clock.
+/// device's connection went, while the device may have kept it through the
+/// gap. Never `backfill` ([`RemoteSessionDao::replace_earlier_inferred_end`]).
 fn inferred_by_device_loss() -> DaoResult<Vec<bson::Bson>> {
     Ok(vec![
         bson::to_bson(&EndSource::Registration)?,

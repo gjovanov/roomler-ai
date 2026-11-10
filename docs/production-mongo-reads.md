@@ -109,7 +109,7 @@ other cluster must not reach that cluster, not even to fetch credentials for it.
 whose kubeconfig has no production context, every entry point is refused after one local
 `kubectl config get-contexts -o name`. The other readers pin their own `kubectl` calls from
 `prod-mongo-read.sh --print-context` (`scripts/fr97-caps-census.sh:28`,
-`scripts/fr138-roll-read.sh:157`).
+`scripts/fr138-roll-read.sh:165`).
 
 ## 3. What a script sees
 
@@ -174,7 +174,7 @@ can prevent it:
 | `scripts/fr65-stall-census.sh` + `.cjs` | FR-65's stall census (`docs/stall-watch.md` §7) | `--mars --yes` ships the census and the runner in one `roomler ssh`. `--kubectl` hands the census to the runner (`scripts/fr65-stall-census.sh:93`) |
 | `scripts/rc-shadow-report.sh` + `.cjs` | FR-63's shadow report (`docs/rate-control.md`) | the same shape (`scripts/rc-shadow-report.sh:142`) |
 | `scripts/fr97-caps-census.sh` | FR-97's capability words by OS | on mars. The aggregation goes to the runner on stdin with `--db` (`scripts/fr97-caps-census.sh:78`). It no longer reads the app's database URL, which holds the password, from `roomler2` |
-| `scripts/fr138-roll-read.sh` | FR-138's roll read | the same (`scripts/fr138-roll-read.sh:461`). `--mars` ships itself and the runner in one `roomler ssh` |
+| `scripts/fr138-roll-read.sh` | FR-138's roll read | the same (`scripts/fr138-roll-read.sh:493`). `--mars` ships itself and the runner in one `roomler ssh` |
 | By hand | the growth-observability field check, the `rc.connect` mining in `docs/remote-control.md`, the pairing audit in `docs/device-pairing.md` | `scripts/prod-mongo-read.sh --mars --yes - <<'JS'` … `JS`, with `db` already open |
 
 ```bash
