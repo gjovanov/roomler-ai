@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 G ROX EOOD
-//! WebSocket signaling loop against `/ws?role=agent&token=...`.
+//! WebSocket signaling loop against `/ws?role=agent&tid=...`, the agent token
+//! in `Authorization: Bearer` (#3656, [`crate::ws_connect::dial`]).
 //!
 //! Handles the full rc:* handshake and owns a map of per-session
 //! [`AgentPeer`] values that back each live WebRTC PeerConnection.
@@ -1772,36 +1773,25 @@ async fn connect_once(
     // outlives this connection. Every exit below detaches or closes them.
     peers: &mut SessionTable,
 ) -> Result<(), ConnectError> {
-    // S6 — `tid` is the tenant-affinity key the server-front LB hashes
-    // on, co-locating this agent's WS with its tenant's controllers on
-    // one pod (the rc-hub is pod-local). Server validates it against
-    // the JWT's tenant claim; pre-S6 servers just ignore the param.
     // FR-103 — the token as of THIS connect, never the startup copy.
     let token = ctx.token.get();
-    let url = format!(
-        "{}?token={}&role=agent&tid={}",
-        cfg.ws_url(),
-        urlencode(&token),
-        urlencode(&cfg.tenant_id)
-    );
-    // Log the endpoint WITHOUT the token: the URL carries the long-lived agent
-    // JWT (a 1-year credential), and this line lands in the rolling log a user
-    // might paste into a chat / issue (field 2026-07-25 — a controller shared a
-    // log with the full token in it). The token itself never adds diagnostic
-    // value here; `{server}/ws (role=agent)` is enough to see WHERE we dial.
+    let control = control_dial(&cfg.ws_url(), &cfg.tenant_id, &token);
     info!(server = %cfg.ws_url(), "connecting to signaling server (role=agent)");
 
-    // rc.58: wrap `connect_async` in a hard timeout. A hung TLS
-    // handshake (rustls refusing renegotiation against an LB that
-    // requests it mid-stream is one observed mode) would otherwise
-    // sit here indefinitely, never giving the outer backoff loop a
-    // chance to fire. The timeout becomes another `Transient` so the
-    // backoff handles it like any other connection failure.
+    // rc.58: each dial has a hard timeout. A hung TLS handshake (rustls
+    // refusing renegotiation against an LB that requests it mid-stream is
+    // one observed mode) would otherwise sit here indefinitely, never
+    // giving the outer backoff loop a chance to fire. The timeout becomes
+    // another `Transient` so the backoff handles it like any other
+    // connection failure.
     // #2187 — the server's address comes from `ctl_dns`: a name resolved
     // before never waits on a resolver that has stopped answering (an exit
     // whose DNS died kept a dropped control WS from ever reconnecting).
+    // #3656 — the token rides `Authorization: Bearer`; a server older than
+    // that hears it once more in the query (`ws_connect::dial`), and the
+    // arms below read the last answer.
     // FR-138 — and the dial serves what the last connection kept meanwhile.
-    let dial = tokio::time::timeout(WS_CONNECT_TIMEOUT, crate::ws_connect::connect(&url));
+    let dial = crate::ws_connect::dial(&control, WS_CONNECT_TIMEOUT);
     let (mut ws, response) = match serving_kept(dial, peers, kill_rx, idle_rx, &indicator).await {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
@@ -7060,6 +7050,20 @@ fn record_caps() -> Vec<String> {
     }
 }
 
+/// The control socket's dial to `ws_url` (`wss://host/ws`) with `token`.
+///
+/// S6 — `tid` is the tenant-affinity key the server-front LB hashes on,
+/// co-locating this agent's WS with its tenant's controllers on one pod (the
+/// rc-hub is pod-local). The server validates it against the JWT's tenant
+/// claim; pre-S6 servers just ignore the param. #3656 — the token is not in
+/// the URL: [`crate::ws_connect::dial`] presents it in a header.
+pub(crate) fn control_dial(ws_url: &str, tenant_id: &str, token: &str) -> crate::ws_connect::Dial {
+    crate::ws_connect::Dial {
+        url: format!("{ws_url}?role=agent&tid={}", urlencode(tenant_id)),
+        credential: crate::ws_connect::Credential::token(token),
+    }
+}
+
 pub(crate) fn urlencode(s: &str) -> String {
     s.replace('+', "%2B")
         .replace('/', "%2F")
@@ -7162,6 +7166,21 @@ fn end_in_gap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3656 — the control socket's URL names the role and the tenant, and the
+    /// token goes with it as the dial's credential, never in the URL.
+    #[test]
+    fn the_control_url_carries_the_tenant_and_no_token() {
+        let dial = control_dial("wss://roomler.ai/ws", "64b1f0aa12cd34ef56ab78cd", "a.b/c");
+        assert_eq!(
+            dial.url,
+            "wss://roomler.ai/ws?role=agent&tid=64b1f0aa12cd34ef56ab78cd"
+        );
+        assert_eq!(
+            dial.credential,
+            crate::ws_connect::Credential::token("a.b/c")
+        );
+    }
 
     /// #3280 — a later caps try reads the registry the session pump writes.
     #[test]

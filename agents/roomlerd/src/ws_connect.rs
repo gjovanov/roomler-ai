@@ -12,15 +12,30 @@
 //! [`connect`] dials the remembered address instead and hands the URL itself to
 //! the handshake, so TLS still verifies the server's NAME (SNI and certificate)
 //! and the `Host` header is unchanged. Only where the address comes from moves.
+//!
+//! #3656 — and [`dial`] is how the daemon's long-lived credentials travel: the
+//! agent JWT on `/ws` and the control plane's `/derp`, and a regional relay's
+//! admission ticket. Each rides `Authorization: Bearer`, and the URL names the
+//! endpoint, the role and the tenant only, because a request line is what
+//! access logs and inspecting proxies record. A server or relay older than the
+//! header gets one redial in the query form, and that endpoint keeps the query
+//! form for [`upgrade_auth::QUERY_FORM_FOR`]; a verdict on the credential
+//! itself never sends it into a URL.
 
 use std::net::IpAddr;
 use std::time::Duration;
 
+use roomler_ai_remote_control::upgrade_auth::{self, Carrier};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::{self, handshake::client::Response, http::Uri};
+use tokio::time::error::Elapsed;
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::{Request, Response};
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri, header};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
 };
+use tracing::{debug, info};
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -134,25 +149,151 @@ pub fn is_lb_502(e: &tungstenite::Error) -> bool {
     matches!(e, tungstenite::Error::Http(resp) if resp.status().as_u16() == 502)
 }
 
+/// #3656 — the long-lived credential one dial presents, and the name the query
+/// form gives it. `Debug` never shows the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credential {
+    value: String,
+    query_name: &'static str,
+}
+
+impl Credential {
+    /// The agent JWT, on `/ws` and the control plane's `/derp`: `token=` in
+    /// the query form.
+    pub fn token(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            query_name: "token",
+        }
+    }
+
+    /// A regional relay's admission ticket: `ticket=` in the query form.
+    pub fn ticket(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            query_name: "ticket",
+        }
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Credential({}=<redacted>)", self.query_name)
+    }
+}
+
+/// #3656 — one native dial: a URL that names the endpoint, the role and the
+/// tenant, and the credential that goes with it, which the URL never holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dial {
+    pub url: String,
+    pub credential: Credential,
+}
+
+/// #3656 — the upgrade request for `dial` with its credential in `carrier`:
+/// an `Authorization: Bearer` header whose value is marked sensitive, or the
+/// query form a server or relay older than the header reads. Never both.
+pub fn request(dial: &Dial, carrier: Carrier) -> Result<Request, tungstenite::Error> {
+    let Credential { value, query_name } = &dial.credential;
+    match carrier {
+        Carrier::Header => {
+            let mut request = dial.url.as_str().into_client_request()?;
+            let mut bearer = HeaderValue::from_str(&format!("Bearer {value}"))?;
+            bearer.set_sensitive(true);
+            request.headers_mut().insert(header::AUTHORIZATION, bearer);
+            Ok(request)
+        }
+        Carrier::Query => {
+            let sep = if dial.url.contains('?') { '&' } else { '?' };
+            let value = crate::signaling::urlencode(value);
+            format!("{}{sep}{query_name}={value}", dial.url).into_client_request()
+        }
+    }
+}
+
+/// #3656 — dial with the credential in a header, each attempt bounded by
+/// `per_dial`, and hand back the last answer.
+///
+/// A header-only dial refused with no verdict on the credential (the bare 401
+/// or 400 of a server or relay older than the header, or our own challenge
+/// that saw no credential because something on the way dropped the header)
+/// gets ONE redial in the query form. If that one upgrades, the endpoint is
+/// noted and its dials take the query form for [`upgrade_auth::QUERY_FORM_FOR`].
+/// A refusal that names an error is final: dialling again would only put a
+/// refused credential into a URL to hear the same answer.
+pub async fn dial(
+    dial: &Dial,
+    per_dial: Duration,
+) -> Result<Result<(Ws, Response), tungstenite::Error>, Elapsed> {
+    let notes = upgrade_auth::query_form_notes();
+    let endpoint = upgrade_auth::endpoint_of(&dial.url);
+    let first = notes.carrier_for(endpoint);
+    let answer = dial_with(dial, first, per_dial).await;
+    if first == Carrier::Query || !asks_for_query_form(&answer) {
+        return answer;
+    }
+    debug!(
+        %endpoint,
+        "upgrade refused with no verdict on the credential (a server or relay older than \
+         the header, or a header dropped on the way); dialling once more with it in the query"
+    );
+    let again = dial_with(dial, Carrier::Query, per_dial).await;
+    if matches!(again, Ok(Ok(_))) {
+        notes.note_query_form(endpoint);
+        info!(
+            %endpoint,
+            "this endpoint took the credential only in the query: its dials carry it there \
+             for the next 6 h (#3656)"
+        );
+    }
+    again
+}
+
+async fn dial_with(
+    dial: &Dial,
+    carrier: Carrier,
+    per_dial: Duration,
+) -> Result<Result<(Ws, Response), tungstenite::Error>, Elapsed> {
+    match request(dial, carrier) {
+        Ok(request) => tokio::time::timeout(per_dial, connect(request)).await,
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+/// Whether a dial's answer is a refusal [`upgrade_auth::asks_for_query_form`]
+/// reads as a request for the query form.
+fn asks_for_query_form(
+    answer: &Result<Result<(Ws, Response), tungstenite::Error>, Elapsed>,
+) -> bool {
+    let Ok(Err(tungstenite::Error::Http(refused))) = answer else {
+        return false;
+    };
+    let challenges = refused.headers().get_all(header::WWW_AUTHENTICATE);
+    upgrade_auth::asks_for_query_form(
+        refused.status().as_u16(),
+        challenges.iter().filter_map(|v| v.to_str().ok()),
+    )
+}
+
 /// `connect_async`, with the host's address from `ctl_dns`. An address literal,
 /// or a name nothing knows, takes `connect_async`'s own path unchanged.
-pub async fn connect(url: &str) -> Result<(Ws, Response), tungstenite::Error> {
-    let Some((host, port)) = host_port(url) else {
-        return connect_async(url).await;
+pub async fn connect(request: Request) -> Result<(Ws, Response), tungstenite::Error> {
+    let Some((host, port)) = host_port(request.uri()) else {
+        return connect_async(request).await;
     };
     if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
-        return connect_async(url).await;
+        return connect_async(request).await;
     }
     let hostport = tunnel_core::ctl_dns::hostport(&host, port);
     let addrs = tunnel_core::ctl_dns::resolve(&hostport).await;
     if addrs.is_empty() {
-        return connect_async(url).await;
+        return connect_async(request).await;
     }
     let mut last = None;
     for addr in &addrs {
         match tokio::time::timeout(PER_ADDR_CONNECT, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
-                let done = client_async_tls_with_config(url, stream, None, None).await;
+                let done = client_async_tls_with_config(request, stream, None, None).await;
                 // An HTTP answer (a 401, say) proves the address; anything else
                 // may be a server that moved, so look again behind the caller.
                 if let Err(e) = &done
@@ -179,8 +320,7 @@ pub async fn connect(url: &str) -> Result<(Ws, Response), tungstenite::Error> {
 }
 
 /// Host and port of a `ws(s)://` URL, the scheme's default port when it has none.
-fn host_port(url: &str) -> Option<(String, u16)> {
-    let uri: Uri = url.parse().ok()?;
+fn host_port(uri: &Uri) -> Option<(String, u16)> {
     let host = uri.host()?.to_string();
     let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
         Some("wss") | Some("https") => 443,
@@ -373,15 +513,16 @@ mod tests {
 
     #[test]
     fn host_port_reads_the_url() {
+        let of = |url: &str| host_port(&url.parse().unwrap());
         assert_eq!(
-            host_port("wss://roomler.ai/ws?token=x&role=agent&tid=y"),
+            of("wss://roomler.ai/ws?role=agent&tid=y"),
             Some(("roomler.ai".into(), 443))
         );
         assert_eq!(
-            host_port("ws://relay.example:8080/derp"),
+            of("ws://relay.example:8080/derp"),
             Some(("relay.example".into(), 8080))
         );
-        assert_eq!(host_port("not a url"), None);
+        assert_eq!(of("/ws?role=agent"), None, "no host");
     }
 
     /// #2187 — the field case in one process: a name the resolver can never
@@ -414,12 +555,191 @@ mod tests {
         let hostport = format!("ctl-dns-2187.invalid:{}", local.port());
         tunnel_core::ctl_dns::remember(&hostport, &[local]);
         let url = format!("ws://{hostport}/ws");
-        let (mut ws, _) = tokio::time::timeout(Duration::from_secs(10), connect(&url))
-            .await
-            .expect("must not wait on the resolver")
-            .expect("connects to the remembered address");
+        let (mut ws, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect(url.into_client_request().unwrap()),
+        )
+        .await
+        .expect("must not wait on the resolver")
+        .expect("connects to the remembered address");
         let first = ws.next().await.unwrap().unwrap();
         assert_eq!(first, Message::Text("hello".into()));
         assert_eq!(*host_seen.lock().unwrap(), hostport, "Host keeps the name");
+    }
+
+    /// #3656 — the request each carrier makes: the header form holds the
+    /// credential in a sensitive header and the URL unchanged, the query form
+    /// in the URL alone, encoded as released clients encode it.
+    #[test]
+    fn each_carrier_puts_the_credential_in_one_place_only() {
+        let control = Dial {
+            url: "wss://roomler.ai/ws?role=agent&tid=t1".into(),
+            credential: Credential::token("a.b/c+d="),
+        };
+        let header_form = request(&control, Carrier::Header).unwrap();
+        assert_eq!(
+            header_form.uri().to_string(),
+            "wss://roomler.ai/ws?role=agent&tid=t1"
+        );
+        let bearer = header_form.headers().get(header::AUTHORIZATION).unwrap();
+        assert_eq!(bearer, "Bearer a.b/c+d=");
+        assert!(bearer.is_sensitive());
+        assert!(
+            !format!("{header_form:?}").contains("a.b/c"),
+            "{header_form:?}"
+        );
+
+        let query_form = request(&control, Carrier::Query).unwrap();
+        assert_eq!(
+            query_form.uri().to_string(),
+            "wss://roomler.ai/ws?role=agent&tid=t1&token=a.b%2Fc%2Bd%3D"
+        );
+        assert!(query_form.headers().get(header::AUTHORIZATION).is_none());
+
+        let regional = Dial {
+            url: "wss://relay.example/derp".into(),
+            credential: Credential::ticket("the-ticket"),
+        };
+        assert_eq!(
+            request(&regional, Carrier::Query)
+                .unwrap()
+                .uri()
+                .to_string(),
+            "wss://relay.example/derp?ticket=the-ticket"
+        );
+        assert!(!format!("{control:?}{regional:?}").contains("a.b/c"));
+        assert!(!format!("{regional:?}").contains("the-ticket"));
+    }
+
+    /// Long enough for a loopback upgrade on a loaded CI runner.
+    const PER_DIAL: Duration = Duration::from_secs(20);
+
+    fn control_dial(base: &str) -> Dial {
+        Dial {
+            url: format!("{base}/ws?role=agent&tid=t1"),
+            credential: Credential::token("tok/en"),
+        }
+    }
+
+    /// The status a refused dial ended on.
+    fn refused_with(answer: Result<Result<(Ws, Response), tungstenite::Error>, Elapsed>) -> u16 {
+        match answer {
+            Ok(Err(tungstenite::Error::Http(refused))) => refused.status().as_u16(),
+            Ok(Err(e)) => panic!("refused some other way: {e}"),
+            Ok(Ok(_)) => panic!("upgraded"),
+            Err(_) => panic!("timed out"),
+        }
+    }
+
+    /// #3656 — a server older than the header answers a bare 401, and one
+    /// behind a middlebox that dropped the header answers our own challenge
+    /// with no error. Either gets ONE redial in the query form, with no header,
+    /// and the endpoint's next dial goes straight to the query form.
+    #[tokio::test]
+    async fn a_refusal_with_no_verdict_gets_one_query_redial_that_is_remembered() {
+        use test_front::Verdict;
+        for challenge in [None, Some(upgrade_auth::CHALLENGE)] {
+            // One front each: the note is process-wide, keyed by endpoint.
+            let (base, log) = test_front::start(move |seen| {
+                if seen.uri.contains("token=") {
+                    Verdict::Accept
+                } else {
+                    Verdict::Refuse(401, challenge)
+                }
+            })
+            .await;
+            let control = control_dial(&base);
+            dial(&control, PER_DIAL)
+                .await
+                .unwrap()
+                .expect("the query form upgrades");
+            let seen = test_front::seen(&log);
+            assert_eq!(seen.len(), 2, "{challenge:?}: {seen:?}");
+            assert_eq!(seen[0].authorization.as_deref(), Some("Bearer tok/en"));
+            assert_eq!(seen[0].uri, "/ws?role=agent&tid=t1");
+            assert_eq!(seen[1].authorization, None, "never both: {seen:?}");
+            assert_eq!(seen[1].uri, "/ws?role=agent&tid=t1&token=tok%2Fen");
+
+            dial(&control, PER_DIAL)
+                .await
+                .unwrap()
+                .expect("the noted endpoint upgrades");
+            let seen = test_front::seen(&log);
+            assert_eq!(seen.len(), 3, "one dial, in the query form: {seen:?}");
+            assert_eq!(seen[2].authorization, None);
+            assert!(seen[2].uri.ends_with("&token=tok%2Fen"), "{seen:?}");
+        }
+    }
+
+    /// #3656 — a relay older than the header answers a bare 400, and the
+    /// redial names the ticket as a released daemon does.
+    #[tokio::test]
+    async fn a_relay_older_than_the_header_gets_its_ticket_in_the_query() {
+        use test_front::Verdict;
+        let (base, log) = test_front::start(|seen| {
+            if seen.uri.contains("ticket=") {
+                Verdict::Accept
+            } else {
+                Verdict::Refuse(400, None)
+            }
+        })
+        .await;
+        let regional = Dial {
+            url: format!("{base}/derp?tid=t1"),
+            credential: Credential::ticket("the-ticket"),
+        };
+        dial(&regional, PER_DIAL)
+            .await
+            .unwrap()
+            .expect("the query form upgrades");
+        let seen = test_front::seen(&log);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0].authorization.as_deref(), Some("Bearer the-ticket"));
+        assert_eq!(seen[0].uri, "/derp?tid=t1");
+        assert_eq!(seen[1].authorization, None);
+        assert_eq!(seen[1].uri, "/derp?tid=t1&ticket=the-ticket");
+    }
+
+    /// #3656 — a verdict on the credential is final: one dial, and the
+    /// credential never reaches a URL. Nor does any answer that is not about
+    /// the credential start a redial.
+    #[tokio::test]
+    async fn a_verdict_or_another_answer_is_final() {
+        use test_front::Verdict;
+        for (status, challenge) in [
+            (401, Some(upgrade_auth::CHALLENGE_REFUSED)),
+            (400, Some(upgrade_auth::CHALLENGE_BAD_REQUEST)),
+            (403, None),
+            (500, None),
+            (502, None),
+            (503, None),
+        ] {
+            let (base, log) = test_front::start(move |_| Verdict::Refuse(status, challenge)).await;
+            let control = control_dial(&base);
+            assert_eq!(refused_with(dial(&control, PER_DIAL).await), status);
+            let seen = test_front::seen(&log);
+            assert_eq!(seen.len(), 1, "{status}: {seen:?}");
+            assert_eq!(seen[0].uri, "/ws?role=agent&tid=t1");
+            assert_eq!(seen[0].authorization.as_deref(), Some("Bearer tok/en"));
+            assert_eq!(
+                upgrade_auth::query_form_notes().carrier_for(&format!("{base}/ws")),
+                Carrier::Header
+            );
+        }
+    }
+
+    /// #3656 — a redial refused too notes nothing, and its answer is the one
+    /// the dial hands back: a credential that the old server refuses keeps
+    /// being offered in the header first.
+    #[tokio::test]
+    async fn a_redial_refused_too_is_not_remembered() {
+        use test_front::Verdict;
+        let (base, log) = test_front::start(|_| Verdict::Refuse(401, None)).await;
+        let control = control_dial(&base);
+        assert_eq!(refused_with(dial(&control, PER_DIAL).await), 401);
+        assert_eq!(refused_with(dial(&control, PER_DIAL).await), 401);
+        let seen = test_front::seen(&log);
+        let carried: Vec<bool> = seen.iter().map(|s| s.authorization.is_some()).collect();
+        assert_eq!(carried, [true, false, true, false], "{seen:?}");
     }
 }
