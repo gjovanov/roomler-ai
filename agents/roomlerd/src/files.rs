@@ -402,12 +402,12 @@ impl FsAs {
     }
 }
 
-/// #3048 — the person's Downloads on Windows: their known folder when
-/// `check` finds it a folder (read as them, so a share it is redirected to is
-/// reached with their logon), else their profile. Unchecked (the status card),
-/// the known folder as it is: no probe on that path, so an offline share
-/// cannot hold it up.
-#[cfg(target_os = "windows")]
+/// #3048 — the person's Downloads on Windows: their known folder when `check`
+/// finds it a folder (read as them, so a share it is redirected to is reached
+/// with their logon), else their profile. Unchecked (the status card), the
+/// known folder as it is: no probe, so an offline share cannot hold it up.
+/// Compiled for tests on every OS, so its test runs where the caller does not.
+#[cfg(any(target_os = "windows", test))]
 fn person_downloads_windows(
     downloads: Option<&std::path::Path>,
     profile: &std::path::Path,
@@ -5286,7 +5286,8 @@ mod tests {
 /// FR-97 P3d — a received file on a Linux system install, written as the
 /// person at seat0. The identity half needs root: CI runs this module under
 /// sudo with `ROOMLERD_TEST_REQUIRE_ROOT`, so it cannot pass by skipping.
-/// `xdg_download_dir` is pure and runs everywhere.
+/// `xdg_download_dir` is pure and runs everywhere, as does #3048's Windows
+/// folder choice (`person_downloads_windows`).
 #[cfg(test)]
 mod seat_user_tests {
     use super::*;
@@ -5319,6 +5320,43 @@ mod seat_user_tests {
             "the home itself means unset"
         );
         assert_eq!(pick(""), None);
+    }
+
+    /// #3048 — the Windows folder choice, on every OS: temp folders stand in
+    /// for a local Downloads and for the share Folder Redirection moved it
+    /// to. The person's Downloads known folder when it is a folder, else their
+    /// profile; unchecked (the status card), the known folder as it is.
+    #[test]
+    fn person_downloads_windows_is_the_known_folder_else_the_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let local = profile.join("Downloads");
+        // Redirected: outside the profile, while the local `Downloads` above
+        // outlived the redirection.
+        let redirected = temp.path().join("share").join("Downloads");
+        let offline = temp.path().join("offline").join("Downloads");
+        let a_file = temp.path().join("not-a-folder");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&redirected).unwrap();
+        std::fs::write(&a_file, b"x").unwrap();
+        let checked =
+            |known: Option<&std::path::Path>| person_downloads_windows(known, &profile, true);
+
+        assert_eq!(checked(Some(&local)), local, "local");
+        assert_eq!(
+            checked(Some(&redirected)),
+            redirected,
+            "redirected: the known folder, not the local one left behind"
+        );
+        assert_eq!(checked(None), profile, "none: the profile");
+        assert_eq!(checked(Some(&offline)), profile, "unreachable: the profile");
+        assert_eq!(checked(Some(&a_file)), profile, "not a folder: the profile");
+        // Unchecked: the known folder as it is, even one that does not exist.
+        assert_eq!(
+            person_downloads_windows(Some(&offline), &profile, false),
+            offline
+        );
+        assert_eq!(person_downloads_windows(None, &profile, false), profile);
     }
 
     #[cfg(target_os = "linux")]
@@ -5786,6 +5824,55 @@ mod seat_user_tests {
                 FsAs::Daemon,
                 "the switch keeps the daemon's own identity"
             );
+        }
+
+        /// #3048's criterion, for a SystemContext worker (`fs_as_for` as
+        /// LocalSystem, with a person signed in): with no folder chosen, a file
+        /// lands in the person's Downloads known folder, local or redirected,
+        /// else in their profile, and the status card shows the known folder
+        /// unchecked. Never the machine-global folder the daemon's own ladder
+        /// ends in.
+        #[test]
+        fn a_system_context_worker_takes_the_person_downloads_never_the_machine_folder() {
+            let _lock = FILES_DIR_TEST_LOCK.blocking_lock();
+            set_files_dir(None);
+            let temp = tempfile::tempdir().unwrap();
+            let profile = temp.path().join("p");
+            let local = profile.join("Downloads");
+            let redirected = temp.path().join("share").join("p").join("Downloads");
+            let offline = temp.path().join("offline").join("Downloads");
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::create_dir_all(&redirected).unwrap();
+            let machine = crate::appdirs::machine_global_dir().join("uploads");
+            let worker = |known: Option<&Path>| {
+                fs_as_for(
+                    true,
+                    true,
+                    Some(SessionPerson {
+                        sid: "S-1-5-21-1-2-3-1001".into(),
+                        profile: profile.clone(),
+                        downloads: known.map(Path::to_path_buf),
+                    }),
+                )
+            };
+            // (their known folder, where a file lands, what the card shows)
+            let cases = [
+                (Some(local.as_path()), &local, &local),
+                (Some(redirected.as_path()), &redirected, &redirected),
+                (None, &profile, &profile),
+                (Some(offline.as_path()), &profile, &offline),
+            ];
+            for (known, lands, card) in cases {
+                let who = worker(known);
+                let got = download_dir_as(&who).unwrap();
+                assert_eq!(&got, lands, "a file, with the known folder {known:?}");
+                assert_ne!(got, machine, "never the machine-global folder");
+                assert_eq!(
+                    &default_download_dir_as(&who, false).unwrap(),
+                    card,
+                    "the card, with the known folder {known:?}"
+                );
+            }
         }
     }
 }
