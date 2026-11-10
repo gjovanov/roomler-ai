@@ -2871,11 +2871,17 @@ mod tests {
                         && !a.ends_with(";CO")
                 })
             };
-            assert!(
-                full_for_another(&sddl(tree.parent())),
-                "the creator's entry: {}",
-                sddl(tree.parent())
-            );
+            // Where an administrator's new folders are its own (a client
+            // Windows' default), the entry names this test's account, as it
+            // names the person in the field. Where they are the group's
+            // (Windows Server's default), it names Administrators from the
+            // start, and the rest still holds.
+            if !full_for_another(&sddl(tree.parent())) {
+                eprintln!(
+                    "note: the creator's entry names Administrators here: {}",
+                    sddl(tree.parent())
+                );
+            }
             std::fs::write(tree.config(), "agent_token = \"t\"\n").unwrap();
             repair(&tree, true);
             let why = check(&tree).expect_err("a parent a person made");
