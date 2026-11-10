@@ -48,7 +48,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::Directive, filter::LevelFilter, filter::filter_fn, fmt,
+    EnvFilter, filter::Directive, filter::LevelFilter, fmt, fmt::writer::MakeWriterExt,
 };
 
 use crate::logs_upload::{LogLine, LogUploadLayer};
@@ -249,7 +249,10 @@ pub fn init() {
             .with_ansi(false);
         // #3230 — an installer step's own lines are the file's. The console
         // already has each answer ([`answer`]) and shows what it always showed.
-        let stdout = stdout.with_filter(filter_fn(|meta| meta.target() != STEP_TARGET));
+        // Its writer drops them: a per-layer filter here would make the whole
+        // stack's level TRACE (`init_keeps_the_level_of_the_default_filter`).
+        let console = std::io::stdout.with_filter(|meta| meta.target() != STEP_TARGET);
+        let stdout = stdout.with_writer(console);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with((!quiet).then_some(stdout))
@@ -291,7 +294,10 @@ pub fn init() {
 /// write there waits for that conhost, which a host busy with higher-priority work
 /// runs only now and then: the exit-DNS purge's 10 s bound was logged 40-46 s
 /// after the purge began. Only a process with a [`ServiceLogRole`] is asked, so a
-/// verb a person runs keeps its console lines, in a terminal or over SSH.
+/// verb a person runs with no role keeps its console lines, in a terminal or over
+/// SSH. The installer steps have a role and are asked: run in a terminal window, a
+/// step keeps its console lines because that console has a window, and so does a
+/// step whose stdout is a file or a pipe, which is no console.
 #[cfg(windows)]
 fn console_nobody_reads() -> bool {
     use windows_sys::Win32::System::Console::{
@@ -1701,6 +1707,8 @@ mod tests {
         use std::path::{Path, PathBuf};
 
         const CHILD: &str = "ROOMLER_TEST_INSTALLER_STEP";
+        const LEVEL_CHILD: &str = "ROOMLER_TEST_LEVEL_AFTER_INIT";
+        const LEVEL_SAID: &str = "level after init: ";
         /// More lines than the writer drains between a step's last line and an
         /// exit that does not wait for it.
         const BURST: usize = 20_000;
@@ -1800,28 +1808,44 @@ mod tests {
             std::process::exit(if flushed { 1 } else { 3 });
         }
 
-        /// Runs [`child_runs_a_step_that_fails`] with a log dir of its own, stdout
-        /// to `console` (or nowhere, as under Windows Installer), and returns the
-        /// installer log's text.
-        fn run_child(dir: &Path, burst: usize, console: Option<&Path>) -> String {
+        /// Runs the test `name` of this module alone in a new process, with `var`
+        /// set, a log dir of its own, no `RUST_LOG`, and stdout to `console` (or
+        /// nowhere, as under Windows Installer).
+        fn child(
+            name: &str,
+            (var, value): (&str, &str),
+            dir: &Path,
+            console: Option<&Path>,
+        ) -> std::process::ExitStatus {
             let stdout = match console {
                 Some(file) => std::fs::File::create(file).unwrap().into(),
                 None => std::process::Stdio::null(),
             };
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "logging::tests::installer_log::child_runs_a_step_that_fails",
+                    &format!("logging::tests::installer_log::{name}"),
                     "--nocapture",
                 ])
-                .env(CHILD, burst.to_string())
+                .env(var, value)
                 .env("ROOMLER_TEST_LOG_DIR", dir)
                 .env_remove("RUST_LOG")
                 .stdin(std::process::Stdio::null())
                 .stdout(stdout)
                 .stderr(std::process::Stdio::null())
                 .status()
-                .unwrap();
+                .unwrap()
+        }
+
+        /// Runs [`child_runs_a_step_that_fails`] and returns the installer log's text.
+        fn run_child(dir: &Path, burst: usize, console: Option<&Path>) -> String {
+            let burst = burst.to_string();
+            let status = child(
+                "child_runs_a_step_that_fails",
+                (CHILD, &burst),
+                dir,
+                console,
+            );
             assert_eq!(
                 status.code(),
                 Some(1),
@@ -1895,6 +1919,58 @@ mod tests {
                 "{console}"
             );
             assert!(!console.contains("installer step"), "{console}");
+        }
+
+        /// A daemon's [`init`]: a log file and a console, and no role, so nothing
+        /// turns the console off. Says the level tracing now compares callsites with.
+        #[test]
+        fn child_says_the_level_after_init() {
+            if std::env::var_os(LEVEL_CHILD).is_none() {
+                return;
+            }
+            init();
+            println!(
+                "{LEVEL_SAID}{}",
+                tracing::level_filters::LevelFilter::current()
+            );
+        }
+
+        /// #3230 — tracing compares every `debug!` and `trace!` with ONE level, and
+        /// `try_init` hands the same level to the `log` crate, whose macros webrtc,
+        /// sctp and ice use on per-packet paths. With the default filter that level
+        /// is INFO, and each line it turns off costs one compare. A per-layer
+        /// filter under a layer with no level of its own (the file layer, the upload
+        /// layer) takes the level away: the whole stack is left with none, which
+        /// tracing takes as TRACE (tracing-subscriber 0.3.23, `layer/layered.rs:496`),
+        /// and a callsite the default filter turns off is asked again on every hit
+        /// instead of never (`:470`). Every daemon that keeps its console then walks
+        /// the subscriber stack for each of those lines. This test keeps such a
+        /// filter out: after a daemon's `init` the level is the default filter's
+        /// own. A line kept off one output is kept off at that output's writer
+        /// (`MakeWriterExt::with_filter`), which leaves the level alone.
+        #[test]
+        fn init_keeps_the_level_of_the_default_filter() {
+            let tmp = tempfile::tempdir().unwrap();
+            let console_file = tmp.path().join("console.txt");
+            let status = child(
+                "child_says_the_level_after_init",
+                (LEVEL_CHILD, "1"),
+                tmp.path(),
+                Some(&console_file),
+            );
+            let console = std::fs::read_to_string(&console_file).unwrap();
+            assert!(status.success(), "{status:?}: {console}");
+            let said = console
+                .lines()
+                .find_map(|l| l.strip_prefix(LEVEL_SAID))
+                .unwrap_or_else(|| panic!("no level said: {console}"));
+            let own = filter_for(None).max_level_hint().map(|l| l.to_string());
+            assert_eq!(
+                own.as_deref(),
+                Some("info"),
+                "the default filter's own level"
+            );
+            assert_eq!(Some(said), own.as_deref(), "the level after init");
         }
     }
 
