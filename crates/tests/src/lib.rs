@@ -296,6 +296,13 @@ mod rc_resume_claim_tests;
 /// one.
 #[cfg(test)]
 mod rc_resume_ends_tests;
+/// FR-138 — the server's resume at the edges deferred to "PR D": a detached
+/// session's slot against a request on its own pod, a lost claim and the
+/// winner's lease, a displaced claim's detach written back, a detached
+/// lease's life, the external marker and D3 at the claim, an admin's end that
+/// cannot be written, and the rejoin's gate rate.
+#[cfg(test)]
+mod rc_resume_pd_tests;
 /// FR-138 P1b-2 — the viewer's half of the server's resume: the hold through
 /// the viewer's own socket loss, the rejoin on either pod with the gate run
 /// again, the slot a held session never costs its own viewer (`replaces`

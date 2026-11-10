@@ -48,7 +48,7 @@ use crate::rc_resume_rejoin_tests::{
 };
 
 /// The remote module's state on `app`.
-fn remote(app: &TestApp) -> &RemoteState {
+pub(crate) fn remote(app: &TestApp) -> &RemoteState {
     app.state
         .modules
         .remote
@@ -57,7 +57,7 @@ fn remote(app: &TestApp) -> &RemoteState {
 }
 
 /// The session's row, as a claim reads it.
-async fn as_read(app: &TestApp, tenant: ObjectId, sid: ObjectId) -> RemoteSession {
+pub(crate) async fn as_read(app: &TestApp, tenant: ObjectId, sid: ObjectId) -> RemoteSession {
     remote(app)
         .remote_sessions
         .find_in_tenant(tenant, sid)
@@ -68,7 +68,7 @@ async fn as_read(app: &TestApp, tenant: ObjectId, sid: ObjectId) -> RemoteSessio
 /// A connection of `agent_id` registered straight in `app`'s hub, under the
 /// window and claiming back `kept`: its context, as the socket builds it, and
 /// what the hub sends the device on it.
-fn claiming_connection(
+pub(crate) fn claiming_connection(
     app: &TestApp,
     agent_id: ObjectId,
     tenant_id: ObjectId,
@@ -112,7 +112,10 @@ fn claiming_connection(
 
 /// The hub's answer to a claim on `sid`, sent on `rx`: the first
 /// `rc:session.resumed` or `rc:terminate` naming it.
-async fn hub_answer(rx: &mut mpsc::Receiver<ServerMsg>, sid: ObjectId) -> Option<ServerMsg> {
+pub(crate) async fn hub_answer(
+    rx: &mut mpsc::Receiver<ServerMsg>,
+    sid: ObjectId,
+) -> Option<ServerMsg> {
     let deadline = tokio::time::Instant::now() + WITHIN;
     while let Ok(Some(msg)) = tokio::time::timeout_at(deadline, rx.recv()).await {
         match &msg {
