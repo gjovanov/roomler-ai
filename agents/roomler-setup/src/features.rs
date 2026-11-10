@@ -136,8 +136,14 @@ impl Asked {
 /// The URL to fetch for `server`, read as the enroll reads it (a remote
 /// `http://` upgraded to `https://`, loopback left alone, no trailing slash).
 pub fn features_url(server: &str) -> String {
+    format!("{}{ROUTE}", origin(server))
+}
+
+/// `server`'s origin as [`features_url`] reads it, without the trailing slash:
+/// the key its clock reading is kept under ([`crate::server_clock`]).
+pub fn origin(server: &str) -> String {
     let origin = roomler_ai_remote_control::server_url::secure(server, false).url;
-    format!("{}{ROUTE}", origin.trim_end_matches('/'))
+    origin.trim_end_matches('/').to_string()
 }
 
 /// The answer as the switches: a 2xx whose body is a JSON object, with each
@@ -171,12 +177,32 @@ pub fn older_server(status: u16) -> bool {
 
 /// One answer as [`Asked`]: the switches, and whether it was the server's word.
 pub fn read_answer(status: u16, body: &[u8]) -> Asked {
-    let an_object = (200..300).contains(&status)
-        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.is_object());
     Asked {
         features: parse(status, body),
-        answered: an_object || older_server(status),
+        answered: an_object(status, body) || older_server(status),
     }
+}
+
+/// A 2xx whose body is a JSON object: the server's own answer to the route.
+fn an_object(status: u16, body: &[u8]) -> bool {
+    (200..300).contains(&status)
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.is_object())
+}
+
+/// #3523 — whether an answer's `Date` is the configured server's clock: its
+/// own answer to the route ([`an_object`]), from the origin that was asked. The
+/// target of a redirect to another origin, a proxy's or a captive portal's
+/// page, and an older server's 404 (an ingress's default backend answers one
+/// too) are not, and leave the clock unknown, which never blocks a token.
+pub fn tells_the_servers_clock(
+    asked: &str,
+    answered_from: &reqwest::Url,
+    status: u16,
+    body: &[u8],
+) -> bool {
+    let same_origin =
+        reqwest::Url::parse(asked).is_ok_and(|asked| asked.origin() == answered_from.origin());
+    same_origin && an_object(status, body)
 }
 
 /// Ask `server`. Never fails: a server that cannot be reached, answers
@@ -199,9 +225,22 @@ pub async fn ask(server: &str) -> Asked {
     };
     match client.get(&url).send().await {
         Ok(resp) => {
+            // #3523 — the server's clock as of the moment its answer arrived,
+            // kept only when the answer is the server's own.
+            let at = std::time::Instant::now();
+            let device_unix = crate::server_clock::device_now();
+            let date = resp
+                .headers()
+                .get(reqwest::header::DATE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let answered_from = resp.url().clone();
             let status = resp.status().as_u16();
             let body = resp.bytes().await.unwrap_or_default();
             let asked = read_answer(status, &body);
+            if tells_the_servers_clock(&url, &answered_from, status, &body) {
+                crate::server_clock::record(&origin(server), date.as_deref(), at, device_unix);
+            }
             if older_server(status) {
                 tracing::debug!(%url, status, "setup features: an older server; every switch off");
             } else if !asked.answered {

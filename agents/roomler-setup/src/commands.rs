@@ -479,8 +479,12 @@ pub struct TokenValidation {
     pub subject: Option<String>,
     pub jti: Option<String>,
     pub expires_at_unix: Option<i64>,
-    /// `true` when `exp <= now` or `exp` is missing entirely.
-    pub appears_expired: bool,
+    /// #3523 — the verdict on `exp`, judged on the server's clock when the
+    /// wizard holds a reading of it ([`judge_expiry`]).
+    pub expiry: TokenExpiry,
+    /// #3523 — this device's clock minus the server's, in seconds, when the
+    /// wizard holds a reading of the server's (positive: this device is ahead).
+    pub clock_offset_secs: Option<i64>,
     /// Server-emitted `token_type` claim via
     /// `wizard_shared::token_peek`.
     pub token_type: Option<String>,
@@ -498,6 +502,42 @@ pub struct TokenValidation {
     pub will_anchor: Option<bool>,
 }
 
+/// #3523 — what a token's `exp` comes to on the Token step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TokenExpiry {
+    /// Not expired by the clock the wizard trusts.
+    Valid,
+    /// Expired by the server's clock, or carrying no `exp`: the step blocks.
+    Expired,
+    /// Expired by this device's clock only: the server's clock reads it
+    /// valid, or could not be read. The step warns and lets the person go on;
+    /// the server checks the token at enrollment.
+    DeviceClockOnly,
+}
+
+/// #3523 — the Token step's judgement of `view`'s `exp`. `server_now` is the
+/// server's clock when the wizard holds a reading of it
+/// ([`crate::server_clock`]), `device_now` this device's. This device's clock
+/// alone never makes a token [`TokenExpiry::Expired`]: a fresh enrollment
+/// token lives 10 minutes, and a device clock that runs ahead refused tokens
+/// the server would accept. A token with no `exp` blocks, as it always did.
+pub fn judge_expiry(
+    view: &roomlerd::jwt_introspect::JwtView,
+    device_now: i64,
+    server_now: Option<i64>,
+) -> TokenExpiry {
+    use roomlerd::jwt_introspect::is_likely_expired;
+    if view.expires_at_unix.is_none() {
+        return TokenExpiry::Expired;
+    }
+    match server_now {
+        Some(now) if is_likely_expired(view, now) => TokenExpiry::Expired,
+        _ if is_likely_expired(view, device_now) => TokenExpiry::DeviceClockOnly,
+        _ => TokenExpiry::Valid,
+    }
+}
+
 /// Introspect a JWT WITHOUT verifying the signature (the wizard has
 /// no signing key; the server re-verifies on every enrollment POST).
 /// Used by the Token step to show "Issuer / Token type / Expires in
@@ -506,22 +546,42 @@ pub struct TokenValidation {
 /// `rename_all = "camelCase"` so the JS arg keys bind 1:1 (see
 /// `cmd_install` for the field repro that motivates the attribute).
 #[tauri::command(rename_all = "camelCase")]
-pub fn cmd_validate_token(token: String, role: Option<Role>) -> Result<TokenValidation, String> {
-    use roomlerd::jwt_introspect::{is_likely_expired, parse_unverified};
-    let view = parse_unverified(&token).map_err(|e| e.to_string())?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let token_type = wizard_shared::token_peek::parse_token_type(&token);
+pub async fn cmd_validate_token(
+    token: String,
+    role: Option<Role>,
+    server: Option<String>,
+) -> Result<TokenValidation, String> {
+    let view = roomlerd::jwt_introspect::parse_unverified(&token).map_err(|e| e.to_string())?;
+    // #3523 — `exp` is the server's time, so it is judged on the server's
+    // clock: the reading the Token page's own setup-features request took,
+    // else a new one. `None` when the server cannot say.
+    let server_now = match server.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(server) => crate::server_clock::read(server).await,
+        None => None,
+    };
+    let device_now = crate::server_clock::device_now();
+    Ok(token_validation(&token, view, role, device_now, server_now))
+}
+
+/// [`cmd_validate_token`] once both clocks are known: this device's, and the
+/// server's when the wizard could read it.
+fn token_validation(
+    token: &str,
+    view: roomlerd::jwt_introspect::JwtView,
+    role: Option<Role>,
+    device_now: i64,
+    server_now: Option<i64>,
+) -> TokenValidation {
+    let token_type = wizard_shared::token_peek::parse_token_type(token);
     let audience_matches = match role {
         Some(Role::TunnelClient) => Some(token_type.as_deref() == Some("tunnel_enrollment")),
         _ => None,
     };
-    let will_anchor = wizard_shared::token_peek::parse_anchor_claim(&token)
+    let will_anchor = wizard_shared::token_peek::parse_anchor_claim(token)
         .then(|| role.is_some_and(crate::orchestrator_agent::role_anchors));
-    Ok(TokenValidation {
-        appears_expired: is_likely_expired(&view, now),
+    TokenValidation {
+        expiry: judge_expiry(&view, device_now, server_now),
+        clock_offset_secs: server_now.map(|now| device_now - now),
         audience_matches,
         will_anchor,
         issuer: view.issuer,
@@ -530,7 +590,7 @@ pub fn cmd_validate_token(token: String, role: Option<Role>) -> Result<TokenVali
         subject: view.subject,
         jti: view.jti,
         expires_at_unix: view.expires_at_unix,
-    })
+    }
 }
 
 // ─── Wizard state persistence ────────────────────────────────────────────────
@@ -1265,7 +1325,8 @@ mod tests {
             subject: Some("507f1f77bcf86cd799439011".to_string()),
             jti: Some("abc".to_string()),
             expires_at_unix: Some(1_700_000_000),
-            appears_expired: false,
+            expiry: TokenExpiry::DeviceClockOnly,
+            clock_offset_secs: Some(10_800),
             token_type: Some("tunnel_enrollment".to_string()),
             audience_matches: Some(true),
             will_anchor: Some(true),
@@ -1275,7 +1336,9 @@ mod tests {
         // FR-104 — the SPA reads `willAnchor`.
         assert!(json.contains(r#""willAnchor":true"#), "{json}");
         assert!(json.contains("expiresAtUnix"), "{json}");
-        assert!(json.contains("appearsExpired"), "{json}");
+        // #3523 — the SPA blocks on `expired` alone and warns on `deviceClockOnly`.
+        assert!(json.contains(r#""expiry":"deviceClockOnly""#), "{json}");
+        assert!(json.contains(r#""clockOffsetSecs":10800"#), "{json}");
         assert!(
             json.contains(r#""tokenType":"tunnel_enrollment""#),
             "{json}"
@@ -1283,19 +1346,28 @@ mod tests {
         assert!(!json.contains("expires_at_unix"), "{json}");
     }
 
+    /// [`cmd_validate_token`] with no server named: no reading of its clock.
+    fn validate(token: String, role: Option<Role>) -> Result<TokenValidation, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(cmd_validate_token(token, role, None))
+    }
+
     #[test]
     fn validate_token_gates_audience_only_for_tunnel_role() {
         // Tunnel role: gate evaluates.
-        let v = cmd_validate_token(tunnel_enrollment_jwt(), Some(Role::TunnelClient)).unwrap();
+        let v = validate(tunnel_enrollment_jwt(), Some(Role::TunnelClient)).unwrap();
         assert_eq!(v.audience_matches, Some(true));
         assert_eq!(v.token_type.as_deref(), Some("tunnel_enrollment"));
         assert_eq!(v.issuer.as_deref(), Some("roomler-ai"));
         // Daemon role: no client-side gate (None), token_type still
         // surfaced for the info card.
-        let v = cmd_validate_token(tunnel_enrollment_jwt(), Some(Role::DaemonSystem)).unwrap();
+        let v = validate(tunnel_enrollment_jwt(), Some(Role::DaemonSystem)).unwrap();
         assert_eq!(v.audience_matches, None);
         // No role: also ungated.
-        let v = cmd_validate_token(tunnel_enrollment_jwt(), None).unwrap();
+        let v = validate(tunnel_enrollment_jwt(), None).unwrap();
         assert_eq!(v.audience_matches, None);
     }
 
@@ -1303,21 +1375,234 @@ mod tests {
     fn validate_token_flags_wrong_type_for_tunnel_role() {
         // Operator pasted the AGENT-enrollment token (token_type
         // "enrollment") while on the tunnel-client role.
-        let v = cmd_validate_token(agent_enrollment_jwt(), Some(Role::TunnelClient)).unwrap();
+        let v = validate(agent_enrollment_jwt(), Some(Role::TunnelClient)).unwrap();
         assert_eq!(v.audience_matches, Some(false));
         assert_eq!(v.token_type.as_deref(), Some("enrollment"));
     }
 
+    /// An `exp` in 1970: with no reading of the server's clock, this device's
+    /// clock alone only warns (#3523); the server's clock blocks.
     #[test]
     fn validate_token_reports_expiry() {
-        let v = cmd_validate_token(expired_jwt(), None).unwrap();
-        assert!(v.appears_expired);
+        let v = validate(expired_jwt(), None).unwrap();
+        assert_eq!(v.expiry, TokenExpiry::DeviceClockOnly);
+        assert_eq!(v.clock_offset_secs, None);
         assert_eq!(v.expires_at_unix, Some(1_000_000));
+        let view = roomlerd::jwt_introspect::parse_unverified(&expired_jwt()).unwrap();
+        let now = device_now();
+        let v = token_validation(&expired_jwt(), view, None, now, Some(now - 60));
+        assert_eq!(v.expiry, TokenExpiry::Expired);
+        assert_eq!(v.clock_offset_secs, Some(60));
+    }
+
+    fn view_expiring_at(exp: Option<i64>) -> roomlerd::jwt_introspect::JwtView {
+        roomlerd::jwt_introspect::JwtView {
+            expires_at_unix: exp,
+            ..Default::default()
+        }
+    }
+
+    /// #3523 — the whole judgement table: the server's clock known or not ×
+    /// this device's clock ahead of it, behind it or equal × a fresh token or
+    /// one the server's clock reads expired. Only the server's clock blocks.
+    #[test]
+    fn the_token_expiry_table() {
+        use TokenExpiry::{DeviceClockOnly, Expired, Valid};
+        const SERVER: i64 = 1_800_000_000;
+        const AHEAD: i64 = 3 * 3600;
+        let fresh = view_expiring_at(Some(SERVER + 600));
+        let expired = view_expiring_at(Some(SERVER - 60));
+        #[rustfmt::skip]
+        let table = [
+            // the server's clock, this device's offset, the token, the verdict
+            (Some(SERVER), AHEAD, &fresh, DeviceClockOnly),
+            (Some(SERVER), AHEAD, &expired, Expired),
+            (Some(SERVER), -AHEAD, &fresh, Valid),
+            (Some(SERVER), -AHEAD, &expired, Expired),
+            (Some(SERVER), 0, &fresh, Valid),
+            (Some(SERVER), 0, &expired, Expired),
+            (None, AHEAD, &fresh, DeviceClockOnly),
+            (None, AHEAD, &expired, DeviceClockOnly),
+            (None, -AHEAD, &fresh, Valid),
+            (None, -AHEAD, &expired, Valid),
+            (None, 0, &fresh, Valid),
+            (None, 0, &expired, DeviceClockOnly),
+        ];
+        for (server_now, offset, view, want) in table {
+            assert_eq!(
+                judge_expiry(view, SERVER + offset, server_now),
+                want,
+                "server {server_now:?}, device {offset:+} s, exp {:?}",
+                view.expires_at_unix
+            );
+        }
+    }
+
+    /// A token with no `exp` blocks, as before #3523, whichever clock is known.
+    #[test]
+    fn a_token_with_no_exp_blocks_on_either_clock() {
+        let none = view_expiring_at(None);
+        let now = 1_800_000_000;
+        assert_eq!(judge_expiry(&none, now, Some(now)), TokenExpiry::Expired);
+        assert_eq!(judge_expiry(&none, now, None), TokenExpiry::Expired);
+    }
+
+    /// {"iss":"roomler-ai","token_type":"enrollment","exp":<exp>}
+    fn enrollment_jwt_expiring_at(exp: i64) -> String {
+        use base64::Engine as _;
+        let payload = format!(r#"{{"iss":"roomler-ai","token_type":"enrollment","exp":{exp}}}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("{FAKE_HEADER}.{payload}.sig")
+    }
+
+    fn device_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// A server on a loopback port that answers every request with `status`,
+    /// the header lines `headers` (each ending in CRLF) and `body`. It lives as
+    /// long as the test process, so no later test's server takes over its port
+    /// and, with it, the clock reading kept for its origin.
+    fn server_answering(status: &'static str, headers: String, body: &'static str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(answer.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A `Date` header line saying `unix`.
+    fn date_line(unix: i64) -> String {
+        let date = httpdate::fmt_http_date(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix as u64),
+        );
+        format!("Date: {date}\r\n")
+    }
+
+    /// A server on a loopback port that answers the setup-features request
+    /// with `{}` and a `Date` of `server_unix`.
+    fn server_with_clock(server_unix: i64) -> String {
+        server_answering("200 OK", date_line(server_unix), "{}")
+    }
+
+    /// #3523 — RED before the fix, which judged on this device's clock alone:
+    /// this device's clock runs 3 h ahead of the server's, and the token was
+    /// minted just now by the server's clock. Read from the server's `Date`,
+    /// the step warns and lets the person continue.
+    #[tokio::test]
+    async fn device_clock_ahead_and_a_fresh_token_does_not_block() {
+        let server_now = device_now() - 3 * 3600;
+        let server = server_with_clock(server_now);
+        let token = enrollment_jwt_expiring_at(server_now + 600);
+        let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
+        assert_eq!(
+            v.expiry,
+            TokenExpiry::DeviceClockOnly,
+            "the step blocks a token the server would accept"
+        );
+        let offset = v.clock_offset_secs.expect("the server's clock was read");
+        assert!((3 * 3600 - 5..=3 * 3600 + 5).contains(&offset), "{offset}");
+    }
+
+    /// This device's clock runs 3 h behind the server's: a token the server's
+    /// clock reads expired still blocks, though this device reads it valid.
+    #[tokio::test]
+    async fn device_clock_behind_and_a_token_the_server_reads_expired_blocks() {
+        let server_now = device_now() + 3 * 3600;
+        let server = server_with_clock(server_now);
+        let token = enrollment_jwt_expiring_at(server_now - 60);
+        let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
+        assert_eq!(v.expiry, TokenExpiry::Expired);
+    }
+
+    /// Nothing answers: the server's clock is unknown, and this device's clock
+    /// alone only warns.
+    #[tokio::test]
+    async fn an_unreachable_server_leaves_its_clock_unknown() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let token = enrollment_jwt_expiring_at(device_now() - 60);
+        let server = format!("http://127.0.0.1:{port}");
+        let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
+        assert_eq!(v.expiry, TokenExpiry::DeviceClockOnly);
+        assert_eq!(v.clock_offset_secs, None);
+    }
+
+    /// The server answers, but with no `Date` or one that does not parse: its
+    /// clock is unknown, and this device's clock alone only warns.
+    #[tokio::test]
+    async fn an_answer_with_no_date_or_a_bad_one_leaves_the_clock_unknown() {
+        for headers in ["", "Date: yesterday\r\n"] {
+            let server = server_answering("200 OK", headers.to_string(), "{}");
+            let token = enrollment_jwt_expiring_at(device_now() - 60);
+            let v = cmd_validate_token(token, None, Some(server)).await.unwrap();
+            assert_eq!(v.expiry, TokenExpiry::DeviceClockOnly, "{headers:?}");
+            assert_eq!(v.clock_offset_secs, None, "{headers:?}");
+        }
+    }
+
+    /// A token this device reads fresh, judged against `server`. The answers
+    /// below say the server's clock runs 3 h ahead, which would block it; none
+    /// of them is the configured server's own answer, so the clock stays
+    /// unknown and the token passes.
+    async fn judged_against(server: String) -> TokenValidation {
+        let token = enrollment_jwt_expiring_at(device_now() + 600);
+        cmd_validate_token(token, None, Some(server)).await.unwrap()
+    }
+
+    /// The configured server redirects to another origin: the answer there is
+    /// not the configured server's, and neither is its `Date`.
+    #[tokio::test]
+    async fn a_redirect_to_another_origin_does_not_set_the_servers_clock() {
+        let elsewhere = server_answering("200 OK", date_line(device_now() + 3 * 3600), "{}");
+        let location = format!("Location: {elsewhere}/api/setup/features\r\n");
+        let server = server_answering("302 Found", location, "");
+        let v = judged_against(server).await;
+        assert_eq!(
+            v.clock_offset_secs, None,
+            "the redirect target's Date was kept"
+        );
+        assert_eq!(v.expiry, TokenExpiry::Valid);
+    }
+
+    /// Pages that are not the server's answer to the route: an ingress's (or an
+    /// older server's) 404, a captive portal's sign-in page, a proxy's error.
+    #[tokio::test]
+    async fn a_page_that_is_not_the_servers_answer_does_not_set_its_clock() {
+        let ahead = date_line(device_now() + 3 * 3600);
+        for (status, body) in [
+            ("404 Not Found", "404 page not found"),
+            (
+                "200 OK",
+                "<html><body>Sign in to this network</body></html>",
+            ),
+            ("502 Bad Gateway", "<html><body>Bad gateway</body></html>"),
+        ] {
+            let server = server_answering(status, ahead.clone(), body);
+            let v = judged_against(server).await;
+            assert_eq!(v.clock_offset_secs, None, "{status}: its Date was kept");
+            assert_eq!(v.expiry, TokenExpiry::Valid, "{status}");
+        }
     }
 
     #[test]
     fn validate_token_rejects_malformed() {
-        assert!(cmd_validate_token("not-a-jwt".to_string(), None).is_err());
+        assert!(validate("not-a-jwt".to_string(), None).is_err());
     }
 
     #[test]

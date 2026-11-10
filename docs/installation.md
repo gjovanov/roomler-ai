@@ -71,6 +71,36 @@ The server URL is kept either way. Before FR-129 C1 a finished run's role and
 name came back: a test run's tunnel-client role preselected the tunnel card on
 the operator's own machine, and its device name was offered again.
 
+### The Token page judges a token on the server's clock (#3523)
+
+On the paste path the Token page reads the token without verifying it and shows its
+issuer, type and expiry. It judges the token's `exp` on the **configured server's
+clock**, never on this computer's clock alone. A fresh enrollment token lives 10
+minutes, and a computer whose clock ran ahead (a cloned Windows VM boots about 3 h
+ahead) used to refuse tokens the server would still accept. The server verifies the
+token at enrollment either way.
+
+- **The reading** is the `Date` header of the server's answer to the setup-features
+  request the page sends when it opens (`agents/roomler-setup/src/features.rs:242`). It
+  counts only when the answer is the server's own: a 2xx JSON object from the origin that
+  was asked (`agents/roomler-setup/src/features.rs:197`, `tells_the_servers_clock`). The
+  target of a redirect to another origin, a proxy's or a captive portal's page, and an
+  older server's 404 leave the clock unknown. A reading is kept with the monotonic time it
+  arrived (`agents/roomler-setup/src/server_clock.rs:50`) and carried forward on that
+  clock, so a wall-clock step does not move it. It is used for 5
+  minutes by either clock; after that the check asks the server again
+  (`agents/roomler-setup/src/server_clock.rs:112`).
+- **The verdict** (`agents/roomler-setup/src/commands.rs:525`, `judge_expiry`):
+
+| The server's clock | Expired by the server's clock | Expired by this computer's clock only | Neither |
+|---|---|---|---|
+| known | **blocks**: "This token has already expired" | warns with the gap ("3 h ahead of the server's"); Continue stays enabled | continues |
+| unknown: no answer, no `Date` that parses, or an answer that is not the server's own | (cannot be known) | warns; Continue stays enabled | continues |
+
+A token with no `exp` blocks, as before. The macOS second token follows the same rule
+(`agents/roomler-setup/src/front/app.js:1030`, `rootTokenProblem`). The expiry the page shows
+("in N min", "N min ago") is counted on the server's clock when the wizard has a reading of it.
+
 ### The install page: a list of steps, and a failure that says why (#3432, #3590)
 
 The Install page draws what Rust sends it and keeps nothing of its own about the
@@ -108,8 +138,8 @@ did not apply. After every change the tracker sends the whole checklist as one
 `ProgressEvent::Steps { rows }` snapshot
 (`crates/roomler-setup-core/src/progress.rs:227`, each row a
 `StepRow { step, state, label, detail }`, `progress.rs:247`), and the page draws
-the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1635`;
-`renderInstall`, `app.js:1714`).
+the last one (`handleProgress`, `agents/roomler-setup/src/front/app.js:1671`;
+`renderInstall`, `app.js:1750`).
 
 | Row state | When | The page shows |
 |---|---|---|
@@ -138,7 +168,7 @@ in a person's words (`label_existing`, `orchestrator_agent.rs:1878`,
 replaces it". A switch to the other kind is the switch's warning row to say.
 Done lists every warning the run raised, each once (`Steps::warnings`,
 `steps.rs:479`, into `DoneReport.warnings`,
-`agents/roomler-setup/src/commands.rs:602`; `renderDone`, `app.js:1803`): the
+`agents/roomler-setup/src/commands.rs:662`; `renderDone`, `app.js:1839`): the
 anchor's note there carries only its manual command.
 
 **The failure.** An error site hands over the error itself (`.or_fail(code)`
@@ -152,7 +182,7 @@ site's say. One function sends the terminal
 `ProgressEvent::Error { step, kind, status, words, chain }`
 (`progress.rs:216`) to the page and the replay log and writes the same line to
 the wizard's log (`conclude`, `failure.rs:187`). The page titles it "Install
-failed at: ‹the failed row's label›" (`app.js:1757`), shows the words, and keeps
+failed at: ‹the failed row's label›" (`app.js:1793`), shows the words, and keeps
 the whole chain under Details.
 
 The kind (`Kind`, `failure.rs:46`) is decided by walking the error's causes and

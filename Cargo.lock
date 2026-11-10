@@ -8774,8 +8774,10 @@ name = "roomler-setup"
 version = "0.4.209"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "directories",
  "gethostname 0.5.0",
+ "httpdate",
  "native-tls",
  "quote",
  "rcgen",
