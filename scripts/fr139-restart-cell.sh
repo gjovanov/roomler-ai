@@ -418,7 +418,8 @@ cmd_log() {
     printf '[Service]\nEnvironment=RUST_LOG=%s\n' "$spec" > "$DROPIN"
   fi
   systemctl daemon-reload
-  echo "log $1 on $(hostname): $(tr '\n' ' ' < "$DROPIN" 2>/dev/null)"
+  # The braces carry the redirect's own error too: after `off` the drop-in is gone.
+  echo "log $1 on $(hostname): $( { tr '\n' ' ' < "$DROPIN"; } 2>/dev/null)"
 }
 
 # Every fr139 rule, out of INPUT and OUTPUT, v4 and v6.

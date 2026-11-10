@@ -157,13 +157,53 @@ answers a `/derp` initiation would break #2820. §3.4 keeps it working.
   (`establish.rs:1148`, `:1184`, `:1197`). A build that needs the server's grant "lands later via the alloc
   queue" (`:1200`), and until then the pair has no carrier.
 
-### 2.7 Not established
+### 2.7 The stray frame, named in P0 [M]
 
-**Which `/derp` frame the restarted side sends** about 50 ms after its LAN initiation. A ran at INFO in
-§2.1. Its log shows `/derp WS connected + registered`, but no `DERP floor installed at birth` and no
-`DERP link ready` for B. The candidates in the code are the 1-byte relay permission nudge
-(`assert_relay_permission`, `wg.rs:114`), an initiation from a DERP carrier or floor built at birth, and a
-stamp probe. P0 names it at DEBUG.
+P0's naming runs (§9) put A's `tunnel_core` at DEBUG. **The frame is the first send of the DERP floor
+that A builds at birth.** A's establish walk finds B carrier-less and builds the floor before any direct
+tier is up (`establish.rs:1961`, `relay_link.rs:2134`, logged `DERP floor installed at birth` at `:2207`).
+`install_ready` installs it like any relay carrier, and that sends two frames to B over `/derp`:
+
+1. **The 1-byte relay permission bootstrap** (`establish.rs:2595`, `assert_relay_permission` at
+   `wg.rs:114`, logged with `context="install"`). It is shorter than any WireGuard message, so boringtun
+   discards it as `InvalidPacket`.
+2. **A WireGuard handshake initiation.** A relay carrier has one initiator, the smaller public key
+   (`establish.rs:2898`), and on this pair that is A.
+
+A then probes LAN make-before-break against the floor (`relay held`). The probe latches within 2 ms, and A
+promotes LAN. But A's `/derp` WS has not registered yet. The frames wait in the WS writer's queue
+(`agents/roomlerd/src/derp.rs:341`), which the writer starts to drain only after registration (`:404`,
+`:485`). It sends a queued frame only while it is younger than FR-18's age bound, 100 ms by default
+(`:503-510`, `transport/derp.rs:72-77`). In the three naming runs, the WS registered 45–47 ms after the LAN
+probe went out (on A's clock), so both frames were sent. They reached B 49–52 ms after B made the new LAN
+session (on B's clock). The
+bootstrap byte arrives first, unrouted, and B follows (§2.3). The initiation then lands on the DERP
+carrier that the follow has just installed.
+
+So three things race at A's birth: the LAN probe, the WS registration and the 100 ms bound. If the probe
+goes out first, the pair splits (9 of 10 runs in §5). If the WS registers first, B follows before the LAN
+initiation reaches it and takes that initiation as a probe, so the pair does not split (run 5). If the WS
+registers more than 100 ms after the floor's send, the writer sheds both frames, and B has nothing to
+follow. The lab has not produced that third case.
+
+**The frame is load-bearing.** The floor exists so that a reachable peer is never carrier-less, and on a
+pair whose direct tiers never come up its first send is what opens the relay. So P2 defers it (§3.5); it
+does not remove it.
+
+**Two notes on the read.**
+
+- **A server pin doubled the frames.** In all three naming runs the server had also force-pinned the pair
+  to DERP (`relay_link.rs:920`, `server escalation — TURN churn`), as one pin with the same expiry. So A
+  built a DERP link beside the floor (`:1490`, `:1973`), and the link sent the same two frames again,
+  about 3 ms later. What set the pin was not read. The floor sends first and alone carries the frame.
+- **§2.1's INFO log said nothing about the floor.** The packaged default level (`roomlerd=info,warn`)
+  shows `tunnel_core` only at WARN, so `DERP floor installed at birth` could not appear there. The
+  `/derp` lines that did appear are the daemon's own (`agents/roomlerd/src/derp.rs:404`, `overlay.rs:367`).
+
+**Still not established:** why the Windows pair of §2.2 stayed on `/derp` for about 3 minutes. On this
+Linux pair, B installs A's DERP carrier with `initiate=false`, so after B's follow nobody initiates over
+`/derp`, and A's own 15 s WireGuard retry brings the pair back on LAN (§5). P0's reverse cell makes the
+silent end the one with the smaller key, to test whether the order of the keys decides it (§9).
 
 ## 3. Design
 
@@ -295,9 +335,18 @@ The rule: **a node sends nothing over `/derp` to a peer it holds, or is establis
 except a follow-probe after its own poke went unanswered** (§3.3, step 3), or a stamp probe from a TURN
 incumbent.
 
-P0 names the frame (§2.7), and P2 removes it. If the frame is load-bearing, for example the first initiation
-of a DERP floor built at birth, P2 defers it until the direct carrier has missed its handshake deadline,
-instead of removing it.
+P0 named the frame (§2.7). It is the first send of the DERP floor built at birth: the permission bootstrap
+byte and the floor's initiation, held in the `/derp` mux until the WS registers. It is load-bearing, so P2
+defers it and does not remove it. There are two shapes, and P2 picks one with its own lab read:
+
+- **Drop what was superseded.** At the writer's dequeue, where FR-18 already sheds a frame by age
+  (`agents/roomlerd/src/derp.rs:503`), it also drops a frame queued for a carrier that is no longer
+  installed, because a direct probe promoted in the meantime. This covers the ordering that splits the
+  pair in §5, where the probe latches about 47 ms before the WS registers.
+- **Hold the floor's first send while a direct probe is in flight.** The floor stays silent until the
+  probe misses its deadline, or at once when no direct tier is a candidate. This also covers the ordering
+  in which the WS registers first, which §5 measured once in 10 runs. In that ordering B follows before the
+  LAN initiation reaches it, so the pair does not split, but B still books a strike.
 
 ### 3.6 Old meets new
 
@@ -392,7 +441,7 @@ Setting a switch to `0` restores today's behaviour byte for byte.
 |---|---|---|---|---|---|---|
 | **P0** | The lab rig and the restart cell as a script. The RED on the current release, 10 runs of §5's LAN cell. The stray frame named, with A at DEBUG; if the existing DEBUG lines cannot name it, one DEBUG line at the `/derp` send path naming each frame's kind (inert). The far-end loss window at a promotion measured, for P3. Each tier's topology proven to classify (`roomler peers` reads the tier) before its RED | `scripts/` (the cell), the lab | none: a read | — | The RED in §9 | — |
 | **P1** | Verify, then follow, for a direct incumbent (§3.3). A plain make-before-break follow for a relay incumbent (§3.4). The strike only on a *moved* verdict (§3.7). The verdict line and counters (§3.11). A resume clears the holdoff, if D5 = A | `runtime/establish.rs`, `runtime.rs` (`PokeArm`), `relay_link.rs` (the probe variant of the follow), `wg.rs` (payload counted on a probe), `path.rs` | `ROOMLERD_OVERLAY_FOLLOW_MBB`, on (D4) | §5's LAN, public and srflx cells, and the mixed pair (old restarts, new is silent) | §6's AC1–AC3, AC5, AC6 | the switch, one release after the fleet read is GREEN |
-| **P2** | The restarted side sends no stray frame (§3.5) | where P0 names the frame | `ROOMLERD_OVERLAY_DERP_QUIET`, on (D4); the name is provisional until P0 | the mixed pair (new restarts, old is silent) | AC4 | as P1 |
+| **P2** | The restarted side sends no stray frame (§3.5) | `relay_link.rs` (`build_floor`), `runtime/establish.rs` (`install_ready`), the `/derp` mux's flush at registration | `ROOMLERD_OVERLAY_DERP_QUIET`, on (D4) | the mixed pair (new restarts, old is silent) | AC4 | as P1 |
 | **P3** | The drain after any switch (§3.8), if D1 = B | `wg.rs` (`promote_direct_probe`, `add_peer`), `carrier_plane.rs` | `ROOMLERD_OVERLAY_SWITCH_DRAIN`, on | P0's far-end window | AC7 | as P1 |
 | **P4** | The DERP→TURN regrade as a probe (§3.8), if D1 = B | `runtime/establish.rs` (`maybe_regrade_derp`), `relay_link.rs` (`derp_regrade_due`, `:1294`) | `ROOMLERD_OVERLAY_REGRADE_MBB`, on | a regrade's carrier-less gap, read in the lab | AC8 | as P1 |
 | **PF** | The fleet read after the release that carries P1 and P2 rolls (AC10) | a read, with the hub's OK per device | none: a read | — | AC10 | — |
@@ -405,31 +454,50 @@ node with its switch off behaves as the old release does.
 
 **The lab.** Two Linux root daemons on throwaway Ubuntu guests of the vmtest lab, 4 GiB each, on one /24.
 They run the current release with auto-update off (`auto_update = false` and `ROOMLERD_AUTO_UPDATE=0`),
-enrolled with the lab org's ephemeral key, so each row removes itself on a clean stop. #3528's lab is the
-starting point: its restart cell, its capture and its log drop-in. Every boot of the lab hypervisor needs
-the hub's GO (guests, GiB, hours). Fleet devices are read only, with the hub's OK for each one.
+enrolled with the lab org's ephemeral key, so each row removes itself on a clean stop. The cell is
+`scripts/fr139-restart-cell.sh` (P0), grown from #3528's restart cell. It refuses every host except a lab
+guest of its rig, and it reads each daemon's own log file. Every boot of the lab hypervisor needs the hub's
+GO (guests, GiB, hours). Fleet devices are read only, with the hub's OK for each one.
 
 **One run of the restart cell:**
 
 1. **Precondition.** B's `roomler peers` reads A on the cell's carrier (direct `Lan` for the LAN cell),
    established, and B has been silent for at least 30 s. A run starts only when this holds again. After a
    RED run that means the holdoff plus one make-before-break cycle, about 4 minutes.
-2. **B.** A journal mark, a capture of A's address (the WireGuard lengths 148/92/64/32 tell an initiation,
-   a response, a cookie and a keepalive apart), and the log drop-in
-   `tunnel_core::overlay::wg=debug,boringtun=debug`.
-3. **A.** `roomler restart`, then wait for the new pid and its overlay address. In P0 only, A runs at DEBUG
-   for `tunnel_core::overlay::relay_link`, `tunnel_core::transport::derp` and `tunnel_core::overlay::wg`, to
-   name the frame.
-4. **The number.** A pings B's overlay address every 0.2 s. `first_reply` is the time from the daemon being
-   up (its start line) to the first echo reply, on A's monotonic clock.
-5. **After.** At +60 s and at +180 s, read both ends' `roomler peers` rows for each other, and `roomler why`
-   for the holdoff. Count, in B's log for the cell's window: `demote-follow`, `UNREGISTERED receiver index`,
-   and (from P1) `follow verdict`.
+2. **B.** A mark in its log file, a capture of every UDP datagram to and from A's LAN address (the WireGuard
+   lengths 148/92/64/32 tell an initiation, a response, a cookie and a keepalive apart), a 2 s sampler of
+   B's `roomler peers` row for A, and the log drop-in that puts `tunnel_core::overlay::wg`,
+   `tunnel_core::overlay::runtime::establish` and `boringtun` at DEBUG.
+3. **A.** `roomler restart`, then wait for a new pid that holds an overlay address (`daemon_up`). For the
+   RED, A runs the packaged default level. Only P0's naming runs raise it, to `tunnel_core=debug,boringtun=debug`,
+   to name the frame (§2.7).
+4. **The number.** A pings B's overlay address every 0.2 s, with a 1 s timeout. `first_reply` is the time
+   from `daemon_up` to the first echo reply, on A's monotonic clock. Then a 0.5 s ping runs for 200 s, and
+   its gaps are read from when each reply arrived (ping's own receive stamps), not from its sequence numbers.
+5. **After.** At +60 s and at +180 s, read both ends' `roomler peers` rows for each other, with the holdoff
+   and its strikes. Count, in B's log for the cell's window: `demote-follow`, `UNREGISTERED receiver index`,
+   and (from P1) `follow verdict`. Count them for A only, by A's node id or a datagram from A's LAN address,
+   because a lab org can hold other guests on the same LAN.
 
-**RED, on the current release (AC1's baseline).** `first_reply` about 15.7 s in most of 10 runs. B logs a
-`demote-follow` with `was=Some(Lan)` and `UNREGISTERED receiver index` drops. At +60 s B reads A on `/derp`,
-and the pair stays there until the holdoff ends. Nothing touched the follow since #3541's anchor `28a268086`
-(§9), so 0.4.207 is expected to read as 0.4.203 did.
+**RED, read on 0.4.207 (§9). It is AC1's and AC2's baseline.** 9 of 10 runs split the pair, with
+`first_reply` at 15.68–15.70 s. B logs one `demote-follow` with `was=Some(Lan)` in every run. In the nine
+runs that split, it also logs two `UNREGISTERED receiver index` warnings: the warning is throttled to one
+line per 10 s, so two lines cover 15 s of drops.
+
+- **The split is a race between A's two frames at B.** In the nine runs that split, A's LAN initiation
+  reached B 46–52 ms before its `/derp` frame. B made the new session on its LAN carrier, and the follow
+  then tore it down (§2.3). In run 5 the `/derp` frame reached B 8 ms first. B had already followed, so it
+  took the initiation as a make-before-break probe and promoted LAN 2 ms later, with no split.
+- **The split ends at 15 s.** A's WireGuard re-initiates after 15 s of sending with nothing received. By
+  then B holds A on `/derp`, so it answers the initiation as a shadow probe and promotes it on the latch
+  (`establish.rs:2164`). Since #33 it answers even inside the relayed-instead holdoff
+  (`path.rs:1313-1315`), because the holdoff gates only what B starts itself (`eligible`, `path.rs:900`).
+  So B reads A on `lan` again by +60 s in every run, and the holdoff never holds this pair on the relay.
+- **The holdoff is booked anyway, split or not.** It climbs while the restarts land inside its 30 min
+  memory: 3, 6 and 12 min, then the 15 min cap from the fourth follow on (`path.rs:641`). So AC2 reads RED
+  in 10 of 10 runs.
+
+Nothing touched the follow between #3541's anchor `28a268086` and the release that was read (§9).
 
 **GREEN.** `first_reply` ≤ 1 s in 10 of 10 runs. No `UNREGISTERED receiver index` drop and no
 `demote-follow` on B. One `follow verdict … stay` line per stray frame (P1), or no stray frame at all (P2).
