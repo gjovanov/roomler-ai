@@ -72,6 +72,9 @@ still held it, and the unique index would lock that joiner out **permanently**.
 This order only ever *leaks* a host.
 ⚠️ Rows are **tombstoned, not deleted**, and lookups are live-scoped ⇒ **removal is
 final**: a re-enrolled machine gets a fresh lease, never the revived tombstone.
+Its agent row comes back as a new device (#3627): before the row is live,
+`agent_revived` releases a lease the removal left, through `release_overlay_node`
+(the same order), and takes the device out of the tunnel policies.
 Evict = "force a new lease", **not** a ban.
 ⚠️ Client-side teardown is keyed by **pubkey**, never by IP.
 

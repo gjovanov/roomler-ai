@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 G ROX EOOD
-//! A removed device that enrolls again starts from a new device's settings.
+//! A removed device that enrolls again starts from a new device's settings
+//! (#3627).
 //!
 //! Enrolling a machine id its org has removed revives the removed row in
 //! place: the unique `(tenant_id, machine_id)` index covers tombstones, so the
@@ -8,9 +9,9 @@
 //! revived row came back with everything the removed device had been allowed:
 //! its SSH, exec and access policies, the org-relay and External access
 //! approvals, its connect code, approved routes, owner and labels, a pending
-//! config (pushed to the machine again on its first connect, `ssh_enabled` and
-//! authorized keys included) and a standing key-rotation order. The org's
-//! tunnel policies that named it applied to it again too.
+//! config (pushed to the machine again on its first connect) and a standing
+//! key-rotation order. The org's tunnel policies that named it applied to it
+//! again too.
 //!
 //! A revive keeps what identifies the row and its history (`_id`,
 //! `machine_id`, `created_at`, `enrolled_by`), the removal generation that
@@ -739,4 +740,60 @@ async fn a_live_re_enrollment_does_not_undo_a_removal_that_landed_after_its_read
     let row = agents.find_any_in_tenant(tid, aid).await.unwrap();
     assert!(row.deleted_at.is_some(), "the removal stands");
     assert_eq!(row.ssh_policy.mode, SshMode::On, "and nothing was written");
+}
+
+/// A revive is a compare-and-swap on the removal it read. One that read a
+/// removal which has since been revived (the row is live) or revived and
+/// removed again (a new removal time, a higher generation) writes nothing, so
+/// a stale read can never put a lower `token_gen` back and wake the tokens the
+/// second removal ended.
+#[tokio::test]
+async fn a_revive_that_read_an_earlier_removal_writes_nothing() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("revive4").await;
+    let (tid, admin) = (oid(&seeded.tenant_id), oid(&seeded.admin.id));
+    let (agent_id, _) = enroll(&app, &seeded, "mach-stale", "stale box").await;
+    let aid = oid(&agent_id);
+    let agents = &app.state.fleet().agents;
+    assert!(agents.soft_delete(tid, aid).await.unwrap());
+    let first_removal = agents.find_any_in_tenant(tid, aid).await.unwrap();
+    assert_eq!(first_removal.token_gen, 1);
+
+    // Another enrollment revived it first: the row is live.
+    let (again, _) = enroll(&app, &seeded, "mach-stale", "stale box").await;
+    assert_eq!(again, agent_id);
+    let revive = |tombstone: Agent| async move {
+        agents
+            .revive(
+                &tombstone,
+                admin,
+                "stale box".into(),
+                OsKind::Linux,
+                "0.4.207".into(),
+                None,
+            )
+            .await
+            .unwrap()
+    };
+    assert!(
+        revive(first_removal.clone()).await.is_none(),
+        "a revive must not write onto a live row"
+    );
+
+    // …and removed it again: generation 2, a new removal time.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(agents.soft_delete(tid, aid).await.unwrap());
+    assert!(
+        revive(first_removal).await.is_none(),
+        "a revive that read the first removal must not undo the second"
+    );
+    let row = agents.find_any_in_tenant(tid, aid).await.unwrap();
+    assert!(row.deleted_at.is_some(), "the second removal stands");
+    assert_eq!(row.token_gen, 2, "the generation never goes back");
+
+    // The current removal revives, at its own generation.
+    let current = agents.find_any_in_tenant(tid, aid).await.unwrap();
+    let revived = revive(current).await.expect("the current removal revives");
+    assert!(revived.deleted_at.is_none());
+    assert_eq!(revived.token_gen, 2);
 }

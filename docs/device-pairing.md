@@ -126,9 +126,9 @@ holds no token, and the FR-102 ledger has no row yet (test `:299-304`).
 3. **The mint, by the existing calls**, `halves` times. A daemon pairing takes
    `issue_enrollment_token_with(approver, org, ENROLLMENT_TTL_SECS, anchor = false)`
    (`crates/services/src/auth/mod.rs:541`; the 600 s is the admin route's own constant,
-   `crates/modules/fleet/src/agent.rs:26`) and writes the FR-102 ledger with
+   `crates/modules/fleet/src/agent.rs:29`) and writes the FR-102 ledger with
    `record_issued(jti, org, approver, now)` exactly as `POST …/agent/enroll-token` does
-   (`pairing.rs:992-1011` beside `agent.rs:115-126`). A tunnel pairing takes
+   (`pairing.rs:992-1011` beside `agent.rs:118-129`). A tunnel pairing takes
    `issue_tunnel_enrollment_token(approver, org, 600)` (`auth/mod.rs:731`) through the
    services layer, so no `fleet → network` edge appears; like the tunnel admin route, it
    writes no ledger row.

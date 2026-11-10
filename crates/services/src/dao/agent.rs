@@ -9,7 +9,7 @@ use roomler_ai_remote_control::models::{
     ExecPolicy, ExternalAccessPolicy, InstallInfo, OsKind, PeerRelayPolicy, SshPolicy,
 };
 
-use super::base::{BaseDao, DaoResult, PaginatedResult, PaginationParams};
+use super::base::{BaseDao, DaoError, DaoResult, PaginatedResult, PaginationParams};
 
 pub struct AgentDao {
     pub base: BaseDao<Agent>,
@@ -214,8 +214,9 @@ impl AgentDao {
 
     /// Locate an agent by `(tenant_id, machine_id)` regardless of soft-delete
     /// state. The unique index on this pair is unconditional, so a soft-deleted
-    /// row still occupies the slot — the enroll path calls this to detect that
-    /// case and rehydrate via [`Self::rehydrate`] rather than failing with E11000.
+    /// row still occupies the slot. The enroll path calls this to tell its
+    /// three cases apart rather than failing with E11000: no row (create), a
+    /// live row ([`Self::rehydrate`]) and a removed one ([`Self::revive`]).
     pub async fn find_by_tenant_and_machine(
         &self,
         tenant_id: ObjectId,
@@ -229,10 +230,17 @@ impl AgentDao {
             .await
     }
 
-    /// Refresh an existing agent row at re-enrollment time: clear `deleted_at`
-    /// (in case the row was soft-deleted), update os / agent_version from the
+    /// Refresh a LIVE agent row at re-enrollment time, for a device nobody
+    /// removed (a lost token, a reinstall): update os / agent_version from the
     /// new enrollment payload, bump `updated_at`. Returns the updated row so
-    /// the caller can issue a fresh agent token against it.
+    /// the caller can issue a fresh agent token against it. Everything the
+    /// device was allowed stays.
+    ///
+    /// Live only: `NotFound` when the row is a tombstone, which includes a
+    /// removal that landed after the caller read the row live. This used to
+    /// clear `deleted_at` by `_id` alone, so such a removal was undone and the
+    /// device came back with every grant it held. A removed row comes back
+    /// through [`Self::revive`], and only there.
     ///
     /// `name` is refreshed ONLY while `name_admin_set` is unset: machine-
     /// reported names keep flowing for never-renamed devices, but a re-enroll
@@ -256,7 +264,6 @@ impl AgentDao {
             "os": os_bson,
             "agent_version": agent_version,
             "updated_at": DateTime::now(),
-            "deleted_at": bson::Bson::Null,
         };
         if let Some(install) = install {
             set.insert(
@@ -264,19 +271,103 @@ impl AgentDao {
                 bson::to_bson(install).unwrap_or(bson::Bson::Null),
             );
         }
+        // `deleted_at: null` matches null or absent: the live predicate every
+        // reader of this collection uses.
+        let live = doc! { "_id": agent_id, "deleted_at": null };
+        let matched = self
+            .base
+            .collection()
+            .update_one(live.clone(), doc! { "$set": set })
+            .await?
+            .matched_count;
+        if matched == 0 {
+            return Err(DaoError::NotFound);
+        }
+        // Second, FILTERED update for the name half. Matching zero docs (an
+        // admin-renamed row) is the intended no-op, not an error.
+        let mut unrenamed = live;
+        unrenamed.insert("name_admin_set", doc! { "$ne": true });
         self.base
-            .update_by_id(agent_id, doc! { "$set": set })
-            .await?;
-        // Second, FILTERED update for the name half — update_by_id can't
-        // carry the extra predicate. Matching zero docs (admin-renamed row)
-        // is the intended no-op, not an error.
-        self.base
-            .update_one(
-                doc! { "_id": agent_id, "name_admin_set": { "$ne": true } },
-                doc! { "$set": { "name": name } },
-            )
+            .update_one(unrenamed, doc! { "$set": { "name": name } })
             .await?;
         self.base.find_by_id(agent_id).await
+    }
+
+    /// Bring a REMOVED device's row back for a new enrollment of the same
+    /// machine id, as a new device (#3627): the row becomes what
+    /// [`Self::create`] makes from this request, and keeps only what identifies
+    /// it and its history. Before, a revive cleared `deleted_at` and nothing
+    /// else, so the row came back with everything the removed device had been
+    /// allowed.
+    ///
+    /// Kept from the tombstone: `_id` (sessions, audits, logs and crash reports
+    /// hang off it), `tenant_id` and `machine_id` (the unique key),
+    /// `created_at` and `enrolled_by` (when and by whom the row was first
+    /// enrolled), `token_gen` (FR-103: the removal advanced it, so every token
+    /// minted before the removal stays refused) and `desired_config.revision`
+    /// (a counter, so the next save is one above every revision this row has
+    /// used). Everything else is a new enrollment's: the SSH, exec and access
+    /// policies, the org-relay and External access approvals, the connect
+    /// code, approved routes, the pending config, the key-rotation order, the
+    /// owner (now `owner_user_id`, the enroller), labels, and what the removed
+    /// device last reported. That holds by construction: the document is
+    /// REPLACED with [`Self::new_row`]'s, so a field added to `Agent` later
+    /// comes back at its new-enrollment default too, with no list here to
+    /// forget it in.
+    ///
+    /// The write is a compare-and-swap on THIS tombstone: `deleted_at` must
+    /// still be the removal time the caller read. A concurrent revive (the row
+    /// is live) or a revive followed by a second removal (a new removal time,
+    /// a higher `token_gen`) makes it match nothing, and the answer is `None`:
+    /// the caller reads the row again and decides again. A stale read can
+    /// therefore never write a lower generation back.
+    pub async fn revive(
+        &self,
+        tombstone: &Agent,
+        owner_user_id: ObjectId,
+        name: String,
+        os: OsKind,
+        agent_version: String,
+        install: Option<InstallInfo>,
+    ) -> DaoResult<Option<Agent>> {
+        let (Some(id), Some(removed_at)) = (tombstone.id, tombstone.deleted_at) else {
+            return Err(DaoError::Validation(
+                "only a removed row with an id can be revived".to_string(),
+            ));
+        };
+        let mut row = Self::new_row(
+            tombstone.tenant_id,
+            owner_user_id,
+            name,
+            tombstone.machine_id.clone(),
+            os,
+            agent_version,
+            String::new(),
+            install,
+        );
+        row.id = Some(id);
+        row.created_at = tombstone.created_at;
+        row.enrolled_by = tombstone.enrolled_by;
+        row.token_gen = tombstone.token_gen;
+        row.desired_config.revision = tombstone.desired_config.revision;
+        let matched = self
+            .base
+            .collection()
+            .replace_one(
+                doc! {
+                    "_id": id,
+                    "tenant_id": tombstone.tenant_id,
+                    "machine_id": &tombstone.machine_id,
+                    "deleted_at": removed_at,
+                },
+                &row,
+            )
+            .await?
+            .matched_count;
+        if matched == 0 {
+            return Ok(None);
+        }
+        self.base.find_by_id(id).await.map(Some)
     }
 
     /// FR-104 — record which enrollment token enrolled (or revived) this row.
@@ -886,9 +977,11 @@ impl AgentDao {
     /// FR-94 — record the device's anchor, replacing any earlier one: the fresh
     /// `anchor_id` is what revokes the credentials an earlier anchor minted.
     ///
-    /// Through [`Self::live_row`] because a removal ends the anchor (#2133) and a
-    /// tombstone revives whole: one written after the removal would come back
-    /// with the machine's next enrollment, and with it SYSTEM exec.
+    /// Through [`Self::live_row`] because a removal ends the anchor (#2133): one
+    /// written after the removal would sit on the removed device's record as a
+    /// live SYSTEM credential. (Before a revive started the row from a new
+    /// device's settings, it also came back with the machine's next
+    /// enrollment.)
     pub async fn set_exec_anchor(
         &self,
         tenant_id: ObjectId,
@@ -1198,16 +1291,16 @@ impl AgentDao {
     /// sweep's calls to the same answer.
     ///
     /// #2133: a removal also ENDS the device's FR-94 exec anchor, in the same
-    /// update. Enrolling the same machine again revives this row in place
-    /// ([`Self::rehydrate`]), and an anchor left here would revive with it.
-    /// The service credential still on the machine's disk would then be
-    /// accepted again, with no elevated step. Removing a device must do at
-    /// least what un-anchoring it does.
+    /// update. Removing a device must do at least what un-anchoring it does:
+    /// the service credential still on the machine's disk is refused from the
+    /// removal on. (Enrolling the same machine again brings this row back as a
+    /// new device, [`Self::revive`], which has no anchor either.)
     ///
     /// FR-103: the same update advances `token_gen`, so every agent token
     /// minted before the removal is refused from now on, including after a
-    /// revival: re-enrollment mints at the new generation. `rehydrate`
-    /// touches neither field, because re-enrolling a LIVE device keeps both.
+    /// revival: [`Self::revive`] keeps the generation and re-enrollment mints
+    /// at it. `rehydrate` touches neither field, because re-enrolling a LIVE
+    /// device keeps both.
     pub async fn soft_delete(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<bool> {
         self.base
             .update_one(

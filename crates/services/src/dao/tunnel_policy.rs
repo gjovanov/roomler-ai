@@ -192,4 +192,36 @@ impl TunnelPolicyDao {
             )
             .await
     }
+
+    /// Take one device out of every live policy of its org: the `agent_id`
+    /// entries naming it as a subject (what it may originate) and as a target
+    /// (who may tunnel through it). Called before a REMOVED device's row comes
+    /// back for a new enrollment of its machine id, which keeps the row's id: a
+    /// new device is named by no policy, so the revived one must not be either
+    /// (#3627). Answers how many policies changed.
+    ///
+    /// Every other subject and target stays. A policy that named only this
+    /// device is left with an empty list and grants nothing (`subject_matches`
+    /// and `target_matches` are `any` over the list); it stays in the admin's
+    /// list to edit or delete. Removed policies are history and are left as
+    /// they are.
+    pub async fn forget_agent(&self, tenant_id: ObjectId, agent_id: ObjectId) -> DaoResult<u64> {
+        // `{kind, id}` is the stored shape of both `PolicySubject::AgentId` and
+        // `PolicyTarget::AgentId`; `$elemMatch` and `$pull` match an element
+        // by these two fields, in either order.
+        let names_it = doc! { "kind": "agent_id", "id": agent_id };
+        self.base
+            .update_many(
+                doc! {
+                    "tenant_id": tenant_id,
+                    "deleted_at": null,
+                    "$or": [
+                        { "subjects": { "$elemMatch": names_it.clone() } },
+                        { "targets": { "$elemMatch": names_it.clone() } },
+                    ],
+                },
+                doc! { "$pull": { "subjects": names_it.clone(), "targets": names_it } },
+            )
+            .await
+    }
 }

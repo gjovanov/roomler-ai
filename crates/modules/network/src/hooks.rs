@@ -19,6 +19,9 @@ use roomler_core::hooks::{
 
 use crate::NetworkState;
 
+/// The reason a revive's release of a leftover lease is logged with.
+const REVIVE_RELEASE_REASON: &str = "agent_revived";
+
 /// The overlay lease + MagicDNS label holder, over the host's overlay code.
 pub struct NetworkHooks {
     pub state: NetworkState,
@@ -47,6 +50,66 @@ impl FleetLifecycle for NetworkHooks {
         Ok(released.map(|r| ReleasedLease {
             overlay_ip: r.overlay_ip,
         }))
+    }
+
+    /// A removed device's machine is enrolling again, and its row is about to
+    /// come back as a new device. Two things here name the removed device and
+    /// would apply to the revived one, and a new enrollment has neither:
+    ///
+    /// 1. An overlay lease its removal did not release. Normally there is none:
+    ///    the removal released it ([`Self::agent_removed`]). But that release
+    ///    reads the node with a lookup whose failure it logs and passes over,
+    ///    and the device's first join would then REHYDRATE the leftover node,
+    ///    approved routes and exit authority included. So a live node of this
+    ///    machine that belongs to this agent goes through the one release
+    ///    (tombstone, then the pool, then the peers' `removes`), and the
+    ///    device takes a fresh lease at its join, as any device does.
+    /// 2. Its id in the org's live tunnel policies, as a subject and as a
+    ///    target ([`TunnelPolicyDao::forget_agent`]).
+    ///
+    /// Fail closed: an error here stops the enrollment, so the row is never
+    /// revived beside either.
+    ///
+    /// [`TunnelPolicyDao::forget_agent`]: roomler_ai_services::dao::tunnel_policy::TunnelPolicyDao::forget_agent
+    async fn agent_revived(
+        &self,
+        tenant_id: ObjectId,
+        agent_id: ObjectId,
+        machine_id: &str,
+    ) -> anyhow::Result<()> {
+        let state = &self.state;
+        let mine = NodeRef::Agent { agent_id };
+        let leftover = state
+            .overlay_nodes
+            .find_live_by_tenant_and_machine(tenant_id, machine_id)
+            .await?
+            .filter(|n| n.node_ref == mine);
+        if let Some(node) = leftover {
+            tracing::warn!(
+                %tenant_id, %agent_id, overlay_ip = %node.overlay_ip,
+                "revive: the removed device still held an overlay lease; releasing it"
+            );
+            crate::overlay::release_overlay_node(state, &node, REVIVE_RELEASE_REASON).await;
+            if state
+                .overlay_nodes
+                .find_live_by_tenant_and_machine(tenant_id, machine_id)
+                .await?
+                .is_some_and(|n| n.node_ref == mine)
+            {
+                anyhow::bail!("the removed device's overlay lease could not be released");
+            }
+        }
+        let policies = state
+            .tunnel_policies
+            .forget_agent(tenant_id, agent_id)
+            .await?;
+        if policies > 0 {
+            tracing::info!(
+                %tenant_id, %agent_id, policies,
+                "revive: the removed device was taken out of the org's tunnel policies"
+            );
+        }
+        Ok(())
     }
 
     /// Best-effort propagation onto the live overlay node: peers see the new

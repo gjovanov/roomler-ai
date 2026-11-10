@@ -296,9 +296,12 @@ stateDiagram-v2
 | the same machine re-enrolls | **still refused** (401): the revived row has no anchor | the worker, until an administrator anchors it again |
 
 ⚠️ **Removing a device ends its anchor** (#2133). Re-enrolling the same machine
-(the same `machine_id`) revives the removed row in place (`AgentDao::rehydrate`),
-but not the anchor: `AgentDao::soft_delete` clears `exec_anchor` in the same
-update that tombstones the row. The anchor file still on the machine is then
+(the same `machine_id`) revives the removed row in place, as a new device
+(`AgentDao::revive`, #3627): no anchor, and no exec policy either, since every
+policy is back at its closed default
+([`device-credentials.md`](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)).
+`AgentDao::soft_delete` also clears `exec_anchor` in the same update that
+tombstones the row. The anchor file still on the machine is then
 useless, since its credential names an anchor the server no longer records. The
 device's commands go to the worker until an administrator runs
 `roomlerd anchor create` again. Re-enrolling a device that was **never

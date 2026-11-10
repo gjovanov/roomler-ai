@@ -86,8 +86,9 @@ mod agent_redial_tests;
 /// `rc:goodbye AgentDeleted`, instead of leaving it its socket.
 #[cfg(test)]
 mod agent_removal_tests;
-/// A removed device that enrolls again starts from a new device's settings:
-/// what the removed device was allowed does not come back with its machine id.
+/// #3627 — a removed device that enrolls again starts from a new device's
+/// settings: what the removed device was allowed does not come back with its
+/// machine id.
 #[cfg(test)]
 mod agent_revive_tests;
 /// FR-84 D5a — `/api/agent/self/{devices,mesh}`: a device's own view of its

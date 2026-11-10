@@ -850,7 +850,11 @@ Locked by lib tests, each shown red with a one-line negative control:
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
    as *subject* (user / tunnel client / agent) ×
    *target* (agent) × *destination* (`host:port`, protocol). Managed in the
-   admin UI; every decision lands in `tunnel_audit` (90 d).
+   admin UI; every decision lands in `tunnel_audit` (90 d). A device the org
+   removed is refused as a target while it is removed; if its machine enrolls
+   again, the device is taken out of every live policy's subjects and targets
+   before its row comes back, because it comes back as a new device (#3627). A
+   policy left naming nobody grants nothing and stays in the list to edit.
 2. **Agent-local `forward_acl`** (config.toml): the exit machine's own last word —
    it survives a compromised server. Empty-but-enabled means "trust the server".
 

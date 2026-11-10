@@ -59,7 +59,14 @@ sequenceDiagram
 ```
 
 `machine_id` is a stable hardware-derived hash, unique per `(tenant_id, machine_id)`
-— re-enrolling a known machine reuses its row. The tunnel-client flow is identical
+— re-enrolling a known machine reuses its row. A live row keeps everything it was
+allowed; a **removed** one comes back as a new device, with only its identity, history
+and token generation kept (#3627,
+[device-credentials.md](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)).
+Two answers belong to that path: **503** when the removed device's grants could not be
+dropped (nothing is revived; the token is spent, so enroll again with a new one), and
+**409** when the row kept changing under the enrollment (removed or enrolled again at
+the same moment). The tunnel-client flow is identical
 in shape (`…/tunnel-client/enroll-token` → `POST /api/tunnel-client/enroll` →
 `{tunnel_client_token}`), with a distinct audience so a leaked agent token can't
 impersonate a client or vice-versa.

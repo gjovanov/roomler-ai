@@ -119,6 +119,10 @@ brand-new row). Both `MANAGE_AGENTS`. What happens:
    re-enroll refreshes os/version but **no longer overwrites the name** with
    the machine-reported one (it used to, silently reverting every rename).
    A never-renamed device keeps following its machine-reported hostname.
+   This is a re-enroll of a device nobody removed: a **removed** device whose
+   machine enrolls again starts from a new device's settings, so its name is
+   the machine's again and its display name and tags are gone (#3627,
+   [`device-credentials.md`](device-credentials.md#a-revived-device-starts-from-a-new-devices-settings-3627)).
 2. If the device has a **live overlay node**, the new MagicDNS label is derived
    (`dns_label`, de-duped within the network excluding the node itself, so a
    no-op rename keeps its label) and written; the unique
