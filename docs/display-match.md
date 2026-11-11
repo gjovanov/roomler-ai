@@ -292,7 +292,7 @@ sequenceDiagram
   ([`scrap_backend.rs:269`](../agents/roomlerd/src/capture/scrap_backend.rs#L269)). The encoder already
   rebuilds when the frame size changes.
 - **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
-  the same display ([`virtual_desktop.rs:1094`](../agents/roomlerd/src/virtual_desktop.rs#L1094) `start_server`). An
+  the same display ([`virtual_desktop.rs:1113`](../agents/roomlerd/src/virtual_desktop.rs#L1113) `start_server`). An
   Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
   start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`

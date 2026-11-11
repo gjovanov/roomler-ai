@@ -614,8 +614,8 @@ impl Procs for RealProcs {
 /// The teardown itself, separated from the global so a test can drive it
 /// against a tree it built. Linux-only.
 #[cfg(target_os = "linux")]
-fn kill_tree(roots: &[i32], pgid: Option<i32>, grace: Duration) {
-    kill_tree_with(&mut RealProcs, roots, pgid, grace);
+fn kill_tree(roots: &[i32], pgid: Option<i32>, grace: Duration) -> bool {
+    kill_tree_with(&mut RealProcs, roots, pgid, grace)
 }
 
 /// SIGTERM the tree, wait `grace`, SIGKILL what is left, wait for the kills to
@@ -636,7 +636,7 @@ fn kill_tree(roots: &[i32], pgid: Option<i32>, grace: Duration) {
 ///    cannot. Each pass checks against its own snapshot — never a fresher one,
 ///    which might already describe the recycled process.
 #[cfg(target_os = "linux")]
-fn kill_tree_with(p: &mut dyn Procs, roots: &[i32], pgid: Option<i32>, grace: Duration) {
+fn kill_tree_with(p: &mut dyn Procs, roots: &[i32], pgid: Option<i32>, grace: Duration) -> bool {
     use std::collections::{BTreeSet, HashMap};
     let self_pid = std::process::id() as i32;
     let is_root = |pid: i32| roots.contains(&pid);
@@ -647,7 +647,7 @@ fn kill_tree_with(p: &mut dyn Procs, roots: &[i32], pgid: Option<i32>, grace: Du
     let snap = p.snapshot();
     let targets = select_targets(&snap, roots, pgid, self_pid);
     if targets.is_empty() {
-        return;
+        return true;
     }
     let ident: HashMap<i32, ProcInfo> = snap.iter().map(|i| (i.pid, *i)).collect();
     info!(
@@ -732,9 +732,12 @@ fn kill_tree_with(p: &mut dyn Procs, roots: &[i32], pgid: Option<i32>, grace: Du
     // Reap LAST — and only now (rule 1). Bounded, so the unit's cgroup does not
     // keep our zombies: they were SIGKILLed above and exit within milliseconds.
     let reap_by = Instant::now() + Duration::from_secs(1);
-    while !p.reap(roots) && Instant::now() < reap_by {
+    let mut collected = p.reap(roots);
+    while !collected && Instant::now() < reap_by {
         p.sleep(Duration::from_millis(20));
+        collected = p.reap(roots);
     }
+    collected
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,16 +1010,32 @@ impl Desktop {
             let mut st = self.state();
             (st.tree.take(), std::mem::take(&mut st.unreaped))
         };
-        if let Some(handle) = handle {
-            kill_tree(&handle.roots, handle.pgid, TEARDOWN_GRACE);
-            waiting.extend(handle.roots);
-        }
-        // `kill_tree` reaps within a bound. A child it could not collect in
-        // time would stay a zombie for the daemon's life, now that the daemon
-        // lives on after a kill: nothing else ever waits for it. Keep it, and
-        // ask again at the next kill.
+        // Children an earlier kill could not collect in its bound: ask again.
         waiting.retain(|pid| !RealProcs.reap(&[*pid]));
+        if let Some(handle) = handle
+            && !kill_tree(&handle.roots, handle.pgid, TEARDOWN_GRACE)
+        {
+            // `kill_tree` reaps within a bound, and this time the bound
+            // passed. A child it left would stay a zombie for the daemon's
+            // life, now that the daemon lives on after a kill: nothing else
+            // ever waits for it. Keep the ones still there, for the next kill.
+            waiting.extend(
+                handle
+                    .roots
+                    .into_iter()
+                    .filter(|pid| !RealProcs.reap(&[*pid])),
+            );
+        }
         self.state().unreaped = waiting;
+    }
+
+    /// Clear the lock a server of ours left on the display, once that server
+    /// has been collected. One the kill could not collect is still dying, and
+    /// its lock is still its own.
+    fn clear_lock_of(&self, pid: i32) {
+        if !self.state().unreaped.contains(&pid) {
+            remove_stale_lock(&x_files(&self.display).1, pid);
+        }
     }
 
     /// The graceful stop: nothing is started from here on, the supervisor is
@@ -1161,7 +1180,7 @@ impl Desktop {
             }),
             Err(not_ready) => {
                 self.kill_recorded_tree();
-                remove_stale_lock(&lock, pid);
+                self.clear_lock_of(pid);
                 let why = match not_ready {
                     NotReady::Exited => format!(
                         "{} exited while it was starting on display {}",
@@ -1280,7 +1299,7 @@ fn supervise(desk: &Desktop, first: Option<XServer>) {
             // down so the next start is clean and none of them stays a zombie;
             // this is also what reaps the server.
             desk.kill_recorded_tree();
-            remove_stale_lock(&x_files(&desk.display).1, x.pid);
+            desk.clear_lock_of(x.pid);
             warn!(
                 display = desk.display.as_str(),
                 server = x.kind.name(),
@@ -1462,16 +1481,17 @@ fn lock_is(lock: &Path, pid: i32) -> bool {
 /// on a display nobody serves). We know better: `dead_pid` was our child. The
 /// socket is left where it is: the next server unlinks it before it binds.
 ///
-/// ⚠️ Three guards, since the display's names are shared with every X server
-/// on the host. It waits until the child is COLLECTED: one that is still
-/// dying keeps its lock. A lock that names any other pid is not touched. And
-/// it is moved aside in one step and read again before it is deleted: between
-/// the first read and an unlink, another server could have cleared the stale
-/// lock itself and put its own there, and the unlink would have taken that
-/// one. What the rename took, if it is not ours after all, is put back.
+/// ⚠️ Call it only for a child that has been COLLECTED
+/// ([`Desktop::clear_lock_of`]): one that is still dying keeps its lock. And
+/// two guards here, since the display's names are shared with every X server
+/// on the host. A lock that names any other pid is not touched. And it is
+/// moved aside in one step and read again before it is deleted: between the
+/// first read and an unlink, another server could have cleared the stale lock
+/// itself and put its own there, and the unlink would have taken that one.
+/// What the rename took, if it is not ours after all, is put back.
 #[cfg(target_os = "linux")]
 fn remove_stale_lock(lock: &Path, dead_pid: i32) {
-    if Path::new(&format!("/proc/{dead_pid}")).exists() || !lock_is(lock, dead_pid) {
+    if !lock_is(lock, dead_pid) {
         return;
     }
     let aside =
@@ -1626,10 +1646,14 @@ impl Tail {
 /// client changes it, and `xkbcomp` reports on the server's stderr each keysym
 /// it does not know: dozens of `> Warning:` lines a time, none of them an
 /// error. Kept, they would be the whole tail of a server that was killed, and
-/// could push a real last word out of it.
+/// could push a real last word out of it. Only the report's own three shapes
+/// are dropped: a line that names `xkbcomp` beside an error is the server's.
 fn keymap_chatter(line: &[u8]) -> bool {
     let text = String::from_utf8_lossy(line);
-    text.trim_start().starts_with('>') || text.contains("xkbcomp")
+    let text = text.trim_start();
+    text.starts_with('>')
+        || text.starts_with("The XKEYBOARD keymap compiler (xkbcomp) reports:")
+        || text.starts_with("Errors from xkbcomp are not fatal to the X server")
 }
 
 impl StderrTail {
@@ -2443,6 +2467,16 @@ mod tests {
         abrupt.push(b" found");
         abrupt.close();
         assert_eq!(abrupt.last_lines(Duration::ZERO), "(EE) no screens found");
+        // A real error that names the compiler is the server's, and is kept.
+        let broken = StderrTail::default();
+        broken.push(b"(EE) Error compiling keymap (server-99) executing '\"/usr/bin/xkbcomp\"'\n");
+        broken.close();
+        assert!(
+            broken
+                .last_lines(Duration::ZERO)
+                .contains("Error compiling keymap"),
+            "an error line was dropped as chatter"
+        );
 
         // More than the cap: the front goes, and the fragment it leaves.
         let long = StderrTail::default();
@@ -3185,8 +3219,9 @@ mod supervise_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stale lock is removed only when it is OURS and its server is gone:
-    /// never a live server's, and never one that names another pid.
+    /// A stale lock is removed only when it is OURS, never one that names
+    /// another pid. (That its server has been collected is the caller's to
+    /// know: `Desktop::clear_lock_of`.)
     #[test]
     fn a_stale_lock_is_removed_only_when_it_is_ours() {
         let dir = scratch("lock");
@@ -3200,12 +3235,6 @@ mod supervise_tests {
         std::fs::write(&lock, format!("{:>10}\n", gone + 1)).unwrap();
         remove_stale_lock(&lock, gone);
         assert!(lock.exists(), "another server's lock was removed");
-
-        // This test's own pid is alive, so its "server" is not gone yet.
-        let alive = std::process::id() as i32;
-        std::fs::write(&lock, format!("{alive:>10}\n")).unwrap();
-        remove_stale_lock(&lock, alive);
-        assert!(lock.exists(), "a live server's lock was removed");
 
         std::fs::write(&lock, format!("{gone:>10}\n")).unwrap();
         remove_stale_lock(&lock, gone);
