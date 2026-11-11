@@ -788,7 +788,10 @@ The same run found what the supervisor does not reach, the open session of
 them with NVIDIA's EGL. Each Xvfb came back on the display it had before, now
 with `-noreset`, and was the same server five minutes later, with no zombie.
 On the one server that has Mesa's vendor file the X server names it; on the two
-that have no vendor file its environment is as it was.
+that have no vendor file its environment is as it was. The WSL2 dev host, the
+one fleet host on Xorg with the dummy driver, updated itself the same day: Xorg
+came back on the display it had before, names Mesa's vendor file, and was the
+same server seven minutes after its start, with no zombie.
 
 ## 3. The DRM arm (FR-36)
 
