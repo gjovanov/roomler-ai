@@ -372,10 +372,8 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
     //    as `plan_per_user_removal` decides (#3702).
     #[cfg(feature = "system-context")]
     {
-        let service_account =
-            crate::appdirs::is_service_account(crate::win_token::own_user_sid().as_deref());
         let plan = plan_per_user_removal(
-            service_account,
+            crate::win_token::own_user_sid().as_deref(),
             crate::system_context::user_profile::active_user_profile_root,
         );
         remove_per_user_trees(plan, report, dry_run);
@@ -426,18 +424,28 @@ fn per_user_trees(profile_root: &Path) -> [std::path::PathBuf; 4] {
 }
 
 /// #3702 — the plan for a person's data trees ([`per_user_trees`]) below the
-/// profile `profile_root` names. On the service account (`service_account`)
-/// it removes none and asks `profile_root` nothing: the only profile that
-/// account names is its own. A tree that is a link, holds one, or is reached
+/// profile `profile_root` names, for a step running as the account whose SID
+/// is `own_sid`. When the step cannot tell which account that is (`None`), or
+/// it is the service account (the only profile that account names is its
+/// own), it removes none and asks `profile_root` nothing. A tree that is a link, holds one, or is reached
 /// through one below the profile (`appdirs::link_below`, [`link_inside`]) is
 /// left in place with a line that names it; the others are still planned.
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 fn plan_per_user_removal(
-    service_account: bool,
+    own_sid: Option<&str>,
     profile_root: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> PerUserPlan {
     let mut plan = PerUserPlan::default();
-    if service_account {
+    let Some(own_sid) = own_sid else {
+        plan.left.push(
+            "user data dirs left in place: this step cannot tell which account it runs as, so \
+             it looks up no profile and removes no user data dir; the Scheduled Task clean-up \
+             still runs"
+                .to_string(),
+        );
+        return plan;
+    };
+    if crate::appdirs::is_service_account(Some(own_sid)) {
         plan.left.push(
             "user data dirs left in place: on the service account this step looks up no \
              profile and removes no user data dir; the Scheduled Task clean-up still runs"
@@ -826,7 +834,7 @@ mod tests {
         std::fs::create_dir_all(&roaming).unwrap();
         junction(&roaming.join("roomler"), &elsewhere);
 
-        let plan = plan_per_user_removal(false, || Some(profile.clone()));
+        let plan = plan_per_user_removal(Some(A_PERSON), || Some(profile.clone()));
         assert_eq!(plan.remove, vec![local.join("roomler")], "{plan:?}");
         for tree in [
             local.join("roomler-agent"),
@@ -856,7 +864,7 @@ mod tests {
         // present, and nothing is removed.
         let empty = root.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        let plan = plan_per_user_removal(false, || Some(empty.clone()));
+        let plan = plan_per_user_removal(Some(A_PERSON), || Some(empty.clone()));
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(
             plan.left
@@ -874,13 +882,39 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "system-context"))]
     #[test]
     fn on_the_service_account_the_per_user_clean_up_names_no_profile_and_removes_nothing() {
-        let plan = plan_per_user_removal(true, || {
+        let plan = plan_per_user_removal(Some(roomler_node_core::machine_tree::SYSTEM), || {
             panic!("a profile was looked up on the service account")
         });
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(plan.left.len(), 1, "{plan:?}");
         for words in [
             "service account",
+            "no profile",
+            "no user data dir",
+            "Scheduled Task",
+        ] {
+            assert!(plan.left[0].contains(words), "{words}: {plan:?}");
+        }
+    }
+
+    /// A person's SID, as `win_token::own_user_sid` writes one.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    const A_PERSON: &str = "S-1-5-21-1-2-3-1001";
+
+    /// #3702 — when the step cannot tell which account it runs as, the
+    /// per-user clean-up looks up no profile and removes no data tree, and
+    /// its one line says why, together with the Scheduled Task clean-up that
+    /// still runs.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    #[test]
+    fn with_no_account_named_the_per_user_clean_up_names_no_profile_and_removes_nothing() {
+        let plan = plan_per_user_removal(None, || {
+            panic!("a profile was looked up for an account the step cannot name")
+        });
+        assert!(plan.remove.is_empty(), "{plan:?}");
+        assert_eq!(plan.left.len(), 1, "{plan:?}");
+        for words in [
+            "cannot tell which account",
             "no profile",
             "no user data dir",
             "Scheduled Task",
