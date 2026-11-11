@@ -266,15 +266,15 @@ sequenceDiagram
 ```
 
 - **The server is Xorg with the dummy driver** wherever `xserver-xorg-video-dummy` and `xrandr` are installed
-  ([`virtual_desktop.rs:110`](../agents/roomlerd/src/virtual_desktop.rs#L110) `xorg_dummy`). Xvfb has one
+  ([`virtual_desktop.rs:117`](../agents/roomlerd/src/virtual_desktop.rs#L117) `xorg_dummy`). Xvfb has one
   mode, its start size, and cannot switch at all (the spec's §8 row 5), so a desktop on Xvfb still answers
   `unsupported`.
 - The real Xorg binary runs **unprivileged**, never the console-only wrapper. It gets a config of its own
   and an **empty** config directory, so no `xorg.conf.d` snippet of the host's (a GPU's, an input device's)
   leaks in, and no input device at all: input arrives through XTest, as on Xvfb
-  ([`virtual_desktop.rs:182`](../agents/roomlerd/src/virtual_desktop.rs#L182) `xorg_args`). It starts at the
+  ([`virtual_desktop.rs:189`](../agents/roomlerd/src/virtual_desktop.rs#L189) `xorg_args`). It starts at the
   configured size exactly, as a `roomler-WxH` modeline
-  ([`virtual_desktop.rs:138`](../agents/roomlerd/src/virtual_desktop.rs#L138) `xorg_conf`).
+  ([`virtual_desktop.rs:145`](../agents/roomlerd/src/virtual_desktop.rs#L145) `xorg_conf`).
 - ⚠️ **The config declares `ReducedBlanking`.** The modelines carry reduced blanking, and without the option
   Xorg drops the start mode ("monitor doesn't support reduced blanking") and starts at the dummy driver's
   2048×1536, leaving no named mode to restore to. Found in the build's own probe.
@@ -291,8 +291,10 @@ sequenceDiagram
   and restore bumps a counter the capture worker watches
   ([`scrap_backend.rs:269`](../agents/roomlerd/src/capture/scrap_backend.rs#L269)). The encoder already
   rebuilds when the frame size changes.
-- **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb
-  ([`virtual_desktop.rs:752`](../agents/roomlerd/src/virtual_desktop.rs#L752) `spawn_x_server`).
+- **A failing Xorg costs the switch, never the desktop:** if it does not come up, the desktop runs on Xvfb, on
+  the same display ([`virtual_desktop.rs:1094`](../agents/roomlerd/src/virtual_desktop.rs#L1094) `start_server`). An
+  Xorg that hung is not tried again while the daemon runs; one that exited is tried again at the next
+  start of the desktop.
 - Kill switches: `ROOMLERD_VIRTUAL_DESKTOP_SERVER=xvfb` keeps the desktop on Xvfb; `display_match = never`
   stops the switching.
 

@@ -22,9 +22,44 @@ const REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
 static LATEST: Mutex<Option<DesktopBrief>> = Mutex::new(None);
 
+/// Set by [`refresh_soon`]; the refresher waits on it between two reads.
+#[cfg(target_os = "linux")]
+static SOON: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
 /// The latest brief. Never blocks on logind.
 pub fn current() -> Option<DesktopBrief> {
     LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// #3643 — read the brief again now, not at the next [`REFRESH`]: the daemon's
+/// own virtual desktop went down or came back, and the device should stop or
+/// start offering its X11 arm within a heartbeat, not within a minute. Never
+/// blocks, and a call made while a read is running is not lost: the refresher
+/// reads once more as soon as that one ends.
+#[cfg(target_os = "linux")]
+pub fn refresh_soon() {
+    *SOON.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    SOON.1.notify_all();
+}
+
+/// Sleep until the next refresh is due: [`REFRESH`] from now, or at once when
+/// [`refresh_soon`] has asked.
+#[cfg(target_os = "linux")]
+fn wait_for_the_next_refresh(every: std::time::Duration) {
+    let due = std::time::Instant::now() + every;
+    let mut soon = SOON.0.lock().unwrap_or_else(|e| e.into_inner());
+    while !*soon {
+        let left = due.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        soon = SOON
+            .1
+            .wait_timeout(soon, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    *soon = false;
 }
 
 /// FR-93 P3d — whether the desktop a controller would see is a Wayland one:
@@ -86,7 +121,7 @@ pub fn start() {
                         }
                         *latest = Some(brief);
                         drop(latest);
-                        std::thread::sleep(REFRESH);
+                        wait_for_the_next_refresh(REFRESH);
                     }
                 });
             if let Err(e) = spawned {
