@@ -1266,12 +1266,10 @@ pub(crate) fn staging_root_windows() -> PathBuf {
 }
 
 /// #3688 — the most bytes an upload's id may have ([`transfer_id`]).
-#[allow(dead_code)] // RED
 pub(crate) const TRANSFER_ID_MAX_BYTES: usize = 128;
 
 /// #3688 — what an id that is not one plain name is told ([`transfer_id`]).
 /// The viewer shows it in its `files:error`.
-#[allow(dead_code)] // RED
 pub(crate) const NOT_A_TRANSFER_ID: &str = "the transfer id is not valid";
 
 /// #3688 — an upload's id names its staging folder, so it is one plain name:
@@ -1280,9 +1278,18 @@ pub(crate) const NOT_A_TRANSFER_ID: &str = "the transfer id is not valid";
 /// such names. Every entry that takes an id from the viewer checks it first
 /// (`begin_as`, `resume_incoming_as`, `cancel_incoming`, `end`), and
 /// [`partial_dir_for`] builds a path from no other id.
-#[allow(dead_code)] // RED
 pub(crate) fn transfer_id(id: &str) -> Result<&str> {
-    Ok(id) // RED: every id is taken, as before
+    let plain = !id.is_empty()
+        && id.len() <= TRANSFER_ID_MAX_BYTES
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if plain {
+        Ok(id)
+    } else {
+        Err(anyhow!(NOT_A_TRANSFER_ID))
+    }
 }
 
 /// Compute the canonical staging dir path for an upload `id`. On
@@ -1292,6 +1299,7 @@ pub(crate) fn transfer_id(id: &str) -> Result<&str> {
 /// at `<dest_dir>/.roomler-partial/<id>`. #3688 — an id that is not one plain
 /// name ([`transfer_id`]) is refused here too.
 pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> Result<PathBuf> {
+    let id = transfer_id(id)?;
     #[cfg(target_os = "windows")]
     {
         if stage_in_programdata() {
@@ -1870,7 +1878,7 @@ impl FilesHandler {
     fn partial_dir(&self, dest_dir: &std::path::Path, id: &str) -> Result<PathBuf> {
         #[cfg(test)]
         if let Some(root) = &self.staging_root {
-            return Ok(root.join(id));
+            return Ok(root.join(transfer_id(id)?));
         }
         partial_dir_for(dest_dir, id)
     }
@@ -1943,6 +1951,9 @@ impl FilesHandler {
         rel_path: Option<&str>,
         dest_path: Option<&str>,
     ) -> Result<PathBuf> {
+        // #3688 — the id names this upload's staging folder: one plain name,
+        // checked before anything else.
+        transfer_id(&id)?;
         // Before anything lands on disk (a message straddling the session's
         // end); an upload that got past this is dropped by `end_session`.
         self.refuse_if_ended()?;
@@ -2190,6 +2201,9 @@ impl FilesHandler {
     /// <id>/` dir + registry entry. Returns the *actual* final path
     /// (may differ from the begin-time reservation per M4 fix).
     pub async fn end(&self, id: &str) -> Result<(PathBuf, u64)> {
+        // #3688 — one plain name, as every entry checks first; the upload in
+        // flight is not touched.
+        transfer_id(id)?;
         let mut guard = self.incoming.lock().await;
         let Some(mut state) = guard.take() else {
             return Err(anyhow!("no active transfer to end"));
@@ -2444,6 +2458,9 @@ impl FilesHandler {
     /// upload matched the id (caller logs this for audit clarity), and an
     /// error the viewer is sent for an id that is not one plain name (#3688).
     pub async fn cancel_incoming(&self, id: &str) -> Result<bool> {
+        // #3688 — one plain name, checked before anything is cleared or
+        // removed.
+        transfer_id(id)?;
         // First clear in-flight state if it matches.
         let mut cleared_state = false;
         {
@@ -2525,6 +2542,8 @@ impl FilesHandler {
         id: &str,
         requested_offset: u64,
     ) -> Result<u64> {
+        // #3688 — one plain name, checked before any partial is looked for.
+        transfer_id(id)?;
         // Locate meta_path: registry first, then on-demand probe at
         // the canonical Downloads-rooted location for cross-restart
         // discovery survivors. Poison-tolerant — the HashMap has no
