@@ -892,6 +892,7 @@ mod tests {
         const ROOT: &str = "ROOMLER_TEST_MACHINE_WRITE_ROOT";
         const THIS_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setups_machine_enrollment_is_owned_by_administrators_and_sealed";
         const PERSON_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setup_on_a_tree_a_person_made_comes_out_the_same";
+        const PLANTED_TEST: &str = "machine_write::tests::on_ntfs::a_limited_setup_never_folds_into_a_folder_moved_into_a_parent_a_person_made";
         const CHECKED: &str = "MACHINE WRITE CHECKED";
 
         /// `%ProgramData%`'s own DACL: SYSTEM and Administrators full control,
@@ -973,6 +974,43 @@ mod tests {
                 staging_owner,
                 "the person's own folder"
             );
+        }
+
+        /// #3666 — the same install where a sealed machine folder holding an
+        /// administrator's config and `.prev` was moved into a parent a person
+        /// made. Setup reads the config as found, before the step takes the
+        /// parent: nothing is folded (the child sees no config to keep), the
+        /// config is written fresh, and no `.prev` is kept.
+        #[test]
+        fn a_limited_setup_never_folds_into_a_folder_moved_into_a_parent_a_person_made() {
+            if let Some(root) = std::env::var_os(ROOT) {
+                return the_wizard_and_its_step(Path::new(&root));
+            }
+            if !elevated_or_skip("Setup's machine write over a folder moved in") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let program_data = stand_in(root.path());
+            let person = local_guest().unwrap_or_else(|| USERS.to_string());
+            let parent = program_data.join("roomler");
+            let folder = parent.join("roomler");
+            assert!(icacls(&parent, &["/setowner", &format!("*{person}")]));
+            set_dacl(&folder, "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+            let planted = "server_url = \"https://roomler.ai\"\nagent_token = \"tok\"\n\
+                           agent_id = \"aid\"\ntenant_id = \"tid\"\nmachine_id = \"mid\"\n\
+                           machine_name = \"planted\"\nplanted_marker = \"planted\"\n";
+            for name in ["config.toml", "config.toml.prev"] {
+                let file = folder.join(name);
+                std::fs::write(&file, planted).unwrap();
+                set_dacl(&file, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+            }
+            run_the_child(PLANTED_TEST, root.path(), &program_data);
+            assert!(
+                !folder.join("config.toml.prev").exists(),
+                "no .prev is kept"
+            );
+            let written = std::fs::read_to_string(folder.join("config.toml")).unwrap();
+            assert!(!written.contains("planted"), "{written}");
         }
 
         /// `%ProgramData%`'s stand-in under `root`, with the parent and the

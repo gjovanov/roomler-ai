@@ -4258,6 +4258,11 @@ pub fn save(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
     save_with_base(path, path, cfg)
 }
 
+/// #3666 — RED seam: master keeps what the folder held.
+pub fn save_fresh(path: &PathBuf, cfg: &AgentConfig) -> Result<()> {
+    save(path, cfg)
+}
+
 /// #3116 — the saves a daemon makes while it starts. They write the copy it
 /// LOADED (a migration stamp, a minted WireGuard or SSH key, the crash
 /// bookkeeping), where every later writer reloads the file under the
@@ -4467,8 +4472,26 @@ fn save_with_base(path: &PathBuf, base: &std::path::Path, cfg: &AgentConfig) -> 
 /// machine-global one: what [`save_with_base`] repairs before it writes.
 #[cfg(windows)]
 fn machine_tree_of(path: &std::path::Path) -> Option<crate::machine_tree::MachineTree> {
+    #[cfg(test)]
+    if let Some(tree) = STAND_IN.with(|tree| tree.borrow().clone()) {
+        return path.starts_with(tree.folder()).then_some(tree);
+    }
     let tree = crate::machine_tree::MachineTree::here();
     path.starts_with(tree.folder()).then_some(tree)
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Tests only: the tree this thread's test stands in for the computer's
+    /// own machine tree, which [`machine_tree_of`] then never answers.
+    static STAND_IN: std::cell::RefCell<Option<crate::machine_tree::MachineTree>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #3666 — RED seam: master loads without asking.
+pub fn machine_config_as_found(path: &std::path::Path) -> Result<()> {
+    let _ = path;
+    Ok(())
 }
 
 /// #3609 — what an elevated save of the machine config (Setup's machine write,
@@ -6916,6 +6939,79 @@ tenant_id = "tid2"
 
         fn base(tree: &MachineTree) -> MergeBase {
             machine_merge_base(&tree.config(), tree, Switches::ON)
+        }
+
+        /// #3666 — `tree` stands in for the computer's own machine tree on
+        /// this test's thread: a save or a check at its config takes the
+        /// machine path.
+        fn stand_in(tree: &MachineTree) {
+            super::super::STAND_IN.with(|it| *it.borrow_mut() = Some(tree.clone()));
+        }
+
+        /// #3666 — a config with a key this build does not know, which a save
+        /// that keeps the outgoing file's keys would carry over.
+        fn planted() -> String {
+            format!("{}planted_marker = \"planted\"\n", minimal_toml())
+        }
+
+        /// #3666 — a config an administrator wrote into a machine folder that
+        /// `%ProgramData%` still lets Users add to is never folded into: as
+        /// found, before any repair, any account could have put it there.
+        #[test]
+        fn a_config_in_an_open_machine_folder_is_never_folded() {
+            if !elevated_or_skip("a config in an open machine folder, folded") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            match base(&tree) {
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&tree.folder().display().to_string()),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
+            }
+        }
+
+        /// #3666 — a writer that folds nothing keeps nothing the folder held:
+        /// not the outgoing config as `.prev`, not an old `.prev`, not the
+        /// keys this build does not know.
+        #[test]
+        fn a_fresh_machine_save_keeps_nothing_the_folder_held() {
+            if !elevated_or_skip("a fresh machine save") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            std::fs::write(tree.config(), planted()).unwrap();
+            std::fs::write(tree.prev(), planted()).unwrap();
+            stand_in(&tree);
+            let cfg = try_load(&tree.config()).unwrap();
+            save_fresh(&tree.config(), &cfg).unwrap();
+            assert!(!tree.prev().exists(), "no .prev is kept");
+            let written = std::fs::read_to_string(tree.config()).unwrap();
+            assert!(!written.contains("planted"), "{written}");
+            assert_eq!(crate::machine_tree::check(&tree), Ok(()));
+        }
+
+        /// #3666 — `roomlerd re-enroll` and `roomlerd org` ask before they
+        /// load: a config that was not the machine's as found is refused with
+        /// nothing read from it; once an elevated save has sealed the tree,
+        /// it is the machine's.
+        #[test]
+        fn re_enroll_and_org_refuse_a_config_that_was_not_the_machines() {
+            if !elevated_or_skip("re-enroll's check") {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let tree = waiting_tree(root.path());
+            std::fs::write(tree.config(), minimal_toml()).unwrap();
+            stand_in(&tree);
+            let why = machine_config_as_found(&tree.config()).expect_err("an open folder");
+            assert!(format!("{why:#}").contains("nothing was sent"), "{why:#}");
+            crate::machine_tree::repair(&tree, true);
+            machine_config_as_found(&tree.config()).expect("the machine's");
         }
 
         fn other_account() -> String {
