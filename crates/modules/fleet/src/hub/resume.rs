@@ -776,9 +776,12 @@ impl Hub {
     /// through the audit sink like every end, so the projection applies the
     /// fencing (`end`). The claim's refusals and the registration read use
     /// it. P1b-2's ends for a session no hub holds (an admin's, the
-    /// controller's own, a redial's `replaces`, the device's own after its
-    /// hello) write the row themselves and record it here as
-    /// [`RowEnd::written`]: the audit's trail, with no projection.
+    /// controller's own, a redial's `replaces` of a session not detached, the
+    /// device's own after its hello) write the row themselves and record it
+    /// here as [`RowEnd::written`]: the audit's trail, with no projection. So
+    /// do the inferred ends that write their row as read (the sweep's, the
+    /// dead-row close's and, D5 = A, a redial's `replaces` of a detached
+    /// session), as [`RowEnd::already_written`].
     pub fn record_end(
         &self,
         session_id: ObjectId,

@@ -23,12 +23,22 @@
 //! 4. ends the session on this pod too, when a claim rebuilt it here
 //!    meanwhile: a pod never receives its own control events.
 //!
+//! D5 = A (the operator, 2026-11-11) — one `replaces` is no end someone asked
+//! for: a redial's of a session whose DEVICE's socket went (its row
+//! detached). A page the server told so sends no hangup first, and gives the
+//! session up only once its peer went or its own deadline passed, so the
+//! session ended on the device's side, and nobody saw it. Its row ends
+//! `agent_disconnect`, dated by the row's own last clock and marked
+//! `end_source: redial`, fenced at the row as read, as the sweep ends one
+//! (`replaced_detached`). A `replaces` of an attached row is still the
+//! person's `controller_hangup`.
+//!
 //! With the window at 0 none of this runs, and an end of a session this pod
 //! does not hold writes nothing, as before FR-138.
 
 use bson::{DateTime, oid::ObjectId};
 use roomler_ai_mod_fleet::hub::RowEnd;
-use roomler_ai_remote_control::models::{EndReason, RemoteSession, SessionPhase};
+use roomler_ai_remote_control::models::{EndReason, EndSource, RemoteSession, SessionPhase};
 use roomler_ai_services::dao::remote_session::EndScope;
 use roomler_core::cluster::session_slots::SlotScope;
 use tracing::{info, warn};
@@ -180,9 +190,10 @@ pub async fn controller_end(
 ///
 /// * `replaces` names the held session the redial gives up. This pod's hub
 ///   ends it when it holds it for this person and this device
-///   (`Hub::end_replaced`); otherwise its row is written as
-///   `controller_hangup`, when the row names this person and this device,
-///   and the pod that holds it is told.
+///   (`Hub::end_replaced`). Otherwise, when the row names this person and
+///   this device: a row its device's socket left detached ends
+///   `agent_disconnect`, inferred (D5 = A, `replaced_detached`); any other
+///   is written as `controller_hangup`, and the pod that holds it is told.
 /// * Every session held for this person on this device here ends too, as
 ///   the orphan reap ends one for its own person (`Hub::reap_held_for`): a
 ///   page too old to send `replaces`, or the person's other tab.
@@ -206,12 +217,14 @@ pub async fn before_request(
             // Held here, but not this person's on this device: left alone.
             None if hub.session_snapshot(old).is_some() => {}
             None => {
-                let scope = EndScope {
-                    controller_user_id: Some(user_id),
-                    agent_id: Some(agent_id),
-                    ..EndScope::default()
-                };
-                end_and_publish(state, old, user_id, &scope, EndReason::ControllerHangup).await;
+                if !replaced_detached(state, old, user_id, agent_id).await {
+                    let scope = EndScope {
+                        controller_user_id: Some(user_id),
+                        agent_id: Some(agent_id),
+                        ..EndScope::default()
+                    };
+                    end_and_publish(state, old, user_id, &scope, EndReason::ControllerHangup).await;
+                }
             }
         }
     }
@@ -223,6 +236,98 @@ pub async fn before_request(
             }
         }
     }
+}
+
+/// D5 = A (the operator, 2026-11-11) — a redial's `replaces` of a session no
+/// pod holds because its DEVICE's socket went: its row is live, detached, and
+/// names this person and this device. The page knew it was detached, sent no
+/// hangup, and redialed only once its peer went or its own deadline passed,
+/// so the session ended on the device's side and nobody saw it. The row ends
+/// `agent_disconnect` at its own last clock ([`crate::resume::inferred_end`]:
+/// the detach), marked `end_source: redial` and fenced at the row as read
+/// (`RemoteSessionDao::end_replaced_detached`). Its trail goes in the audit,
+/// and its FR-115 slot (kept through the window, renewed by nobody) is given
+/// back before the request claims one. A device that ended the session
+/// itself during the gap says so after its hello, and its reason replaces
+/// this one (`resume::device_end`).
+///
+/// `false` = not such a row, or the fenced write matched nothing (a claim
+/// resumed it meanwhile, the sweep ended it) or failed: the caller takes the
+/// path every other `replaces` takes, which writes only a row still live.
+async fn replaced_detached(
+    state: &RemoteState,
+    session_id: ObjectId,
+    user_id: ObjectId,
+    agent_id: ObjectId,
+) -> bool {
+    let row = match state
+        .remote_sessions
+        .find_for_controller(session_id, user_id)
+        .await
+    {
+        Ok(row)
+            if row.agent_id == agent_id
+                && row.phase == SessionPhase::Active
+                && row.ended_at.is_none()
+                && row.detached_at.is_some() =>
+        {
+            row
+        }
+        _ => return false,
+    };
+    let at = crate::resume::inferred_end(&row);
+    match state.remote_sessions.end_replaced_detached(&row, at).await {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(e) => {
+            warn!(session = %session_id.to_hex(), %e, "rc session a redial replaces: its detached row could not be written");
+            return false;
+        }
+    }
+    info!(
+        session = %session_id.to_hex(),
+        agent = %row.agent_id,
+        ended_at_ms = at.timestamp_millis(),
+        "rc session a redial replaces while detached — ended agent_disconnect at its own last clock"
+    );
+    state.fleet.rc_hub.record_end(
+        session_id,
+        row.agent_id,
+        row.tenant_id,
+        EndReason::AgentDisconnect,
+        None,
+        RowEnd::inferred(row.attach_seq, at, EndSource::Redial).already_written(),
+    );
+    if crate::slots::enabled(state)
+        && let Some(slots) = &state.session_slots
+        && let Err(e) = slots
+            .release(SlotScope::Org(row.tenant_id), session_id)
+            .await
+    {
+        warn!(session = %session_id.to_hex(), %e, "session slot: an ended session's slot was not given back; it expires on its own");
+    }
+    // As after every row end: the pod that holds the session is told, and
+    // this pod ends it if a claim rebuilt it here. The write was fenced at
+    // the row as read, so neither should find it; both are insurance.
+    roomler_ai_mod_fleet::ctrl::publish_rc_ctrl(
+        state,
+        "controller_terminate",
+        serde_json::json!({
+            "session_id": session_id.to_hex(),
+            "tenant_id": row.tenant_id.to_hex(),
+            "user_id": user_id.to_hex(),
+            "reason": EndReason::AgentDisconnect,
+        }),
+    )
+    .await;
+    end_here_if_rebuilt(
+        state,
+        session_id,
+        row.tenant_id,
+        Some(user_id),
+        EndReason::AgentDisconnect,
+    );
+    true
 }
 
 /// The controller's end: the row, then the control event for the pod that

@@ -454,6 +454,93 @@ describe('FR-138 P1c — fall back', () => {
   })
 })
 
+describe('FR-138 D5 — no hangup before the redial of a session the server says is detached', () => {
+  // D5 = A (the operator, 2026-11-11). The device is away, so the session
+  // ended on its side, and the redial's `replaces` records that
+  // (`agent_disconnect`, inferred). A hangup sent first, over this page's own
+  // socket, wrote `controller_hangup` for a session nobody hung up (#3604,
+  // AC4 cell (d)).
+  const hangups = (r: Rig) => [...r.sent, ...r.dropped].filter((m) => m.t === 'rc:terminate')
+  const HANGUP = { t: 'rc:terminate', session_id: S1, reason: 'controller_hangup' }
+
+  it('the device closes its kept peer at its deadline: no rc:terminate, and the redial names what it replaces', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.deliver({ t: 'rc:session.detached', session_id: S1, resume_by: Date.now() + 60_000 })
+    await flush(2_000)
+    r.control().close()
+    expect(r.rc.phase.value).toBe('reconnecting')
+    const req = await nextRequest(r)
+    expect(req.replaces).toBe(S1)
+    expect(hangups(r)).toEqual([])
+  })
+
+  it('…nor when the peer fails during the gap', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.deliver({ t: 'rc:session.detached', session_id: S1, resume_by: Date.now() + 60_000 })
+    await flush(2_000)
+    r.pc().setState('failed')
+    expect(r.rc.phase.value).toBe('reconnecting')
+    const req = await nextRequest(r)
+    expect(req.replaces).toBe(S1)
+    expect(hangups(r)).toEqual([])
+  })
+
+  it('…nor at the page\'s own deadline, resume_by + 5 s', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.deliver({ t: 'rc:session.detached', session_id: S1, resume_by: Date.now() + 60_000 })
+    await flush(60_000 + RC_HOLD_GRACE_MS + 100)
+    expect(r.rc.phase.value).toBe('reconnecting')
+    const req = await nextRequest(r)
+    expect(req.replaces).toBe(S1)
+    expect(hangups(r)).toEqual([])
+  })
+
+  it('a rejoin answered rc:session.detached counts the same: the page\'s own socket was back first', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.socket(false)
+    await flush(2_000)
+    r.socket(true)
+    r.deliver({ t: 'rc:session.detached', session_id: S1, resume_by: Date.now() + 50_000 })
+    await flush(500)
+    r.control().close()
+    const req = await nextRequest(r)
+    expect(req.replaces).toBe(S1)
+    expect(hangups(r)).toEqual([])
+  })
+
+  it('the person\'s own Disconnect during the gap still says controller_hangup', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.deliver({ t: 'rc:session.detached', session_id: S1, resume_by: Date.now() + 60_000 })
+    await flush(1_000)
+    r.rc.disconnect()
+    expect(hangups(r)).toEqual([HANGUP])
+  })
+
+  it('once the device has claimed it back (rc:session.resumed), a transport signal sends the hangup as today', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.deliver({ t: 'rc:session.detached', session_id: S1, resume_by: Date.now() + 60_000 })
+    await flush(1_000)
+    r.deliver({ t: 'rc:session.resumed', session_id: S1 })
+    r.pc().setState('failed')
+    expect(hangups(r)).toEqual([HANGUP])
+  })
+
+  it('a session the server never said is detached keeps today\'s hangup: its device is connected, and the hangup frees its place now', async () => {
+    const r = makeRig()
+    await live(r, { resume_secs: 60 })
+    r.pc().setState('failed')
+    expect(hangups(r)).toEqual([HANGUP])
+    const req = await nextRequest(r)
+    expect(req.replaces).toBe(S1)
+  })
+})
+
 describe('FR-138 P1c — rc:ended on the control channel', () => {
   it('the person at the device ended it during the gap: closed as host_disconnect is, no ladder, the replay arguments dropped', async () => {
     const r = makeRig()

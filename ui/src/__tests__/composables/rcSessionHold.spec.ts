@@ -311,6 +311,61 @@ describe('createSessionHold — rc:session.detached', () => {
   })
 })
 
+describe('createSessionHold — deviceDetached: the server said the device holds the session no longer (D5 = A)', () => {
+  it('false until rc:session.detached names this hold\'s session; a loss of this page\'s own socket is not it', () => {
+    const r = rig()
+    r.hold.arm(S1, 60)
+    expect(r.hold.deviceDetached(S1)).toBe(false)
+    r.setUp(false)
+    expect(r.hold.holding()).toBe(true)
+    expect(r.hold.deviceDetached(S1)).toBe(false)
+    r.setUp(true)
+    r.hold.detached(S1, r.serverNow() + 60_000)
+    expect(r.hold.deviceDetached(S1)).toBe(true)
+    expect(r.hold.deviceDetached(S2)).toBe(false)
+    expect(r.hold.deviceDetached(null)).toBe(false)
+  })
+
+  it('outlives the hold\'s own end: the deadline\'s redial reads it after expired, and a transport end too', () => {
+    const r = rig()
+    r.hold.arm(S1, 60)
+    r.hold.detached(S1, r.serverNow() + 60_000)
+    vi.advanceTimersByTime(65_000)
+    expect(r.expired).toHaveLength(1)
+    expect(r.hold.deviceDetached(S1)).toBe(true)
+    const t = rig()
+    t.hold.arm(S1, 60)
+    t.hold.detached(S1, t.serverNow() + 60_000)
+    t.hold.end('transport')
+    expect(t.hold.deviceDetached(S1)).toBe(true)
+  })
+
+  it('rc:session.resumed clears it (the device has the session again), and so do arm() and disarm()', () => {
+    const r = rig()
+    r.hold.arm(S1, 60)
+    r.hold.detached(S1, r.serverNow() + 60_000)
+    r.hold.resumed(S1)
+    expect(r.hold.deviceDetached(S1)).toBe(false)
+    r.hold.detached(S1, r.serverNow() + 60_000)
+    r.hold.arm(S2, 60)
+    expect(r.hold.deviceDetached(S1)).toBe(false)
+    r.hold.detached(S2, r.serverNow() + 60_000)
+    r.hold.disarm()
+    expect(r.hold.deviceDetached(S2)).toBe(false)
+  })
+
+  it('a detached for another session, or for a session never armed, sets nothing', () => {
+    const r = rig()
+    r.hold.arm(S1, 60)
+    r.hold.detached(S2, r.serverNow() + 60_000)
+    expect(r.hold.deviceDetached(S2)).toBe(false)
+    const off = rig()
+    off.hold.arm(S1, null)
+    off.hold.detached(S1, off.serverNow() + 60_000)
+    expect(off.hold.deviceDetached(S1)).toBe(false)
+  })
+})
+
 describe('createSessionHold — every end clears its timers', () => {
   it('end() is an end with its reason, and nothing fires after it', () => {
     const r = rig()

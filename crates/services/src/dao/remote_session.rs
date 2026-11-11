@@ -346,14 +346,14 @@ impl RemoteSessionDao {
     }
 
     /// FR-138 P1b-2 — an end someone asked for (an admin's, the controller's
-    /// own, a redial's `replaces`, a rejoin's gate refused) of a session no
-    /// hub on the asking pod holds, written straight to the row (spec §4.4,
-    /// §4.6): one conditional update that ends it only while it is live
-    /// (Active, not ended) and names what `scope` names, at any fencing
-    /// number. The caller awaits it BEFORE it publishes the control event a
-    /// pod that does hold the session acts on: a claim reads the row once
-    /// more after it rebuilt the session, so it either finds this end or
-    /// receives that event. The row as it was, when it matched.
+    /// own, a redial's `replaces` of a session not detached, a rejoin's gate
+    /// refused) of a session no hub on the asking pod holds, written straight
+    /// to the row (spec §4.4, §4.6): one conditional update that ends it only
+    /// while it is live (Active, not ended) and names what `scope` names, at
+    /// any fencing number. The caller awaits it BEFORE it publishes the
+    /// control event a pod that does hold the session acts on: a claim reads
+    /// the row once more after it rebuilt the session, so it either finds
+    /// this end or receives that event. The row as it was, when it matched.
     pub async fn end_unheld(
         &self,
         session_id: ObjectId,
@@ -408,8 +408,9 @@ impl RemoteSessionDao {
 
     /// FR-138 (review 2, N5) — a device's own end of a session whose end was
     /// inferred BEFORE this connection: by the sweep, once the device had
-    /// been away past the window, or by an earlier connection's registration,
-    /// before the device could say how the session ended. As
+    /// been away past the window, by an earlier connection's registration,
+    /// before the device could say how the session ended, or (D5 = A) by its
+    /// viewer's redial naming it in `replaces` while it was detached. As
     /// [`Self::replace_inferred_end`] does for this connection's own
     /// inference, the device's reason replaces `agent_disconnect` and
     /// `end_source` is cleared, in the device's tenant and only for a row
@@ -470,8 +471,9 @@ impl RemoteSessionDao {
     ///   session for the device's earlier connection): a seen end, unmarked,
     ///   so `ended_at` stays the reap's (`now` when this lands first).
     ///
-    /// Either way an end the sweep or another pod's registration inferred
-    /// first (review 2, N5) is replaced the same way, keeping its clock.
+    /// Either way an end the sweep, another pod's registration or (D5 = A) a
+    /// redial inferred first (review 2, N5) is replaced the same way, keeping
+    /// its clock.
     ///
     /// A row someone else ended meanwhile (an admin's end) matches neither
     /// shape and is left alone. `false` = nothing matched.
@@ -612,6 +614,22 @@ impl RemoteSessionDao {
             .await
     }
 
+    /// FR-138 (D5 = A) — a redial's `replaces` of a session no pod holds
+    /// because its DEVICE's socket went (the row detached), as the caller read
+    /// the row: `agent_disconnect`, dated `at` (the row's own last clock) and
+    /// marked `end_source: redial`, only while the row is still live, at the
+    /// fencing number read and with the `resume_by` and `stats_at` read, so a
+    /// claim that resumed it meanwhile is never undone. `false` = it matched
+    /// nothing.
+    pub async fn end_replaced_detached(
+        &self,
+        row: &RemoteSession,
+        at: DateTime,
+    ) -> DaoResult<bool> {
+        self.end_inferred_as_read(row, at, EndSource::Redial, None)
+            .await
+    }
+
     /// FR-138 P1b-2 — the one-time close's read (`POST
     /// /api/admin/rc-sessions/close-dead`): live rows created before
     /// `older_than` whose own clock has not moved since (`stats_at` absent or
@@ -687,10 +705,11 @@ impl RemoteSessionDao {
             .await
     }
 
-    /// The sweep's and the dead-row close's write: `agent_disconnect` at
-    /// `at`, marked `source`, on the row only as it was read (and, when
-    /// given, only on a row created before `created_before`). Never an end
-    /// over an end: the row must still be live.
+    /// The sweep's, the dead-row close's and a detached session's redial's
+    /// write: `agent_disconnect` at `at`, marked `source`, on the row only as
+    /// it was read (and, when given, only on a row created before
+    /// `created_before`). Never an end over an end: the row must still be
+    /// live.
     async fn end_inferred_as_read(
         &self,
         row: &RemoteSession,
@@ -744,13 +763,15 @@ fn after_filter((created_at, id): RowCursor) -> bson::Document {
 }
 
 /// FR-138 (review 2, N5) — the inferred ends a device's own end may replace:
-/// the registration read's and the sweep's. Both ended a session because its
-/// device's connection went, while the device may have kept it through the
-/// gap. Never `backfill` ([`RemoteSessionDao::replace_earlier_inferred_end`]).
+/// the registration read's, the sweep's and (D5 = A) a redial's of a detached
+/// session. Each ended a session because its device's connection went, while
+/// the device may have kept it through the gap. Never `backfill`
+/// ([`RemoteSessionDao::replace_earlier_inferred_end`]).
 fn inferred_by_device_loss() -> DaoResult<Vec<bson::Bson>> {
     Ok(vec![
         bson::to_bson(&EndSource::Registration)?,
         bson::to_bson(&EndSource::Sweep)?,
+        bson::to_bson(&EndSource::Redial)?,
     ])
 }
 
