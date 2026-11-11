@@ -108,6 +108,10 @@ pub mod keep_busy;
 /// carries the overlay feature split inside so the handler compiles the same
 /// in every build (see the module doc for the rustc ICE that forced this).
 pub mod key_rotation;
+/// #3695 — the line reader with a limit, for the channels to the helpers the
+/// daemon starts in a person's session. Ungated, as the delegation channel
+/// that reads with it is.
+pub mod line_limit;
 pub mod localapi_state;
 pub mod lock_on_end;
 pub mod lock_overlay;
