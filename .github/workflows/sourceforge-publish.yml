@@ -23,9 +23,9 @@ name: Publish to SourceForge
 # visitor needs: the `setup-v<V>` assets (the wizard for each platform, with its
 # checksum and signature), about 55 MiB a version, the newest SF_KEEP versions.
 #
-# WHAT A RUN DOES, in this order, and it stops at the first step that fails:
-#   1. resolve the tag (the one named, or the newest when reconciling); stop
-#      unless it is a final `setup-v<V>` with a published GitHub release
+# WHAT A PUBLISH DOES, in this order, and it stops at the first step that fails:
+#   1. resolve the tag it was dispatched with; stop unless it is a final
+#      `setup-v<V>` with a published GitHub release
 #   2. download that release and prove the bytes: each file against GitHub's own
 #      asset digest, each installer against its `.sha256` sidecar
 #   3. upload to /home/frs/project/roomler-ai/<tag>/ over rsync+ssh, to a host
@@ -63,8 +63,8 @@ name: Publish to SourceForge
 #    leave the listing stale with no failed run to say so, which is the state
 #    this workflow exists to end. The reconcile publishes nothing itself. It
 #    takes the newest final setup release and, when SourceForge does not have
-#    it, SENDS THAT DISPATCH AGAIN, so the `publish` job does the work in its
-#    own queue. The job's comment has how it decides.
+#    it or an alert is still open, SENDS THAT DISPATCH AGAIN, so the `publish`
+#    job does the work in its own queue. The job's comment has how it decides.
 #  - `pull_request` on these files: the self-test only. No secret is in reach.
 #
 # CREDENTIALS (repository secrets, in place since 2026-11-11; docs/sourceforge.md
@@ -82,7 +82,10 @@ name: Publish to SourceForge
 # fleet updates, and the listing quietly keeps its old button, which is the
 # state this workflow exists to end. So a failure opens one issue, a repeat
 # comments on it, and the next green publish closes it (the shape of
-# release-setup.yml's wizard alert).
+# release-setup.yml's wizard alert). Nothing else closes one. While one is
+# open the reconcile sends the newest release again, four times a day, so the
+# alert ends when the fault does and not at the next release. A fault of the
+# reconcile itself files the same issue.
 
 on:
   workflow_dispatch:
@@ -113,16 +116,18 @@ permissions:
 # set" and "old folders removed" is fine, one cut inside an upload is a
 # half-written folder.
 # ⚠️ GitHub keeps ONE run waiting in a group, and a newer arrival replaces it
-# without a trace. So only a publish (a dispatch that names a tag) joins the
-# `live` group. A reconcile run gets a group of its own: it only reads and
-# dispatches, and in `live` a cron tick could push a release's waiting publish
-# out of the queue.
+# without a trace. So only a real publish (a dispatch that names a tag and is
+# not a dry run) joins the `live` group. Every other run gets a group of its
+# own, since it changes nothing on SourceForge: a reconcile reads and
+# dispatches, and a dry run only reads. In `live`, a cron tick or a rehearsal
+# could push a release's waiting publish out of the queue.
 concurrency:
   group: >-
     sourceforge-publish-${{
       github.event_name == 'pull_request' && github.ref ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && 'live') ||
-      format('reconcile-{0}', github.run_id) }}
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' &&
+       github.event.inputs.dry_run != 'true' && 'live') ||
+      format('solo-{0}', github.run_id) }}
   cancel-in-progress: false
 
 env:
@@ -523,9 +528,14 @@ jobs:
   #     bot protection may one day stop answering a runner. No folder for the
   #     release: send.
   #   - best_release.json adds only what it can prove. Read, and behind: send.
-  #     Read, and current: nothing to do, and an alert left open by an earlier
-  #     failure is closed, because the listing has outlived it. Unreadable:
-  #     nothing is concluded from it.
+  #     Read, and current: nothing to do. Unreadable: nothing is concluded
+  #     from it.
+  #   - An alert is still open ("SourceForge publish failed"): send, whatever
+  #     the listing looks like. Only a green publish closes an alert, so one
+  #     that passes ends it and one that fails says "failed again" on the same
+  #     issue. This job never closes one itself: a publish can fail after the
+  #     buttons have moved (the wait for the listing, retention), and the
+  #     buttons cannot tell whether that fault is gone.
   #   - Neither could be read: send. The publish is idempotent and it is the
   #     job with the alert. A reconcile that kept quiet whenever it could not
   #     read would be quiet for good on the day SourceForge blocks runners.
@@ -535,6 +545,9 @@ jobs:
   #     docs/sourceforge.md §5 has what a person does then.
   # A read GitHub does not answer ends the run quietly; the next one reads
   # again. This job is not in the `live` concurrency group (see above).
+  # A fault of this job itself (SourceForge ahead of GitHub, a dispatch that
+  # will not go through) has no `publish` job behind it, so the `alert` job
+  # never hears of it: this job's last step files the alert.
   # ---------------------------------------------------------------------------
   reconcile:
     name: Reconcile the listing with the newest setup release
@@ -546,7 +559,7 @@ jobs:
     permissions:
       contents: read
       actions: write   # send the dispatch
-      issues: write    # close an alert the listing has outlived
+      issues: write    # read an open alert; file one for a fault of this job
     env:
       GH_TOKEN: ${{ github.token }}
       EVENT_NAME: ${{ github.event_name }}
@@ -642,9 +655,30 @@ jobs:
             echo "::warning title=SourceForge reconcile::best_release.json did not answer in the shape this job reads, so the buttons were not read"
           fi
 
+          # --- an alert left open ------------------------------------------------
+          # Only read here, never closed. A read GitHub does not answer is not
+          # an open alert.
+          alert=unreadable
+          if n="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+                    --search 'in:title "SourceForge publish failed"' --limit 5 --json number --jq 'length' 2> gh.err)"; then
+            case "$n" in
+              0) alert=none ;;
+              ''|*[!0-9]*) ;;
+              *) alert=open
+                 echo "an alert is open: a publish failed and none has passed since" ;;
+            esac
+          else
+            cat gh.err >&2
+          fi
+          if [ "$alert" = unreadable ]; then
+            echo "::warning title=SourceForge reconcile::GitHub did not answer with the open alerts, so none is counted"
+          fi
+
           # --- the plan ----------------------------------------------------------
-          # A refusal fails the run: SourceForge is ahead of GitHub.
-          if ! bash scripts/sourceforge-publish.sh reconcile-plan "$tag" "$folders" "$listing" < folders.txt > plan.txt; then
+          # A refusal fails the run: SourceForge is ahead of GitHub. This job's
+          # last step files the alert for it.
+          if ! bash scripts/sourceforge-publish.sh reconcile-plan "$tag" "$folders" "$listing" "$alert" < folders.txt > plan.txt; then
+            echo "fault=ahead" >> "$GITHUB_OUTPUT"
             echo "::error title=SourceForge is ahead of GitHub::SourceForge carries a setup release newer than $tag, the newest final one on GitHub. If that release was pulled back on purpose: move the buttons with  gh workflow run sourceforge-publish.yml -f tag=$tag  and remove the newer folder from SourceForge's Files. docs/sourceforge.md, section 5."
             exit 1
           fi
@@ -652,12 +686,13 @@ jobs:
           why="$(sed -n 2p plan.txt)"
           echo "plan=$plan" >> "$GITHUB_OUTPUT"
           if [ "$plan" = publish ]; then
-            echo "::warning title=The listing lacks the newest release::$why. Sending the dispatch for $tag, which its own release (release-setup.yml, the sourceforge job) did not get through."
+            echo "::warning title=SourceForge reconcile sends the dispatch::$why. Sending the dispatch for $tag again: its own release's dispatch (release-setup.yml, the sourceforge job) did not get through, or a publish failed."
           else
             echo "::notice title=SourceForge reconcile::$why"
           fi
 
       - name: Send the dispatch
+        id: send
         if: steps.decide.outputs.tag != '' && (steps.decide.outputs.plan == 'publish' || env.DRY_RUN == 'true')
         shell: bash
         env:
@@ -680,29 +715,50 @@ jobs:
           echo "::error::could not dispatch the publish for $TAG. By hand: gh workflow run sourceforge-publish.yml -f tag=$TAG"
           exit 1
 
-      - name: Close an alert the listing has outlived
-        if: steps.decide.outputs.plan == 'verified' && env.DRY_RUN != 'true'
+      # A fault of this job has no `publish` job behind it, so the `alert` job
+      # below never hears of it. The same issue, found by the same prefix: a
+      # repeat comments on it, and the next green publish closes it. A dry run
+      # is watched by whoever dispatched it and files nothing.
+      - name: Alert on a reconcile that failed
+        if: failure() && env.DRY_RUN != 'true'
         shell: bash
         env:
           TAG: ${{ steps.decide.outputs.tag }}
+          FAULT: ${{ steps.decide.outputs.fault }}
+          SEND: ${{ steps.send.outcome }}
         run: |
           set -euo pipefail
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          nums="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search 'in:title "SourceForge publish failed"' --limit 50 --json number --jq '.[].number')"
-          if [ -z "$nums" ]; then
-            echo "no open SourceForge alert: nothing to close"
-            exit 0
+          # The backticks below are Markdown for the issue, not a command.
+          # shellcheck disable=SC2016
+          if [ "$FAULT" = ahead ]; then
+            short="SourceForge serves a release GitHub no longer has"
+            what="$(printf 'SourceForge carries a setup release newer than `%s`, the newest final one on GitHub. That is a release pulled back on GitHub. The reconcile sends nothing until a person decides: `docs/sourceforge.md`, section 5, has the two steps.' "$TAG")"
+          elif [ "$SEND" = failure ]; then
+            short="the reconcile could not send the newest release"
+            what="$(printf 'The reconcile decided to send the dispatch for `%s` and GitHub refused it three times. By hand:\n\n```\ngh workflow run sourceforge-publish.yml -f tag=%s\n```' "$TAG" "$TAG")"
+          else
+            short="the reconcile failed"
+            what="The reconcile failed before it could decide. The log of the run says where."
           fi
-          for n in $nums; do
-            echo "closing #$n"
-            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed \
-              --comment "$(printf 'The listing serves %s on Windows, macOS and Linux, read from best_release.json on %s: %s\n\nSo the condition this issue reports no longer holds. Closed automatically; a later failure opens a new issue.\n' "$TAG" "$(date -u +%F)" "$run_url")"
-          done
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search 'in:title "SourceForge publish failed"' --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "reusing open alert #$existing"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "$(printf 'The reconcile failed on %s: %s\n\n%s\n\nStill unresolved. This issue closes by itself when a publish succeeds.\n' "$(date -u +%F)" "$run_url" "$what")"
+          else
+            # shellcheck disable=SC2016
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "SourceForge publish failed: $short ($(date -u +%F))" \
+              --body "$(printf 'The SourceForge reconcile failed: %s\n\n%s\n\nThe runbook is `docs/sourceforge.md`. This issue closes by itself when a publish succeeds.\n' "$run_url" "$what")"
+          fi
 
   # ---------------------------------------------------------------------------
   # One issue per CONDITION: reused while it holds, closed by the next green
-  # publish, so an open one always means "the listing is stale right now".
+  # publish and by nothing else, so an open one always means "a publish failed
+  # and none has passed since". The reconcile sends the newest release again
+  # while one is open, so that green publish does not wait for a release.
   # `--search` is `in:title` against the fixed prefix, which is why the date
   # sits at the END of the title. A dry run is watched by whoever dispatched
   # it and files nothing.

@@ -263,9 +263,10 @@ wizard lane's last job (`sourceforge` in `release-setup.yml`) dispatches
 `sourceforge-publish.yml` for the tag it has just published. That run uploads the
 release's 16 assets, moves the listing's Windows, macOS and Linux Download
 defaults to it and removes versions older than the newest 10. Nothing to do at a
-cut. A failure opens a "SourceForge publish failed" issue and the next green
-publish closes it; `roomler.ai` is never affected. Runbook, the two secrets and
-the manual fallback: `docs/sourceforge.md`.
+cut. A failure opens a "SourceForge publish failed" issue, the reconcile sends
+the release again every 6 hours while it is open, and the next green publish
+closes it; `roomler.ai` is never affected. Runbook, the two secrets and the
+manual fallback: `docs/sourceforge.md`.
 ⚠️ **A run that `GITHUB_TOKEN` started starts no workflow, not even by
 finishing.** The wizard run's actor is `github-actions[bot]`, so neither
 `on: release` nor `workflow_run` on "Release roomler-setup" ever fires for a real
@@ -274,11 +275,12 @@ does fire `workflow_run`, which is how a rehearsal can look fine). Anything that
 must follow a wizard release is a `workflow_dispatch` from inside it.
 ⚠️ The dispatch job never fails a release, so a lost dispatch is silent. The
 publish workflow's `reconcile` job (every 6 hours) sends it again when
-SourceForge has no folder for the newest setup release;
-`gh workflow run sourceforge-publish.yml` with no tag runs it at once.
+SourceForge has no folder for the newest setup release, or while an alert is
+open; `gh workflow run sourceforge-publish.yml` with no tag runs it at once.
 ⚠️ **Pulling a wizard release back** (deleted, or back to draft) after
 SourceForge took it leaves the listing's buttons on it, and every reconcile run
-then fails with "SourceForge is ahead of GitHub". Move the buttons with
+then fails with "SourceForge is ahead of GitHub" and says so on the alert
+issue. Move the buttons with
 `gh workflow run sourceforge-publish.yml -f tag=<the release before it>` and
 remove the pulled folder from SourceForge's Files (`docs/sourceforge.md` §5).
 ⚠️ It needs the secrets `SOURCEFORGE_SSH_KEY` and `SOURCEFORGE_API_KEY`. Without

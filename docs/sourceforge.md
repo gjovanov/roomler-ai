@@ -73,19 +73,31 @@ wizard run on a tag cut before that job existed sends none. So a second job, `re
 a schedule four times a day, and by a dispatch with no tag.
 
 **It publishes nothing.** It finds the newest final setup release on GitHub, reads what
-SourceForge has, and when that release is missing it sends the dispatch the release should have
-sent. The `publish` job then does the work, in its own queue, with its own alert. A scheduled run
-leaves a release younger than 45 minutes to its own dispatch.
+SourceForge has, and when that release is missing, or an alert is still open, it sends the
+dispatch the release should have sent. The `publish` job then does the work, in its own queue,
+with its own alert. A scheduled run leaves a release younger than 45 minutes to its own dispatch.
 
 | SourceForge's file store (sftp) | `best_release.json` | What the reconcile does |
 |---|---|---|
 | no folder for the release | anything | sends the dispatch |
 | the folder is there | read, and a button does not serve the release | sends the dispatch |
-| the folder is there | read, and all three buttons serve it | nothing, and it closes an alert an earlier failure left open |
-| the folder is there | not readable | nothing. A publish that failed half-way has an alert of its own |
+| the folder is there | read, and all three buttons serve it | nothing |
+| the folder is there | not readable | nothing |
 | not readable | read: as the two rows above | |
 | not readable | not readable | sends the dispatch |
+| any row above that says "nothing", while an alert issue is open | | sends the dispatch |
 | a setup folder, or a button, **newer** than GitHub's newest release | anything | the run fails and sends nothing: a release was pulled back on GitHub, and §5 has what to do |
+
+**An open alert sends the dispatch again**, whatever the listing looks like. Only a green publish
+closes an alert, so while one is open the reconcile publishes the newest release again, four times
+a day. A run that passes closes the issue, and one that fails comments "failed again" on it. The
+reconcile never closes an alert itself: a publish can fail after the buttons have moved (the 15
+minute wait, a retention that fails), and the buttons cannot tell whether that fault is gone.
+
+**A fault of the reconcile itself files the same alert.** No `publish` job stands behind it, so
+its last step opens the issue or comments on the open one. Three things can do that: SourceForge
+is ahead of GitHub, GitHub refused the dispatch three times, or the run failed before it could
+decide.
 
 The file store decides because it is the channel a publish needs anyway, and it is another host
 than the web tier, whose bot protection may one day stop answering a runner. `best_release.json`
@@ -96,9 +108,9 @@ it could not read would be quiet for good on the day SourceForge blocks runners.
 A read GitHub does not answer ends the run with a notice. The next run reads again.
 
 > ⚠️ **GitHub keeps one run waiting in a concurrency group, and a newer arrival replaces it
-> without a trace.** Only a publish, a dispatch that names a tag, joins the `live` group. A
-> reconcile run gets a group of its own, so a cron tick cannot push a release's waiting publish
-> out of the queue.
+> without a trace.** Only a real publish, a dispatch that names a tag and is not a dry run, joins
+> the `live` group. A reconcile run and a dry run each get a group of their own, so neither a cron
+> tick nor a rehearsal can push a release's waiting publish out of the queue.
 
 ## 2. What SourceForge holds
 
@@ -215,10 +227,11 @@ curl -s https://sourceforge.net/projects/roomler-ai/best_release.json \
 
 | Situation | What happens | What to do |
 |---|---|---|
-| A publish fails | One issue opens, "SourceForge publish failed". A repeat comments on it | Fix the cause, re-run the command in the issue. The next green publish closes it |
+| A publish fails | One issue opens, "SourceForge publish failed". A repeat comments on it. While it is open the reconcile sends the newest release again, four times a day | Fix the cause. The next green publish closes it, by itself or from the command in the issue |
 | A release's dispatch never arrives | Nothing fails. Within about seven hours a reconcile run finds no folder for the release on SourceForge, sends the dispatch and says so in a warning | Nothing. To do it at once: `gh workflow run sourceforge-publish.yml` |
-| A publish failed after the buttons had moved (the 15 minute wait ran out, or retention failed) | The alert is open although the listing is current | Nothing. The next reconcile run reads the buttons and closes it |
-| A release is pulled back on GitHub (deleted, or back to draft) after SourceForge took it | Every reconcile run fails with "SourceForge is ahead of GitHub" and sends nothing. The buttons stay on the pulled release | 1. `gh workflow run sourceforge-publish.yml -f tag=<the release before it>` moves the three buttons back. 2. Remove the pulled release's folder in SourceForge's Files (its trash icon). The reconcile is green again once the folder is gone. Putting the release back on GitHub ends it too |
+| A publish failed after the buttons had moved (the 15 minute wait ran out, or retention failed) | The alert is open although the listing is current. The next reconcile run sends the release again | Nothing, if that publish passes: it closes the alert. If it fails it comments on the issue, and the fault is still there: fix it |
+| A reconcile run cannot send its dispatch | The run fails and the alert opens, with the command in it | Run that command. The next green publish closes the alert |
+| A release is pulled back on GitHub (deleted, or back to draft) after SourceForge took it | Every reconcile run fails with "SourceForge is ahead of GitHub", sends nothing, and opens the alert or comments on it. The buttons stay on the pulled release | 1. `gh workflow run sourceforge-publish.yml -f tag=<the release before it>` moves the three buttons back. 2. Remove the pulled release's folder in SourceForge's Files (its trash icon). The reconcile is green again once the folder is gone. Putting the release back on GitHub ends it too |
 | A dispatch names an older tag | Its files are uploaded. The defaults and every other folder are left alone | Nothing: that is a backfill |
 | The secrets are missing | A warning on the run, and it skips | §4 |
 | `best_release.json` cannot be read from the runner | A warning, not a failure: the API's own answer is the record that the defaults moved | Read the JSON by hand once |
@@ -260,7 +273,7 @@ two. So the webhook went, and the publish became ours.
 
 | File | What to look for |
 |---|---|
-| `.github/workflows/sourceforge-publish.yml` | the `publish` job: the `gate` step (which runs go on, and `is_newest`), `Upload`, the `defaults` step, the `served` step, the retention step. The `reconcile` job: its `decide` step. The `alert` and `recovered` jobs |
+| `.github/workflows/sourceforge-publish.yml` | the `publish` job: the `gate` step (which runs go on, and `is_newest`), `Upload`, the `defaults` step, the `served` step, the retention step. The `reconcile` job: its `decide` step, its `send` step, and its last step, which files the alert for a fault of its own. The `alert` and `recovered` jobs |
 | `.github/workflows/release-setup.yml` | the `sourceforge` job, which dispatches the publish |
 | `scripts/sourceforge-publish.sh` | `valid_tag`, `sorted_tags`, `newest`, `default_file`, `default_for`, `defaults_plan`, `verify`, `prune_plan`, `listing_state`, `reconcile_plan`, `selftest` |
 | `scripts/sourceforge-known-hosts` | the three pinned keys, with their fingerprints in the header |

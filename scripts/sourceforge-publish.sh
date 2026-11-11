@@ -18,7 +18,7 @@
 #                                        oldest first
 #   listing-state <tag>                  what the listing serves for windows, mac and
 #                                        linux on stdin -> current | behind | newer
-#   reconcile-plan <tag> <folders> <listing>
+#   reconcile-plan <tag> <folders> <listing> <alert>
 #                                        what the reconcile does about the newest
 #                                        release -> publish | verified | nothing
 #   --selftest                           proves each of the above, offline
@@ -239,20 +239,31 @@ listing_state() {
 #   <listing>  current | behind | newer | unreadable
 #                                listing-state's word for the three buttons, or
 #                                unreadable when best_release.json gave none.
+#   <alert>    open | none | unreadable
+#                                whether a "SourceForge publish failed" issue is
+#                                open: a publish failed and none has passed since.
 # Prints one word, and on a second line the reason in plain words:
 #   publish   the release's folder is not on SourceForge, or the buttons were read
-#             and do not serve it, or nothing at all could be read
+#             and do not serve it, or an alert is open, or nothing at all could be
+#             read
 #   verified  nothing to do, and the buttons were read to be this release's
-#   nothing   nothing to do: the folder is there and the buttons could not be read.
-#             A publish that failed half-way has an alert of its own.
+#   nothing   nothing to do: the folder is there and the buttons could not be read
 # The file store decides, because it is the channel a publish needs anyway. The
 # buttons only add what they can prove: `behind` sends, `current` verifies.
 #
+# An open alert sends, whatever the listing looks like. Only a green publish
+# closes an alert, so the one way to end it is to publish again: a run that passes
+# closes it, and one that fails says "failed again" on the same issue. A publish
+# can fail after the buttons have moved (the wait for the listing, retention), and
+# the buttons alone cannot tell whether that fault is gone. An alert that could
+# not be read is not an open one.
+#
 # It refuses when SourceForge carries a setup release NEWER than <tag>, as a folder
 # or on a button. That is a release pulled back on GitHub. Sending <tag> again
-# would move the buttons backwards, and that is a person's decision.
+# would move the buttons backwards, and that is a person's decision. An open alert
+# does not change that.
 reconcile_plan() {
-  local tag="$1" folders="$2" listing="$3" all="" top
+  local tag="$1" folders="$2" listing="$3" alert="$4" all="" top
   valid_tag "$tag" || die "not a final setup release tag: '$tag'"
   case "$folders" in
     ok|unreadable) ;;
@@ -261,6 +272,10 @@ reconcile_plan() {
   case "$listing" in
     current|behind|newer|unreadable) ;;
     *) die "listing must be current, behind, newer or unreadable, got '$listing'" ;;
+  esac
+  case "$alert" in
+    open|none|unreadable) ;;
+    *) die "alert must be open, none or unreadable, got '$alert'" ;;
   esac
 
   if [ "$folders" = ok ]; then
@@ -279,6 +294,8 @@ reconcile_plan() {
     printf 'publish\n%s\n' "SourceForge has no folder for $tag"
   elif [ "$listing" = behind ]; then
     printf 'publish\n%s\n' "the Download buttons do not serve $tag"
+  elif [ "$alert" = open ]; then
+    printf 'publish\n%s\n' "an alert is open: a publish failed and none has passed since"
   elif [ "$listing" = current ]; then
     printf 'verified\n%s\n' "the Download buttons serve $tag"
   elif [ "$folders" = ok ]; then
@@ -513,8 +530,10 @@ selftest() {
 
   # --- reconcile-plan -----------------------------------------------------------
   # rplan <tag> <folders> <listing> [folder names...]: `out` is the plan word.
+  # The fourth argument, the alert, is `$alert`: none unless a block sets it.
+  local alert=none
   rplan() {
-    out="$(printf '%s\n' "${@:4}" | bash "$0" reconcile-plan "$1" "$2" "$3" 2>"$tmp/err")" && rc=0 || rc=$?
+    out="$(printf '%s\n' "${@:4}" | bash "$0" reconcile-plan "$1" "$2" "$3" "$alert" 2>"$tmp/err")" && rc=0 || rc=$?
     why="$(printf '%s\n' "$out" | sed -n 2p)"
     out="$(printf '%s\n' "$out" | sed -n 1p)"
   }
@@ -545,7 +564,7 @@ selftest() {
   eq "reconcile: an unread file store is not consulted" "$out" verified
   # sftp's own output shape, and version order.
   out="$(printf 'sftp> ls -1 /home/frs/project/x/\r\n/home/frs/project/x/setup-v0.4.9/\r\n/home/frs/project/x/setup-v0.4.10\r\n' \
-        | bash "$0" reconcile-plan setup-v0.4.10 ok current | sed -n 1p)" && rc=0 || rc=$?
+        | bash "$0" reconcile-plan setup-v0.4.10 ok current none | sed -n 1p)" && rc=0 || rc=$?
   eq "reconcile: sftp listing, 0.4.10 after 0.4.9" "$out" verified
 
   # A release pulled back on GitHub: SourceForge is ahead, and nothing is sent.
@@ -568,6 +587,34 @@ selftest() {
   rplan setup-v0.4.211 ok stale "${held[@]}";        eq "reconcile refuses an unknown listing word" "$rc" 2
   rplan setup-v0.4.211 ok "" "${held[@]}";           eq "reconcile refuses an empty listing word" "$rc" 2
 
+  # An open alert sends, whatever the listing looks like: only a green publish
+  # closes an alert, so the reconcile publishes again until one passes.
+  alert=open
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile: an alert open, buttons current" "$out" publish
+  eq "reconcile: an open alert says why" "$why" "an alert is open: a publish failed and none has passed since"
+  rplan setup-v0.4.211 ok unreadable "${held[@]}"; eq "reconcile: an alert open, buttons unread" "$out" publish
+  rplan setup-v0.4.211 unreadable current;         eq "reconcile: an alert open, files unread, buttons current" "$out" publish
+  # The reasons that already send keep their own words.
+  rplan setup-v0.4.211 ok current    "${lacks[@]}"; eq "reconcile: an alert open, no folder: the folder is the reason" "$why" "SourceForge has no folder for setup-v0.4.211"
+  rplan setup-v0.4.211 ok behind     "${held[@]}"; eq "reconcile: an alert open, buttons behind: the buttons are the reason" "$why" "the Download buttons do not serve setup-v0.4.211"
+  # It does not outrank a refusal: nothing is sent while SourceForge is ahead.
+  rplan setup-v0.4.210 ok current    "${held[@]}"; eq "reconcile refuses a newer folder with an alert open" "$rc" 2
+  eq "reconcile prints no plan on that refusal either" "$out" ''
+  rplan setup-v0.4.211 ok newer      "${held[@]}"; eq "reconcile refuses a newer button with an alert open" "$rc" 2
+  # An alert that could not be read is not an open one.
+  alert=unreadable
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile: an unread alert, buttons current" "$out" verified
+  rplan setup-v0.4.211 ok unreadable "${held[@]}"; eq "reconcile: an unread alert, buttons unread" "$out" nothing
+  rplan setup-v0.4.211 ok current    "${lacks[@]}"; eq "reconcile: an unread alert, no folder" "$out" publish
+  # The alert word itself.
+  alert=maybe
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile refuses an unknown alert word" "$rc" 2
+  alert=''
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile refuses an empty alert word" "$rc" 2
+  alert=none
+  out="$(printf '%s\n' "${held[@]}" | bash "$0" reconcile-plan setup-v0.4.211 ok current 2>"$tmp/err")" && rc=0 || rc=$?
+  eq "reconcile-plan refuses a call without the alert word" "$rc" 2
+
   if [ "$fail" -ne 0 ]; then
     echo "sourceforge-publish selftest: $fail of $((pass + fail)) checks FAILED" >&2
     return 1
@@ -584,8 +631,8 @@ case "${1:-}" in
   prune-plan)    [ $# -eq 3 ] || die "usage: prune-plan <keep> <current-tag>";  prune_plan "$2" "$3" ;;
   listing-state) [ $# -eq 2 ] || die "usage: listing-state <tag>  (three file names on stdin)"; listing_state "$2" ;;
   reconcile-plan)
-    [ $# -eq 4 ] || die "usage: reconcile-plan <tag> <ok|unreadable> <current|behind|newer|unreadable>  (folder names on stdin)"
-    reconcile_plan "$2" "$3" "$4" ;;
+    [ $# -eq 5 ] || die "usage: reconcile-plan <tag> <ok|unreadable> <current|behind|newer|unreadable> <open|none|unreadable>  (folder names on stdin)"
+    reconcile_plan "$2" "$3" "$4" "$5" ;;
   --selftest)    selftest ;;
   *) die "usage: $0 valid-tag|newest|default-for|defaults-plan|verify|prune-plan|listing-state|reconcile-plan|--selftest (see the header)" ;;
 esac
