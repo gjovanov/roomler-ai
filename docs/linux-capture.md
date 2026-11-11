@@ -584,7 +584,8 @@ exec /usr/bin/Xvfb "$@"
 
 A container that mounts only the driver's compute libraries (the rented DGX
 Spark of FR-122) has no NVIDIA EGL and was never affected. The Xorg
-dummy-driver path gets the same EGL vendor, and is untested on such a host.
+dummy-driver path gets the same EGL vendor; it ran on such a host for the first
+time in §2.2's field run.
 
 ⚠️ **A startup app can map before the window manager is listening.** `start`
 launches the WM and the apps back to back, and a window that maps while openbox
@@ -742,8 +743,12 @@ environment as it is.
   the #1684 class, and it was there before: [#3665](https://github.com/gjovanov/roomler-ai/issues/3665).
 - Display match's mode after a restart: the new server starts at the
   configured size.
-- A session that was open when the server exited. Its capture ends, and the
-  person reconnects.
+- A session that was open when the server exited. Nothing tells it. It keeps
+  the dead server's connection and goes on showing the last picture, at the
+  full frame rate and with a warning per frame in the daemon log (56 a second
+  when measured), until the person reconnects. A session opened afterwards
+  shows the new desktop at once. The daemon's clipboard worker keeps the old
+  connection too: [#3671](https://github.com/gjovanov/roomler-ai/issues/3671).
 
 **Proven** by `virtual_desktop::supervise_tests` (`:2910`): stand-in servers
 that die or hang, a display that someone else's server answers on, a lock and
@@ -751,8 +756,39 @@ a directory that are not ours, all in every Linux unit run; and on the CI Xvfb
 lane a real Xvfb that is SIGKILLed and is back on the same display, on a new
 server, with its stale lock cleared. The same test passes for Xorg with the
 dummy driver when it is run as root on a host that has the driver
-(`ROOMLERD_TEST_XORG=1`). ⚠️ The g5g run on the release that carries this is
-still owed ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643)).
+(`ROOMLERD_TEST_XORG=1`).
+
+**In the field** (2026-11-11, FR-122 §8): an AWS `g5g.xlarge`, an NVIDIA T4G
+on driver 595.112.07, the image as shipped (NVIDIA's EGL vendor file and no
+other) and no wrapper. The control was the released 0.4.209 on the same box.
+The 0.4.210 column was measured before the tag, on the arm64 package of the
+release's rehearsal build, and the package published afterwards is that file
+byte for byte. The published one was then installed through the served
+`install.sh`, on the image put back as shipped: one Xvfb from the daemon's
+start until it was killed at 332 s, a session at the start and another at five
+minutes, back 1.24 s after a `SIGKILL` and 2.42 s after a `SIGABRT` that came
+18 s later (a start that lasts under a minute doubles the delay), no zombie,
+and a session afterwards.
+
+| What was done | 0.4.209 | 0.4.210 |
+|---|---|---|
+| The daemon starts its desktop | Xvfb has 20 NVIDIA libraries mapped and is a zombie within 19 s, with openbox and the app; the daemon goes on announcing the desktop, and a session shows no picture | the same Xvfb at 309 s, answering every 30 s, no NVIDIA library mapped; a session shows the desktop |
+| The X server is signalled under the daemon: `SIGKILL` four times, `SIGABRT` once | — | back on the same display after 1.23 to 1.30 s each time, no zombie, the daemon's pid unchanged. The hello's `capture_arm` reads `none`, then `x11`. The `SIGABRT` exit is logged as `signal 6 (aborted), core dumped`, with the server's own `Caught signal 6 (Aborted). Server aborting` in `said=` |
+| Mesa's EGL is installed beside NVIDIA's (`libegl-mesa0`), the case in which the server still aborted before | — | the next server names Mesa's file and maps no NVIDIA library |
+| The dummy driver is installed (`xserver-xorg-core`, `xserver-xorg-video-dummy`, `x11-xserver-utils`) | — | the next server is Xorg with the dummy driver. It loads X.Org's GLX module and nothing of NVIDIA's, though the image has NVIDIA's own GLX server module; `xrandr` lists its mode; killed, it comes back as Xorg |
+| A GL client on the desktop (`glxinfo -B`) | — | direct rendering on Mesa's llvmpipe: with no EGL vendor in the server, with Mesa's, and on Xorg |
+| `Xvfb` and `Xorg` are moved away and the server is killed | — | the daemon stays online without a desktop (4 min 14 s here) and retries after 2, 4, 8 … 128 s, logging `missing required binaries` each time. A session opened meanwhile shows "This device cannot capture its screen" with the agent's sentence. Once the binaries are back the desktop returns at the next retry, 119 s later here, with no daemon restart |
+
+The last row is the price of the doubling delay: a desktop whose cause was
+fixed by hand comes back at the next retry, which can be five minutes away.
+The same run found what the supervisor does not reach, the open session of
+"Not covered" above.
+
+**On the fleet**, the same day: its three Linux servers took 0.4.210, none of
+them with NVIDIA's EGL. Each Xvfb came back on the display it had before, now
+with `-noreset`, and was the same server five minutes later, with no zombie.
+On the one server that has Mesa's vendor file the X server names it; on the two
+that have no vendor file its environment is as it was.
 
 ## 3. The DRM arm (FR-36)
 
