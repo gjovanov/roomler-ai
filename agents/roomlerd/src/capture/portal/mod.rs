@@ -1430,11 +1430,8 @@ pub mod helper {
         // Drain stdout on another thread while waiting: a child that filled
         // the pipe would otherwise deadlock against our own wait.
         let out = child.stdout.take();
-        let reader = std::thread::spawn(move || {
-            out.map(read_answer)
-                .and_then(|answer| answer.ok())
-                .unwrap_or_default()
-        });
+        let reader =
+            std::thread::spawn(move || out.map(read_answer).unwrap_or_else(|| Ok(String::new())));
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1459,14 +1456,44 @@ pub mod helper {
             }
         }
 
-        Ok(reader.join().unwrap_or_default())
+        match reader.join() {
+            Ok(Ok(answer)) => Ok(answer),
+            // #3695 — the answer is over [`ANSWER_MAX`] or is not text: the
+            // caller hears why, as it does for a helper that hung.
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "portal: the helper's answer was refused");
+                Err(SpawnError::Other(e.to_string()))
+            }
+            Err(_) => Ok(String::new()),
+        }
     }
 
-    /// The helper's answer: its whole stdout, read to the end.
+    /// #3695 — the longest answer the daemon reads from a one-shot run of the
+    /// helper ([`spawn_in_session`]: the probe, the screencast session report,
+    /// the notification probe). Each answer is one marked line on stdout, and
+    /// diagnostics go to stderr; the largest, the screencast session's report,
+    /// is about 1 KiB. 64 KiB is the limit a handshake line has
+    /// ([`HANDSHAKE_LINE_MAX`]).
+    pub const ANSWER_MAX: usize = 64 * 1024;
+
+    /// The helper's answer: its stdout, read to the end. #3695 — at most
+    /// [`ANSWER_MAX`] bytes of it: a longer answer is an error that names the
+    /// limit, and the rest is read and dropped, so the helper never blocks on
+    /// a full pipe while the daemon waits for it to exit.
     fn read_answer(mut out: impl std::io::Read) -> std::io::Result<String> {
-        let mut buf = String::new();
-        out.read_to_string(&mut buf)?;
-        Ok(buf)
+        use std::io::Read;
+        let mut kept = Vec::new();
+        (&mut out)
+            .take(ANSWER_MAX as u64 + 1)
+            .read_to_end(&mut kept)?;
+        if kept.len() > ANSWER_MAX {
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the portal helper's answer is longer than {ANSWER_MAX} bytes"),
+            ));
+        }
+        String::from_utf8(kept).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Pull the status out of the child's stdout.
