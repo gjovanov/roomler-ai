@@ -1265,19 +1265,40 @@ pub(crate) fn staging_root_windows() -> PathBuf {
     crate::appdirs::machine_global_dir().join("staging")
 }
 
+/// #3688 — the most bytes an upload's id may have ([`transfer_id`]).
+#[allow(dead_code)] // RED
+pub(crate) const TRANSFER_ID_MAX_BYTES: usize = 128;
+
+/// #3688 — what an id that is not one plain name is told ([`transfer_id`]).
+/// The viewer shows it in its `files:error`.
+#[allow(dead_code)] // RED
+pub(crate) const NOT_A_TRANSFER_ID: &str = "the transfer id is not valid";
+
+/// #3688 — an upload's id names its staging folder, so it is one plain name:
+/// letters, digits, `.`, `_` and `-` only, not starting with `.`, and at most
+/// [`TRANSFER_ID_MAX_BYTES`]. The viewer's ids (`up-<base36>-<base36>`) are
+/// such names. Every entry that takes an id from the viewer checks it first
+/// (`begin_as`, `resume_incoming_as`, `cancel_incoming`, `end`), and
+/// [`partial_dir_for`] builds a path from no other id.
+#[allow(dead_code)] // RED
+pub(crate) fn transfer_id(id: &str) -> Result<&str> {
+    Ok(id) // RED: every id is taken, as before
+}
+
 /// Compute the canonical staging dir path for an upload `id`. On
 /// Windows in production this is `%PROGRAMDATA%\roomler\<segment>\
 /// staging\<id>` (rc.22, ESET fix; segment per `machine_global_dir()`). On other platforms or when the
 /// legacy-per-dest escape hatch is set, falls back to the rc.19 layout
-/// at `<dest_dir>/.roomler-partial/<id>`.
-pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> PathBuf {
+/// at `<dest_dir>/.roomler-partial/<id>`. #3688 — an id that is not one plain
+/// name ([`transfer_id`]) is refused here too.
+pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if stage_in_programdata() {
-            return staging_root_windows().join(id);
+            return Ok(staging_root_windows().join(id));
         }
     }
-    dest_dir.join(".roomler-partial").join(id)
+    Ok(dest_dir.join(".roomler-partial").join(id))
 }
 
 /// #3688 — how a received file's own files (its partial, the partial's
@@ -1844,11 +1865,12 @@ impl FilesHandler {
         }
     }
 
-    /// The staging folder of upload `id` that targets `dest_dir`.
-    fn partial_dir(&self, dest_dir: &std::path::Path, id: &str) -> PathBuf {
+    /// The staging folder of upload `id` that targets `dest_dir`; #3688 —
+    /// refused for an id that is not one plain name, as [`partial_dir_for`].
+    fn partial_dir(&self, dest_dir: &std::path::Path, id: &str) -> Result<PathBuf> {
         #[cfg(test)]
         if let Some(root) = &self.staging_root {
-            return root.join(id);
+            return Ok(root.join(id));
         }
         partial_dir_for(dest_dir, id)
     }
@@ -1963,7 +1985,7 @@ impl FilesHandler {
         // rc.19: stage at <dest_dir>/.roomler-partial/<id>/data so a
         // mid-upload DC drop leaves the partial discoverable (B1 +
         // B2 fixes). `end()` renames to a freshly-resolved final path.
-        let partial_dir = self.partial_dir(&target_dir, &id);
+        let partial_dir = self.partial_dir(&target_dir, &id)?;
         // #3048 — staging in the daemon's own folder is the daemon's to write,
         // and the target folder the person's: the two halves below run as
         // each. Staged beside the target, both are `who` (FR-97 P3d).
@@ -2419,8 +2441,9 @@ impl FilesHandler {
     /// staging dir + registry entry. Called from the
     /// `FilesIncoming::Cancel` arm in peer.rs (P2 wiring) when the
     /// browser's reconnect budget is exhausted. Returns true when an
-    /// upload matched the id (caller logs this for audit clarity).
-    pub async fn cancel_incoming(&self, id: &str) -> bool {
+    /// upload matched the id (caller logs this for audit clarity), and an
+    /// error the viewer is sent for an id that is not one plain name (#3688).
+    pub async fn cancel_incoming(&self, id: &str) -> Result<bool> {
         // First clear in-flight state if it matches.
         let mut cleared_state = false;
         {
@@ -2438,7 +2461,7 @@ impl FilesHandler {
         let staging = {
             let g = match PARTIAL_REGISTRY.lock() {
                 Ok(g) => g,
-                Err(_) => return cleared_state,
+                Err(_) => return Ok(cleared_state),
             };
             // meta_path is <dest_dir>/.roomler-partial/<id>/meta.json;
             // parent is the per-id staging dir.
@@ -2462,9 +2485,9 @@ impl FilesHandler {
             if let Ok(mut g) = PARTIAL_REGISTRY.lock() {
                 g.remove(id);
             }
-            true
+            Ok(true)
         } else {
-            cleared_state
+            Ok(cleared_state)
         }
     }
 
@@ -2524,13 +2547,13 @@ impl FilesHandler {
                 // the daemon, whose folder it is.
                 let stager = self.stager_for(&now);
                 let canonical = if self.stages_in_a_root() {
-                    self.partial_dir(std::path::Path::new(""), id)
+                    self.partial_dir(std::path::Path::new(""), id)?
                         .join("meta.json")
                 } else {
                     let downloads = download_dir_for(&now)
                         .await
                         .context("resolving Downloads for on-demand resume probe")?;
-                    self.partial_dir(&downloads, id).join("meta.json")
+                    self.partial_dir(&downloads, id)?.join("meta.json")
                 };
                 let probe = canonical.clone();
                 if !stager
@@ -6425,7 +6448,7 @@ mod tests {
             let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             assert!(g.contains_key(&id));
         }
-        let cleared = h.cancel_incoming(&id).await;
+        let cleared = h.cancel_incoming(&id).await.expect("a plain id");
         assert!(cleared, "cancel_incoming should return true");
         assert!(!staging.exists(), "staging dir leaked after cancel");
         {
@@ -6509,7 +6532,7 @@ mod tests {
         // rc.19 per-dest layout regardless of platform. The actual
         // staging-strategy-flag lock is `STAGE_IN_PROGRAMDATA`.
         let dest = std::path::Path::new("C:\\some\\dest");
-        let got = partial_dir_for(dest, "abc-123");
+        let got = partial_dir_for(dest, "abc-123").expect("a plain id");
         let want = dest.join(".roomler-partial").join("abc-123");
         assert_eq!(got, want);
     }
@@ -8613,5 +8636,413 @@ fn turn_the_folder_into_a_file(dir: &std::path::Path, bytes: &[u8]) {
                 tries += 1;
             }
         }
+    }
+}
+
+/// #3688 — an upload's id is one plain name ([`transfer_id`]), checked first
+/// at every entry that takes one from the viewer, before anything on disk is
+/// touched, on every OS. Each test collects what went wrong for every kind
+/// of id before it fails, so one run shows them all.
+#[cfg(test)]
+mod transfer_id_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// The shared registry is keyed by id, and `..`, `.` and the empty id
+    /// are the same in every test: the tests that register under them, or
+    /// read the registry for them, take turns.
+    static TURNS: Mutex<()> = Mutex::const_new(());
+
+    fn base36(mut n: u64) -> String {
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut out = Vec::new();
+        loop {
+            out.push(DIGITS[(n % 36) as usize]);
+            n /= 36;
+            if n == 0 {
+                break;
+            }
+        }
+        out.reverse();
+        String::from_utf8(out).expect("base36 digits are ASCII")
+    }
+
+    /// An id shaped as the viewer mints one (`uploadOne`,
+    /// `ui/src/composables/useRemoteControl.ts`):
+    /// `up-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`.
+    fn viewer_shaped() -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let millis = chrono::Utc::now().timestamp_millis().unsigned_abs();
+        let random = u64::from(std::process::id())
+            .wrapping_mul(1_000_003)
+            .wrapping_add(SEQ.fetch_add(1, Ordering::Relaxed))
+            % 36u64.pow(6);
+        format!("up-{}-{}", base36(millis), base36(random))
+    }
+
+    /// Every kind of id that is not one plain name, with what it is. `tag`
+    /// keeps a test's ids its own where the kind allows; the absolute one
+    /// names a path inside `abs_in`.
+    fn not_one_plain_name(tag: &str, abs_in: &Path) -> Vec<(String, &'static str)> {
+        let over = format!("{tag}-{}", "x".repeat(TRANSFER_ID_MAX_BYTES - tag.len()));
+        assert_eq!(over.len(), TRANSFER_ID_MAX_BYTES + 1);
+        vec![
+            ("..".to_string(), "`..`"),
+            (format!("../{tag}"), "a name after `..`"),
+            (
+                abs_in
+                    .join(format!("{tag}-abs"))
+                    .to_string_lossy()
+                    .into_owned(),
+                "an absolute path",
+            ),
+            (format!("{tag}/{tag}"), "a name holding `/`"),
+            (format!("{tag}\\{tag}"), "a name holding `\\`"),
+            (format!(".{tag}"), "a leading dot"),
+            (".".to_string(), "`.`"),
+            (String::new(), "an empty id"),
+            (over, "one byte over the most"),
+        ]
+    }
+
+    /// `Ok` when `res` refused the id with the words the viewer's
+    /// `files:error` shows; else what happened instead.
+    fn refused<T: std::fmt::Debug>(res: Result<T>) -> std::result::Result<(), String> {
+        match res {
+            Err(e) if e.to_string() == NOT_A_TRANSFER_ID => Ok(()),
+            Err(e) => Err(format!("refused, but saying {e:#}")),
+            Ok(v) => Err(format!("taken: {v:?}")),
+        }
+    }
+
+    /// Everything under `root`, each path with its length, so a change
+    /// anywhere under it shows.
+    fn tree(root: &Path) -> BTreeSet<(PathBuf, u64)> {
+        let mut out = BTreeSet::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let len = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    dirs.push(path.clone());
+                }
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                out.insert((rel, len));
+            }
+        }
+        out
+    }
+
+    /// A partial as a begin leaves one in `dir`: its notes, and ten bytes.
+    fn plant(dir: &Path, dest: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let meta = PartialMeta {
+            protocol_version: 1,
+            filename: "x.bin".into(),
+            expected_size: 10,
+            dest_dir: dest.to_path_buf(),
+            reserved_final_path: dest.join("x.bin"),
+            created_at_unix: chrono::Utc::now().timestamp(),
+            rel_path: None,
+            person_sid: None,
+        };
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        std::fs::write(dir.join("data"), b"0123456789").unwrap();
+    }
+
+    fn registered(id: &str) -> Option<PathBuf> {
+        let g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        g.get(id).map(|e| e.meta_path.clone())
+    }
+
+    fn register(id: &str, meta_path: PathBuf) {
+        let mut g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        g.insert(
+            id.to_string(),
+            PartialEntry {
+                meta_path,
+                who: FsAs::Daemon,
+            },
+        );
+    }
+
+    fn forget(id: &str) {
+        let mut g = PARTIAL_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        g.remove(id);
+    }
+
+    /// A handler that stages in `root`, as a Windows install stages in the
+    /// machine's own folder: a resume that finds no registered partial looks
+    /// for one there, by its id.
+    fn staging_in(root: &Path) -> FilesHandler {
+        FilesHandler {
+            staging_root: Some(root.to_path_buf()),
+            ..FilesHandler::new()
+        }
+    }
+
+    /// The rule itself. The viewer's ids, and ids shaped as the tests', pass
+    /// up to 128 bytes; every kind of id that is not one plain name is
+    /// refused, as is any byte but letters, digits, `.`, `_` and `-`.
+    #[test]
+    fn a_transfer_id_is_one_plain_name() {
+        let most = "x".repeat(TRANSFER_ID_MAX_BYTES);
+        let viewer = viewer_shaped();
+        let mut wrong = Vec::new();
+        for id in [
+            viewer.as_str(),
+            "up-mhv3k2x1-4fzyo8",
+            "up-mhv3k2x1-",
+            "rc19-stage-1762876543210987654",
+            "a3688-1",
+            "w3048-split-4242",
+            "abc-123",
+            "a.b_c-D9.",
+            most.as_str(),
+        ] {
+            if transfer_id(id).ok() != Some(id) {
+                wrong.push(format!("refused one plain name {id:?}"));
+            }
+        }
+        let mut not: Vec<(String, &str)> = not_one_plain_name("rule", &std::env::temp_dir());
+        for (id, what) in [
+            ("a b", "a space"),
+            ("a:b", "a colon"),
+            ("a\0b", "a NUL"),
+            ("caf\u{e9}", "a byte past ASCII"),
+            ("a%2fb", "a percent sign"),
+            ("a*b?", "a wildcard"),
+            ("~a", "a tilde"),
+        ] {
+            not.push((id.to_string(), what));
+        }
+        for (id, what) in not {
+            if let Err(why) = refused(transfer_id(&id)) {
+                wrong.push(format!("{what} {id:?}: {why}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A staging path is built from one plain name only: `partial_dir_for`
+    /// and a handler's own staging root refuse every other id themselves, so
+    /// a caller that skipped the check reaches no path. One plain name stays
+    /// one folder inside the staging folder.
+    #[test]
+    fn a_staging_path_is_built_from_one_plain_name_only() {
+        let dest = Path::new("dest");
+        let root = Path::new("staging");
+        let mut wrong = Vec::new();
+        for (id, what) in not_one_plain_name("path", &std::env::temp_dir()) {
+            if let Err(why) = refused(partial_dir_for(dest, &id)) {
+                wrong.push(format!("partial_dir_for, {what} {id:?}: {why}"));
+            }
+            if let Err(why) = refused(FilesHandler::new().partial_dir(dest, &id)) {
+                wrong.push(format!("the handler, {what} {id:?}: {why}"));
+            }
+            if let Err(why) = refused(staging_in(root).partial_dir(dest, &id)) {
+                wrong.push(format!("a staging root, {what} {id:?}: {why}"));
+            }
+        }
+        let id = viewer_shaped();
+        assert_eq!(
+            partial_dir_for(dest, &id).expect("a viewer-shaped id"),
+            dest.join(".roomler-partial").join(&id)
+        );
+        assert_eq!(
+            staging_in(root)
+                .partial_dir(dest, &id)
+                .expect("a viewer-shaped id"),
+            root.join(&id)
+        );
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `files:begin` refuses an id that is not one plain name, in the words
+    /// the viewer shows, before anything on disk is touched: the folder it
+    /// targets, the folders around it and the path an absolute id names stay
+    /// as they were, and nothing is registered. A viewer-shaped id begins as
+    /// before, staged in its own folder.
+    #[tokio::test]
+    async fn begin_refuses_an_id_that_is_not_one_plain_name_before_touching_the_disk() {
+        let _turn = TURNS.lock().await;
+        let sandbox = tempfile::tempdir().unwrap();
+        let dest = sandbox.path().join("to").join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let dest = dest.to_string_lossy().into_owned();
+        let mut wrong = Vec::new();
+        for (id, what) in not_one_plain_name("begin", sandbox.path()) {
+            let before = tree(sandbox.path());
+            let begun = FilesHandler::new()
+                .begin_as(
+                    FsAs::Daemon,
+                    id.clone(),
+                    "x.bin".into(),
+                    10,
+                    None,
+                    Some(&dest),
+                )
+                .await;
+            if let Err(why) = refused(begun) {
+                wrong.push(format!("{what} {id:?}: {why}"));
+            }
+            if tree(sandbox.path()) != before {
+                wrong.push(format!("{what} {id:?}: the disk changed"));
+            }
+            if registered(&id).is_some() {
+                wrong.push(format!("{what} {id:?}: registered"));
+                forget(&id);
+            }
+        }
+        let id = viewer_shaped();
+        let h = FilesHandler::new();
+        h.begin_as(
+            FsAs::Daemon,
+            id.clone(),
+            "x.bin".into(),
+            10,
+            None,
+            Some(&dest),
+        )
+        .await
+        .expect("a viewer-shaped id begins");
+        let staged = registered(&id).expect("and is registered");
+        assert!(
+            staged.ends_with(Path::new(".roomler-partial").join(&id).join("meta.json")),
+            "staged in its own folder: {}",
+            staged.display()
+        );
+        assert!(h.cancel_incoming(&id).await.expect("and cancels"));
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `files:resume` refuses an id that is not one plain name before it
+    /// looks for a partial. A partial planted where each id names, for a
+    /// handler that stages in a root of its own (a Windows install's layout,
+    /// where a resume with nothing registered looks there by the id), keeps
+    /// every byte. A viewer-shaped id resumes as before.
+    #[tokio::test]
+    async fn resume_refuses_an_id_that_is_not_one_plain_name_before_touching_the_disk() {
+        let _turn = TURNS.lock().await;
+        let sandbox = tempfile::tempdir().unwrap();
+        let root = sandbox.path().join("staging");
+        let dest = sandbox.path().join("dest");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut wrong = Vec::new();
+        for (id, what) in not_one_plain_name("resume", sandbox.path()) {
+            plant(&root.join(&id), &dest);
+            let before = tree(sandbox.path());
+            let resumed = staging_in(&root)
+                .resume_incoming_as(FsAs::Daemon, &id, 0)
+                .await;
+            if let Err(why) = refused(resumed) {
+                wrong.push(format!("{what} {id:?}: {why}"));
+            }
+            if tree(sandbox.path()) != before {
+                wrong.push(format!("{what} {id:?}: the disk changed"));
+            }
+        }
+        let id = viewer_shaped();
+        plant(&root.join(&id), &dest);
+        let h = staging_in(&root);
+        let accepted = h
+            .resume_incoming_as(FsAs::Daemon, &id, 0)
+            .await
+            .expect("a viewer-shaped id resumes");
+        assert_eq!(accepted, 0);
+        h.abort().await;
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `files:cancel` refuses an id that is not one plain name before it
+    /// acts: a partial registered under the id, as a begin that took it would
+    /// have left one, stays on disk and registered. A viewer-shaped id
+    /// cancels as before, and its partial goes.
+    #[tokio::test]
+    async fn cancel_refuses_an_id_that_is_not_one_plain_name_before_touching_the_disk() {
+        let _turn = TURNS.lock().await;
+        let sandbox = tempfile::tempdir().unwrap();
+        let dest = sandbox.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let mut wrong = Vec::new();
+        for (n, (id, what)) in not_one_plain_name("cancel", sandbox.path())
+            .into_iter()
+            .enumerate()
+        {
+            let partial = sandbox.path().join("partials").join(n.to_string());
+            plant(&partial, &dest);
+            register(&id, partial.join("meta.json"));
+            let before = tree(sandbox.path());
+            if let Err(why) = refused(FilesHandler::new().cancel_incoming(&id).await) {
+                wrong.push(format!("{what} {id:?}: {why}"));
+            }
+            if tree(sandbox.path()) != before {
+                wrong.push(format!("{what} {id:?}: the disk changed"));
+            }
+            if registered(&id) != Some(partial.join("meta.json")) {
+                wrong.push(format!("{what} {id:?}: the registry changed"));
+            }
+            forget(&id);
+        }
+        let id = viewer_shaped();
+        let h = FilesHandler::new();
+        h.begin_as(
+            FsAs::Daemon,
+            id.clone(),
+            "x.bin".into(),
+            10,
+            None,
+            Some(&dest.to_string_lossy()),
+        )
+        .await
+        .expect("a viewer-shaped id begins");
+        let staging = registered(&id)
+            .and_then(|m| m.parent().map(Path::to_path_buf))
+            .expect("its partial, registered");
+        assert!(h.cancel_incoming(&id).await.expect("and cancels"));
+        assert!(!staging.exists(), "its partial goes");
+        assert!(registered(&id).is_none(), "and its registration");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `files:end` refuses an id that is not one plain name, and the upload
+    /// in flight stays as it was: its own end still completes it.
+    #[tokio::test]
+    async fn end_refuses_an_id_that_is_not_one_plain_name_and_keeps_the_upload() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let dest = sandbox.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        let id = viewer_shaped();
+        let h = FilesHandler::new();
+        h.begin_as(
+            FsAs::Daemon,
+            id.clone(),
+            "x.bin".into(),
+            5,
+            None,
+            Some(&dest.to_string_lossy()),
+        )
+        .await
+        .expect("a viewer-shaped id begins");
+        h.chunk(b"hello").await.expect("its bytes");
+        let mut wrong = Vec::new();
+        for (bad, what) in not_one_plain_name("end", sandbox.path()) {
+            if let Err(why) = refused(h.end(&bad).await) {
+                wrong.push(format!("{what} {bad:?}: {why}"));
+            }
+        }
+        let (path, bytes) = h.end(&id).await.expect("its own end completes it");
+        assert_eq!(
+            (bytes, std::fs::read(&path).unwrap()),
+            (5, b"hello".to_vec())
+        );
+        let _ = std::fs::remove_file(&path);
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

@@ -13206,7 +13206,7 @@ async fn handle_files_control(
             // Browsers send files:cancel on terminal upload failure
             // (6 reconnect attempts exhausted).
             let out_cancelled = handler.cancel_outgoing(&id).await;
-            let in_cancelled = handler.cancel_incoming(&id).await;
+            let in_cancelled = handler.cancel_incoming(&id).await.unwrap_or(false); // RED
             info!(
                 %session_id, %id, out_cancelled, in_cancelled,
                 "files: cancel requested"
