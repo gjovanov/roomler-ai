@@ -122,15 +122,15 @@ refuses to silently fall back to `%APPDATA%`.
 
 From an elevated prompt it first takes the machine folder and its parent,
 `C:\ProgramData\roomler`, for Administrators (#3609,
-`crates/agent-core/src/config.rs:4485`): the folder's owner and nothing else,
+`crates/agent-core/src/config.rs:4592`): the folder's owner and nothing else,
 and for the parent its owner and what it inherits derived again for that
-owner (`crates/agent-core/src/machine_tree.rs:680`). A person's daemon may have
+owner (`crates/agent-core/src/machine_tree.rs:868`). A person's daemon may have
 made both to stage received files before the service ever ran, and the
 service never takes over an entry another account owns, so without this the
 device would keep waiting (2a). What that person made below them stays theirs.
 A config already at the path is carried over (its `machine_id`, mesh and
 settings) only when it is private to the computer's administrators once the
-service's repair has run (`crates/agent-core/src/machine_tree.rs:836`), and
+service's repair has run (`crates/agent-core/src/machine_tree.rs:1064`), and
 (#3666) only when it was the machine's **as found**, read before that repair
 changes anything: `C:\ProgramData\roomler` gave no account other than an
 administrator a right to replace the machine folder, and the folder and the
@@ -140,7 +140,7 @@ place with no `.prev` and no key this build does not know kept from the old
 files, and the device's earlier settings do not carry over. Setup's
 background-service role does the same, from the step that runs the installer
 when Setup itself was started without elevation
-(`agents/roomler-setup/src/machine_write.rs:435`), and reads the config before
+(`agents/roomler-setup/src/machine_write.rs:442`), and reads the config before
 it seals `C:\ProgramData\roomler`. `roomlerd re-enroll` and `roomlerd org`
 refuse such a config, with nothing read from it or sent.
 
@@ -197,19 +197,19 @@ icacls "C:\ProgramData\roomler"
 ```
 
 The service repairs the tree in-process, by handle, with no `icacls` child
-(`crates/agent-core/src/machine_tree.rs:466`), before every check: its own
+(`crates/agent-core/src/machine_tree.rs:592`), before every check: its own
 start, the worker's start, every save of the config, and `keep-system-context`
 at every per-machine upgrade:
 
 | Entry | The repair leaves it | It never |
 |---|---|---|
-| `%ProgramData%\roomler` | an entry of its own for another account that lets that account change anything, cut to read and execute (`machine_tree.rs:200`). Explorer adds full control for the account that confirms its "You don't currently have permission to access this folder" prompt | turns its inheritance off: on an attended host the person's daemon stages received files below it. #3666: while the machine folder holds a config and no save is writing one, it never cuts an entry that lets an account other than an administrator replace the folder (delete what the parent holds, delete the parent, change its permissions or owner); the check refuses the parent until an elevated save cuts it |
+| `%ProgramData%\roomler` | an entry of its own for another account that lets that account change anything, cut to read and execute (`machine_tree.rs:307`). Explorer adds full control for the account that confirms its "You don't currently have permission to access this folder" prompt | turns its inheritance off: on an attended host the person's daemon stages received files below it. #3666: while the machine folder holds a config and no save is writing one, it never cuts an entry that lets an account other than an administrator replace the folder (delete what the parent holds, delete the parent, change its permissions or owner); the check refuses the parent until an elevated save cuts it |
 | the machine folder, once it holds a config that was the machine's as found (#3666), or a save writes one | owned by Administrators, not inheriting, SYSTEM and Administrators `(OI)(CI)` full control only. What is below it inherits that | touches a folder that holds no machine config (a waiting or attended host's), or one whose config was not the machine's as found: sealed, the check would pass whatever another account put in it |
 | `config.toml`; `.prev`, and outside a save `peer-auth\` and the key files the daemon loads, only when that entry itself gave no account other than an administrator a right to change it as found | not inheriting, SYSTEM and Administrators full control only, so an entry added to a folder above later does not reach them | seals a `.prev` or a key file another account could have written (#3666): the check, or the recovery that reads `.prev`, refuses it instead |
 | the attempt record | the same, and read for Users: Setup reads it as the person who started it, to say which stage of a failed background-service install failed | gives Users anything more than read |
 | any of them owned by a member of the computer's Administrators group | given to the Administrators group. The computer's own account database decides, read locally: an account of this computer directly or through another group, a domain account only when the group names it directly | takes over one owned by any other account, or by one that database does not name (a domain account that is an administrator only through a domain group, an Entra account) |
 
-Then it checks the same entries (`machine_tree.rs:729`), all but `.prev`: each is a plain folder or file, owned
+Then it checks the same entries (`machine_tree.rs:917`), all but `.prev`: each is a plain folder or file, owned
 by SYSTEM or Administrators, and no other account may change it (for
 `%ProgramData%\roomler`: may rename or replace what it holds). `.prev` is checked
 where it is read, to recover a config that does not parse; an old one another
@@ -219,11 +219,11 @@ once which entry fails and why (step 6). The service host and the worker read
 it through one function (`agents/roomlerd/src/win_service/supervisor.rs:972`),
 so they cannot disagree, and a SYSTEM worker never loads a config the check
 refused (`agents/roomlerd/src/app.rs:1812`). `keep-system-context` reads a
-record that fails as no record, so SystemContext off (`machine_tree.rs:913`).
+record that fails as no record, so SystemContext off (`machine_tree.rs:1152`).
 
-The writers make every file they write (`machine_tree.rs:287`): the config's temp file, its
+The writers make every file they write (`machine_tree.rs:398`): the config's temp file, its
 `.prev` and the record are new files, given their owner and DACL through their
-handle before they take the name (`machine_tree.rs:977`). A file of that name made by anyone
+handle before they take the name (`machine_tree.rs:1216`). A file of that name made by anyone
 before them is never written into; at worst the save fails and says so.
 
 **Reading the logs:** use `roomler logs` or an elevated shell. Opening these
@@ -244,11 +244,11 @@ starts the SYSTEM worker:
 | The log's reason | Fix |
 |---|---|
 | `… is owned by an account other than SYSTEM or Administrators`, or `… is left as it is: it is owned by an account that is not an administrator of this computer` | `takeown /F "<the entry>" /A`, for a folder with `/R /D Y` (`/D J` on German Windows) |
-| the same for the machine folder, `C:\ProgramData\roomler\roomler`, or for `C:\ProgramData\roomler`: a person's daemon made it to stage received files | Setup run again (its machine write is an administrator's either way), or step 2b from an elevated shell: the save of the machine config takes both for Administrators before it writes (`crates/agent-core/src/machine_tree.rs:644`, `:680`), and its repair then seals the machine folder. What that person made below them keeps its owner. By hand: `takeown /F C:\ProgramData\roomler\roomler /A`, without `/R`, and for `C:\ProgramData\roomler` the row two below |
+| the same for the machine folder, `C:\ProgramData\roomler\roomler`, or for `C:\ProgramData\roomler`: a person's daemon made it to stage received files | Setup run again (its machine write is an administrator's either way), or step 2b from an elevated shell: the save of the machine config takes both for Administrators before it writes (`crates/agent-core/src/machine_tree.rs:832`, `:868`), and its repair then seals the machine folder. What that person made below them keeps its owner. By hand: `takeown /F C:\ProgramData\roomler\roomler /A`, without `/R`, and for `C:\ProgramData\roomler` the row two below |
 | `… is a link (a junction or a symbolic link), not a plain folder` or `file` | move it away and put a plain folder or file in its place (step 2b or 2c for the config) |
 | `C:\ProgramData\roomler\roomler is left as it is: the config it holds was not the machine's as found (…)`, or `C:\ProgramData\roomler lets an account other than SYSTEM or Administrators rename or replace what it holds` on a host whose folder holds a config (#3666) | another account could have put that config there, or chosen what it holds, so it is never run, folded into, re-enrolled or joined from, and the repair does not seal it. Remove that account's entry (`icacls "<the entry>" /remove:g *<SID>`), then run Setup again or step 2b from an elevated shell: the save writes a fresh config and keeps no `.prev`. `… lets an account that is not an administrator of this computer …` on `.prev` or a key file is the same entry-level case: the save replaces `.prev`, and a key file another account could write is sealed only by that elevated save |
 | `… lets an account other than SYSTEM or Administrators change it` | the repair is off (`ROOMLERD_MACHINE_TREE_REPAIR=0`), or this process may not change the entry; `icacls "<the entry>" /reset` from an elevated shell, or switch the repair back on |
-| `C:\ProgramData\roomler lets an account other than SYSTEM or Administrators rename or replace what it holds` | an entry the folder inherits, which the repair leaves (a person's daemon made the folder, so the creator's entry `%ProgramData%` hands down names that person): Setup run again, or step 2b, takes the folder and derives that entry again for Administrators (`machine_tree.rs:680`). By hand: once the folder is Administrators' (`takeown /F C:\ProgramData\roomler /A`), `icacls C:\ProgramData\roomler /reset` |
+| `C:\ProgramData\roomler lets an account other than SYSTEM or Administrators rename or replace what it holds` | an entry the folder inherits, which the repair leaves (a person's daemon made the folder, so the creator's entry `%ProgramData%` hands down names that person): Setup run again, or step 2b, takes the folder and derives that entry again for Administrators (`machine_tree.rs:868`). By hand: once the folder is Administrators' (`takeown /F C:\ProgramData\roomler /A`), `icacls C:\ProgramData\roomler /reset` |
 
 **Switches**, in the `Roomler` service's `Environment`
 (`roomlerd set-service-env-var`): `ROOMLERD_MACHINE_TREE_REPAIR=0` stops the
@@ -275,10 +275,10 @@ the installer and does not read the service's `Environment`: there, both are on.
 > the owner, the new DACL did not reach the children another account owns
 > (measured on #3609's tests). A file gets both in one call. Setup's machine
 > write (the wizard, or the step that runs the installer for a wizard started
-> without elevation, `agents/roomler-setup/src/machine_write.rs:407`) first gives
+> without elevation, `agents/roomler-setup/src/machine_write.rs:414`) first gives
 > the folder to Administrators by handle, refusing a link
-> (`crates/agent-core/src/machine_tree.rs:680`). Its `icacls` step
-> (`agents/roomler-setup/src/orchestrator_agent.rs:1748`)
+> (`crates/agent-core/src/machine_tree.rs:868`). Its `icacls` step
+> (`agents/roomler-setup/src/orchestrator_agent.rs:1750`)
 > takes `%ProgramData%\roomler` for Administrators, then drops its inheritance
 > and grants in one `icacls` call, and stops if it cannot take it.
 
