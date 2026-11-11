@@ -1421,7 +1421,7 @@ mod tests {
             }
             std::fs::rename(from, to)
         });
-        assert_eq!(tried, [config.0.clone()], "{notes:?}");
+        assert_eq!(tried, std::slice::from_ref(&config.0), "{notes:?}");
         assert!(!tree_present(&config.1, &data.1), "{notes:?}");
         assert!(config.0.join("config.toml").is_file(), "{notes:?}");
         assert!(
