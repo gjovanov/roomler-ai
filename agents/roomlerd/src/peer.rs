@@ -13474,9 +13474,10 @@ fn spawn_outgoing_zip_pump(
         let (writer_half, reader_half) = tokio::io::duplex(PIPE_BUFFER);
         let cancel = offer.cancel.clone();
         let path = offer.path.clone();
+        let who = offer.who.clone();
         let walk_cancel = cancel.clone();
         let walk_handle = tokio::spawn(async move {
-            crate::files::walk_and_zip(writer_half, &path, walk_cancel).await
+            crate::files::walk_and_zip(writer_half, &path, &who, walk_cancel).await
         });
 
         let dc_for_pump = dc.clone();
