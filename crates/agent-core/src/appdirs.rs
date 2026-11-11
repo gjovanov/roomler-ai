@@ -623,7 +623,7 @@ pub fn migrate_legacy_trees(
                 Some(profile) => {
                     // The config pair is first in `pairs`: the order
                     // `migrate_dirs_within` keeps.
-                    notes.extend(migrate_dirs_within(profile, &pairs, migrate_dir));
+                    notes.extend(migrate_dirs_within(profile, &pairs, rename_on_disk));
                     // Best-effort: drop the now-empty legacy shells (e.g.
                     // Windows `%APPDATA%\roomler\roomler-agent` after its
                     // `config`/`data` children moved out). `remove_dir`
@@ -672,7 +672,7 @@ pub fn migrate_legacy_trees(
                     notes.push(in_an_installer_step(&old));
                 }
             } else {
-                notes.extend(migrate_dirs_within(&root, &[(old, new)], migrate_dir));
+                notes.extend(migrate_dirs_within(&root, &[(old, new)], rename_on_disk));
             }
         }
     }
@@ -757,24 +757,25 @@ fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
     None
 }
 
-/// #3702 — [`migrate_dir`] (`mv`) for every pair in `root`, or for none of
-/// them ([`kept_in_place`]). The pairs move in the order given, the config
-/// pair first, and a pair whose move fails leaves the pairs after it where
-/// they are. The segment choice ([`tree_exists`]) keys on the NEW config
-/// folder and the NEW local data folder, so it finds a NEW tree only once
-/// the config is in it: the daemon reads the config it had, from the NEW
-/// tree or from the OLD one.
+/// #3702 — [`migrate_dir`] for every pair in `root`, or for none of
+/// them ([`kept_in_place`]), with `rename` as the rename of a pair's folder
+/// ([`rename_on_disk`] outside tests). The pairs move in the order given,
+/// the config pair first, and a pair whose move fails leaves the pairs
+/// after it where they are. The segment choice ([`tree_exists`]) keys on
+/// the NEW config folder and the NEW local data folder, so it finds a NEW
+/// tree only once the config is in it: the daemon reads the config it had,
+/// from the NEW tree or from the OLD one.
 fn migrate_dirs_within(
     root: &Path,
     pairs: &[(PathBuf, PathBuf)],
-    mut mv: impl FnMut(&Path, &Path) -> Result<Option<String>, String>,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Vec<String> {
     if let Some(note) = kept_in_place(root, pairs) {
         return vec![note];
     }
     let mut notes = Vec::new();
     for (at, (old, new)) in pairs.iter().enumerate() {
-        match mv(old, new) {
+        match migrate_dir(old, new, &mut rename) {
             Ok(note) => notes.extend(note),
             Err(note) => {
                 notes.push(note);
@@ -793,11 +794,22 @@ fn migrate_dirs_within(
     notes
 }
 
-/// Apply the migration rules to one directory pair: `Ok` with a note for
-/// anything noteworthy (moved, or left beside a NEW folder that is already
-/// there), `Ok(None)` for the quiet no-legacy case, `Err` with a note when
-/// the move failed and the legacy folder is still where it was.
-fn migrate_dir(old: &Path, new: &Path) -> Result<Option<String>, String> {
+/// The system's own rename: the one [`migrate_dirs_within`] takes outside
+/// tests.
+fn rename_on_disk(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// Apply the migration rules to one directory pair, with `rename` as the
+/// rename of its folder: `Ok` with a note for anything noteworthy (moved, or
+/// left beside a NEW folder that is already there), `Ok(None)` for the quiet
+/// no-legacy case, `Err` with a note when the move failed and the legacy
+/// folder is still where it was.
+fn migrate_dir(
+    old: &Path,
+    new: &Path,
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Option<String>, String> {
     if !old.exists() {
         return Ok(None);
     }
@@ -815,7 +827,7 @@ fn migrate_dir(old: &Path, new: &Path) -> Result<Option<String>, String> {
             parent.display()
         ));
     }
-    match std::fs::rename(old, new) {
+    match rename(old, new) {
         Ok(()) => Ok(Some(format!(
             "migrated legacy tree {} -> {}",
             old.display(),
@@ -1299,7 +1311,7 @@ mod tests {
         let notes = migrate_dirs_within(
             &profile,
             &[(link.join(OLD_APP), link.join(NEW_APP))],
-            migrate_dir,
+            rename_on_disk,
         );
         assert!(
             elsewhere.join(OLD_APP).join("config.toml").is_file(),
@@ -1313,7 +1325,7 @@ mod tests {
         let notes = migrate_dirs_within(
             &real,
             &[(real.join(OLD_APP), real.join(NEW_APP))],
-            migrate_dir,
+            rename_on_disk,
         );
         assert!(real.join(NEW_APP).is_dir(), "{notes:?}");
     }
@@ -1349,7 +1361,7 @@ mod tests {
         std::fs::write(data_home.join(OLD_APP).join("logs.txt"), "x").unwrap();
         let (config, data) = (pair_in(&config_home), pair_in(&data_home));
 
-        let notes = migrate_dirs_within(&profile, &[config.clone(), data.clone()], migrate_dir);
+        let notes = migrate_dirs_within(&profile, &[config.clone(), data.clone()], rename_on_disk);
 
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
@@ -1367,7 +1379,7 @@ mod tests {
         for (old, _) in &pairs {
             std::fs::create_dir_all(old).unwrap();
         }
-        let notes = migrate_dirs_within(&plain, &pairs, migrate_dir);
+        let notes = migrate_dirs_within(&plain, &pairs, rename_on_disk);
         assert!(
             pairs.iter().all(|(old, new)| !old.exists() && new.is_dir()),
             "{notes:?}"
@@ -1390,12 +1402,12 @@ mod tests {
         }
         std::fs::write(config.0.join("config.toml"), "x").unwrap();
         let mut tried = Vec::new();
-        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |old, new| {
-            tried.push(old.to_path_buf());
-            if old == config.0 {
-                return Err(format!("migration failed ({})", old.display()));
+        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |from, to| {
+            tried.push(from.to_path_buf());
+            if from == config.0 {
+                return Err(std::io::Error::other("another volume"));
             }
-            migrate_dir(old, new)
+            std::fs::rename(from, to)
         });
         assert_eq!(tried, [config.0.clone()], "{notes:?}");
         assert!(!tree_present(&config.1, &data.1), "{notes:?}");
@@ -1406,6 +1418,43 @@ mod tests {
                 .any(|n| n.contains(&data.0.display().to_string())),
             "{notes:?}"
         );
+    }
+
+    /// #3702 — the config folder moves by one rename or not at all. A rename
+    /// of it that the system refuses (an indexer's handle on the folder)
+    /// leaves no NEW config folder and moves no pair after it: the segment
+    /// choice keeps the OLD tree, which holds the config and everything else
+    /// the folder held.
+    #[test]
+    fn the_config_folder_moves_by_one_rename_or_not_at_all() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let (config, data) = (
+            pair_in(&profile.join("config")),
+            pair_in(&profile.join("data")),
+        );
+        for (old, _) in [&config, &data] {
+            std::fs::create_dir_all(old).unwrap();
+            std::fs::write(old.join("a.log"), "x").unwrap();
+        }
+        std::fs::write(config.0.join("config.toml"), "x").unwrap();
+
+        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |from, to| {
+            if from == config.0 {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            std::fs::rename(from, to)
+        });
+
+        assert!(!tree_present(&config.1, &data.1), "{notes:?}");
+        assert!(tree_present(&config.0, &data.0), "{notes:?}");
+        for file in [
+            config.0.join("config.toml"),
+            config.0.join("a.log"),
+            data.0.join("a.log"),
+        ] {
+            assert!(file.is_file(), "{}: {notes:?}", file.display());
+        }
     }
 
     #[test]
@@ -1538,7 +1587,7 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("config.toml"), b"agent_token = \"x\"").unwrap();
 
-        let note = migrate_dir(&old, &new)
+        let note = migrate_dir(&old, &new, rename_on_disk)
             .unwrap()
             .expect("a move produces a note");
         assert!(note.starts_with("migrated"), "{note}");
@@ -1559,7 +1608,7 @@ mod tests {
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(old.join("stale.txt"), b"old").unwrap();
 
-        let note = migrate_dir(&old, &new)
+        let note = migrate_dir(&old, &new, rename_on_disk)
             .unwrap()
             .expect("both-present produces a note");
         assert!(note.contains("left in place"), "{note}");
@@ -1646,7 +1695,8 @@ mod tests {
         assert_eq!(
             migrate_dir(
                 &tmp.path().join("roomler-agent"),
-                &tmp.path().join("roomler")
+                &tmp.path().join("roomler"),
+                rename_on_disk
             ),
             Ok(None)
         );
