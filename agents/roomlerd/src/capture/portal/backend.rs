@@ -137,8 +137,19 @@ impl PortalCapture {
                  will show a picker, so somebody has to be at the screen"
             );
         }
-        let mut child =
+        let child =
             super::helper::spawn_streaming(target_fps, want_input, use_mutter, window_capture)?;
+        Self::from_helper(child, use_mutter, want_input)
+    }
+
+    /// The capture over a helper already started: its handshake, then its
+    /// frames. Split from [`Self::open_with`] so a test can hand it a
+    /// stand-in helper.
+    fn from_helper(
+        mut child: std::process::Child,
+        use_mutter: bool,
+        want_input: bool,
+    ) -> Result<Self> {
         let stdout = child
             .stdout
             .take()
@@ -867,5 +878,26 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_secs(5));
         let _ = running.kill();
         let _ = running.wait();
+    }
+
+    /// #3695 — a handshake that fails ends the helper and waits for it. The
+    /// stand-in closes its stdout without announcing a stream and stays up;
+    /// once the open has returned, it is no longer in the process table.
+    #[test]
+    fn a_failed_handshake_ends_the_helper_and_waits_for_it() {
+        let helper = std::process::Command::new("sh")
+            .args(["-c", "exec >&-; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = helper.id();
+        let e = PortalCapture::from_helper(helper, false, false)
+            .err()
+            .expect("the handshake failed");
+        assert!(e.to_string().contains("before announcing a stream"), "{e}");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the helper is still in the process table"
+        );
     }
 }
