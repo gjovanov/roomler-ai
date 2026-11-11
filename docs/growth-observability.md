@@ -1467,7 +1467,7 @@ with its reason on hover, a rate appears only with n ≥ 30, subjects are render
 
 **In the digest**, the `newsletter` section gains `delivery` — the day's (and 7/28 days')
 delivered, bounced (hard), dropped, spam reports and addresses suppressed, by each event's own
-time ([`delivery_figures`, digest.rs:1874](../crates/api/src/growth/digest.rs)), `not_measured`
+time ([`delivery_figures`, digest.rs:1875](../crates/api/src/growth/digest.rs)), `not_measured`
 on a server without the webhook — `unsubscribed_via_issue`, and per issue sent that day its
 delivery so far and its unsubscribes, by the same reads and the same three cells as the table.
 
@@ -1640,7 +1640,7 @@ current month.
 
 > [!NOTE]
 > **"Nothing on record" states what the backfill did, as its ledger row says**
-> ([`no_billing_record`, digest.rs:2064](../crates/api/src/growth/digest.rs)). The panel's `billed` and
+> ([`no_billing_record`, digest.rs:2065](../crates/api/src/growth/digest.rs)). The panel's `billed` and
 > the digest's share one reason, and it reads three ways:
 >
 > - *the backfill has not run*;
@@ -1660,9 +1660,9 @@ current month.
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
   the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
   cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2088](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  ([`billed_figures`, digest.rs:2089](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2183](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2184](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel
