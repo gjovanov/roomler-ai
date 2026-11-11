@@ -16,6 +16,11 @@
 #                                        every installer against its .sha256 sidecar
 #   prune-plan    <keep> <current-tag>   folder names on stdin -> the folders to remove,
 #                                        oldest first
+#   listing-state <tag>                  what the listing serves for windows, mac and
+#                                        linux on stdin -> current | behind | newer
+#   reconcile-plan <tag> <folders> <listing> <alert>
+#                                        what the reconcile does about the newest
+#                                        release -> publish | verified | nothing
 #   --selftest                           proves each of the above, offline
 #
 # ⚠️ This file makes no network call and must never gain one. `--selftest` runs on
@@ -65,18 +70,26 @@ newest() {
   printf '%s\n' "$all" | tail -n 1
 }
 
-# Which OS's Download default an asset becomes. Exact names only: the Windows
-# `.zip` holds the same EXE and the aarch64 tarball is a second Linux build, and
-# neither may ever win the button by matching a looser pattern.
+# The one file that is an OS's Download default in version <v>. Exact names only:
+# the Windows `.zip` holds the same EXE and the aarch64 tarball is a second Linux
+# build, and neither may ever win the button by matching a looser pattern.
+default_file() {
+  case "$1" in
+    windows) echo "roomler-setup-${2}-x86_64-pc-windows-msvc.exe" ;;
+    mac)     echo "roomler-setup-${2}-universal-apple-darwin.tar.gz" ;;
+    linux)   echo "roomler-setup-${2}-x86_64-unknown-linux-gnu.tar.gz" ;;
+    *)       die "no such platform: '$1'" ;;
+  esac
+}
+
+# Which OS's Download default an asset becomes: nothing for every other asset.
 default_for() {
-  local tag="$1" name="$2" v
+  local tag="$1" name="$2" v os
   valid_tag "$tag" || die "not a final setup release tag: '$tag'"
   v="${tag#setup-v}"
-  case "$name" in
-    "roomler-setup-${v}-x86_64-pc-windows-msvc.exe")      echo windows ;;
-    "roomler-setup-${v}-universal-apple-darwin.tar.gz")   echo mac ;;
-    "roomler-setup-${v}-x86_64-unknown-linux-gnu.tar.gz") echo linux ;;
-  esac
+  for os in windows mac linux; do
+    if [ "$name" = "$(default_file "$os" "$v")" ]; then echo "$os"; fi
+  done
 }
 
 # The three defaults of a release, or a failure naming the one that is missing.
@@ -89,11 +102,7 @@ defaults_plan() {
   [ -d "$dir" ] || die "no such directory: '$dir'"
   v="${tag#setup-v}"
   for os in windows mac linux; do
-    case "$os" in
-      windows) file="roomler-setup-${v}-x86_64-pc-windows-msvc.exe" ;;
-      mac)     file="roomler-setup-${v}-universal-apple-darwin.tar.gz" ;;
-      linux)   file="roomler-setup-${v}-x86_64-unknown-linux-gnu.tar.gz" ;;
-    esac
+    file="$(default_file "$os" "$v")"
     if [ -f "$dir/$file" ]; then
       printf '%s\t%s\n' "$os" "$file"
     else
@@ -183,6 +192,117 @@ prune_plan() {
   n="$(printf '%s\n' "$all" | grep -c . || true)"
   [ "$n" -gt "$keep" ] || return 0
   printf '%s\n' "$all" | head -n "$((n - keep))" | grep -vxF -- "$current" || true
+}
+
+# Whether the listing's three Download buttons are this release's. stdin: the file
+# best_release.json names for windows, for mac and for linux, in that order, one
+# per line (`/setup-v0.4.211/roomler-setup-0.4.211-….exe`; an empty line for a
+# platform that has no default). Prints one word:
+#   current  all three are exactly this release's defaults
+#   newer    at least one button serves a setup release NEWER than this one, so
+#            this tag is not the newest SourceForge knows
+#   behind   anything else: an older release, another file, or no default at all
+# It refuses only what it cannot read: a tag that is not one, or not three lines.
+listing_state() {
+  local tag="$1" v os line folder i=0 state=current
+  local -a served=()
+  valid_tag "$tag" || die "not a final setup release tag: '$tag'"
+  v="${tag#setup-v}"
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Two statements on purpose. `served+=("${line%$'\r'}")` keeps the CR on
+    # bash 5.2.37 (Git for Windows): inside an array assignment that shell does
+    # not read `$'\r'` as a carriage return. The plain assignment does, on both.
+    line="${line%$'\r'}"
+    served+=("$line")
+  done
+  [ "${#served[@]}" -eq 3 ] || die "want three lines (windows, mac, linux), got ${#served[@]}"
+  for os in windows mac linux; do
+    line="${served[$i]}"
+    i=$((i + 1))
+    [ "$line" != "/$tag/$(default_file "$os" "$v")" ] || continue
+    [ "$state" = newer ] || state=behind
+    folder="${line#/}"
+    folder="${folder%%/*}"
+    if valid_tag "$folder" && [ "$folder" != "$tag" ] \
+       && [ "$(printf '%s\n%s\n' "$folder" "$tag" | sorted_tags | tail -n 1)" = "$folder" ]; then
+      state=newer
+    fi
+  done
+  echo "$state"
+}
+
+# What the reconcile does about <tag>, the newest final setup release on GitHub,
+# from what it could read of SourceForge. It never publishes anything itself: the
+# answer `publish` means "send the dispatch this release should have sent".
+#   <folders>  ok | unreadable   whether the file store's listing was read. When ok,
+#                                stdin is that listing, as `sftp ls -1` prints it.
+#   <listing>  current | behind | newer | unreadable
+#                                listing-state's word for the three buttons, or
+#                                unreadable when best_release.json gave none.
+#   <alert>    open | none | unreadable
+#                                whether a "SourceForge publish failed" issue is
+#                                open: a publish failed and none has passed since.
+# Prints one word, and on a second line the reason in plain words:
+#   publish   the release's folder is not on SourceForge, or the buttons were read
+#             and do not serve it, or an alert is open, or nothing at all could be
+#             read
+#   verified  nothing to do, and the buttons were read to be this release's
+#   nothing   nothing to do: the folder is there and the buttons could not be read
+# The file store decides, because it is the channel a publish needs anyway. The
+# buttons only add what they can prove: `behind` sends, `current` verifies.
+#
+# An open alert sends, whatever the listing looks like. Only a green publish
+# closes an alert, so the one way to end it is to publish again: a run that passes
+# closes it, and one that fails says "failed again" on the same issue. A publish
+# can fail after the buttons have moved (the wait for the listing, retention), and
+# the buttons alone cannot tell whether that fault is gone. An alert that could
+# not be read is not an open one.
+#
+# It refuses when SourceForge carries a setup release NEWER than <tag>, as a folder
+# or on a button. That is a release pulled back on GitHub. Sending <tag> again
+# would move the buttons backwards, and that is a person's decision. An open alert
+# does not change that.
+reconcile_plan() {
+  local tag="$1" folders="$2" listing="$3" alert="$4" all="" top
+  valid_tag "$tag" || die "not a final setup release tag: '$tag'"
+  case "$folders" in
+    ok|unreadable) ;;
+    *) die "folders must be ok or unreadable, got '$folders'" ;;
+  esac
+  case "$listing" in
+    current|behind|newer|unreadable) ;;
+    *) die "listing must be current, behind, newer or unreadable, got '$listing'" ;;
+  esac
+  case "$alert" in
+    open|none|unreadable) ;;
+    *) die "alert must be open, none or unreadable, got '$alert'" ;;
+  esac
+
+  if [ "$folders" = ok ]; then
+    all="$(sorted_tags)"
+    top="$(printf '%s\n' "$all" | tail -n 1)"
+    if [ -n "$top" ] && [ "$top" != "$tag" ] \
+       && [ "$(printf '%s\n%s\n' "$top" "$tag" | sorted_tags | tail -n 1)" = "$top" ]; then
+      die "SourceForge holds $top, which is newer than $tag: refusing"
+    fi
+  fi
+  if [ "$listing" = newer ]; then
+    die "a Download button serves a setup release newer than $tag: refusing"
+  fi
+
+  if [ "$folders" = ok ] && ! printf '%s\n' "$all" | grep -qxF -- "$tag"; then
+    printf 'publish\n%s\n' "SourceForge has no folder for $tag"
+  elif [ "$listing" = behind ]; then
+    printf 'publish\n%s\n' "the Download buttons do not serve $tag"
+  elif [ "$alert" = open ]; then
+    printf 'publish\n%s\n' "an alert is open: a publish failed and none has passed since"
+  elif [ "$listing" = current ]; then
+    printf 'verified\n%s\n' "the Download buttons serve $tag"
+  elif [ "$folders" = ok ]; then
+    printf 'nothing\n%s\n' "the folder for $tag is on SourceForge, and the buttons could not be read"
+  else
+    printf 'publish\n%s\n' "neither SourceForge's files nor its buttons could be read"
+  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -347,6 +467,154 @@ selftest() {
   plan x setup-v0.4.211 "${names[@]}";  eq "prune refuses a keep that is not a number" "$rc" 2
   plan 10 seed-cache "${names[@]}";     eq "prune refuses a current tag of another family" "$rc" 2
 
+  # --- listing-state ------------------------------------------------------------
+  # stdin: what best_release.json names for windows, mac and linux, in that order.
+  state() { out="$(printf '%s\n' "${@:2}" | bash "$0" listing-state "$1" 2>"$tmp/err")" && rc=0 || rc=$?; }
+  local w211=/setup-v0.4.211/roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe
+  local m211=/setup-v0.4.211/roomler-setup-0.4.211-universal-apple-darwin.tar.gz
+  local l211=/setup-v0.4.211/roomler-setup-0.4.211-x86_64-unknown-linux-gnu.tar.gz
+  local w210=/setup-v0.4.210/roomler-setup-0.4.210-x86_64-pc-windows-msvc.exe
+  local m210=/setup-v0.4.210/roomler-setup-0.4.210-universal-apple-darwin.tar.gz
+  local l210=/setup-v0.4.210/roomler-setup-0.4.210-x86_64-unknown-linux-gnu.tar.gz
+
+  state setup-v0.4.211 "$w211" "$m211" "$l211"; eq "listing-state: all three are this release's" "$out" current
+  eq "listing-state: and that is exit 0" "$rc" 0
+  state setup-v0.4.211 "$w210" "$m210" "$l210"; eq "listing-state: all three one release back" "$out" behind
+  eq "listing-state: behind is exit 0 too" "$rc" 0
+  state setup-v0.4.211 "$w210" "$m211" "$l211"; eq "listing-state: only windows back" "$out" behind
+  state setup-v0.4.211 "$w211" "$m210" "$l211"; eq "listing-state: only mac back" "$out" behind
+  state setup-v0.4.211 "$w211" "$m211" "$l210"; eq "listing-state: only linux back" "$out" behind
+  state setup-v0.4.211 "$w211" "$m211" "";      eq "listing-state: a platform with no default" "$out" behind
+  # The right folder is not enough: the button has to be the one default file.
+  state setup-v0.4.211 /setup-v0.4.211/roomler-setup-0.4.211-x86_64-pc-windows-msvc.zip "$m211" "$l211"
+  eq "listing-state: the zip is not the windows default" "$out" behind
+  state setup-v0.4.211 "$w211" "$m211" /setup-v0.4.211/roomler-setup-0.4.211-aarch64-unknown-linux-gnu.tar.gz
+  eq "listing-state: the aarch64 tarball is not the linux default" "$out" behind
+  state setup-v0.4.211 "$w211" "$l211" "$m211"; eq "listing-state: the right files on the wrong platforms" "$out" behind
+  state setup-v0.4.211 /agent-v0.4.211/roomler-desktop-0.4.211-x86_64-pc-windows-msvc.exe "$m211" "$l211"
+  eq "listing-state: a file of another release family" "$out" behind
+  out="$(printf '%s\r\n%s\r\n%s\r\n' "$w211" "$m211" "$l211" | bash "$0" listing-state setup-v0.4.211)" && rc=0 || rc=$?
+  eq "listing-state: CR line ends" "$out" current
+  # Version order, not text order: 0.4.9 is older than 0.4.10.
+  state setup-v0.4.10 /setup-v0.4.9/roomler-setup-0.4.9-x86_64-pc-windows-msvc.exe \
+        /setup-v0.4.10/roomler-setup-0.4.10-universal-apple-darwin.tar.gz \
+        /setup-v0.4.10/roomler-setup-0.4.10-x86_64-unknown-linux-gnu.tar.gz
+  eq "listing-state: 0.4.9 is behind 0.4.10" "$out" behind
+
+  # Newer: a button already serves a later setup release than the tag asked about.
+  state setup-v0.4.210 "$w211" "$m211" "$l211"; eq "listing-state: all three newer" "$out" newer
+  eq "listing-state: newer is exit 0, a word and not a failure" "$rc" 0
+  state setup-v0.4.210 "$w211" "$m210" "$l210"; eq "listing-state: only windows newer" "$out" newer
+  state setup-v0.4.210 "$w210" "$m211" "$l210"; eq "listing-state: only mac newer" "$out" newer
+  state setup-v0.4.210 "$w210" "$m210" "$l211"; eq "listing-state: only linux newer" "$out" newer
+  # One newer and one older is still newer: the order of the lines must not matter.
+  state setup-v0.4.210 "$w211" /setup-v0.4.209/roomler-setup-0.4.209-universal-apple-darwin.tar.gz "$l210"
+  eq "listing-state: newer first, then older" "$out" newer
+  state setup-v0.4.210 /setup-v0.4.209/roomler-setup-0.4.209-x86_64-pc-windows-msvc.exe "$m210" "$l211"
+  eq "listing-state: older first, then newer" "$out" newer
+  state setup-v0.4.9 /setup-v0.4.10/roomler-setup-0.4.10-x86_64-pc-windows-msvc.exe \
+        /setup-v0.4.9/roomler-setup-0.4.9-universal-apple-darwin.tar.gz \
+        /setup-v0.4.9/roomler-setup-0.4.9-x86_64-unknown-linux-gnu.tar.gz
+  eq "listing-state: 0.4.10 is newer than 0.4.9" "$out" newer
+
+  # Refusals: only what cannot be read.
+  state setup-v0.4.211 "$w211" "$m211";                  eq "listing-state refuses two lines" "$rc" 2
+  eq "listing-state prints nothing on a refusal" "$out" ''
+  state setup-v0.4.211 "$w211" "$m211" "$l211" "$l211";  eq "listing-state refuses four lines" "$rc" 2
+  state setup-v0.4.211;                                  eq "listing-state refuses one blank line" "$rc" 2
+  out="$(bash "$0" listing-state setup-v0.4.211 < /dev/null 2>"$tmp/err")" && rc=0 || rc=$?
+  eq "listing-state refuses an empty answer" "$rc" 2
+  state seed-cache "$w211" "$m211" "$l211";              eq "listing-state refuses a tag of another family" "$rc" 2
+  state seed-cache "" "" "";                             eq "listing-state refuses it whatever the listing serves" "$rc" 2
+  state setup-v0.4.212-rc.1 "$w211" "$m211" "$l211";     eq "listing-state refuses a pre-release tag" "$rc" 2
+
+  # --- reconcile-plan -----------------------------------------------------------
+  # rplan <tag> <folders> <listing> [folder names...]: `out` is the plan word.
+  # The fourth argument, the alert, is `$alert`: none unless a block sets it.
+  local alert=none
+  rplan() {
+    out="$(printf '%s\n' "${@:4}" | bash "$0" reconcile-plan "$1" "$2" "$3" "$alert" 2>"$tmp/err")" && rc=0 || rc=$?
+    why="$(printf '%s\n' "$out" | sed -n 2p)"
+    out="$(printf '%s\n' "$out" | sed -n 1p)"
+  }
+  local why
+  local held=(setup-v0.4.209 setup-v0.4.210 setup-v0.4.211)     # the release's folder is there
+  local lacks=(setup-v0.4.209 setup-v0.4.210)                   # it is not
+
+  # The file store decides.
+  rplan setup-v0.4.211 ok current    "${lacks[@]}"; eq "reconcile: no folder, buttons current" "$out" publish
+  rplan setup-v0.4.211 ok behind     "${lacks[@]}"; eq "reconcile: no folder, buttons behind" "$out" publish
+  rplan setup-v0.4.211 ok unreadable "${lacks[@]}"; eq "reconcile: no folder, buttons unread" "$out" publish
+  eq "reconcile: and it says why" "$why" "SourceForge has no folder for setup-v0.4.211"
+  rplan setup-v0.4.211 ok unreadable;               eq "reconcile: an empty file store" "$out" publish
+  rplan setup-v0.4.211 ok unreadable seed-cache agent-v0.4.211 README.md
+  eq "reconcile: a file store with no setup folder" "$out" publish
+  # With the folder there, the buttons add only what they can prove.
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile: folder there, buttons current" "$out" verified
+  rplan setup-v0.4.211 ok behind     "${held[@]}"; eq "reconcile: folder there, buttons behind" "$out" publish
+  eq "reconcile: behind says why" "$why" "the Download buttons do not serve setup-v0.4.211"
+  rplan setup-v0.4.211 ok unreadable "${held[@]}"; eq "reconcile: folder there, buttons unread" "$out" nothing
+  eq "reconcile: nothing is exit 0" "$rc" 0
+  # Without the file store, the buttons decide; without either, it sends.
+  rplan setup-v0.4.211 unreadable current;    eq "reconcile: files unread, buttons current" "$out" verified
+  rplan setup-v0.4.211 unreadable behind;     eq "reconcile: files unread, buttons behind" "$out" publish
+  rplan setup-v0.4.211 unreadable unreadable; eq "reconcile: nothing could be read" "$out" publish
+  # stdin is not the file store when it could not be read: whatever is on it is ignored.
+  rplan setup-v0.4.211 unreadable current setup-v0.4.212 setup-v0.4.213
+  eq "reconcile: an unread file store is not consulted" "$out" verified
+  # sftp's own output shape, and version order.
+  out="$(printf 'sftp> ls -1 /home/frs/project/x/\r\n/home/frs/project/x/setup-v0.4.9/\r\n/home/frs/project/x/setup-v0.4.10\r\n' \
+        | bash "$0" reconcile-plan setup-v0.4.10 ok current none | sed -n 1p)" && rc=0 || rc=$?
+  eq "reconcile: sftp listing, 0.4.10 after 0.4.9" "$out" verified
+
+  # A release pulled back on GitHub: SourceForge is ahead, and nothing is sent.
+  rplan setup-v0.4.210 ok current    "${held[@]}"; eq "reconcile refuses when a newer folder is there" "$rc" 2
+  eq "reconcile prints no plan on that refusal" "$out" ''
+  rplan setup-v0.4.210 ok behind     "${held[@]}"; eq "reconcile refuses it with the buttons behind too" "$rc" 2
+  rplan setup-v0.4.210 ok unreadable "${held[@]}"; eq "reconcile refuses it with the buttons unread too" "$rc" 2
+  rplan setup-v0.4.9 ok current setup-v0.4.9 setup-v0.4.10
+  eq "reconcile refuses 0.4.10 as newer than 0.4.9" "$rc" 2
+  rplan setup-v0.4.211 ok newer "${held[@]}";      eq "reconcile refuses a newer button" "$rc" 2
+  rplan setup-v0.4.211 unreadable newer;           eq "reconcile refuses a newer button with the files unread" "$rc" 2
+  # A newer folder of another family, or a pre-release one, is not a newer setup release.
+  rplan setup-v0.4.211 ok current "${held[@]}" agent-v0.4.999 setup-v0.4.212-rc.1 tunnel-v9.9.9
+  eq "reconcile: strangers are not newer releases" "$out" verified
+  # Arguments it cannot read.
+  rplan seed-cache ok current "${held[@]}";          eq "reconcile refuses a tag of another family" "$rc" 2
+  rplan seed-cache unreadable current;               eq "reconcile refuses it with nothing else to trip on" "$rc" 2
+  rplan setup-v0.4.212-rc.1 unreadable current;      eq "reconcile refuses a pre-release tag" "$rc" 2
+  rplan setup-v0.4.211 yes current "${held[@]}";     eq "reconcile refuses an unknown folders word" "$rc" 2
+  rplan setup-v0.4.211 ok stale "${held[@]}";        eq "reconcile refuses an unknown listing word" "$rc" 2
+  rplan setup-v0.4.211 ok "" "${held[@]}";           eq "reconcile refuses an empty listing word" "$rc" 2
+
+  # An open alert sends, whatever the listing looks like: only a green publish
+  # closes an alert, so the reconcile publishes again until one passes.
+  alert=open
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile: an alert open, buttons current" "$out" publish
+  eq "reconcile: an open alert says why" "$why" "an alert is open: a publish failed and none has passed since"
+  rplan setup-v0.4.211 ok unreadable "${held[@]}"; eq "reconcile: an alert open, buttons unread" "$out" publish
+  rplan setup-v0.4.211 unreadable current;         eq "reconcile: an alert open, files unread, buttons current" "$out" publish
+  # The reasons that already send keep their own words.
+  rplan setup-v0.4.211 ok current    "${lacks[@]}"; eq "reconcile: an alert open, no folder: the folder is the reason" "$why" "SourceForge has no folder for setup-v0.4.211"
+  rplan setup-v0.4.211 ok behind     "${held[@]}"; eq "reconcile: an alert open, buttons behind: the buttons are the reason" "$why" "the Download buttons do not serve setup-v0.4.211"
+  # It does not outrank a refusal: nothing is sent while SourceForge is ahead.
+  rplan setup-v0.4.210 ok current    "${held[@]}"; eq "reconcile refuses a newer folder with an alert open" "$rc" 2
+  eq "reconcile prints no plan on that refusal either" "$out" ''
+  rplan setup-v0.4.211 ok newer      "${held[@]}"; eq "reconcile refuses a newer button with an alert open" "$rc" 2
+  # An alert that could not be read is not an open one.
+  alert=unreadable
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile: an unread alert, buttons current" "$out" verified
+  rplan setup-v0.4.211 ok unreadable "${held[@]}"; eq "reconcile: an unread alert, buttons unread" "$out" nothing
+  rplan setup-v0.4.211 ok current    "${lacks[@]}"; eq "reconcile: an unread alert, no folder" "$out" publish
+  # The alert word itself.
+  alert=maybe
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile refuses an unknown alert word" "$rc" 2
+  alert=''
+  rplan setup-v0.4.211 ok current    "${held[@]}"; eq "reconcile refuses an empty alert word" "$rc" 2
+  alert=none
+  out="$(printf '%s\n' "${held[@]}" | bash "$0" reconcile-plan setup-v0.4.211 ok current 2>"$tmp/err")" && rc=0 || rc=$?
+  eq "reconcile-plan refuses a call without the alert word" "$rc" 2
+
   if [ "$fail" -ne 0 ]; then
     echo "sourceforge-publish selftest: $fail of $((pass + fail)) checks FAILED" >&2
     return 1
@@ -361,6 +629,10 @@ case "${1:-}" in
   defaults-plan) [ $# -eq 3 ] || die "usage: defaults-plan <tag> <dir>";        defaults_plan "$2" "$3" ;;
   verify)        [ $# -eq 3 ] || die "usage: verify <dir> <digests.tsv>";       verify "$2" "$3" ;;
   prune-plan)    [ $# -eq 3 ] || die "usage: prune-plan <keep> <current-tag>";  prune_plan "$2" "$3" ;;
+  listing-state) [ $# -eq 2 ] || die "usage: listing-state <tag>  (three file names on stdin)"; listing_state "$2" ;;
+  reconcile-plan)
+    [ $# -eq 5 ] || die "usage: reconcile-plan <tag> <ok|unreadable> <current|behind|newer|unreadable> <open|none|unreadable>  (folder names on stdin)"
+    reconcile_plan "$2" "$3" "$4" "$5" ;;
   --selftest)    selftest ;;
-  *) die "usage: $0 valid-tag|newest|default-for|defaults-plan|verify|prune-plan|--selftest (see the header)" ;;
+  *) die "usage: $0 valid-tag|newest|default-for|defaults-plan|verify|prune-plan|listing-state|reconcile-plan|--selftest (see the header)" ;;
 esac
