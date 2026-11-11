@@ -86,6 +86,13 @@ inverted one. The 31 already on master when it landed (2026-10-21, all half-shif
 pinned in `scripts/anchor-range-baseline.txt`. Fix one and delete its line; the baseline only
 shrinks.
 
+A **code map** is the exception to `file:line`: the table under a doc's `Code map` heading
+whose first column is `File` names its code and carries **no line numbers** (#3686). A name
+survives a move, so a PR that only moves code needs no edit there. CI's
+`scripts/code-map-audit.sh` fails on a name that is no longer in its row's file, on a file
+that is not in the repository, and on a line number. Where a row means a place inside a
+function, it names the function.
+
 ## Registry
 
 <!-- RETIRED-NAME-ANCHOR(22): the FR-21 row names what FR-21 retired; an FR title
