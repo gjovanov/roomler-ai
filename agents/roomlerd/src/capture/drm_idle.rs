@@ -175,7 +175,7 @@ pub fn sample_rows_n(src: &[u8], row_bytes: usize, height: u32, pitch: u32, n: u
     let mut h = FNV_OFFSET;
     let n = n.min(height);
     for i in 0..n {
-        let start = sampled_row(i, n, height) * pitch as usize;
+        let start = sampled_row_index(i, n, height) * pitch as usize;
         let Some(row) = src.get(start..start + row_bytes) else {
             break;
         };
@@ -186,7 +186,7 @@ pub fn sample_rows_n(src: &[u8], row_bytes: usize, height: u32, pitch: u32, n: u
 
 /// The `i`-th of `n` sampled rows of a `height`-row picture: the centre of the
 /// `i`-th of `n` equal bands.
-fn sampled_row(i: u32, n: u32, height: u32) -> usize {
+fn sampled_row_index(i: u32, n: u32, height: u32) -> usize {
     (u64::from(2 * i + 1) * u64::from(height) / u64::from(2 * n)) as usize
 }
 
@@ -271,7 +271,7 @@ mod tests {
     /// The rows [`sample_rows`] reads for a `height`-row picture.
     fn sampled(height: u32) -> Vec<usize> {
         let n = SAMPLE_ROWS.min(height);
-        (0..n).map(|i| sampled_row(i, n, height)).collect()
+        (0..n).map(|i| sampled_row_index(i, n, height)).collect()
     }
 
     #[test]
@@ -346,7 +346,7 @@ mod tests {
             1u32, 7, 8, 9, 63, 600, 768, 800, 1012, 1080, 1440, 1600, 2160,
         ] {
             let n = gate.rows(h);
-            let rows: Vec<usize> = (0..n).map(|i| sampled_row(i, n, h)).collect();
+            let rows: Vec<usize> = (0..n).map(|i| sampled_row_index(i, n, h)).collect();
             assert!(rows.windows(2).all(|r| r[0] < r[1]), "height {h}");
             for start in 0..h.saturating_sub(IN_PLACE_ROW_GAP - 1) as usize {
                 let band = start..start + IN_PLACE_ROW_GAP as usize;
