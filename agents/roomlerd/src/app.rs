@@ -3247,6 +3247,9 @@ async fn re_enroll_cmd(
             config_path.display()
         );
     }
+    // #3666 — a machine config is loaded, and its server sent a token, only
+    // when it was the machine's as found.
+    config::machine_config_as_found(config_path)?;
     let existing = config::load(config_path).context("loading existing config")?;
     // rc.52 BLOCKER-6: preserve the EXISTING machine_id verbatim — do
     // NOT re-derive from `config_path`. `derive_machine_id` hashes the
@@ -3345,6 +3348,9 @@ async fn re_enroll_cmd(
 /// changes on its next start. Runtime org verbs over the LocalAPI land with
 /// the desktop org-management UI in a later phase.
 fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
+    // #3666 — a machine config is loaded, and changed or its servers sent a
+    // token, only when it was the machine's as found.
+    config::machine_config_as_found(config_path)?;
     let mut cfg = config::load(config_path).with_context(|| {
         format!(
             "loading config at {} (run `roomlerd enroll` first)",

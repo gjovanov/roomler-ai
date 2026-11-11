@@ -4488,8 +4488,38 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// #3666 — RED seam: master loads without asking.
+/// #3666 — what `roomlerd re-enroll` and `roomlerd org` ask before they
+/// [`load`] the config at `path`, which they then send an enrollment token on
+/// or change: on Windows, at the machine-global location, the config must
+/// have been the machine's as found (`machine_tree::as_found`), with nothing
+/// repaired first. A config another account could have put there, or chosen
+/// what it holds, names the server the token goes to. `Ok` anywhere else,
+/// with no config there, and, logged, with `ROOMLERD_MACHINE_TREE_CHECK=0`.
+/// An entry this process may not read is a refusal too: nothing is decided
+/// about a config that could not be looked at.
 pub fn machine_config_as_found(path: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    if let Some(tree) = machine_tree_of(path) {
+        use crate::machine_tree::Refusal;
+        match crate::machine_tree::as_found(&tree) {
+            Ok(()) | Err(Refusal::Absent) => {}
+            Err(Refusal::NotPrivate(why)) if !crate::machine_tree::Switches::from_env().check => {
+                tracing::warn!(
+                    path = %path.display(), reason = %why,
+                    "config: the machine config was not the machine's as found; \
+                     ROOMLERD_MACHINE_TREE_CHECK=0, so it is loaded anyway"
+                );
+            }
+            Err(Refusal::NotPrivate(why)) => anyhow::bail!(
+                "the machine config at {} is not loaded, and nothing was sent: {why}. \
+                 Whoever could do that may have chosen what it holds, the server an \
+                 enrollment goes to included. Run Setup, or `roomlerd enroll \
+                 --machine-global` from an elevated prompt, to write a fresh one",
+                path.display()
+            ),
+        }
+    }
+    #[cfg(not(windows))]
     let _ = path;
     Ok(())
 }
