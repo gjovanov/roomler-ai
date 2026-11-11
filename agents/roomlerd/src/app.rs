@@ -1521,6 +1521,9 @@ async fn daemon_main() -> Result<()> {
     #[cfg(target_os = "windows")]
     let _timer_guard = win_timer::TimerResolutionGuard::request_1ms();
 
+    // Reads no appdirs: every default of `Cli` is a constant.
+    let cli = Cli::parse();
+
     // RETIRED-NAME-ANCHOR: a migration note names BOTH halves by necessity.
     // docs/fr/FR-21
     // S1b — one-shot legacy-tree migration (`roomler-agent` → `roomler`).
@@ -1528,12 +1531,26 @@ async fn daemon_main() -> Result<()> {
     // before ANY appdirs consumer (segment decisions are OnceLock-cached per
     // process). Skipped while the desktop companion is running — it may hold
     // open handles in the tree; the read-both resolution keeps everything
-    // working until the next start retries.
+    // working until the next start retries. #3702 — it runs only for the
+    // account that owns the folders: never in an installer step, and only
+    // over folders in the profile (on Unix the home) the system names for
+    // the account this process runs as.
     #[cfg(target_os = "windows")]
     let companion_running = roomlerd::companion::desktop_running();
     #[cfg(not(target_os = "windows"))]
     let companion_running = false;
-    roomlerd::appdirs::migrate_legacy_trees(companion_running);
+    let installer_step =
+        cfg!(target_os = "windows") && cli.command.as_ref().is_some_and(is_installer_step);
+    #[cfg(target_os = "windows")]
+    let own_profile = roomlerd::win_token::own_user_sid()
+        .and_then(|sid| roomlerd::appdirs::profile_of_account(&sid));
+    #[cfg(unix)]
+    let own_profile = roomlerd::appdirs::own_home();
+    roomlerd::appdirs::migrate_legacy_trees(
+        companion_running,
+        installer_step,
+        own_profile.as_deref(),
+    );
 
     // Same one-shot, same reason, different axis: a Linux SYSTEM install's
     // config belongs at `/etc/roomler/config.toml` (what the packaged unit
@@ -1541,9 +1558,7 @@ async fn daemon_main() -> Result<()> {
     // or any config read, and before logging::init, so it collects notes the
     // same way.
     #[cfg(target_os = "linux")]
-    roomlerd::appdirs::migrate_system_config();
-
-    let cli = Cli::parse();
+    roomlerd::appdirs::migrate_system_config(own_profile.as_deref());
 
     // S1b — the SCM service host, netd, the SystemContext worker and the
     // per-Machine MSI's own steps log into the machine-global `service-logs`

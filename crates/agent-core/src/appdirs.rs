@@ -571,7 +571,18 @@ pub fn migration_notes() -> &'static [String] {
 /// `companion_running` (the roomler-desktop tray): skip entirely — the tray
 /// may hold open handles inside the tree, and a pre-S1a tray would keep
 /// writing the old tree after the move, re-manufacturing the split.
-pub fn migrate_legacy_trees(companion_running: bool) {
+///
+/// #3702 — the move runs only for the account that owns the folders
+/// ([`may_migrate`]): never in an installer step (`installer_step`), and the
+/// per-user pairs only when each lies in `own_profile`, the profile the
+/// system names for the account this process runs as. Every pair is moved
+/// by [`migrate_dir_within`], which follows no link below its root; the
+/// machine pair's root is [`machine_program_data`].
+pub fn migrate_legacy_trees(
+    companion_running: bool,
+    installer_step: bool,
+    own_profile: Option<&Path>,
+) {
     let mut notes = Vec::new();
     if companion_running {
         notes.push(
@@ -596,28 +607,65 @@ pub fn migrate_legacy_trees(companion_running: bool) {
             // data_dir == data_local_dir on Linux; config may coincide too on
             // some platforms. Adjacent duplicates only.
             pairs.dedup();
-            for (o, n) in &pairs {
-                if let Some(note) = migrate_dir(o, n) {
-                    notes.push(note);
-                }
-            }
-            // Best-effort: drop the now-empty legacy shells (e.g. Windows
-            // `%APPDATA%\roomler\roomler-agent` after its `config`/`data`
-            // children moved out). `remove_dir` refuses non-empty dirs, so
-            // anything left behind survives.
-            for parent in pairs
+            let folders: Vec<PathBuf> = pairs
                 .iter()
-                .filter_map(|(o, _)| o.parent().map(Path::to_path_buf))
-            {
-                if parent.file_name().is_some_and(|f| f == OLD_APP) {
-                    let _ = std::fs::remove_dir(&parent);
+                .flat_map(|(o, n)| [o.clone(), n.clone()])
+                .collect();
+            match own_profile.filter(|_| may_migrate(installer_step, own_profile, &folders)) {
+                Some(profile) => {
+                    for (o, n) in &pairs {
+                        if let Some(note) = migrate_dir_within(profile, o, n) {
+                            notes.push(note);
+                        }
+                    }
+                    // Best-effort: drop the now-empty legacy shells (e.g.
+                    // Windows `%APPDATA%\roomler\roomler-agent` after its
+                    // `config`/`data` children moved out). `remove_dir`
+                    // refuses non-empty dirs, so anything left behind
+                    // survives; a shell reached through a link stays.
+                    for parent in pairs
+                        .iter()
+                        .filter_map(|(o, _)| o.parent().map(Path::to_path_buf))
+                    {
+                        if parent.file_name().is_some_and(|f| f == OLD_APP)
+                            && link_below(profile, &parent).is_none()
+                        {
+                            let _ = std::fs::remove_dir(&parent);
+                        }
+                    }
+                }
+                None => {
+                    if let Some((old, _)) = pairs.iter().find(|(o, _)| o.exists()) {
+                        notes.push(match own_profile {
+                            _ if installer_step => in_an_installer_step(old),
+                            Some(profile) => format!(
+                                "legacy tree left in place: {} is not in this account's own profile {}",
+                                folders
+                                    .iter()
+                                    .find(|f| !in_folder(f, profile))
+                                    .unwrap_or(old)
+                                    .display(),
+                                profile.display()
+                            ),
+                            None => format!(
+                                "legacy tree left in place: {} (the system names no profile for this account)",
+                                old.display()
+                            ),
+                        });
+                    }
                 }
             }
         }
         #[cfg(target_os = "windows")]
         {
-            let base = machine_program_data().join(ORG);
-            if let Some(note) = migrate_dir(&base.join(OLD_APP), &base.join(NEW_APP)) {
+            let root = machine_program_data();
+            let base = root.join(ORG);
+            let (old, new) = (base.join(OLD_APP), base.join(NEW_APP));
+            if installer_step {
+                if old.exists() {
+                    notes.push(in_an_installer_step(&old));
+                }
+            } else if let Some(note) = migrate_dir_within(&root, &old, &new) {
                 notes.push(note);
             }
         }
@@ -625,15 +673,80 @@ pub fn migrate_legacy_trees(companion_running: bool) {
     let _ = MIGRATION_NOTES.set(notes);
 }
 
-/// #3702 — may the one-time folder move run in this process over `folders`?
-pub fn may_migrate(installer_step: bool, own_profile: Option<&Path>, folders: &[PathBuf]) -> bool {
-    let _ = (installer_step, own_profile, folders);
-    true
+/// The note for a legacy tree an installer step leaves to the daemon.
+fn in_an_installer_step(old: &Path) -> String {
+    format!(
+        "legacy tree left in place: {} moves at the daemon's own start, not in an installer step",
+        old.display()
+    )
 }
 
-/// #3702 — [`migrate_dir`] for a pair in the profile `root`.
+/// #3702 — the home folder the system names for the account this process
+/// runs as: its own entry in the account database (`getpwuid_r` of the
+/// effective uid), never the environment. `None` when there is no entry or
+/// it names no absolute folder.
+#[cfg(unix)]
+pub fn own_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: `geteuid` is a thread-safe read of the caller's own credentials.
+    let uid = unsafe { libc::geteuid() };
+    let mut buf: Vec<libc::c_char> = vec![0; 1024];
+    loop {
+        // SAFETY: an all-zero `passwd` is a valid value of a plain C struct;
+        // `getpwuid_r` fills it in.
+        let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer names memory this frame owns for the whole
+        // call, and `buf.len()` is the length of `buf`, where the entry's
+        // strings are written.
+        let rc =
+            unsafe { libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) };
+        if rc == libc::ERANGE && buf.len() < 1 << 20 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
+            return None;
+        }
+        // SAFETY: `pw_dir` points into `buf`, NUL-terminated by `getpwuid_r`,
+        // and `buf` outlives this borrow.
+        let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+        let home = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+        return home.is_absolute().then_some(home);
+    }
+}
+
+/// #3702 — may the one-time folder move run in this process over `folders`?
+/// Never in an installer step, and only when every folder lies in
+/// `own_profile`, the profile (or on Unix the home) the system names for the
+/// account this process runs as: a folder anywhere else is another
+/// account's, moved by that account's own process.
+pub fn may_migrate(installer_step: bool, own_profile: Option<&Path>, folders: &[PathBuf]) -> bool {
+    !installer_step && own_profile.is_some_and(|own| folders.iter().all(|f| in_folder(f, own)))
+}
+
+/// #3702 — [`migrate_dir`] for a pair in `root` (a profile, or the machine's
+/// data folder): a pair outside it, or reached through a folder link below
+/// it ([`link_below`]), is left where it is, with a note.
 fn migrate_dir_within(root: &Path, old: &Path, new: &Path) -> Option<String> {
-    let _ = root;
+    if !old.exists() {
+        return None;
+    }
+    for path in [old, new] {
+        if !in_folder(path, root) {
+            return Some(format!(
+                "legacy tree left in place: {} is not in {}",
+                path.display(),
+                root.display()
+            ));
+        }
+        if let Some(link) = link_below(root, path) {
+            return Some(format!(
+                "legacy tree left in place: {} is a link",
+                link.display()
+            ));
+        }
+    }
     migrate_dir(old, new)
 }
 
@@ -728,8 +841,12 @@ pub fn running_as_root() -> bool {
 ///
 /// MUST run before `logging::init`, like the tree migration — hence the same
 /// note-collecting instead of tracing.
+///
+/// #3702 — like the tree migration, it moves only root's own config: one in
+/// `own_home`, the home the system names for this account ([`own_home`]),
+/// reached by no link below it ([`system_config_home`]).
 #[cfg(target_os = "linux")]
-pub fn migrate_system_config() {
+pub fn migrate_system_config(own_home: Option<&Path>) {
     let mut notes = Vec::new();
     if !running_as_root() {
         let _ = SYSTEM_CONFIG_NOTES.set(notes);
@@ -744,6 +861,14 @@ pub fn migrate_system_config() {
         let _ = SYSTEM_CONFIG_NOTES.set(notes);
         return;
     }
+    let home = match system_config_home(own_home, &legacy) {
+        Ok(home) => home,
+        Err(note) => {
+            notes.push(note);
+            let _ = SYSTEM_CONFIG_NOTES.set(notes);
+            return;
+        }
+    };
     if let Some(parent) = new.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
@@ -771,7 +896,7 @@ pub fn migrate_system_config() {
             // Best-effort; a left-behind `.prev` is untidy, not dangerous,
             // and must never turn a successful migration into a failure.
             let (lp, np) = (with_prev(&legacy), with_prev(&new));
-            if lp.exists() && !np.exists() {
+            if lp.exists() && !np.exists() && link_below(home, &lp).is_none() {
                 let _ = std::fs::rename(&lp, &np);
             }
         }
@@ -782,6 +907,33 @@ pub fn migrate_system_config() {
         )),
     }
     let _ = SYSTEM_CONFIG_NOTES.set(notes);
+}
+
+/// #3702 — the home a legacy root-profile config (`legacy`) may move out of:
+/// `own_home`, when `legacy` lies in it and the way down to it holds no link.
+/// `Err` is the note that says why it stays.
+#[cfg(target_os = "linux")]
+fn system_config_home<'a>(own_home: Option<&'a Path>, legacy: &Path) -> Result<&'a Path, String> {
+    match own_home {
+        Some(home) if may_migrate(false, Some(home), &[legacy.to_path_buf()]) => {
+            match link_below(home, legacy) {
+                None => Ok(home),
+                Some(link) => Err(format!(
+                    "system config left in place: {} is a link",
+                    link.display()
+                )),
+            }
+        }
+        Some(home) => Err(format!(
+            "system config left in place: {} is not in this account's own home {}",
+            legacy.display(),
+            home.display()
+        )),
+        None => Err(format!(
+            "system config left in place: {} (the system names no home for this account)",
+            legacy.display()
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1193,6 +1345,33 @@ mod tests {
             with_prev(Path::new("/etc/roomler/config.toml")),
             PathBuf::from("/etc/roomler/config.toml.prev")
         );
+    }
+
+    /// #3702 — root's profile config moves into `/etc/roomler` only from
+    /// the home the system names for root, and by no link below it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_config_moves_only_from_the_accounts_own_home() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let config = |home: &Path| home.join(".config").join(ORG).join("config.toml");
+        std::fs::create_dir_all(config(&home).parent().unwrap()).unwrap();
+        std::fs::write(config(&home), "x").unwrap();
+        assert_eq!(
+            system_config_home(Some(&home), &config(&home)),
+            Ok(home.as_path())
+        );
+        let other = root.path().join("other");
+        let note = system_config_home(Some(&other), &config(&home)).unwrap_err();
+        assert!(note.contains("not in this account's own home"), "{note}");
+        let note = system_config_home(None, &config(&home)).unwrap_err();
+        assert!(note.contains("names no home"), "{note}");
+        // The same file reached through a link below the home stays.
+        let linked = root.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        folder_link(&linked.join(".config"), &home.join(".config"));
+        let note = system_config_home(Some(&linked), &config(&linked)).unwrap_err();
+        assert!(note.contains("is a link"), "{note}");
     }
 
     #[test]
