@@ -203,6 +203,20 @@ pub enum DelegateFrame {
     /// a terminal exit, a claim it can no longer make). The worker's own
     /// deadline closes a kept session anyway, so a lost `Close` leaks nothing.
     Close { session_id: String, reason: String },
+    /// FR-138 P2b — daemon → worker: the server ended a session the daemon
+    /// keeps a record of (a kick, the maximum length, a refused claim, the
+    /// viewer's hang-up), with the `reason` and `limit` of its `rc:terminate`.
+    /// An order, so the worker serves it wherever it serves orders, its own
+    /// connection down included; the `Terminate` that crosses beside it waits
+    /// for that connection. Whichever of the two the worker reads first ends
+    /// the session, and the other finds nothing. Sent only to the worker whose
+    /// records these are, which said [`KEEP_DELEGATED`].
+    Ended {
+        session_id: String,
+        reason: roomler_ai_remote_control::models::EndReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
+    },
 }
 
 /// FR-138 P2b — the word a worker says in [`DelegateFrame::WorkerCaps`] when it
@@ -240,9 +254,16 @@ pub enum WorkerOrder {
     Resumed { session_id: String },
     /// [`DelegateFrame::Close`].
     Close { session_id: String, reason: String },
+    /// [`DelegateFrame::Ended`].
+    Ended {
+        session_id: String,
+        reason: roomler_ai_remote_control::models::EndReason,
+        limit: Option<String>,
+    },
     /// The channel to the daemon ended, and both processes may live on (D5):
     /// the delegated sessions' links stop waiting until the next attach.
-    Paused,
+    /// `cause` says why the channel ended.
+    Paused { cause: String },
     /// The channel is back: the delegated sessions' links point at it again.
     Attached,
 }
@@ -1737,7 +1758,8 @@ impl DelegateHost {
                     | DelegateFrame::KeepBusyAsk { .. }
                     | DelegateFrame::Detached { .. }
                     | DelegateFrame::Resumed { .. }
-                    | DelegateFrame::Close { .. },
+                    | DelegateFrame::Close { .. }
+                    | DelegateFrame::Ended { .. },
                 ) => {
                     // Daemon → worker only. A worker sending one is confused
                     // about which end it is.

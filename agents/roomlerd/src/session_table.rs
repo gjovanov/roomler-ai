@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::delegate::DelegateHost;
+use crate::delegate::{DelegateHost, WorkerOrder};
 use crate::peer::AgentPeer;
 use crate::signaling::close_within_budget;
 
@@ -689,8 +689,9 @@ impl<P: TablePeer> SessionTable<P> {
     /// a session whose params crossed `keepable` gets a record, attached to
     /// this connection, and the worker's replies about it are bound to the
     /// record's link. Anything else (the switch off, an older worker, no
-    /// connection) gets none and is served as today.
-    pub(crate) fn cross_offer(&mut self, session_id: ObjectId) {
+    /// connection) gets none and is served as today. `generation` is the
+    /// attach generation the gate read ([`Self::live_generation`]).
+    pub(crate) fn cross_offer(&mut self, session_id: ObjectId, generation: Option<u64>) {
         let Some(host) = self.host.clone() else {
             return;
         };
@@ -698,12 +699,11 @@ impl<P: TablePeer> SessionTable<P> {
         if !self.survive || !host.is_keepable(&hex) {
             return;
         }
-        let Some(current) = self.current.clone() else {
+        let (Some(current), Some(generation)) = (self.current.clone(), generation) else {
             return;
         };
         let link = SessionLink::new(session_id, current, self.ended_tx.clone(), true);
         host.bind(hex, link.sender());
-        let generation = host.generation();
         if self
             .records
             .insert(
@@ -732,12 +732,17 @@ impl<P: TablePeer> SessionTable<P> {
         self.records.contains_key(session_id)
     }
 
-    /// FR-138 P2b (A7) — the server ended a delegated session: its record goes,
-    /// and the `Terminate` crosses to the worker as today, whose delegated
-    /// table says the end and closes after the grace (C1). No `Close`: on its
-    /// own lane it could overtake the `Terminate` and close the peer before
-    /// the end is said.
-    pub(crate) fn drop_record(&mut self, session_id: &ObjectId) {
+    /// FR-138 P2b (A7) — the server ended a delegated session, `reason` and
+    /// `limit` its `rc:terminate`'s: its record goes, and the `Terminate`
+    /// crosses to the worker as today, whose delegated table says the end and
+    /// closes after the grace (C1). No `Close`: on its own lane it could
+    /// overtake the `Terminate` and close the peer before the end is said.
+    pub(crate) fn drop_record(
+        &mut self,
+        session_id: &ObjectId,
+        reason: &EndReason,
+        limit: Option<&str>,
+    ) {
         let Some(record) = self.records.remove(session_id) else {
             return;
         };
@@ -746,6 +751,8 @@ impl<P: TablePeer> SessionTable<P> {
         }
         info!(
             session_id = %session_id,
+            ?reason,
+            ?limit,
             kept_ms = record.kept.as_ref().map(|k| millis(k.since.elapsed())),
             "rc session closed (delegated): the server ended it; the GUI worker closes its peer \
              (FR-138 P2b)"
@@ -903,6 +910,61 @@ impl<P: TablePeer> SessionTable<P> {
         }
     }
 
+    /// FR-138 P2b (B4, B5) — one of the daemon's orders, on a GUI worker's
+    /// delegated table. `channel` is the delegation channel, which a resumed
+    /// session speaks on again; `grace` is how long a session the server ended
+    /// says so on its control channel before its peer closes (C1).
+    pub(crate) async fn obey(
+        &mut self,
+        order: WorkerOrder,
+        channel: &mpsc::Sender<ClientMsg>,
+        grace: Duration,
+    ) {
+        let parse = |s: &str| ObjectId::parse_str(s).ok();
+        match order {
+            WorkerOrder::Detached {
+                sessions,
+                exit,
+                netchange,
+                keep_ms,
+            } => {
+                let ids: Vec<ObjectId> = sessions.iter().filter_map(|s| parse(s)).collect();
+                let exit = ConnExit::from_label(&exit, netchange);
+                self.detach_named(&ids, exit, Duration::from_millis(keep_ms))
+                    .await;
+            }
+            WorkerOrder::Resumed { session_id } => {
+                if let Some(sid) = parse(&session_id) {
+                    self.resume(sid, channel).await;
+                }
+            }
+            WorkerOrder::Close { session_id, reason } => {
+                if let Some(sid) = parse(&session_id) {
+                    info!(session_id = %sid, %reason, "rc: the daemon closes a delegated session (FR-138 P2b)");
+                    self.close_session(sid, "daemon_close").await;
+                }
+            }
+            WorkerOrder::Ended {
+                session_id,
+                reason,
+                limit,
+            } => {
+                debug!(
+                    %session_id,
+                    ?reason,
+                    ?limit,
+                    grace_ms = millis(grace),
+                    "rc: the daemon's end of a delegated session (FR-138 P2b)"
+                );
+            }
+            WorkerOrder::Paused { cause } => {
+                debug!(%cause, "rc: the channel to the daemon ended (FR-138 P2b)");
+                self.pause();
+            }
+            WorkerOrder::Attached => self.unpause(),
+        }
+    }
+
     /// FR-138 P2b (B7) — the person at the device ended a session (Disconnect,
     /// the idle limit) that this table holds: kept (any table), or attached on
     /// a GUI worker's delegated table. It stops serving at once, closes after
@@ -946,7 +1008,8 @@ impl<P: TablePeer> SessionTable<P> {
     }
 
     /// FR-138 P2b (A9) — the attach generation of the worker attached now.
-    fn live_generation(&self) -> Option<u64> {
+    /// `None` for a loop that does not hold the delegation host.
+    pub(crate) fn live_generation(&self) -> Option<u64> {
         self.host.as_ref().map(DelegateHost::generation)
     }
 
@@ -3168,7 +3231,7 @@ mod tests {
                 None,
                 DelegateFrame::SessionParams(Box::new(keepable_params(id)))
             ));
-            table.cross_offer(id);
+            table.cross_offer(id, table.live_generation());
             ids.push(id);
         }
         ids.sort();

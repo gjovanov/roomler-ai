@@ -282,7 +282,9 @@ struct PauseOnDrop<'a>(&'a tokio::sync::mpsc::Sender<WorkerOrder>);
 
 impl Drop for PauseOnDrop<'_> {
     fn drop(&mut self) {
-        let _ = self.0.try_send(WorkerOrder::Paused);
+        let _ = self.0.try_send(WorkerOrder::Paused {
+            cause: "the attach ended".to_string(),
+        });
     }
 }
 
@@ -512,7 +514,8 @@ async fn attach_once(
                             | DelegateFrame::ToWorker { .. }
                             | DelegateFrame::Detached { .. }
                             | DelegateFrame::Resumed { .. }
-                            | DelegateFrame::Close { .. },
+                            | DelegateFrame::Close { .. }
+                            | DelegateFrame::Ended { .. },
                         )) => tracing::debug!("delegation: a frame for another lane; skipping"),
                         // Skip, never close: a NEWER daemon may push a frame
                         // this worker has never heard of, and an additive

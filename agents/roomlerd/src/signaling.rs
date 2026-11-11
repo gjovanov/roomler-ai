@@ -3915,8 +3915,13 @@ async fn handle_server_msg(
     //
     // FR-138 P2b (A7) — the server ended a delegated session: the daemon's
     // record of it goes, whether or not the end crosses.
-    if let ServerMsg::Terminate { session_id, .. } = &msg {
-        peers.drop_record(session_id);
+    if let ServerMsg::Terminate {
+        session_id,
+        reason,
+        limit,
+    } = &msg
+    {
+        peers.drop_record(session_id, reason, limit.as_deref());
     }
     // FR-138 P2b (A1) — routing first, then delegation: with the switch on, a
     // session this loop's own table holds (attached or kept) is served here,
@@ -3937,7 +3942,8 @@ async fn handle_server_msg(
         // FR-138 P2b (A3) — a keepable session's offer crossed: the daemon
         // keeps a record of it, to claim it through this socket's loss.
         if let ServerMsg::SdpOffer { session_id, .. } = &msg {
-            peers.cross_offer(*session_id);
+            let generation = peers.live_generation();
+            peers.cross_offer(*session_id, generation);
         }
         return Ok(());
     }
@@ -7335,39 +7341,11 @@ impl DelegatedSide {
         }
     }
 
-    /// One of the daemon's orders.
+    /// One of the daemon's orders, served by the delegated table.
     async fn obey(&mut self, order: crate::delegate::WorkerOrder) {
-        use crate::delegate::WorkerOrder;
-        let parse = |s: &str| bson::oid::ObjectId::parse_str(s).ok();
-        match order {
-            WorkerOrder::Detached {
-                sessions,
-                exit,
-                netchange,
-                keep_ms,
-            } => {
-                let ids: Vec<bson::oid::ObjectId> =
-                    sessions.iter().filter_map(|s| parse(s)).collect();
-                let exit = ConnExit::from_label(&exit, netchange);
-                self.table
-                    .detach_named(&ids, exit, Duration::from_millis(keep_ms))
-                    .await;
-            }
-            WorkerOrder::Resumed { session_id } => {
-                if let Some(sid) = parse(&session_id) {
-                    let channel = self.channel.clone();
-                    self.table.resume(sid, &channel).await;
-                }
-            }
-            WorkerOrder::Close { session_id, reason } => {
-                if let Some(sid) = parse(&session_id) {
-                    info!(session_id = %sid, %reason, "rc: the daemon closes a delegated session (FR-138 P2b)");
-                    self.table.close_session(sid, "daemon_close").await;
-                }
-            }
-            WorkerOrder::Paused => self.table.pause(),
-            WorkerOrder::Attached => self.table.unpause(),
-        }
+        self.table
+            .obey(order, &self.channel, host_disconnect_grace())
+            .await;
     }
 }
 
