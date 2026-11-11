@@ -287,6 +287,10 @@ pub(crate) enum FsAs {
     /// a read) nobody at seat0 (#3688): every read is refused, saying so.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     Nobody,
+    /// (Linux root, a read) who is at seat0 could not be told (#3688).
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // RED: a read takes it in the fix.
+    CannotTell,
 }
 
 /// #3688 — what a step as the person at seat0 does with its thread's
@@ -402,11 +406,13 @@ impl FsAs {
     /// seat0 a write takes, by the same rule ([`linux_fs_as`]), each step
     /// with no capability; nobody there, or a seat0 lookup that does not
     /// answer within [`SEAT_LOOKUP_WAIT`], refuses the read. macOS and user
-    /// installs read as the daemon, as before. A test stands a reader in for
-    /// this answer (`stand_in::reader`), so the entry points are tested with
-    /// the person, not only the daemon.
+    /// installs read as the daemon, as before. On Windows a test stands a
+    /// reader in for this answer (`stand_in::reader`), so the entry points
+    /// are tested with the person, not only the daemon. On Linux it stands
+    /// in who is at seat0 (`stand_in::seat`), so they are tested through
+    /// this very rule.
     pub(crate) async fn for_read() -> Self {
-        #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+        #[cfg(all(test, target_os = "windows"))]
         if let Some(who) = stand_in::reader_now() {
             return who;
         }
@@ -416,9 +422,19 @@ impl FsAs {
             if !(root && switch_on) {
                 return Self::Daemon;
             }
+            // Asked here, on the thread a test stood it in on.
+            #[cfg(test)]
+            let stood_in = stand_in::seat_now();
             // Off the async worker, and bounded: logind and the account
             // database are other processes, and either may hang.
-            let seat = seat_within(SEAT_LOOKUP_WAIT, seat_now).await;
+            let seat = seat_within(SEAT_LOOKUP_WAIT, move || {
+                #[cfg(test)]
+                if let Some(seat) = stood_in {
+                    return seat;
+                }
+                seat_now()
+            })
+            .await;
             linux_fs_as(root, switch_on, true, move || seat)
         }
         #[cfg(not(target_os = "linux"))]
@@ -456,7 +472,7 @@ impl FsAs {
             return Err(anyhow!(why));
         }
         #[cfg(target_os = "linux")]
-        if matches!(self, Self::DaemonAlone) {
+        if matches!(self, Self::DaemonAlone | Self::CannotTell) {
             return Err(anyhow!(why));
         }
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -503,7 +519,7 @@ impl FsAs {
             return Some(NOBODY_SIGNED_IN);
         }
         #[cfg(target_os = "linux")]
-        if matches!(self, Self::Nobody) {
+        if matches!(self, Self::Nobody | Self::CannotTell) {
             return Some(NOBODY_AT_THE_SCREEN);
         }
         None
@@ -561,7 +577,7 @@ impl FsAs {
             #[cfg(target_os = "linux")]
             Self::DaemonAlone => f(),
             #[cfg(target_os = "linux")]
-            Self::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+            Self::Nobody | Self::CannotTell => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
             #[cfg(target_os = "linux")]
             Self::Person { account, caps, .. } => {
                 // #3688 — a read's step also empties the thread's
@@ -616,6 +632,11 @@ impl FsAs {
                 privileged: true,
                 active_home: None,
             },
+            #[cfg(target_os = "linux")]
+            Self::CannotTell => files_dir::Writer {
+                privileged: true,
+                active_home: None,
+            },
         }
     }
 }
@@ -651,22 +672,36 @@ enum Seat {
     /// Nobody, and why: no logind, an empty seat, the login screen, a lock
     /// that switches seat0 to a greeter, an account that does not resolve.
     Nobody(String),
+    /// Not known, and why.
+    #[allow(dead_code)] // RED: the seat0 lookup tells it in the fix.
+    CannotTell(String),
 }
 
 /// Who is at seat0 now, by FR-97 P5a's rule (`companion::seat0_account`).
 /// Blocking: logind, then the account database.
 #[cfg(target_os = "linux")]
 fn seat_now() -> Seat {
-    let (name, uid) = match crate::companion::seat0_account() {
+    seat_of(crate::companion::seat0_account(), |name| {
+        crate::fs_identity::Account::by_name(name)
+            .and_then(|account| crate::exec::account_home(name).map(|home| (account, home)))
+    })
+}
+
+/// The pure half of [`seat_now`]: what logind `found` at seat0, and the
+/// account and home its name `resolve`s to.
+#[cfg(target_os = "linux")]
+fn seat_of(
+    found: Result<(String, Option<u32>)>,
+    resolve: impl FnOnce(&str) -> std::result::Result<(crate::fs_identity::Account, PathBuf), String>,
+) -> Seat {
+    let (name, uid) = match found {
         Ok(found) => found,
         Err(e) => return Seat::Nobody(format!("{e:#}")),
     };
     if uid == Some(0) {
         return Seat::Root;
     }
-    let person = crate::fs_identity::Account::by_name(&name)
-        .and_then(|account| crate::exec::account_home(&name).map(|home| (account, home)));
-    match person {
+    match resolve(&name) {
         Ok((account, home)) => Seat::Person { account, home },
         Err(e) => Seat::Nobody(e),
     }
@@ -698,11 +733,11 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             caps: if reading { Caps::Empty } else { Caps::Kept },
         },
         Seat::Root => FsAs::Daemon,
-        Seat::Nobody(why) if reading => {
+        Seat::Nobody(why) | Seat::CannotTell(why) if reading => {
             tracing::debug!(%why, "files: nobody at seat0 — a read is refused");
             FsAs::Nobody
         }
-        Seat::Nobody(why) => {
+        Seat::Nobody(why) | Seat::CannotTell(why) => {
             tracing::debug!(
                 %why,
                 "files: nobody at seat0 — received files are written as the daemon, \
@@ -3022,6 +3057,8 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = checks;
+                #[cfg(all(test, target_os = "linux"))]
+                stand_in::before_a_folder_opens(&canon);
                 let read = std::fs::read_dir(&canon)
                     .with_context(|| format!("reading {}", canon.display()))?;
                 Ok((canon, read))
@@ -3240,6 +3277,8 @@ impl FilesHandler {
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = checks;
+                #[cfg(all(test, target_os = "linux"))]
+                stand_in::before_a_folder_opens(&resolved);
                 // A folder the reader may not list is refused here, saying
                 // why, rather than sent as an empty zip that looks complete.
                 std::fs::read_dir(&resolved)
@@ -3474,6 +3513,8 @@ fn zip_folder_entries(
     }
     #[cfg(not(target_os = "linux"))]
     let _ = checks;
+    #[cfg(all(test, target_os = "linux"))]
+    stand_in::before_a_folder_opens(dir);
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)?.take(room as usize) {
         let Ok(entry) = entry else {
@@ -3800,7 +3841,7 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
         #[cfg(target_os = "windows")]
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         #[cfg(target_os = "linux")]
-        FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+        FsAs::Nobody | FsAs::CannotTell => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
     }
 }
 
@@ -3820,7 +3861,7 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
         #[cfg(target_os = "windows")]
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         #[cfg(target_os = "linux")]
-        FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+        FsAs::Nobody | FsAs::CannotTell => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
     }
 }
 
@@ -3908,32 +3949,42 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
 /// `begin_outgoing_zip`, `list_dir`) would otherwise always read as the
 /// daemon here, and could not be told from ones that never ask.
 ///
-/// #3688 — on Linux the reader stands in the same way; its person is a real
-/// account (`nobody`, in the tests run as root), so only the reader is here.
+/// #3688 — on Linux [`stand_in::seat`] stands in who is at seat0 instead, so
+/// `FsAs::for_read` itself still decides: a real account (`nobody`, in the
+/// tests run as root) at the screen is read as through the very rule a
+/// daemon takes. [`stand_in::swap_before_open`] swaps a folder for a link
+/// just before a read opens it.
 #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 pub(crate) mod stand_in {
+    #[cfg(target_os = "windows")]
     use super::FsAs;
+    #[cfg(target_os = "linux")]
+    use super::Seat;
     #[cfg(target_os = "windows")]
     use crate::win_identity::PersonToken;
-    #[cfg(target_os = "windows")]
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::path::PathBuf;
     #[cfg(target_os = "windows")]
     use std::sync::Arc;
     use std::sync::{Mutex, PoisonError};
 
     /// The reader stood in, with the thread it answers on: one at a time.
+    #[cfg(target_os = "windows")]
     static READER: Mutex<Option<(std::thread::ThreadId, FsAs)>> = Mutex::new(None);
 
-    /// The tests that stand a reader in take turns, each for as long as its
-    /// stand-in lives.
+    /// The tests that stand a reader (or a seat) in take turns, each for as
+    /// long as its stand-in lives.
     static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// While this lives, `FsAs::for_read()` answers its reader on the thread
     /// that stood it in.
+    #[cfg(target_os = "windows")]
     pub(crate) struct Reader {
         _turn: tokio::sync::MutexGuard<'static, ()>,
     }
 
+    #[cfg(target_os = "windows")]
     impl Drop for Reader {
         fn drop(&mut self) {
             *READER.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -3944,6 +3995,7 @@ pub(crate) mod stand_in {
     /// only. A `#[tokio::test]` polls its whole body on its own thread, and
     /// the tests that run beside it, which read through `for_read()` on
     /// threads of their own, keep the daemon.
+    #[cfg(target_os = "windows")]
     pub(crate) async fn reader(who: FsAs) -> Reader {
         let turn = TURN.lock().await;
         *READER.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -3952,11 +4004,117 @@ pub(crate) mod stand_in {
     }
 
     /// The reader stood in for this thread, if there is one.
+    #[cfg(target_os = "windows")]
     pub(super) fn reader_now() -> Option<FsAs> {
         let held = READER.lock().unwrap_or_else(PoisonError::into_inner);
         held.as_ref()
             .filter(|(thread, _)| *thread == std::thread::current().id())
             .map(|(_, who)| who.clone())
+    }
+
+    /// #3688 — who is at seat0, stood in on one thread: the seat the
+    /// lookup answers, and how many more times a folder download finds them
+    /// still there (`None`: always).
+    #[cfg(target_os = "linux")]
+    struct StoodSeat {
+        thread: std::thread::ThreadId,
+        seat: Seat,
+        #[allow(dead_code)] // RED: the walk's check counts it down in the fix.
+        stays_for: Option<u32>,
+    }
+
+    #[cfg(target_os = "linux")]
+    static SEAT: Mutex<Option<StoodSeat>> = Mutex::new(None);
+
+    /// While this lives, the seat0 lookup answers its seat on the thread
+    /// that stood it in.
+    #[cfg(target_os = "linux")]
+    pub(super) struct SeatStoodIn {
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for SeatStoodIn {
+        fn drop(&mut self) {
+            *SEAT.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Stand `seat` in for who is at seat0, on this thread only, as
+    /// [`reader`] does on Windows. `FsAs::for_read()` still decides who
+    /// reads, from the process (root, the switch) and this seat.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn seat(seat: Seat) -> SeatStoodIn {
+        stand(seat, None).await
+    }
+
+    /// [`seat`], whose person a folder download finds still at the screen
+    /// `checks` times, and gone after.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn seat_leaving_after(seat: Seat, checks: u32) -> SeatStoodIn {
+        stand(seat, Some(checks)).await
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn stand(seat: Seat, stays_for: Option<u32>) -> SeatStoodIn {
+        let turn = TURN.lock().await;
+        *SEAT.lock().unwrap_or_else(PoisonError::into_inner) = Some(StoodSeat {
+            thread: std::thread::current().id(),
+            seat,
+            stays_for,
+        });
+        SeatStoodIn { _turn: turn }
+    }
+
+    /// The seat stood in for this thread, if there is one.
+    #[cfg(target_os = "linux")]
+    pub(super) fn seat_now() -> Option<Seat> {
+        let held = SEAT.lock().unwrap_or_else(PoisonError::into_inner);
+        held.as_ref()
+            .filter(|stood| stood.thread == std::thread::current().id())
+            .map(|stood| stood.seat.clone())
+    }
+
+    /// What a read does just before it opens a folder, once: by the
+    /// folder's path.
+    #[cfg(target_os = "linux")]
+    type BeforeOpen = (PathBuf, Box<dyn FnOnce() + Send>);
+
+    #[cfg(target_os = "linux")]
+    static BEFORE_OPEN: Mutex<Vec<BeforeOpen>> = Mutex::new(Vec::new());
+
+    /// #3688 — once a read has resolved `dir` and is about to open it, `dir`
+    /// is moved aside and a link to `to` takes its place: a component
+    /// swapped after it was resolved. The swap runs on the step's own
+    /// thread, with its rights, so the folder `dir` is in must be theirs.
+    #[cfg(target_os = "linux")]
+    pub(super) fn swap_before_open(dir: &Path, to: &Path) {
+        let (dir, to) = (dir.to_path_buf(), to.to_path_buf());
+        let aside = dir.with_extension("aside");
+        let swap = {
+            let dir = dir.clone();
+            move || {
+                std::fs::rename(&dir, &aside).expect("moving the folder aside");
+                std::os::unix::fs::symlink(&to, &dir).expect("a link in its place");
+            }
+        };
+        BEFORE_OPEN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir, Box::new(swap)));
+    }
+
+    /// Runs what a test set for `dir` with [`swap_before_open`], once.
+    #[cfg(target_os = "linux")]
+    pub(super) fn before_a_folder_opens(dir: &Path) {
+        let swap = {
+            let mut held = BEFORE_OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+            let at = held.iter().position(|(d, _)| d == dir);
+            at.map(|i| held.remove(i).1)
+        };
+        if let Some(swap) = swap {
+            swap();
+        }
     }
 
     /// The person: the runner's own SID, through a low-integrity copy of
@@ -6416,6 +6574,24 @@ mod seat_user_tests {
             }
         }
 
+        /// #3688 — the person at seat0, as the seat0 lookup answers them: a
+        /// read through `FsAs::for_read()` then takes them by its own rule.
+        fn at_the_screen(person: &crate::fs_identity::Account, home: &std::path::Path) -> Seat {
+            Seat::Person {
+                account: person.clone(),
+                home: home.to_path_buf(),
+            }
+        }
+
+        /// What the viewer is told when what a read opened as the person is
+        /// not the folder asked for.
+        fn not_the_folder_asked(path: &std::path::Path) -> String {
+            format!(
+                "{}: what opened is not the folder asked for, so file transfer does not list it",
+                path.display()
+            )
+        }
+
         /// A file or folder only root may open, as root's own are.
         fn roots_only(path: &std::path::Path, mode: u32) {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -6447,7 +6623,7 @@ mod seat_user_tests {
 
         /// #3688 — a download is opened as the person a read takes: through
         /// `begin_outgoing`, the entry point `files:get` calls, with the
-        /// person stood in for what `FsAs::for_read()` answers. Their own
+        /// person stood in at seat0, so `FsAs::for_read()` decides. Their own
         /// file is offered as theirs and its bytes are the ones sent; a file
         /// only root may read is refused, saying why; the daemon itself is
         /// offered that file (the control). An entry point that read as the
@@ -6469,7 +6645,7 @@ mod seat_user_tests {
             let me = reader(&person, home.path());
             let h = FilesHandler::new();
             {
-                let _as = stand_in::reader(me.clone()).await;
+                let _as = stand_in::seat(at_the_screen(&person, home.path())).await;
                 let offer = h
                     .begin_outgoing("r3688-1".into(), &at(&mine))
                     .await
@@ -6520,7 +6696,7 @@ mod seat_user_tests {
             roots_only(&shut, 0o700);
 
             let mine = {
-                let _as = stand_in::reader(reader(&person, home.path())).await;
+                let _as = stand_in::seat(at_the_screen(&person, home.path())).await;
                 download(&root_dir).await
             };
             let said = mine.said();
@@ -6539,7 +6715,7 @@ mod seat_user_tests {
                 "nor one inside a folder they may not list"
             );
             let all = {
-                let _as = stand_in::reader(FsAs::Daemon).await;
+                let _as = stand_in::seat(Seat::Root).await;
                 download(&root_dir).await
             };
             for needle in [
@@ -6571,7 +6747,7 @@ mod seat_user_tests {
             roots_only(&shut, 0o700);
             let at = |p: &std::path::Path| p.to_string_lossy().into_owned();
             {
-                let _as = stand_in::reader(reader(&person, home.path())).await;
+                let _as = stand_in::seat(at_the_screen(&person, home.path())).await;
                 let listed = list_dir(&at(&mine)).await.expect("their folder lists");
                 let names: Vec<_> = listed.entries.iter().map(|e| e.name.as_str()).collect();
                 assert_eq!(names, ["a.txt"]);
@@ -6725,6 +6901,206 @@ mod seat_user_tests {
             assert!(!listed.entries.is_empty());
         }
 
+        /// The three folders a read lists, each one of the person's swapped
+        /// for a link to `to` after it resolved and before it opens
+        /// (`stand_in::swap_before_open`): the drawer's listing, a folder
+        /// download's root, and a folder of its walk. Each is refused,
+        /// saying `why` of the folder asked.
+        async fn swapped_folders_are_refused(
+            to: &std::path::Path,
+            why: impl Fn(&std::path::Path) -> String,
+        ) {
+            let (home, person) = nobodys_home();
+            let base = std::fs::canonicalize(home.path()).unwrap();
+            let me = reader(&person, home.path());
+            let swapped = |tag: &str| {
+                let dir = base.join(tag);
+                std::fs::create_dir(&dir).unwrap();
+                theirs(&dir, &person);
+                stand_in::swap_before_open(&dir, to);
+                dir
+            };
+
+            let dir = swapped("listed");
+            {
+                let _as = stand_in::seat(at_the_screen(&person, home.path())).await;
+                match list_dir(&dir.to_string_lossy()).await {
+                    Ok(listed) => panic!(
+                        "the drawer listed a link to {}: {:?}",
+                        to.display(),
+                        listed.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+                    ),
+                    Err(refused) => assert_eq!(format!("{refused}"), why(&dir), "the drawer"),
+                }
+            }
+            let dir = swapped("zipped");
+            match FilesHandler::new()
+                .begin_outgoing_zip_as(me.clone(), "s3688-1".into(), &dir.to_string_lossy())
+                .await
+            {
+                Ok(_) => panic!("a folder download began on a link to {}", to.display()),
+                Err(refused) => {
+                    assert_eq!(format!("{refused}"), why(&dir), "a folder download's root")
+                }
+            }
+            let dir = swapped("walked");
+            let walked = {
+                let dir = dir.clone();
+                me.run(move || Ok(zip_folder_entries(&dir, 100, true)))
+                    .await
+                    .unwrap()
+            };
+            match walked {
+                Ok(entries) => panic!(
+                    "a walk listed a link to {}: {} entries",
+                    to.display(),
+                    entries.len()
+                ),
+                Err(e) => assert_eq!(format!("{e}"), why(&dir), "a folder of a walk"),
+            }
+        }
+
+        /// #3688 — a folder a read lists is held to the folder asked, as a
+        /// file is: here one swapped for a link to the daemon's own handle
+        /// (`/proc/self/fd/N`) on a folder inside one only root may pass. A
+        /// thread of the daemon's follows that link whatever the folders on
+        /// its path say, so a listing by path would name what is in it. The
+        /// same link met while the path resolves is refused by the folder
+        /// only root may pass: the path is resolved as the person.
+        #[tokio::test]
+        async fn a_folder_swapped_for_a_link_to_the_daemons_own_handle_is_not_listed() {
+            use std::os::fd::AsRawFd;
+            if !root() {
+                return;
+            }
+            let shut = tempfile::tempdir().unwrap();
+            roots_only(shut.path(), 0o700);
+            let inner = shut.path().join("inner");
+            std::fs::create_dir(&inner).unwrap();
+            std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(inner.join("a-name-only-root-may-see.txt"), b"x").unwrap();
+            let held = std::fs::File::open(&inner).unwrap();
+            let magic = PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+
+            let (home, person) = nobodys_home();
+            let link = std::fs::canonicalize(home.path()).unwrap().join("link");
+            std::os::unix::fs::symlink(&magic, &link).unwrap();
+            {
+                let _as = stand_in::seat(at_the_screen(&person, home.path())).await;
+                let Err(refused) = list_dir(&link.to_string_lossy()).await else {
+                    panic!("a link to the daemon's handle was listed as it resolved");
+                };
+                assert_eq!(format!("{refused}"), not_allowed(&link));
+            }
+
+            swapped_folders_are_refused(&magic, not_the_folder_asked).await;
+            drop(held);
+        }
+
+        /// #3688 — a folder swapped for a link to a kernel file system after
+        /// it resolved is refused by its handle, as a file is: what opened is
+        /// on procfs, whatever the path said before.
+        #[tokio::test]
+        async fn a_folder_swapped_for_a_link_to_a_kernel_file_system_is_not_listed() {
+            if !root() {
+                return;
+            }
+            swapped_folders_are_refused(std::path::Path::new("/proc/sys/kernel"), |dir| {
+                on_a_kernel_fs(dir, "procfs")
+            })
+            .await;
+        }
+
+        /// #3688 — a folder download ends with `files:error`, never
+        /// `files:eof`, once the person it began for has left seat0 (signed
+        /// out, or the login screen or another person took it): before it
+        /// lists each folder it asks who is there. Here they are there for
+        /// the first folder and gone by the second, so the first folder's
+        /// file is in, the second's is not, and the viewer is told why, in
+        /// the words a Windows walk uses.
+        #[tokio::test]
+        async fn a_person_who_leaves_the_screen_mid_folder_ends_it_with_an_error_not_eof() {
+            use crate::peer::folder_download_as_the_person_tests::download;
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let root_dir = home.path().join("folder");
+            let later = root_dir.join("later");
+            std::fs::create_dir_all(&later).unwrap();
+            std::fs::write(root_dir.join("first.txt"), b"the first folder's file").unwrap();
+            std::fs::write(later.join("second.txt"), b"the second folder's file").unwrap();
+            let got = {
+                let seat = at_the_screen(&person, home.path());
+                let _as = stand_in::seat_leaving_after(seat, 1).await;
+                download(&root_dir).await
+            };
+            let said = got.said();
+            assert!(
+                got.has(b"the first folder's file"),
+                "the file sent before they left"
+            );
+            assert!(!got.has(b"the second folder's file"), "none after");
+            assert!(
+                !said.iter().any(|m| m.contains("files:eof")),
+                "never files:eof: {said:?}"
+            );
+            let last = said.last().expect("a last message");
+            assert!(
+                last.contains(r#""t":"files:error""#) && last.contains(NOT_THE_PERSON),
+                "the walk's error reaches the viewer: {last}"
+            );
+        }
+
+        /// #3688 — with nobody at seat0 a received file is the daemon's, in
+        /// the default folder, which on a server is the shared `/tmp`: it is
+        /// born root's and 0600, its partial and the partial's notes
+        /// included, so no other account reads any of it at any point.
+        #[tokio::test]
+        async fn nobody_at_the_screen_receives_a_file_only_root_may_read() {
+            if !root() {
+                return;
+            }
+            // No folder chosen: the drop folder, which is process-wide and
+            // which a test beside this one sets.
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let lands = download_dir_for(&FsAs::DaemonAlone).await.unwrap();
+            let only_root = |path: &std::path::Path| {
+                let md = std::fs::metadata(path).unwrap();
+                (md.mode() & 0o777, md.uid(), md.gid())
+            };
+            let h = FilesHandler::new();
+            let id = format!("alone-0600-{}", std::process::id());
+            h.begin_as(
+                FsAs::DaemonAlone,
+                id.clone(),
+                format!("{id}.bin"),
+                5,
+                None,
+                None,
+            )
+            .await
+            .expect("begin with nobody at the screen");
+            let partial = lands.join(".roomler-partial").join(&id);
+            assert_eq!(
+                only_root(&partial.join("data")),
+                (0o600, 0, 0),
+                "the partial, from its first byte"
+            );
+            assert_eq!(
+                only_root(&partial.join("meta.json")),
+                (0o600, 0, 0),
+                "the partial's notes"
+            );
+            h.chunk(b"hello").await.expect("chunk");
+            let (placed, bytes) = h.end(&id).await.expect("end");
+            let mode = only_root(&placed);
+            let _ = std::fs::remove_file(&placed);
+            assert_eq!(bytes, 5);
+            assert_eq!(placed.parent(), Some(lands.as_path()), "the default folder");
+            assert_eq!(mode, (0o600, 0, 0), "the file");
+        }
+
         /// The file is born the person's, in their folder, and nothing of the
         /// staging is left. 0.4.143 wrote it `root:root` into `/tmp` (FR-97
         /// §8, P3d's red).
@@ -6860,8 +7236,7 @@ mod seat_user_tests {
     /// capability; with nobody there a read is refused and a received file
     /// is the daemon's, never where a controller chose; root itself at the
     /// screen, a user install, and the switch off are the daemon, both
-    /// ways; a seat lookup that does not answer in time is nobody. On
-    /// Windows a test process is never LocalSystem, so a read is the
+    /// ways. On Windows a test process is never LocalSystem, so a read is the
     /// daemon's, as a write is; macOS reads as the daemon.
     #[tokio::test]
     async fn reads_take_whom_writes_take() {
@@ -6926,19 +7301,6 @@ mod seat_user_tests {
                 FsAs::DaemonAlone,
                 "a write: the daemon, alone"
             );
-
-            let wait = std::time::Duration::from_millis(20);
-            let slow = seat_within(wait, || {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                Seat::Root
-            })
-            .await;
-            assert!(
-                matches!(slow, Seat::Nobody(_)),
-                "a lookup past its time is nobody: {slow:?}"
-            );
-            let quick = seat_within(std::time::Duration::from_secs(5), || Seat::Root).await;
-            assert_eq!(quick, Seat::Root);
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -6995,6 +7357,172 @@ mod seat_user_tests {
                 };
                 assert_eq!(format!("{dir}"), BROWSE, "{path:?} as {who:?}");
             }
+        }
+    }
+
+    /// #3688 — a seat0 lookup that fails or runs out of time is not nobody at
+    /// the screen: who is there is not known, and a read says so in its own
+    /// words, never that nobody is signed in. A received file takes the
+    /// daemon alone, as with nobody there. The states that are nobody (an
+    /// empty seat, the login screen) keep their texts.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_seat_that_cannot_be_told_is_not_nobody() {
+        const CANNOT_TELL: &str =
+            "Could not tell who is signed in at this computer's screen. Try again.";
+        let wait = std::time::Duration::from_millis(20);
+        let slow = seat_within(wait, || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            Seat::Root
+        })
+        .await;
+        assert!(
+            matches!(slow, Seat::CannotTell(_)),
+            "a lookup past its time: {slow:?}"
+        );
+        let broke = seat_within(std::time::Duration::from_secs(5), || -> Seat {
+            panic!("a seat0 lookup that fails")
+        })
+        .await;
+        assert!(
+            matches!(broke, Seat::CannotTell(_)),
+            "a lookup that failed: {broke:?}"
+        );
+        let quick = seat_within(std::time::Duration::from_secs(5), || Seat::Root).await;
+        assert_eq!(quick, Seat::Root);
+
+        let not_asked =
+            |_: &str| -> std::result::Result<(crate::fs_identity::Account, PathBuf), String> {
+                panic!("no account is resolved for nobody")
+            };
+        let no_logind = seat_of(
+            Err(anyhow!(
+                "loginctl show-seat seat0 failed: Failed to connect to bus"
+            )),
+            not_asked,
+        );
+        assert!(
+            matches!(no_logind, Seat::CannotTell(_)),
+            "logind could not be asked: {no_logind:?}"
+        );
+        let empty = seat_of(
+            Err(crate::companion::nobody_at_the_screen(
+                "seat0 has no active session".into(),
+            )),
+            not_asked,
+        );
+        assert!(matches!(empty, Seat::Nobody(_)), "an empty seat: {empty:?}");
+        let unresolved = seat_of(Ok(("ana".into(), Some(1000))), |_| {
+            Err("getpwnam_r(ana): the account database did not answer".into())
+        });
+        assert!(
+            matches!(unresolved, Seat::CannotTell(_)),
+            "an account the database did not answer: {unresolved:?}"
+        );
+        let unknown = || Seat::CannotTell("the seat0 lookup did not answer".into());
+        assert_eq!(
+            linux_fs_as(true, true, true, unknown),
+            FsAs::CannotTell,
+            "a read"
+        );
+        assert_eq!(
+            linux_fs_as(true, true, false, unknown),
+            FsAs::DaemonAlone,
+            "a write"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("x.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let folder = temp.path().to_string_lossy().into_owned();
+        let h = FilesHandler::new();
+        let who = FsAs::CannotTell;
+        let Err(get) = h
+            .begin_outgoing_as(who.clone(), "c3688-1".into(), &file.to_string_lossy())
+            .await
+        else {
+            panic!("a download began with no one known at the screen");
+        };
+        assert_eq!(format!("{get}"), CANNOT_TELL, "files:get");
+        let Err(zip) = h
+            .begin_outgoing_zip_as(who.clone(), "c3688-2".into(), &folder)
+            .await
+        else {
+            panic!("a folder download began with no one known at the screen");
+        };
+        assert_eq!(format!("{zip}"), CANNOT_TELL, "files:get-folder");
+        let (zip_writer, _zip_reader) = tokio::io::duplex(64 * 1024);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let walked = walk_and_zip(zip_writer, temp.path(), &who, cancel).await;
+        assert_eq!(format!("{}", walked.expect_err("a walk")), CANNOT_TELL);
+        for path in [folder.as_str(), "", "~", STAGING_SENTINEL] {
+            let Err(dir) = list_dir_as(&who, path).await else {
+                panic!("{path:?} was listed with no one known at the screen");
+            };
+            assert_eq!(format!("{dir}"), CANNOT_TELL, "files:dir {path:?}");
+        }
+    }
+
+    /// #3688 — a listing answers inside the viewer's own timer for it: the
+    /// drawer gives up on `files:dir` after 5 s (`listDir`,
+    /// `ui/src/composables/useRemoteControl.ts`). The seat0 lookup and the
+    /// listing's own timeout run one after the other, so together they stay
+    /// inside it; a lookup that took the whole 5 s could never be answered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listing_waits_for_the_seat_inside_the_drawers_timer() {
+        let drawer = std::time::Duration::from_secs(5);
+        let listing = std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS);
+        assert!(
+            SEAT_LOOKUP_WAIT + listing < drawer,
+            "{SEAT_LOOKUP_WAIT:?} + {listing:?} leaves no room inside {drawer:?}"
+        );
+    }
+
+    /// #3688 — the uid logind recorded for seat0's session must be the uid
+    /// its name resolves to: a name the account database answers with
+    /// another uid (a lookup order that puts another source first, an
+    /// account deleted and made again) is nobody, saying why, never another
+    /// account's rights. With no uid recorded the name decides, as before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seat0_name_that_resolves_to_another_uid_is_nobody() {
+        fn resolves_to(
+            uid: u32,
+        ) -> impl FnOnce(&str) -> std::result::Result<(crate::fs_identity::Account, PathBuf), String>
+        {
+            move |name| Ok((ana(uid, name), PathBuf::from("/home/ana")))
+        }
+        fn ana(uid: u32, name: &str) -> crate::fs_identity::Account {
+            crate::fs_identity::Account {
+                uid,
+                gid: uid,
+                groups: vec![uid],
+                name: name.into(),
+            }
+        }
+        let found = |uid: Option<u32>| Ok(("ana".to_string(), uid));
+        let person = Seat::Person {
+            account: ana(1000, "ana"),
+            home: PathBuf::from("/home/ana"),
+        };
+        assert_eq!(
+            seat_of(found(Some(1000)), resolves_to(1000)),
+            person,
+            "the same uid"
+        );
+        assert_eq!(
+            seat_of(found(None), resolves_to(1000)),
+            person,
+            "no uid recorded: the name's account"
+        );
+        assert_eq!(seat_of(found(Some(0)), resolves_to(1000)), Seat::Root);
+        match seat_of(found(Some(1001)), resolves_to(1000)) {
+            Seat::Nobody(why) => assert!(
+                why.contains("1001") && why.contains("1000"),
+                "the reason names both: {why}"
+            ),
+            other => panic!("another uid's account was taken: {other:?}"),
         }
     }
 
