@@ -1659,7 +1659,7 @@ pub fn on_tick(session: bson::oid::ObjectId) -> Option<Answer> {
     }
     // The virtual desktop is the daemon's own: nobody comes back to it.
     let presence = || {
-        if crate::virtual_desktop::switchable_display().is_some() {
+        if crate::virtual_desktop::active() {
             Presence::Unattended
         } else {
             crate::presence::now()

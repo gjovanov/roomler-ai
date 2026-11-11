@@ -560,8 +560,8 @@ per-user config), with one viewer on the daemon's row:
 Every re-created session waited the same 30 s, so each notice reached a session
 already gone, and the page blamed the network
 ([FR-43](fr/FR-43-macos-single-enrollment.md), the black rows). `scrap_open`
-(`agents/roomlerd/src/capture/mod.rs:4839`) now asks `tcc::has_gui_session`
-first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:4855`).
+(`agents/roomlerd/src/capture/mod.rs:4849`) now asks `tcc::has_gui_session`
+first, through `open_in_session` (`agents/roomlerd/src/capture/mod.rs:4865`).
 Where it answers no, nothing runs that waits on a window server: TCC's
 preflight and request (`agents/roomlerd/src/capture/scrap_backend.rs:112`), the
 display wake (`agents/roomlerd/src/capture/scrap_backend.rs:160`) and

@@ -3556,7 +3556,7 @@ fn maybe_start_virtual_desktop() -> Result<Option<virtual_desktop::VirtualDeskto
         wm: node_env("VIRTUAL_DESKTOP_WM").unwrap_or_else(|| "openbox".to_string()),
         startup,
     };
-    let vd = virtual_desktop::start(&cfg).context("starting virtual desktop")?;
+    let vd = virtual_desktop::start(&cfg); // cannot fail, by design (#3643)
     // Point capture at the virtual display + (by default) pin media to TURNS/TCP.
     // Set here (early in `run_cmd`, before the agent spawns its session tasks) so
     // the caps/display probe and every later capture see it. `set_var` is

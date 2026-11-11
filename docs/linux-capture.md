@@ -57,7 +57,7 @@ A per-user daemon in its own Wayland session, with no capture key set, runs
 | **DRM/KMS** (`drm_backend.rs`) | the primary CRTC's scanout framebuffer, via `/dev/dri/cardN` | **yes** — it reads below the compositor, so a lock screen is just more pixels | no | a real display controller with a live, linear-modifier scanout buffer | **off** | `ROOMLERD_DRM_CAPTURE=1` (`mod.rs:3167`) |
 | **portal** (`portal/screencast.rs`) | a PipeWire stream the compositor publishes through `org.freedesktop.portal.ScreenCast` | **the greeter, no; a locked screen, per compositor** — mutter refuses to create *or restore* a screencast while locked, KWin keeps streaming its lock screen (§1.2) | **yes**, once; a restore token skips the dialog afterwards | an active `x11`/`wayland` logind session, `xdg-desktop-portal` + a backend for the compositor, PipeWire | **off**; automatic in a per-user Wayland session with no key where mutter is absent (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` (`mod.rs:3278`) |
 | **mutter direct** (`portal/mutter.rs`) | the same kind of PipeWire stream, from `org.gnome.Mutter.ScreenCast` | no (a session API) | **no** | GNOME's mutter on the user's session bus; no portal backend required | **off**; automatic in a per-user GNOME Wayland session with no key (§1.2) | `ROOMLERD_PORTAL_CAPTURE=1` **and** `ROOMLERD_MUTTER_CAPTURE=1` (`portal/backend.rs:70`) |
-| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:3347`), after the Xwayland guard (`mod.rs:3323`) |
+| **scrap** (`scrap_backend.rs` + `x11_damage.rs`) | the X root window over XShm, with XDamage saying whether anything changed | X11: yes for whatever the X server shows; Wayland: nothing (Xwayland's root is empty), so since FR-93 scrap is never pointed at Xwayland (§1.1) | no | an X display: the session's `DISPLAY`, or the Xvfb the daemon starts itself | **on** — the last real arm | always tried (`mod.rs:3357`), after the Xwayland guard (`mod.rs:3323`) |
 
 Two things about the order are deliberate and worth defending when the next
 backend arrives:
@@ -528,7 +528,7 @@ the portal every minute would start it on every host that does not run it.
 
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
-(`desktop_brief.rs:63`) reads it every 60 s into a cache. The hello and the
+(`desktop_brief.rs:98`) reads it every 60 s into a cache. The hello and the
 heartbeat only read that cache (`signaling.rs:6986`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2561`).
 Until the first read lands, which is milliseconds after start, the hello
@@ -558,7 +558,7 @@ On a host with no X session at all — a headless server, a container, **WSL2**
 (WSLg's rootless XWayland root has no readable framebuffer, so `XGetImage`
 fails) — the daemon can bring up its **own** display:
 `ROOMLERD_VIRTUAL_DESKTOP=1` (`agents/roomlerd/src/app.rs:3541`,
-`virtual_desktop.rs:685`) starts an X server at
+`virtual_desktop.rs:1253`) starts an X server at
 `ROOMLERD_VIRTUAL_DESKTOP_RESOLUTION` (default `1920x1080`) — Xorg with the
 dummy driver where it is installed, so a viewer's size can become the mode
 (FR-108 P2, `docs/display-match.md`), else Xvfb — with the window manager named by
@@ -568,17 +568,13 @@ probe and every capture, and captures it with the unchanged scrap + damage
 path. This is the hardware-encode test bed on the WSL2 dev host, and the
 remote-apps surface of FR-56 rides on it.
 
-⚠️ **On a host with NVIDIA's userspace driver, Xvfb does not survive its own
-start** ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643), open). Its
-GLX reaches EGL through Mesa's DRI shim, glvnd hands that call to its first
-vendor, and with NVIDIA's EGL inside the server it aborts within seconds
-(`double free or corruption`). The daemon does not watch the server, so it goes
-on advertising the desktop, and a session then shows "This device cannot
-capture its screen". Measured on an AWS g5g on 0.4.208 (FR-122 §8): an Xvfb
-started alone aborts, installing Mesa's EGL beside NVIDIA's changes nothing
-(NVIDIA's vendor file sorts first), and pinning the vendor for the server keeps
-it up. Until the fix, put a wrapper ahead of `/usr/bin/Xvfb` on the daemon's
-`PATH`:
+⚠️ **Through 0.4.209, on a host with NVIDIA's userspace driver, Xvfb did not
+survive its own start** ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643)):
+NVIDIA's EGL, loaded into the server, aborted it within seconds, and the daemon
+went on advertising the desktop. The daemon now starts the server with Mesa's
+EGL vendor and supervises it: [§2.2](#22-the-desktop-is-supervised-3643). A
+device on 0.4.209 or older needs a wrapper ahead of `/usr/bin/Xvfb` on the
+daemon's `PATH`:
 
 ```sh
 #!/bin/sh
@@ -587,8 +583,8 @@ exec /usr/bin/Xvfb "$@"
 ```
 
 A container that mounts only the driver's compute libraries (the rented DGX
-Spark of FR-122) has no NVIDIA EGL and is not affected. The Xorg dummy-driver
-path is untested on such a host.
+Spark of FR-122) has no NVIDIA EGL and was never affected. The Xorg
+dummy-driver path gets the same EGL vendor, and is untested on such a host.
 
 ⚠️ **A startup app can map before the window manager is listening.** `start`
 launches the WM and the apps back to back, and a window that maps while openbox
@@ -670,6 +666,93 @@ picture:
 |---|---|---|---|
 | the cursor channel | one `cursor:hide`, nothing else | one `cursor:shape` (18×24, `css: default`), then `cursor:pos` | one `cursor:hide`, nothing else |
 | the pointer at (0.25, 0.25), (0.75, 0.6), (0.5, 0.5) | — | (320, 200), (959, 479), (640, 400) | — |
+
+### 2.2 The desktop is supervised (#3643)
+
+The X server is one process, and until 0.4.209 the daemon took its start for
+its life: once the server's socket existed, the desktop was "up" for as long as
+the daemon ran. On an AWS g5g (NVIDIA T4G, driver 595.112.07, Mesa 25.2.8) the
+server aborted within eleven seconds of every start. The device went on
+offering a desktop, every session connected and showed nothing, and the server
+and the window manager stayed under the daemon as zombies (0.4.208 and 0.4.209,
+FR-122 §8). `agents/roomlerd/src/virtual_desktop.rs` now holds five rules:
+
+| Rule | What it means | Where |
+|---|---|---|
+| **No hardware vendor's EGL inside the server** | The server is a software framebuffer. The crashed one had NVIDIA's EGL mapped beside Mesa's DRI shim and had aborted with `double free or corruption (out)`. The likely path, read from those mappings: its GLX goes through the shim, the shim lists its configurations through EGL, and glvnd hands that call to the first vendor file it finds, which is NVIDIA's `10_nvidia.json`, ahead of `50_mesa.json`. Installing Mesa's EGL beside NVIDIA's changed nothing, and neither did `__GLX_VENDOR_LIBRARY_NAME`. So Xvfb and Xorg are both started with `__EGL_VENDOR_LIBRARY_FILENAMES` naming Mesa's vendor file and nothing else. On a host that has vendor files and none of Mesa's (the g5g's image as shipped) that is Mesa's usual path, which is not there: with no vendor at all the server starts and still lists GLX. A host with no vendor file where glvnd looks by default is left as it was. The window manager and the apps are clients and are not pinned | `egl_vendor_pin` `:1552` |
+| **"Up" means it answers, and it is ours** | The start waits until the server answers an X11 connection setup, for 15 s at most, and fails at once when the server exits. A socket is not enough: the server makes it before it initialises its extensions, which is where the g5g's died. An answer is not enough either: the display keeps its number, so another server can be on it between two of ours, and the display's lock has to name this server before its answer counts. Xvfb now runs with `-noreset`, as Xorg already did, so that this first client leaving does not reset the server | `wait_display_ready` `:1999`, `x_answers` `:1747`, `xvfb_args` `:1880` |
+| **Its exit is noticed, and it comes back** | A thread waits for the server's exit, takes the rest of the tree down, clears the lock a killed server leaves behind, and starts the desktop again on the **same display**, since `DISPLAY` is exported once. The delay is 1 s after an exit, and doubles with every start that fails or lasts under a minute, up to 5 min | `supervise` `:1286`, `Backoff` `:1347`, `remove_stale_lock` `:1493` |
+| **Its last words are kept** | The server's stderr used to go to `/dev/null`. Its last 4 KiB now reach the daemon log when it exits or does not come up (`said=…`), beside how it ended (`signal 6 (aborted), core dumped`). They stay in the log: the reason a controller is shown never carries them | `StderrTail` `:1613`, `wait_exit` `:1389` |
+| **A broken desktop never stops the daemon** | Missing binaries, or a server that will not come up, used to end the daemon's start, and with it the machine's overlay and SSH. The daemon now runs without a desktop, says why, and keeps trying: installing the missing package is enough, with no restart. What a broken desktop can still cost is time, once: the first start is waited for, 15 s a server at most | `start` `:1253` |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Starting: start()
+    Starting --> Up: the server answered, and the lock is its own
+    Starting --> Down: binaries missing, the server exited, or 15 s of silence
+    Up --> Down: the server exited
+    Down --> Starting: after the delay (1 s, doubling to 5 min)
+    Up --> [*]: teardown
+    Down --> [*]: teardown
+```
+
+**While the desktop is down, the device does not offer it.**
+`virtual_desktop::down` (`:273`) carries the reason. The capture plan drops the
+X11 arm (`arm_facts`, `capture/mod.rs:1469`), and the supervisor wakes the
+brief's refresher (`refresh_soon`, `desktop_brief.rs:40`), so the hello's
+`desktop` reads `capture_arm: none` at the next heartbeat instead of up to a
+minute later. A session opened meanwhile is refused with `backend_error` and
+the agent's own words (`capture/mod.rs:3346`), for example: *this device's
+virtual desktop is down: its X server (Xvfb) exited: signal 6 (aborted), core
+dumped. The agent starts it again by itself; reconnect in a moment.* Display
+match treats the desktop as the daemon's own all the while
+(`virtual_desktop::active`), so a server that restarts is never read as a
+person coming back to the screen.
+
+⚠️ **The supervisor waits for the server without reaping it**
+(`waitid(WNOWAIT)`, `wait_exit`). The dead server keeps its pid, and the
+desktop's process group id with it, until `kill_tree_with` (`:639`) has sent
+its last signal: rule 1 of the teardown below. `Child::wait` would free both
+numbers while the window manager is still to be signalled through them. And
+every child is spawned and recorded under the one lock that a graceful exit
+sets `stopping` under (`spawn_server` `:970`), so `teardown` either kills a
+child or the child is never started.
+
+**Xorg's directory is made, never adopted** (`private_dir` `:1787`). It
+sits under the temp directory, so it is created with mode 0700 in one step and
+reused only when it already is this user's own and closed to everyone else;
+anything else found at its path is removed first, and no step follows a link.
+It is kept from one start to the next, so a crashed server's log is still
+there afterwards, as Xorg's own `Xorg.log.old`.
+
+**To choose the server's EGL vendor yourself**, set
+`__EGL_VENDOR_LIBRARY_FILENAMES` or `__EGL_VENDOR_LIBRARY_DIRS` in the daemon's
+own environment (a systemd drop-in). The daemon then leaves the server's
+environment as it is.
+
+**Not covered.**
+
+- A server that hangs but stays alive: only its exit is watched.
+- The window manager's or an app's own exit: they are started once per
+  server, and one that exits stays uncollected until the server next exits or
+  the daemon stops.
+- A descendant that left the desktop's process group (`setsid`) and whose
+  parent died with the server. The teardown reaches such a process through its
+  parent, and after a crash the parent is gone before the tree is read. It is
+  the #1684 class, and it was there before: [#3665](https://github.com/gjovanov/roomler-ai/issues/3665).
+- Display match's mode after a restart: the new server starts at the
+  configured size.
+- A session that was open when the server exited. Its capture ends, and the
+  person reconnects.
+
+**Proven** by `virtual_desktop::supervise_tests` (`:2910`): stand-in servers
+that die or hang, a display that someone else's server answers on, a lock and
+a directory that are not ours, all in every Linux unit run; and on the CI Xvfb
+lane a real Xvfb that is SIGKILLed and is back on the same display, on a new
+server, with its stale lock cleared. The same test passes for Xorg with the
+dummy driver when it is run as root on a host that has the driver
+(`ROOMLERD_TEST_XORG=1`). ⚠️ The g5g run on the release that carries this is
+still owed ([#3643](https://github.com/gjovanov/roomler-ai/issues/3643)).
 
 ## 3. The DRM arm (FR-36)
 
@@ -2140,11 +2223,11 @@ defect — the capture arms only expose it by being knobs.
 | File | Owns |
 |---|---|
 | `agents/roomlerd/src/capture/mod.rs` | `ScreenCapture`, `open_default` (`:2195`), `open_default_async` (`:2215`) and the cascade (`open_with` `:2464`); the FR-80 failure classifier (`:2082`); FR-93's verdicts: `linux_no_pixels_code` (`:1799`), `xwayland_verdict` (`:1848`), the Xwayland guard (`:2824`) and its socket-only probe (`x_server_query` `:1957`), the hints (`wayland_hint` `:586`, `wayland_not_enabled_detail` `:1833`); P2's automatic arm: `wayland_plan` (`:741`), `open_auto_mutter` (`:1648`), and P2d-3's `open_auto_portal` (`:1746`) with `auto_portal_unusable` (`:1780`) and P4b's `auto_portal_input` (`:1730`); P3d's Wayland-only idle skip, decided at the DRM open (`:2685`); P5b's and P3e's wait through a state of the host (`open_through_wait` `:1233`, the states `HostWait` `:1113`, `GNOME_LOCK` `:1131` and `DISPLAY_OFF` `:1143`, bounded by `HOST_WAIT_MAX` `:1075` and retried by `HOST_WAIT_RETRY` `:1094`), a running capture's own wait (`ScreenCapture::waits_for` `:397`), what a parked open waits for (`OpenWait` `:2253`, `WaitFor` `:2265`) the session behind it (`open_has_session` `:2369`; nothing else waits) and how it learns that session left (`open_abandoned` `:2383`); FR-93 P5g: this user's session in the background still plans the automatic arm (`OwnSession` `:692`, `own_session_in` `:897`), and an open waits for it before either arm (`wait_while_away` `:1288` over `SESSION_AWAY` `:1159`, called at `:2602`), its hook firing once per wait (`OnOpenWait` `:2323`, `tell_open_waiting` `:2442`); FR-93 P6c: a stop at the screen, typed for the pumps (`StoppedAtScreen` `:2304`, `stopped_at_screen` `:2315`) |
-| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:47`) and the session a controller would see (`seen_session` `:96`); P3d's `seen_is_wayland` (`:34`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:789`, `:816`, `:832`) |
+| `agents/roomlerd/src/desktop_brief.rs` | FR-93 P2b: the hello's `desktop` brief, its `desktop-brief` refresher (`start` `:98`) and the session a controller would see (`seen_session` `:147`); P3d's `seen_is_wayland` (`:69`); `planned_arm`, P4's `planned_input_route` and `arm_facts` live beside the cascade in `capture/mod.rs` (`:789`, `:816`, `:832`) |
 | `agents/roomlerd/src/keep_busy/logind.rs` | the logind facts the cascade, the brief and keep busy read (`Session` `:36`, `parse_show` `:72`, `sessions` `:157`); FR-93 P5g: a session in the background, never one closing (`in_background` `:65`) |
 | `agents/roomlerd/src/capture/scrap_backend.rs` · `x11_damage.rs` | the X11 arm and its damage listener |
 | `agents/roomlerd/src/capture/x11_cursor.rs` | FR-97 P3a: the X11 pointer for the cursor channel (`X11Cursor::open`, `publish`), its shape (`shape_of`) and its CSS keyword (`css_for`) |
-| `agents/roomlerd/src/virtual_desktop.rs` | Xvfb + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` |
+| `agents/roomlerd/src/virtual_desktop.rs` | the X server + WM + startup apps for `ROOMLERD_VIRTUAL_DESKTOP=1` (`start` `:1253`); #3643: the server's EGL vendor (`egl_vendor_pin` `:1552`), "it answers" (`wait_display_ready` `:1999`), the supervisor (`supervise` `:1286`) and why the desktop is down (`down` `:273`); the teardown (`teardown` `:521`, `kill_tree_with` `:639`) |
 | `agents/roomlerd/src/capture/drm_backend.rs` | the DRM/KMS arm (`env_enabled` `:209`, `primary` `:718`) and the scanout's channel order, both depths (`Layout::of` `:557`, `repack_to_bgra` `:579`, `repack_bgra_half` `:1102`); FR-93 P3c: the plane table with each plane's type (`read_planes` `:258`), the primary by type (`primary_plane` `:306`), the cursor caps (`enable_cursor_caps` `:385`) and the per-frame cursor read (`CursorReader` `:398`, `read_cursor_pixels` `:480`); FR-93 P3d/P3f: the buffer's identity (`BufferId` `:118`) and the mapping's key (`maps` `:132`), the kill switch (`idle_skip_enabled` `:333`), the gate in `grab` (`:915`), and the still screen waited out in `next_frame` (`:1175`); FR-93 P3e: a display switched off (`display_off` `:356`, for an open `display_is_off` `:374`), told apart in the worker loop (`:872`), waited out in `next_frame` (`:1237`, `DARK_POLL` `:348`) and reported by `waits_for` (`:1266`), and its kill switch (`wake_wait_enabled` `:341`); FR-93 P3h: a scanout this daemon may not read, refused at open (`unreadable` `:908`) |
 | `agents/roomlerd/src/capture/drm_cursor.rs` | FR-93 P3c: the published cursor (`publish` `:64`, `latest` `:71`) and the pure conversions (`straighten_and_crop` `:108`, `place` `:167`, `shape_id` `:181`, `pick_primary` `:208`) |
 | `agents/roomlerd/src/capture/drm_idle.rs` | FR-93 P3d: the bounds (`MAX_SKIP` `:44`, `IDLE_WAIT` `:53`, `SAMPLE_ROWS` `:58`), what a tick showed (`Shown` `:62`), the gate (`IdleGate` `:75`, `unchanged` `:83`) and the row hash (`sample_rows` `:110`, `sampled_row` `:125`) |
@@ -2158,4 +2241,4 @@ defect — the capture arms only expose it by being knobs.
 | `agents/roomlerd/src/peer.rs` | the notice (`media_waiting_payload` `:5037`, `media_waiting_hook` `:5313`); FR-93 P3e/P5f: a running capture's wait in the pumps (`CaptureWait` `:5162`), told after a quiet spell (`QUIET_BEFORE_TELL` `:5183`), and the hold that yields so the pump stays abortable (`:2527`, `:3980`, `:7194`); FR-93 P6c: a stop at the screen ends the session, a shared pipeline's followers first, and never reopens (`end_stopped_at_screen` `:5456`) |
 | `agents/roomlerd/src/capture/portal/input.rs` · `input_route.rs` | FR-45 P4 and FR-93 P4: the helper's `Notify*` mapping (`plan` `:123`, mutter's `mutter_call` `:274`); FR-93 P4b's KDE correction (`for_backend` `:224`) and the awaited portal calls (`Target::delivery` `:348`); the arbiter-side per-event route (`try_route` `:113`) and whose session it feeds (`active` `:97`) |
 | `crates/agent-core/src/config_surface.rs` | the keys in §7 and the descriptions `roomler config` prints (`:935-1006`) |
-| `agents/roomlerd/src/app.rs` | `capture-smoke` (`capture_smoke_cmd` `:5522`, the portal line `:5541`); the virtual desktop (`maybe_start_virtual_desktop` `:2647`) |
+| `agents/roomlerd/src/app.rs` | `capture-smoke` (`capture_smoke_cmd` `:7038`, the portal line `:7065`); the virtual desktop (`maybe_start_virtual_desktop` `:3520`) |

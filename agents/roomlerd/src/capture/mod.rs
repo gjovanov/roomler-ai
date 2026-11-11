@@ -1358,7 +1358,7 @@ pub(crate) struct ArmFacts {
     /// FR-93 P4 — `mutter_input` (default on): a mutter arm's input rides
     /// mutter's RemoteDesktop.
     pub mutter_input: bool,
-    /// The daemon captures its own Xvfb.
+    /// The daemon captures its own virtual desktop, whose X server answers.
     pub virtual_desktop: bool,
     /// The session a controller would see is an X11 one.
     pub x11_session: bool,
@@ -1466,7 +1466,7 @@ pub(crate) fn arm_facts(
         portal_input: tunnel_core::env::flag("PORTAL_INPUT", false),
         auto_portal_input: auto_portal_input(),
         mutter_input,
-        virtual_desktop,
+        virtual_desktop: virtual_desktop && crate::virtual_desktop::down().is_none(), // #3643
         x11_session,
         x11_built: cfg!(feature = "scrap-capture"),
     }
@@ -3337,6 +3337,16 @@ fn open_with(
             );
             return Box::new(NoopCapture::unavailable(reason));
         }
+    }
+
+    // #3643 — the daemon's own virtual desktop is down. XShm would only say
+    // "connection refused", which reads like a network fault; say what the
+    // agent knows, and that it is already starting the desktop again.
+    #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
+    if let Some(detail) = crate::virtual_desktop::down_detail() {
+        tracing::warn!(%detail, "capture: the virtual desktop is down — nothing to capture until it is back");
+        let reason = CaptureUnavailable::new(CaptureUnavailableCode::BackendError, detail);
+        return Box::new(NoopCapture::unavailable(reason));
     }
 
     #[cfg(all(target_os = "linux", feature = "scrap-capture"))]
