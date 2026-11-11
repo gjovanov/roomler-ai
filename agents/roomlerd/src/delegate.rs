@@ -1411,6 +1411,10 @@ impl DelegateHost {
             return;
         }
         tracing::info!("delegation channel attached");
+        // ⚠️ `run` clears the sender, the caps and the questions without a
+        // check of which channel set them. It requires that no other channel
+        // attaches until that clear is done: `attached` is released only after
+        // `run` returns, and one channel is attached at a time.
         let result = self.run(rd, wr).await;
         self.inner.attached.store(false, Ordering::Release);
         match result {
