@@ -1691,10 +1691,11 @@ struct RemoteFacts {
 
 /// FR-138 — whether somebody saw a session row's end: not when it was
 /// inferred (`end_source`: the registration read, the sweep, the dead-row
-/// close), whose `ended_at` is only the row's own last clock. Such an end is
-/// no end in the quality section's counts by `ended_at` (review 2, N12): it
-/// is no failure a pod saw, and it would land, back-dated, in a day already
-/// reported. Its hours still count, up to that end (`read_remote_usage`).
+/// close, a detached session's redial), whose `ended_at` is only the row's
+/// own last clock. Such an end is no end in the quality section's counts by
+/// `ended_at` (review 2, N12): it is no failure a pod saw, and it would land,
+/// back-dated, in a day already reported. Its hours still count, up to that
+/// end (`read_remote_usage`).
 fn end_was_seen(d: &Document) -> bool {
     matches!(d.get("end_source"), None | Some(Bson::Null))
 }
@@ -3797,7 +3798,13 @@ mod tests {
     fn an_inferred_end_is_no_end_a_pod_saw() {
         assert!(end_was_seen(&doc! { "ended_at": DateTime::now() }));
         assert!(end_was_seen(&doc! { "end_source": Bson::Null }));
-        for source in ["registration", "sweep", "backfill", "a_later_source"] {
+        for source in [
+            "registration",
+            "sweep",
+            "backfill",
+            "redial",
+            "a_later_source",
+        ] {
             assert!(!end_was_seen(&doc! { "end_source": source }), "{source}");
         }
     }

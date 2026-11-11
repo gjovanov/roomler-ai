@@ -6108,7 +6108,8 @@ pub struct RemoteSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats_at: Option<DateTime>,
     /// FR-138 — who ended a session whose end nobody saw: the read at the
-    /// device's registration, or the sweep. Absent on every session whose end
+    /// device's registration, the sweep, or a redial that named it in
+    /// `replaces` while it was detached. Absent on every session whose end
     /// was seen, so an hour-weighted read can leave out the inferred ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_source: Option<EndSource>,
@@ -6140,6 +6141,12 @@ pub enum EndSource {
     /// open (`POST /api/admin/rc-sessions/close-dead`), dated by the row's own
     /// last clock. An older image reads it as [`Self::Unknown`].
     Backfill,
+    /// D5 = A — a redial named it in `replaces` while it was detached: its
+    /// viewer gave it up (its peer gone, or its own deadline passed) while
+    /// the device was away, and hung up nothing first, so nobody saw how the
+    /// device's side ended. Dated by the row's own last clock. An older image
+    /// reads it as [`Self::Unknown`].
+    Redial,
     /// A source a newer server wrote: the row still reads.
     #[serde(other)]
     Unknown,
@@ -6747,8 +6754,9 @@ pub enum AuditKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ended_at: Option<DateTime>,
         /// FR-138 — who inferred that end (the read at the device's
-        /// registration, or the sweep), written onto the row so an
-        /// hour-weighted read can leave it out. Absent on every end seen.
+        /// registration, the sweep, or a redial's `replaces` of a detached
+        /// session), written onto the row so an hour-weighted read can leave
+        /// it out. Absent on every end seen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         end_source: Option<EndSource>,
     },
@@ -11159,6 +11167,15 @@ mod fr138_resume_tests {
         assert_eq!(
             bson::to_bson(&EndSource::Backfill).unwrap(),
             bson::Bson::String("backfill".into())
+        );
+        // D5 = A — a redial's `replaces` of a detached session.
+        let mut d = doc.clone();
+        d.insert("end_source", "redial");
+        let back: RemoteSession = bson::from_document(d).unwrap();
+        assert_eq!(back.end_source, Some(EndSource::Redial));
+        assert_eq!(
+            bson::to_bson(&EndSource::Redial).unwrap(),
+            bson::Bson::String("redial".into())
         );
         let mut d = doc;
         d.insert("end_source", "a_later_source");

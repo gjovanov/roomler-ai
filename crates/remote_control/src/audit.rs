@@ -302,13 +302,13 @@ async fn set_phase(
 /// `no_prompt_surface` on the same row, and the row reads the second.
 ///
 /// FR-138 (review 2, N11) — but never over an INFERRED end (`end_source`
-/// set: the registration read, the sweep, the one-time close). Such a row
-/// was ended because the session was over, by the best evidence there was,
-/// and a later asked end can only come from a copy some pod still held of a
-/// session already ended (a half-open socket kept it): its reason and its
-/// `now` would rewrite the row's end and leave the mark on it. `{end_source:
-/// null}` matches a row with no `end_source` at all, which is every row but
-/// an inferred one.
+/// set: the registration read, the sweep, the one-time close, a detached
+/// session's redial). Such a row was ended because the session was over, by
+/// the best evidence there was, and a later asked end can only come from a
+/// copy some pod still held of a session already ended (a half-open socket
+/// kept it): its reason and its `now` would rewrite the row's end and leave
+/// the mark on it. `{end_source: null}` matches a row with no `end_source`
+/// at all, which is every row but an inferred one.
 async fn end_session(
     sessions: &Collection<RemoteSession>,
     ev: &RemoteAuditEvent,
