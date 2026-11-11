@@ -2854,6 +2854,83 @@ mod tests {
         task.await.unwrap();
         assert!(!host.worker_keeps(), "gone with its channel");
     }
+
+    /// FR-138 P2b (review HIGH-2) — the channel ends on an I/O error, its
+    /// worker gone while the daemon writes to it (EPIPE): what P2b holds for
+    /// the channel ends with it all the same, as on a clean end. The attach
+    /// generation moves on, each bound record hears its session end as
+    /// `error` (D6), the bindings go, and the worker's word with them. Written
+    /// first: before the fix only a clean end ran any of it.
+    #[tokio::test]
+    async fn p2b_review_a_channel_that_ends_on_a_write_error_ends_what_p2b_held() {
+        let host = DelegateHost::new();
+        let secret = host.mint();
+        // Two pipes, one each way, so the daemon's writes can fail while its
+        // reads go on: the error exit, not the clean end of a read EOF.
+        let (mut to_daemon, daemon_rd) = tokio::io::duplex(4096);
+        let (daemon_wr, from_daemon) = tokio::io::duplex(4096);
+        let h = host.clone();
+        let task = tokio::spawn(async move {
+            h.serve(&secret, Box::new(daemon_rd), Box::new(daemon_wr))
+                .await
+        });
+        let mut lines = BufReader::new(from_daemon).lines();
+        assert!(matches!(
+            next_frame(&mut lines).await,
+            DelegateFrame::Attached { .. }
+        ));
+        write_frame(
+            &mut to_daemon,
+            &DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features: vec![KEEP_DELEGATED.to_string()],
+            },
+        )
+        .await
+        .unwrap();
+        to_daemon.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.worker_keeps(), "a P2b worker is attached");
+        let session = bson::oid::ObjectId::new();
+        let (link, mut heard) = tokio::sync::mpsc::channel(8);
+        host.bind(session.to_hex(), link);
+        let before = host.generation();
+
+        // The worker is gone: the daemon's next write, the pong, is EPIPE.
+        drop(lines);
+        to_daemon.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the daemon's loop ends on the write error")
+            .unwrap();
+
+        assert_eq!(
+            host.generation(),
+            before + 1,
+            "the attach generation moves on"
+        );
+        let said = heard.try_recv().ok();
+        assert!(
+            matches!(
+                said,
+                Some(ClientMsg::Terminate {
+                    session_id,
+                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                    ..
+                }) if session_id == session
+            ),
+            "D6: the bound record's session ends as error: {said:?}"
+        );
+        assert!(
+            !host.worker_keeps(),
+            "the worker's word goes with its channel"
+        );
+        host.relay_upstream(ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        });
+        assert!(heard.try_recv().is_err(), "the binding is gone");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -3163,6 +3240,58 @@ mod routing_tests {
                 WorkerLane::Here(DelegateFrame::Ping)
             ),
             "liveness stays in the attach loop"
+        );
+    }
+
+    /// FR-138 P2b (review HIGH-1) — the server's end of a session the daemon
+    /// keeps a record of travels the worker's ORDERS lane, which the worker
+    /// serves wherever its loop waits, its own socket's dial, hello and every
+    /// backoff included. The inbound lane, where the `Terminate` beside it
+    /// waits, is read only once that socket is up. Its wire is stable, and a
+    /// frame with no limit parses. Written first: before the fix it went to
+    /// the attach loop, which skips it.
+    #[test]
+    fn p2b_review_the_daemons_end_takes_the_orders_lane() {
+        use serde_json::json;
+        let id = oid().to_hex();
+        let frame = DelegateFrame::Ended {
+            session_id: id.clone(),
+            reason: EndReason::IdleTimeout,
+            limit: Some("max_duration".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&frame).ok(),
+            Some(json!({"t": "ended", "d": {
+                "session_id": id, "reason": "idle_timeout", "limit": "max_duration"
+            }})),
+            "its wire"
+        );
+        let bare = serde_json::from_value::<DelegateFrame>(json!({"t": "ended", "d": {
+            "session_id": id, "reason": "admin_terminated"
+        }}))
+        .ok();
+        assert!(
+            matches!(
+                bare,
+                Some(DelegateFrame::Ended {
+                    reason: EndReason::AdminTerminated,
+                    limit: None,
+                    ..
+                })
+            ),
+            "no limit: {bare:?}"
+        );
+        let lane = worker_lane(frame);
+        assert!(
+            matches!(
+                lane,
+                WorkerLane::Order(WorkerOrder::Ended {
+                    ref session_id,
+                    reason: EndReason::IdleTimeout,
+                    ref limit,
+                }) if *session_id == id && limit.as_deref() == Some("max_duration")
+            ),
+            "the orders lane: {lane:?}"
         );
     }
 }

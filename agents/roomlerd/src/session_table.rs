@@ -3922,4 +3922,219 @@ mod tests {
         table.close_all("test_end").await;
         assert_eq!(a.peer.closes() + b.peer.closes(), 2);
     }
+
+    // ─── FR-138 P2b: the review of #3713 ───────────────────────────────────
+    //
+    // Written first, against inert seams: the server's end of a recorded
+    // session is not an order to the worker, a channel end only pauses the
+    // worker's delegated table, and the worker's own deadline says nothing up.
+
+    /// The daemon's `Ended` orders in `frames`: session, reason, limit.
+    fn endeds_of(frames: &[DelegateFrame]) -> Vec<(String, EndReason, Option<String>)> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                DelegateFrame::Ended {
+                    session_id,
+                    reason,
+                    limit,
+                } => Some((session_id.clone(), *reason, limit.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ended(session_id: ObjectId, reason: EndReason, limit: Option<&str>) -> WorkerOrder {
+        WorkerOrder::Ended {
+            session_id: session_id.to_hex(),
+            reason,
+            limit: limit.map(str::to_string),
+        }
+    }
+
+    fn sorted(mut ends: Vec<(ObjectId, RealEnd)>) -> Vec<(ObjectId, RealEnd)> {
+        ends.sort_by_key(|(s, _)| *s);
+        ends
+    }
+
+    /// FR-138 P2b (review HIGH-1, scenario A) — a roll dropped both sockets,
+    /// and the claim is refused because of a kick in the gap: the daemon
+    /// orders the worker to end the session, with the kick's reason, on the
+    /// lane the worker serves while its own socket redials. The `Terminate`
+    /// that crosses beside it waits for that socket.
+    #[tokio::test]
+    async fn p2b_review_a_refused_claim_is_ordered_to_the_worker() {
+        let mut r = record_rig(8, Some(60), 1).await;
+        let id = r.ids[0];
+        r.table.end_connection(ConnExit::ReadError).await;
+        let (claim, _tx, _rx) = record_reconnect(&mut r).await;
+        assert_eq!(claim, vec![id], "claimed");
+        let _ = sent(&mut r.frames);
+        r.table.drop_record(&id, &EndReason::AdminTerminated, None);
+        assert_eq!(
+            endeds_of(&sent(&mut r.frames)),
+            vec![(id.to_hex(), EndReason::AdminTerminated, None)],
+            "the worker is ordered to end it, with the kick's reason"
+        );
+        assert!(!r.table.holds_record(&id));
+    }
+
+    /// FR-138 P2b (review HIGH-1, scenario B) — the daemon's socket is up and
+    /// the worker's own row is down: the server's end of an ATTACHED record (a
+    /// kick, the maximum length, the viewer's hang-up) is ordered to the worker
+    /// too, with its reason and limit. Only to the worker whose record it is:
+    /// a gone worker's record is never the next worker's to end.
+    #[tokio::test]
+    async fn p2b_review_a_server_end_of_an_attached_record_is_ordered_to_its_worker() {
+        let mut r = record_rig(8, Some(60), 2).await;
+        let (a, b) = (r.ids[0], r.ids[1]);
+        r.table
+            .drop_record(&a, &EndReason::IdleTimeout, Some("max_duration"));
+        assert_eq!(
+            endeds_of(&sent(&mut r.frames)),
+            vec![(
+                a.to_hex(),
+                EndReason::IdleTimeout,
+                Some("max_duration".to_string())
+            )],
+            "the maximum length, ordered with its limit"
+        );
+        r.host.end_channel_for_test();
+        let mut next_worker = r.host.attach_for_test();
+        r.table.drop_record(&b, &EndReason::ControllerHangup, None);
+        assert!(
+            endeds_of(&sent(&mut next_worker)).is_empty(),
+            "a gone worker's record is not the next worker's to end"
+        );
+    }
+
+    /// FR-138 P2b (review HIGH-1, scenarios A and B) — the worker serves the
+    /// daemon's `Ended` on its delegated table, kept or attached: control stops
+    /// at once, the end is said on the control channel with its reason and
+    /// limit, and the peer closes after the grace, with its real end. The
+    /// `Terminate` read after it finds nothing, and a second order closes
+    /// nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_review_the_worker_ends_a_session_on_the_daemons_order() {
+        let mut w = worker_rig(2).await;
+        let (a, b) = (w.sessions[0].id, w.sessions[1].id);
+        w.table
+            .detach_named(&[a], ConnExit::ReadError, WINDOW)
+            .await;
+        let tx = w.tx.clone();
+        let grace = Duration::from_millis(500);
+        w.table
+            .obey(ended(a, EndReason::AdminTerminated, None), &tx, grace)
+            .await;
+        w.table
+            .obey(
+                ended(b, EndReason::IdleTimeout, Some("max_duration")),
+                &tx,
+                grace,
+            )
+            .await;
+        assert!(
+            w.sessions[0].peer.stopped() && w.sessions[1].peer.stopped(),
+            "control stops at once"
+        );
+        tokio::time::sleep(grace * 2).await;
+        let said = |s: &Session| {
+            s.peer
+                .said()
+                .first()
+                .map(|v| (v["reason"].clone(), v["limit"].clone()))
+        };
+        assert_eq!(
+            said(&w.sessions[0]),
+            Some((
+                serde_json::json!("admin_terminated"),
+                serde_json::Value::Null
+            )),
+            "kept: the kick is said on its control channel"
+        );
+        assert_eq!(
+            said(&w.sessions[1]),
+            Some((
+                serde_json::json!("idle_timeout"),
+                serde_json::json!("max_duration")
+            )),
+            "attached: the maximum length is said, with its limit"
+        );
+        assert_eq!(w.closes(), 2, "each closes once, after the grace");
+        assert_eq!(
+            sorted(w.ends.all()),
+            sorted(vec![(a, RealEnd::Ended), (b, RealEnd::Ended)]),
+            "each real end ran: the recording, the banner"
+        );
+        assert_eq!(w.table.len(), 0);
+        assert!(
+            w.table.take(&a, "terminate").is_none(),
+            "the Terminate read after it finds nothing"
+        );
+        w.table
+            .obey(ended(a, EndReason::AdminTerminated, None), &tx, grace)
+            .await;
+        tokio::time::sleep(grace * 2).await;
+        assert_eq!(w.closes(), 2, "a second end closes nothing more");
+    }
+
+    /// FR-138 P2b (review MEDIUM-1) — the channel to the daemon ends with both
+    /// processes alive: the daemon has ended every one of these sessions as
+    /// `error` (D6), so the worker closes each peer, attached and kept, with
+    /// its real end, and says nothing up the channel, since the daemon said
+    /// it. Nothing is left for the next attach.
+    #[tokio::test]
+    async fn p2b_review_a_channel_end_closes_every_delegated_session() {
+        let mut w = worker_rig(2).await;
+        let (a, b) = (w.sessions[0].id, w.sessions[1].id);
+        w.table
+            .detach_named(&[b], ConnExit::ReadError, WINDOW)
+            .await;
+        let tx = w.tx.clone();
+        w.table
+            .obey(
+                WorkerOrder::Paused {
+                    cause: "Connection reset by peer (os error 54)".into(),
+                },
+                &tx,
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(w.sessions[0].peer.closes(), 1, "attached: closed");
+        assert_eq!(w.sessions[1].peer.closes(), 1, "kept: closed");
+        assert_eq!(w.table.len(), 0, "nothing left for the next attach");
+        assert_eq!(
+            sorted(w.ends.all()),
+            sorted(vec![(a, RealEnd::Ended), (b, RealEnd::Ended)]),
+            "each real end ran"
+        );
+        assert!(
+            drain(&mut w.channel).is_empty(),
+            "nothing goes up: the daemon said it"
+        );
+        w.table
+            .obey(WorkerOrder::Attached, &tx, Duration::ZERO)
+            .await;
+        assert_eq!(w.closes(), 2);
+    }
+
+    /// FR-138 P2b (review LOW-2) — the worker's own deadline closes a kept
+    /// session and says so up the channel, `agent_disconnect`, as the net
+    /// change's look does: had the daemon's `Resumed` been lost to a full
+    /// queue, its record would otherwise stay live with no peer behind it.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_review_the_workers_own_deadline_says_the_session_is_gone() {
+        let mut w = worker_rig(1).await;
+        let a = w.sessions[0].id;
+        w.table
+            .detach_named(&[a], ConnExit::ReadError, WINDOW)
+            .await;
+        serve_for(&mut w.table, WINDOW + Duration::from_secs(1)).await;
+        assert_eq!(w.sessions[0].peer.closes(), 1, "closed at its deadline");
+        assert_eq!(
+            ends_said(&drain(&mut w.channel)),
+            vec![(a, EndReason::AgentDisconnect)],
+            "the daemon hears it is gone"
+        );
+    }
 }
