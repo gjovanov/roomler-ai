@@ -1467,7 +1467,7 @@ with its reason on hover, a rate appears only with n ≥ 30, subjects are render
 
 **In the digest**, the `newsletter` section gains `delivery` — the day's (and 7/28 days')
 delivered, bounced (hard), dropped, spam reports and addresses suppressed, by each event's own
-time ([`delivery_figures`, digest.rs:1874](../crates/api/src/growth/digest.rs)), `not_measured`
+time ([`delivery_figures`, digest.rs:1875](../crates/api/src/growth/digest.rs)), `not_measured`
 on a server without the webhook — `unsubscribed_via_issue`, and per issue sent that day its
 delivery so far and its unsubscribes, by the same reads and the same three cells as the table.
 
@@ -1640,7 +1640,7 @@ current month.
 
 > [!NOTE]
 > **"Nothing on record" states what the backfill did, as its ledger row says**
-> ([`no_billing_record`, digest.rs:2064](../crates/api/src/growth/digest.rs)). The panel's `billed` and
+> ([`no_billing_record`, digest.rs:2065](../crates/api/src/growth/digest.rs)). The panel's `billed` and
 > the digest's share one reason, and it reads three ways:
 >
 > - *the backfill has not run*;
@@ -1660,9 +1660,9 @@ current month.
 - **In the digest**, the revenue section gains `billed` — MRR at the day's end per currency;
   the day's (and 7/28 days') invoices, billed cash, failed payments, first payments,
   cancellations and trials; `record_since` and `backfilled`
-  ([`billed_figures`, digest.rs:2088](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
+  ([`billed_figures`, digest.rs:2089](../crates/api/src/growth/digest.rs)) — and `upgrade_intent`,
   the windows' collisions and the orgs that hit hardest
-  ([`upgrade_intent_section`, digest.rs:2183](../crates/api/src/growth/digest.rs)). The
+  ([`upgrade_intent_section`, digest.rs:2184](../crates/api/src/growth/digest.rs)). The
   estimate keeps its line and its label.
 - The SPA's `/observability/growth` gains a **Revenue** tab
   ([`GrowthRevenue.vue`](../ui/src/components/growth/GrowthRevenue.vue)); the Overview's funnel
@@ -1910,7 +1910,7 @@ flowchart LR
 
 | Rule | As built |
 |---|---|
-| **Which day a session belongs to** | the day it was **requested** (`created_at`). It *reached Active* when `started_at` is set (ended or still running); it *never reached Active* when it ended without one — a refusal (`user_denied`, `consent_timeout`, `no_prompt_surface`), a connect failure (`error`, `agent_disconnect`) or a controller that gave up waiting (`controller_hangup` before Active); it is *pending* when the freeze saw it neither started nor ended. `by_end_reason` keeps the two apart (`reached_active: true/false`); a session not ended reads `open` (`quality::session_quality`). An end nobody saw (FR-138: the row carries `end_source`, from the registration read, the sweep or the dead-row close) reads `inferred`, never a failure, and adds no duration: its `ended_at` is only the row's own last clock |
+| **Which day a session belongs to** | the day it was **requested** (`created_at`). It *reached Active* when `started_at` is set (ended or still running); it *never reached Active* when it ended without one — a refusal (`user_denied`, `consent_timeout`, `no_prompt_surface`), a connect failure (`error`, `agent_disconnect`) or a controller that gave up waiting (`controller_hangup` before Active); it is *pending* when the freeze saw it neither started nor ended. `by_end_reason` keeps the two apart (`reached_active: true/false`); a session not ended reads `open` (`quality::session_quality`). An end nobody saw (FR-138: the row carries `end_source`, from the registration read, the sweep, a redial's `replaces` of a detached session or the dead-row close) reads `inferred`, never a failure, and adds no duration: its `ended_at` is only the row's own last clock |
 | **Duration, frame rate, RTT** | Active sessions that ended: `ended_at − started_at`; `stats.peak_fps` and `stats.avg_rtt_ms` of the Active sessions whose device reported one above 0 (`stats` is `$max`-merged live by the device's samples, so a session that never reached Active has none) |
 | **Time to first frame** | the `ttff_ms` of `first_frame` records from a **foreground tab** (`hidden: false`), on a **first attempt** (`attempt: 1`, `after_drop: false`) — FR-22's own mining filter. A hidden tab's paint timing is invalid by the standing rule and a retry measures the retry, so both are counted as *set aside* (`hidden`, `later_attempts`), and every foreground record is counted by `outcome` (`first_frame` · `abandoned` · `closed` · `retried`). A record filed under one org's page for another org's device (FR-52, `agent_org_id`) follows both exclusions (`quality::ttff_quality`) |
 | **When TTFF is measured** | only while **every** record of the day still exists: `day_start + 7 d > now` (`quality::logs_complete`). A day whose first rows have started to expire would give a sample biased to its late hours, so it is frozen **without** TTFF — not measured, never 0. At the nightly tick that is yesterday and the two days before; a first fill or a backfill measures the last six closed days and no more |

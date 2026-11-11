@@ -69,7 +69,7 @@ stateDiagram-v2
   ([`touchGestures.ts:147`](../ui/src/composables/touchGestures.ts#L147) `createWheelSteps`). On the
   field run that turned 21 frames of about 6 px, which the host never saw, into one step it did.
 - A mouse and a pen keep their own paths. Only a pointer whose `pointerType` is `touch` goes through the
-  gestures ([`useRemoteControl.ts:12351`](../ui/src/composables/useRemoteControl.ts#L12351)).
+  gestures ([`useRemoteControl.ts:12360`](../ui/src/composables/useRemoteControl.ts#L12360)).
 - Every gesture is made of frames a mouse already sends (`mouse_button`, `mouse_move`, `mouse_wheel`), so
   it works with every deployed agent.
 
@@ -96,16 +96,16 @@ window, so a small desktop window is not a phone ([`touchInput.ts:80`](../ui/src
 two-finger handling as direct mode.)
 
 - **Two ways to move the pointer**, picked by what the agent advertises
-  ([`useRemoteControl.ts:12546`](../ui/src/composables/useRemoteControl.ts#L12546) `runTrackpad`):
+  ([`useRemoteControl.ts:12555`](../ui/src/composables/useRemoteControl.ts#L12555) `runTrackpad`):
   - **An agent that advertises `mouse-rel`** gets the travel as FR-109's `mouse_rel` and presses with
     `mouse_press` / `mouse_release`, which act where its pointer is.
   - **An older agent** gets absolute moves. The viewer starts from where the host's pointer is (its last
     `cursor:pos`, divided by the picture's size), adds the finger's travel, and presses at that point
-    ([`useRemoteControl.ts:12530`](../ui/src/composables/useRemoteControl.ts#L12530) `hostPointerNorm`).
+    ([`useRemoteControl.ts:12539`](../ui/src/composables/useRemoteControl.ts#L12539) `hostPointerNorm`).
     It re-reads `cursor:pos` at the start of each gesture, so it follows a pointer that someone else moved.
 - **The travel** is measured in the picture's own normalised space, the same mapping the stage's clicks use,
   so letterbox and zoom are already accounted for
-  ([`useRemoteControl.ts:12538`](../ui/src/composables/useRemoteControl.ts#L12538) `padTravel`).
+  ([`useRemoteControl.ts:12547`](../ui/src/composables/useRemoteControl.ts#L12547) `padTravel`).
 - The whole stage is the pad: in trackpad mode a finger may land on the letterbox too.
 
 ## On-screen controls
@@ -170,7 +170,7 @@ flowchart LR
   tab is hidden or the overlay closes
   ([`TouchControls.vue:250`](../ui/src/components/remote/TouchControls.vue#L250) `releaseAll`). The stage's
   own release on a blur or a detach covers the controls' presses too, and a release for something already
-  let go is dropped ([`useRemoteControl.ts:12619`](../ui/src/composables/useRemoteControl.ts#L12619)
+  let go is dropped ([`useRemoteControl.ts:12628`](../ui/src/composables/useRemoteControl.ts#L12628)
   `stageControls`).
 - **Ctrl on a Mac host** goes out as the keyboard's would (FR-13): with the viewer turning Ctrl into Cmd,
   Ctrl+C reaches the Mac as Cmd+C, and the button says ⌘C
@@ -187,7 +187,7 @@ flowchart LR
   as the physical keys do. On a Mac host it is Option+Tab, not the app switcher (Cmd+Tab). A preset binds
   the same keys whatever the host, so a Mac host gets a layout of its own from the editor (P4b-2), chosen
   for that device: with the viewer turning Ctrl into Cmd, a button bound to Ctrl+Tab reaches the Mac as
-  Cmd+Tab ([`useRemoteControl.ts:12624`](../ui/src/composables/useRemoteControl.ts#L12624)).
+  Cmd+Tab ([`useRemoteControl.ts:12633`](../ui/src/composables/useRemoteControl.ts#L12633)).
 
 ## The org's presets (P4)
 
@@ -210,10 +210,10 @@ sequenceDiagram
 ```
 
 - **The data is the viewer's own preset**, stored as it is: rows of buttons, d-pads and sticks
-  ([`models.rs:6238`](../crates/remote_control/src/models.rs#L6238) `TouchPreset`). P4 adds one action
+  ([`models.rs:6245`](../crates/remote_control/src/models.rs#L6245) `TouchPreset`). P4 adds one action
   beside a chord of keys and a mouse button: a **macro**, a list of steps, each a key or a mouse button
   pressed, released or tapped, then a wait
-  ([`models.rs:6356`](../crates/remote_control/src/models.rs#L6356) `MacroStep`).
+  ([`models.rs:6363`](../crates/remote_control/src/models.rs#L6363) `MacroStep`).
 - **Who:** any member reads them, since every viewer in the org offers them. Writing takes `MANAGE_TENANT`,
   like the org's session policy, because a stored preset runs on every member's viewer
   ([`touch_presets.rs:88`](../crates/modules/remote/src/touch_presets.rs#L88) `list`,
@@ -223,13 +223,13 @@ sequenceDiagram
   is a 404 that leaks nothing
   ([`touch_presets.rs:152`](../crates/modules/remote/src/touch_presets.rs#L152) `update`,
   [`touch_presets.rs:185`](../crates/modules/remote/src/touch_presets.rs#L185) `delete`).
-- **Read strictly** ([`models.rs:6410`](../crates/remote_control/src/models.rs#L6410) `validate`). Each
+- **Read strictly** ([`models.rs:6417`](../crates/remote_control/src/models.rs#L6417) `validate`). Each
   refusal is a 422 with a code, and nothing is stored:
 
   | Refused | Code |
   |---|---|
   | an unknown field at any level, a key past a byte, a malformed body | `invalid_json` |
-  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:6385`](../crates/remote_control/src/models.rs#L6385) `touch_key_ok`) | `key_invalid` |
+  | a key the keyboard path cannot send: only the Keyboard/Keypad page's keys and its eight modifiers ([`models.rs:6392`](../crates/remote_control/src/models.rs#L6392) `touch_key_ok`) | `key_invalid` |
   | a name empty, over 48 characters or with a control character | `name_empty`, `name_invalid` |
   | a label over 16 characters, an id over 32 or repeated within the preset | `label_invalid`, `id_invalid`, `id_duplicate` |
   | no controls or more than 24, an empty row or one of more than 12 buttons, a chord of more than 4 keys | `no_controls`, `too_many_controls`, `row_buttons`, `chord_keys` |
@@ -307,9 +307,9 @@ layout:
   machine too. Opening the editor sets `keyboardPaused`
   ([`useRemoteControl.ts:7249`](../ui/src/composables/useRemoteControl.ts#L7249)). The listener then leaves
   every event to the page
-  ([`useRemoteControl.ts:15284`](../ui/src/composables/useRemoteControl.ts#L15284)), and pausing first lets go
+  ([`useRemoteControl.ts:15293`](../ui/src/composables/useRemoteControl.ts#L15293)), and pausing first lets go
   of whatever the keyboard held on the host
-  ([`useRemoteControl.ts:13086`](../ui/src/composables/useRemoteControl.ts#L13086)).
+  ([`useRemoteControl.ts:13095`](../ui/src/composables/useRemoteControl.ts#L13095)).
 - **A live preview** runs the draft through the real overlay on a sink that sends nothing, so a button can
   be tried, a macro included, without pressing anything on the host.
 
@@ -342,7 +342,7 @@ sequenceDiagram
 - **A cancelled pointer still lets go.** A cancelled drag is released at its last point; a press the gestures
   had not made yet is dropped. A mouse or pen pointer the browser cancels releases exactly the button it
   pressed ([`touchInput.ts:36`](../ui/src/composables/touchInput.ts#L36) `createPointerPressTracker`,
-  [`useRemoteControl.ts:12261`](../ui/src/composables/useRemoteControl.ts#L12261) `onPointerCancel`). In
+  [`useRemoteControl.ts:12270`](../ui/src/composables/useRemoteControl.ts#L12270) `onPointerCancel`). In
   relative mode (FR-109) the release is `mouse_release`, which lets go wherever the host's pointer is
   ([`touchInput.ts:57`](../ui/src/composables/touchInput.ts#L57) `releaseForCancelledPointer`).
 

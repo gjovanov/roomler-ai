@@ -205,7 +205,7 @@ async fn device_ice(agent: &mut Ws, sid: ObjectId) {
 
 /// The cross-pod relay needs both pods' bus subscribers up. `false` when the
 /// harness has no Redis (the cluster tests skip then too).
-async fn wait_bus(a: &TestApp, b: &TestApp) -> bool {
+pub(crate) async fn wait_bus(a: &TestApp, b: &TestApp) -> bool {
     let (Some(x), Some(y)) = (a.state.cluster_bus.as_ref(), b.state.cluster_bus.as_ref()) else {
         return false;
     };

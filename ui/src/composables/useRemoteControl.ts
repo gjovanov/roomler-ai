@@ -9748,7 +9748,15 @@ export function useRemoteControl(
     // request bounces off `agent_busy` for many seconds. Skipped
     // (notifyServer: false) when the trigger was the server ending
     // the session itself.
-    if (opts?.notifyServer !== false && sessionId.value) {
+    // FR-138 D5 = A — skipped too for a session the server has told this page
+    // is detached (`rc:session.detached`, not resumed since), this redial
+    // included when the hold's own deadline started it. Its device is away,
+    // so the session ended on the device's side, and the redial's `replaces`
+    // records that (`agent_disconnect`, inferred) and gives the org's slot
+    // back before the request's gate. A hangup would free nothing the device
+    // can hear, and wrote `controller_hangup` for a session nobody hung up
+    // (#3604, AC4 cell (d)). A person's Disconnect still says it (`disconnect`).
+    if (opts?.notifyServer !== false && sessionId.value && !hold.deviceDetached(sessionId.value)) {
       ws.sendRaw({
         t: 'rc:terminate',
         session_id: sessionId.value,
@@ -9758,7 +9766,8 @@ export function useRemoteControl(
     // FR-138 — a transport signal during a hold keeps today's meaning: the
     // peer failed. A session the server may hold keeps its id, as the
     // `replaces` of every request until one is answered: the hangup above
-    // goes nowhere while this page's socket is down (spec §4.4, §4.5).
+    // goes nowhere while this page's socket is down, and is not sent for a
+    // detached session (spec §4.4, §4.5).
     endHold('transport')
     if (!externalMode && sessionId.value && hold.resumable(sessionId.value)) replacesId = sessionId.value
     sessionId.value = null
