@@ -273,9 +273,14 @@ release (measured 2026-11-11; a wizard run dispatched from a person's account
 does fire `workflow_run`, which is how a rehearsal can look fine). Anything that
 must follow a wizard release is a `workflow_dispatch` from inside it.
 ⚠️ The dispatch job never fails a release, so a lost dispatch is silent. The
-publish workflow's schedule (every 6 hours) publishes the newest setup release
-when the listing does not serve it yet; `gh workflow run sourceforge-publish.yml`
-with no tag does the same at once.
+publish workflow's `reconcile` job (every 6 hours) sends it again when
+SourceForge has no folder for the newest setup release;
+`gh workflow run sourceforge-publish.yml` with no tag runs it at once.
+⚠️ **Pulling a wizard release back** (deleted, or back to draft) after
+SourceForge took it leaves the listing's buttons on it, and every reconcile run
+then fails with "SourceForge is ahead of GitHub". Move the buttons with
+`gh workflow run sourceforge-publish.yml -f tag=<the release before it>` and
+remove the pulled folder from SourceForge's Files (`docs/sourceforge.md` §5).
 ⚠️ It needs the secrets `SOURCEFORGE_SSH_KEY` and `SOURCEFORGE_API_KEY`. Without
 them a run warns "SourceForge publish is not configured" and skips, and the
 listing stays on the release someone last moved it to by hand.
