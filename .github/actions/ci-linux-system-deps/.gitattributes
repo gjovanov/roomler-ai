@@ -1,0 +1,8 @@
+# ci-apt.sh runs on the Linux runners, and as root through sudo once `prepare`
+# has copied it to /usr/local/bin as apt-fast. A CRLF shebang is
+# `#!/usr/bin/env bash\r`, which the kernel resolves to a nonexistent
+# interpreter, and every lane of ci.yml would then lose its apt step. This repo
+# is developed from a Windows box where `core.autocrlf=true`, so the
+# normalisation happens by config rather than by rule; this makes it a rule
+# (the root .gitattributes does the same for scripts/*.sh).
+*.sh text eol=lf
