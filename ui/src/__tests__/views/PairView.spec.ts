@@ -103,6 +103,24 @@ async function typeCode(w: Mounted['w'], raw: string) {
   return input
 }
 
+/**
+ * What a browser does with a paste: the `paste` event, then, if nothing
+ * cancelled it, the text goes into the field and an `input` event says so. A
+ * field that refused the paste would fail the first `expect` here.
+ */
+async function pasteCode(w: Mounted['w'], text: string) {
+  const input = w.find('[data-test="pair-code"] input')
+  expect(input.exists()).toBe(true)
+  const el = input.element as HTMLInputElement
+  const paste = new Event('paste', { bubbles: true, cancelable: true })
+  el.dispatchEvent(paste)
+  expect(paste.defaultPrevented).toBe(false)
+  el.value = text
+  el.dispatchEvent(new InputEvent('input', { inputType: 'insertFromPaste', data: text, bubbles: true }))
+  await flushPromises()
+  return input
+}
+
 async function lookup(w: Mounted['w'], raw = 'bcdf-ghjk') {
   await typeCode(w, raw)
   await w.find('form').trigger('submit')
@@ -254,6 +272,54 @@ describe('PairView — the code', () => {
     mockApi.post.mockRejectedValueOnce(new ApiError(503, { error: 'unavailable', message: 'Pairing is unavailable right now' }))
     await lookup(w)
     expect(w.find('[data-test="pair-lookup-error"]').text()).toBe('Pairing is unavailable right now')
+  })
+})
+
+// #3395 — after Open, the installer's browser page covers the window that holds
+// the code. The page cannot know which installer sent the person (Roomler Setup
+// in a window, or `install.sh --pair`, `install.ps1 -Pair` or `roomlerd enroll
+// --pair` in a terminal), so its words hold for a window and a terminal alike.
+describe('PairView — where the code is', () => {
+  it('says, before a code is typed, where the code is and what to do when the browser covers it', async () => {
+    const { w } = await mountPair()
+    const text = w.text()
+    expect(text).toContain('Type the code your installer shows.')
+    expect(text).toContain('It is in the window of the installer you started, or in the terminal where you ran it.')
+    expect(text).toContain('If this browser is covering it, switch back to the installer.')
+    expect(text).toContain('Eight letters, shown as XXXX-XXXX. A pasted code works too.')
+    // The page says "installer", as it always has: never the name of one of the four.
+    expect(text).not.toMatch(/wizard/i)
+  })
+
+  it('a code pasted from the installer fills the field and can be looked up', async () => {
+    const { w } = await mountPair()
+    const input = await pasteCode(w, 'BCDF-GHJK')
+    expect((input.element as HTMLInputElement).value).toBe('BCDF-GHJK')
+    expect((w.find('[data-test="pair-lookup"]').element as HTMLButtonElement).disabled).toBe(false)
+
+    mockApi.post.mockResolvedValueOnce(DEVICE)
+    await w.find('form').trigger('submit')
+    await flushPromises()
+    expect(postCalls('/pair/lookup')).toEqual([['/pair/lookup', { user_code: 'BCDFGHJK' }]])
+  })
+
+  it('a paste fills the field as typing the same text would, whatever the text carries', async () => {
+    const { w } = await mountPair()
+    const cases: Array<[raw: string, shown: string]> = [
+      ['bcdf-ghjk', 'BCDF-GHJK'],
+      [' BCDF GHJK\n', 'BCDF-GHJK'],
+      // The example in the issue: a code holds no vowel, so typing and a paste drop them alike.
+      ['ABCD-EFGH', 'BCDF-GH'],
+      ['BCDF-GHJK-LMNP', 'BCDF-GHJK'],
+    ]
+    for (const [raw, shown] of cases) {
+      await typeCode(w, '')
+      const typed = ((await typeCode(w, raw)).element as HTMLInputElement).value
+      await typeCode(w, '')
+      const pasted = ((await pasteCode(w, raw)).element as HTMLInputElement).value
+      expect(typed).toBe(shown)
+      expect(pasted).toBe(typed)
+    }
   })
 })
 
