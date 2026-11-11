@@ -366,6 +366,7 @@ async fn attach_once(
             &mut wr,
             &DelegateFrame::WorkerCaps {
                 caps: Box::new(caps),
+                features: crate::delegate::worker_features(),
             },
         )
         .await?;
@@ -470,6 +471,13 @@ async fn attach_once(
                             // confused about which end it is.
                             tracing::warn!("delegation: daemon sent a worker-only frame; ignoring");
                         }
+                        // FR-138 P2b — the daemon's orders about the sessions
+                        // it will claim.
+                        Ok(
+                            DelegateFrame::Detached { .. }
+                            | DelegateFrame::Resumed { .. }
+                            | DelegateFrame::Close { .. },
+                        ) => tracing::debug!("delegation: skipping an order"),
                         // Skip, never close: a NEWER daemon may push a frame
                         // this worker has never heard of, and an additive
                         // protocol is only additive if old readers skip it.
@@ -517,6 +525,7 @@ async fn attach_once(
                     &mut wr,
                     &DelegateFrame::WorkerCaps {
                         caps: Box::new(caps),
+                        features: crate::delegate::worker_features(),
                     },
                 )
                 .await?;

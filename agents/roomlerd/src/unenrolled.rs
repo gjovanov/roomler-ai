@@ -566,6 +566,7 @@ mod tests {
                 idle_secs: None,
                 lock_on_end: None,
                 media_legacy: None,
+                keepable: false,
             })))
             .await
             .unwrap();

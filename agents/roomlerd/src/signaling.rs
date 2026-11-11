@@ -4213,6 +4213,9 @@ async fn handle_server_msg(
                             // which a push to its row put in force here but
                             // not in the worker that builds the peer.
                             media_legacy: remote_cfg.media_legacy_for_delegate(),
+                            // FR-138 P2b (A2) — this session will be claimed through
+                            // this loop's control-socket loss.
+                            keepable: false,
                         },
                     )),
                 );

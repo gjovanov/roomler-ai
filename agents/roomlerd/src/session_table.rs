@@ -46,6 +46,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::delegate::DelegateHost;
 use crate::peer::AgentPeer;
 use crate::signaling::close_within_budget;
 
@@ -523,6 +524,29 @@ struct Kept<P> {
     exit: ConnExit,
 }
 
+/// FR-138 P2b — the daemon's record of a delegated session: no peer, since the
+/// GUI worker holds it, but the claim, the deadline and what the server must
+/// hear are the daemon's.
+struct Record {
+    /// Where the worker's replies about the session go
+    /// ([`DelegateHost::bind`]): to the connection while attached; while kept,
+    /// what the server must hear goes to the table and the rest is dropped.
+    link: SessionLink,
+    /// `None` while attached.
+    kept: Option<RecordKept>,
+    /// The attach generation it was made under ([`DelegateHost::generation`]):
+    /// a record of an older one belongs to a worker that is gone (A9).
+    generation: u64,
+}
+
+/// FR-138 P2b — a record kept through the loss of its connection.
+struct RecordKept {
+    since: Instant,
+    /// Set once, at the detach; the worker was sent the same window.
+    deadline: Instant,
+    exit: ConnExit,
+}
+
 /// What the table must act on next ([`SessionTable::next_event`]).
 #[derive(Debug)]
 pub(crate) enum TableEvent {
@@ -563,6 +587,16 @@ pub(crate) struct SessionTable<P: TablePeer = AgentPeer> {
     /// The next look at the peers kept after a net change. An instant, not a
     /// period: a loop that comes round often must not push it back.
     next_look: Option<Instant>,
+    /// FR-138 P2b — the daemon's records of the delegated sessions it will
+    /// claim. Empty everywhere but a loop that holds the delegation host.
+    records: HashMap<ObjectId, Record>,
+    /// FR-138 P2b — the delegation host, for a loop that holds it: where the
+    /// records' links are bound and the worker's orders go.
+    host: Option<DelegateHost>,
+    /// FR-138 P2b — this is a GUI worker's delegated table: its sessions are
+    /// the daemon's to claim, and its peers close themselves on their own end
+    /// (B6).
+    worker: bool,
 }
 
 impl<P: TablePeer> SessionTable<P> {
@@ -580,7 +614,96 @@ impl<P: TablePeer> SessionTable<P> {
             ended_tx,
             ended_rx,
             next_look: None,
+            records: HashMap::new(),
+            host: None,
+            worker: false,
         }
+    }
+
+    /// FR-138 P2b (B1) — a GUI worker's delegated table: the sessions the
+    /// daemon said it will claim through its control-socket loss. Its switch is
+    /// on, since the daemon's decided it, and what it says goes up `channel`,
+    /// the delegation channel, which spans the worker's own connections.
+    pub(crate) fn for_worker(
+        capacity: usize,
+        on_end: EndHook,
+        channel: &mpsc::Sender<ClientMsg>,
+    ) -> Self {
+        let mut table = Self::new(capacity, on_end);
+        table.survive = true;
+        table.current = Some(channel.clone());
+        table.worker = true;
+        table
+    }
+
+    /// FR-138 P2b — this loop holds the delegation host: its records' links
+    /// are bound there, and its orders go to the attached worker.
+    pub(crate) fn set_host(&mut self, host: DelegateHost) {
+        self.host = Some(host);
+    }
+
+    /// FR-138 P2b (A3) — the gate crossed `session_id`'s offer to the worker:
+    /// a session whose params crossed `keepable` gets a record, attached to
+    /// this connection.
+    pub(crate) fn cross_offer(&mut self, session_id: ObjectId) {
+        let _ = session_id;
+    }
+
+    /// FR-138 P2b — whether the table keeps a record of this delegated session.
+    pub(crate) fn holds_record(&self, session_id: &ObjectId) -> bool {
+        self.records.contains_key(session_id)
+    }
+
+    /// FR-138 P2b (A7) — the server ended a delegated session: its record goes,
+    /// and the `Terminate` crosses to the worker as today.
+    pub(crate) fn drop_record(&mut self, session_id: &ObjectId) {
+        if let Some(record) = self.records.remove(session_id)
+            && let Some(host) = &self.host
+        {
+            host.unbind(&session_id.to_hex());
+            drop(record);
+        }
+    }
+
+    /// FR-138 P2b (B5) — the worker's half of a detach: the daemon's
+    /// `Detached` names the sessions it will claim, and only those are kept,
+    /// until `window` from now at most.
+    pub(crate) async fn detach_named(
+        &mut self,
+        sessions: &[ObjectId],
+        exit: ConnExit,
+        window: Duration,
+    ) {
+        let _ = (sessions, exit, window);
+    }
+
+    /// FR-138 P2b (B5) — the daemon's `Close`: the session closes, with its real
+    /// end. A session the table does not hold changes nothing.
+    pub(crate) async fn close_session(&mut self, session_id: ObjectId, why: &'static str) {
+        let _ = (session_id, why);
+    }
+
+    /// FR-138 P2b (B9, D5) — the channel to the daemon ended while both
+    /// processes live: the attached sessions' links stop waiting, and keep
+    /// what the server must hear, until [`Self::unpause`].
+    pub(crate) fn pause(&mut self) {}
+
+    /// FR-138 P2b (B9) — the channel is back: the attached sessions' links
+    /// point at it again.
+    pub(crate) fn unpause(&mut self) {}
+
+    /// FR-138 P2b (B7) — the person at the device ended a session of a GUI
+    /// worker's delegated table (Disconnect, the idle limit), attached or kept:
+    /// it stops serving at once, and its end goes up the channel, which never
+    /// waits. `false` when the table does not hold it.
+    pub(crate) fn end_by_device(
+        &mut self,
+        session_id: ObjectId,
+        terminate: ClientMsg,
+        why: &'static str,
+        grace: Duration,
+    ) -> bool {
+        self.end_kept_by_device(session_id, terminate, why, grace)
     }
 
     /// A connection is up: its switch, read once. The window starts unannounced
