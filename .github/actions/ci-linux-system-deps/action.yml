@@ -39,11 +39,28 @@ runs:
       # to 09-24 against caches that were full the whole time, because
       # `ldconfig -p` reads /etc/ld.so.cache rather than the disk (#1604) — 17
       # days of warnings that described the detector, not the cache.
-      - name: Configure apt retries and refresh the index
+      #
+      # 2026-11-11 (#3698): the `Acquire::Retries "3"` below was a belt that
+      # never held on the ubuntu-26.04 image: its own /etc/apt/apt.conf.d/
+      # zz-retries (Retries 1, Timeout 15) sorts after `80-ci-retries` and wins,
+      # and neither setting covers the resolver's wait. That wait is what hung
+      # every lane for 40 min from ~13:45Z, when the runners' resolver (Azure DNS
+      # behind systemd-resolved's stub) stopped answering for *.ubuntu.com while
+      # 1.1.1.1 and 8.8.8.8 answered in milliseconds: `apt-get update` exits 0
+      # with only `W:` lines after 2-3 min and leaves the image's STALE index in
+      # use, which moves the GTK set's cache key off the entry master saved (a
+      # hit needs no mirror), and the cold path then waits ~20 s per package.
+      # ci-apt.sh probes the mirror names first, fails over to a public resolver
+      # when the runner's own has failed (with a ::warning naming it; apt's
+      # signature checks are untouched), bounds the refresh, and puts a bounded
+      # apt-fast stand-in in front of the action's cold install. Its header holds
+      # the evidence. Nothing in `prepare` can fail the step: a cache HIT needs no
+      # mirror, and the verify steps below are what judge the outcome.
+      - name: Configure apt retries, reach the mirror, refresh the index
         shell: bash
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
+          bash "${{ github.action_path }}/ci-apt.sh" prepare || echo "::warning::ci-apt.sh prepare failed (rc=$?): the cached-apt steps below run unbounded, as before #3698"
 
       # rc.18 added a Tauri-tray companion (agents/roomler-tray) that
       # pulls in glib-sys / gobject-sys on Linux. Workspace clippy walks
@@ -55,6 +72,14 @@ runs:
       # step, run 32191779671) can only ever bite the first run after
       # the package list or runner image changes.
       - name: Install system deps for workspace clippy (cached apt)
+        # 2026-11-11 (#3698): a failure of the action itself (its cache service,
+        # its cold install) falls through to the verify step below, which
+        # installs directly, bounded, and fails with the reason. What bounds the
+        # cold install INSIDE the action is the apt-fast stand-in that
+        # ci-apt.sh put in front of it; a step-level timeout could not (a
+        # composite step cannot carry one, and on a normal step it ends the
+        # step but leaves apt-get running under the next one).
+        continue-on-error: true
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           packages: libglib2.0-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
@@ -91,13 +116,18 @@ runs:
       # actually consults, never the action's status. `apt-get update` first:
       # the stale index IS the root cause, so a fallback that skipped it would
       # re-resolve the same missing versions.
+      #
+      # 2026-11-11 (#3698): the fallback is `ci-apt.sh fallback`: the same
+      # refresh-then-install, but bounded, after a probe of the mirror names, and
+      # with one ::error that says why when they cannot be reached. It used to be
+      # a bare `apt-get update` + `apt-get install` that waited on the resolver
+      # for as long as the job allowed.
       - name: Verify the GTK set really landed (fallback to apt-get)
         shell: bash
         run: |
           if ! pkg-config --exists glib-2.0 webkit2gtk-4.1; then
             echo "::warning::cached apt set did not deliver the GTK dev packages — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends \
+            bash "${{ github.action_path }}/ci-apt.sh" fallback \
               libglib2.0-dev libgtk-3-dev libsoup-3.0-dev \
               libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev pkg-config
           fi
@@ -114,6 +144,8 @@ runs:
       # latent under the feature flag — and so the `bun run e2e`
       # VP9-444 spec doesn't drift away from the agent it's testing.
       - name: Install libvpx (cached apt)
+        # 2026-11-11 (#3698): see the GTK step above.
+        continue-on-error: true
         uses: awalsh128/cache-apt-pkgs-action@v1
         with:
           # libasound2-dev is for the `audio` half of `full` in the capture
@@ -151,8 +183,7 @@ runs:
           sudo ldconfig
           if ! ldconfig -p | grep -q 'libvpx\.so'; then
             echo "::warning::cached apt set did not deliver libvpx — installing directly"
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
+            bash "${{ github.action_path }}/ci-apt.sh" fallback libvpx-dev pkg-config libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev cmake libclang-dev libasound2-dev
           fi
           ldconfig -p | grep 'libvpx\.so' || { echo "::error::libvpx.so still not loadable after the fallback install"; exit 1; }
 
