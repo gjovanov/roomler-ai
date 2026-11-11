@@ -1207,7 +1207,7 @@ bus asking it anything gets `no-session-bus`, which is the architecture rather
 than a misconfiguration. So the daemon spawns **itself** — the hidden
 `roomlerd portal-helper` subcommand — as the console user, with that session's
 `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY` and `WAYLAND_DISPLAY`
-(`capture/portal/mod.rs:1083`), through a verified privilege drop rather than
+(`capture/portal/mod.rs:1306`), through a verified privilege drop rather than
 `CommandExt::uid()` (which leaves the child in root's supplementary groups — a
 silent retention bug, not a visible failure).
 
@@ -1219,7 +1219,7 @@ never started, and the cascade fell through to Xwayland's empty root — a black
 stream on every per-user install that set `portal_capture`. Every FR-45 field
 run was under root, which hid it until the vmtest per-user cell ran with the
 keys set (#1719 run B). The rule is now three-way (`run_as`,
-`capture/portal/mod.rs:1182`): root drops, the session's owner runs as itself,
+`capture/portal/mod.rs:1407`): root drops, the session's owner runs as itself,
 anyone else is refused with both uids named — and a per-user daemon looks up
 its **own** session, not the first active one.
 
