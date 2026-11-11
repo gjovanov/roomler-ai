@@ -2569,26 +2569,6 @@ mod tests {
         r.table.close_all("test_end").await;
     }
 
-    /// L11 — a supervised Mac's delegated sessions live in its GUI worker,
-    /// which keeps nothing yet (P2b), and a server's end for a session the
-    /// daemon kept would cross to that worker. Until P2b, a loop that holds
-    /// the delegation host keeps nothing and says no `rc-resume`, whatever
-    /// the switch.
-    #[test]
-    fn a_loop_that_holds_the_delegation_host_keeps_nothing() {
-        assert!(connection_keeps(true, false));
-        assert!(!connection_keeps(true, true), "the host holds it off");
-        assert!(!connection_keeps(false, false));
-        assert!(!connection_keeps(false, true));
-        assert!(
-            signaling_code().contains(
-                "letsurvive=crate::session_table::connection_keeps(\
-                 crate::session_table::survive_enabled(),delegation.host().is_some()"
-            ),
-            "each connection reads its switch through it"
-        );
-    }
-
     /// The loop asks the table: a server's end closes through it (C1), and
     /// both device-end paths read `no_video` off it (L10).
     #[test]
@@ -2602,5 +2582,759 @@ mod tests {
             code.contains("peers.no_video(&sid)") && code.contains("table.no_video(&sid)"),
             "L10: the loop's device end and the gap's both read the table"
         );
+    }
+
+    // ─── FR-138 P2b: a supervised Mac's delegated sessions ─────────────────
+    //
+    // The daemon claims a delegated session and keeps a RECORD of it, with no
+    // peer; the GUI worker keeps and closes the peer, on a delegated table of
+    // its own. Written first: at the seam nothing makes a record, nothing is
+    // told to the worker, and the worker's table keeps nothing.
+
+    use crate::delegate::{DelegateFrame, DelegateHost, SessionParams};
+
+    /// A daemon loop that holds the delegation host, a worker attached (its
+    /// frames read here), and `n` delegated sessions whose params crossed
+    /// `keepable` and whose offers crossed, on a connection whose server
+    /// announced `window`.
+    struct RecordRig {
+        table: SessionTable<Fake>,
+        host: DelegateHost,
+        frames: mpsc::Receiver<DelegateFrame>,
+        conn: mpsc::Receiver<ClientMsg>,
+        ids: Vec<ObjectId>,
+    }
+
+    fn keepable_params(id: ObjectId) -> SessionParams {
+        SessionParams {
+            session_id: id.to_hex(),
+            codec: "h264".into(),
+            transport: None,
+            chroma: None,
+            chunk_framing: false,
+            audio: false,
+            permissions: roomler_ai_remote_control::permissions::Permissions::all(),
+            controller_name: String::new(),
+            input_mode: None,
+            asking_org: None,
+            record: None,
+            rc_overlay: None,
+            idle_secs: None,
+            lock_on_end: None,
+            media_legacy: None,
+            keepable: true,
+        }
+    }
+
+    async fn record_rig(capacity: usize, window: Option<u32>, n: usize) -> RecordRig {
+        let host = DelegateHost::new();
+        let mut frames = host.attach_for_test();
+        let mut table: SessionTable<Fake> = SessionTable::new(capacity, Ends::default().hook());
+        table.set_host(host.clone());
+        let (tx, conn) = mpsc::channel(64);
+        assert!(table.begin_connection(true).await.is_empty());
+        table.connected(&tx);
+        // As `connect_once` points the host at each connection.
+        host.set_outbound(None, tx.clone());
+        if let Some(w) = window {
+            table.set_window(w);
+        }
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let id = ObjectId::new();
+            assert!(host.send_params(
+                None,
+                DelegateFrame::SessionParams(Box::new(keepable_params(id)))
+            ));
+            table.cross_offer(id);
+            ids.push(id);
+        }
+        ids.sort();
+        // The params the worker was handed: not what these tests read.
+        while frames.try_recv().is_ok() {}
+        RecordRig {
+            table,
+            host,
+            frames,
+            conn,
+            ids,
+        }
+    }
+
+    /// The next connection, pointed at by the host as well.
+    async fn record_reconnect(
+        r: &mut RecordRig,
+    ) -> (
+        Vec<ObjectId>,
+        mpsc::Sender<ClientMsg>,
+        mpsc::Receiver<ClientMsg>,
+    ) {
+        let (claim, tx, rx) = reconnect(&mut r.table).await;
+        r.host.set_outbound(None, tx.clone());
+        (claim, tx, rx)
+    }
+
+    fn sent(frames: &mut mpsc::Receiver<DelegateFrame>) -> Vec<DelegateFrame> {
+        let mut out = Vec::new();
+        while let Ok(f) = frames.try_recv() {
+            out.push(f);
+        }
+        out
+    }
+
+    fn hexes(ids: &[ObjectId]) -> Vec<String> {
+        ids.iter().map(|id| id.to_hex()).collect()
+    }
+
+    fn closes_of(frames: &[DelegateFrame]) -> Vec<String> {
+        let mut out: Vec<String> = frames
+            .iter()
+            .filter_map(|f| match f {
+                DelegateFrame::Close { session_id, .. } => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn resumes_of(frames: &[DelegateFrame]) -> Vec<String> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                DelegateFrame::Resumed { session_id } => Some(session_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn detaches_of(frames: &[DelegateFrame]) -> Vec<(Vec<String>, String, bool, u64)> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                DelegateFrame::Detached {
+                    sessions,
+                    exit,
+                    netchange,
+                    keep_ms,
+                } => Some((sessions.clone(), exit.clone(), *netchange, *keep_ms)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<ClientMsg>) -> Vec<ClientMsg> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    fn ends_said(msgs: &[ClientMsg]) -> Vec<(ObjectId, EndReason)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ClientMsg::Terminate {
+                    session_id, reason, ..
+                } => Some((*session_id, reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stats(session_id: ObjectId) -> ClientMsg {
+        serde_json::from_value(serde_json::json!({
+            "t": "rc:session.stats",
+            "session_id": session_id.to_hex(),
+            "bytes_sent": 1, "bytes_recv": 1, "fps": 30.0, "rtt_ms": 10.0,
+            "keyframe_requests": 0, "input_events": 0
+        }))
+        .expect("a stats sample")
+    }
+
+    /// FR-138 P2b (R1, A11) — L11 lifted: a loop that holds the delegation
+    /// host keeps what it can, with the switch on, as every loop does. What it
+    /// cannot keep (an older worker's session, none attached) it does not
+    /// claim, and the server ends that at the hello (D1).
+    #[test]
+    fn p2b_a_loop_that_holds_the_delegation_host_keeps_with_the_switch() {
+        assert!(connection_keeps(true, false));
+        assert!(
+            connection_keeps(true, true),
+            "a supervised Mac's daemon keeps with the switch on"
+        );
+        assert!(!connection_keeps(false, false));
+        assert!(!connection_keeps(false, true));
+        assert!(
+            signaling_code().contains(
+                "letsurvive=crate::session_table::connection_keeps(\
+                 crate::session_table::survive_enabled(),delegation.host().is_some()"
+            ),
+            "each connection reads its switch through it"
+        );
+    }
+
+    /// FR-138 P2b — the signalling loop wires the delegated sessions through
+    /// the tables: A1's gate, A2's word, A3's record, A7's end, the host given
+    /// to the table that holds it, and the worker's delegated table (B1).
+    #[test]
+    fn p2b_the_signalling_loop_wires_the_delegated_sessions() {
+        let code = signaling_code();
+        for (needle, what) in [
+            (
+                "served_by_daemon(peers.keeps_sessions()",
+                "A1: the gate asks the table first, with the switch",
+            ),
+            ("session_keepable(", "A2: the params say keepable"),
+            ("peers.cross_offer(", "A3: a crossed offer gets its record"),
+            ("peers.drop_record(", "A7: a server end drops the record"),
+            (
+                "table.set_host(",
+                "the host is lent to the table that holds it",
+            ),
+            (
+                "SessionTable::for_worker(",
+                "B1: the worker's delegated table",
+            ),
+        ] {
+            assert!(code.contains(needle), "{what}: `{needle}`");
+        }
+    }
+
+    /// FR-138 P2b (R3, A4, A5) — a delegated session the daemon will claim is
+    /// kept at each of the twelve transient exits with a window, claimed by the
+    /// next hello, and the worker is told once, with the window.
+    #[tokio::test]
+    async fn p2b_a_record_is_kept_at_every_transient_exit_and_the_worker_told_once() {
+        for exit in ConnExit::ALL
+            .into_iter()
+            .filter(|e| e.kind() != ExitKind::Terminal)
+        {
+            let mut r = record_rig(8, Some(60), 2).await;
+            r.table.end_connection(exit).await;
+            assert_eq!(r.table.kept_ids(), r.ids, "{exit:?}: both are claimed");
+            let frames = sent(&mut r.frames);
+            let detached = detaches_of(&frames);
+            assert_eq!(detached.len(), 1, "{exit:?}: one Detached a loss");
+            let (sessions, label, netchange, keep_ms) = &detached[0];
+            let mut sessions = sessions.clone();
+            sessions.sort();
+            assert_eq!(sessions, hexes(&r.ids), "{exit:?}");
+            assert_eq!(label, exit.label(), "{exit:?}");
+            assert_eq!(*netchange, exit.kind() == ExitKind::NetChange, "{exit:?}");
+            assert_eq!(*keep_ms, 60_000, "{exit:?}: the window");
+            assert!(closes_of(&frames).is_empty(), "{exit:?}: nothing closed");
+        }
+    }
+
+    /// FR-138 P2b (R4) — a terminal exit, or a refused token, drops every
+    /// record and closes it in the worker; nothing is claimed.
+    #[tokio::test]
+    async fn p2b_a_terminal_exit_or_a_refused_token_drops_every_record() {
+        for exit in ConnExit::ALL
+            .into_iter()
+            .filter(|e| e.kind() == ExitKind::Terminal)
+        {
+            let mut r = record_rig(8, Some(60), 2).await;
+            assert_eq!(r.table.len(), 2, "{exit:?}: records count while live");
+            r.table.end_connection(exit).await;
+            let frames = sent(&mut r.frames);
+            assert_eq!(closes_of(&frames), hexes(&r.ids), "{exit:?}: each closes");
+            assert!(detaches_of(&frames).is_empty(), "{exit:?}");
+            assert_eq!(r.table.len(), 0, "{exit:?}");
+            let (claim, _tx, _rx) = record_reconnect(&mut r).await;
+            assert!(claim.is_empty(), "{exit:?}: nothing claimed");
+        }
+        let mut r = record_rig(8, Some(60), 2).await;
+        r.table.end_connection(ConnExit::ReadError).await;
+        let _ = sent(&mut r.frames);
+        r.table.close_all("token_refused").await;
+        assert_eq!(
+            closes_of(&sent(&mut r.frames)),
+            hexes(&r.ids),
+            "a refused token closes the kept ones"
+        );
+        assert!(r.table.kept_ids().is_empty());
+    }
+
+    /// FR-138 P2b (R5, M3) — a connection that ends before its server announced
+    /// a window closes the records it built, in the worker too.
+    #[tokio::test]
+    async fn p2b_with_no_window_a_record_is_closed_not_kept() {
+        let mut r = record_rig(8, None, 1).await;
+        assert!(r.table.holds_record(&r.ids[0]), "the offer made its record");
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert!(r.table.kept_ids().is_empty());
+        assert_eq!(closes_of(&sent(&mut r.frames)), hexes(&r.ids));
+        assert!(!r.table.holds_record(&r.ids[0]));
+    }
+
+    /// FR-138 P2b (R6, A6) — `resumed` re-attaches a kept record, points its
+    /// link at the new connection, and tells the worker.
+    #[tokio::test]
+    async fn p2b_resumed_reattaches_a_kept_record_and_tells_the_worker() {
+        let mut r = record_rig(8, Some(60), 1).await;
+        let id = r.ids[0];
+        r.table.end_connection(ConnExit::ReadError).await;
+        let _ = sent(&mut r.frames);
+        let (claim, tx2, mut rx2) = record_reconnect(&mut r).await;
+        assert_eq!(claim, vec![id]);
+        assert!(r.table.resume(id, &tx2).await, "the claim is honoured");
+        assert_eq!(resumes_of(&sent(&mut r.frames)), vec![id.to_hex()]);
+        r.host.relay_upstream(ice(id));
+        let got = tokio::time::timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .ok()
+            .flatten();
+        assert!(
+            matches!(got, Some(ClientMsg::Ice { session_id, .. }) if session_id == id),
+            "the worker's reply reaches the new connection: {got:?}"
+        );
+        assert!(drain(&mut r.conn).is_empty(), "nothing on the old one");
+    }
+
+    /// FR-138 P2b (R7, A6, A9) — a claim answered after the daemon's deadline,
+    /// or for a record whose worker is gone, is refused: the server hears it is
+    /// gone, and the worker is told to close.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_a_claim_answered_late_or_for_a_gone_worker_is_refused() {
+        let mut r = record_rig(8, Some(60), 1).await;
+        let id = r.ids[0];
+        r.table.end_connection(ConnExit::ReadError).await;
+        let _ = sent(&mut r.frames);
+        let (claim, tx2, mut rx2) = record_reconnect(&mut r).await;
+        assert_eq!(claim, vec![id]);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(!r.table.resume(id, &tx2).await, "late");
+        assert_eq!(closes_of(&sent(&mut r.frames)), vec![id.to_hex()]);
+        assert!(
+            ends_said(&drain(&mut rx2)).contains(&(id, EndReason::AgentDisconnect)),
+            "the server hears it is gone"
+        );
+
+        let mut r = record_rig(8, Some(60), 1).await;
+        let id = r.ids[0];
+        r.table.end_connection(ConnExit::ReadError).await;
+        let (claim, tx2, mut rx2) = record_reconnect(&mut r).await;
+        assert_eq!(claim, vec![id], "claimed while its worker is attached");
+        r.host.end_channel_for_test();
+        assert!(!r.table.resume(id, &tx2).await, "its worker is gone");
+        assert!(!r.table.holds_record(&id));
+        assert!(ends_said(&drain(&mut rx2)).contains(&(id, EndReason::AgentDisconnect)));
+    }
+
+    /// FR-138 P2b (R8, A8, D4) — the daemon's deadline drops the record and
+    /// tells the worker to close; the worker's own deadline is the backstop.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_the_daemons_deadline_drops_the_record_and_closes_it_in_the_worker() {
+        let mut r = record_rig(8, Some(60), 1).await;
+        r.table.end_connection(ConnExit::ReadError).await;
+        let _ = sent(&mut r.frames);
+        serve_for(&mut r.table, Duration::from_secs(61)).await;
+        assert_eq!(closes_of(&sent(&mut r.frames)), hexes(&r.ids));
+        assert!(r.table.kept_ids().is_empty());
+    }
+
+    /// FR-138 P2b (R9, L7, L9) — what the worker says about a kept record that
+    /// the server must hear (a report, then the person's Disconnect) waits for
+    /// the next connection and follows its hello, in order; an ended session is
+    /// not claimed.
+    #[tokio::test]
+    async fn p2b_a_workers_end_for_a_kept_record_follows_the_next_hello_in_order() {
+        let mut r = record_rig(8, Some(60), 1).await;
+        let id = r.ids[0];
+        r.table.end_connection(ConnExit::ReadError).await;
+        r.host.relay_upstream(recording_activity(id));
+        r.host
+            .relay_upstream(terminate(id, EndReason::HostDisconnect, None));
+        serve_for(&mut r.table, Duration::from_millis(300)).await;
+        assert!(
+            drain(&mut r.conn).is_empty(),
+            "nothing to the dead connection"
+        );
+        let (claim, _tx2, mut rx2) = record_reconnect(&mut r).await;
+        assert!(claim.is_empty(), "an ended session is not claimed");
+        let got = drain(&mut rx2);
+        assert!(
+            matches!(
+                got.as_slice(),
+                [
+                    ClientMsg::RecordingActivity { session_id: a, .. },
+                    ClientMsg::Terminate { session_id: b, reason: EndReason::HostDisconnect, .. },
+                ] if *a == id && *b == id
+            ),
+            "the report, then the end, after the hello: {got:?}"
+        );
+    }
+
+    /// FR-138 P2b (R10) — a kept record's ICE and stats are dropped and never
+    /// wait; the record stays kept for its claim.
+    #[tokio::test]
+    async fn p2b_ice_and_stats_for_a_kept_record_are_dropped_and_never_wait() {
+        let mut r = record_rig(8, Some(60), 1).await;
+        let id = r.ids[0];
+        r.table.end_connection(ConnExit::ReadError).await;
+        for _ in 0..100 {
+            r.host.relay_upstream(ice(id));
+            r.host.relay_upstream(stats(id));
+        }
+        serve_for(&mut r.table, Duration::from_millis(300)).await;
+        assert_eq!(r.table.kept_ids(), vec![id], "still kept for its claim");
+        assert!(
+            drain(&mut r.conn).is_empty(),
+            "nothing to the dead connection"
+        );
+        let (_, _tx2, mut rx2) = record_reconnect(&mut r).await;
+        assert!(drain(&mut rx2).is_empty(), "and nothing waits for the next");
+    }
+
+    /// FR-138 P2b (R11, A9) — the records of a worker that is gone (its channel
+    /// ended) are never claimed or counted: its process took its peers.
+    #[tokio::test]
+    async fn p2b_records_of_a_gone_worker_are_never_claimed_or_counted() {
+        let mut r = record_rig(8, Some(60), 2).await;
+        assert_eq!(r.table.len(), 2, "counted while their worker is attached");
+        r.host.end_channel_for_test();
+        assert_eq!(r.table.len(), 0, "not once it is gone");
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert!(r.table.kept_ids().is_empty(), "never claimed");
+        assert!(!r.table.has_kept());
+        assert!(!r.table.full_beside_kept());
+    }
+
+    /// FR-138 P2b (D6) — a worker gone while the daemon's socket is up: each of
+    /// its records ends, `rc:terminate error`, on this connection, rather than
+    /// leave the viewer watching a frozen picture until its own ICE fails.
+    #[tokio::test]
+    async fn p2b_a_worker_gone_while_the_socket_is_up_ends_its_records_as_error() {
+        let mut r = record_rig(8, Some(60), 2).await;
+        r.host.end_channel_for_test();
+        serve_for(&mut r.table, Duration::from_millis(300)).await;
+        let mut ended: Vec<ObjectId> = ends_said(&drain(&mut r.conn))
+            .into_iter()
+            .filter(|(_, reason)| *reason == EndReason::Error)
+            .map(|(s, _)| s)
+            .collect();
+        ended.sort();
+        assert_eq!(ended, r.ids, "each ends as error, once");
+        assert!(!r.table.holds_record(&r.ids[0]));
+    }
+
+    /// FR-138 P2b (R14, A10) — kept records count against the device's
+    /// capacity, and the table never keeps more than it.
+    #[tokio::test]
+    async fn p2b_kept_records_count_against_the_capacity() {
+        let mut r = record_rig(2, Some(60), 2).await;
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert!(
+            r.table.full_beside_kept(),
+            "a third request is refused as busy"
+        );
+        let _ = record_reconnect(&mut r).await;
+        assert!(r.table.full_beside_kept(), "until the claim is answered");
+
+        let mut r = record_rig(1, Some(60), 2).await;
+        r.table.end_connection(ConnExit::ReadError).await;
+        assert_eq!(r.table.kept_ids().len(), 1, "no more than the capacity");
+        assert_eq!(
+            closes_of(&sent(&mut r.frames)).len(),
+            1,
+            "the other closes in the worker"
+        );
+    }
+
+    /// A GUI worker's delegated table, `n` sessions on it built as the offer
+    /// arm builds them there: each on a link pointed at the delegation channel.
+    struct WorkerRig {
+        table: SessionTable<Fake>,
+        ends: Ends,
+        channel: mpsc::Receiver<ClientMsg>,
+        tx: mpsc::Sender<ClientMsg>,
+        sessions: Vec<Session>,
+    }
+
+    impl WorkerRig {
+        fn closes(&self) -> usize {
+            self.sessions.iter().map(|s| s.peer.closes()).sum()
+        }
+    }
+
+    async fn worker_rig(n: usize) -> WorkerRig {
+        let ends = Ends::default();
+        let (tx, channel) = mpsc::channel(64);
+        let mut table = SessionTable::for_worker(8, ends.hook(), &tx);
+        let mut sessions = Vec::new();
+        for _ in 0..n {
+            sessions.push(attach(&mut table, &tx).await);
+        }
+        WorkerRig {
+            table,
+            ends,
+            channel,
+            tx,
+            sessions,
+        }
+    }
+
+    const WINDOW: Duration = Duration::from_secs(60);
+
+    /// FR-138 P2b (R15, B5) — `Detached` keeps only the sessions it names (one
+    /// worker serves every org's sessions on a one-row Mac), and the worker's
+    /// own deadline, capped as the daemon's is, closes each once.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_worker_detached_keeps_only_the_named_sessions_until_its_deadline() {
+        let mut w = worker_rig(3).await;
+        let (a, b) = (w.sessions[0].id, w.sessions[1].id);
+        let mut named = vec![a, b];
+        named.sort();
+        w.table
+            .detach_named(&named, ConnExit::ReadError, WINDOW)
+            .await;
+        assert_eq!(w.table.kept_ids(), named, "the named two are kept");
+        assert_eq!(w.table.attached_len(), 1, "another org's stays attached");
+        assert_eq!(w.closes(), 0);
+        serve_for(&mut w.table, Duration::from_secs(61)).await;
+        assert_eq!(w.sessions[0].peer.closes(), 1);
+        assert_eq!(w.sessions[1].peer.closes(), 1);
+        assert_eq!(w.sessions[2].peer.closes(), 0);
+        assert_eq!(w.ends.all().len(), 2, "each kept one's real end");
+
+        let mut w = worker_rig(1).await;
+        let a = w.sessions[0].id;
+        w.table
+            .detach_named(&[a], ConnExit::ReadError, Duration::from_secs(600))
+            .await;
+        serve_for(&mut w.table, WINDOW_CAP + Duration::from_secs(1)).await;
+        assert_eq!(w.closes(), 1, "a window past the cap is capped");
+    }
+
+    /// FR-138 P2b (R16, M1) — a dead peer at `Detached` is closed, and its end,
+    /// `error`, goes up the channel: its own `Terminate` may have gone with the
+    /// daemon's socket.
+    #[tokio::test]
+    async fn p2b_worker_a_dead_peer_at_detached_closes_and_says_error_up_the_channel() {
+        let mut w = worker_rig(1).await;
+        let a = w.sessions[0].id;
+        w.sessions[0].peer.set_dead();
+        w.table
+            .detach_named(&[a], ConnExit::ReadError, WINDOW)
+            .await;
+        assert_eq!(w.sessions[0].peer.closes(), 1);
+        assert!(w.table.kept_ids().is_empty());
+        assert_eq!(
+            ends_said(&drain(&mut w.channel)),
+            vec![(a, EndReason::Error)]
+        );
+    }
+
+    /// FR-138 P2b (R17, B5) — `Resumed` re-attaches a kept session, and its
+    /// sends go up the channel again.
+    #[tokio::test]
+    async fn p2b_worker_resumed_reattaches_and_its_sends_go_up_the_channel_again() {
+        let mut w = worker_rig(1).await;
+        let id = w.sessions[0].id;
+        let held = w.sessions[0].held.clone();
+        w.table
+            .detach_named(&[id], ConnExit::ReadError, WINDOW)
+            .await;
+        held.send(ice(id)).await.unwrap();
+        settled(&held).await;
+        assert!(drain(&mut w.channel).is_empty(), "kept, its ICE is dropped");
+        let tx = w.tx.clone();
+        assert!(w.table.resume(id, &tx).await);
+        held.send(ice(id)).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), w.channel.recv())
+            .await
+            .ok()
+            .flatten();
+        assert!(
+            matches!(got, Some(ClientMsg::Ice { session_id, .. }) if session_id == id),
+            "resumed, it goes up the channel: {got:?}"
+        );
+        w.table.close_all("test_end").await;
+    }
+
+    /// FR-138 P2b (R18, B6) — a delegated peer's own end closes it at once,
+    /// attached and kept, with no echo: after a roll the server that would
+    /// echo it no longer holds the session. Its real end runs, and its end
+    /// goes up the channel once.
+    #[tokio::test]
+    async fn p2b_worker_a_delegated_peers_own_end_closes_it_at_once() {
+        let mut w = worker_rig(2).await;
+        let (a, b) = (w.sessions[0].id, w.sessions[1].id);
+        w.sessions[0]
+            .held
+            .send(terminate(a, EndReason::Error, None))
+            .await
+            .unwrap();
+        serve_for(&mut w.table, Duration::from_millis(300)).await;
+        assert_eq!(
+            w.sessions[0].peer.closes(),
+            1,
+            "attached, closed with no echo"
+        );
+        assert!(
+            w.ends.all().contains(&(a, RealEnd::Ended)),
+            "its real end ran: the banner, the recording"
+        );
+        w.table
+            .detach_named(&[b], ConnExit::ReadError, WINDOW)
+            .await;
+        w.sessions[1]
+            .held
+            .send(terminate(b, EndReason::Error, None))
+            .await
+            .unwrap();
+        serve_for(&mut w.table, Duration::from_millis(300)).await;
+        assert_eq!(w.sessions[1].peer.closes(), 1, "kept, closed too");
+        assert_eq!(
+            ends_said(&drain(&mut w.channel)),
+            vec![(a, EndReason::Error), (b, EndReason::Error)],
+            "each end goes up the channel once"
+        );
+        assert_eq!(w.table.len(), 0);
+    }
+
+    /// FR-138 P2b (R19, B7) — the person's Disconnect and the idle limit, in
+    /// the worker where the banner and the registry are: a kept session says
+    /// `rc:ended` on its control channel, an attached one stops at once, each
+    /// closes after the grace, and each end goes up the channel.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_worker_a_disconnect_or_the_idle_limit_ends_it_and_its_end_goes_up() {
+        let mut w = worker_rig(3).await;
+        let (a, b, c) = (w.sessions[0].id, w.sessions[1].id, w.sessions[2].id);
+        let mut named = vec![a, b];
+        named.sort();
+        w.table
+            .detach_named(&named, ConnExit::ReadError, WINDOW)
+            .await;
+        let grace = Duration::from_millis(500);
+        assert!(w.table.end_by_device(
+            a,
+            terminate(a, EndReason::HostDisconnect, None),
+            "host_disconnect",
+            grace
+        ));
+        assert!(w.table.end_by_device(
+            b,
+            terminate(b, EndReason::IdleTimeout, None),
+            "idle_timeout",
+            grace
+        ));
+        assert!(
+            w.table.end_by_device(
+                c,
+                terminate(c, EndReason::HostDisconnect, None),
+                "host_disconnect",
+                grace
+            ),
+            "an attached one of this table too"
+        );
+        tokio::time::sleep(grace * 2).await;
+        for s in &w.sessions {
+            assert!(s.peer.stopped(), "{} stops at once", s.id);
+            assert_eq!(s.peer.closes(), 1, "{} closes after the grace", s.id);
+        }
+        assert_eq!(w.sessions[0].peer.said()[0]["reason"], "host_disconnect");
+        assert_eq!(w.sessions[1].peer.said()[0]["reason"], "idle_timeout");
+        assert_eq!(
+            ends_said(&drain(&mut w.channel)),
+            vec![
+                (a, EndReason::HostDisconnect),
+                (b, EndReason::IdleTimeout),
+                (c, EndReason::HostDisconnect),
+            ]
+        );
+        assert!(
+            w.ends
+                .all()
+                .iter()
+                .all(|(_, end)| *end == RealEnd::HostEnded),
+            "the person ended them"
+        );
+    }
+
+    /// FR-138 P2b (R20, C1) — the server's end of a kept delegated session (a
+    /// refused claim, a kick) is said on its control channel, then it closes
+    /// after the grace.
+    #[tokio::test(start_paused = true)]
+    async fn p2b_worker_a_server_end_of_a_kept_session_is_said_then_closes() {
+        let mut w = worker_rig(1).await;
+        let a = w.sessions[0].id;
+        w.table
+            .detach_named(&[a], ConnExit::ReadError, WINDOW)
+            .await;
+        assert_eq!(w.table.kept_ids(), vec![a], "kept");
+        let peer = w.table.take(&a, "terminate").expect("held");
+        let grace = Duration::from_millis(500);
+        w.table
+            .close_terminated(peer, a, &EndReason::AdminTerminated, None, grace)
+            .await;
+        tokio::time::sleep(grace * 2).await;
+        assert_eq!(w.sessions[0].peer.said()[0]["reason"], "admin_terminated");
+        assert_eq!(w.sessions[0].peer.closes(), 1);
+    }
+
+    /// FR-138 P2b (R21, B5) — `Close` closes a held session once, attached or
+    /// kept, with its real end; one the table does not hold changes nothing,
+    /// and nothing goes up (the daemon decided).
+    #[tokio::test]
+    async fn p2b_worker_close_closes_a_held_session_once_and_nothing_else() {
+        let mut w = worker_rig(2).await;
+        let (a, b) = (w.sessions[0].id, w.sessions[1].id);
+        w.table
+            .detach_named(&[b], ConnExit::ReadError, WINDOW)
+            .await;
+        w.table.close_session(a, "close").await;
+        w.table.close_session(b, "deadline").await;
+        w.table.close_session(ObjectId::new(), "deadline").await;
+        w.table.close_session(a, "close").await;
+        assert_eq!(w.sessions[0].peer.closes(), 1, "attached");
+        assert_eq!(w.sessions[1].peer.closes(), 1, "kept");
+        assert_eq!(w.table.len(), 0);
+        let mut ends = w.ends.all();
+        ends.sort_by_key(|(s, _)| *s);
+        let mut want = vec![(a, RealEnd::Ended), (b, RealEnd::Ended)];
+        want.sort_by_key(|(s, _)| *s);
+        assert_eq!(ends, want);
+        assert!(drain(&mut w.channel).is_empty(), "nothing goes up");
+    }
+
+    /// FR-138 P2b (R22, B9, D5) — a paused or kept delegated link never waits
+    /// on a full channel: with the channel down and both processes alive,
+    /// nobody drains its queue.
+    #[tokio::test]
+    async fn p2b_worker_a_paused_or_kept_link_never_waits_on_a_full_channel() {
+        let ends = Ends::default();
+        let (tx, _channel) = mpsc::channel(1);
+        tx.try_send(ice(ObjectId::new())).unwrap();
+        let mut table: SessionTable<Fake> = SessionTable::for_worker(8, ends.hook(), &tx);
+        let a = attach(&mut table, &tx).await;
+        let b = attach(&mut table, &tx).await;
+        table.pause();
+        let (held, id) = (a.held.clone(), a.id);
+        let paused = tokio::time::timeout(Duration::from_secs(2), async move {
+            for _ in 0..1000 {
+                held.send(ice(id)).await.unwrap();
+            }
+        })
+        .await;
+        assert!(
+            paused.is_ok(),
+            "paused, an attached session's sends never wait"
+        );
+        table
+            .detach_named(&[b.id], ConnExit::ReadError, WINDOW)
+            .await;
+        let (held, id) = (b.held.clone(), b.id);
+        let kept = tokio::time::timeout(Duration::from_secs(2), async move {
+            for _ in 0..1000 {
+                held.send(ice(id)).await.unwrap();
+            }
+        })
+        .await;
+        assert!(kept.is_ok(), "kept, they never wait");
+        table.close_all("test_end").await;
+        assert_eq!(a.peer.closes() + b.peer.closes(), 2);
     }
 }

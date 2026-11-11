@@ -2644,6 +2644,62 @@ mod tests {
         assert!(!secret_eq("abc", "abd"));
         assert!(!secret_eq("", "x"));
     }
+
+    /// FR-138 P2b (R12, A2) — a delegated session is said `keepable` only to a
+    /// worker that said `keep-delegated` (by equality: a near miss is not the
+    /// word), only with the switch on, and never for an external session; and
+    /// this build's worker says the word.
+    #[tokio::test]
+    async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
+        assert_eq!(
+            worker_features(),
+            vec![KEEP_DELEGATED.to_string()],
+            "this build's worker says it"
+        );
+        assert!(
+            session_keepable(true, true, false),
+            "switch on, a P2b worker"
+        );
+        assert!(!session_keepable(false, true, false), "switch off");
+        assert!(
+            !session_keepable(true, false, false),
+            "an older worker, or none"
+        );
+        assert!(!session_keepable(true, true, true), "an external session");
+
+        let host = DelegateHost::new();
+        assert!(!host.worker_keeps(), "no worker");
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        async fn caps(
+            cwr: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+            lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+            features: Vec<String>,
+        ) {
+            let frame = DelegateFrame::WorkerCaps {
+                caps: Box::new(AgentCaps::default()),
+                features,
+            };
+            write_frame(cwr, &frame).await.unwrap();
+            // The daemon reads in order: its Pong means the caps were read.
+            cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+            assert!(matches!(next_frame(lines).await, DelegateFrame::Pong));
+        }
+        caps(&mut cwr, &mut lines, Vec::new()).await;
+        assert!(!host.worker_keeps(), "an older worker says no word");
+        caps(
+            &mut cwr,
+            &mut lines,
+            vec!["keep-delegated-v2".into(), "keep".into()],
+        )
+        .await;
+        assert!(!host.worker_keeps(), "a near miss is not the word");
+        caps(&mut cwr, &mut lines, vec![KEEP_DELEGATED.to_string()]).await;
+        assert!(host.worker_keeps(), "a P2b worker");
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+        assert!(!host.worker_keeps(), "gone with its channel");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2874,6 +2930,86 @@ mod routing_tests {
             limit: None,
         });
         assert!(!k.is_empty() && k != "?", "got {k}");
+    }
+
+    /// FR-138 P2b (R2, A1) — with the switch on, a delegable message about a
+    /// session the daemon's own table holds is the daemon's, and never crosses
+    /// to a worker that attached since: its `Terminate` or `Ice` would go to a
+    /// process that never held the peer.
+    #[test]
+    fn p2b_a_session_the_daemon_holds_is_served_there_with_the_switch_on() {
+        assert!(
+            served_by_daemon(true, true),
+            "a daemon-held session's Terminate or Ice never crosses"
+        );
+        assert!(
+            !served_by_daemon(true, false),
+            "a session the daemon does not hold crosses as before"
+        );
+    }
+
+    /// FR-138 P2b (a6's amendment) — with the switch off the gate is today's: a
+    /// `Terminate` for a session the daemon holds still crosses, as on master.
+    /// A guard, so it passes before the implementation and after it.
+    #[test]
+    fn p2b_with_the_switch_off_the_gate_is_todays() {
+        assert!(!served_by_daemon(false, true), "off, it still crosses");
+        assert!(!served_by_daemon(false, false));
+    }
+
+    /// FR-138 P2b (R23, B4) — the daemon's orders go to the worker's orders
+    /// lane, which is served wherever its loop waits; params and rc messages
+    /// keep their one ordered inbound lane, and liveness stays in the attach
+    /// loop.
+    #[test]
+    fn p2b_the_daemons_orders_go_to_their_own_lane_and_the_rest_as_before() {
+        let id = oid().to_hex();
+        let lane = worker_lane(DelegateFrame::Detached {
+            sessions: vec![id.clone()],
+            exit: "read_error".into(),
+            netchange: false,
+            keep_ms: 60_000,
+        });
+        assert!(
+            matches!(
+                lane,
+                WorkerLane::Order(WorkerOrder::Detached { ref sessions, keep_ms: 60_000, .. })
+                    if *sessions == vec![id.clone()]
+            ),
+            "Detached: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::Resumed {
+            session_id: id.clone(),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Order(WorkerOrder::Resumed { ref session_id }) if *session_id == id),
+            "Resumed: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::Close {
+            session_id: id.clone(),
+            reason: "deadline".into(),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Order(WorkerOrder::Close { ref reason, .. }) if reason == "deadline"),
+            "Close: {lane:?}"
+        );
+        let lane = worker_lane(DelegateFrame::ToWorker {
+            msg: Box::new(ServerMsg::Ice {
+                session_id: oid(),
+                candidate: serde_json::Value::Null,
+            }),
+        });
+        assert!(
+            matches!(lane, WorkerLane::Inbound(WorkerInbound::Msg(_))),
+            "an rc message: {lane:?}"
+        );
+        assert!(
+            matches!(
+                worker_lane(DelegateFrame::Ping),
+                WorkerLane::Here(DelegateFrame::Ping)
+            ),
+            "liveness stays in the attach loop"
+        );
     }
 }
 
@@ -3781,6 +3917,97 @@ mod params_tests {
                 files: FeaturePolicy::Off,
                 audio: FeaturePolicy::Off,
             }
+        );
+    }
+
+    // ─── FR-138 P2b ─────────────────────────────────────────────────────────
+
+    /// FR-138 P2b (R13) — the three orders and both fields keep a stable wire,
+    /// and a frame from an older peer, without them, still parses. Written
+    /// first: at the seam the orders and the fields are off the wire.
+    #[test]
+    fn p2b_the_orders_and_both_fields_keep_a_stable_wire_and_older_frames_parse() {
+        use serde_json::json;
+        let id = bson::oid::ObjectId::new().to_hex();
+        let detached = DelegateFrame::Detached {
+            sessions: vec![id.clone()],
+            exit: "read_error".into(),
+            netchange: false,
+            keep_ms: 60_000,
+        };
+        assert_eq!(
+            serde_json::to_value(&detached).ok(),
+            Some(json!({"t": "detached", "d": {
+                "sessions": [id], "exit": "read_error", "netchange": false, "keep_ms": 60000
+            }})),
+            "Detached"
+        );
+        assert_eq!(
+            serde_json::to_value(DelegateFrame::Resumed {
+                session_id: id.clone()
+            })
+            .ok(),
+            Some(json!({"t": "resumed", "d": {"session_id": id}})),
+            "Resumed"
+        );
+        assert_eq!(
+            serde_json::to_value(DelegateFrame::Close {
+                session_id: id.clone(),
+                reason: "deadline".into()
+            })
+            .ok(),
+            Some(json!({"t": "close", "d": {"session_id": id, "reason": "deadline"}})),
+            "Close"
+        );
+        let back = serde_json::from_value::<DelegateFrame>(json!({"t": "detached", "d": {
+            "sessions": [id], "exit": "netchange_probe", "netchange": true, "keep_ms": 120000
+        }}))
+        .ok();
+        assert!(
+            matches!(
+                back,
+                Some(DelegateFrame::Detached { ref sessions, netchange: true, keep_ms: 120_000, .. })
+                    if *sessions == vec![id.clone()]
+            ),
+            "a Detached reads back: {back:?}"
+        );
+
+        let caps = serde_json::to_value(DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps::default()),
+            features: vec![KEEP_DELEGATED.to_string()],
+        })
+        .unwrap();
+        assert_eq!(
+            caps["d"]["features"],
+            json!(["keep-delegated"]),
+            "the word is on the wire"
+        );
+        let older = serde_json::from_value::<DelegateFrame>(json!({
+            "t": "worker_caps",
+            "d": {"caps": serde_json::to_value(AgentCaps::default()).unwrap()}
+        }))
+        .unwrap();
+        assert!(
+            matches!(older, DelegateFrame::WorkerCaps { ref features, .. } if features.is_empty()),
+            "an older worker's caps parse, with no word"
+        );
+
+        let mut p = params(
+            &id,
+            roomler_ai_remote_control::permissions::Permissions::empty(),
+        );
+        p.keepable = true;
+        let wire = serde_json::to_value(&p).unwrap();
+        assert_eq!(wire["keepable"], json!(true), "keepable is on the wire");
+        let back: SessionParams = serde_json::from_value(wire).unwrap();
+        assert!(back.keepable);
+        p.keepable = false;
+        let wire = serde_json::to_value(&p).unwrap();
+        assert!(wire.get("keepable").is_none(), "false stays off it: {wire}");
+        let older: SessionParams = serde_json::from_value(wire).unwrap();
+        assert!(
+            !older.keepable,
+            "an older daemon's params read not keepable"
         );
     }
 }
