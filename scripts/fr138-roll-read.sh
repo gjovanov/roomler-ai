@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# fr138-roll-read.sh — FR-138 P0: what a server roll did to the remote-control
-# sessions that were live across it, and how many session rows were never ended.
-# READ-ONLY.
+# fr138-roll-read.sh — FR-138 P0 and P3: what a server roll did to the
+# remote-control sessions that were live across it, and how many session rows
+# were never ended. READ-ONLY.
 #
 # FR-138 (docs/fr/FR-138-the-session-outlives-its-control-socket.md) keeps a live
 # session through the loss of its control socket. §6 is the field read every RED
@@ -18,16 +18,23 @@
 #   - the viewer's `rc.connect` records (POST /api/log/browser) after the cut,
 #     with `after_drop`, matched on the record's `fields.agent_id` and the
 #     batch's user: a browser batch carries no document agent id;
+#   - the viewer's `rc.resume` records, from P2a on: per session its outcome,
+#     `gap_ms`, `ws_down_ms` and `held_ms`, and every such record in the
+#     window for any device;
 #   - any consent prompt raised for the new row: its `remote_audit` events, and
 #     the agent's own `consent prompt surface` line;
 #   - the agent's lines around the cut: `torn down peers ...` (today's close),
 #     the failed connect, the flat redial, `rc:agent.hello sent`. A daemon
 #     enrolled in several orgs runs one connection per org and uploads all of
 #     their lines under its first enrollment, so the read prints how many orgs
-#     the machine is enrolled in. FR-138's detach, resume and close lines do not
-#     exist before P2a, so this read prints them as absent at P0;
+#     the machine is enrolled in. From P2a on it also prints FR-138's own
+#     lines, tagged DETACHED, RESUMED, CLOSED_AT_LOSS, CLOSED_HOST_END and
+#     CLOSED_KEPT with the session they name, and the window the server
+#     announced (or ignored, for a device whose switch is off). A daemon
+#     older than P2a has none of them, and the read counts them as 0;
 #   - the media gap, as §6 step 4 defines it at P0: from the old row's
-#     ended_at to the redial's first_frame record;
+#     ended_at to the redial's first_frame record. A resumed session has no
+#     redial: its gap is its `rc.resume` record's `gap_ms`;
 #   - AC7's count: each session the roll window ended, by class. A session
 #     ended `agent_disconnect` (seen, or inferred: the row's `end_source`) and
 #     one whose resume was lost because its viewer never rejoined
@@ -303,11 +310,20 @@ if (MODE === "active") {
         { $sort: { created_at: 1 } },
         { $limit: 3000 },
         { $project: { _id: 0, user_id: 1, session_id: 1, created_at: 1,
-            l: { $filter: { input: "$lines", as: "l", cond: { $eq: ["$$l.target", "rc.connect"] } } } } },
+            l: { $filter: { input: "$lines", as: "l", cond: { $in: ["$$l.target", ["rc.connect", "rc.resume"]] } } } } },
         { $unwind: "$l" },
-        { $project: { user_id: 1, session_id: 1, created_at: 1, ts: "$l.ts", level: "$l.level", f: "$l.fields" } }
+        { $project: { user_id: 1, session_id: 1, created_at: 1, ts: "$l.ts", level: "$l.level", target: "$l.target", f: "$l.fields" } }
       ], { maxTimeMS: 30000, hint: { created_at: 1 } }).toArray();
     }
+    const resumes = recs.filter((x) => x.target === "rc.resume");
+    recs = recs.filter((x) => x.target !== "rc.resume");
+    print("rc.resume records in window=" + resumes.length);
+    const resLine = (x) => at(x.ts) + " " + x.level + " v=" + x.f.v + " outcome=" + x.f.outcome
+      + " gap_ms=" + (x.f.gap_ms === null || x.f.gap_ms === undefined ? "-" : x.f.gap_ms)
+      + " ws_down_ms=" + (x.f.ws_down_ms === undefined ? "-" : x.f.ws_down_ms)
+      + " held_ms=" + (x.f.held_ms === undefined ? "-" : x.f.held_ms)
+      + " session=" + (x.session_id ? "s:" + String(x.session_id).slice(-4) : "-")
+      + " fields=" + Object.keys(x.f || {}).join(",");
     const ad = recs.filter((x) => x.f && x.f.after_drop === true);
     print("rc.connect records in window=" + recs.length + " after_drop=" + ad.length);
     const recLine = (x) => at(x.ts) + " " + x.level + " v=" + x.f.v + " attempt=" + x.f.attempt + " outcome=" + x.f.outcome
@@ -318,7 +334,15 @@ if (MODE === "active") {
     // The agent's lines around the cut (P0's close is the teardown line).
     const MSGS = ["torn down peers + hid indicator overlays on ws disconnect", "signaling connect failed; backing off",
       "signaling: the load balancer has no pod for this org yet; redialling flat (FR-28)", "rc:agent.hello sent",
-      "consent prompt surface", "operator consent decision", "ws closed by peer"];
+      "consent prompt surface", "operator consent decision", "ws closed by peer",
+      "rc session detached: its peer is kept until the server answers the claim, for the window at most (FR-138)",
+      "rc session resumed: re-attached to the new connection (FR-138)",
+      "rc session closed: a kept session ended (FR-138)",
+      "rc session closed at the control socket's loss: it could not be kept (FR-138)",
+      "rc session closed: ended at the device while kept; said on its control channel, and its end goes to the server (FR-138)",
+      "rc: the server announced a resume window (FR-138)",
+      "rc: a resume window for a device whose switch is off; ignored (FR-138)",
+      "rc: the connection ended before its server announced a window; the kept sessions keep their deadlines (FR-138)"];
     const agentLines = new Map();
     const linesOf = (r) => {
       const k = hex(r.agent_id);
@@ -350,6 +374,15 @@ if (MODE === "active") {
       if (x.msg === "consent prompt surface") return "consent prompt raised for s:" + String(f.session || "").slice(-4)
         + " (native=" + f.native + " notified=" + f.notified + ")";
       if (x.msg === "operator consent decision") return "consent decided for s:" + String(f.session || "").slice(-4);
+      const sp = " s:" + String(f.session_id || "").slice(-4);
+      if (x.msg.startsWith("rc session detached")) return "DETACHED" + sp + " exit=" + f.exit + " window_s=" + f.window_s + " netchange=" + f.netchange;
+      if (x.msg.startsWith("rc session resumed")) return "RESUMED" + sp + " exit=" + f.exit + " kept_ms=" + f.kept_ms;
+      if (x.msg.startsWith("rc session closed at the control socket's loss")) return "CLOSED_AT_LOSS" + sp + " why=" + f.why + " exit=" + f.exit;
+      if (x.msg.startsWith("rc session closed: ended at the device")) return "CLOSED_HOST_END" + sp + " why=" + f.why + " kept_ms=" + f.kept_ms;
+      if (x.msg.startsWith("rc session closed")) return "CLOSED_KEPT" + sp + " why=" + f.why + " kept_ms=" + f.kept_ms;
+      if (x.msg.startsWith("rc: the server announced a resume window")) return "window announced " + JSON.stringify(f);
+      if (x.msg.startsWith("rc: a resume window for a device whose switch is off")) return "window IGNORED (switch off) " + JSON.stringify(f);
+      if (x.msg.startsWith("rc: the connection ended before")) return "connection ended before its window " + JSON.stringify(f);
       return x.msg;
     };
 
@@ -442,7 +475,16 @@ if (MODE === "active") {
         const pr = al.lines.find((x) => x.msg === "consent prompt surface" && String((x.f || {}).session || "") === hex(N._id));
         print("  consent prompt raised for the new row: " + (pr ? "yes, at " + at(pr.ts) : "no `consent prompt surface` line"));
       }
-      print("  detach / resume / close lines: absent at P0 (none exist before P2a)");
+      const myRes = resumes.filter((x) => x.f && x.f.agent_id === aH && x.user_id && hex(x.user_id) === U && x.ts >= FROM)
+        .sort((p, q) => p.ts - q.ts);
+      const myResAny = resumes.filter((x) => x.session_id && String(x.session_id) === hex(r._id));
+      const rr = myRes.length ? myRes : myResAny;
+      print("  rc.resume from this controller to this device after --from: " + rr.length);
+      for (const x of rr) print("    " + resLine(x));
+      const kinds = ["DETACHED", "RESUMED", "CLOSED_AT_LOSS", "CLOSED_HOST_END", "CLOSED_KEPT"];
+      const mineL = al.lines.map((x) => lineText(x)).filter((t) => kinds.some((k) => t.startsWith(k)) && t.includes(" s:" + hex(r._id).slice(-4)));
+      print("  FR-138 detach / resume / close lines for this session: " + mineL.length
+        + " (" + kinds.map((k) => k + "=" + mineL.filter((t) => t.startsWith(k + " ")).length).join(" ") + ")");
     }
 
     if (inflight.length) {
@@ -464,6 +506,10 @@ if (MODE === "active") {
         + ", its rc.connect records=" + own.length + " (after_drop on " + own.filter((x) => x.f && x.f.after_drop === true).length + ")"
         + (same ? ", same device and controller as " + sid(same._id) + (isNext ? " (its next row)" : "") : ""));
     }
+    print("");
+    print("RC.RESUME RECORDS IN THE WINDOW, ANY DEVICE:");
+    if (!resumes.length) print("  none");
+    for (const x of resumes) print("  " + (x.f.agent_id ? dev(x.f.agent_id) : "dev?") + " " + resLine(x));
     print("");
     print("AFTER_DROP RECORDS IN THE WINDOW, ANY DEVICE:");
     if (!ad.length) print("  none");
