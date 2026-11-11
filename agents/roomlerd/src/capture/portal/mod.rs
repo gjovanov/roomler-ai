@@ -1200,15 +1200,22 @@ pub mod helper {
         })
     }
 
+    /// #3695 — the longest handshake line the daemon reads from the helper:
+    /// 64 KiB, the control-frame limit FR-142 sets for the session worker.
+    /// The largest legitimate line is the stream-failed reason, one sentence;
+    /// a [`StreamStarted`] is about 200 bytes.
+    pub const HANDSHAKE_LINE_MAX: usize = 64 * 1024;
+
     /// Read the streaming handshake line, skipping anything the child wrote
-    /// before it.
+    /// before it. #3695 — at most 64 lines of at most [`HANDSHAKE_LINE_MAX`]
+    /// bytes each; a longer line ends the handshake with the limit named.
     pub fn read_stream_handshake(r: &mut impl std::io::BufRead) -> anyhow::Result<StreamStarted> {
-        let mut line = String::new();
         for _ in 0..64 {
-            line.clear();
-            if r.read_line(&mut line)? == 0 {
+            let line = crate::line_limit::read_line(r, HANDSHAKE_LINE_MAX)
+                .map_err(|e| anyhow::anyhow!("the portal helper's handshake: {e}"))?;
+            let Some(line) = line else {
                 anyhow::bail!("the portal helper exited before announcing a stream");
-            }
+            };
             if let Some(json) = line.trim().strip_prefix(STREAM_MARKER) {
                 return Ok(serde_json::from_str(json)?);
             }
