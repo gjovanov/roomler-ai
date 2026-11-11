@@ -105,7 +105,48 @@ impl FrameHeader {
                 h.stride, h.width
             ));
         }
+        // #3695 — the payload is exactly the rows the header describes:
+        // `stride` bytes for each of `height` rows. The decode holds this
+        // rule rather than `Frame`, because it needs only the header: a frame
+        // that breaks it is refused before `read_frame` allocates or reads
+        // its payload, so every consumer gets the rows its stride promises.
+        // The helper sends exactly this many bytes ([`payload`]).
+        let rows = h.stride as u64 * h.height as u64;
+        if h.len as u64 != rows {
+            return Err(format!(
+                "frame payload is {} bytes; its header's {} rows of {} bytes make {rows}",
+                h.len, h.height, h.stride
+            ));
+        }
         Ok(h)
+    }
+}
+
+/// #3695 — the bytes the helper sends for one frame, from the valid bytes of
+/// a PipeWire buffer: exactly `stride * height` of them, which is what
+/// [`FrameHeader::decode`] accepts.
+///
+/// - **Longer**: the first `stride * height` bytes. What follows the last row
+///   is not pixels.
+/// - **Shorter, holding every pixel** (at least `stride * (height - 1) +
+///   width * 4` bytes): only the last row's padding is missing, so it is
+///   added as zeros.
+/// - **Shorter still**: sent as it is, so the daemon refuses the frame and
+///   says why, rather than the helper inventing pixels.
+pub fn payload(bytes: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
+    let (width, height, stride) = (width as u64, height as u64, stride as u64);
+    let rows = stride * height;
+    let pixels = (stride * height.saturating_sub(1)).saturating_add(width * 4);
+    let have = bytes.len() as u64;
+    if rows > MAX_PAYLOAD as u64 || have < pixels.min(rows) {
+        bytes.to_vec()
+    } else if have >= rows {
+        bytes[..rows as usize].to_vec()
+    } else {
+        let mut v = Vec::with_capacity(rows as usize);
+        v.extend_from_slice(bytes);
+        v.resize(rows as usize, 0);
+        v
     }
 }
 
@@ -159,6 +200,7 @@ mod tests {
         assert!(FrameHeader::decode(&h.encode()).is_err());
 
         h.stride = 1920 * 4 + 256; // padded — must be accepted
+        h.len = h.stride * h.height;
         assert_eq!(FrameHeader::decode(&h.encode()).unwrap().stride, h.stride);
     }
 
@@ -181,5 +223,42 @@ mod tests {
         }
         h.len = rows;
         assert!(FrameHeader::decode(&h.encode()).is_ok());
+    }
+
+    /// #3695 — what the helper sends is what the decode accepts: exactly the
+    /// rows, cut from a longer buffer or padded where only the last row's
+    /// padding is missing; a buffer short of pixels goes as it is, and the
+    /// daemon refuses it.
+    #[test]
+    fn the_helper_sends_exactly_its_headers_rows() {
+        let (width, height, stride) = (4u32, 3u32, 20u32);
+        let rows = (stride * height) as usize;
+        let accepted = |len: usize| {
+            let h = FrameHeader {
+                width,
+                height,
+                stride,
+                video_format: 8,
+                len: len as u32,
+            };
+            FrameHeader::decode(&h.encode()).is_ok()
+        };
+        let longer: Vec<u8> = (0..rows as u8 + 7).collect();
+        let sent = payload(&longer, width, height, stride);
+        assert_eq!(sent, longer[..rows], "the rows, nothing after them");
+        assert!(accepted(sent.len()));
+
+        assert_eq!(payload(&longer[..rows], width, height, stride).len(), rows);
+
+        let pixels = (stride * (height - 1) + width * 4) as usize;
+        let sent = payload(&longer[..pixels], width, height, stride);
+        assert_eq!(sent.len(), rows);
+        assert_eq!(sent[..pixels], longer[..pixels], "the pixels kept");
+        assert!(sent[pixels..].iter().all(|b| *b == 0), "padding added");
+        assert!(accepted(sent.len()));
+
+        let short = payload(&longer[..pixels - 1], width, height, stride);
+        assert_eq!(short.len(), pixels - 1, "sent as it is");
+        assert!(!accepted(short.len()), "and refused");
     }
 }

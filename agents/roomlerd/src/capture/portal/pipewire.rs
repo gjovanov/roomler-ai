@@ -824,15 +824,19 @@ unsafe fn copy_out(
     let offset = (chunk.offset as usize).min(d.maxsize as usize);
     let len = (chunk.size as usize).min(d.maxsize as usize - offset);
     let bytes = unsafe { std::slice::from_raw_parts((d.data as *const u8).add(offset), len) };
+    // #3695 — exactly the rows the header announces, which is all the
+    // daemon's decode accepts.
+    let stride = chunk.stride as u32;
+    let payload = super::wire::payload(bytes, fmt.width, fmt.height, stride);
     Some((
         super::wire::FrameHeader {
             width: fmt.width,
             height: fmt.height,
-            stride: chunk.stride as u32,
+            stride,
             video_format: fmt.video_format,
-            len: len as u32,
+            len: payload.len() as u32,
         },
-        bytes.to_vec(),
+        payload,
     ))
 }
 
