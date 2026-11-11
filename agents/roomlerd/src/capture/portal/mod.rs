@@ -1200,15 +1200,22 @@ pub mod helper {
         })
     }
 
+    /// #3695 — the longest handshake line the daemon reads from the helper:
+    /// 64 KiB, the control-frame limit FR-142 sets for the session worker.
+    /// The largest legitimate line is the stream-failed reason, one sentence;
+    /// a [`StreamStarted`] is about 200 bytes.
+    pub const HANDSHAKE_LINE_MAX: usize = 64 * 1024;
+
     /// Read the streaming handshake line, skipping anything the child wrote
-    /// before it.
+    /// before it. #3695 — at most 64 lines of at most [`HANDSHAKE_LINE_MAX`]
+    /// bytes each; a longer line ends the handshake with the limit named.
     pub fn read_stream_handshake(r: &mut impl std::io::BufRead) -> anyhow::Result<StreamStarted> {
-        let mut line = String::new();
         for _ in 0..64 {
-            line.clear();
-            if r.read_line(&mut line)? == 0 {
+            let line = crate::line_limit::read_line(r, HANDSHAKE_LINE_MAX)
+                .map_err(|e| anyhow::anyhow!("the portal helper's handshake: {e}"))?;
+            let Some(line) = line else {
                 anyhow::bail!("the portal helper exited before announcing a stream");
-            }
+            };
             if let Some(json) = line.trim().strip_prefix(STREAM_MARKER) {
                 return Ok(serde_json::from_str(json)?);
             }
@@ -1423,14 +1430,8 @@ pub mod helper {
         // Drain stdout on another thread while waiting: a child that filled
         // the pipe would otherwise deadlock against our own wait.
         let out = child.stdout.take();
-        let reader = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = String::new();
-            if let Some(mut s) = out {
-                let _ = s.read_to_string(&mut buf);
-            }
-            buf
-        });
+        let reader =
+            std::thread::spawn(move || out.map(read_answer).unwrap_or_else(|| Ok(String::new())));
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1455,7 +1456,44 @@ pub mod helper {
             }
         }
 
-        Ok(reader.join().unwrap_or_default())
+        match reader.join() {
+            Ok(Ok(answer)) => Ok(answer),
+            // #3695 — the answer is over [`ANSWER_MAX`] or is not text: the
+            // caller hears why, as it does for a helper that hung.
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "portal: the helper's answer was refused");
+                Err(SpawnError::Other(e.to_string()))
+            }
+            Err(_) => Ok(String::new()),
+        }
+    }
+
+    /// #3695 — the longest answer the daemon reads from a one-shot run of the
+    /// helper ([`spawn_in_session`]: the probe, the screencast session report,
+    /// the notification probe). Each answer is one marked line on stdout, and
+    /// diagnostics go to stderr; the largest, the screencast session's report,
+    /// is about 1 KiB. 64 KiB is the limit a handshake line has
+    /// ([`HANDSHAKE_LINE_MAX`]).
+    pub const ANSWER_MAX: usize = 64 * 1024;
+
+    /// The helper's answer: its stdout, read to the end. #3695 — at most
+    /// [`ANSWER_MAX`] bytes of it: a longer answer is an error that names the
+    /// limit, and the rest is read and dropped, so the helper never blocks on
+    /// a full pipe while the daemon waits for it to exit.
+    fn read_answer(mut out: impl std::io::Read) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut kept = Vec::new();
+        (&mut out)
+            .take(ANSWER_MAX as u64 + 1)
+            .read_to_end(&mut kept)?;
+        if kept.len() > ANSWER_MAX {
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("the portal helper's answer is longer than {ANSWER_MAX} bytes"),
+            ));
+        }
+        String::from_utf8(kept).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Pull the status out of the child's stdout.
@@ -1580,6 +1618,35 @@ pub mod helper {
             let mut silent = std::io::Cursor::new(String::new());
             let e = read_stream_handshake(&mut silent).unwrap_err().to_string();
             assert!(e.contains("exited before announcing a stream"), "{e}");
+        }
+
+        /// #3695 — the handshake's line reader has a limit: a line over it
+        /// ends the read with the limit named, before anything behind it.
+        #[test]
+        fn a_handshake_line_over_the_limit_is_refused() {
+            let failed = format!(
+                "{STREAM_FAILED_MARKER}{}\n",
+                serde_json::to_string("declined").unwrap()
+            );
+            let mut input = "x".repeat(64 * 1024 + 1);
+            input.push('\n');
+            input.push_str(&failed);
+            let mut r = std::io::Cursor::new(input);
+            let e = read_stream_handshake(&mut r).unwrap_err().to_string();
+            assert!(e.contains("65536"), "{e}");
+        }
+
+        /// #3695 — the helper's one-shot answer (the probe, the screencast
+        /// session report, the notification probe) is read up to a limit: an
+        /// answer over it is refused with the limit named, and one at it is
+        /// read whole.
+        #[test]
+        fn an_answer_over_the_limit_is_refused() {
+            let at = "x".repeat(64 * 1024);
+            assert_eq!(read_answer(at.as_bytes()).unwrap(), at);
+            let over = "x".repeat(64 * 1024 + 1);
+            let e = read_answer(over.as_bytes()).unwrap_err().to_string();
+            assert!(e.contains("65536"), "{e}");
         }
 
         /// #1719 run B: only a root daemon drops privilege; a per-user daemon

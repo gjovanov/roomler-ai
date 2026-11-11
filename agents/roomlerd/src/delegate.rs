@@ -55,10 +55,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use roomler_ai_remote_control::models::AgentCaps;
+use roomler_ai_remote_control::models::{AgentCaps, RecordCap, Unavailable};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
@@ -256,6 +256,21 @@ pub fn org_key(is_primary: bool, label: &str) -> Option<&str> {
     (!is_primary).then_some(label)
 }
 
+/// #3695 — the longest attach line the daemon reads off a fresh connection.
+/// The line is the worker's secret, `2 * SECRET_BYTES` = 64 hex characters;
+/// 1 KiB is 16 times that. A longer line closes the connection before any
+/// secret is compared.
+pub const ATTACH_LINE_MAX: usize = 1024;
+
+/// #3695 — the longest frame line the daemon reads from its worker. The
+/// largest frame a worker sends is a full [`DelegateFrame::WorkerLogs`]:
+/// [`WORKER_LOG_LINES_PER_FRAME`] lines of at most [`WORKER_LOG_LINE_MAX`]
+/// bytes each, about 1.6 MiB. Every other frame it sends (a session's
+/// answer, candidates and stats, a recording's claim, its capabilities, its
+/// keep-busy and consent-floor reports, liveness) is under 64 KiB. 4 MiB is
+/// 2.5 times the largest; a longer line closes the channel.
+pub const DELEGATE_LINE_MAX: usize = 4 * 1024 * 1024;
+
 /// FR-43 P3a — the most log lines one [`DelegateFrame::WorkerLogs`] carries.
 pub const WORKER_LOG_LINES_PER_FRAME: usize = 100;
 
@@ -269,16 +284,117 @@ pub const WORKER_LOG_MSG_MAX: usize = 8 * 1024;
 pub const WORKER_LOG_FIELD: &str = "process";
 pub const WORKER_LOG_PROCESS: &str = "gui-worker";
 
+/// #3695 — the most bytes one relayed worker line takes, JSON-encoded as it
+/// travels in a [`DelegateFrame::WorkerLogs`]. With
+/// [`WORKER_LOG_LINES_PER_FRAME`] it holds a full frame to about 1.6 MiB,
+/// under [`DELEGATE_LINE_MAX`], so a worker never sends a frame its daemon
+/// refuses. Twice [`WORKER_LOG_MSG_MAX`]: a message cut to that and a few
+/// fields fit whole.
+pub const WORKER_LOG_LINE_MAX: usize = 16 * 1024;
+
 /// FR-43 P3a — cut `line`'s message to [`WORKER_LOG_MSG_MAX`] bytes, on a
-/// character boundary.
+/// character boundary. #3695 — then hold the whole line, encoded, to
+/// [`WORKER_LOG_LINE_MAX`]: its fields go first, then its message and its
+/// target are halved until it fits. Both ends run this, the worker before it
+/// sends a line and the daemon before it keeps one.
 pub fn trim_worker_line(line: &mut crate::logs_upload::LogLine) {
-    if line.msg.len() > WORKER_LOG_MSG_MAX {
-        let mut end = WORKER_LOG_MSG_MAX;
-        while !line.msg.is_char_boundary(end) {
+    cut_to(&mut line.msg, WORKER_LOG_MSG_MAX);
+    let encoded = |line: &crate::logs_upload::LogLine| {
+        serde_json::to_vec(line).map_or(usize::MAX, |bytes| bytes.len())
+    };
+    if encoded(line) <= WORKER_LOG_LINE_MAX {
+        return;
+    }
+    line.fields.clear();
+    while encoded(line) > WORKER_LOG_LINE_MAX {
+        if !line.msg.is_empty() {
+            let half = line.msg.len() / 2;
+            cut_to(&mut line.msg, half);
+        } else if !line.target.is_empty() {
+            let half = line.target.len() / 2;
+            cut_to(&mut line.target, half);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Cut `s` to at most `max` bytes, on a character boundary.
+fn cut_to(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
             end -= 1;
         }
-        line.msg.truncate(end);
+        s.truncate(end);
     }
+}
+
+/// #3695 — the `apps`, `audio` and `permissions` words a worker may give for
+/// its device: the words this build's own builders write
+/// (`encode/caps.rs`: `apps_caps_for`, and `compute_caps`'s audio and
+/// permission words). Its `record` words are those [`RecordCap`] reads. A
+/// word a builder gains is added here too, or a delegated Mac does not pass
+/// it on.
+const WORKER_APPS_WORDS: [&str; 4] = ["status", "list", "focus", "launch"];
+const WORKER_AUDIO_WORDS: [&str; 1] = ["opus"];
+const WORKER_PERMISSION_WORDS: [&str; 3] = ["screen-capture", "input", "no-gui-session"];
+
+/// #3695 — the longest `unavailable["audio"]` code the daemon keeps from its
+/// worker, a word of `[a-z0-9-]` (`no-session`). A code that is not one drops
+/// the reason.
+pub const WORKER_REASON_CODE_MAX: usize = 64;
+
+/// #3695 — the longest `unavailable["audio"]` reason the daemon keeps from
+/// its worker, cut on a character boundary. The reason is one sentence for
+/// the person at the viewer; the longest the agent writes today is under 200
+/// bytes.
+pub const WORKER_REASON_MAX: usize = 512;
+
+/// #3695 — what the daemon keeps of its worker's capabilities: the words that
+/// are the worker's to say, and nothing else. Those are the fields
+/// [`DelegateHost::effective_record`], [`DelegateHost::effective_apps`],
+/// [`DelegateHost::effective_audio`] and [`DelegateHost::effective_permissions`]
+/// hand on; codecs, encoders and every other field stay the daemon's own and
+/// are never read from the worker. Each list keeps the words this build knows,
+/// each once, in the worker's order; `permissions` keeps `None` apart from
+/// `Some([])`, which says the worker holds neither permission.
+fn worker_words(caps: AgentCaps) -> AgentCaps {
+    fn known(words: &[String], allowed: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut kept: Vec<String> = Vec::new();
+        for word in words {
+            if allowed(word) && !kept.contains(word) {
+                kept.push(word.clone());
+            }
+        }
+        kept
+    }
+    let mut kept = AgentCaps {
+        record: known(&caps.record, |w| RecordCap::from_wire(w).is_some()),
+        apps: known(&caps.apps, |w| WORKER_APPS_WORDS.contains(&w)),
+        audio: known(&caps.audio, |w| WORKER_AUDIO_WORDS.contains(&w)),
+        permissions: caps
+            .permissions
+            .as_deref()
+            .map(|words| known(words, |w| WORKER_PERMISSION_WORDS.contains(&w))),
+        has_input_permission: caps.has_input_permission,
+        ..AgentCaps::default()
+    };
+    if let Some(why) = caps.unavailable.get("audio") {
+        let code_ok = !why.code.is_empty()
+            && why.code.len() <= WORKER_REASON_CODE_MAX
+            && why
+                .code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if code_ok {
+            let mut reason = why.reason.clone();
+            cut_to(&mut reason, WORKER_REASON_MAX);
+            kept.unavailable
+                .insert("audio".into(), Unavailable::new(&why.code, &reason));
+        }
+    }
+    kept
 }
 
 /// FR-43 P3a — a worker's line as the daemon uploads it: trimmed, and marked as
@@ -846,16 +962,10 @@ impl DelegateHost {
     #[cfg(unix)]
     async fn serve_stream(&self, stream: UnixStream) {
         let (rd, wr) = tokio::io::split(stream);
-        let mut lines = BufReader::new(rd).lines();
-        let offered = match lines.next_line().await {
-            Ok(Some(line)) => line.trim().to_string(),
-            _ => {
-                tracing::debug!("delegation: connection closed before offering a secret");
-                return;
-            }
+        let Some((offered, rd)) = read_attach(rd).await else {
+            return;
         };
-        self.serve(&offered, Box::new(lines.into_inner()), Box::new(wr))
-            .await;
+        self.serve(&offered, Box::new(rd), Box::new(wr)).await;
     }
 
     /// Mint a fresh secret, replacing any previous one.
@@ -1301,6 +1411,10 @@ impl DelegateHost {
             return;
         }
         tracing::info!("delegation channel attached");
+        // ⚠️ `run` clears the sender, the caps and the questions without a
+        // check of which channel set them. It requires that no other channel
+        // attaches until that clear is done: `attached` is released only after
+        // `run` returns, and one channel is attached at a time.
         let result = self.run(rd, wr).await;
         self.inner.attached.store(false, Ordering::Release);
         match result {
@@ -1309,9 +1423,33 @@ impl DelegateHost {
         }
     }
 
+    /// The channel, and what it leaves behind cleared however it ends.
+    /// #3695 — a read or write error, or a line over [`DELEGATE_LINE_MAX`],
+    /// ends it as the worker's own close does.
+    async fn run(
+        &self,
+        rd: Box<dyn AsyncRead + Send + Unpin>,
+        wr: Box<dyn AsyncWrite + Send + Unpin>,
+    ) -> std::io::Result<()> {
+        let ended = self.frames(rd, wr).await;
+        *self.inner.to_worker.lock().expect("to_worker mutex") = None;
+        // ⚠️ Clear the caps with the channel. Keeping them would leave the row
+        // advertising a capture target that has gone, and the next session
+        // would get the black screen P2b existed to fix.
+        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
+        // FR-92 — and the questions it will now never answer: dropping each
+        // sender ends its caller's wait at once instead of at the timeout.
+        self.inner
+            .keep_busy_asks
+            .lock()
+            .expect("keep_busy_asks mutex")
+            .clear();
+        ended
+    }
+
     /// The frame loop: liveness, plus the rc-session messages in both
     /// directions (P2b).
-    async fn run(
+    async fn frames(
         &self,
         rd: Box<dyn AsyncRead + Send + Unpin>,
         mut wr: Box<dyn AsyncWrite + Send + Unpin>,
@@ -1341,7 +1479,9 @@ impl DelegateHost {
         let (to_worker_tx, mut to_worker_rx) = tokio::sync::mpsc::channel(64);
         *self.inner.to_worker.lock().expect("to_worker mutex") = Some(to_worker_tx);
 
-        let mut lines = BufReader::new(rd).lines();
+        // #3695 — lines of at most DELEGATE_LINE_MAX: a longer one is an
+        // error, which ends the channel with it as the reason.
+        let mut lines = crate::line_limit::Lines::new(BufReader::new(rd), DELEGATE_LINE_MAX);
         loop {
             let line = tokio::select! {
                 queued = to_worker_rx.recv() => {
@@ -1387,12 +1527,14 @@ impl DelegateHost {
                 // FR-43 P3b — and its person's consent floor.
                 Ok(DelegateFrame::PersonFloor(floor)) => self.note_person_floor(floor),
                 Ok(DelegateFrame::WorkerCaps { caps }) => {
+                    // #3695 — only the words that are the worker's to say.
+                    let caps = worker_words(*caps);
                     tracing::info!(
                         permissions = ?caps.permissions,
                         has_input = caps.has_input_permission,
                         "delegation: worker announced its capabilities"
                     );
-                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(*caps);
+                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(caps);
                 }
                 Ok(
                     DelegateFrame::ToWorker { .. }
@@ -1413,18 +1555,6 @@ impl DelegateHost {
                 }
             }
         }
-        *self.inner.to_worker.lock().expect("to_worker mutex") = None;
-        // ⚠️ Clear the caps with the channel. Keeping them would leave the row
-        // advertising a capture target that has gone, and the next session
-        // would get the black screen P2b existed to fix.
-        *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
-        // FR-92 — and the questions it will now never answer: dropping each
-        // sender ends its caller's wait at once instead of at the timeout.
-        self.inner
-            .keep_busy_asks
-            .lock()
-            .expect("keep_busy_asks mutex")
-            .clear();
         Ok(())
     }
 
@@ -1490,6 +1620,27 @@ impl DelegateHost {
     }
 }
 
+/// Read the attach line off a fresh connection: the secret a worker offers,
+/// and the reader positioned at the first frame after it. `None` when the
+/// connection ends before offering one.
+/// #3695 — read with [`ATTACH_LINE_MAX`]: a longer line closes the
+/// connection, with the reason in the log.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn read_attach<R: AsyncRead + Unpin>(rd: R) -> Option<(String, BufReader<R>)> {
+    let mut lines = crate::line_limit::Lines::new(BufReader::new(rd), ATTACH_LINE_MAX);
+    match lines.next_line().await {
+        Ok(Some(line)) => Some((line.trim().to_string(), lines.into_inner())),
+        Ok(None) => {
+            tracing::debug!("delegation: connection closed before offering a secret");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "delegation attach refused: the attach line was not read");
+            None
+        }
+    }
+}
+
 /// Write one newline-delimited frame and flush it.
 ///
 /// Flushing per frame is deliberate: this channel is latency-sensitive at
@@ -1522,6 +1673,7 @@ pub(crate) fn secret_eq(expected: &str, offered: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncBufReadExt;
 
     /// Read one line from the client side, or `None` if the daemon just closed.
     async fn first_line(client: tokio::io::DuplexStream) -> Option<String> {
@@ -1579,6 +1731,151 @@ mod tests {
         drop(cwr);
         drop(lines);
         task.await.unwrap();
+    }
+
+    /// #3695 — attach a worker with `secret`; the client's reader and writer.
+    async fn attached(
+        host: &DelegateHost,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        let greeting = lines.next_line().await.unwrap().unwrap();
+        assert!(greeting.contains("\"attached\""), "got {greeting}");
+        (task, lines, cwr)
+    }
+
+    /// #3695 — the frame reader has a limit: a line over it closes the
+    /// channel, and nothing behind it is answered.
+    #[tokio::test]
+    async fn a_line_over_the_limit_closes_the_channel() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; 4 * 1024 * 1024 + 1]).await;
+            let _ = cwr.write_all(b"\n{\"t\":\"ping\"}\n").await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed, no pong");
+        task.await.unwrap();
+        drop(writer);
+    }
+
+    /// #3695 — the log frame's limit bounds what is read: a frame over it
+    /// closes the channel before any of its lines reach the sink.
+    #[tokio::test]
+    async fn a_log_frame_over_the_limit_reaches_no_sink() {
+        let host = DelegateHost::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        host.set_worker_log_sink(tx);
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let msg = "x".repeat(48 * 1024);
+        let frame = DelegateFrame::WorkerLogs {
+            lines: (0..101)
+                .map(|_| log_line(&msg, bson::Document::new()))
+                .collect(),
+        };
+        let writer = tokio::spawn(async move {
+            let _ = write_frame(&mut cwr, &frame).await;
+            let _ = cwr.write_all(b"{\"t\":\"ping\"}\n").await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed, no pong");
+        task.await.unwrap();
+        assert!(rx.try_recv().is_err(), "no line of the frame was kept");
+        drop(writer);
+    }
+
+    /// #3695 — a channel closed over the limit ends as the worker's own
+    /// close does: the words it advertised for the device are cleared.
+    #[tokio::test]
+    async fn a_channel_closed_over_the_limit_clears_the_workers_words() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let caps = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into()],
+                ..Default::default()
+            }),
+        };
+        write_frame(&mut cwr, &caps).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+        assert!(host.effective_record().is_some(), "held while attached");
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; DELEGATE_LINE_MAX + 1]).await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed");
+        task.await.unwrap();
+        assert_eq!(host.effective_record(), None, "cleared with the channel");
+        drop(writer);
+    }
+
+    /// #3695 — what the daemon takes from its worker's capabilities is known
+    /// words, each once, and a reason of bounded length.
+    #[tokio::test]
+    async fn the_workers_capability_words_are_known_words_only() {
+        use roomler_ai_remote_control::models::Unavailable;
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let mut caps = AgentCaps {
+            record: vec!["remote".into(), "remote".into(), "everything".into()],
+            apps: vec!["status".into(), "x".repeat(1 << 16)],
+            audio: vec!["opus".into(), "pcm".into()],
+            permissions: Some(vec!["screen-capture".into(), "root".into()]),
+            has_input_permission: true,
+            ..Default::default()
+        };
+        caps.unavailable.insert(
+            "audio".into(),
+            Unavailable::new("no-session", &"why ".repeat(1000)),
+        );
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(caps),
+        };
+        write_frame(&mut cwr, &frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+
+        assert_eq!(host.effective_record(), Some(vec!["remote".to_string()]));
+        assert_eq!(host.effective_apps(), Some(vec!["status".to_string()]));
+        let audio = host.effective_audio().unwrap();
+        assert_eq!(audio.audio, vec!["opus".to_string()]);
+        let why = audio.why.unwrap();
+        assert_eq!(why.code, "no-session");
+        assert!(why.reason.len() <= 512, "{}", why.reason.len());
+        assert_eq!(
+            host.effective_permissions(),
+            Some((vec!["screen-capture".to_string()], true))
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// #3695 — the attach line has a limit: a line over it is refused, and
+    /// one within it leaves the reader at the frame after it.
+    #[tokio::test]
+    async fn an_attach_line_over_the_limit_is_refused() {
+        let over = format!("{}\n{{\"t\":\"ping\"}}\n", "a".repeat(1024 + 1));
+        assert!(read_attach(over.as_bytes()).await.is_none());
+
+        let at = format!("{}\n{{\"t\":\"ping\"}}\n", "a".repeat(1024));
+        let (offered, rest) = read_attach(at.as_bytes()).await.expect("within it");
+        assert_eq!(offered.len(), 1024);
+        let next = rest.lines().next_line().await.unwrap();
+        assert_eq!(next.as_deref(), Some("{\"t\":\"ping\"}"));
     }
 
     fn log_line(msg: &str, fields: bson::Document) -> crate::logs_upload::LogLine {
