@@ -6716,6 +6716,9 @@ mod seat_user_tests {
             if !root() {
                 return;
             }
+            // No folder chosen: the drop folder, which is process-wide and
+            // which a test beside this one sets.
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
             let (home, person) = nobodys_home();
             let h = FilesHandler::new();
             let id = format!("p3d-born-{}", std::process::id());
@@ -6759,6 +6762,9 @@ mod seat_user_tests {
             if !root() {
                 return;
             }
+            // No folder chosen: the drop folder, which is process-wide and
+            // which a test beside this one sets.
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
             let (home, person) = nobodys_home();
             let roots_only = tempfile::tempdir().unwrap();
             std::fs::set_permissions(roots_only.path(), std::fs::Permissions::from_mode(0o700))
@@ -6800,6 +6806,9 @@ mod seat_user_tests {
             if !root() {
                 return;
             }
+            // The drop folder is process-wide, and a test beside this one
+            // sets it.
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
             let (home, person) = nobodys_home();
             let theirs = |p: &std::path::Path| {
                 std::fs::create_dir_all(p).unwrap();
@@ -6970,6 +6979,67 @@ mod seat_user_tests {
                 assert_eq!(format!("{dir}"), BROWSE, "{path:?} as {who:?}");
             }
         }
+    }
+
+    /// The process-wide drop folder a test set, unset again when this drops
+    /// (a failed assertion included), with the folder it names removed.
+    /// Hold `FILES_DIR_TEST_LOCK` while it lives.
+    #[cfg(target_os = "linux")]
+    struct DropFolderSet(PathBuf);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DropFolderSet {
+        fn drop(&mut self) {
+            set_files_dir(None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// #3688 — with nobody at seat0 on a Linux system install, a configured
+    /// drop folder is not taken either: `~` has no person's home to expand
+    /// against, so `~/…` never resolves in the daemon's own home, which on a
+    /// root daemon is root's. The drop, the status card and the orphan sweep
+    /// take the default folder, and nothing is made where the configured
+    /// folder would be. The daemon itself (root at the screen, or the switch
+    /// off) still takes it there (the control).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nobody_at_the_screen_takes_no_configured_folder_either() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        let home = writer_context()
+            .active_home
+            .map(PathBuf::from)
+            .expect("the daemon's own home");
+        let sub = format!("roomler-files-dir-alone-{}", std::process::id());
+        let in_its_home = home.join(&sub);
+        let _ = std::fs::remove_dir_all(&in_its_home);
+        let raw = format!("~/{sub}");
+        set_files_dir(Some(raw.clone()));
+        let _set = DropFolderSet(in_its_home.clone());
+        let default = default_download_dir(false).unwrap();
+
+        assert_eq!(
+            download_dir_for(&FsAs::DaemonAlone).await.unwrap(),
+            default,
+            "a drop with nobody at the screen: the default folder"
+        );
+        assert!(
+            !in_its_home.exists(),
+            "nothing is made in the daemon's own home"
+        );
+        assert_eq!(
+            compute_effective_files_dir_as(&FsAs::DaemonAlone, Some(raw.as_str())),
+            Some(default.to_string_lossy().into_owned()),
+            "the status card names the default folder"
+        );
+        let walked = configured_folder_without_creating(&FsAs::DaemonAlone);
+        assert!(walked.is_err(), "the sweep never walks it: {walked:?}");
+
+        assert_eq!(
+            download_dir_for(&FsAs::Daemon).await.unwrap(),
+            in_its_home,
+            "the daemon itself takes `~` in its own home"
+        );
     }
 
     /// #3688 — a handle a read as the person opened leaves its step only
