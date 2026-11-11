@@ -1910,8 +1910,10 @@ async fn connect_once(
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     // FR-138 — the switch, read once for this connection: with it on, the
-    // hello says `rc-resume` and claims what the last connection kept. P2a-2
-    // (L11): a loop that holds the delegation host keeps nothing until P2b.
+    // hello says `rc-resume` and claims what the last connection kept. P2b
+    // (A11): a loop that holds the delegation host reads it as every loop
+    // does; its delegated sessions are kept as records, and one it cannot
+    // keep it does not claim.
     let survive = crate::session_table::connection_keeps(
         crate::session_table::survive_enabled(),
         delegation.host().is_some(),
@@ -3914,7 +3916,8 @@ async fn handle_server_msg(
     // only for the org whose params crossed, so no org reaches into another's.
     //
     // FR-138 P2b (A7) — the server ended a delegated session: the daemon's
-    // record of it goes, whether or not the end crosses.
+    // record of it goes, whether or not the end crosses, and its worker is
+    // ordered to end it, on the lane it serves while its own socket is down.
     if let ServerMsg::Terminate {
         session_id,
         reason,
@@ -3923,6 +3926,11 @@ async fn handle_server_msg(
     {
         peers.drop_record(session_id, reason, limit.as_deref());
     }
+    // FR-138 P2b (A3, review LOW-1) — the attach generation is read BEFORE an
+    // offer crosses: a channel that ends between the send and the record
+    // leaves the record under the generation of the worker that got the offer,
+    // which is gone, and so never claimed or counted. None off the host.
+    let offer_generation = peers.live_generation();
     // FR-138 P2b (A1) — routing first, then delegation: with the switch on, a
     // session this loop's own table holds (attached or kept) is served here,
     // and its `Terminate` or `Ice` never crosses to a worker that attached
@@ -3942,8 +3950,7 @@ async fn handle_server_msg(
         // FR-138 P2b (A3) — a keepable session's offer crossed: the daemon
         // keeps a record of it, to claim it through this socket's loss.
         if let ServerMsg::SdpOffer { session_id, .. } = &msg {
-            let generation = peers.live_generation();
-            peers.cross_offer(*session_id, generation);
+            peers.cross_offer(*session_id, offer_generation);
         }
         return Ok(());
     }
@@ -6976,7 +6983,7 @@ async fn send_one_session_stats(
 /// moved nothing worth auditing, or when its telemetry did not answer within
 /// [`SESSION_STATS_BUDGET`]: a sample of zeros could overwrite the live
 /// totals of a session the server has not ended yet.
-async fn final_session_stats(
+pub(crate) async fn final_session_stats(
     session_id: bson::oid::ObjectId,
     peer: &AgentPeer,
 ) -> Option<ClientMsg> {

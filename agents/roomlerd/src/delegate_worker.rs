@@ -232,17 +232,23 @@ pub async fn run(
     let mut backoff = BACKOFF_MIN;
     let mut last_error: Option<String> = None;
     loop {
-        match attach_once(
+        let mut lane = OrdersLane::new(&orders);
+        let attach = attach_once(
             &secret,
             &to_signaling,
             &mut from_signaling,
-            &orders,
+            &mut lane,
             &mut logs,
             person,
             &mut shutdown,
         )
-        .await
-        {
+        .await;
+        // FR-138 P2b — a greeted attach's end, with its cause.
+        lane.ended(match &attach {
+            Ok(()) => "closed".to_string(),
+            Err(e) => e.to_string(),
+        });
+        match attach {
             Ok(()) => {
                 tracing::info!("delegation: channel closed by the daemon");
                 backoff = BACKOFF_MIN;
@@ -275,16 +281,44 @@ pub async fn run(
     }
 }
 
-/// FR-138 P2b (B9, D5) — said once when a greeted attach ends, however it
-/// ends: the delegated sessions' links stop waiting on a channel nobody drains
-/// until the next attach says [`WorkerOrder::Attached`].
-struct PauseOnDrop<'a>(&'a tokio::sync::mpsc::Sender<WorkerOrder>);
+/// FR-138 P2b (B4, B9) — the orders lane as one attach holds it: the daemon's
+/// orders go on it, and a greeted attach's end is said on it once, however
+/// the attach ends, with its cause ([`WorkerOrder::Paused`]). The delegated
+/// sessions close there, since the daemon ended each as `error` (D6, review
+/// MEDIUM-1), and the line that says so names the cause. Never waits.
+struct OrdersLane<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<WorkerOrder>,
+    /// Greeted, and its end not said yet.
+    up: bool,
+}
 
-impl Drop for PauseOnDrop<'_> {
+impl<'a> OrdersLane<'a> {
+    fn new(tx: &'a tokio::sync::mpsc::Sender<WorkerOrder>) -> Self {
+        Self { tx, up: false }
+    }
+
+    /// The daemon greeted the attach: the channel is up again.
+    fn attached(&mut self) {
+        let _ = self.tx.try_send(WorkerOrder::Attached);
+        self.up = true;
+    }
+
+    /// One of the daemon's orders. `false` when the lane is full or closed.
+    fn order(&self, order: WorkerOrder) -> bool {
+        self.tx.try_send(order).is_ok()
+    }
+
+    /// The attach ended: said once, and only for a greeted one.
+    fn ended(&mut self, cause: String) {
+        if std::mem::take(&mut self.up) {
+            let _ = self.tx.try_send(WorkerOrder::Paused { cause });
+        }
+    }
+}
+
+impl Drop for OrdersLane<'_> {
     fn drop(&mut self) {
-        let _ = self.0.try_send(WorkerOrder::Paused {
-            cause: "the attach ended".to_string(),
-        });
+        self.ended("the attach loop stopped".to_string());
     }
 }
 
@@ -293,7 +327,7 @@ async fn attach_once(
     secret: &str,
     to_signaling: &tokio::sync::mpsc::Sender<WorkerInbound>,
     from_signaling: &mut tokio::sync::mpsc::Receiver<ClientMsg>,
-    orders: &tokio::sync::mpsc::Sender<WorkerOrder>,
+    lane: &mut OrdersLane<'_>,
     logs: &mut Option<tokio::sync::mpsc::Receiver<crate::logs_upload::LogLine>>,
     // FR-43 P3b — `Some(auto_grant_session)` when this worker hands the
     // person's floor to the daemon.
@@ -360,9 +394,9 @@ async fn attach_once(
         }
     }
     // FR-138 P2b (B9) — the channel is up: the delegated sessions' links point
-    // at it again, and they stop waiting the moment it ends.
-    let _ = orders.try_send(WorkerOrder::Attached);
-    let _paused = PauseOnDrop(orders);
+    // at it again, and its end, whatever ends it, is said on the lane with
+    // its cause ([`OrdersLane::ended`]).
+    lane.attached();
 
     // FR-43 P2c — tell the daemon what THIS process can do, as the first thing
     // after the handshake. The daemon is in session 0 and honestly reports
@@ -440,7 +474,7 @@ async fn attach_once(
                         // nothing, since the delegated table's own deadline
                         // closes what it keeps.
                         Ok(WorkerLane::Order(order)) => {
-                            if orders.try_send(order).is_err() {
+                            if !lane.order(order) {
                                 tracing::warn!(
                                     "delegation: orders queue full or closed; dropped an order (FR-138 P2b)"
                                 );
@@ -801,5 +835,40 @@ mod tests {
         let floor = person_floor(false);
         assert!(!floor.auto_grant_session);
         assert_eq!(floor.session_policy, crate::session_policy::device_policy());
+    }
+
+    /// FR-138 P2b (review MEDIUM-1) — a greeted attach's end is said once on
+    /// the orders lane, with its cause, and so is one whose loop stopped; an
+    /// attach the daemon never greeted says nothing.
+    #[test]
+    fn a_greeted_attach_says_its_end_once_with_its_cause() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.ended("refused".to_string());
+        }
+        assert!(rx.try_recv().is_err(), "never greeted: nothing");
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.attached();
+            lane.ended("Broken pipe (os error 32)".to_string());
+        }
+        assert_eq!(rx.try_recv().ok(), Some(WorkerOrder::Attached));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(WorkerOrder::Paused {
+                cause: "Broken pipe (os error 32)".to_string()
+            })
+        );
+        assert!(rx.try_recv().is_err(), "said once");
+        {
+            let mut lane = OrdersLane::new(&tx);
+            lane.attached();
+        }
+        assert_eq!(rx.try_recv().ok(), Some(WorkerOrder::Attached));
+        assert!(
+            matches!(rx.try_recv().ok(), Some(WorkerOrder::Paused { .. })),
+            "a greeted attach whose loop stopped says it too"
+        );
     }
 }

@@ -300,9 +300,25 @@ pub(crate) trait TablePeer: Send + Sync + 'static {
     fn is_dead(&self) -> bool;
     /// Whether its RTP pump asked for its end for want of an encoder (#3245).
     fn no_video(&self) -> bool;
+    /// FR-101 P3 — the audit's last sample, taken before the close. `None` when
+    /// there is nothing worth it (the stand-in in the tests has none).
+    fn final_stats(
+        &self,
+        session_id: ObjectId,
+    ) -> impl Future<Output = Option<ClientMsg>> + Send + '_ {
+        let _ = session_id;
+        async { None }
+    }
 }
 
 impl TablePeer for AgentPeer {
+    fn final_stats(
+        &self,
+        session_id: ObjectId,
+    ) -> impl Future<Output = Option<ClientMsg>> + Send + '_ {
+        crate::signaling::final_session_stats(session_id, self)
+    }
+
     fn close(&self) -> impl Future<Output = ()> + Send + '_ {
         AgentPeer::close(self)
     }
@@ -733,29 +749,47 @@ impl<P: TablePeer> SessionTable<P> {
     }
 
     /// FR-138 P2b (A7) — the server ended a delegated session, `reason` and
-    /// `limit` its `rc:terminate`'s: its record goes, and the `Terminate`
-    /// crosses to the worker as today, whose delegated table says the end and
-    /// closes after the grace (C1). No `Close`: on its own lane it could
-    /// overtake the `Terminate` and close the peer before the end is said.
+    /// `limit` its `rc:terminate`'s: its record goes, the worker is ORDERED to
+    /// end it (`Ended`), and the `Terminate` crosses to it as today. The order
+    /// goes on the lane the worker serves wherever its loop waits, so the end
+    /// reaches the peer while the worker's own socket redials (a two-row Mac's
+    /// roll) or sits in a backoff; the `Terminate` on the inbound lane waits
+    /// for that socket. Either ends the session in the worker, said on its
+    /// control channel and closed after the grace (C1), and the other finds
+    /// nothing. Only to the worker whose record it is: a gone worker's record
+    /// is not the next one's, and an older worker never gets the frame. A bare
+    /// `Close` it is not: one could overtake the end and close the peer before
+    /// the end is said.
     pub(crate) fn drop_record(
         &mut self,
         session_id: &ObjectId,
         reason: &EndReason,
         limit: Option<&str>,
     ) {
+        let live = self.live_generation();
         let Some(record) = self.records.remove(session_id) else {
             return;
         };
+        let mut told = false;
         if let Some(host) = &self.host {
-            host.unbind(&session_id.to_hex());
+            let hex = session_id.to_hex();
+            host.unbind(&hex);
+            if Some(record.generation) == live {
+                told = host.send_order(crate::delegate::DelegateFrame::Ended {
+                    session_id: hex,
+                    reason: *reason,
+                    limit: limit.map(str::to_string),
+                });
+            }
         }
         info!(
             session_id = %session_id,
             ?reason,
             ?limit,
+            told,
             kept_ms = record.kept.as_ref().map(|k| millis(k.since.elapsed())),
-            "rc session closed (delegated): the server ended it; the GUI worker closes its peer \
-             (FR-138 P2b)"
+            "rc session closed (delegated): the server ended it; the GUI worker is told and \
+             closes its peer (FR-138 P2b)"
         );
     }
 
@@ -876,25 +910,87 @@ impl<P: TablePeer> SessionTable<P> {
         close_within_budget(live.peer.close(), session_id, why).await;
     }
 
-    /// FR-138 P2b (B9, D5) — the channel to the daemon ended while both
-    /// processes live: the attached sessions' links stop waiting, and hand the
-    /// table what the server must hear, until [`Self::unpause`]. No deadline
-    /// starts: the daemon governs these sessions, and a peer that fails still
-    /// closes itself (B6).
+    /// FR-138 P2b (B9, D5) — the attached sessions' links stop waiting on the
+    /// channel, and hand the table what the server must hear, until
+    /// [`Self::unpause`]: nobody drains a channel that ended. The first step of
+    /// [`Self::close_at_channel_end`], so nothing a closing peer says waits.
     pub(crate) fn pause(&mut self) {
-        if self.attached.is_empty() {
-            return;
-        }
         for live in self.attached.values() {
             if let Some(link) = &live.link {
                 link.keep();
             }
         }
+    }
+
+    /// FR-138 P2b (review MEDIUM-1) — the channel to the daemon ended,
+    /// `cause` its why, and this process lives on. The daemon ended each of
+    /// these sessions as `error` when the channel ended (D6), so the server has
+    /// ended them, and the peer of an ended session must close: every one
+    /// closes, attached and kept, through the budget, with its real end. Their
+    /// links stop waiting first. Nothing goes up the channel: the daemon said
+    /// it. The line names the cause, so a later read can count the blips that
+    /// ended sessions with both processes alive. Surviving a blip, re-bound at
+    /// the next attach, would be a design change. Empty with the switch off.
+    pub(crate) async fn close_at_channel_end(&mut self, cause: &str) {
+        self.pause();
+        let attached: Vec<(ObjectId, Live<P>)> = self.attached.drain().collect();
+        let kept: Vec<ObjectId> = self.kept.keys().copied().collect();
+        if attached.is_empty() && kept.is_empty() {
+            return;
+        }
         info!(
-            count = self.attached.len(),
-            "rc: the channel to the daemon ended; the delegated sessions' links wait for the next \
-             attach and never block (FR-138 P2b)"
+            cause,
+            attached = attached.len(),
+            kept = kept.len(),
+            "rc: the channel to the daemon ended; its delegated sessions close, since the daemon \
+             ended each as `error` (FR-138 P2b)"
         );
+        for (session_id, live) in attached {
+            (self.on_end)(session_id, RealEnd::Ended);
+            close_within_budget(live.peer.close(), session_id, "channel_ended").await;
+        }
+        for session_id in kept {
+            self.close_kept(session_id, "channel_ended").await;
+        }
+    }
+
+    /// FR-138 P2b (review HIGH-1) — the daemon's `Ended`: the server ended a
+    /// session this worker table holds, attached or kept (a kick, the maximum
+    /// length, a refused claim, the viewer's hang-up). It ends as the
+    /// `Terminate` beside it would: the recording's end said before the close
+    /// (FR-85 P3b-3) and the banner down, the audit's last sample up the
+    /// channel through the queue that never waits, then the end said on its
+    /// control channel and the close after `grace` (C1). Whichever of the two
+    /// the worker reads first ends it, and the other finds nothing. `false`
+    /// when the table does not hold it.
+    pub(crate) async fn end_ordered(
+        &mut self,
+        session_id: ObjectId,
+        reason: &EndReason,
+        limit: Option<&str>,
+        grace: Duration,
+    ) -> bool {
+        let Some(peer) = self.take(&session_id, "ended") else {
+            debug!(
+                session_id = %session_id,
+                "rc: the daemon's end of a delegated session this table no longer holds (FR-138 P2b)"
+            );
+            return false;
+        };
+        (self.on_end)(session_id, RealEnd::Ended);
+        if let Some(stats) = peer.final_stats(session_id).await {
+            self.queue_end(stats);
+        }
+        info!(
+            session_id = %session_id,
+            ?reason,
+            ?limit,
+            "rc session closed (delegated): the daemon ordered its end; said on its control \
+             channel, the peer closes after the grace (FR-138 P2b)"
+        );
+        self.close_terminated(peer, session_id, reason, limit, grace)
+            .await;
+        true
     }
 
     /// FR-138 P2b (B9) — the channel is back: the attached sessions' links
@@ -949,18 +1045,12 @@ impl<P: TablePeer> SessionTable<P> {
                 reason,
                 limit,
             } => {
-                debug!(
-                    %session_id,
-                    ?reason,
-                    ?limit,
-                    grace_ms = millis(grace),
-                    "rc: the daemon's end of a delegated session (FR-138 P2b)"
-                );
+                if let Some(sid) = parse(&session_id) {
+                    self.end_ordered(sid, &reason, limit.as_deref(), grace)
+                        .await;
+                }
             }
-            WorkerOrder::Paused { cause } => {
-                debug!(%cause, "rc: the channel to the daemon ended (FR-138 P2b)");
-                self.pause();
-            }
+            WorkerOrder::Paused { cause } => self.close_at_channel_end(&cause).await,
             WorkerOrder::Attached => self.unpause(),
         }
     }
@@ -1824,6 +1914,13 @@ impl<P: TablePeer> SessionTable<P> {
             .collect();
         for session_id in due {
             self.close_kept(session_id, "deadline").await;
+            // FR-138 P2b (review LOW-2) — on a GUI worker's delegated table the
+            // daemon holds the claim: it hears the session is gone, as at the
+            // net change's look. Had its `Resumed` been lost to a full queue,
+            // its record would stay live with no peer behind it.
+            if self.worker {
+                self.queue_end(gone(session_id, EndReason::AgentDisconnect));
+            }
         }
         // FR-138 P2b (A8, D4) — a kept record past the daemon's deadline: its
         // worker is told to close, and its own deadline closes it anyway.
@@ -3381,9 +3478,47 @@ mod tests {
                 "SessionTable::for_worker(",
                 "B1: the worker's delegated table",
             ),
+            (
+                "peers.drop_record(session_id,reason,limit.as_deref())",
+                "review HIGH-1: the record's end carries the terminate's reason and limit",
+            ),
+            (
+                "peers.cross_offer(*session_id,offer_generation)",
+                "review LOW-1: the record takes the generation read before the offer crossed",
+            ),
+            (
+                ".obey(order,&self.channel,host_disconnect_grace())",
+                "the worker's delegated table serves the daemon's orders",
+            ),
         ] {
             assert!(code.contains(needle), "{what}: `{needle}`");
         }
+        // Review LOW-1 — the gate reads the generation BEFORE the offer crosses.
+        let read = code.find("letoffer_generation=peers.live_generation();");
+        let send = code.find(
+            "delegate.send_to_worker(crate::delegate::org_key(ctx.is_primary,&ctx.label),&msg)",
+        );
+        assert!(
+            read.is_some() && send.is_some() && read < send,
+            "the generation is read before the send: {read:?} < {send:?}"
+        );
+        // Review HIGH-1 — the orders lane, where the server's end of a recorded
+        // session travels, is served wherever `run` waits: the sleep hold, every
+        // backoff (auth, replaced, the two short ones, the transient one) and,
+        // through `serving_kept`, the dial, the hello and the overlay's start.
+        assert_eq!(
+            code.matches("serving_delegated(").count(),
+            5,
+            "the hold and the auth, replaced and two short backoffs serve the orders lane"
+        );
+        assert!(
+            code.contains("event=next_side(&mutside)=>serve_side(&mutside,event).await"),
+            "the transient backoff serves the orders lane"
+        );
+        assert!(
+            code.contains("event=next_side(side)=>serve_side(side,event).await"),
+            "`serving_kept` serves the orders lane"
+        );
     }
 
     /// FR-138 P2b (R3, A4, A5) — a delegated session the daemon will claim is

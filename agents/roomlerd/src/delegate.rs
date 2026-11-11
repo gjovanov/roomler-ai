@@ -304,6 +304,18 @@ pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
         DelegateFrame::Close { session_id, reason } => {
             WorkerLane::Order(WorkerOrder::Close { session_id, reason })
         }
+        // The server's end of a session the daemon keeps a record of: on this
+        // lane it is served while the worker's own socket redials, where the
+        // `Terminate` beside it on the inbound lane waits for that socket.
+        DelegateFrame::Ended {
+            session_id,
+            reason,
+            limit,
+        } => WorkerLane::Order(WorkerOrder::Ended {
+            session_id,
+            reason,
+            limit,
+        }),
         other => WorkerLane::Here(other),
     }
 }
@@ -1636,6 +1648,16 @@ impl DelegateHost {
         // attaches until that clear is done: `attached` is released only after
         // `run` returns, and one channel is attached at a time.
         let result = self.run(rd, wr).await;
+        // FR-138 P2b — what P2b holds for the channel ends with it however
+        // `run` ended, a write or read error too, and BEFORE the flag clears,
+        // so the next worker to attach never shares this one's generation or
+        // bindings. (What `run` clears on a clean end alone is master's; an
+        // error end leaving it set is F4, outside the switch.)
+        let cause = match &result {
+            Ok(()) => "closed".to_string(),
+            Err(e) => e.to_string(),
+        };
+        self.records_channel_ended(&cause);
         self.inner.attached.store(false, Ordering::Release);
         match result {
             Ok(()) => tracing::info!("delegation channel closed"),
@@ -1785,11 +1807,6 @@ impl DelegateHost {
         // advertising a capture target that has gone, and the next session
         // would get the black screen P2b existed to fix.
         *self.inner.worker_caps.lock().expect("worker caps mutex") = None;
-        self.inner
-            .worker_features
-            .lock()
-            .expect("worker features mutex")
-            .clear();
         // FR-92 — and the questions it will now never answer: dropping each
         // sender ends its caller's wait at once instead of at the timeout.
         self.inner
@@ -1797,14 +1814,31 @@ impl DelegateHost {
             .lock()
             .expect("keep_busy_asks mutex")
             .clear();
-        // FR-138 P2b (A9) — and the sessions it kept for the daemon's claim:
-        // a record of this generation belongs to a worker that is gone, whose
-        // process took its peers (or, alive, keeps them paused). Bumped
-        // BEFORE the ends below, so the table that reads one reads the record
-        // as gone. (D6) Each bound record hears its session end as `error`:
-        // attached, the table says it to the server on this connection, and
-        // the viewer stops watching a frozen picture; kept, after the next
-        // hello. The sends never wait.
+    }
+
+    /// FR-138 P2b — the channel to the worker ended, `cause` its why: what P2b
+    /// holds for it goes with it. Run by [`Self::serve`] on EVERY end of
+    /// [`Self::run`], an I/O error's too (a worker gone mid-write is EPIPE).
+    /// Before, only a clean end ran it, and a record of a worker gone that way
+    /// kept its generation: counted, claimed at the next roll, with no peer
+    /// behind it. With the switch off nothing here was ever set, so it changes
+    /// nothing.
+    fn records_channel_ended(&self, cause: &str) {
+        // The worker's word goes with it: a session asked next is not
+        // keepable until a worker says it again.
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .clear();
+        // (A9) The sessions it kept for the daemon's claim: a record of this
+        // generation belongs to a worker whose channel ended, whose process
+        // took its peers, or, alive, closes them (MEDIUM-1). Bumped BEFORE the
+        // ends below, so the table that reads one reads the record as gone.
+        // (D6) Each bound record hears its session end as `error`: attached,
+        // the table says it to the server on this connection, and the viewer
+        // stops watching a frozen picture; kept, after the next hello. The
+        // sends never wait.
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
         let bound: Vec<(String, tokio::sync::mpsc::Sender<ClientMsg>)> = self
             .inner
@@ -1819,8 +1853,9 @@ impl DelegateHost {
             };
             tracing::info!(
                 %session,
-                "delegation: the GUI worker that held a kept-for-claim session is gone; it ends \
-                 as `error` (FR-138 P2b)"
+                %cause,
+                "delegation: the channel to the GUI worker that held a kept-for-claim session \
+                 ended; it ends as `error` (FR-138 P2b)"
             );
             let _ = link.try_send(ClientMsg::Terminate {
                 session_id,
@@ -1902,10 +1937,11 @@ impl DelegateHost {
         rx
     }
 
-    /// The channel's end, as `run` ends it, for a test.
+    /// The channel's clean end, as `run` and `serve` end it, for a test.
     #[cfg(test)]
     pub(crate) fn end_channel_for_test(&self) {
         self.channel_ended();
+        self.records_channel_ended("closed");
     }
 
     /// Put a worker's reply on the control WS — if the whitelist allows it.
