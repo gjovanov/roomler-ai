@@ -238,13 +238,24 @@ fn process_home() -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
     /// This process: every macOS install, every user install, a Windows
-    /// worker that is not LocalSystem, and a root daemon with nobody at seat0.
+    /// worker that is not LocalSystem, a Linux root daemon with root itself
+    /// signed in at seat0, and any install with
+    /// `ROOMLERD_FILES_AS_SEAT_USER=0`.
     Daemon,
+    /// (Linux root, a received file) nobody at seat0 (#3688): written as the
+    /// daemon, as [`Self::Daemon`] is, but never in a folder a controller
+    /// chose: FR-84 D4's rule, "with nobody signed in, nowhere a controller
+    /// chose" ([`check_dest_placement`]). Only a write takes it; a read with
+    /// nobody there is [`Self::Nobody`].
+    #[cfg(target_os = "linux")]
+    DaemonAlone,
     /// (Linux root) the person signed in at seat0.
     #[cfg(target_os = "linux")]
     Person {
         account: crate::fs_identity::Account,
         home: PathBuf,
+        /// #3688 — what a step does with the thread's capabilities.
+        caps: Caps,
     },
     /// (Windows, a LocalSystem worker) the person signed in to this process's
     /// session, fixed when the transfer began.
@@ -260,10 +271,36 @@ pub(crate) enum FsAs {
         token: crate::win_identity::PersonToken,
     },
     /// (Windows, a LocalSystem worker) nobody is signed in to this process's
-    /// session: every step is refused with [`NOBODY_SIGNED_IN`].
-    #[cfg(target_os = "windows")]
+    /// session: every step is refused with [`NOBODY_SIGNED_IN`]. (Linux root,
+    /// a read) nobody at seat0 (#3688): every read is refused, saying so.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    // RED (#3688): a read takes it once the read side lands.
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     Nobody,
 }
+
+/// #3688 — what a step as the person at seat0 does with its thread's
+/// capabilities (`fs_identity::FsIdentity`).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caps {
+    /// Kept: a received file's steps, which the placement rule holds to the
+    /// person's own folders (FR-97 P3d, unchanged).
+    Kept,
+    /// Emptied for the step and given back after it: a read's, which may
+    /// name any path. The thread is still root by its euid, so it reads
+    /// with the person's rights and no capability on top of them.
+    // RED (#3688): a read takes it once the read side lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Empty,
+}
+
+/// #3688 — a step taken for nobody on a Linux system install. A read says so
+/// in its own words before any step ([`NOBODY_SIGNED_IN_TO_SEND`],
+/// [`NOBODY_SIGNED_IN_TO_BROWSE`]), and a received file never takes nobody
+/// ([`FsAs::DaemonAlone`]), so this answers only a state nothing produces.
+#[cfg(target_os = "linux")]
+const NOBODY_AT_THE_SCREEN: &str = "Nobody is signed in at this computer's screen";
 
 /// #3048 — said when a step would be taken for someone other than the person
 /// a transfer, or a listing (#3669), began for: they signed out, or another
@@ -330,18 +367,10 @@ impl FsAs {
     pub(crate) fn now() -> Self {
         #[cfg(target_os = "linux")]
         {
-            // SAFETY: `geteuid` reads this process's own credentials.
-            if unsafe { libc::geteuid() } == 0 && tunnel_core::env::flag("FILES_AS_SEAT_USER", true)
-            {
-                match seat_person() {
-                    Ok(person) => return person,
-                    Err(e) => tracing::debug!(
-                        %e,
-                        "files: nobody at seat0 — received files are written as the daemon"
-                    ),
-                }
-            }
+            let (root, switch_on) = linux_process();
+            linux_fs_as(root, switch_on, false, seat_now)
         }
+        #[cfg(not(target_os = "linux"))]
         Self::session_or_daemon()
     }
 
@@ -351,7 +380,7 @@ impl FsAs {
     /// different people; everywhere else the daemon, as before. A Windows
     /// test stands a reader in for this answer (`stand_in::reader`), so its
     /// entry points are tested with the person, not only the daemon.
-    pub(crate) fn for_read() -> Self {
+    pub(crate) async fn for_read() -> Self {
         #[cfg(all(test, target_os = "windows"))]
         if let Some(who) = stand_in::reader_now() {
             return who;
@@ -417,6 +446,10 @@ impl FsAs {
         if matches!(self, Self::Nobody) {
             return Some(NOBODY_SIGNED_IN);
         }
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Nobody) {
+            return Some(NOBODY_AT_THE_SCREEN);
+        }
         None
     }
 
@@ -427,6 +460,28 @@ impl FsAs {
             return Some(sid);
         }
         None
+    }
+
+    /// #3688 — whether steps as `self` are the daemon's own: a received file
+    /// with nobody at seat0 is written as the daemon too
+    /// ([`Self::DaemonAlone`]).
+    fn is_the_daemon(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::DaemonAlone) {
+            return true;
+        }
+        matches!(self, Self::Daemon)
+    }
+
+    /// #3688 — whether a read's steps hold each handle they open to what
+    /// was asked ([`held_to_the_person`], [`folder_held_to_the_person`]):
+    /// on Linux, as the person at seat0.
+    fn checks_handles(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Person { .. }) {
+            return true;
+        }
+        false
     }
 
     /// Run blocking filesystem work as this identity, on a blocking thread:
@@ -448,6 +503,10 @@ impl FsAs {
         match self {
             Self::Daemon => f(),
             #[cfg(target_os = "linux")]
+            Self::DaemonAlone => f(),
+            #[cfg(target_os = "linux")]
+            Self::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+            #[cfg(target_os = "linux")]
             Self::Person { account, .. } => {
                 let _as_them = crate::fs_identity::FsIdentity::begin(account)
                     .map_err(|e| anyhow!("acting as {} for a received file: {e}", account.name))?;
@@ -466,7 +525,13 @@ impl FsAs {
     /// daemon is still privileged, and the person's home is the active one.
     fn writer(&self) -> files_dir::Writer {
         match self {
+            // #3688 — nobody at seat0 keeps the daemon's writer: the
+            // configured folder's gates (set, use, the status card, the
+            // sweep) are unchanged; only a controller's chosen folder is
+            // refused, before it is touched ([`resolve_dest_path_as`]).
             Self::Daemon => writer_context(),
+            #[cfg(target_os = "linux")]
+            Self::DaemonAlone => writer_context(),
             #[cfg(target_os = "linux")]
             Self::Person { home, .. } => files_dir::Writer {
                 privileged: true,
@@ -479,7 +544,7 @@ impl FsAs {
             },
             // No profile: every folder refused, as for any privileged writer
             // that cannot name one.
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             Self::Nobody => files_dir::Writer {
                 privileged: true,
                 active_home: None,
@@ -505,13 +570,96 @@ fn person_downloads_windows(
     }
 }
 
-/// The person at seat0, as an account (uid 0 refused) and a home.
+/// #3688 — who is at seat0, as a root daemon's file steps see it.
 #[cfg(target_os = "linux")]
-fn seat_person() -> std::result::Result<FsAs, String> {
-    let name = crate::companion::seat0_user().map_err(|e| format!("{e:#}"))?;
-    let account = crate::fs_identity::Account::by_name(&name)?;
-    let home = crate::exec::account_home(&name)?;
-    Ok(FsAs::Person { account, home })
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seat {
+    /// A person, as an account (uid 0 refused) and a home.
+    Person {
+        account: crate::fs_identity::Account,
+        home: PathBuf,
+    },
+    /// root itself is signed in at the screen: the daemon is that person.
+    Root,
+    /// Nobody, and why: no logind, an empty seat, the login screen, a lock
+    /// that switches seat0 to a greeter, an account that does not resolve.
+    Nobody(String),
+}
+
+/// Who is at seat0 now, by FR-97 P5a's rule (`companion::seat0_account`).
+/// Blocking: logind, then the account database.
+#[cfg(target_os = "linux")]
+fn seat_now() -> Seat {
+    let (name, uid) = match crate::companion::seat0_account() {
+        Ok(found) => found,
+        Err(e) => return Seat::Nobody(format!("{e:#}")),
+    };
+    if uid == Some(0) {
+        return Seat::Root;
+    }
+    let person = crate::fs_identity::Account::by_name(&name)
+        .and_then(|account| crate::exec::account_home(&name).map(|home| (account, home)));
+    match person {
+        Ok((account, home)) => Seat::Person { account, home },
+        Err(e) => Seat::Nobody(e),
+    }
+}
+
+/// Whether this process is root, and whether `ROOMLERD_FILES_AS_SEAT_USER`
+/// is on (the default).
+#[cfg(target_os = "linux")]
+fn linux_process() -> (bool, bool) {
+    // SAFETY: `geteuid` reads this process's own credentials.
+    let root = unsafe { libc::geteuid() } == 0;
+    (root, tunnel_core::env::flag("FILES_AS_SEAT_USER", true))
+}
+
+/// #3688 — who a step starting now acts as on Linux, from whether this
+/// process is root, the switch, and who is at seat0, which is asked only
+/// when it is needed. Pure, so the decision is a test.
+#[cfg(target_os = "linux")]
+fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -> Seat) -> FsAs {
+    if !root || !switch_on {
+        return FsAs::Daemon;
+    }
+    // RED (#3688): master's answers. A read is the daemon's; a received file
+    // with nobody at seat0 is the daemon's, wherever a controller chose.
+    if reading {
+        return FsAs::Daemon;
+    }
+    match seat() {
+        Seat::Person { account, home } => FsAs::Person {
+            account,
+            home,
+            caps: Caps::Kept,
+        },
+        Seat::Root => FsAs::Daemon,
+        Seat::Nobody(why) => {
+            tracing::debug!(%why, "files: nobody at seat0 — received files are written as the daemon");
+            FsAs::DaemonAlone
+        }
+    }
+}
+
+/// #3688 — how long a read waits for the seat0 lookup.
+#[cfg(target_os = "linux")]
+// RED (#3688): a read asks once the read side lands.
+#[allow(dead_code)]
+const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// #3688 — `lookup` on a blocking thread, given `wait` at most: a wedged
+/// logind or account lookup is nobody at the screen, never a stalled async
+/// worker. A lookup past its time finishes on its own thread.
+#[cfg(target_os = "linux")]
+// RED (#3688): a read asks once the read side lands.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn seat_within(
+    wait: std::time::Duration,
+    lookup: impl FnOnce() -> Seat + Send + 'static,
+) -> Seat {
+    // RED (#3688): asked on this thread, however long it takes.
+    let _ = wait;
+    lookup()
 }
 
 /// The person's Downloads: `XDG_DOWNLOAD_DIR` from their own
@@ -1818,7 +1966,7 @@ impl FilesHandler {
             state.partial_dir.clone(),
         );
         // #3048 — staged by the daemon, placed for the person: copied across.
-        if matches!(state.stager, FsAs::Daemon) && !matches!(state.who, FsAs::Daemon) {
+        if state.stager.is_the_daemon() && !state.who.is_the_daemon() {
             let placed = place_across(
                 &state.stager,
                 &state.who,
@@ -2149,7 +2297,7 @@ impl FilesHandler {
         // #3048 — who places the file: the person a drop would be written as
         // now, when the daemon staged it in its own folder; whoever staged it,
         // when it sits beside the target (FR-97 P3d).
-        let who = if self.stages_in_a_root() && matches!(stager, FsAs::Daemon) {
+        let who = if self.stages_in_a_root() && stager.is_the_daemon() {
             now
         } else {
             stager.clone()
@@ -2269,7 +2417,8 @@ impl FilesHandler {
     /// between chunks; calling [`Self::cancel_outgoing`] flips the
     /// flag and the next loop iteration will exit.
     pub async fn begin_outgoing(&self, id: String, path: &str) -> Result<OutgoingOffer> {
-        self.begin_outgoing_as(FsAs::for_read(), id, path).await
+        self.begin_outgoing_as(FsAs::for_read().await, id, path)
+            .await
     }
 
     /// [`Self::begin_outgoing`], read as `who` (#3669): the file is opened in
@@ -2281,8 +2430,8 @@ impl FilesHandler {
         path: &str,
     ) -> Result<OutgoingOffer> {
         who.refuse_read(NOBODY_SIGNED_IN_TO_SEND)?;
-        let asked = path.to_string();
-        let opened = who.run(move || open_to_send(&asked)).await;
+        let (asked, checks) = (path.to_string(), who.checks_handles());
+        let opened = who.run(move || open_to_send(&asked, checks)).await;
         let (resolved, size, file) = who.explain_refusal(path, opened)?;
 
         let name = resolved
@@ -2388,8 +2537,11 @@ pub struct OutgoingOffer {
 /// as the reader: the path resolved and held to the denylists, the agent's
 /// own secrets refused, the file opened, and the handle stated and capped.
 /// Windows checks access when a handle is opened, so the pump that reads
-/// through this one needs no identity.
-fn open_to_send(asked: &str) -> Result<(PathBuf, u64, std::fs::File)> {
+/// through this one needs no identity. #3688 — so does Linux, for the files
+/// it is left to read: with `checks` (the person at seat0), the handle is
+/// held to the file asked for before it leaves the step
+/// ([`held_to_the_person`]).
+fn open_to_send(asked: &str, checks: bool) -> Result<(PathBuf, u64, std::fs::File)> {
     let resolved = validate_outgoing_path(asked).context("validating outgoing path")?;
     if is_agent_secret(&resolved) {
         return Err(anyhow!(
@@ -2408,6 +2560,12 @@ fn open_to_send(asked: &str) -> Result<(PathBuf, u64, std::fs::File)> {
     }
     let file = std::fs::File::open(&resolved)
         .with_context(|| format!("opening {}", resolved.display()))?;
+    #[cfg(target_os = "linux")]
+    if checks {
+        held_to_the_person(&file, &resolved)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = checks;
     // The checks that count are on the handle that is sent, not the path:
     // the path may have been swapped between that stat and the open.
     let meta = file
@@ -2731,7 +2889,7 @@ pub const STAGING_SENTINEL: &str = "<staging>";
 /// agree on which spellings mean "the roots", or the drawer labels a real
 /// listing a roots view and drives into bare entry names.
 pub async fn list_dir(path: &str) -> Result<DirListing> {
-    list_dir_as(&FsAs::for_read(), path).await
+    list_dir_as(&FsAs::for_read().await, path).await
 }
 
 /// [`list_dir`], read as `who` (#3669). With nobody signed in it is refused
@@ -2761,12 +2919,18 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
         // off the async worker with it, so a share that hangs cannot stall
         // one. The entries are read after, untimed as before, through the
         // handle that step opened.
-        let asked = pb.to_path_buf();
+        let (asked, checks) = (pb.to_path_buf(), who.checks_handles());
         let (canon, read) = tokio::time::timeout(
             std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS),
             who.run(move || {
                 let canon = std::fs::canonicalize(&asked)
                     .with_context(|| format!("canonicalising {}", asked.display()))?;
+                #[cfg(target_os = "linux")]
+                if checks {
+                    folder_held_to_the_person(&canon)?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = checks;
                 let read = std::fs::read_dir(&canon)
                     .with_context(|| format!("reading {}", canon.display()))?;
                 Ok((canon, read))
@@ -2956,7 +3120,8 @@ impl FilesHandler {
     /// (folder zips have unknown size up front — it's a streaming
     /// stream).
     pub async fn begin_outgoing_zip(&self, id: String, path: &str) -> Result<OutgoingOffer> {
-        self.begin_outgoing_zip_as(FsAs::for_read(), id, path).await
+        self.begin_outgoing_zip_as(FsAs::for_read().await, id, path)
+            .await
     }
 
     /// [`Self::begin_outgoing_zip`], read as `who` (#3669): the folder is
@@ -2969,7 +3134,7 @@ impl FilesHandler {
         path: &str,
     ) -> Result<OutgoingOffer> {
         who.refuse_read(NOBODY_SIGNED_IN_TO_SEND)?;
-        let asked = path.to_string();
+        let (asked, checks) = (path.to_string(), who.checks_handles());
         let checked = who
             .run(move || {
                 let resolved = validate_outgoing_path(&asked).context("validating folder path")?;
@@ -2978,6 +3143,12 @@ impl FilesHandler {
                 if !meta.is_dir() {
                     return Err(anyhow!("not a directory: {}", resolved.display()));
                 }
+                #[cfg(target_os = "linux")]
+                if checks {
+                    folder_held_to_the_person(&resolved)?;
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = checks;
                 // A folder the reader may not list is refused here, saying
                 // why, rather than sent as an empty zip that looks complete.
                 std::fs::read_dir(&resolved)
@@ -3059,6 +3230,7 @@ where
     use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
     who.refuse_read(NOBODY_SIGNED_IN_TO_SEND)?;
+    let checks = who.checks_handles();
     let root_canon = {
         let root = root.to_path_buf();
         who.run(move || {
@@ -3083,7 +3255,8 @@ where
         let room = ZIP_MAX_ENTRIES.saturating_sub(count).saturating_add(1);
         let listed = {
             let dir = dir.clone();
-            who.run(move || Ok(zip_folder_entries(&dir, room))).await?
+            who.run(move || Ok(zip_folder_entries(&dir, room, checks)))
+                .await?
         };
         let entries = match listed {
             Ok(entries) => entries,
@@ -3146,7 +3319,7 @@ where
             // fails ends the walk.
             let opened = {
                 let path = path.clone();
-                who.run(move || Ok(std::fs::File::open(&path))).await?
+                who.run(move || Ok(open_zip_entry(&path, checks))).await?
             };
             let mut src = match opened {
                 Ok(f) => tokio::fs::File::from_std(f),
@@ -3197,11 +3370,19 @@ enum ZipEntry {
 
 /// #3669 — one folder of a zip walk, listed in one step as the reader: each
 /// entry's path and kind, at most `room` of them, the listing ending at its
-/// first error as it always did. `Err` when the reader may not list it.
+/// first error as it always did. `Err` when the reader may not list it, and
+/// (#3688, `checks`) when it is on a kernel file system.
 fn zip_folder_entries(
     dir: &std::path::Path,
     room: u32,
+    checks: bool,
 ) -> std::io::Result<Vec<(PathBuf, ZipEntry)>> {
+    #[cfg(target_os = "linux")]
+    if checks {
+        folder_held_to_the_person(dir)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = checks;
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir)?.take(room as usize) {
         let Ok(entry) = entry else {
@@ -3216,6 +3397,68 @@ fn zip_folder_entries(
         out.push((path, kind));
     }
     Ok(out)
+}
+
+/// #3688 — one file of a zip walk, opened in a step as the reader and, with
+/// `checks` (the person at seat0), held to the entry its folder listed
+/// ([`held_to_the_person`]): a link swapped in since the listing, which the
+/// open follows, is left out as an unreadable file is.
+fn open_zip_entry(path: &std::path::Path, checks: bool) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    #[cfg(target_os = "linux")]
+    if checks {
+        held_to_the_person(&file, path)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = checks;
+    Ok(file)
+}
+
+/// #3688 — the kernel's own file systems, by `statfs` magic: a read as the
+/// person at seat0 never opens a file on one, nor lists a folder of one.
+/// Some of their files answer by who reads at `read()`, which the pump does
+/// as the daemon, and some by the thread's euid, which stays root; neither
+/// is the person's own right to the file.
+#[cfg(target_os = "linux")]
+const KERNEL_FILE_SYSTEMS: &[(u32, &str)] = &[
+    (0x0000_9fa0, "procfs"),
+    (0x6265_6572, "sysfs"),
+    (0x6462_6720, "debugfs"),
+    (0x7472_6163, "tracefs"),
+    (0x7363_6673, "securityfs"),
+    (0xde5e_81e4, "efivarfs"),
+    (0xcafe_4a11, "bpf"),
+    (0x6165_676c, "pstore"),
+    (0x6265_6570, "configfs"),
+    (0x0027_e0eb, "cgroup"),
+    (0x6367_7270, "cgroup2"),
+    (0xf97c_ff8c, "selinuxfs"),
+    (0x4341_5d53, "smackfs"),
+    (0x4249_4e4d, "binfmt_misc"),
+    (0x6573_5543, "fusectl"),
+];
+
+/// #3688 — a file a read opened as the person at seat0, held to what they
+/// asked for before its handle leaves the step: never on a kernel file
+/// system ([`KERNEL_FILE_SYSTEMS`]), and the very file asked for, by the
+/// kernel's own path for the handle. A link swapped in after the path was
+/// resolved is followed by the open; through a `/proc/<pid>/fd` link it
+/// lands on a file the daemon holds open, past the folders that would have
+/// refused the person. `Err` says why, in the words the viewer shows.
+#[cfg(target_os = "linux")]
+fn held_to_the_person(file: &std::fs::File, asked: &std::path::Path) -> std::io::Result<()> {
+    // RED (#3688): every handle passes, as on master.
+    let _ = (file, asked);
+    Ok(())
+}
+
+/// #3688 — a folder a read lists as the person at seat0: never one on a
+/// kernel file system ([`KERNEL_FILE_SYSTEMS`]).
+#[cfg(target_os = "linux")]
+fn folder_held_to_the_person(dir: &std::path::Path) -> std::io::Result<()> {
+    // RED (#3688): every folder passes, as on master.
+    let _ = (dir, KERNEL_FILE_SYSTEMS);
+    Ok(())
 }
 
 /// Byte-count snapshot emitted after a chunk that crossed a progress
@@ -3367,6 +3610,8 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
     match who {
         FsAs::Daemon => download_dir(),
         #[cfg(target_os = "linux")]
+        FsAs::DaemonAlone => download_dir(),
+        #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => {
             if let Some(raw) = configured_files_dir() {
                 let writer = who.writer();
@@ -3411,6 +3656,8 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
         }
         #[cfg(target_os = "windows")]
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
+        #[cfg(target_os = "linux")]
+        FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
     }
 }
 
@@ -3418,6 +3665,8 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
 fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
     match who {
         FsAs::Daemon => default_download_dir(log),
+        #[cfg(target_os = "linux")]
+        FsAs::DaemonAlone => default_download_dir(log),
         #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => Ok(person_downloads(home)),
         // `log` is false for the status card and the sweep: no probe there.
@@ -3427,6 +3676,8 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
         } => Ok(person_downloads_windows(downloads.as_deref(), profile, log)),
         #[cfg(target_os = "windows")]
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
+        #[cfg(target_os = "linux")]
+        FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
     }
 }
 
@@ -3508,12 +3759,19 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
 /// [`FsAs::for_read`] answers: the public entry points (`begin_outgoing`,
 /// `begin_outgoing_zip`, `list_dir`) would otherwise always read as the
 /// daemon here, and could not be told from ones that never ask.
-#[cfg(all(test, target_os = "windows"))]
+///
+/// #3688 — on Linux the reader stands in the same way; its person is a real
+/// account (`nobody`, in the tests run as root), so only the reader is here.
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 pub(crate) mod stand_in {
     use super::FsAs;
+    #[cfg(target_os = "windows")]
     use crate::win_identity::PersonToken;
+    #[cfg(target_os = "windows")]
     use std::path::Path;
-    use std::sync::{Arc, Mutex, PoisonError};
+    #[cfg(target_os = "windows")]
+    use std::sync::Arc;
+    use std::sync::{Mutex, PoisonError};
 
     /// The reader stood in, with the thread it answers on: one at a time.
     static READER: Mutex<Option<(std::thread::ThreadId, FsAs)>> = Mutex::new(None);
@@ -3546,6 +3804,8 @@ pub(crate) mod stand_in {
     }
 
     /// The reader stood in for this thread, if there is one.
+    // RED (#3688): Linux's `for_read` asks once the read side lands.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(super) fn reader_now() -> Option<FsAs> {
         let held = READER.lock().unwrap_or_else(PoisonError::into_inner);
         held.as_ref()
@@ -3555,6 +3815,7 @@ pub(crate) mod stand_in {
 
     /// The person: the runner's own SID, through a low-integrity copy of
     /// its token, with `downloads` as their Downloads.
+    #[cfg(target_os = "windows")]
     pub(crate) fn person(profile: &Path, downloads: &Path) -> FsAs {
         with_token(
             profile,
@@ -3565,6 +3826,7 @@ pub(crate) mod stand_in {
 
     /// [`person`], who signs out after `steps` steps: every step after
     /// those is refused, as it is once a person has gone.
+    #[cfg(target_os = "windows")]
     pub(crate) fn person_signing_out_after(steps: u32, profile: &Path) -> FsAs {
         with_token(
             profile,
@@ -3576,10 +3838,12 @@ pub(crate) mod stand_in {
         )
     }
 
+    #[cfg(target_os = "windows")]
     fn low_integrity_token() -> crate::win_token::Owned {
         crate::win_token::low_integrity_copy().expect("a low-integrity token")
     }
 
+    #[cfg(target_os = "windows")]
     fn with_token(profile: &Path, downloads: &Path, token: PersonToken) -> FsAs {
         FsAs::Person {
             sid: crate::win_token::own_user_sid().expect("our own SID"),
@@ -3593,6 +3857,7 @@ pub(crate) mod stand_in {
     /// refuses reading up (`S:(ML;;NRNW;;;ME)`). The low-integrity person
     /// can neither read it nor list it; the runner can. An unlabelled file
     /// is the person's own.
+    #[cfg(target_os = "windows")]
     pub(crate) fn label_no_read_up(path: &Path) {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::LocalFree;
@@ -4330,6 +4595,83 @@ mod tests {
         // Cleanup.
         h.abort().await;
         let _ = tokio::fs::remove_dir_all(&base).await;
+    }
+
+    /// #3688 — FR-84 D4 on a Linux system install with nobody at seat0: a
+    /// received file is the daemon's, but never in a folder a controller
+    /// chose. That folder is refused before it is touched, and the upload
+    /// lands in the default folder, as one with no folder chosen does. The
+    /// daemon itself (root at the screen, or the switch off) still lands
+    /// where it was asked (the control). The chosen folder is one THIS
+    /// writer may use, so the control holds as root too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nobody_at_the_screen_takes_no_folder_a_controller_chose() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        let _env = HOME_ENV_LOCK.lock().await;
+        let drops = ScratchDrops::new("alone-default");
+        std::fs::create_dir_all(&drops.0).unwrap();
+        let default = std::fs::canonicalize(&drops.0).unwrap();
+        let chosen = scratch_drop_dir("alone-chosen");
+        let _ = std::fs::remove_dir_all(&chosen);
+        std::fs::create_dir_all(&chosen).unwrap();
+        let chosen = std::fs::canonicalize(&chosen).unwrap();
+        let at = chosen.to_string_lossy().into_owned();
+        let lands = |path: PathBuf| path.parent().map(std::path::Path::to_path_buf);
+        let h = FilesHandler::new();
+
+        let alone = h
+            .begin_as(
+                FsAs::DaemonAlone,
+                "a3688-1".into(),
+                "out.bin".into(),
+                4,
+                None,
+                Some(&at),
+            )
+            .await
+            .expect("the default folder takes it");
+        h.abort().await;
+        assert_eq!(
+            lands(alone),
+            Some(default.clone()),
+            "a folder a controller chose, with nobody at the screen: the default folder"
+        );
+        let unasked = h
+            .begin_as(
+                FsAs::DaemonAlone,
+                "a3688-2".into(),
+                "out.bin".into(),
+                4,
+                None,
+                None,
+            )
+            .await
+            .expect("no folder chosen");
+        h.abort().await;
+        assert_eq!(
+            lands(unasked),
+            Some(default),
+            "no folder chosen: the default folder"
+        );
+        let daemon = h
+            .begin_as(
+                FsAs::Daemon,
+                "a3688-3".into(),
+                "out.bin".into(),
+                4,
+                None,
+                Some(&at),
+            )
+            .await
+            .expect("the daemon's own");
+        h.abort().await;
+        assert_eq!(
+            lands(daemon),
+            Some(chosen.clone()),
+            "the daemon lands where it was asked"
+        );
+        let _ = std::fs::remove_dir_all(&chosen);
     }
 
     #[test]
@@ -5914,7 +6256,327 @@ mod seat_user_tests {
             FsAs::Person {
                 account: person.clone(),
                 home: home.to_path_buf(),
+                caps: Caps::Kept,
             }
+        }
+
+        /// #3688 — the person as a read takes them: their capabilities
+        /// emptied for each step.
+        fn reader(person: &crate::fs_identity::Account, home: &std::path::Path) -> FsAs {
+            FsAs::Person {
+                account: person.clone(),
+                home: home.to_path_buf(),
+                caps: Caps::Empty,
+            }
+        }
+
+        /// A file or folder only root may open, as root's own are.
+        fn roots_only(path: &std::path::Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        /// Made the person's own.
+        fn theirs(path: &std::path::Path, person: &crate::fs_identity::Account) {
+            std::os::unix::fs::chown(path, Some(person.uid), Some(person.gid)).unwrap();
+        }
+
+        /// What the viewer is told when Linux refuses a read to the person.
+        fn not_allowed(path: &std::path::Path) -> String {
+            format!(
+                "{}: Linux refused to open it for the person signed in at this computer's \
+                 screen",
+                path.display()
+            )
+        }
+
+        /// What the viewer is told when a read as the person meets a kernel
+        /// file system.
+        fn on_a_kernel_fs(path: &std::path::Path, fs: &str) -> String {
+            format!(
+                "{}: {fs} is a kernel file system, which file transfer does not read for the \
+                 person signed in at this computer's screen",
+                path.display()
+            )
+        }
+
+        /// #3688 — a download is opened as the person a read takes: through
+        /// `begin_outgoing`, the entry point `files:get` calls, with the
+        /// person stood in for what `FsAs::for_read()` answers. Their own
+        /// file is offered as theirs and its bytes are the ones sent; a file
+        /// only root may read is refused, saying why; the daemon itself is
+        /// offered that file (the control). An entry point that read as the
+        /// daemon would offer it to the person.
+        #[tokio::test]
+        async fn a_download_opens_the_file_as_the_person() {
+            use tokio::io::AsyncReadExt;
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let mine = home.path().join("theirs.txt");
+            let not_mine = home.path().join("roots-only.txt");
+            std::fs::write(&mine, b"the person's file").unwrap();
+            theirs(&mine, &person);
+            std::fs::write(&not_mine, b"only root reads this file").unwrap();
+            roots_only(&not_mine, 0o600);
+            let at = |p: &std::path::Path| p.to_string_lossy().into_owned();
+            let me = reader(&person, home.path());
+            let h = FilesHandler::new();
+            {
+                let _as = stand_in::reader(me.clone()).await;
+                let offer = h
+                    .begin_outgoing("r3688-1".into(), &at(&mine))
+                    .await
+                    .expect("the person's own file");
+                assert_eq!(offer.who, me, "offered as theirs");
+                assert_eq!(offer.size, Some(17));
+                let mut sent = Vec::new();
+                h.open_outgoing("r3688-1")
+                    .await
+                    .expect("the open file")
+                    .read_to_end(&mut sent)
+                    .await
+                    .unwrap();
+                assert_eq!(sent, b"the person's file");
+                h.finish_outgoing("r3688-1").await;
+
+                let Err(refused) = h.begin_outgoing("r3688-2".into(), &at(&not_mine)).await else {
+                    panic!("files:get offered the person a file only root may read");
+                };
+                assert_eq!(format!("{refused}"), not_allowed(&not_mine));
+            }
+            h.begin_outgoing_as(FsAs::Daemon, "r3688-3".into(), &at(&not_mine))
+                .await
+                .expect("the daemon reads it");
+            h.finish_outgoing("r3688-3").await;
+        }
+
+        /// #3688 — a folder download, from the task `files:get-folder` runs
+        /// to its last message (`peer::outgoing_zip`), opens every entry as
+        /// the person: their file is in the zip; a file only root may read,
+        /// and one inside a folder only root may list, are left out; the zip
+        /// completes. The daemon itself zips all three (the control).
+        #[tokio::test]
+        async fn a_folder_download_opens_every_entry_as_the_person() {
+            use crate::peer::folder_download_as_the_person_tests::download;
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let root_dir = home.path().join("folder");
+            let shut = root_dir.join("roots-only");
+            std::fs::create_dir_all(&shut).unwrap();
+            std::fs::write(root_dir.join("theirs.txt"), b"the person's file").unwrap();
+            theirs(&root_dir.join("theirs.txt"), &person);
+            std::fs::write(root_dir.join("not-theirs.txt"), b"only root reads this").unwrap();
+            roots_only(&root_dir.join("not-theirs.txt"), 0o600);
+            std::fs::write(shut.join("inside.txt"), b"only root lists this").unwrap();
+            roots_only(&shut, 0o700);
+
+            let mine = {
+                let _as = stand_in::reader(reader(&person, home.path())).await;
+                download(&root_dir).await
+            };
+            let said = mine.said();
+            assert!(
+                said.last()
+                    .is_some_and(|m| m.contains(r#""t":"files:eof""#)),
+                "the zip completes: {said:?}"
+            );
+            assert!(mine.has(b"the person's file"), "their file is in");
+            assert!(
+                !mine.has(b"only root reads this"),
+                "a file they may not read is not: the walk read as the daemon"
+            );
+            assert!(
+                !mine.has(b"only root lists this"),
+                "nor one inside a folder they may not list"
+            );
+            let all = {
+                let _as = stand_in::reader(FsAs::Daemon).await;
+                download(&root_dir).await
+            };
+            for needle in [
+                &b"the person's file"[..],
+                b"only root reads this",
+                b"only root lists this",
+            ] {
+                assert!(all.has(needle), "the daemon zips {needle:?}");
+            }
+        }
+
+        /// #3688 — the drawer lists a folder as the person, through
+        /// `list_dir`, which `files:dir` calls: theirs lists; one only root
+        /// may list is refused, saying why; the daemon itself lists it (the
+        /// control).
+        #[tokio::test]
+        async fn a_listing_runs_as_the_person() {
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let mine = home.path().join("theirs");
+            let shut = home.path().join("roots-only");
+            std::fs::create_dir(&mine).unwrap();
+            std::fs::write(mine.join("a.txt"), b"a").unwrap();
+            theirs(&mine, &person);
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(shut.join("b.txt"), b"b").unwrap();
+            roots_only(&shut, 0o700);
+            let at = |p: &std::path::Path| p.to_string_lossy().into_owned();
+            {
+                let _as = stand_in::reader(reader(&person, home.path())).await;
+                let listed = list_dir(&at(&mine)).await.expect("their folder lists");
+                let names: Vec<_> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+                assert_eq!(names, ["a.txt"]);
+                let Err(refused) = list_dir(&at(&shut)).await else {
+                    panic!("files:dir listed the person a folder only root may list");
+                };
+                assert_eq!(format!("{refused}"), not_allowed(&shut));
+            }
+            let control = list_dir_as(&FsAs::Daemon, &at(&shut))
+                .await
+                .expect("the daemon lists it");
+            assert_eq!(control.entries.len(), 1);
+        }
+
+        /// This thread's credentials, as the kernel reports them.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Creds {
+            thread: std::thread::ThreadId,
+            cap_eff: String,
+            uids: String,
+            gids: String,
+            groups: String,
+        }
+
+        fn own_creds() -> Creds {
+            let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            let field = |key: &str| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .map(|v| v.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default()
+            };
+            Creds {
+                thread: std::thread::current().id(),
+                cap_eff: field("CapEff:"),
+                uids: field("Uid:"),
+                gids: field("Gid:"),
+                groups: field("Groups:"),
+            }
+        }
+
+        /// #3688 — a read's step holds no capability while it runs as the
+        /// person, and leaves the thread as it found it: capabilities,
+        /// fsuid, fsgid and groups, after a step that returns and after one
+        /// that panics. One blocking thread, so every step lands on it.
+        #[test]
+        fn a_read_step_empties_the_capabilities_and_leaves_nothing_behind() {
+            if !root() {
+                return;
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (home, person) = nobodys_home();
+                let me = reader(&person, home.path());
+                let before = FsAs::Daemon.run(|| Ok(own_creds())).await.unwrap();
+                assert_ne!(
+                    before.cap_eff, "0000000000000000",
+                    "root holds capabilities"
+                );
+
+                let inside = me.run(|| Ok(own_creds())).await.unwrap();
+                assert_eq!(inside.thread, before.thread, "the same blocking thread");
+                assert_eq!(
+                    inside.cap_eff, "0000000000000000",
+                    "no capability while the person reads"
+                );
+                let fsuid = inside.uids.split(' ').nth(3).map(str::to_string);
+                assert_eq!(fsuid, Some(person.uid.to_string()), "the person's fsuid");
+                assert_eq!(
+                    FsAs::Daemon.run(|| Ok(own_creds())).await.unwrap(),
+                    before,
+                    "everything given back"
+                );
+
+                let panicked = me
+                    .run(|| -> Result<()> { panic!("a read step that panics as the person") })
+                    .await;
+                assert!(panicked.is_err(), "the panic is the step's error");
+                assert_eq!(
+                    FsAs::Daemon.run(|| Ok(own_creds())).await.unwrap(),
+                    before,
+                    "everything given back after a panic"
+                );
+            });
+        }
+
+        /// #3688 — a read as the person never opens a file on a kernel file
+        /// system, nor lists one, nor zips one: their files answer by the
+        /// reader at `read()`, which the pump does as the daemon, or by the
+        /// thread's euid, which stays root. The daemon itself reads them, as
+        /// it always has (the control).
+        #[tokio::test]
+        async fn kernel_filesystems_are_not_read_as_the_person() {
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let me = reader(&person, home.path());
+            let h = FilesHandler::new();
+            let status = std::fs::canonicalize("/proc/self/status").unwrap();
+            let Err(refused) = h
+                .begin_outgoing_as(me.clone(), "k3688-1".into(), "/proc/self/status")
+                .await
+            else {
+                panic!("a procfs file was offered to the person");
+            };
+            assert_eq!(format!("{refused}"), on_a_kernel_fs(&status, "procfs"));
+            let online = std::path::Path::new("/sys/devices/system/cpu/online");
+            if online.exists() {
+                let online = std::fs::canonicalize(online).unwrap();
+                let Err(refused) = h
+                    .begin_outgoing_as(me.clone(), "k3688-2".into(), &online.to_string_lossy())
+                    .await
+                else {
+                    panic!("a sysfs file was offered to the person");
+                };
+                assert_eq!(format!("{refused}"), on_a_kernel_fs(&online, "sysfs"));
+            }
+            for (dir, fs) in [("/proc", "procfs"), ("/sys", "sysfs")] {
+                let Err(refused) = list_dir_as(&me, dir).await else {
+                    panic!("{dir} was listed for the person");
+                };
+                assert_eq!(
+                    format!("{refused}"),
+                    on_a_kernel_fs(std::path::Path::new(dir), fs)
+                );
+            }
+            let Err(refused) = h
+                .begin_outgoing_zip_as(me.clone(), "k3688-3".into(), "/proc/sys/kernel")
+                .await
+            else {
+                panic!("a procfs folder was offered to the person as a zip");
+            };
+            assert_eq!(
+                format!("{refused}"),
+                on_a_kernel_fs(std::path::Path::new("/proc/sys/kernel"), "procfs")
+            );
+
+            h.begin_outgoing_as(FsAs::Daemon, "k3688-4".into(), "/proc/self/status")
+                .await
+                .expect("the daemon reads it");
+            h.finish_outgoing("k3688-4").await;
+            let listed = list_dir_as(&FsAs::Daemon, "/proc")
+                .await
+                .expect("the daemon lists it");
+            assert!(!listed.entries.is_empty());
         }
 
         /// The file is born the person's, in their folder, and nothing of the
@@ -6038,19 +6700,201 @@ mod seat_user_tests {
         }
     }
 
-    /// #3669 — a read runs as someone other than the daemon only on a
-    /// machine-wide Windows install, whose worker is LocalSystem; every other
-    /// install reads as the daemon, as it always has. A test process is never
-    /// LocalSystem, so here a read is the daemon's on every OS, and on Windows
-    /// it takes whom a write takes.
+    /// #3669, #3688 — a read takes whom a received file takes. On a Linux
+    /// system install that is the person at seat0, whose read steps hold no
+    /// capability; with nobody there a read is refused and a received file
+    /// is the daemon's, never where a controller chose; root itself at the
+    /// screen, a user install, and the switch off are the daemon, both
+    /// ways; a seat lookup that does not answer in time is nobody. On
+    /// Windows a test process is never LocalSystem, so a read is the
+    /// daemon's, as a write is; macOS reads as the daemon.
+    #[tokio::test]
+    async fn reads_take_whom_writes_take() {
+        #[cfg(target_os = "linux")]
+        {
+            let ana = crate::fs_identity::Account {
+                uid: 1000,
+                gid: 1000,
+                groups: vec![1000, 27],
+                name: "ana".into(),
+            };
+            let home = PathBuf::from("/home/ana");
+            let person = || Seat::Person {
+                account: ana.clone(),
+                home: home.clone(),
+            };
+            let not_asked =
+                || -> Seat { panic!("the seat is asked only by a root daemon, switch on") };
+            for reading in [true, false] {
+                assert_eq!(
+                    linux_fs_as(false, true, reading, not_asked),
+                    FsAs::Daemon,
+                    "a user install"
+                );
+                assert_eq!(
+                    linux_fs_as(true, false, reading, not_asked),
+                    FsAs::Daemon,
+                    "the switch off"
+                );
+                assert_eq!(
+                    linux_fs_as(true, true, reading, || Seat::Root),
+                    FsAs::Daemon,
+                    "root at the screen"
+                );
+            }
+            let caps_of = |who: FsAs| match who {
+                FsAs::Person {
+                    account,
+                    home: h,
+                    caps,
+                } if account == ana && h == home => Some(caps),
+                _ => None,
+            };
+            assert_eq!(
+                caps_of(linux_fs_as(true, true, true, person)),
+                Some(Caps::Empty),
+                "a read: the person, emptied"
+            );
+            assert_eq!(
+                caps_of(linux_fs_as(true, true, false, person)),
+                Some(Caps::Kept),
+                "a write: the person, as P3d"
+            );
+            let nobody = || Seat::Nobody("seat0 has no active session".into());
+            assert_eq!(
+                linux_fs_as(true, true, true, nobody),
+                FsAs::Nobody,
+                "a read: refused"
+            );
+            assert_eq!(
+                linux_fs_as(true, true, false, nobody),
+                FsAs::DaemonAlone,
+                "a write: the daemon, alone"
+            );
+
+            let wait = std::time::Duration::from_millis(20);
+            let slow = seat_within(wait, || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                Seat::Root
+            })
+            .await;
+            assert!(
+                matches!(slow, Seat::Nobody(_)),
+                "a lookup past its time is nobody: {slow:?}"
+            );
+            let quick = seat_within(std::time::Duration::from_secs(5), || Seat::Root).await;
+            assert_eq!(quick, Seat::Root);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(FsAs::for_read().await, FsAs::Daemon);
+            #[cfg(target_os = "windows")]
+            assert_eq!(
+                FsAs::for_read().await,
+                FsAs::now(),
+                "a read and a write take the same person"
+            );
+        }
+    }
+
+    /// #3688 — with nobody at seat0 on a Linux system install, every read is
+    /// refused before anything is touched, with a reason the viewer shows:
+    /// a download, a folder download and its walk say there is no one to
+    /// send it as; the drawer (a folder, the roots, the staging button) says
+    /// there is no one to browse as. A received file's answer for nobody
+    /// ([`FsAs::DaemonAlone`]) is refused the same way, were it ever to reach
+    /// a read.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn nobody_at_the_screen_refuses_every_read_with_a_reason() {
+        const SEND: &str = "Nobody is signed in at this computer's screen to send the file";
+        const BROWSE: &str = "Nobody is signed in at this computer's screen to browse its files";
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("x.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let folder = temp.path().to_string_lossy().into_owned();
+        let h = FilesHandler::new();
+
+        for who in [FsAs::Nobody, FsAs::DaemonAlone] {
+            let Err(get) = h
+                .begin_outgoing_as(who.clone(), "n3688-1".into(), &file.to_string_lossy())
+                .await
+            else {
+                panic!("a download began as {who:?}");
+            };
+            assert_eq!(format!("{get}"), SEND, "{who:?}");
+            let Err(zip) = h
+                .begin_outgoing_zip_as(who.clone(), "n3688-2".into(), &folder)
+                .await
+            else {
+                panic!("a folder download began as {who:?}");
+            };
+            assert_eq!(format!("{zip}"), SEND, "{who:?}");
+            let (zip_writer, _zip_reader) = tokio::io::duplex(64 * 1024);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let walked = walk_and_zip(zip_writer, temp.path(), &who, cancel).await;
+            assert_eq!(format!("{}", walked.expect_err("a walk")), SEND, "{who:?}");
+            for path in [folder.as_str(), "", "~", STAGING_SENTINEL] {
+                let Err(dir) = list_dir_as(&who, path).await else {
+                    panic!("{path:?} was listed as {who:?}");
+                };
+                assert_eq!(format!("{dir}"), BROWSE, "{path:?} as {who:?}");
+            }
+        }
+    }
+
+    /// #3688 — a handle a read as the person opened leaves its step only
+    /// when it is the file asked for, off the kernel's own file systems: the
+    /// same file reached through a `/proc/self/fd` link is not the one asked
+    /// (the link's own path is), and a procfs file is on one; a folder on
+    /// sysfs is refused for listing. A plain file and folder pass.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn reads_take_the_daemon_unless_local_system() {
-        assert_eq!(FsAs::for_read(), FsAs::Daemon);
-        #[cfg(target_os = "windows")]
+    fn a_handle_that_is_not_the_file_asked_is_refused() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let asked = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .join("asked.txt");
+        std::fs::write(&asked, b"x").unwrap();
+        let file = std::fs::File::open(&asked).unwrap();
+        held_to_the_person(&file, &asked).expect("the file asked for passes");
+        folder_held_to_the_person(temp.path()).expect("an ordinary folder passes");
+
+        let magic = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        let through = std::fs::File::open(&magic).unwrap();
+        let Err(swapped) = held_to_the_person(&through, &magic) else {
+            panic!("a handle reached through a /proc link passed as the file asked");
+        };
         assert_eq!(
-            FsAs::for_read(),
-            FsAs::now(),
-            "a read and a write take the same person"
+            swapped.to_string(),
+            format!(
+                "{}: what opened is not the file asked for, so file transfer does not send it",
+                magic.display()
+            )
+        );
+
+        let status = std::fs::canonicalize("/proc/self/status").unwrap();
+        let kernel = std::fs::File::open(&status).unwrap();
+        let Err(on_proc) = held_to_the_person(&kernel, &status) else {
+            panic!("a procfs handle passed");
+        };
+        assert_eq!(
+            on_proc.to_string(),
+            format!(
+                "{}: procfs is a kernel file system, which file transfer does not read for the \
+                 person signed in at this computer's screen",
+                status.display()
+            )
+        );
+        let Err(on_sys) = folder_held_to_the_person(std::path::Path::new("/sys")) else {
+            panic!("a sysfs folder passed");
+        };
+        assert!(
+            on_sys
+                .to_string()
+                .starts_with("/sys: sysfs is a kernel file system"),
+            "{on_sys}"
         );
     }
 

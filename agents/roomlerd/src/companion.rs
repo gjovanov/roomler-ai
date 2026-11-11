@@ -490,8 +490,8 @@ mod version_tests {
 #[cfg(test)]
 mod console_tests {
     use super::{
-        console_owner_person, seat0_active_session, seat0_person_uid, session_person,
-        session_person_uid, show_field,
+        console_owner_person, seat0_active_session, seat0_person_uid, session_account,
+        session_person, session_person_uid, show_field,
     };
 
     /// `key=value` lines, the whole key and nothing but it: `NameX=` is not
@@ -535,6 +535,41 @@ mod console_tests {
         let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
         let e = session_person("3", unnamed).unwrap_err().to_string();
         assert!(e.contains("names no account"), "{e}");
+    }
+
+    /// #3688 — a GNOME or KDE lock keeps the person's own session showing on
+    /// seat0, marked `LockedHint=yes`: it is still their person, for a
+    /// viewer's reads as for a received file. LightDM's light-locker switches
+    /// seat0 to a greeter session instead, which is nobody, as the login
+    /// screen is. The uid logind recorded comes with the name, so root
+    /// signed in at the screen is told from a person.
+    #[test]
+    fn a_locked_screen_keeps_its_person() {
+        let seat = "Id=seat0\nActiveSession=2\nCanGraphical=yes\nSessions=2\n";
+        assert_eq!(seat0_active_session(seat).unwrap(), "2");
+        let locked = "Id=2\nName=ana\nUser=1000\nSeat=seat0\nType=wayland\nClass=user\n\
+                      Active=yes\nState=active\nLockedHint=yes\nRemote=no\n";
+        assert_eq!(session_person("2", locked).unwrap(), "ana");
+        assert_eq!(
+            session_account("2", locked).unwrap(),
+            ("ana".to_string(), Some(1000))
+        );
+
+        let light_locker = "Id=c2\nName=lightdm\nUser=111\nSeat=seat0\nType=x11\nClass=greeter\n\
+                            Active=yes\nRemote=no\n";
+        let e = session_account("c2", light_locker).unwrap_err().to_string();
+        assert!(e.contains("the login screen is showing"), "{e}");
+
+        let root = "Id=4\nName=root\nUser=0\nSeat=seat0\nType=tty\nClass=user\nRemote=no\n";
+        assert_eq!(
+            session_account("4", root).unwrap(),
+            ("root".to_string(), Some(0))
+        );
+        let no_uid = "Id=6\nName=ops\nSeat=seat0\nType=tty\nClass=user\n";
+        assert_eq!(
+            session_account("6", no_uid).unwrap(),
+            ("ops".to_string(), None)
+        );
     }
 
     /// #2871 (review) — whom a root daemon's person socket is made for:
@@ -1195,8 +1230,16 @@ fn show_field(text: &str, key: &str) -> Option<String> {
 /// screen.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn seat0_user() -> Result<String> {
+    seat0_account().map(|(name, _)| name)
+}
+
+/// #3688 — [`seat0_user`], with the uid logind recorded for that session: a
+/// root daemon's file steps tell root itself at the screen, whose files are
+/// the daemon's own, from a person and from nobody.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn seat0_account() -> Result<(String, Option<u32>)> {
     let id = seat0_active_session(&loginctl_show(&["show-seat", "seat0"])?)?;
-    session_person(&id, &loginctl_show(&["show-session", &id])?)
+    session_account(&id, &loginctl_show(&["show-session", &id])?)
 }
 
 /// #2871 (review) — the uid of the person signed in at seat0, by
@@ -1289,6 +1332,17 @@ fn session_person(id: &str, session: &str) -> Result<String> {
     }
     show_field(session, "Name")
         .ok_or_else(|| anyhow::anyhow!("seat0's session {id} names no account"))
+}
+
+/// The pure half of [`seat0_account`]: [`session_person`]'s person, with the
+/// uid logind recorded for the session when it names one.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn session_account(id: &str, session: &str) -> Result<(String, Option<u32>)> {
+    let name = session_person(id, session)?;
+    Ok((
+        name,
+        show_field(session, "User").and_then(|u| u.parse().ok()),
+    ))
 }
 
 /// Is a process with this exact name running? An exact-name match (`pgrep -x`)

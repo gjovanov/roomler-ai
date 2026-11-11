@@ -16474,15 +16474,18 @@ mod download_stop_tests {
 /// message through the task a `files:get-folder` runs ([`outgoing_zip`]),
 /// walks as the reader it began for: the person its offer carries to the
 /// walk. The person is the low-integrity stand-in (`files::stand_in`).
-#[cfg(all(test, target_os = "windows"))]
-mod folder_download_as_the_person_tests {
+/// #3688 — a Linux system install's twin drives [`download`] from
+/// `files::seat_user_tests::as_root`, which CI runs as root.
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+pub(crate) mod folder_download_as_the_person_tests {
     use super::*;
+    #[cfg(target_os = "windows")]
     use crate::files::stand_in;
 
     /// A channel that keeps what it was sent: the bytes, and each message
     /// as its JSON.
     #[derive(Clone, Default)]
-    struct Recorded {
+    pub(crate) struct Recorded {
         bytes: Arc<std::sync::Mutex<Vec<u8>>>,
         said: Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -16504,18 +16507,18 @@ mod folder_download_as_the_person_tests {
     }
 
     impl Recorded {
-        fn has(&self, needle: &[u8]) -> bool {
+        pub(crate) fn has(&self, needle: &[u8]) -> bool {
             let bytes = self.bytes.lock().unwrap();
             bytes.windows(needle.len()).any(|w| w == needle)
         }
-        fn said(&self) -> Vec<String> {
+        pub(crate) fn said(&self) -> Vec<String> {
             self.said.lock().unwrap().clone()
         }
     }
 
     /// `root` downloaded as a folder, read as whoever `FsAs::for_read()`
     /// answers now.
-    async fn download(root: &std::path::Path) -> Recorded {
+    pub(crate) async fn download(root: &std::path::Path) -> Recorded {
         let sink = Recorded::default();
         outgoing_zip(
             sink.clone(),
@@ -16531,6 +16534,7 @@ mod folder_download_as_the_person_tests {
     /// Their file is in the zip; a file only the daemon may read, and one
     /// inside a folder only the daemon may list, are left out; the zip
     /// completes. Without a stand-in the daemon zips all three (the control).
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn a_folder_download_walks_as_the_person_its_offer_carries() {
         let temp = tempfile::tempdir().unwrap();
@@ -16576,6 +16580,7 @@ mod folder_download_as_the_person_tests {
     /// taken for the whole folder. The steps: the download's start (1), the
     /// root resolved (2) and listed (3), the first file opened (4); by the
     /// second file they have gone.
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn a_person_who_signs_out_mid_folder_ends_it_with_an_error_not_eof() {
         let temp = tempfile::tempdir().unwrap();
