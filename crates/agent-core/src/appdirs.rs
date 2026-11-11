@@ -278,6 +278,13 @@ pub fn system_folder_variables() -> Vec<(&'static str, PathBuf)> {
     vars
 }
 
+/// #3702 — is `own_sid`, the SID of the account a process runs as, the
+/// service account's (LocalSystem's)? What [`pin_system_folders`] asks first.
+#[cfg(target_os = "windows")]
+pub fn is_service_account(own_sid: Option<&str>) -> bool {
+    own_sid == Some(crate::machine_tree::SYSTEM)
+}
+
 /// #3702 — the first thing a daemon's `main` does on Windows, before the
 /// process has a second thread. On the service account (`own_sid` is
 /// LocalSystem's) it sets the process's folder variables to
@@ -298,7 +305,7 @@ pub fn system_folder_variables() -> Vec<(&'static str, PathBuf)> {
 /// when the process started.
 #[cfg(target_os = "windows")]
 pub fn pin_system_folders(own_sid: Option<&str>) -> bool {
-    if own_sid != Some(crate::machine_tree::SYSTEM) {
+    if !is_service_account(own_sid) {
         return false;
     }
     for (name, value) in system_folder_variables() {

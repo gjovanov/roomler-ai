@@ -9,8 +9,8 @@
 //! lives in the user's interactive session (typically session 1).
 //! That means the worker's own `%USERPROFILE%` resolves to
 //! `C:\Windows\System32\config\systemprofile\` — NOT the user's
-//! profile, so a feature that needs the person's folders (the
-//! install clean-up's per-user leftovers) has to find them another way.
+//! profile, so a feature that needs the person's folders has to find
+//! them another way.
 //!
 //! A SystemContext worker never loads its CONFIG from here: it runs
 //! the machine's own enrollment and nothing else (#3387, `app.rs`
@@ -58,7 +58,8 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 /// user, FFI failure).
 ///
 /// Used by the install clean-up (`install_cleanup.rs`), for the
-/// per-user leftovers of an earlier install.
+/// per-user leftovers of an earlier install, on any account but the
+/// service account.
 pub fn active_user_profile_root() -> Option<PathBuf> {
     let session_id = current_session_id()?;
     let username = user_name_for_session(session_id)?;
