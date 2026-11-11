@@ -20,6 +20,7 @@
  * | `rc:session.resumed` | the hold ends, `resumed` |
  * | `rc:terminate`, `rc:ended`, a transport signal, a hangup | the hold ends, `ended`, and the composable does what it does today |
  * | the deadline | the hold ends, `expired`: the composable closes the peer and starts today's ladder |
+ * | an automatic redial of a session `rc:session.detached` named, until `rc:session.resumed` | {@link SessionHold.deviceDetached}: the composable sends no hangup first (D5 = A); a person's Disconnect still does |
  *
  * The machine owns no socket, no peer and no clock: the composable hands them
  * in ({@link SessionHoldDeps}), so every row above is a unit test
@@ -138,6 +139,16 @@ export interface SessionHold {
   resumed(sessionId: string): RcHoldSummary | null
   /** The hold ends `ended`, with `reason`; `null` when none ran. */
   end(reason: string): RcHoldSummary | null
+  /**
+   * FR-138 D5 = A (#3604) — has the server told this page that its device
+   * holds `sessionId` no longer (`rc:session.detached`), with no
+   * `rc:session.resumed` since? The hold's end does not clear it (the
+   * deadline's own redial reads it after `expired`); the next {@link arm},
+   * {@link disarm} or `rc:session.resumed` does. While it is true an automatic
+   * redial sends no hangup: the session ended on its device's side, and the
+   * redial's `replaces` records that (`agent_disconnect`, inferred).
+   */
+  deviceDetached(sessionId: string | null): boolean
 }
 
 interface Running {
@@ -157,6 +168,9 @@ export function createSessionHold(deps: SessionHoldDeps): SessionHold {
   let armedId: string | null = null
   let windowSecs = 0
   let run: Running | null = null
+  /** The session `rc:session.detached` last named for this hold, until it is
+   *  resumed or the hold is armed again ({@link SessionHold.deviceDetached}). */
+  let detachedId: string | null = null
 
   function setDeadline(at: number) {
     if (!run) return
@@ -220,11 +234,13 @@ export function createSessionHold(deps: SessionHoldDeps): SessionHold {
       finish('ended', 'teardown')
       armedId = resumeSecs ? sessionId : null
       windowSecs = resumeSecs ?? 0
+      detachedId = null
     },
     disarm() {
       finish('ended', 'teardown')
       armedId = null
       windowSecs = 0
+      detachedId = null
     },
     resumable(sessionId) {
       return sessionId !== null && armedId !== null && sessionId === armedId
@@ -261,6 +277,7 @@ export function createSessionHold(deps: SessionHoldDeps): SessionHold {
       if (!armedId || sessionId !== armedId) return false
       if (!run) start(!deps.socketUp())
       if (!run) return false
+      detachedId = sessionId
       if (typeof resumeBy === 'number' && Number.isFinite(resumeBy)) {
         const at = deps.now() + holdRemainingMs(resumeBy, deps.wallNow(), windowSecs) + RC_HOLD_GRACE_MS
         // A repeated `rc:session.detached` never moves the deadline later: a
@@ -281,11 +298,16 @@ export function createSessionHold(deps: SessionHoldDeps): SessionHold {
       return true
     },
     resumed(sessionId) {
+      // The device has the session again, whether or not a hold still runs.
+      if (detachedId === sessionId) detachedId = null
       if (!run || run.sessionId !== sessionId) return null
       return finish('resumed', null)
     },
     end(reason) {
       return finish('ended', reason)
+    },
+    deviceDetached(sessionId) {
+      return sessionId !== null && detachedId === sessionId
     },
   }
 }

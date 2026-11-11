@@ -1665,7 +1665,7 @@ The agent does **not** render the cursor into the captured frame (it tells the O
 ### 6.3 One owner per key — the soft keyboard beside a hardware keyboard (#2888)
 
 The viewer has two places a key can enter the host from. The window-level
-CAPTURE listener (`attachInput`, `useRemoteControl.ts:13082`) sees every key
+CAPTURE listener (`attachInput`, `useRemoteControl.ts:13091`) sees every key
 first and forwards it — `key_text` for a printable character, a HID `key` frame
 otherwise. The soft keyboard (`MobileKeyboard.vue`) is an off-screen textarea
 whose focus brings up the OS keyboard; its typing arrives as `input` events
@@ -1708,9 +1708,9 @@ pre-fix run.
 | Ctrl+Alt+End | End forwarded, no SAS | SAS (derived) | SAS once, no End |
 | sticky toolbar Ctrl, then `c` | `L text:"c"` + `S` Ctrl+C — **twice, and the host's text first** | same | `S` Ctrl+C — once, the modifier cleared |
 
-The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:15278`, pure)
-and carried out by `applyKeyRoute` (`:15075`): a key whose target is the soft
-keyboard's textarea (`isSoftKeyboardTarget`, `:14816` — the same
+The rule now, decided by `routeKeyEvent` (`useRemoteControl.ts:15287`, pure)
+and carried out by `applyKeyRoute` (`:15377`): a key whose target is the soft
+keyboard's textarea (`isSoftKeyboardTarget`, `:15118` — the same
 `data-rc-capture` attribute `isViewerOwnInput` exempts) is **driving**, like a
 key over the stage or under keyboard lock, and has one owner — which one
 depends on the key.
@@ -1720,7 +1720,7 @@ depends on the key.
 | **forwards a HID frame** (a named key, a chord, a modifier): default prevented, propagation stopped | nothing — no `input` event, and `onKeyDown` never runs |
 | **leaves a printable character** (no chord) **or a dead key** untouched — `untouched / soft-keyboard` | the character, through `input` — with the toolbar's sticky Ctrl / Alt / Win applied (`consumeModBits`); a dead key composes with the next, and `compositionend` carries the composed character |
 | **drops** (IME, `keyCode` 229, a `code` it cannot map): untouched | the typed text, the composition, the code-less Enter / Tab / Backspace / Delete (#2909) |
-| **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `routeDeferredPaste` consumes the paste event for `onPaste` (`:11766`) |
+| **defers Ctrl+V**: default NOT prevented (the paste event must fire), propagation stopped | nothing — `routeDeferredPaste` consumes the paste event for `onPaste` (`:12837`) |
 
 ```mermaid
 flowchart TD
@@ -1776,17 +1776,17 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3461`), registered at mount (`:5735`), and the deferred
-Ctrl+V's `onPaste` (`useRemoteControl.ts:12828`), registered later by
-`attachInput` (`:12779`). Same node, same phase, so the drawer's runs
+(`RemoteControl.vue:3461`), registered at mount (`:5737`), and the deferred
+Ctrl+V's `onPaste` (`useRemoteControl.ts:12837`), registered later by
+`attachInput` (`:13077`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
 default folder. Now each half steps aside for the other: `drawerPasteFiles`
-(`useRemoteControl.ts:15487`) returns nothing for a paste already consumed,
-and `routeDeferredPaste` (`:15168`) answers `taken` for one the drawer
+(`useRemoteControl.ts:15496`) returns nothing for a paste already consumed,
+and `routeDeferredPaste` (`:15470`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
-upload (`:12551`). Whichever listener runs first owns the paste, so a future
+upload (`:12849`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
@@ -3375,7 +3375,7 @@ flowchart LR
 | the switch | `localStorage.setItem('roomler-rc-dc-worker', '1')` turns it on and `'0'` off, then reconnect. Anything else is the default, read once per connect. The default is **off** until S11 (§ below), and it is one constant | `storedDcWorker`, `ui/src/composables/useRemoteControl.ts:4475`; `DC_WORKER_DEFAULT`, `:4473` |
 | the move | `startDcPath` posts the channel in the transfer list in the task that created it, the only task in which a channel can move: the spec ends its transferability at the end of that task, and at its first `send()`, which the viewer never calls on this channel. A browser that cannot transfer one throws `DataCloneError` from `postMessage` before anything is detached, so the channel is still the page's, whole, and the relay carries it. The console says which arm the session got, and why | `moveVideoChannelToWorker`, `ui/src/workers/rc-video-channel.ts:116`; `useRemoteControl.ts:8740` |
 | the worker's side | sets the channel's binary type, which does not travel with it, and feeds every message to the same `onChunk` the relay's `chunk` message feeds, with no `sentAt` | `attachVideoChannel`, `ui/src/workers/rc-dc-worker.ts:665`; `onChunk`, `:605` |
-| the word back | the page keeps no copy of a channel it moved, so a move `postMessage` took can still fail in the worker. The worker says `video-channel-attached` as it takes the channel, and `message-error` when a message could not be received in its realm. The page waits 2 s from the worker's first answer to `init-canvas` (`decoder-configured` or `decoder-configure-error`), which the worker sends just before it reads the channel, so a slow module load is not inside the wait. No word by then, or a `message-error`, and the page stops the path, relays the channel on every later session of this viewer, and reconnects at once rather than at the watchdog. The flag lives in the composable (`dcWorkerMoveFailed`, `useRemoteControl.ts:6180`), so leaving the remote page and coming back clears it | `createChannelMoveWatch`, `ui/src/workers/rc-video-channel.ts:48`; `DC_WORKER_ATTACH_GRACE_MS`, `useRemoteControl.ts:4490`; `onVideoChannelMoveFailed`, `:9019`, read at connect, `:11736`; the worker, `rc-dc-worker.ts:588`, `:597` |
+| the word back | the page keeps no copy of a channel it moved, so a move `postMessage` took can still fail in the worker. The worker says `video-channel-attached` as it takes the channel, and `message-error` when a message could not be received in its realm. The page waits 2 s from the worker's first answer to `init-canvas` (`decoder-configured` or `decoder-configure-error`), which the worker sends just before it reads the channel, so a slow module load is not inside the wait. No word by then, or a `message-error`, and the page stops the path, relays the channel on every later session of this viewer, and reconnects at once rather than at the watchdog. The flag lives in the composable (`dcWorkerMoveFailed`, `useRemoteControl.ts:6180`), so leaving the remote page and coming back clears it | `createChannelMoveWatch`, `ui/src/workers/rc-video-channel.ts:48`; `DC_WORKER_ATTACH_GRACE_MS`, `useRemoteControl.ts:4490`; `onVideoChannelMoveFailed`, `:9019`, read at connect, `:11745`; the worker, `rc-dc-worker.ts:588`, `:597` |
 | open and close | the worker posts `video-channel-open` and `video-channel-closed`, once each. The page marks `dc_open` and logs `[rc] <path> DC opened` and `DC closed`, as the relay's own handlers do | `onDcWorkerMessage`, `useRemoteControl.ts:8831` |
 | the delivery gap | the 1.5 s network-silence warning (the 2026-07-24 freeze triangulation) moves with the channel. One clock, `createDeliveryGapClock`, runs on whichever side reads the channel, and the page prints the same line | `rc-video-channel.ts:24`; `useRemoteControl.ts:8509`, `:8514` |
 | the page's object | a moved channel leaves a closed husk behind. It stays out of `channels`, so `teardown()` has nothing to close there | `useRemoteControl.ts:8740` |
@@ -3528,7 +3528,7 @@ only to its grain, as it times every hop only to its grain.
 **The switch.** `localStorage.setItem('roomler-rc-clock-cal', '0')`, then reconnect, and the page measures no
 worker's clock: each worker reads the page's timestamps on its own clock, as before #3566, and the console says so
 once per connect. Anything else, no value, or storage that cannot be read leaves it on (`storedClockCal`,
-`rc-clock-cal.ts:59`, read at `useRemoteControl.ts:11742`). It is on by default, because it is a fix, and the switch
+`rc-clock-cal.ts:59`, read at `useRemoteControl.ts:11751`). It is on by default, because it is a fix, and the switch
 is there because FR-15's live law reads the age it corrects. It is ledger row `r0:CLOCK-1`, which retires after a
 week of field reads with it on.
 
@@ -3589,10 +3589,10 @@ sequenceDiagram
 | Rule | Where |
 |---|---|
 | Only `redialing` is taken over: the ladder's timer waiting, the args known, not external. A request or a consent prompt in flight reads `live`, and a live session gets the banner, never a reload in the middle of it | `rcReloadState`, `ui/src/composables/useRemoteControl.ts:443` |
-| The redial is stopped, not failed: no request leaves a page that is unloading. If the page is still there 20 s later, `releaseRedial` re-arms the ladder with its backoff, and the recorded resume is deleted, or an F5 inside the minute would open a second session beside the redial and, on a device that asks, a second prompt | `reloadSurface`, `useRemoteControl.ts:9873`; `startReload`, `ui/src/utils/staleBuildWatch.ts:284` |
+| The redial is stopped, not failed: no request leaves a page that is unloading. If the page is still there 20 s later, `releaseRedial` re-arms the ladder with its backoff, and the recorded resume is deleted, or an F5 inside the minute would open a second session beside the redial and, on a device that asks, a second prompt | `reloadSurface`, `useRemoteControl.ts:9882`; `startReload`, `ui/src/utils/staleBuildWatch.ts:284` |
 | An external session (FR-52) is never taken over: its login opened one session, and another costs the device's password | `rcReloadState`; the banner says Reload ends it |
-| Work only this page holds keeps the redial: a transfer the redial would resume (rc.19), a recording's download | `reloadSurface.state`, `useRemoteControl.ts:9873` |
-| The next load resumes once, for the same signed-in person, through the redial's own ladder: the connect args set, the attempt count at least 1, the phase `reconnecting`, then the attempt. A first connect would start the ladder at 0, where `rc:error` gives up on `agent_offline`: a tab reloaded while its device restarted for an update would stop there. Its record is `after_drop`. A load with no resume recorded never connects by itself | `resumeAfterNewBuild`, `ui/src/views/remote/RemoteControl.vue:5500`; `resumeAfterReload`, `useRemoteControl.ts:9916`; `resumeArgsFor`, `ui/src/utils/staleBuildPolicy.ts:318` |
+| Work only this page holds keeps the redial: a transfer the redial would resume (rc.19), a recording's download | `reloadSurface.state`, `useRemoteControl.ts:9882` |
+| The next load resumes once, for the same signed-in person, through the redial's own ladder: the connect args set, the attempt count at least 1, the phase `reconnecting`, then the attempt. A first connect would start the ladder at 0, where `rc:error` gives up on `agent_offline`: a tab reloaded while its device restarted for an update would stop there. Its record is `after_drop`. A load with no resume recorded never connects by itself | `resumeAfterNewBuild`, `ui/src/views/remote/RemoteControl.vue:5500`; `resumeAfterReload`, `useRemoteControl.ts:9925`; `resumeArgsFor`, `ui/src/utils/staleBuildPolicy.ts:318` |
 | A session that ended within 5 minutes, or whose rating prompt is up, holds the page: its notice and its error are what the person is reading | `RC_ENDED_HOLD_MS`, `useRemoteControl.ts:468` |
 
 The device decides consent for the resumed session the way it would have for the redial, per device and user,
@@ -3727,38 +3727,42 @@ sequenceDiagram
     V->>V: the hold ends, the chip clears, and rc.resume goes to /api/log/browser
 ```
 
-The machine is `createSessionHold` (`ui/src/composables/rcSessionHold.ts:156`), with its clocks, timers and
+The machine is `createSessionHold` (`ui/src/composables/rcSessionHold.ts:167`), with its clocks, timers and
 socket handed in, so every row below is a unit test. The composable wires it (`ui/src/composables/useRemoteControl.ts:5593`).
 
 | Event | What the page does | Where |
 |---|---|---|
-| `rc:session.created` carries `resume_secs` | The session may be held, for that many seconds at most, capped at the agent's own 120 s. An external session (FR-52, D3) never is | `holdWindowFor`, `ui/src/composables/rcSessionHold.ts:61`; `useRemoteControl.ts:9192` |
-| This page's socket drops while the session is live, or the session goes live while it is down | The hold starts. Its deadline is the drop plus `resume_secs` plus 5 s, because a dying pod may never send `rc:session.detached` | the status watch, `useRemoteControl.ts:9980`; `:10455` |
-| `rc:session.detached {resume_by}` | The hold starts if it has not, and the chip reads `connected · server link down` with this page's socket up. The deadline becomes `resume_by` plus 5 s, and a rejoin goes out a second later | `useRemoteControl.ts:9492`; `classifyDegraded`, `:980` |
-| The socket is back | `rc:session.rejoin {session_id}` at once, on the socket that just opened | `socketUp`, `ui/src/composables/rcSessionHold.ts:251` |
-| `rc:session.detached` again, the answer to a rejoin | Asks again a second later, until the deadline. Never without an answer, so a server that drops rejoins gets one rejoin a socket | `detached`, `ui/src/composables/rcSessionHold.ts:260` |
+| `rc:session.created` carries `resume_secs` | The session may be held, for that many seconds at most, capped at the agent's own 120 s. An external session (FR-52, D3) never is | `holdWindowFor`, `ui/src/composables/rcSessionHold.ts:62`; `useRemoteControl.ts:9192` |
+| This page's socket drops while the session is live, or the session goes live while it is down | The hold starts. Its deadline is the drop plus `resume_secs` plus 5 s, because a dying pod may never send `rc:session.detached` | the status watch, `useRemoteControl.ts:9989`; `:10464` |
+| `rc:session.detached {resume_by}` | The hold starts if it has not, and the chip reads `connected · server link down` with this page's socket up. The deadline becomes `resume_by` plus 5 s, and a rejoin goes out a second later. The page also notes that the server called the session detached, until an `rc:session.resumed` or the hold's next arm or disarm, and the hold's own end leaves the note: until then no automatic redial of the session hangs up first (D5 = A, below) | `useRemoteControl.ts:9492`; `classifyDegraded`, `:980`; `deviceDetached`, `ui/src/composables/rcSessionHold.ts:309` |
+| The socket is back | `rc:session.rejoin {session_id}` at once, on the socket that just opened | `socketUp`, `ui/src/composables/rcSessionHold.ts:267` |
+| `rc:session.detached` again, the answer to a rejoin | Asks again a second later, until the deadline. Never without an answer, so a server that drops rejoins gets one rejoin a socket | `detached`, `ui/src/composables/rcSessionHold.ts:276` |
 | `rc:session.resumed` | The hold ends `resumed` and the chip clears. No `rc.connect` record, because no attempt starts | `useRemoteControl.ts:9498` |
 | `rc:terminate` | The hold ends `ended` with its reason, and the rest is today's: a retryable reason starts the ladder, a final one closes and says why. An admin's end now has a sentence (§2.5 of the spec) | `useRemoteControl.ts:9509`; `friendlyEndReason`, `:946` |
 | `rc:ended {reason, limit}` on the control channel | Read as an `rc:terminate` for the session: a retryable reason starts the ladder, a final one closes with no ladder and drops the replay arguments, so a reload resumes nothing either. The first of `rc:terminate` and `rc:ended` for a session wins, and the second does nothing. One from a peer the page has since replaced ends nothing | `onDeviceEnded`, `useRemoteControl.ts:5706`; `claimEnd`, `:5691` |
-| An `rc:error` | The server refused the rejoin: the hold ends `ended` with the code, and the page redials. A held session sends nothing but its rejoins, ICE included, so the error is never about a stray candidate | `useRemoteControl.ts:9599`; `:10434` |
-| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. A `derp` session lands here at a roll (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9762` |
-| The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts | `onExpired`, `useRemoteControl.ts:5604` |
+| An `rc:error` | The server refused the rejoin: the hold ends `ended` with the code, and the page redials. A held session sends nothing but its rejoins, ICE included, so the error is never about a stray candidate | `useRemoteControl.ts:9599`; `:10443` |
+| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. For a session the server called detached it sends no `rc:terminate controller_hangup` first (D5 = A): its device is away, so the session ended on the device's side, and the request's `replaces` ends the row as that (§11.18). A `derp` session lands here at a roll (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9771`; the skipped hangup, `:9759` |
+| The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts, with no hangup first for a session the server called detached, as above | `onExpired`, `useRemoteControl.ts:5604` |
 
 ⚠️ **`resume_by` is on the server's clock, never this browser's** (#3511). It is read once, at receipt, against
 this browser's wall clock, and what is left is bounded to `[0, resume_secs]` (`holdRemainingMs`,
-`ui/src/composables/rcSessionHold.ts:77`). A browser an hour behind the server holds `resume_secs` plus 5 s, not an
+`ui/src/composables/rcSessionHold.ts:78`). A browser an hour behind the server holds `resume_secs` plus 5 s, not an
 hour. One an hour ahead reads the deadline as past and gives up after the grace, which costs a redial and no more.
 The first `resume_by` a hold hears replaces the socket-loss fallback, and a repeated one never moves the deadline
 later, since a recount against a skewed clock would every second.
 
 **A redial names what it replaces.** A server may keep a resumable session past its viewer's socket, so a redial's
-best-effort hangup no longer frees its slot on its own: it goes nowhere while the page's socket is down.
+best-effort hangup no longer frees its slot on its own: it goes nowhere while the page's socket is down. Before a
+redial of a session the server called detached it is not sent at all (D5 = A, the operator, 2026-11-11). Its device
+is away, so a hangup could free nothing on it, and it wrote `controller_hangup` for a session nobody hung up
+(FR-138's AC4, cell (d), #3604): the request's `replaces` ends that row `agent_disconnect`, inferred, and gives
+the org's slot back before the request's gate (§11.18).
 
 | Rule | Where |
 |---|---|
-| A redial of a session the server called resumable, for any reason, keeps its id and sends it as `replaces` on every `rc:session.request` until an `rc:session.created` answers one. The hangup stays | `scheduleReconnect`, `useRemoteControl.ts:9762`; the request, `:11839`; answered, `:9193` |
-| A user's own Connect, a hangup, a failure or a final end replaces nothing, so every other request is the one a page before FR-138 sent | `useRemoteControl.ts:10116`, `:9664`, `:11953` |
-| A reload that takes a redial over (§11.15) carries the id to the next load, by shape only, and that load's first request names it. A reload of a live resumable session names that session | `withReloadReplaces`, `useRemoteControl.ts:9864`; `RcResumeArgs.replaces`, `ui/src/utils/staleBuildPolicy.ts:206`; `resumeAfterReload`, `useRemoteControl.ts:9921` |
+| A redial of a session the server called resumable, for any reason, keeps its id and sends it as `replaces` on every `rc:session.request` until an `rc:session.created` answers one. The hangup stays, except before a redial of a session the server called detached; a person's Disconnect always sends it | `scheduleReconnect`, `useRemoteControl.ts:9771`; the skipped hangup, `:9759`; the request, `:11848`; answered, `:9193`; `disconnect`, `:11949` |
+| A user's own Connect, a hangup, a failure or a final end replaces nothing, so every other request is the one a page before FR-138 sent | `useRemoteControl.ts:10125`, `:9664`, `:11962` |
+| A reload that takes a redial over (§11.15) carries the id to the next load, by shape only, and that load's first request names it. A reload of a live resumable session names that session | `withReloadReplaces`, `useRemoteControl.ts:9873`; `RcResumeArgs.replaces`, `ui/src/utils/staleBuildPolicy.ts:206`; `resumeAfterReload`, `useRemoteControl.ts:9930` |
 
 **`rc.resume`, a record of its own.** One record per hold, on the road `rc.connect` takes (`POST /api/log/browser`,
 §12.1.5), best effort and capped at 12 a minute (`buildResumeRecordUpload`, `ui/src/composables/rcResumeRecord.ts:104`).
@@ -3792,7 +3796,8 @@ What stays as it was:
 - **The redial ladder, the stage mount and `rc.connect`.** A redial is today's, with one more field on its request.
   A held session writes no `rc.connect` record, and a redial writes today's.
 - **Off is today.** With no `resume_secs` the hold is never armed: no rejoin, no deadline, `rc:session.detached`
-  ignored, no `replaces` and no `rc.resume`. A test compares the redial's request with the first one, field for field.
+  ignored, so every automatic redial hangs up first, no `replaces` and no `rc.resume`. A test compares the redial's
+  request with the first one, field for field.
 
 The tests: `rcSessionHold.spec.ts` (the machine), `useRemoteControl.hold.spec.ts` (the composable end to end, with
 a fake peer), `rcResumeRecord.spec.ts`, `rcPaintGap.spec.ts`, `rcPaintGapWorkers.spec.ts` and
@@ -3962,11 +3967,14 @@ map on every ask.
 **A held session never costs its own viewer the slot.** Before every capacity gate a request meets, the org's FR-115
 slot first (claimed before the hub's own dispatch), the pod that holds the device ends the session the redial names in
 `replaces`, and every session held for the same person on that device, and gives each one's slot back before it
-claims one (`before_request`, `crates/modules/remote/src/row_end.rs:192`; `Hub::end_replaced`,
+claims one (`before_request`, `crates/modules/remote/src/row_end.rs:203`; `Hub::end_replaced`,
 `crates/modules/fleet/src/hub/hold.rs:284`; `Hub::reap_held_for`, `:323`). The hub's own orphan reap spares a held
 session against another person's request and never takes a session with no controller for an orphan
-(`crates/modules/fleet/src/hub.rs:1642`). A redial sends `replaces` again on every attempt until it is answered,
-so it may name a session that has already ended: that ends nothing and refuses nothing, and the request goes on.
+(`crates/modules/fleet/src/hub.rs:1642`). When no pod holds the session the redial names, because its device's
+socket went (the row is detached), it ends at its row instead, as `agent_disconnect`, inferred, and its slot is given
+back there, still before the gate (D5 = A; the end table below). A redial sends `replaces` again on every attempt until it is
+answered, so it may name a session that has already ended: that ends nothing and refuses nothing, and the request
+goes on.
 
 **The FR-115 slot through a gap** (review 1: M5, L5, L2, and `refuse_claim`'s race; PR D's review: MEDIUM 1 and 2,
 LOW 4 to 7). A detached session is held by no pod, so nobody renews its lease, and that lease is its slot: a request
@@ -4035,11 +4043,12 @@ receives the event:
 
 | End | The row must name | Then |
 |---|---|---|
-| an admin's, `POST …/session/{id}/terminate` (`admin_end`, `:131`); the answer says `row_ended`. A write that failed answers 503 and asks to try again, since the device's claim may still resume the session (`Written::Failed`, `:47`; review 2, N10) | the route's org | the `terminate` control event, as before, published before the 503, so a pod that holds the session still ends it |
-| the controller's own `rc:terminate` (`controller_end`, `:156`) | the person | `controller_terminate`, which the holding pod applies only to that org and that person (`crates/modules/fleet/src/ctrl.rs:126`) |
-| a redial's `replaces` | the person and the device | `controller_terminate` |
-| the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:714`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:478`) |
-| the device's own, for a session whose end was inferred BEFORE this connection: by the sweep, or by an earlier connection's registration (review 2, N5; `earlier_inferred_end`, `crates/modules/remote/src/resume.rs:775`) | the device, and an end inferred as `registration` or `sweep` | none: as above (`replace_earlier_inferred_end`, `crates/services/src/dao/remote_session.rs:424`). Never the one-time close's rows (`backfill`): that end is an operator's, taken only once the row's own clock has stood still for an hour at least and its device has had a session since, long after any device stopped keeping the session (a window is 120 s at most), and no inference from the device's connection going |
+| an admin's, `POST …/session/{id}/terminate` (`admin_end`, `:141`); the answer says `row_ended`. A write that failed answers 503 and asks to try again, since the device's claim may still resume the session (`Written::Failed`, `:57`; review 2, N10) | the route's org | the `terminate` control event, as before, published before the 503, so a pod that holds the session still ends it |
+| the controller's own `rc:terminate` (`controller_end`, `:166`) | the person | `controller_terminate`, which the holding pod applies only to that org and that person (`crates/modules/fleet/src/ctrl.rs:126`) |
+| a redial's `replaces` of a session not detached (`before_request`, `crates/modules/remote/src/row_end.rs:203`) | the person and the device | `controller_terminate` |
+| a redial's `replaces` of a session its device's socket left detached (D5 = A; `replaced_detached`, `crates/modules/remote/src/row_end.rs:257`). The page knew, sent no hangup first, and gave the session up only once its peer went or its own deadline passed, so the session ended on the device's side | the person and the device, live and detached | `controller_terminate` with `agent_disconnect`, as insurance: the row is ended `agent_disconnect` at its own last clock (`detached_at`), marked `end_source: redial`, only as it was read (`end_replaced_detached`, `crates/services/src/dao/remote_session.rs:624`), and its FR-115 slot is given back before the request's gate. A write that matches nothing (a claim resumed the session, or the sweep ended it) takes the row above's path. ⚠️ The detach reaches the row through the audit sink, which batches for up to 200 ms, so a redial inside that gap reads the row attached and ends it `controller_hangup` |
+| the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:714`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:480`) |
+| the device's own, for a session whose end was inferred BEFORE this connection: by the sweep, by an earlier connection's registration (review 2, N5; `earlier_inferred_end`, `crates/modules/remote/src/resume.rs:775`), or by its viewer's redial while it was detached (D5 = A) | the device, and an end inferred as `registration`, `sweep` or `redial` (`inferred_by_device_loss`, `crates/services/src/dao/remote_session.rs:770`) | none: as above (`replace_earlier_inferred_end`, `crates/services/src/dao/remote_session.rs:425`). Never the one-time close's rows (`backfill`): that end is an operator's, taken only once the row's own clock has stood still for an hour at least and its device has had a session since, long after any device stopped keeping the session (a window is 120 s at most), and no inference from the device's connection going |
 
 Each writes the audit's `session_ended` as its trail, which projects nothing onto the row
 (`AuditSink::record_trail`, `crates/remote_control/src/audit.rs:100`).
@@ -4053,7 +4062,7 @@ Each writes the audit's `session_ended` as its trail, which projects nothing ont
 | live with no `resume_by`, quiet for longer than the window, on a device in the scope that the presence sweep found offline for longer than the window, or that was removed: the pod that held it died without a word, and the device has not come back | only with the window on | `stats_at`, else `started_at` |
 
 Each is `agent_disconnect` with `end_source: sweep`, written only on the row as the sweep read it: still live, at the
-`attach_seq`, the `resume_by` and the `stats_at` read (`end_swept`, `crates/services/src/dao/remote_session.rs:610`). A
+`attach_seq`, the `resume_by` and the `stats_at` read (`end_swept`, `crates/services/src/dao/remote_session.rs:612`). A
 claim that resumed the session meanwhile bumps the one and clears the other, and a session whose own clock moved is
 alive, so neither is undone. Its FR-115 slot is given back. A row outside the scope with no `resume_by` stays as it is
 until the scope reaches its device.
@@ -4112,23 +4121,23 @@ curl -sS -X POST "$SERVER/api/admin/rc-sessions/close-dead" \
 ```
 
 The growth digest counts a row with an `end_source` in its hour-weighted sums up to that inferred `ended_at`
-(`read_remote_usage`, `crates/api/src/growth/digest.rs:1702`). The row was seen alive at that clock, so the end is a
+(`read_remote_usage`, `crates/api/src/growth/digest.rs:1703`). The row was seen alive at that clock, so the end is a
 proven lower bound, and `growth_org_daily` counts the row the same way (`compute_range`,
 `crates/api/src/growth/org_daily.rs:217`), so the live digest and the nightly freeze agree. The digest leaves such a
-row out of its quality section's ends by `ended_at` (`end_was_seen`, `crates/api/src/growth/digest.rs:1698`): the end
+row out of its quality section's ends by `ended_at` (`end_was_seen`, `crates/api/src/growth/digest.rs:1699`): the end
 is no failure a pod saw, and it would land, back-dated, in a day already reported. In the quality rule such a session
 still went live and still counts as requested, but it adds no duration and its end counts as `inferred`, never as an
-`agent_disconnect` failure (`session_quality`, `crates/api/src/growth/quality.rs:200`).
+`agent_disconnect` failure (`session_quality`, `crates/api/src/growth/quality.rs:201`).
 
 **An end someone asks for never overwrites an inferred one** (review 2, N11). The audit's projection writes such an
 end (an admin's, the controller's, the device's, a consent verdict) only to a row with no `end_source`
-(`end_session`, `crates/remote_control/src/audit.rs:312`). An inferred end (the registration read's, the sweep's or the
-one-time close's) was written because the session was over, by the best evidence there was, and a later asked end can only come from a copy some pod still held of a session
+(`end_session`, `crates/remote_control/src/audit.rs:312`). An inferred end (the registration read's, the sweep's, a
+detached session's redial's or the one-time close's) was written because the session was over, by the best evidence there was, and a later asked end can only come from a copy some pod still held of a session
 already ended (a half-open socket kept it), whose reason and `now` would rewrite the row's end and leave the mark on
 it. An asked end still replaces an earlier SEEN end, as every end did before FR-138, and at window 0 that is
 load-bearing: FR-27 audits a device with no prompt surface as `consent_timeout` and then ends it `no_prompt_surface`
 on the same row (`crates/modules/fleet/src/hub.rs:2258`), and the growth digest's `by_end_reason` reads the second
-(`crates/api/src/growth/digest.rs:2357`). A filter of `ended_at: null` (first end wins) would turn every such row into
+(`crates/api/src/growth/digest.rs:2358`). A filter of `ended_at: null` (first end wins) would turn every such row into
 `consent_timeout`.
 
 | Off is today | What happens |
@@ -4136,6 +4145,7 @@ on the same row (`crates/modules/fleet/src/hub.rs:2258`), and the growth digest'
 | window 0 | no window is announced and no `resume_secs` is told; a socket loss of either end ends its sessions as before; every claim is refused at once and nothing is read; a rejoin is dropped unanswered, as an older server drops it; no end is written to a row no hub holds; the sweep ends only a row a detach marked, and a scope change is told to nobody. Review 2's one change at window 0 is N11's: an asked end leaves an inferred end alone, and at window 0 a row carries one only if a window detached it earlier or the one-time close ended it. The later edges change nothing at window 0: the stale-lease check reads no row and no scope, no row is marked `external`, no lease is kept past its expiry, and an admin's end answers as before. What makes every expiry only grow runs at every window but decides nothing at 0: only the pod that holds a session writes its lease, every writer writes 90 s from its own now, and its scores and expiries only grow, so the renewal's and the restore's `GT` and `NX` never refuse a write and the claim's `PTTL` reads never skip one (should a pod's wall clock step back by more than a renewal period, the round reads the lease as missing, and the hub, which still holds the session, restores it, keeping the later score). Each command carries one more word, and the claim script one more read; no outcome differs |
 | a device without `rc-resume`, or outside the scope | as window 0, for that device |
 | an older viewer | ignores `resume_secs` and never rejoins: its own socket's loss keeps the session for the window, which then ends it marked `hold_expired` (AC5 allows as today, or at the window), and its next request reaps it as the same person's |
+| a page from before D5 = A | hangs up before it redials a session the server called detached, so the row reads `controller_hangup`, as before: the hangup ends it first (`controller_end`), and the redial's `replaces` then finds the row ended |
 
 The integration tests are `crates/tests/src/rc_resume_claim_tests.rs` (the device's side),
 `crates/tests/src/rc_resume_rejoin_tests.rs` (the viewer's side, and the ends written to the row),
@@ -4144,7 +4154,9 @@ The integration tests are `crates/tests/src/rc_resume_claim_tests.rs` (the devic
 L1, N5, N17, N9, N11) and `crates/tests/src/rc_resume_pd_tests.rs` (the edges the reviews deferred: M5 and its
 window-0 guard, `refuse_claim`'s race, L2, L5, L6 with D3 at the claim, N10 and N14; then PR D's review: MEDIUM 1,
 LOW 4, 5, 7 and 8, the renewal's `GT`, whose removal fails a test, a session whose slot another took during the gap,
-and a viewer removed from the org during the gap, refused within 5 s). MEDIUM 2's ordering, LOW 3's fence and L13's
+and a viewer removed from the org during the gap, refused within 5 s), and `crates/tests/src/rc_resume_replaces_tests.rs`
+(D5 = A: a redial's `replaces` of a detached session, the device's own end after its hello replacing that inference,
+and an attached session held on another pod, still `controller_hangup`). MEDIUM 2's ordering, LOW 3's fence and L13's
 twin are unit tests in the hub (`crates/modules/fleet/src/hub/resume.rs`); L13's twin also passes without the fix,
 so it is a guard rather than a proof.
 
@@ -4288,7 +4300,7 @@ that dominate a relayed connect (a DERP-relayed LAN pair measured on 2026-08-29:
 ⚠️ **Marks are per ATTEMPT, never per connect.** A recorder shared across the
 ladder would let the fast retry overwrite the lost attempt's marks and report an
 18 s connect as a 3 s one — hiding the exact defect being hunted. Each retry
-calls `beginAttempt()` (`useRemoteControl.ts:10137`) and gets a fresh recorder.
+calls `beginAttempt()` (`useRemoteControl.ts:10146`) and gets a fresh recorder.
 
 ⚠️ **An unreached mark is the finding.** The console line prints it as
 `<name>:—` and the record omits the key; the first missing mark
@@ -5062,10 +5074,10 @@ to-activate, so the browser never sees a bait-and-switch.
   together therefore both failed. The field saw it 9 ms apart, and a drop
   while a long upload runs does the same. Every upload source ends in
   `uploadOne`, so it takes a place in the session's queue there
-  ([`useRemoteControl.ts:13490`](../ui/src/composables/useRemoteControl.ts#L13490),
-  `createUploadQueue` at `useRemoteControl.ts:15519`). The transfer shows
+  ([`useRemoteControl.ts:13499`](../ui/src/composables/useRemoteControl.ts#L13499),
+  `createUploadQueue` at `useRemoteControl.ts:15528`). The transfer shows
   as `queued` at once, and its `files:begin` waits until every earlier
-  upload has settled (`useRemoteControl.ts:13740`). ⚠️ The next place
+  upload has settled (`useRemoteControl.ts:13749`). ⚠️ The next place
   waits for this one's turn AND its settle.
   So an upload cancelled while queued cannot let the one behind it start
   while an earlier one is still on the wire.
@@ -5074,18 +5086,18 @@ to-activate, so the browser never sees a bait-and-switch.
   outside the active user's profile (FR-84 D4), a path that is not a
   directory, or the agent's own state. It says why only in its own log. The
   viewer learns of the fallback from the completed `path`
-  (`uploadLandedIn`, `useRemoteControl.ts:15554`, which compares whole segments:
+  (`uploadLandedIn`, `useRemoteControl.ts:15563`, which compares whole segments:
   `/tmp/x` does not hold `/tmp/xy`). A file that landed outside the folder
   the person chose is a warning that names where it went
-  (`uploadOutcomeMessage`, `useRemoteControl.ts:15580`), not "Uploaded".
+  (`uploadOutcomeMessage`, `useRemoteControl.ts:15589`), not "Uploaded".
   **A success says where, too** (#3048): "Uploaded report.pdf to
   `C:\Users\ana\Downloads`", and "Uploaded 3 files to `\\server\share\…\Downloads`"
-  for several in one folder (`useRemoteControl.ts:15614-15623`). On a
+  for several in one folder (`useRemoteControl.ts:15623-15632`). On a
   machine-wide Windows install that folder is the signed-in person's own
   Downloads, which Folder Redirection may have moved to a share, and the
   viewer is where the controller learns that path. The folder is `path`
   without the uploaded name's tree (`uploadLandingFolder`,
-  `useRemoteControl.ts:15565`), read without a verbatim prefix:
+  `useRemoteControl.ts:15574`), read without a verbatim prefix:
   `\\?\UNC\server\share` reads `\\server\share`. Files that landed in more
   than one folder say "to 2 folders (first: …)".
 - **Remote Apps on the control DC** (FR-56, [`remote-apps.md`](remote-apps.md)):
@@ -5431,7 +5443,7 @@ from (`ui/src/workers/rc-decoder-config.ts:38`). The override wins over whatever
 | | |
 |---|---|
 | **Paths** | both decode workers: `rc-dc-worker` (every codec over the data channel; until FR-135 R3 this was `rc-vp9-444-worker` for VP9, AV1 and H.264 and `rc-hevc-worker`, §11.14) and `rc-webcodecs-worker` (the RTP transform; its flag rides the transform's options, because the transform can start before the canvas arrives). The `<video>` element has no such control and decodes true once the agent describes its stream (FR-130 P1) |
-| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11725`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
+| **Sessions** | every one, from every agent (`ui/src/composables/useRemoteControl.ts:11734`). Every agent so far converts with BT.601 limited, the oldest included. For VP9 this is the only fix: Chrome's WebCodecs ignores VP9's own colour space ([FR-130 §2.5](fr/FR-130-colours-decode-true.md#25-p0-what-chrome-does-with-each-description-2026-10-30)) |
 | **Kill switch** | `localStorage.setItem('roomler-rc-colorspace', 'off')`, then reconnect (`ui/src/composables/useRemoteControl.ts:4432`). The decoders are no longer told, and the console says so at connect |
 | **A browser that refuses it** | keeps its picture (`ui/src/workers/rc-decoder-config.ts:93`). A `configure()` that throws on the colour space goes again without it. A decoder that fails before its first frame with it set is rebuilt once without it, and it waits for a key frame, which it asks the agent for. One console line names the case: `decoder colour space dropped (FR-130 P2)` |
 | **Reading it** | each worker's `decoder configured` line in the console names the colour space `configure()` was told, and its `first frame` line the one the decoder says it produced. With the override, that is `matrix=smpte170m primaries=bt709 transfer=iec61966-2-1 range=limited` |
