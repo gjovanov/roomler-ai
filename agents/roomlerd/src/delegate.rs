@@ -2967,6 +2967,132 @@ mod tests {
         });
         assert!(heard.try_recv().is_err(), "the binding is gone");
     }
+
+    /// FR-138 P2b, over #3706 — one caps frame through both of the daemon's
+    /// known-words filters: `keep-delegated` survives, so a P2b worker is
+    /// still one (without it P2b would silently never engage), and a feature
+    /// word this build does not know is dropped, a near miss of the word too,
+    /// as #3706 drops a capability word it does not know.
+    #[tokio::test]
+    async fn p2b_the_keep_word_passes_the_workers_known_words_and_an_unknown_word_does_not() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached_worker(&host).await;
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into(), "everything".into()],
+                ..Default::default()
+            }),
+            features: vec![
+                "keep-delegated-v2".into(),
+                KEEP_DELEGATED.to_string(),
+                "x".repeat(1 << 16),
+                KEEP_DELEGATED.to_string(),
+                "KEEP-DELEGATED".into(),
+            ],
+        };
+        write_frame(&mut cwr, &frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(host.worker_keeps(), "the word survives the worker's words");
+        assert_eq!(
+            host.effective_record(),
+            Some(vec!["remote".to_string()]),
+            "#3706's filter acts on the same frame"
+        );
+        assert_eq!(
+            *host
+                .inner
+                .worker_features
+                .lock()
+                .expect("worker features mutex"),
+            vec![KEEP_DELEGATED.to_string()],
+            "the known word, once; nothing else"
+        );
+
+        let unknown = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps::default()),
+            features: vec!["keep-delegated-v2".into(), "keep".into()],
+        };
+        write_frame(&mut cwr, &unknown).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        assert!(matches!(next_frame(&mut lines).await, DelegateFrame::Pong));
+        assert!(!host.worker_keeps(), "a near miss is not the word");
+        assert!(
+            host.inner
+                .worker_features
+                .lock()
+                .expect("worker features mutex")
+                .is_empty(),
+            "an unknown word is dropped"
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
+    /// FR-138 P2b, over #3706 — a channel #3706 closes over its line limit
+    /// ends what P2b held as every other end does, because `serve` runs
+    /// `records_channel_ended` after `run` however it ended: the attach
+    /// generation moves on, the bound record hears its session end as
+    /// `error` (D6), its binding goes, and the worker's word with it. #3706's
+    /// own clear of the worker's words holds beside it.
+    #[tokio::test]
+    async fn p2b_a_channel_closed_over_the_line_limit_ends_what_p2b_held() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let caps = DelegateFrame::WorkerCaps {
+            caps: Box::new(AgentCaps {
+                record: vec!["remote".into()],
+                ..Default::default()
+            }),
+            features: vec![KEEP_DELEGATED.to_string()],
+        };
+        write_frame(&mut cwr, &caps).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+        assert!(host.worker_keeps(), "a P2b worker is attached");
+        let session = bson::oid::ObjectId::new();
+        let (link, mut heard) = tokio::sync::mpsc::channel(8);
+        host.bind(session.to_hex(), link);
+        let before = host.generation();
+
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; DELEGATE_LINE_MAX + 1]).await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed");
+        task.await.unwrap();
+
+        assert_eq!(
+            host.generation(),
+            before + 1,
+            "the attach generation moves on"
+        );
+        let said = heard.try_recv().ok();
+        assert!(
+            matches!(
+                said,
+                Some(ClientMsg::Terminate {
+                    session_id,
+                    reason: roomler_ai_remote_control::models::EndReason::Error,
+                    ..
+                }) if session_id == session
+            ),
+            "D6: the bound record's session ends as error: {said:?}"
+        );
+        assert!(
+            !host.worker_keeps(),
+            "the worker's word goes with its channel"
+        );
+        assert_eq!(host.effective_record(), None, "#3706's clear holds");
+        host.relay_upstream(ClientMsg::Ice {
+            session_id: session,
+            candidate: serde_json::Value::Null,
+        });
+        assert!(heard.try_recv().is_err(), "the binding is gone");
+        drop(writer);
+    }
 }
 
 #[cfg(all(test, unix))]
