@@ -13203,14 +13203,31 @@ async fn handle_files_control(
             // cancel_incoming clears upload state + removes the
             // .roomler-partial/<id>/ staging dir + registry entry so
             // the partial doesn't sit until the 24h orphan sweep.
-            // Browsers send files:cancel on terminal upload failure
-            // (6 reconnect attempts exhausted).
+            // The viewer sends files:cancel to stop a download; for an
+            // upload only when its resume loop gives up, which since
+            // rc.23's endless retry it never does.
             let out_cancelled = handler.cancel_outgoing(&id).await;
-            let in_cancelled = handler.cancel_incoming(&id).await;
-            info!(
-                %session_id, %id, out_cancelled, in_cancelled,
-                "files: cancel requested"
-            );
+            // #3688 — an upload's id is one plain name
+            // (`files::transfer_id`): any other is refused, and the viewer
+            // told, as at files:begin and files:resume.
+            match handler.cancel_incoming(&id).await {
+                Ok(in_cancelled) => info!(
+                    %session_id, %id, out_cancelled, in_cancelled,
+                    "files: cancel requested"
+                ),
+                Err(e) => {
+                    warn!(%session_id, %id, out_cancelled, %e, "files: cancel refused");
+                    let msg = format!("{e}");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: &msg,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
         crate::files::FilesIncoming::Dir { req_id, path } => {
             if !crate::files::is_remote_browse_enabled() {

@@ -573,6 +573,21 @@ are the daemon, both ways. Only root sets that switch, in the service's own
 environment (a systemd drop-in); remote config cannot reach it
 ([`desktop-companion.md`](desktop-companion.md) §9.4).
 
+### An upload's id is one plain name (#3688)
+
+The viewer chooses an upload's `id`, and the daemon names the upload's staging
+folder after it. So the id is one plain name: letters, digits, `.`, `_` and
+`-`, not starting with `.`, at most 128 bytes (`transfer_id`,
+`agents/roomlerd/src/files.rs:1281`). Every entry that takes an id from the
+files channel checks it first, on every OS and before anything on disk is
+touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
+other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
+which builds the staging path, refuses one too, so a new verb that forgets the
+check still builds no path from it. The viewer's own ids
+(`up-<base36>-<base36>`) are such names. A download's id (`files:get`,
+`files:get-folder`) names no path and is only echoed back. Pinned by
+`files::transfer_id_tests`, one test per entry.
+
 ### An enrollment token is spent once, through one owner (#3328)
 
 **A single-use enrollment token enrolls once**, at every door: the daemon's
