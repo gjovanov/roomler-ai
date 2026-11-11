@@ -281,7 +281,7 @@ fn sweep_vacated_dir(dir: &Path, report: &mut CleanupReport, dry_run: bool) {
     // Paranoia guard: never sweep the directory we are running from.
     if let Ok(own) = std::env::current_exe()
         && let Some(own_dir) = own.parent()
-        && same_dir(own_dir, &dir)
+        && same_dir(own_dir, dir)
     {
         report.skipped.push(format!(
             "vacated-dir sweep: {} is the running exe's own directory — skipped",
@@ -307,7 +307,7 @@ fn sweep_vacated_dir(dir: &Path, report: &mut CleanupReport, dry_run: bool) {
             }
         }
     }
-    match std::fs::remove_dir(&dir) {
+    match std::fs::remove_dir(dir) {
         Ok(()) => report
             .removed
             .push(format!("vacated install dir {}", dir.display())),

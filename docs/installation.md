@@ -1459,6 +1459,30 @@ beside `stderr_capture` (`.github/workflows/ci.yml:1646`). In `roomlerd`,
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7844`)
 pin the role per command and the end line of a failure.
 
+### Where a step on the service account finds its folders (#3702)
+
+A step of the per-Machine package and a daemon on the service account (LocalSystem) take every
+folder they name from the system, never from the environment they were started with.
+
+| What | Where it comes from | Code |
+|---|---|---|
+| The folder variables of a process on the service account | Set first thing in `main`, before the process has a second thread: the machine's (`ProgramData`, `ProgramFiles` and the rest) from the kernel and the machine's registry, and `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` of the service account's own profile. A process on any other account keeps the environment the system gave it. | `crates/agent-core/src/appdirs.rs:300`, `agents/roomlerd/src/app.rs:1369` |
+| The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:201`, `crates/agent-core/src/appdirs.rs:212` |
+| The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:263`, `crates/agent-core/src/appdirs.rs:222` |
+| The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:952` |
+| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile (on Unix the home) the system names for the account the process runs as, by no link below it (`migrate_dir_within`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:724`, `crates/agent-core/src/appdirs.rs:731`, `crates/agent-core/src/appdirs.rs:581`, `crates/agent-core/src/appdirs.rs:849`, `crates/agent-core/src/appdirs.rs:689` |
+| The one-time sweep of the vacated install folder | Rooted as above; a folder that is a link, or sits below one, is left as it is. | `agents/roomlerd/src/install_cleanup.rs:266` |
+
+**The rule for a service's `Environment` entry.** A variable that this pin sets, named in a
+service's `Environment` value, is replaced for the service account by the folder the system
+names: a daemon on the service account takes its folders from the system whatever its service
+entry says. A process on any other account keeps what its entry gives it.
+
+A source test, `folder_gate::only_appdirs_reads_a_folder_variable`
+(`crates/agent-core/src/folder_gate.rs`), holds every other file of `roomler-node-core` and
+`roomlerd` to this: only `appdirs.rs`, and the two readers its list names with the reason each
+is kept, read a folder variable.
+
 ## Linux
 
 ```bash
