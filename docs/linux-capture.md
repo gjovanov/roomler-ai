@@ -1277,7 +1277,7 @@ answers without asking anyone — exactly the restore-token case.
 
 The daemon side is `PortalCapture::open` (`portal/backend.rs:117`). It reads
 the handshake under a **120 s deadline** (`HANDSHAKE_DEADLINE`,
-`backend.rs:735`) because a portal `Start` blocks until the dialog is answered
+`backend.rs:771`) because a portal `Start` blocks until the dialog is answered
 and `open_default` runs synchronously on a media-pump worker — an unanswered
 dialog fails the open with *"a consent dialog left unanswered, most likely"*
 and the cascade falls through, instead of parking that worker forever. Frames
@@ -1317,7 +1317,7 @@ checked before the daemon acts on it:
 
 | What the daemon reads | The limit | Over it | Where |
 |---|---|---|---|
-| A frame | The payload is exactly its header's rows, `stride × height` bytes (256 MiB at most), in a pixel format the daemon knows | The frame is refused before its payload is read. The refusal is the reason the capture ends, and the media pump logs it as it rebuilds the capturer | `FrameHeader::decode`, `portal/wire.rs:114`; `read_frame`, `portal/backend.rs:551`; `stream_end`, `backend.rs:714` |
+| A frame | The payload is exactly its header's rows, `stride × height` bytes (256 MiB at most), in a pixel format the daemon knows | The frame is refused before its payload is read. The refusal is the reason the capture ends, and the media pump logs it as it rebuilds the capturer | `FrameHeader::decode`, `portal/wire.rs:114`; `read_frame`, `portal/backend.rs:587`; `stream_end`, `backend.rs:750` |
 | A frame, the helper's half | The helper sends exactly those rows: a longer buffer is cut after the last row, a buffer missing only the last row's padding gets it as zeros, and a shorter one is sent as it is, for the daemon to refuse | — | `payload`, `portal/wire.rs:136`, called at `portal/pipewire.rs:830` |
 | The handshake | At most 64 lines, each at most 64 KiB (`HANDSHAKE_LINE_MAX`), the size FR-142 gives a control frame. The longest legitimate line is the failure reason, one sentence; a `StreamStarted` line is about 200 bytes | The open fails with the limit named | `read_stream_handshake`, `portal/mod.rs:1212`; the line reader, `line_limit.rs:85` |
 | A one-shot answer: the probe, the screencast session report, the notification probe | 64 KiB in all (`ANSWER_MAX`), the handshake line's limit. The largest answer, the session report, is about 1 KiB | The caller is told why. The rest of the output is read and dropped, so the helper never waits on a full pipe | `read_answer`, `portal/mod.rs:1483`; `spawn_in_session`, `:1463` |
@@ -1468,7 +1468,7 @@ time, and `CreateSession` timed out activating `…impl.portal.desktop.gnome`.
 ### 4.6 One request per host, and an open that holds no worker (FR-93 P2d)
 
 An attended open shows the person at the screen a dialog and waits for them for
-up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:735`). The FR-93 lab ran
+up to `HANDSHAKE_DEADLINE` (120 s, `portal/backend.rs:771`). The FR-93 lab ran
 the portal automatically on KDE and measured what that did with nobody answering:
 
 - **A dialog storm.** The viewer's media watchdog re-creates a session that has
@@ -1478,7 +1478,7 @@ the portal automatically on KDE and measured what that did with nobody answering
   session already gone, with the sharing indicator on.
 - **A held worker, then a dead daemon.** The pumps called
   `capture::open_default` inline, so each unanswered dialog blocked one runtime
-  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:189`). Four of
+  worker for the whole wait (`hs_rx.recv_timeout`, `backend.rs:200`). Four of
   them is every worker of a 4-core host. Measured on the released **0.4.130**
   (the KDE guest, 4 cores, `portal_capture` on, one viewer trying):
   - The viewer's watchdog re-created the session 4 times in 30 s, raising 4
