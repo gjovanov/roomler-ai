@@ -258,6 +258,30 @@ back into.
 feed; the wizard lane's `refresh-release-cache` busts it, and the 15 min TTL is
 the backstop.
 
+**The SourceForge listing follows the wizard release by itself (FR-143).** When
+the wizard lane finishes on a `setup-v*` ref, `sourceforge-publish.yml` uploads
+that release's 16 assets, moves the listing's Windows, macOS and Linux Download
+defaults to it and removes versions older than the newest 10. Nothing to do at a
+cut. A failure opens a "SourceForge publish failed" issue and the next green
+publish closes it; `roomler.ai` is never affected. Runbook, the two secrets and
+the manual fallback: `docs/sourceforge.md`.
+⚠️ It needs the secrets `SOURCEFORGE_SSH_KEY` and `SOURCEFORGE_API_KEY`. Without
+them a run warns "SourceForge publish is not configured" and skips, and the
+listing stays on the release someone last moved it to by hand.
+
+```bash
+# After a cut: all four entries name setup-v<V> within ~15 min of the wizard run
+curl -s https://sourceforge.net/projects/roomler-ai/best_release.json \
+  | jq '{generic: .release.filename} + (.platform_releases | map_values(.filename))'
+# Re-publish by hand (idempotent), or rehearse with -f dry_run=true
+gh workflow run sourceforge-publish.yml -f tag=setup-v<V>
+```
+
+⚠️ **Never reconnect SourceForge's "GitHub Releases Integration".** It is a
+webhook on every `release` event with no filter, and `seed-cache` is a release:
+it mirrored the 31 GiB CI cache, re-imported it about 500 times a day, and took
+the listing to 85.5 GB against a 5 GB limit (2026-11-11).
+
 ⚠️ **`scripts/install.sh` ships on two trains (FR-129 B1).** The server compiles
 it in and serves it as `/api/setup/install.sh`
 (`crates/modules/fleet/src/setup_release.rs:346`), so the **terminal's** copy
@@ -269,8 +293,9 @@ the newest wizard come from different commits, which during a promote hold can
 last weeks. (`agents/roomlerd/src/updater.rs` includes it too, in a test only.)
 ⚠️ Both copies install the **newest** packages (`/api/agent/latest-release`), and a
 wizard someone downloaded keeps running its own copy for as long as the download
-is kept: an admin's share, or the SourceForge default, which stays on a pinned
-`setup-v` until someone moves it. So everything the script assumes about a package
+is kept: an admin's share, or one of the ten wizards SourceForge keeps (and its
+Download default, which stays on an older `setup-v` for as long as the publish
+above is failing). So everything the script assumes about a package
 is a compatibility surface: the asset names it matches, the macOS marker that must
 exist before the `.pkg` (`/etc/roomler/enable-daemon`), what the postinstall does
 with it, and the `adopt-enrollment` verb. A package that changes one of these must
