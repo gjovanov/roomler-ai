@@ -3456,11 +3456,9 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// the enrolled config here; the worker's resolution ladder consults
 /// it ahead of the (never-populated) SYSTEM-profile default.
 ///
-/// Windows-only — there is no machine-global config concept on
-/// Linux/macOS (the agent there is perUser). Returns `None` if
-/// `%PROGRAMDATA%` can't be resolved (it always can on a sane
-/// Windows install; the `C:\ProgramData` literal is the documented
-/// fallback used elsewhere in the crate).
+/// Windows-only. The folder is rooted in the machine's `ProgramData`
+/// as the system names it ([`crate::appdirs::machine_program_data`]),
+/// never in a variable, so every account's process names the same file.
 ///
 /// #3609 — the folder, this file, its `.prev` and its keys are kept to SYSTEM
 /// and Administrators by [`crate::machine_tree`]: every save repairs the chain

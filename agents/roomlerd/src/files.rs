@@ -887,8 +887,8 @@ pub(crate) fn stage_in_programdata() -> bool {
 /// one only where that tree already exists). Do NOT restate it as a literal —
 /// FR-21 P4 fixed a viewer that did exactly that.
 /// SYSTEM-writable, persistent across reboots, present on every Windows
-/// install. Falls back to `C:\ProgramData` when the env var is unset
-/// (matches the rc.21 download_dir() fallback shape).
+/// install. Rooted in the machine's `ProgramData` folder as the system
+/// names it (`appdirs::machine_program_data`), never in a variable.
 #[cfg(target_os = "windows")]
 pub(crate) fn staging_root_windows() -> PathBuf {
     crate::appdirs::machine_global_dir().join("staging")

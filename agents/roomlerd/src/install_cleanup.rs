@@ -714,9 +714,9 @@ mod tests {
     // ── P4b vacated-dir sweep ─────────────────────────────────────
 
     /// The sweep targets the LEGACY folder name under the flavour's
-    /// root. Env-var roots are always set on a real Windows session
-    /// (and the Windows CI runners), so suffix asserts are
-    /// host-state-independent.
+    /// root: the account's own `LocalAppData` known folder for perUser,
+    /// the machine's `Program Files` as the system names it for
+    /// perMachine. Both are named on every Windows host.
     #[cfg(target_os = "windows")]
     #[test]
     fn vacated_dir_derives_legacy_name_per_flavour() {
