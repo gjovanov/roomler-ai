@@ -365,7 +365,7 @@ mod tests {
     fn the_machine_folders_a_step_names_come_from_the_system() {
         const ANSWER: &str = "ROOMLER_TEST_MACHINE_ROOTS=";
         const CHILD: &str = "ROOMLER_TEST_MACHINE_ROOTS_CHILD";
-        let mut roots = vec![
+        let roots = vec![
             crate::appdirs::machine_global_dir(),
             path(),
             crate::updater::install_dir_with_name(
@@ -375,7 +375,11 @@ mod tests {
             .unwrap_or_default(),
         ];
         #[cfg(feature = "system-context")]
-        roots.push(crate::system_context::peer_presence::marker_path());
+        let roots = {
+            let mut roots = roots;
+            roots.push(crate::system_context::peer_presence::marker_path());
+            roots
+        };
         let answer = format!("{ANSWER}{roots:?}");
         if std::env::var_os(CHILD).is_some() {
             println!("{answer}");
