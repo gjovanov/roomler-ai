@@ -52,7 +52,7 @@ them, exactly as if they had saved it themselves, and you can pull back or
 browse only what they may open. With nobody signed in at the screen, pulling
 back and browsing are refused, and the session says why. On Windows sending is
 refused too; on Linux the file lands in the service's own folder, never in a
-folder you chose.
+folder you chose or the one the machine's owner set.
 
 On a Linux server where nobody signs in at the screen, its administrator can
 turn this off for that one machine. File transfer there then works with the

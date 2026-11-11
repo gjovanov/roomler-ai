@@ -241,7 +241,8 @@ fn process_home() -> Option<String> {
 /// (`fs_identity::FsIdentity::begin_reading`), and each handle held to what
 /// was asked, off the kernel's own file systems ([`held_to_the_person`]).
 /// With nobody there a read is refused, and a received file is the daemon's
-/// but never in a folder a controller chose ([`FsAs::DaemonAlone`]).
+/// but in the default folder: never in a folder a controller chose, nor in
+/// the configured one ([`FsAs::DaemonAlone`]).
 /// `ROOMLERD_FILES_AS_SEAT_USER=0` gives back the daemon's identity both
 /// ways.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,8 +255,10 @@ pub(crate) enum FsAs {
     /// (Linux root, a received file) nobody at seat0 (#3688): written as the
     /// daemon, as [`Self::Daemon`] is, but never in a folder a controller
     /// chose: FR-84 D4's rule, "with nobody signed in, nowhere a controller
-    /// chose" ([`check_dest_placement`]). Only a write takes it; a read with
-    /// nobody there is [`Self::Nobody`].
+    /// chose" ([`check_dest_placement`]). Nor in the configured folder: its
+    /// writer has no active home ([`Self::writer`]), so the drop lands in
+    /// the default folder. Only a write takes it; a read with nobody there
+    /// is [`Self::Nobody`].
     #[cfg(target_os = "linux")]
     DaemonAlone,
     /// (Linux root) the person signed in at seat0.
@@ -583,13 +586,19 @@ impl FsAs {
     /// daemon is still privileged, and the person's home is the active one.
     fn writer(&self) -> files_dir::Writer {
         match self {
-            // #3688 — nobody at seat0 keeps the daemon's writer: the
-            // configured folder's gates (set, use, the status card, the
-            // sweep) are unchanged; only a controller's chosen folder is
-            // refused, before it is touched ([`resolve_dest_path_as`]).
             Self::Daemon => writer_context(),
+            // #3688 — nobody at seat0: the daemon's writer with no active
+            // home, as a SYSTEM worker's with nobody signed in. `~` has no
+            // home to expand against, and a root daemon's folders none to
+            // sit in, so no configured folder passes its gates (set, use,
+            // the status card, the sweep) and a drop lands in the default
+            // folder. A controller's chosen folder is refused before it is
+            // touched ([`resolve_dest_path_as`]).
             #[cfg(target_os = "linux")]
-            Self::DaemonAlone => writer_context(),
+            Self::DaemonAlone => files_dir::Writer {
+                active_home: None,
+                ..writer_context()
+            },
             #[cfg(target_os = "linux")]
             Self::Person { home, .. } => files_dir::Writer {
                 privileged: true,
@@ -697,7 +706,7 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             tracing::debug!(
                 %why,
                 "files: nobody at seat0 — received files are written as the daemon, \
-                 never in a folder a controller chose"
+                 in the default folder"
             );
             FsAs::DaemonAlone
         }
@@ -3740,8 +3749,11 @@ async fn download_dir_for(who: &FsAs) -> Result<PathBuf> {
 fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
     match who {
         FsAs::Daemon => download_dir(),
+        // #3688 — nobody at seat0: the configured folder is checked with no
+        // active home ([`FsAs::writer`]), so it never resolves in the
+        // daemon's own home, and the drop lands in the default folder.
         #[cfg(target_os = "linux")]
-        FsAs::DaemonAlone => download_dir(),
+        FsAs::DaemonAlone => download_dir_with(&who.writer()),
         #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => {
             if let Some(raw) = configured_files_dir() {
@@ -3813,9 +3825,14 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
 }
 
 fn download_dir() -> Result<PathBuf> {
+    download_dir_with(&writer_context())
+}
+
+/// [`download_dir`] for `writer`: the configured folder when it passes for
+/// it, else the default ladder.
+fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
     if let Some(raw) = configured_files_dir() {
-        let writer = writer_context();
-        match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
+        match files_dir::validate(&raw, writer, &files_dir::Rules::from_env()) {
             Ok(dir) => return Ok(dir),
             Err(e) => tracing::warn!(
                 files_dir = %raw,
