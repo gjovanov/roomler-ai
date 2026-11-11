@@ -625,19 +625,6 @@ async fn run_install_inner(
         elevated_here(),
     )
     .map_err(crate::machine_write::Failure::fail)?;
-    // rc.52: for the SystemContext flavour, lock down %PROGRAMDATA%\roomler\
-    // with an inheritable SYSTEM+Administrators DACL before the config is
-    // written, here when this process writes it (the step does the same before
-    // it reads the config). #3609: the parent is taken for Administrators by
-    // handle first, so the seal, which names it by path, finds a plain folder
-    // that is Administrators' (a person's daemon may have made it).
-    // Best-effort: a failure is said, and the install goes on.
-    #[cfg(target_os = "windows")]
-    if is_system_context && writer.is_local() {
-        for message in crate::machine_write::seal_parent(&config_path) {
-            emit(on_event, ProgressEvent::PreflightWarning { message });
-        }
-    }
     // FR-102 P3 — the wizard says so itself, in-process: `wizard`, with the
     // scope its role installs (`Role::install_scope`). A daemon role always
     // has one; the `None` arm is the tunnel role, which never reaches here.
@@ -677,6 +664,21 @@ async fn run_install_inner(
         .map_err(crate::machine_write::Failure::fail)?;
     for message in prepared.warnings {
         emit(on_event, ProgressEvent::PreflightWarning { message });
+    }
+    // rc.52: for the SystemContext flavour, lock down %PROGRAMDATA%\roomler\
+    // with an inheritable SYSTEM+Administrators DACL before the config is
+    // written, here when this process writes it (the step does the same). #3609:
+    // the parent is taken for Administrators by handle first, so the seal,
+    // which names it by path, finds a plain folder that is Administrators' (a
+    // person's daemon may have made it). #3666: only once the config was read
+    // as found (`writer.prepare`): sealed first, a parent another account made
+    // would read as the machine's, and a sealed folder moved into it would be
+    // folded. Best-effort: a failure is said, and the install goes on.
+    #[cfg(target_os = "windows")]
+    if is_system_context && writer.is_local() {
+        for message in crate::machine_write::seal_parent(&config_path) {
+            emit(on_event, ProgressEvent::PreflightWarning { message });
+        }
     }
     // #3116 — a config was already here: a reinstall, whose MSI restarted the
     // service onto it before the write below (step 7a).

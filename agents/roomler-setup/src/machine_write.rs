@@ -510,14 +510,6 @@ pub fn serve<R: BufRead, W: Write>(
         }
         Err(end) => return end,
     }
-    #[allow(unused_mut)]
-    let mut sealed = Vec::new();
-    // The parent taken and sealed, as an elevated wizard does, here and only
-    // for the machine's own config.
-    #[cfg(target_os = "windows")]
-    if config_path == roomlerd::config::machine_global_config_path().as_path() {
-        sealed = seal_parent(config_path);
-    }
     let found = match prepare(config_path) {
         Ok(found) => found,
         Err(failure) => {
@@ -525,8 +517,16 @@ pub fn serve<R: BufRead, W: Write>(
             return Served::Failed;
         }
     };
+    #[allow(unused_mut)]
     let mut prepared = found.prepared;
-    prepared.warnings.splice(0..0, sealed);
+    // The parent taken and sealed, as an elevated wizard does, here and only
+    // for the machine's own config. #3666: only once the config was read as
+    // found (`prepare`): sealed first, a parent another account made would
+    // read as the machine's, and a sealed folder moved into it would be folded.
+    #[cfg(target_os = "windows")]
+    if config_path == roomlerd::config::machine_global_config_path().as_path() {
+        prepared.warnings.splice(0..0, seal_parent(config_path));
+    }
     if send(writer, &Answer::Prepared(prepared)).is_err() {
         return Served::HungUp;
     }
