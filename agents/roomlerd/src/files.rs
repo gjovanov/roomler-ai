@@ -235,6 +235,15 @@ fn process_home() -> Option<String> {
 /// #3669 — a viewer's reads there take the same person ([`FsAs::for_read`]):
 /// a download, a folder download and the drawer's listing open everything
 /// they touch as them, and with nobody signed in they are refused.
+///
+/// #3688 — so do a viewer's reads on a Linux system install: the person at
+/// seat0, each step with the thread's effective capabilities emptied
+/// (`fs_identity::FsIdentity::begin_reading`), and each handle held to what
+/// was asked, off the kernel's own file systems ([`held_to_the_person`]).
+/// With nobody there a read is refused, and a received file is the daemon's
+/// but never in a folder a controller chose ([`FsAs::DaemonAlone`]).
+/// `ROOMLERD_FILES_AS_SEAT_USER=0` gives back the daemon's identity both
+/// ways.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
     /// This process: every macOS install, every user install, a Windows
@@ -274,8 +283,6 @@ pub(crate) enum FsAs {
     /// session: every step is refused with [`NOBODY_SIGNED_IN`]. (Linux root,
     /// a read) nobody at seat0 (#3688): every read is refused, saying so.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    // RED (#3688): a read takes it once the read side lands.
-    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     Nobody,
 }
 
@@ -290,8 +297,6 @@ pub(crate) enum Caps {
     /// Emptied for the step and given back after it: a read's, which may
     /// name any path. The thread is still root by its euid, so it reads
     /// with the person's rights and no capability on top of them.
-    // RED (#3688): a read takes it once the read side lands.
-    #[cfg_attr(not(test), allow(dead_code))]
     Empty,
 }
 
@@ -316,16 +321,29 @@ pub(crate) const NOBODY_SIGNED_IN: &str =
 /// #3669 — why a download (a file, or a folder as one zip) is refused on a
 /// machine-wide Windows install with nobody signed in. The viewer shows it in
 /// its `files:error`.
+#[cfg(not(target_os = "linux"))]
 pub(crate) const NOBODY_SIGNED_IN_TO_SEND: &str =
     "Nobody is signed in to this computer to send the file";
 
+/// #3688 — the same on a Linux system install with nobody at seat0. The rule
+/// there is the screen: someone signed in over SSH is not at it.
+#[cfg(target_os = "linux")]
+pub(crate) const NOBODY_SIGNED_IN_TO_SEND: &str =
+    "Nobody is signed in at this computer's screen to send the file";
+
 /// #3669 — why the drawer lists nothing on a machine-wide Windows install
 /// with nobody signed in. The viewer shows it in its `files:dir-error`.
+#[cfg(not(target_os = "linux"))]
 pub(crate) const NOBODY_SIGNED_IN_TO_BROWSE: &str =
     "Nobody is signed in to this computer to browse its files";
 
+/// #3688 — the same on a Linux system install with nobody at seat0.
+#[cfg(target_os = "linux")]
+pub(crate) const NOBODY_SIGNED_IN_TO_BROWSE: &str =
+    "Nobody is signed in at this computer's screen to browse its files";
+
 /// #3669 — whether `e` is, anywhere in its chain, an access refusal.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn is_permission_denied(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| {
         cause
@@ -377,20 +395,38 @@ impl FsAs {
     /// #3669 — who a read starting now (a download, a folder download, a
     /// listing) runs as: on a machine-wide Windows install, the person a
     /// write takes, by the same function, so a read and a write cannot take
-    /// different people; everywhere else the daemon, as before. A Windows
-    /// test stands a reader in for this answer (`stand_in::reader`), so its
-    /// entry points are tested with the person, not only the daemon.
+    /// different people. #3688 — on a Linux system install, the person at
+    /// seat0 a write takes, by the same rule ([`linux_fs_as`]), each step
+    /// with no capability; nobody there, or a seat0 lookup that does not
+    /// answer within [`SEAT_LOOKUP_WAIT`], refuses the read. macOS and user
+    /// installs read as the daemon, as before. A test stands a reader in for
+    /// this answer (`stand_in::reader`), so the entry points are tested with
+    /// the person, not only the daemon.
     pub(crate) async fn for_read() -> Self {
-        #[cfg(all(test, target_os = "windows"))]
+        #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
         if let Some(who) = stand_in::reader_now() {
             return who;
         }
+        #[cfg(target_os = "linux")]
+        {
+            let (root, switch_on) = linux_process();
+            if !(root && switch_on) {
+                return Self::Daemon;
+            }
+            // Off the async worker, and bounded: logind and the account
+            // database are other processes, and either may hang.
+            let seat = seat_within(SEAT_LOOKUP_WAIT, seat_now).await;
+            linux_fs_as(root, switch_on, true, move || seat)
+        }
+        #[cfg(not(target_os = "linux"))]
         Self::session_or_daemon()
     }
 
     /// #3048 — on Windows, the person signed in to this process's session
     /// when it is LocalSystem (or cannot tell, #3669), nobody when no one is;
     /// the daemon itself otherwise, or with `ROOMLERD_FILES_AS_SEAT_USER=0`.
+    /// macOS: the daemon. Linux asks [`linux_fs_as`] instead.
+    #[cfg(not(target_os = "linux"))]
     fn session_or_daemon() -> Self {
         #[cfg(target_os = "windows")]
         {
@@ -408,13 +444,19 @@ impl FsAs {
 
     /// #3669 — a read is refused before anything is touched when nobody is
     /// signed in on a machine-wide Windows install; `why` is what the viewer
-    /// is told.
+    /// is told. #3688 — and on a Linux system install with nobody at seat0,
+    /// a received file's answer for that ([`Self::DaemonAlone`]) included:
+    /// it is the daemon's identity, which no read there takes.
     fn refuse_read(&self, why: &'static str) -> Result<()> {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if matches!(self, Self::Nobody) {
             return Err(anyhow!(why));
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::DaemonAlone) {
+            return Err(anyhow!(why));
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = why;
         Ok(())
     }
@@ -424,7 +466,9 @@ impl FsAs {
     /// otherwise be a bare "reading …". It says Windows refused, not that
     /// the person may not: their rights are one cause, and an EDR or DLP
     /// filter answers with the same code. The daemon's errors stay as they
-    /// were.
+    /// were. #3688 — Linux says the same of the person at seat0: their
+    /// rights are one cause, and an LSM (AppArmor, SELinux) answers with the
+    /// same code.
     fn explain_refusal<T>(&self, asked: &str, read: Result<T>) -> Result<T> {
         #[cfg(target_os = "windows")]
         if matches!(self, Self::Person { .. }) && read.as_ref().is_err_and(is_permission_denied) {
@@ -434,7 +478,16 @@ impl FsAs {
                 )
             });
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::Person { .. }) && read.as_ref().is_err_and(is_permission_denied) {
+            return read.with_context(|| {
+                format!(
+                    "{asked}: Linux refused to open it for the person signed in at this \
+                     computer's screen"
+                )
+            });
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = asked;
         read
     }
@@ -507,9 +560,14 @@ impl FsAs {
             #[cfg(target_os = "linux")]
             Self::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
             #[cfg(target_os = "linux")]
-            Self::Person { account, .. } => {
-                let _as_them = crate::fs_identity::FsIdentity::begin(account)
-                    .map_err(|e| anyhow!("acting as {} for a received file: {e}", account.name))?;
+            Self::Person { account, caps, .. } => {
+                // #3688 — a read's step also empties the thread's
+                // capabilities; a received file's is FR-97 P3d's, unchanged.
+                let _as_them = match caps {
+                    Caps::Kept => crate::fs_identity::FsIdentity::begin(account),
+                    Caps::Empty => crate::fs_identity::FsIdentity::begin_reading(account),
+                }
+                .map_err(|e| anyhow!("acting as {}: {e}", account.name))?;
                 f()
             }
             #[cfg(target_os = "windows")]
@@ -622,20 +680,25 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
     if !root || !switch_on {
         return FsAs::Daemon;
     }
-    // RED (#3688): master's answers. A read is the daemon's; a received file
-    // with nobody at seat0 is the daemon's, wherever a controller chose.
-    if reading {
-        return FsAs::Daemon;
-    }
     match seat() {
+        // A read may name any path, so its steps hold no capability; a
+        // received file's are held to the person's folders (FR-97 P3d).
         Seat::Person { account, home } => FsAs::Person {
             account,
             home,
-            caps: Caps::Kept,
+            caps: if reading { Caps::Empty } else { Caps::Kept },
         },
         Seat::Root => FsAs::Daemon,
+        Seat::Nobody(why) if reading => {
+            tracing::debug!(%why, "files: nobody at seat0 — a read is refused");
+            FsAs::Nobody
+        }
         Seat::Nobody(why) => {
-            tracing::debug!(%why, "files: nobody at seat0 — received files are written as the daemon");
+            tracing::debug!(
+                %why,
+                "files: nobody at seat0 — received files are written as the daemon, \
+                 never in a folder a controller chose"
+            );
             FsAs::DaemonAlone
         }
     }
@@ -643,23 +706,30 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
 
 /// #3688 — how long a read waits for the seat0 lookup.
 #[cfg(target_os = "linux")]
-// RED (#3688): a read asks once the read side lands.
-#[allow(dead_code)]
 const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// #3688 — `lookup` on a blocking thread, given `wait` at most: a wedged
 /// logind or account lookup is nobody at the screen, never a stalled async
 /// worker. A lookup past its time finishes on its own thread.
 #[cfg(target_os = "linux")]
-// RED (#3688): a read asks once the read side lands.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn seat_within(
     wait: std::time::Duration,
     lookup: impl FnOnce() -> Seat + Send + 'static,
 ) -> Seat {
-    // RED (#3688): asked on this thread, however long it takes.
-    let _ = wait;
-    lookup()
+    match tokio::time::timeout(wait, tokio::task::spawn_blocking(lookup)).await {
+        Ok(Ok(seat)) => seat,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "files: the seat0 lookup failed — a read is refused");
+            Seat::Nobody(format!("the seat0 lookup failed: {e}"))
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?wait,
+                "files: the seat0 lookup did not answer in time — a read is refused"
+            );
+            Seat::Nobody(format!("the seat0 lookup did not answer within {wait:?}"))
+        }
+    }
 }
 
 /// The person's Downloads: `XDG_DOWNLOAD_DIR` from their own
@@ -2658,7 +2728,19 @@ async fn resolve_dest_path(input: &str) -> Result<PathBuf> {
 /// FR-97 P3d — [`resolve_dest_path`] for `who`, AS `who`: the path is
 /// canonicalised (links followed) with their rights, and for the person at
 /// seat0 the placement rule's active home is theirs.
+///
+/// #3688 — with nobody at seat0 on a Linux system install, FR-84 D4's rule
+/// for a privileged writer with no one signed in holds: nowhere a controller
+/// chose. The folder is refused before it is touched, so the upload lands in
+/// the default folder ([`FilesHandler::begin`]'s fallback).
 async fn resolve_dest_path_as(who: &FsAs, input: &str) -> Result<PathBuf> {
+    #[cfg(target_os = "linux")]
+    if matches!(who, FsAs::DaemonAlone) {
+        return Err(anyhow!(
+            "nobody is signed in at this computer's screen, so a received file goes to the \
+             default folder, never to one a controller chose"
+        ));
+    }
     let (input, writer) = (input.to_string(), who.writer());
     who.run(move || resolve_dest_path_here(&input, &writer, &files_dir::Rules::from_env()))
         .await
@@ -3447,8 +3529,21 @@ const KERNEL_FILE_SYSTEMS: &[(u32, &str)] = &[
 /// refused the person. `Err` says why, in the words the viewer shows.
 #[cfg(target_os = "linux")]
 fn held_to_the_person(file: &std::fs::File, asked: &std::path::Path) -> std::io::Result<()> {
-    // RED (#3688): every handle passes, as on master.
-    let _ = (file, asked);
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fstatfs` fills the zeroed struct it is handed, for a handle
+    // this function borrows.
+    let held_on = statfs_with(|st| unsafe { libc::fstatfs(fd, st) })?;
+    off_the_kernel_file_systems(held_on, asked)?;
+    // The kernel's own path for the handle: what the open reached, wherever
+    // the path led by then.
+    let held = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+    if held != asked {
+        return Err(std::io::Error::other(format!(
+            "{}: what opened is not the file asked for, so file transfer does not send it",
+            asked.display()
+        )));
+    }
     Ok(())
 }
 
@@ -3456,9 +3551,45 @@ fn held_to_the_person(file: &std::fs::File, asked: &std::path::Path) -> std::io:
 /// kernel file system ([`KERNEL_FILE_SYSTEMS`]).
 #[cfg(target_os = "linux")]
 fn folder_held_to_the_person(dir: &std::path::Path) -> std::io::Result<()> {
-    // RED (#3688): every folder passes, as on master.
-    let _ = (dir, KERNEL_FILE_SYSTEMS);
-    Ok(())
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other(format!("{}: a NUL in the path", dir.display())))?;
+    // SAFETY: `statfs` reads a NUL-terminated path that lives across the
+    // call, and fills the zeroed struct it is handed.
+    let listed_on = statfs_with(|st| unsafe { libc::statfs(path.as_ptr(), st) })?;
+    off_the_kernel_file_systems(listed_on, dir)
+}
+
+/// #3688 — the file system type `call` (an `fstatfs` or a `statfs`) reports.
+#[cfg(target_os = "linux")]
+fn statfs_with(call: impl FnOnce(*mut libc::statfs) -> libc::c_int) -> std::io::Result<u32> {
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if call(st.as_mut_ptr()) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the call succeeded, so the kernel filled the struct (zeroed
+    // before it, so every field is initialised either way).
+    let st = unsafe { st.assume_init() };
+    // `f_type` is a signed word on most targets and a u32 on a few; every
+    // magic fits 32 bits.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = st.f_type as u32;
+    Ok(magic)
+}
+
+/// #3688 — `Err`, in the words the viewer shows, when `magic` is one of
+/// [`KERNEL_FILE_SYSTEMS`]. Not an access refusal: the viewer is told this,
+/// not that Linux refused the person.
+#[cfg(target_os = "linux")]
+fn off_the_kernel_file_systems(magic: u32, path: &std::path::Path) -> std::io::Result<()> {
+    match KERNEL_FILE_SYSTEMS.iter().find(|(m, _)| *m == magic) {
+        Some((_, fs)) => Err(std::io::Error::other(format!(
+            "{}: {fs} is a kernel file system, which file transfer does not read for the person \
+             signed in at this computer's screen",
+            path.display()
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Byte-count snapshot emitted after a chunk that crossed a progress
@@ -3804,8 +3935,6 @@ pub(crate) mod stand_in {
     }
 
     /// The reader stood in for this thread, if there is one.
-    // RED (#3688): Linux's `for_read` asks once the read side lands.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(super) fn reader_now() -> Option<FsAs> {
         let held = READER.lock().unwrap_or_else(PoisonError::into_inner);
         held.as_ref()

@@ -538,7 +538,7 @@ answer only ever stops a device: a deny is never credited, and a domain account
 that is an administrator only through a domain group reads as no administrator,
 because an answer that needed a domain controller would flap SYSTEM mode.
 
-### A viewer's file transfer acts as the person at the screen (#3048, #3669)
+### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 
 On a Windows background-service install the worker is LocalSystem. What a
 viewer's file transfer touches on the person's side runs through `FsAs`
@@ -554,6 +554,20 @@ same path: `FsAs::now()` for a write, `FsAs::for_read()` for a read, and every
 call on the person's side inside `FsAs::run`. The person's token is the boundary;
 `validate_outgoing_path`'s denylists and `is_agent_secret` stay, as a second
 line.
+
+On a Linux system install the daemon is root, and the same `FsAs` takes the
+person at seat0 in both directions: a received file is written as them (FR-97
+P3d), and a download, a folder download and the drawer's listing are read as
+them (#3688). Each read step runs on a blocking thread with their fsuid, fsgid
+and groups and an empty effective capability set
+(`fs_identity::FsIdentity::begin_reading`), and every handle it opens is held
+to the file asked and kept off the kernel's own file systems before it leaves
+the step. With nobody at seat0, a read is refused with a reason the viewer
+shows, and a received file is the daemon's but never in a folder a controller
+chose. root itself at seat0, a user install and `ROOMLERD_FILES_AS_SEAT_USER=0`
+are the daemon, both ways. Only root sets that switch, in the service's own
+environment (a systemd drop-in); remote config cannot reach it
+([`desktop-companion.md`](desktop-companion.md) §9.4).
 
 ### An enrollment token is spent once, through one owner (#3328)
 
@@ -832,7 +846,7 @@ Disconnect, and on Wayland no consent prompt. The root daemon therefore also ser
 `/run/user/<uid>/roomler.sock`:
 - it belongs to the person signed in at the machine's own screen: logind's active session
   on `seat0`, when that session is a person's (`companion::seat0_uid`,
-  `agents/roomlerd/src/companion.rs:1208` — the rule received files and `console_user`
+  `agents/roomlerd/src/companion.rs:1251` — the rule received files and `console_user`
   already used). Never a remote login (xrdp, GNOME Remote Login), which sits on no seat
   although logind calls it active. Until #2871's review the socket went to the first
   active graphical session anywhere, which on a host with remote logins could be one;
