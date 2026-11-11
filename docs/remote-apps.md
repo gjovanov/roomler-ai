@@ -300,7 +300,7 @@ The legacy `error` string on a focus/launch refusal keeps its shape and
 `caps.files` (the `with_config_lists` seam), and memoizes the whole
 `AgentCaps` behind a `OnceLock`, the process's `ProbeState::first`
 (`agents/roomlerd/src/encode/caps.rs:49`, filled at `:165`); both the hello
-and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1871`, `:2734`)
+and the FR-43 heartbeat re-announce (`agents/roomlerd/src/signaling.rs:1920`, `:2791`)
 hand out that same struct. So `list` missing from the hello can mean *nobody
 had logged in yet when the daemon started*, and nothing short of a daemon
 restart changes it. That is why P6 added a fourth value:
@@ -493,7 +493,7 @@ label    = "Safari"
 | `window_capture` | config / `ROOMLERD_WINDOW_CAPTURE` (`config_surface.rs:1211`) | **off** | P4 — attended by construction; restart required |
 | `ROOMLERD_VIRTUAL_DESKTOP` | env | off | the daemon's own Xvfb (§2 of [`linux-capture.md`](linux-capture.md)); when set, the Daemon arm wins and no session is discovered |
 
-`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6892`) answers the whole
+`roomlerd apps-probe` (`agents/roomlerd/src/app.rs:6896`) answers the whole
 question on the host with no session and no browser, the way `capture-smoke`
 does for pixels: which config it loaded and whether apps are enabled there,
 whether a desktop was found and as whom (the display and the cookie), what the

@@ -238,9 +238,9 @@ touched: dispatch it on the branch before merging.
 ## Open questions for implementation
 
 - **Session ownership on worker death.** If the worker dies mid-session the daemon holds a
-  live server-side session with nothing behind it. It must `Terminate` with a reason the
-  controller can act on, rather than let the controller watch a frozen screen — the same
-  argument that made `rc:consent.reason` worth splitting in FR-27.
+  live server-side session with nothing behind it. Answered for the sessions the daemon keeps for its claim
+  (FR-138 P2b, D6): each ends `rc:terminate error` when its worker's channel ends. Still open for every other
+  delegated session, whose controller watches a frozen screen: it must `Terminate` with a reason it can act on (FR-27).
 - **Does `SessionCreated` carry everything the worker needs** (permissions, TURN creds,
   relay region) or does the worker need daemon state as well? If the latter, the attach
   handshake should carry it once rather than per-session.

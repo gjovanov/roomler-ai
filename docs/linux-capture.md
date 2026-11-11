@@ -529,8 +529,8 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:98`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:6986`). A changed brief (a login, a
-logout, the greeter) re-announces the caps on the next heartbeat (`:2561`).
+heartbeat only read that cache (`signaling.rs:7135`). A changed brief (a login, a
+logout, the greeter) re-announces the caps on the next heartbeat (`:2618`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
 
@@ -1440,7 +1440,7 @@ names the arm ("desktop portal · allowed at the screen"), FR-45 AC8's option (b
 ### 4.5 Detecting the portal, and why the answer is never cached
 
 `roomlerd capture-smoke` runs the detector *inside the session* and prints one
-line an operator can act on (`app.rs:7086`): `capture-smoke: portal=<status>
+line an operator can act on (`app.rs:7090`): `capture-smoke: portal=<status>
 — <advice>`.
 
 | `portal=` | Means | The advice it prints |
