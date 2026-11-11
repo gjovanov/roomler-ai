@@ -1,0 +1,550 @@
+name: Publish to SourceForge
+
+# Puts each wizard release on the SourceForge listing
+# (https://sourceforge.net/projects/roomler-ai/) and moves the listing's Download
+# button to it: the Windows, macOS and Linux defaults. FR-143, docs/sourceforge.md.
+#
+# WHY THIS IS OURS AND NOT SOURCEFORGE'S GITHUB IMPORT. Until 2026-11-11 the
+# listing was fed by SourceForge's "GitHub Releases Integration": a webhook on
+# this repository's `release` events, with no filter of any kind. Three things
+# followed from that, each measured that day:
+#   - `seed-cache` is a GitHub release too (the rolling CI cargo cache,
+#     docs/build-caches.md). Every cache write is a `release edited` event, so
+#     SourceForge was told 1,571 times in 70 hours, nine in ten of them about
+#     the cache, and mirrored all 31 GiB of it into the public Files area. An
+#     import that ran while CI was replacing an asset failed, and mailed the
+#     operator "GitHub Downloads Import Failed".
+#   - It copied every asset of every release, about 310 MiB a version. The
+#     project stood at 85.5 GB against SourceForge's 5 GB project limit.
+#   - It never set a Download default. Those were moved by hand, per release,
+#     in the browser, and had stood on setup-v0.4.197 for nine days and
+#     thirteen releases while roomler.ai served the current wizard.
+# So the webhook is gone, and this workflow uploads only what a SourceForge
+# visitor needs: the `setup-v<V>` assets (the wizard for each platform, with its
+# checksum and signature), about 55 MiB a version, the newest SF_KEEP versions.
+#
+# WHAT A RUN DOES, in this order, and it stops at the first step that fails:
+#   1. resolve the tag; skip unless it is a final `setup-v<V>` with a published
+#      GitHub release
+#   2. download that release and prove the bytes: each file against GitHub's own
+#      asset digest, each installer against its `.sha256` sidecar
+#   3. upload to /home/frs/project/roomler-ai/<tag>/ over rsync+ssh, to a host
+#      whose keys are pinned (scripts/sourceforge-known-hosts), then prove the
+#      upload by checksum
+#   4. only for the NEWEST setup release: set the three defaults through
+#      SourceForge's Release API, and wait until best_release.json names them
+#   5. only then: remove the `setup-v*` folders older than the newest SF_KEEP
+# Every decision in that list (which tag is final, which file is whose default,
+# what to remove) is a pure function in scripts/sourceforge-publish.sh, proven by
+# its `--selftest` on every pull request that touches these files and again at
+# the start of every run.
+#
+# TRIGGERS.
+#  - `workflow_run`: when "Release roomler-setup" finishes on a `setup-v*` ref.
+#    Not `on: release`: the wizard lane publishes with GITHUB_TOKEN, and an event
+#    made with that token starts no workflow. Not a step in release-setup.yml
+#    either: a run on a tag executes that file as it stood at the tag, and a
+#    change there has to be rehearsed against the seed lanes. This file runs
+#    from the default branch whatever the tag holds.
+#    ⚠️ `workflow_run.head_branch` is text the triggering run chose. It reaches
+#    the shell only through an environment variable and is used only after
+#    `valid-tag` has matched it against `setup-v<major>.<minor>.<patch>`.
+#    The run's CONCLUSION is deliberately not consulted: the release either
+#    exists on GitHub with every platform or it does not, and that is what step
+#    1 reads. A wizard run that published and then failed its cache refresh
+#    still has a release SourceForge should carry.
+#  - `workflow_dispatch`: the same for a tag you name. `dry_run` downloads,
+#    verifies and lists SourceForge, and changes nothing: the way to prove new
+#    credentials. Publishing an OLDER tag uploads its files and leaves the
+#    defaults and every other folder alone.
+#  - `pull_request` on these files: the self-test only. No secret is in reach.
+#
+# CREDENTIALS (repository secrets, both the operator's to create):
+#   SOURCEFORGE_SSH_KEY  private half of a key whose public half is on the
+#                        SourceForge account (Account Settings → SSH Settings).
+#                        Uploads and removes files; nothing else.
+#   SOURCEFORGE_API_KEY  the account's Releases API key (Account Settings →
+#                        "Releases API Key" → Generate). Sets the defaults.
+# Without them a run says so and skips; it does not fail, so this file can sit
+# on master before the secrets exist. Variables: SOURCEFORGE_USER (the account's
+# login, default `roomler-ai`) and the kill switch SOURCEFORGE_PUBLISH=off.
+#
+# A FAILED PUBLISH IS LOUD. Nobody watches this lane: a release is green, the
+# fleet updates, and the listing quietly keeps its old button, which is the
+# state this workflow exists to end. So a failure opens one issue, a repeat
+# comments on it, and the next green publish closes it (the shape of
+# release-setup.yml's wizard alert).
+
+on:
+  workflow_run:
+    workflows: ['Release roomler-setup']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'The setup release to publish, e.g. setup-v0.4.211'
+        required: true
+        type: string
+      dry_run:
+        description: 'Rehearse: download, verify and list SourceForge; upload, set and remove nothing'
+        required: false
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - '.github/workflows/sourceforge-publish.yml'
+      - 'scripts/sourceforge-publish.sh'
+      - 'scripts/sourceforge-known-hosts'
+
+permissions:
+  contents: read
+
+# One publish at a time, in order. Never cancelled mid-run: a run cut between
+# "defaults set" and "old folders removed" is fine, one cut inside an upload is
+# a half-written folder.
+concurrency:
+  group: sourceforge-publish-${{ github.event_name == 'pull_request' && github.ref || 'live' }}
+  cancel-in-progress: false
+
+env:
+  SF_PROJECT: roomler-ai
+  SF_HOST: frs.sourceforge.net
+  # Versions kept on SourceForge. About 55 MiB each, so ten is well inside the
+  # project's 5 GB limit; scripts/sourceforge-publish.sh refuses fewer than 3.
+  SF_KEEP: '10'
+
+jobs:
+  selftest:
+    name: Self-test the publish decisions
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: sourceforge-publish.sh --selftest
+        run: bash scripts/sourceforge-publish.sh --selftest
+      - name: The pinned host keys parse, and are the three SourceForge publishes
+        shell: bash
+        run: |
+          set -euo pipefail
+          got="$(ssh-keygen -lf scripts/sourceforge-known-hosts | awk '{print $2}' | LC_ALL=C sort)"
+          want="$(grep -oE 'SHA256:[A-Za-z0-9+/]{43}' scripts/sourceforge-known-hosts | LC_ALL=C sort)"
+          echo "$got"
+          [ "$(printf '%s\n' "$got" | wc -l)" -eq 3 ]
+          [ "$got" = "$want" ]
+
+  publish:
+    name: Publish the setup release to SourceForge
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       startsWith(github.event.workflow_run.head_branch, 'setup-v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      state: ${{ steps.done.outputs.state || steps.gate.outputs.state }}
+      tag: ${{ steps.gate.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EVENT_NAME: ${{ github.event_name }}
+      INPUT_TAG: ${{ github.event.inputs.tag }}
+      RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
+      SWITCH: ${{ vars.SOURCEFORGE_PUBLISH }}
+      SF_USER: ${{ vars.SOURCEFORGE_USER || 'roomler-ai' }}
+      HAVE_SSH_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY != '' }}
+      HAVE_API_KEY: ${{ secrets.SOURCEFORGE_API_KEY != '' }}
+    steps:
+      # The default branch on a workflow_run, the dispatch ref on a dispatch.
+      # Never the ref of the run that triggered this one.
+      - uses: actions/checkout@v4
+
+      - name: Self-test the publish decisions
+        run: bash scripts/sourceforge-publish.sh --selftest
+
+      - name: Resolve the release
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "::notice title=SourceForge publish skipped::$1"
+            echo "state=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          # A dispatch that cannot do what was asked fails; an automatic run
+          # that has nothing to do says so and passes.
+          refuse() {
+            if [ "$EVENT_NAME" = workflow_dispatch ]; then
+              echo "::error title=SourceForge publish refused::$1"
+              exit 1
+            fi
+            skip "$1"
+          }
+
+          tag="$RUN_BRANCH"
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then tag="$INPUT_TAG"; fi
+          # The raw value is never printed: it is text the triggering run chose.
+          if ! bash scripts/sourceforge-publish.sh valid-tag "$tag"; then
+            refuse "not a final setup release tag (setup-v<major>.<minor>.<patch>)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [ "$SWITCH" = off ]; then
+            skip "the repository variable SOURCEFORGE_PUBLISH is off"
+          fi
+
+          # 404 = no such release (an artifacts-only wizard run). Anything else
+          # is GitHub failing, and has to fail this run rather than skip it.
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > release.json 2> gh.err; then
+            if grep -q 'HTTP 404' gh.err; then
+              refuse "GitHub has no release for $tag"
+            fi
+            cat gh.err >&2
+            exit 1
+          fi
+          if [ "$(jq -r '.draft or .prerelease' release.json)" != false ]; then
+            refuse "$tag is a draft or a pre-release"
+          fi
+
+          # Only the newest setup release takes the defaults and triggers
+          # retention; an older one is a backfill.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' > tags.txt
+          newest="$(bash scripts/sourceforge-publish.sh newest < tags.txt)"
+          if [ "$newest" = "$tag" ]; then
+            echo "is_newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_newest=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=A backfill::$tag is older than $newest: its files are uploaded, the Download defaults and the other folders are left alone"
+          fi
+
+          if [ "$DRY_RUN" != true ] && { [ "$HAVE_SSH_KEY" != true ] || [ "$HAVE_API_KEY" != true ]; }; then
+            echo "::warning title=SourceForge publish is not configured::the secrets SOURCEFORGE_SSH_KEY and SOURCEFORGE_API_KEY are not both set, so $tag was not published. See docs/sourceforge.md."
+            echo "state=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "state=go" >> "$GITHUB_OUTPUT"
+
+      - name: Download the release and prove its bytes
+        if: steps.gate.outputs.state == 'go'
+        shell: bash
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+          jq -r '.assets[] | [.name, (.digest // "")] | @tsv' release.json > digests.tsv
+          bash scripts/sourceforge-publish.sh verify dist digests.tsv
+          bash scripts/sourceforge-publish.sh defaults-plan "$TAG" dist > defaults.tsv
+          echo "the defaults this release provides:"
+          cat defaults.tsv
+          du -sh dist
+
+      # Runs in every mode, a dry run with no secret included: it is the one
+      # read that tells whether a runner can reach SourceForge's web tier at
+      # all, and the Release API sits on the same host.
+      - name: Read what the listing serves now
+        if: steps.gate.outputs.state == 'go'
+        shell: bash
+        run: |
+          set -euo pipefail
+          j="$(curl -sS -m 30 "https://sourceforge.net/projects/$SF_PROJECT/best_release.json" || true)"
+          if jq -e '.platform_releases' <<<"$j" > /dev/null 2>&1; then
+            jq -r '"generic  \(.release.filename)", (.platform_releases | to_entries[] | "\(.key)  \(.value.filename)")' <<<"$j"
+          else
+            echo "::warning title=best_release.json unreadable from the runner::SourceForge did not answer JSON to this runner (bot protection on its web tier?). The Release API is on the same host."
+          fi
+
+      - name: Prepare ssh
+        id: ssh
+        if: steps.gate.outputs.state == 'go'
+        shell: bash
+        env:
+          SF_SSH_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SF_SSH_KEY" ]; then
+            echo "::notice::no SOURCEFORGE_SSH_KEY: this dry run stops after the download and verify"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          d="$RUNNER_TEMP/sf"
+          install -m 700 -d "$d"
+          ( umask 077; printf '%s\n' "$SF_SSH_KEY" | tr -d '\r' > "$d/key" )
+          grep -v '^#' scripts/sourceforge-known-hosts > "$d/known_hosts"
+          # BatchMode: a prompt would hang the run. StrictHostKeyChecking with a
+          # pinned file: an unknown or changed host key ends the run.
+          echo "SF_SSH_OPTS=-i $d/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$d/known_hosts -o ConnectTimeout=30 -o ServerAliveInterval=15" >> "$GITHUB_ENV"
+          echo "SF_ROOT=/home/frs/project/$SF_PROJECT" >> "$GITHUB_ENV"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: List SourceForge before
+        if: steps.ssh.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          printf 'ls -1 %s/\n' "$SF_ROOT" | sftp $SF_SSH_OPTS -b - "$SF_USER@$SF_HOST" > before.txt
+          grep -v '^sftp>' before.txt | sed 's|.*/||' | LC_ALL=C sort | tee before.names
+          echo "$(grep -c . before.names) entries"
+
+      - name: Upload
+        if: steps.ssh.outputs.ready == 'true' && env.DRY_RUN != 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          dest="$SF_USER@$SF_HOST:$SF_ROOT/$TAG/"
+          # --checksum: a copy over there with the right size and time and the
+          # wrong bytes is sent again, so a re-run repairs a folder. 55 MiB, so
+          # the hashing costs nothing. -O: the folder's own time is
+          # SourceForge's to change, and must not read as a difference below.
+          for attempt in 1 2 3; do
+            if rsync -rtO --checksum --timeout=120 --info=stats1 -e "ssh $SF_SSH_OPTS" dist/ "$dest"; then break; fi
+            if [ "$attempt" = 3 ]; then echo "::error::the upload to SourceForge failed three times"; exit 1; fi
+            echo "upload attempt $attempt failed; retrying in 30 s"
+            sleep 30
+          done
+          # Proof, by checksum and not by size or time: a dry run of the same
+          # transfer. A line starting `<f` is a file rsync would still have to
+          # send, which means its content differs or it is missing over there.
+          left="$(rsync -rtOn --timeout=120 --checksum --itemize-changes -e "ssh $SF_SSH_OPTS" dist/ "$dest")"
+          if printf '%s\n' "$left" | grep -q '^<f'; then
+            echo "::error::SourceForge's copy of $TAG differs from the release after the upload"
+            printf '%s\n' "$left"
+            exit 1
+          fi
+          echo "uploaded and verified by checksum: $(find dist -type f | wc -l) files in $TAG"
+
+      - name: Set the Download defaults
+        id: defaults
+        if: steps.ssh.outputs.ready == 'true' && env.DRY_RUN != 'true' && steps.gate.outputs.is_newest == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+          SF_API_KEY: ${{ secrets.SOURCEFORGE_API_KEY }}
+        run: |
+          set -euo pipefail
+          # The key travels in the request body, from a shell builtin into
+          # curl's stdin: never in an argument list, never in a URL.
+          while IFS=$'\t' read -r os file; do
+            url="https://sourceforge.net/projects/$SF_PROJECT/files/$TAG/$file"
+            accepted=false
+            # A file that rsync has just written can take a few minutes to
+            # exist for the API, so "not found" is retried for ten minutes.
+            for attempt in $(seq 1 20); do
+              body="$(printf 'default=%s&api_key=%s' "$os" "$SF_API_KEY" \
+                | curl -sS -m 60 -X PUT -H 'Accept: application/json' --data-binary @- "$url" || true)"
+              if jq -e --arg os "$os" '((.result.x_sf.default // "") | split(",") | index($os)) != null' \
+                   <<<"$body" > /dev/null 2>&1; then
+                accepted=true
+                break
+              fi
+              reason="$(jq -r '.error // empty' <<<"$body" 2>/dev/null || true)"
+              echo "$os, attempt $attempt: ${reason:-no usable answer}"
+              sleep 30
+            done
+            if [ "$accepted" != true ]; then
+              echo "::error::SourceForge did not accept $file as the $os default"
+              exit 1
+            fi
+            echo "$os default: $file"
+          done < defaults.tsv
+
+      - name: Wait until the listing serves them
+        id: served
+        if: steps.defaults.outcome == 'success'
+        shell: bash
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          want="$(awk -F'\t' -v t="$TAG" '{print "/" t "/" $2}' defaults.tsv)"   # windows, mac, linux
+          readable=false
+          deadline=$((SECONDS + 900))
+          while :; do
+            j="$(curl -sS -m 30 "https://sourceforge.net/projects/$SF_PROJECT/best_release.json" || true)"
+            if jq -e '.platform_releases' <<<"$j" > /dev/null 2>&1; then
+              readable=true
+              printf '%s\n' "$j" > best_release.json
+              got="$(jq -r '.platform_releases | [.windows.filename, .mac.filename, .linux.filename] | join("\n")' <<<"$j")"
+              if [ "$got" = "$want" ]; then
+                echo "best_release.json names $TAG for Windows, macOS and Linux"
+                exit 0
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then break; fi
+            sleep 30
+          done
+          if [ "$readable" = true ]; then
+            echo "::error::15 minutes after the API accepted them, best_release.json still names other files:"
+            printf '%s\n' "$got"
+            exit 1
+          fi
+          # The API's own answer above is the record that the defaults moved.
+          # A runner that cannot read the public JSON (bot protection on the
+          # web tier) is not evidence that they did not.
+          echo "::warning title=best_release.json unreadable from the runner::the Release API accepted all three defaults, but the public JSON could not be read back in 15 minutes. Read https://sourceforge.net/projects/$SF_PROJECT/best_release.json by hand."
+
+      - name: Remove the versions that have aged out
+        if: >-
+          steps.ssh.outputs.ready == 'true' && steps.gate.outputs.is_newest == 'true' &&
+          (env.DRY_RUN == 'true' || steps.served.outcome == 'success')
+        shell: bash
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          printf 'ls -1 %s/\n' "$SF_ROOT" | sftp $SF_SSH_OPTS -b - "$SF_USER@$SF_HOST" > after.txt
+          if [ "$DRY_RUN" = true ] && ! grep -v '^sftp>' after.txt | sed 's|.*/||' | grep -qxF -- "$TAG"; then
+            # A rehearsal has not uploaded the tag, so the plan is drawn as if it had.
+            printf '%s\n' "$TAG" >> after.txt
+          fi
+          bash scripts/sourceforge-publish.sh prune-plan "$SF_KEEP" "$TAG" < after.txt > prune.txt
+
+          # Belt and braces: never a folder the listing still serves from.
+          if [ -s best_release.json ]; then
+            jq -r '[.release.filename, (.platform_releases[]?.filename)] | .[] | select(. != null) | split("/")[1]' \
+              best_release.json | LC_ALL=C sort -u > served.dirs
+            if grep -qxFf served.dirs prune.txt; then
+              echo "::warning::a Download default still points into a folder due for removal; it stays this time:"
+              grep -xFf served.dirs prune.txt
+              grep -vxFf served.dirs prune.txt > prune.keep || true
+              mv prune.keep prune.txt
+            fi
+          fi
+
+          if [ ! -s prune.txt ]; then
+            echo "nothing has aged out (keeping the newest $SF_KEEP setup versions)"
+            exit 0
+          fi
+          echo "aged out:"; cat prune.txt
+          if [ "$DRY_RUN" = true ]; then
+            echo "dry run: nothing removed"
+            exit 0
+          fi
+          # Each name is `setup-v<digits>.<digits>.<digits>` by construction, so
+          # it needs no quoting. `-rm`: an already-empty folder is not an error;
+          # `rmdir` without the dash is, so a folder that could not be emptied
+          # fails the run.
+          while IFS= read -r d; do
+            bash scripts/sourceforge-publish.sh valid-tag "$d"
+            printf -- '-rm %s/%s/*\nrmdir %s/%s\n' "$SF_ROOT" "$d" "$SF_ROOT" "$d"
+          done < prune.txt > prune.batch
+          # shellcheck disable=SC2086
+          sftp $SF_SSH_OPTS -b prune.batch "$SF_USER@$SF_HOST"
+          echo "removed $(grep -c . prune.txt) folder(s)"
+
+      - name: Forget the key
+        if: always()
+        shell: bash
+        run: rm -rf "$RUNNER_TEMP/sf"
+
+      - name: Summary
+        id: done
+        if: steps.gate.outputs.state == 'go'
+        shell: bash
+        env:
+          TAG: ${{ steps.gate.outputs.tag }}
+          IS_NEWEST: ${{ steps.gate.outputs.is_newest }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "$DRY_RUN" = true ]; then
+              echo "### SourceForge publish, dry run: \`$TAG\`"
+              echo "Downloaded and verified; nothing was uploaded, set or removed."
+            else
+              echo "### Published \`$TAG\` to SourceForge"
+              echo "https://sourceforge.net/projects/$SF_PROJECT/files/$TAG/"
+              if [ "$IS_NEWEST" = true ]; then
+                echo
+                echo "| platform | Download default |"
+                echo "|---|---|"
+                awk -F'\t' '{printf "| %s | `%s` |\n", $1, $2}' defaults.tsv
+              else
+                echo
+                echo "A backfill: the Download defaults were left where they were."
+              fi
+            fi
+            if [ -s prune.txt ]; then
+              echo
+              echo "Aged out: $(tr '\n' ' ' < prune.txt)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRY_RUN" = true ]; then
+            echo "state=rehearsed" >> "$GITHUB_OUTPUT"
+          else
+            echo "state=published" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # One issue per CONDITION: reused while it holds, closed by the next green
+  # publish, so an open one always means "the listing is stale right now".
+  # `--search` is `in:title` against the fixed prefix, which is why the date
+  # sits at the END of the title. A dry run is watched by whoever dispatched
+  # it and files nothing.
+  # ---------------------------------------------------------------------------
+  alert:
+    name: Alert on a failed SourceForge publish
+    needs: publish
+    if: >-
+      always() && needs.publish.result == 'failure' &&
+      github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: File or update the alert issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.publish.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          what="${TAG:-a setup release}"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search 'in:title "SourceForge publish failed"' --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "reusing open alert #$existing"
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+              --body "$(printf 'Failed again on %s (%s): %s\n\nStill unresolved. This issue closes by itself when a publish succeeds.\n' "$(date -u +%F)" "$what" "$run_url")"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "SourceForge publish failed: the listing's Download button is stale ($(date -u +%F))" \
+              --body "$(printf 'Publishing `%s` to SourceForge failed: %s\n\nUntil a publish succeeds, https://sourceforge.net/projects/roomler-ai/ keeps serving the previous wizard from its Download button. roomler.ai is not affected.\n\nRe-run it once the cause is fixed:\n\n```\ngh workflow run sourceforge-publish.yml -f tag=%s\n```\n\nThe runbook, the two credentials and the manual fallback are in `docs/sourceforge.md`. This issue closes by itself when a publish succeeds.\n' "$what" "$run_url" "${TAG:-setup-v<V>}")"
+          fi
+
+  recovered:
+    name: Close the SourceForge alert on a green publish
+    needs: publish
+    if: needs.publish.outputs.state == 'published'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Close any open alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.publish.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          nums="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search 'in:title "SourceForge publish failed"' --limit 50 --json number --jq '.[].number')"
+          if [ -z "$nums" ]; then
+            echo "no open SourceForge alert: nothing to close"
+            exit 0
+          fi
+          for n in $nums; do
+            echo "closing #$n"
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed \
+              --comment "$(printf '%s published to SourceForge on %s: %s\n\nThe listing serves the current wizard again. Closed automatically; a later failure opens a new issue.\n' "$TAG" "$(date -u +%F)" "$run_url")"
+          done
