@@ -28,7 +28,7 @@ pub(crate) fn own_groups() -> Vec<libc::gid_t> {
     groups
 }
 
-#[cfg(all(target_os = "linux", test, feature = "recording"))]
+#[cfg(target_os = "linux")]
 pub(crate) use linux::fsuid;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{Account, FsIdentity};
