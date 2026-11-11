@@ -40,17 +40,38 @@ use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows_sys::core::PWSTR;
 
 /// `true` when the calling process's primary token is `S-1-5-18`
-/// (`NT AUTHORITY\SYSTEM`). Any failure to read the token is `false`: the
-/// only consequence of a wrong `false` is the ordinary (user) folder rules,
-/// which SYSTEM still cannot be talked past on the system roots.
+/// (`NT AUTHORITY\SYSTEM`), as [`own_token_is_local_system`] read it. A token
+/// that could not be read is `false` here. For the folder rules
+/// (`files::writer_context`) a wrong `false` means the ordinary (user) folder
+/// rules, which SYSTEM still cannot be talked past on the system roots.
+///
+/// ⚠️ File transfer does not take this answer. Since #3048 a received file is
+/// written, and since #3669 a viewer's download, folder download and listing
+/// are read, as the person signed in to the session when this is LocalSystem,
+/// so a wrong `false` there would run them as LocalSystem. `files::fs_as_for`
+/// reads [`own_token_is_local_system`] itself and counts a token that could
+/// not be read as LocalSystem: the person, or nobody, never the worker.
 pub fn process_is_local_system() -> bool {
+    own_token_is_local_system() == Some(true)
+}
+
+/// What this process's own primary token says, read once, the first time any
+/// caller asks (a process's user never changes, and one answer keeps every
+/// caller on the same side): `Some(true)` LocalSystem, `Some(false)` another
+/// account, `None` when the token could not be read.
+pub fn own_token_is_local_system() -> Option<bool> {
+    static READ: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *READ.get_or_init(read_own_token_is_local_system)
+}
+
+fn read_own_token_is_local_system() -> Option<bool> {
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentProcess` is a pseudo-handle that is always valid;
     // `OpenProcessToken` with `TOKEN_QUERY` on our own process is documented
     // infallible in normal conditions; the out-pointer is checked on return.
     let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
     if ok == 0 || token.is_null() {
-        return false;
+        return None;
     }
     let result = token_user_is_local_system(token);
     // SAFETY: we own the handle `OpenProcessToken` gave us.
@@ -93,13 +114,14 @@ pub fn process_is_elevated() -> bool {
     ok != 0 && elevation.TokenIsElevated != 0
 }
 
-fn token_user_is_local_system(token: HANDLE) -> bool {
+/// Whether `token`'s user is LocalSystem; `None` when the token would not say.
+fn token_user_is_local_system(token: HANDLE) -> Option<bool> {
     let mut needed: u32 = 0;
     // SAFETY: the documented size-discovery call — a NULL buffer and a zero
     // length; `ERROR_INSUFFICIENT_BUFFER` is the expected outcome.
     let _ = unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
     if needed == 0 {
-        return false;
+        return None;
     }
     let mut buf: Vec<u8> = vec![0; needed as usize];
     // SAFETY: `buf` is alive for the call and at least `needed` bytes long;
@@ -114,25 +136,25 @@ fn token_user_is_local_system(token: HANDLE) -> bool {
         )
     };
     if ok == 0 {
-        return false;
+        return None;
     }
     // SAFETY: the buffer holds a `TOKEN_USER`; its `User.Sid` points INTO
     // this same buffer (the SID follows the struct) — the documented idiom.
     let token_user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
     let sid = token_user.User.Sid as *const u8;
     if sid.is_null() {
-        return false;
+        return None;
     }
     // Bound the read to the buffer the OS filled: a SID we compare needs its
     // 8-byte header and one 4-byte sub-authority.
     let start = sid as usize;
     let base = buf.as_ptr() as usize;
     if start < base || start + 12 > base + buf.len() {
-        return false;
+        return None;
     }
     // SAFETY: the 12 bytes at `sid` are inside `buf`, checked just above.
     let bytes = unsafe { std::slice::from_raw_parts(sid, 12) };
-    sid_bytes_are_local_system(bytes)
+    Some(sid_bytes_are_local_system(bytes))
 }
 
 /// The profile directory of the user signed in to THIS process's session —
@@ -244,6 +266,14 @@ pub enum PersonToken {
     /// A token a test holds, standing in for the person.
     #[cfg(test)]
     Fixed(std::sync::Arc<crate::win_token::Owned>),
+    /// A test's person who signs out after `steps_left` more steps: each
+    /// step after those is refused as [`crate::files::NOT_THE_PERSON`], as a
+    /// session's token is once they have gone.
+    #[cfg(test)]
+    SignsOutAfter {
+        token: std::sync::Arc<crate::win_token::Owned>,
+        steps_left: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    },
 }
 
 impl PartialEq for PersonToken {
@@ -266,6 +296,8 @@ impl std::fmt::Debug for PersonToken {
             Self::Session => f.write_str("Session"),
             #[cfg(test)]
             Self::Fixed(_) => f.write_str("Fixed"),
+            #[cfg(test)]
+            Self::SignsOutAfter { .. } => f.write_str("SignsOutAfter"),
         }
     }
 }
@@ -369,6 +401,17 @@ pub fn as_person<T>(sid: &str, source: &PersonToken, f: impl FnOnce() -> T) -> R
         }
         #[cfg(test)]
         PersonToken::Fixed(t) => t.raw(),
+        #[cfg(test)]
+        PersonToken::SignsOutAfter { token, steps_left } => {
+            use std::sync::atomic::Ordering::SeqCst;
+            if steps_left
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_err()
+            {
+                return Err(crate::files::NOT_THE_PERSON.to_string());
+            }
+            token.raw()
+        }
     };
     match token_user_sid(token) {
         Some(theirs) if theirs.eq_ignore_ascii_case(sid) => {}
@@ -705,6 +748,10 @@ mod tests {
         // `cargo test` runs as the developer or the CI user; the read must
         // succeed (no panic) and say so.
         assert!(!process_is_local_system());
+        // #3669 — it is a read that SUCCEEDED, not one that failed: a token
+        // that would not say is `None`, which file transfer counts as
+        // LocalSystem (`files::fs_as_for`).
+        assert_eq!(own_token_is_local_system(), Some(false));
     }
 
     /// The token → profile half, on our OWN token: Windows' recorded

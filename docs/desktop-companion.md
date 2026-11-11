@@ -560,9 +560,9 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who writes | `FsAs` (`:239-472`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:751-754`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
+| Who writes | `FsAs` (`:239-489`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:768-771`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
 | How | `FsAs::run` → `crate::fs_identity::FsIdentity` (FR-85's guard, moved out of `recording`) | Linux checks every open, create and unlink against the thread's fsuid, fsgid and groups; root's bypass capabilities leave with the fsuid |
-| Their folder | `person_downloads` / `xdg_download_dir` (`:505-538`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
+| Their folder | `person_downloads` / `xdg_download_dir` (`:522-555`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
 | The staging | `create_dir` and `create_new`, never reuse (`begin_as`) | a folder or a link planted where the staging goes refuses the begin |
 
 ⚠️ **Never as root followed by a `chown`.** In a folder the person owns, a link they planted
@@ -599,12 +599,12 @@ flowchart TD
 
 | What | Where | Why |
 |---|---|---|
-| Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:239-266`), chosen by `fs_as_for` (`:304`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:276`), never from a name, which can name another account's folder |
-| How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:349`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
-| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:480`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:5690`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:6212`): never the machine-global folder |
-| The staging | `stager_for` (`:1464`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
-| The end | `place_across` (`:1901`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
-| A resume | `resume_incoming_as` (`:2086`), `PartialMeta::person_sid` (`:796`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
+| Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:239-266`), chosen by `fs_as_for` (`:309`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
+| How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:381`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
+| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:497`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:5857`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:6379`): never the machine-global folder |
+| The staging | `stager_for` (`:1481`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
+| The end | `place_across` (`:1918`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
+| A resume | `resume_incoming_as` (`:2103`), `PartialMeta::person_sid` (`:813`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
 
 - **A locked screen keeps its user**, so a file sent then lands in their Downloads.
 - **Nobody signed in** (before sign-in, after sign-out): the upload is refused with the reason
@@ -637,23 +637,26 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who reads | `FsAs::for_read` (`:347`), one function with `FsAs::now` (`session_or_daemon`, `:354`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`) |
-| A download | `begin_outgoing_as` (`:2260`), `open_to_send` (`:2375`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
-| A folder | `begin_outgoing_zip_as` (`:2934`), `walk_and_zip` (`:3016`), `zip_folder_entries` (`:3170`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
-| A listing | `list_dir_as` (`:2708`), `list_canonical` (`:2726`) | resolved and opened as them inside the 3 s timeout, then the entries read through that handle |
+| Who reads | `FsAs::for_read` (`:354`), one function with `FsAs::now` (`session_or_daemon`, `:365`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`) |
+| A download | `begin_outgoing_as` (`:2277`), `open_to_send` (`:2392`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
+| A folder | `begin_outgoing_zip_as` (`:2965`), `walk_and_zip` (`:3047`), `zip_folder_entries` (`:3201`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
+| A listing | `list_dir_as` (`:2739`), `list_canonical` (`:2757`) | resolved and opened as them inside the 3 s timeout, then the entries read through that handle |
 
 - **Nobody signed in**: a download or a folder download is refused with "Nobody is signed in to
   this computer to send the file"; the drawer, its drive list included, with "Nobody is signed in
   to this computer to browse its files". The viewer shows either.
-- **A file or folder the person may not open** is refused with "`<path>`: the person signed in to
-  this computer is not allowed to open it".
+- **A file or folder Windows refuses to open for the person** (their own rights, or a filter
+  such as an EDR or DLP product, which answers with the same code) is refused, as a download or a
+  listing, with "`<path>`: Windows refused to open it for the person signed in to this computer".
+  Inside a folder download, an entry they may not open is left out of the zip, not refused, as an
+  unreadable file always was; only a folder they may not list at all is refused.
 - **A locked screen keeps its user**, so reads run as them, as writes do.
 - **Another person signs in** (switch user): the console moves to their session and the service
   replaces the worker with one there, so a read takes them from then on, as a write does. A
   transfer under way ends with the old worker, and every step checks the SID it began with.
-- **A Downloads folder redirected to a share** lists and downloads: the share is reached with the
-  person's own logon, which the folder grants, where the computer's own account is refused. Its
-  path is the one the upload message names.
+- **A Downloads folder redirected to a share** is listed and downloaded with the person's own
+  logon, which the folder grants, where the computer's own account is refused. Like the write in
+  §9.2, the share is a lab read, not a unit test. Its path is the one the upload message names.
 - **The service's own folders** (the drawer's **Upload staging folder** button, `<staging>`,
   and the service's logs and crash dumps) are SYSTEM's and the Administrators' alone once
   sealed ([installation.md](installation.md)). A standard user may not list them, nor may an
@@ -663,13 +666,22 @@ flowchart TD
   `validate_outgoing_path` and `is_agent_secret` run on the path the person resolved.
 - `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the service's own identity for reads too: one switch, both
   directions.
+- **A worker that cannot read its own token** is taken for LocalSystem (`fs_as_for`,
+  `agents/roomlerd/src/files.rs:309`; the token is read once, `win_identity::own_token_is_local_system`,
+  `agents/roomlerd/src/win_identity.rs:62`): reads and writes then take the person, or nobody, never
+  the worker itself.
+- **The entry points are tested with the person**, not only their steps: a test stands the
+  low-integrity person in for what `FsAs::for_read` answers (`files::stand_in`), and drives
+  `files:get` (`begin_outgoing`), `files:dir` (`list_dir`) and `files:get-folder` through the task
+  the viewer's request runs (`peer::outgoing_zip`). A person who signs out partway through a folder
+  ends it with `files:error`, never `files:eof`.
 - Per-user and attended installs, macOS and Linux are unchanged. Three small changes reach every
   install, each a unit test in `files::tests`: a folder that cannot be listed is refused when its
   download begins (`an_unlistable_folder_is_refused_when_its_download_begins`; it used to arrive
-  as an empty zip), a download opens its file before its offer, so one that will not open is
-  refused at once (`a_file_that_will_not_open_is_refused_before_its_offer`), and a listing
-  resolves its path off the async worker, inside its 3 s timeout
-  (`a_listing_resolves_its_path_off_the_async_worker`).
+  as an empty zip), a download opens its file before its offer and checks the handle it sends, so
+  one that will not open is refused at once
+  (`a_file_that_will_not_open_is_refused_before_its_offer`), and a listing resolves its path off
+  the async worker, inside its 3 s timeout (`a_listing_resolves_its_path_off_the_async_worker`).
 
 ## 10. Starting after install, and the Welcome flow
 

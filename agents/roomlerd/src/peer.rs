@@ -13423,139 +13423,136 @@ fn spawn_outgoing_zip_pump(
     id: String,
     requested_path: String,
 ) {
-    tokio::spawn(async move {
-        let offer = match handler
-            .begin_outgoing_zip(id.clone(), &requested_path)
-            .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing_zip failed");
-                let msg = format!("{e}");
-                send_files_json(
-                    &dc,
-                    &crate::files::FilesOutgoing::Error {
-                        id: &id,
-                        message: &msg,
-                    },
-                )
-                .await;
-                return;
-            }
-        };
+    tokio::spawn(outgoing_zip(dc, handler, session_id, id, requested_path));
+}
 
-        // #1730 — as the single-file download: every message races the stop
-        // token, and the transfer's state goes first on every exit.
-        if or_stopped(
-            &offer.cancel,
-            send_files_json(
-                &dc,
-                &crate::files::FilesOutgoing::Offer {
-                    id: &offer.id,
-                    name: &offer.name,
-                    size: None, // streaming — total unknown
-                    mime: offer.mime,
-                },
-            ),
-        )
+/// [`spawn_outgoing_zip_pump`]'s task, over any [`DownloadSink`]: the
+/// channel in production; in the tests (#3669) a recorder, so they drive
+/// the path a `files:get-folder` takes, from its entry point to its last
+/// message.
+async fn outgoing_zip<S: DownloadSink + Clone + 'static>(
+    dc: S,
+    handler: crate::files::FilesHandler,
+    session_id: bson::oid::ObjectId,
+    id: String,
+    requested_path: String,
+) {
+    let offer = match handler
+        .begin_outgoing_zip(id.clone(), &requested_path)
         .await
-        .is_err()
-        {
-            handler.finish_outgoing(&offer.id).await;
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing_zip failed");
+            let msg = format!("{e}");
+            dc.send_json(&crate::files::FilesOutgoing::Error {
+                id: &id,
+                message: &msg,
+            })
+            .await;
             return;
         }
+    };
 
-        // Bounded duplex pipe: write side fed by async_zip; read
-        // side fed to the DC. 256 KiB buffer = ~4 of our 64 KiB
-        // chunks before async_zip's writes start blocking. Keeps
-        // memory usage low and gives backpressure-free crash
-        // protection if the DC is wedged.
-        const PIPE_BUFFER: usize = 256 * 1024;
-        let (writer_half, reader_half) = tokio::io::duplex(PIPE_BUFFER);
-        let cancel = offer.cancel.clone();
-        let path = offer.path.clone();
-        let who = offer.who.clone();
-        let walk_cancel = cancel.clone();
-        let walk_handle = tokio::spawn(async move {
-            crate::files::walk_and_zip(writer_half, &path, &who, walk_cancel).await
-        });
-
-        let dc_for_pump = dc.clone();
-        let pump_cancel = cancel.clone();
-        let id_for_pump = offer.id.clone();
-        let pump_handle = tokio::spawn(async move {
-            zip_pump_loop(dc_for_pump, reader_half, pump_cancel, id_for_pump).await
-        });
-
-        // Wait for both sides. The walk task closes the writer
-        // half; the pump task sees EOF and exits.
-        let walk_res = walk_handle.await;
-        let pump_res = pump_handle.await;
-
-        let total_bytes = match (walk_res, pump_res) {
-            (Ok(Ok(_count)), Ok(Ok(bytes_sent))) => bytes_sent,
-            (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
-                handler.finish_outgoing(&offer.id).await;
-                if offer.cancel.is_cancelled() {
-                    info!(%session_id, id = %offer.id, "files: zip download stopped (cancelled, or the session ended)");
-                    return;
-                }
-                warn!(%session_id, id = %offer.id, %e, "files: zip pump failed");
-                let msg = format!("{e}");
-                let _ = or_stopped(
-                    &offer.cancel,
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::Error {
-                            id: &offer.id,
-                            message: &msg,
-                        },
-                    ),
-                )
-                .await;
-                return;
-            }
-            (Err(je), _) | (_, Err(je)) => {
-                handler.finish_outgoing(&offer.id).await;
-                warn!(%session_id, id = %offer.id, %je, "files: zip pump task panicked");
-                let _ = or_stopped(
-                    &offer.cancel,
-                    send_files_json(
-                        &dc,
-                        &crate::files::FilesOutgoing::Error {
-                            id: &offer.id,
-                            message: "zip pump task panicked",
-                        },
-                    ),
-                )
-                .await;
-                return;
-            }
-        };
-
-        info!(
-            %session_id, id = %offer.id, total_bytes,
-            path = %offer.path.display(),
-            "files: outgoing zip complete"
-        );
-        crate::session_telemetry::counters(session_id).note_file(
-            TransferDirection::FromHost,
-            &offer.name,
-            total_bytes,
-        );
+    // #1730 — as the single-file download: every message races the stop
+    // token, and the transfer's state goes first on every exit.
+    if or_stopped(
+        &offer.cancel,
+        dc.send_json(&crate::files::FilesOutgoing::Offer {
+            id: &offer.id,
+            name: &offer.name,
+            size: None, // streaming — total unknown
+            mime: offer.mime,
+        }),
+    )
+    .await
+    .is_err()
+    {
         handler.finish_outgoing(&offer.id).await;
-        let _ = or_stopped(
-            &offer.cancel,
-            send_files_json(
-                &dc,
-                &crate::files::FilesOutgoing::Eof {
-                    id: &offer.id,
-                    bytes: total_bytes,
-                },
-            ),
-        )
-        .await;
+        return;
+    }
+
+    // Bounded duplex pipe: write side fed by async_zip; read
+    // side fed to the DC. 256 KiB buffer = ~4 of our 64 KiB
+    // chunks before async_zip's writes start blocking. Keeps
+    // memory usage low and gives backpressure-free crash
+    // protection if the DC is wedged.
+    const PIPE_BUFFER: usize = 256 * 1024;
+    let (writer_half, reader_half) = tokio::io::duplex(PIPE_BUFFER);
+    let cancel = offer.cancel.clone();
+    let path = offer.path.clone();
+    let who = offer.who.clone();
+    let walk_cancel = cancel.clone();
+    let walk_handle = tokio::spawn(async move {
+        crate::files::walk_and_zip(writer_half, &path, &who, walk_cancel).await
     });
+
+    let dc_for_pump = dc.clone();
+    let pump_cancel = cancel.clone();
+    let id_for_pump = offer.id.clone();
+    let pump_handle = tokio::spawn(async move {
+        zip_pump_loop(dc_for_pump, reader_half, pump_cancel, id_for_pump).await
+    });
+
+    // Wait for both sides. The walk task closes the writer
+    // half; the pump task sees EOF and exits.
+    let walk_res = walk_handle.await;
+    let pump_res = pump_handle.await;
+
+    let total_bytes = match (walk_res, pump_res) {
+        (Ok(Ok(_count)), Ok(Ok(bytes_sent))) => bytes_sent,
+        (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
+            handler.finish_outgoing(&offer.id).await;
+            if offer.cancel.is_cancelled() {
+                info!(%session_id, id = %offer.id, "files: zip download stopped (cancelled, or the session ended)");
+                return;
+            }
+            warn!(%session_id, id = %offer.id, %e, "files: zip pump failed");
+            let msg = format!("{e}");
+            let _ = or_stopped(
+                &offer.cancel,
+                dc.send_json(&crate::files::FilesOutgoing::Error {
+                    id: &offer.id,
+                    message: &msg,
+                }),
+            )
+            .await;
+            return;
+        }
+        (Err(je), _) | (_, Err(je)) => {
+            handler.finish_outgoing(&offer.id).await;
+            warn!(%session_id, id = %offer.id, %je, "files: zip pump task panicked");
+            let _ = or_stopped(
+                &offer.cancel,
+                dc.send_json(&crate::files::FilesOutgoing::Error {
+                    id: &offer.id,
+                    message: "zip pump task panicked",
+                }),
+            )
+            .await;
+            return;
+        }
+    };
+
+    info!(
+        %session_id, id = %offer.id, total_bytes,
+        path = %offer.path.display(),
+        "files: outgoing zip complete"
+    );
+    crate::session_telemetry::counters(session_id).note_file(
+        TransferDirection::FromHost,
+        &offer.name,
+        total_bytes,
+    );
+    handler.finish_outgoing(&offer.id).await;
+    let _ = or_stopped(
+        &offer.cancel,
+        dc.send_json(&crate::files::FilesOutgoing::Eof {
+            id: &offer.id,
+            bytes: total_bytes,
+        }),
+    )
+    .await;
 }
 
 /// Pump bytes from the duplex reader to the DC, applying SCTP
@@ -16470,6 +16467,143 @@ mod download_stop_tests {
         let want = std::fs::read(&path).expect("read the file back");
         assert_eq!(sent, want.len() as u64);
         assert!(*got.lock().unwrap() == want, "the bytes arrived intact");
+    }
+}
+
+/// #3669 — a folder download, driven from its entry point to its last
+/// message through the task a `files:get-folder` runs ([`outgoing_zip`]),
+/// walks as the reader it began for: the person its offer carries to the
+/// walk. The person is the low-integrity stand-in (`files::stand_in`).
+#[cfg(all(test, target_os = "windows"))]
+mod folder_download_as_the_person_tests {
+    use super::*;
+    use crate::files::stand_in;
+
+    /// A channel that keeps what it was sent: the bytes, and each message
+    /// as its JSON.
+    #[derive(Clone, Default)]
+    struct Recorded {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        said: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl DownloadSink for Recorded {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            self.bytes.lock().unwrap().extend_from_slice(chunk);
+            Ok(())
+        }
+        async fn send_json(&self, msg: &crate::files::FilesOutgoing<'_>) {
+            let json = serde_json::to_string(msg).expect("a message as JSON");
+            self.said.lock().unwrap().push(json);
+        }
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    impl Recorded {
+        fn has(&self, needle: &[u8]) -> bool {
+            let bytes = self.bytes.lock().unwrap();
+            bytes.windows(needle.len()).any(|w| w == needle)
+        }
+        fn said(&self) -> Vec<String> {
+            self.said.lock().unwrap().clone()
+        }
+    }
+
+    /// `root` downloaded as a folder, read as whoever `FsAs::for_read()`
+    /// answers now.
+    async fn download(root: &std::path::Path) -> Recorded {
+        let sink = Recorded::default();
+        outgoing_zip(
+            sink.clone(),
+            crate::files::FilesHandler::new(),
+            bson::oid::ObjectId::new(),
+            "z3669-pump".into(),
+            root.to_string_lossy().into_owned(),
+        )
+        .await;
+        sink
+    }
+
+    /// Their file is in the zip; a file only the daemon may read, and one
+    /// inside a folder only the daemon may list, are left out; the zip
+    /// completes. Without a stand-in the daemon zips all three (the control).
+    #[tokio::test]
+    async fn a_folder_download_walks_as_the_person_its_offer_carries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        let shut = root.join("daemon-only");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::write(root.join("theirs.txt"), b"the person's file").unwrap();
+        std::fs::write(root.join("not-theirs.txt"), b"only the daemon reads this").unwrap();
+        std::fs::write(shut.join("inside.txt"), b"only the daemon lists this").unwrap();
+        stand_in::label_no_read_up(&root.join("not-theirs.txt"));
+        stand_in::label_no_read_up(&shut);
+        let theirs = {
+            let _as = stand_in::reader(stand_in::person(temp.path(), temp.path())).await;
+            download(&root).await
+        };
+        let said = theirs.said();
+        assert!(
+            said.last()
+                .is_some_and(|m| m.contains(r#""t":"files:eof""#)),
+            "the zip completes: {said:?}"
+        );
+        assert!(theirs.has(b"the person's file"), "their file is in");
+        assert!(
+            !theirs.has(b"only the daemon reads this"),
+            "a file they may not read is not: the walk read as the daemon"
+        );
+        assert!(
+            !theirs.has(b"only the daemon lists this"),
+            "nor one inside a folder they may not list"
+        );
+        let all = download(&root).await;
+        for needle in [
+            &b"the person's file"[..],
+            b"only the daemon reads this",
+            b"only the daemon lists this",
+        ] {
+            assert!(all.has(needle), "the daemon zips {needle:?}");
+        }
+    }
+
+    /// A person who signs out partway through ends the download with
+    /// `files:error`, never `files:eof`, so what was already sent is never
+    /// taken for the whole folder. The steps: the download's start (1), the
+    /// root resolved (2) and listed (3), the first file opened (4); by the
+    /// second file they have gone.
+    #[tokio::test]
+    async fn a_person_who_signs_out_mid_folder_ends_it_with_an_error_not_eof() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        // NTFS lists a folder in name order.
+        std::fs::write(root.join("a.txt"), b"the first file").unwrap();
+        std::fs::write(root.join("b.txt"), b"the second file").unwrap();
+        let got = {
+            let who = stand_in::person_signing_out_after(4, temp.path());
+            let _as = stand_in::reader(who).await;
+            download(&root).await
+        };
+        let said = got.said();
+        assert!(
+            got.has(b"the first file"),
+            "the entry sent before they went"
+        );
+        assert!(!got.has(b"the second file"), "none after");
+        assert!(
+            !said.iter().any(|m| m.contains("files:eof")),
+            "never files:eof: {said:?}"
+        );
+        let last = said.last().expect("a last message");
+        assert!(
+            last.contains(r#""t":"files:error""#) && last.contains(crate::files::NOT_THE_PERSON),
+            "the walk's error reaches the viewer: {last}"
+        );
     }
 }
 

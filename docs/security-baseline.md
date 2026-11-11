@@ -546,10 +546,12 @@ viewer's file transfer touches on the person's side runs through `FsAs`
 folder download and the drawer's listing are read, as the person signed in to
 the session the worker serves, their token impersonated on a blocking thread for
 one step at a time. With nobody signed in, each is refused with a reason the
-viewer shows ([`desktop-companion.md`](desktop-companion.md) §9.2, §9.3). Only
-the service's own staging is written as the service. A new file verb takes the
+viewer shows ([`desktop-companion.md`](desktop-companion.md) §9.2, §9.3). A
+worker that cannot read its own token is taken for LocalSystem here: the answer
+is then the person or nobody, never the worker itself. Only the service's own
+staging is written as the service. A new file verb takes the
 same path: `FsAs::now()` for a write, `FsAs::for_read()` for a read, and every
-filesystem call inside `FsAs::run`. The person's token is the boundary;
+call on the person's side inside `FsAs::run`. The person's token is the boundary;
 `validate_outgoing_path`'s denylists and `is_agent_secret` stay, as a second
 line.
 
