@@ -396,7 +396,7 @@ opt-in's bargain (§2), and it is why the owner's lasting remedy is the opt-in.
 **On a supervised Mac** the GUI worker builds each session from its own file,
 which a push to the root's row never reaches. So the daemon sends its entries
 along with each session (`SessionParams::media_legacy`,
-`agents/roomlerd/src/delegate.rs:363`, from `media_legacy_for_delegate`,
+`agents/roomlerd/src/delegate.rs:479`, from `media_legacy_for_delegate`,
 `agents/roomlerd/src/remote_config.rs:310`). The worker adds them to its own
 before it decides the session's paths. Adding legacy entries can only send a path
 back, so this never turns code on, and a daemon older than the field sends
