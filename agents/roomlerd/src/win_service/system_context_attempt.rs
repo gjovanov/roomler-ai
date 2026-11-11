@@ -357,6 +357,55 @@ mod tests {
         assert!(s.ends_with("last-system-context-attempt.json"));
     }
 
+    /// #3702 — the machine's folders, as a step on the service account names
+    /// them, come from the system: the same test in a child process whose
+    /// variables name other folders, as another account's environment would,
+    /// reads the same answer.
+    #[test]
+    fn the_machine_folders_a_step_names_come_from_the_system() {
+        const ANSWER: &str = "ROOMLER_TEST_MACHINE_ROOTS=";
+        const CHILD: &str = "ROOMLER_TEST_MACHINE_ROOTS_CHILD";
+        let mut roots = vec![
+            crate::appdirs::machine_global_dir(),
+            path(),
+            crate::updater::install_dir_with_name(
+                crate::updater::WindowsInstallFlavour::PerMachine,
+                crate::updater::INSTALL_FOLDER_NAME,
+            )
+            .unwrap_or_default(),
+        ];
+        #[cfg(feature = "system-context")]
+        roots.push(crate::system_context::peer_presence::marker_path());
+        let answer = format!("{ANSWER}{roots:?}");
+        if std::env::var_os(CHILD).is_some() {
+            println!("{answer}");
+            return;
+        }
+        assert!(!answer.contains("poison"), "{answer}");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "win_service::system_context_attempt::tests::the_machine_folders_a_step_names_come_from_the_system",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        for name in [
+            "ProgramData",
+            "ALLUSERSPROFILE",
+            "ProgramFiles",
+            "ProgramW6432",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            child.env(name, r"C:\poison");
+        }
+        let out = child.output().unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(printed.contains(&answer), "{printed}");
+    }
+
     fn rec(command: &str, stage: Stage) -> Attempt {
         match stage {
             Stage::Ok => Attempt::ok(command),

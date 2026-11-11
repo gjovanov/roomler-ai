@@ -95,7 +95,7 @@ use anyhow::Result;
 // Only the Windows cleanup paths construct PathBuf — gate the import
 // behind cfg so Linux/macOS clippy doesn't flag it as unused.
 #[cfg(target_os = "windows")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which MSI flavour is being INSTALLED. The helper cleans the
 /// OPPOSITE flavour's artifacts.
@@ -251,6 +251,13 @@ fn cleanup_vacated_install_dir(target: TargetFlavour, report: &mut CleanupReport
             .push("vacated-dir sweep: install root env var unset".to_string());
         return;
     };
+    sweep_vacated_dir(&dir, report, dry_run);
+}
+
+/// The sweep of one vacated install folder, `dir`: what
+/// [`cleanup_vacated_install_dir`] does once it has named it.
+#[cfg(target_os = "windows")]
+fn sweep_vacated_dir(dir: &Path, report: &mut CleanupReport, dry_run: bool) {
     if !dir.is_dir() {
         report
             .skipped
@@ -645,6 +652,61 @@ mod tests {
             "perMachine dir must live under Program Files: {}",
             pm.display()
         );
+    }
+
+    /// A junction at `link` that leads to the folder `target` (`mklink /J`,
+    /// which needs no privilege).
+    #[cfg(target_os = "windows")]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new(crate::appdirs::system32_tool("cmd.exe"))
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J {}", link.display());
+    }
+
+    /// #3702 — the vacated-dir sweep deletes nothing through a link: a folder
+    /// that is a junction, or sits below one, is left as it is, and so is
+    /// everything the link leads to.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_vacated_dir_sweep_follows_no_link() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("roomler-agent")).unwrap();
+        for file in [
+            real.join("roomlerd.exe"),
+            real.join("roomler-agent").join("roomlerd.exe"),
+        ] {
+            std::fs::write(&file, "x").unwrap();
+        }
+        // The folder itself is the link.
+        let at = root.path().join("roomler-agent");
+        junction(&at, &real);
+        // The folder sits below one.
+        let parent = root.path().join("parent");
+        junction(&parent, &real);
+        for dir in [at, parent.join("roomler-agent")] {
+            let mut report = CleanupReport::default();
+            sweep_vacated_dir(&dir, &mut report, false);
+            assert!(real.join("roomlerd.exe").is_file(), "{report:?}");
+            assert!(
+                real.join("roomler-agent").join("roomlerd.exe").is_file(),
+                "{report:?}"
+            );
+            assert!(report.removed.is_empty(), "{report:?}");
+            assert!(
+                report.skipped.iter().any(|s| s.contains("link")),
+                "{report:?}"
+            );
+        }
+        // The same folder, reached with no link, is swept.
+        let mut report = CleanupReport::default();
+        sweep_vacated_dir(&real.join("roomler-agent"), &mut report, false);
+        assert!(!real.join("roomler-agent").exists(), "{report:?}");
     }
 
     /// Dry-run `run_cleanup` always records the sweep's verdict —

@@ -8386,6 +8386,17 @@ mod tests {
         assert_eq!(got, default);
     }
 
+    /// #3702 — the second rung is the SYSTEM profile's own config, and only
+    /// that: a SystemContext process whose profile config resolves anywhere
+    /// else names the machine path, whatever opens there.
+    #[test]
+    fn pick_config_path_system_context_takes_a_profile_config_only_in_the_system_profile() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let elsewhere = Path::new(r"C:\Users\u\AppData\Roaming\roomler\roomler\config\config.toml");
+        let got = pick_config_path(None, true, Some(mg), elsewhere, |p| p == elsewhere);
+        assert_eq!(got, mg);
+    }
+
     /// #3609 — the service host and the worker's ladder read the machine rung
     /// through one function (`win_service::supervisor::rung_opens`), so they
     /// cannot disagree: both refuse a machine config another account may
