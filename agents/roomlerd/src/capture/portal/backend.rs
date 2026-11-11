@@ -145,11 +145,11 @@ impl PortalCapture {
     /// The capture over a helper already started: its handshake, then its
     /// frames. Split from [`Self::open_with`] so a test can hand it a
     /// stand-in helper.
-    fn from_helper(
-        mut child: std::process::Child,
-        use_mutter: bool,
-        want_input: bool,
-    ) -> Result<Self> {
+    fn from_helper(child: std::process::Child, use_mutter: bool, want_input: bool) -> Result<Self> {
+        // #3695 — held by `Starting` until the capture owns it: every return
+        // below that does not hand it over ends it and waits for it.
+        let mut helper = Starting(Some(child));
+        let child = helper.child();
         let stdout = child
             .stdout
             .take()
@@ -201,8 +201,6 @@ impl PortalCapture {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(anyhow!(
                     "the portal helper did not start a stream within {}s — a consent dialog \
                      left unanswered, most likely (the portal is attended)",
@@ -268,7 +266,7 @@ impl PortalCapture {
         let watch = watch_session();
 
         Ok(Self {
-            child,
+            child: helper.hand_over(),
             rx,
             width,
             height,
@@ -286,6 +284,33 @@ impl PortalCapture {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+}
+
+/// #3695 — the helper from its start until a capture owns it. Every return
+/// from [`PortalCapture::from_helper`] that does not hand it over drops this,
+/// and the drop ends the helper and waits for it.
+struct Starting(Option<std::process::Child>);
+
+impl Starting {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("the helper is held until it is handed over")
+    }
+
+    /// The capture takes the helper, and nothing is ended.
+    fn hand_over(mut self) -> std::process::Child {
+        self.0.take().expect("the helper is handed over once")
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
