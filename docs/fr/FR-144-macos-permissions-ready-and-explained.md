@@ -144,7 +144,10 @@ what is missing.
   rows, so it goes away the moment the last one is Allowed.
 - **The restart is ours.** When See the screen turns on, Roomler restarts `roomlerd` itself through the LocalAPI
   `RestartDaemon` verb the card already uses (`overview.js:689-708`), at once when no session is live, and
-  otherwise after asking: "Restart roomlerd now? It ends the current remote session." The step's text before the
+  otherwise after asking: "Restart roomlerd now? It ends the current remote session." What restarts is the
+  process that holds the grant, the person's half: on a Mac with a root half, that half and its private network
+  stay up (which process the verb restarts on a one-row Mac is to verify in P1). "Live" counts everything the
+  restarted process serves: a remote-control session, an SSH session, a tunnel forward. The step's text before the
   switch: "macOS will offer Quit & Reopen: choose Later. Roomler restarts roomlerd for you." For a person who chooses
   Quit & Reopen anyway, the process LaunchServices starts (`app.rs:3794`) takes LaunchServices' open event before it
   leaves, so Finder has nothing to report (#3240 row 9 was triaged "Discard" as owned by the OS; the operator's
@@ -163,7 +166,9 @@ what is missing.
   **One action, Repair:** `tccutil reset <service> com.roomler.agent` (through the root half as the uninstall does,
   `install.sh:1948`, or as the person where there is no root half: to verify in the field), then `roomlerd` asks
   again, which lists it in the pane, the person turns it on, and Roomler restarts it. Repair is never offered to a
-  controller: a reset only removes, and the grant needs a person.
+  controller: a reset only removes, and the grant needs a person. The root half's reset takes one thing from its
+  caller, which row: the bundle id and the service names are fixed in the root half, so the verb reaches no other
+  app's grants.
 - **When it is checked:** at every start of the person's half (where the preflight runs, `app.rs:3943`), so after
   our own update and after a macOS update without a separate trigger; and when a session's capture fails with
   `permission`.
@@ -277,15 +282,18 @@ unless they say otherwise.
 
 ## Open decisions
 
-- **D1. Apply for the persistent-content-capture entitlement now?** Recommendation: yes, at once, since Apple's
-  answer takes its own time and everything else works without it. Cost: a request under the publisher's
-  Developer ID account, a provisioning profile to keep valid in the signing lane, and the launch-failure risk of
-  (e) behind its kill switch.
-- **D2. The restart after Screen Recording: automatic when no session is live?** Recommendation: yes, and ask
+None is open. The operator decided all three on 2026-11-11, each as recommended.
+
+- **D1. Apply for the persistent-content-capture entitlement now? Decided: yes, at once.** Apple's answer takes
+  its own time and everything else works without it. Cost: a request under the publisher's Developer ID account,
+  a provisioning profile to keep valid in the signing lane, and the launch-failure risk of (e) behind its kill
+  switch. The request goes out from the publisher's own Apple Developer account; the field log records it once
+  it is in.
+- **D2. The restart after Screen Recording: automatic when no session is live? Decided: yes**, and Roomler asks
   only while a session is live. Cost: a restart the person did not press, which ends nothing but the daemon's
   own uptime. The other way, always asking, adds one click to every first install.
-- **D3. May the wizard finish before every row is Allowed?** Recommendation: yes, with "Do this later", Done
-  naming what is left, and the standing warning in the companion. Cost: a Mac can leave the wizard not ready for an
+- **D3. May the wizard finish before every row is Allowed? Decided: yes**, with "Do this later", Done naming
+  what is left, and the standing warning in the companion. Cost: a Mac can leave the wizard not ready for an
   unattended session. Making the step required blocks an install on a person who cannot give a grant (a managed
   Mac, a standard user).
 
