@@ -582,9 +582,10 @@ pub fn migration_notes() -> &'static [String] {
 /// #3702 — the move runs only for the account that owns the folders
 /// ([`may_migrate`]): never in an installer step (`installer_step`), and the
 /// per-user pairs only when each lies in `own_profile`, the profile the
-/// system names for the account this process runs as. Every pair is moved
-/// by [`migrate_dir_within`], which follows no link below its root; the
-/// machine pair's root is [`machine_program_data`].
+/// system names for the account this process runs as. The pairs move by
+/// [`migrate_dirs_within`]: all of them or none, none through a link below
+/// its root, the config pair first; the machine pair's root is
+/// [`machine_program_data`].
 pub fn migrate_legacy_trees(
     companion_running: bool,
     installer_step: bool,
@@ -620,11 +621,9 @@ pub fn migrate_legacy_trees(
                 .collect();
             match own_profile.filter(|_| may_migrate(installer_step, own_profile, &folders)) {
                 Some(profile) => {
-                    for (o, n) in &pairs {
-                        if let Some(note) = migrate_dir_within(profile, o, n) {
-                            notes.push(note);
-                        }
-                    }
+                    // The config pair is first in `pairs`: the order
+                    // `migrate_dirs_within` keeps.
+                    notes.extend(migrate_dirs_within(profile, &pairs, migrate_dir));
                     // Best-effort: drop the now-empty legacy shells (e.g.
                     // Windows `%APPDATA%\roomler\roomler-agent` after its
                     // `config`/`data` children moved out). `remove_dir`
@@ -672,8 +671,8 @@ pub fn migrate_legacy_trees(
                 if old.exists() {
                     notes.push(in_an_installer_step(&old));
                 }
-            } else if let Some(note) = migrate_dir_within(&root, &old, &new) {
-                notes.push(note);
+            } else {
+                notes.extend(migrate_dirs_within(&root, &[(old, new)], migrate_dir));
             }
         }
     }
@@ -732,58 +731,96 @@ pub fn may_migrate(installer_step: bool, own_profile: Option<&Path>, folders: &[
     !installer_step && own_profile.is_some_and(|own| folders.iter().all(|f| in_folder(f, own)))
 }
 
-/// #3702 — [`migrate_dir`] for a pair in `root` (a profile, or the machine's
-/// data folder): a pair outside it, or reached through a folder link below
-/// it ([`link_below`]), is left where it is, with a note.
-fn migrate_dir_within(root: &Path, old: &Path, new: &Path) -> Option<String> {
-    if !old.exists() {
-        return None;
-    }
-    for path in [old, new] {
-        if !in_folder(path, root) {
-            return Some(format!(
-                "legacy tree left in place: {} is not in {}",
-                path.display(),
-                root.display()
-            ));
+/// #3702 — why every pair in `root` (a profile, or the machine's data
+/// folder) stays where it is, decided for all of them before any pair moves:
+/// the first folder of a pair with a legacy folder to move that lies outside
+/// `root`, or is reached through a folder link below it ([`link_below`]),
+/// named in one note. `None` when every pair may move.
+fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
+    for (old, new) in pairs.iter().filter(|(old, _)| old.exists()) {
+        for path in [old, new] {
+            if !in_folder(path, root) {
+                return Some(format!(
+                    "legacy tree left in place: {} is not in {}",
+                    path.display(),
+                    root.display()
+                ));
+            }
+            if let Some(link) = link_below(root, path) {
+                return Some(format!(
+                    "legacy tree left in place: {} is a link",
+                    link.display()
+                ));
+            }
         }
-        if let Some(link) = link_below(root, path) {
-            return Some(format!(
-                "legacy tree left in place: {} is a link",
-                link.display()
-            ));
-        }
     }
-    migrate_dir(old, new)
+    None
 }
 
-/// Apply the migration rules to one directory pair. Returns a note for
-/// anything noteworthy (moved / both-present / failed), `None` for the
-/// quiet no-legacy case.
-fn migrate_dir(old: &Path, new: &Path) -> Option<String> {
+/// #3702 — [`migrate_dir`] (`mv`) for every pair in `root`, or for none of
+/// them ([`kept_in_place`]). The pairs move in the order given, the config
+/// pair first, and a pair whose move fails leaves the pairs after it where
+/// they are. The segment choice ([`tree_exists`]) keys on the NEW config
+/// folder and the NEW local data folder, so it finds a NEW tree only once
+/// the config is in it: the daemon reads the config it had, from the NEW
+/// tree or from the OLD one.
+fn migrate_dirs_within(
+    root: &Path,
+    pairs: &[(PathBuf, PathBuf)],
+    mut mv: impl FnMut(&Path, &Path) -> Result<Option<String>, String>,
+) -> Vec<String> {
+    if let Some(note) = kept_in_place(root, pairs) {
+        return vec![note];
+    }
+    let mut notes = Vec::new();
+    for (at, (old, new)) in pairs.iter().enumerate() {
+        match mv(old, new) {
+            Ok(note) => notes.extend(note),
+            Err(note) => {
+                notes.push(note);
+                notes.extend(pairs[at + 1..].iter().filter(|(old, _)| old.exists()).map(
+                    |(old, _)| {
+                        format!(
+                            "legacy tree left in place: {} (a move before it failed)",
+                            old.display()
+                        )
+                    },
+                ));
+                break;
+            }
+        }
+    }
+    notes
+}
+
+/// Apply the migration rules to one directory pair: `Ok` with a note for
+/// anything noteworthy (moved, or left beside a NEW folder that is already
+/// there), `Ok(None)` for the quiet no-legacy case, `Err` with a note when
+/// the move failed and the legacy folder is still where it was.
+fn migrate_dir(old: &Path, new: &Path) -> Result<Option<String>, String> {
     if !old.exists() {
-        return None;
+        return Ok(None);
     }
     if new.exists() {
-        return Some(format!(
+        return Ok(Some(format!(
             "legacy tree left in place (new tree also present): {}",
             old.display()
-        ));
+        )));
     }
     if let Some(parent) = new.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        return Some(format!(
+        return Err(format!(
             "migration failed (create {}): {e}",
             parent.display()
         ));
     }
     match std::fs::rename(old, new) {
-        Ok(()) => Some(format!(
+        Ok(()) => Ok(Some(format!(
             "migrated legacy tree {} -> {}",
             old.display(),
             new.display()
-        )),
+        ))),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
             // denied by an external ROOT-handle (an AV / indexer
@@ -791,9 +828,9 @@ fn migrate_dir(old: &Path, new: &Path) -> Option<String> {
             // were Full, and every CHILD renamed fine). Fall back to
             // moving the children individually; that dodges the
             // root-handle without needing the watcher gone.
-            Some(migrate_children(old, new, &e))
+            migrate_children(old, new, &e).map(Some)
         }
-        Err(e) => Some(format!(
+        Err(e) => Err(format!(
             "migration failed ({} -> {}): {e} — read-both fallback stays in charge",
             old.display(),
             new.display()
@@ -964,24 +1001,26 @@ pub fn system_config_notes() -> &'static [String] {
 }
 
 /// Per-child fallback for a root-locked legacy dir. `config.toml` moves
-/// LAST, and any mid-way failure rolls the already-moved entries back —
-/// so the tree is always either wholly OLD or wholly NEW (a half-empty
+/// LAST, and any mid-way failure rolls the already-moved entries back and
+/// removes the NEW folder this move made (`Err`) — so the tree is always
+/// either wholly OLD or wholly NEW (an empty or half-empty
 /// NEW tree would win the NEW-first resolution and strand the enrolled
 /// config in the abandoned OLD one).
-fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> String {
+fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> Result<String, String> {
     let Ok(entries) = std::fs::read_dir(old) else {
-        return format!(
+        return Err(format!(
             "migration failed ({} -> {}): {root_err} (and the legacy dir is unreadable)",
             old.display(),
             new.display()
-        );
+        ));
     };
     let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
     // config.toml last: the enrollment must be the final thing to leave
     // the old tree.
     children.sort_by_key(|p| p.file_name().is_some_and(|f| f == "config.toml"));
+    let made_new = !new.exists();
     if let Err(e) = std::fs::create_dir_all(new) {
-        return format!("migration failed (create {}): {e}", new.display());
+        return Err(format!("migration failed (create {}): {e}", new.display()));
     }
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for src in &children {
@@ -1001,23 +1040,28 @@ fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> String
                         rolled_back = false;
                     }
                 }
-                return format!(
+                // The NEW folder this move made goes too: the segment choice
+                // keys on it. `remove_dir` leaves it while anything is in it.
+                if made_new {
+                    let _ = std::fs::remove_dir(new);
+                }
+                return Err(format!(
                     "per-child migration of {} aborted at {} ({e}); rolled back: {rolled_back} \
                      (root rename was denied: {root_err})",
                     old.display(),
                     src.display()
-                );
+                ));
             }
         }
     }
     let _ = std::fs::remove_dir(old);
-    format!(
+    Ok(format!(
         "migrated legacy tree {} -> {} per-child ({} entries; the root dir itself was \
          locked by another process: {root_err})",
         old.display(),
         new.display(),
         moved.len()
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -1252,21 +1296,116 @@ mod tests {
         std::fs::create_dir_all(&profile).unwrap();
         let link = profile.join("AppData");
         folder_link(&link, &elsewhere);
-        let note = migrate_dir_within(&profile, &link.join(OLD_APP), &link.join(NEW_APP));
+        let notes = migrate_dirs_within(
+            &profile,
+            &[(link.join(OLD_APP), link.join(NEW_APP))],
+            migrate_dir,
+        );
         assert!(
             elsewhere.join(OLD_APP).join("config.toml").is_file(),
-            "{note:?}"
+            "{notes:?}"
         );
-        assert!(!elsewhere.join(NEW_APP).exists(), "{note:?}");
-        assert!(
-            note.as_deref().is_some_and(|n| n.contains("link")),
-            "{note:?}"
-        );
+        assert!(!elsewhere.join(NEW_APP).exists(), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("link")), "{notes:?}");
         // The same pair with no link moves.
         let real = root.path().join("real");
         std::fs::create_dir_all(real.join(OLD_APP)).unwrap();
-        let note = migrate_dir_within(&real, &real.join(OLD_APP), &real.join(NEW_APP));
-        assert!(real.join(NEW_APP).is_dir(), "{note:?}");
+        let notes = migrate_dirs_within(
+            &real,
+            &[(real.join(OLD_APP), real.join(NEW_APP))],
+            migrate_dir,
+        );
+        assert!(real.join(NEW_APP).is_dir(), "{notes:?}");
+    }
+
+    /// The pair `<home>/roomler-agent` -> `<home>/roomler`.
+    fn pair_in(home: &Path) -> (PathBuf, PathBuf) {
+        (home.join(OLD_APP), home.join(NEW_APP))
+    }
+
+    /// Whether the segment choice ([`tree_exists`]) finds the tree whose
+    /// config folder is `config` and whose local data folder is `data`.
+    fn tree_present(config: &Path, data: &Path) -> bool {
+        config.exists() || data.exists()
+    }
+
+    /// #3702 — the one-time move decides for every pair before any pair
+    /// moves: a link on the way of the config pair (a junction on Windows, a
+    /// symbolic link elsewhere) leaves the data pair where it is too, with one
+    /// note that names the link. No NEW folder exists afterwards, so the
+    /// segment choice keeps the OLD tree, and the config is where it was.
+    #[test]
+    fn a_link_on_one_pairs_way_leaves_every_pair_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(OLD_APP)).unwrap();
+        std::fs::write(elsewhere.join(OLD_APP).join("config.toml"), "x").unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let config_home = profile.join("config");
+        folder_link(&config_home, &elsewhere);
+        let data_home = profile.join("data");
+        std::fs::create_dir_all(data_home.join(OLD_APP)).unwrap();
+        std::fs::write(data_home.join(OLD_APP).join("logs.txt"), "x").unwrap();
+        let (config, data) = (pair_in(&config_home), pair_in(&data_home));
+
+        let notes = migrate_dirs_within(&profile, &[config.clone(), data.clone()], migrate_dir);
+
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains(&config_home.display().to_string()) && notes[0].contains("link"),
+            "{notes:?}"
+        );
+        assert!(data.0.join("logs.txt").is_file(), "{notes:?}");
+        assert!(!tree_present(&config.1, &data.1), "{notes:?}");
+        assert!(tree_present(&config.0, &data.0), "{notes:?}");
+        assert!(config.0.join("config.toml").is_file(), "{notes:?}");
+
+        // The same pairs with no link on their way both move.
+        let plain = root.path().join("plain");
+        let pairs = [pair_in(&plain.join("config")), pair_in(&plain.join("data"))];
+        for (old, _) in &pairs {
+            std::fs::create_dir_all(old).unwrap();
+        }
+        let notes = migrate_dirs_within(&plain, &pairs, migrate_dir);
+        assert!(
+            pairs.iter().all(|(old, new)| !old.exists() && new.is_dir()),
+            "{notes:?}"
+        );
+    }
+
+    /// #3702 — a pair whose move fails leaves the pairs after it where they
+    /// are. The config pair moves first, so no NEW folder the segment choice
+    /// keys on exists while the config is still in the OLD tree.
+    #[test]
+    fn a_failed_move_leaves_the_pairs_after_it_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path();
+        let (config, data) = (
+            pair_in(&profile.join("config")),
+            pair_in(&profile.join("data")),
+        );
+        for (old, _) in [&config, &data] {
+            std::fs::create_dir_all(old).unwrap();
+        }
+        std::fs::write(config.0.join("config.toml"), "x").unwrap();
+        let mut tried = Vec::new();
+        let notes = migrate_dirs_within(profile, &[config.clone(), data.clone()], |old, new| {
+            tried.push(old.to_path_buf());
+            if old == config.0 {
+                return Err(format!("migration failed ({})", old.display()));
+            }
+            migrate_dir(old, new)
+        });
+        assert_eq!(tried, [config.0.clone()], "{notes:?}");
+        assert!(!tree_present(&config.1, &data.1), "{notes:?}");
+        assert!(config.0.join("config.toml").is_file(), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains(&data.0.display().to_string())),
+            "{notes:?}"
+        );
     }
 
     #[test]
@@ -1399,7 +1538,9 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("config.toml"), b"agent_token = \"x\"").unwrap();
 
-        let note = migrate_dir(&old, &new).expect("a move produces a note");
+        let note = migrate_dir(&old, &new)
+            .unwrap()
+            .expect("a move produces a note");
         assert!(note.starts_with("migrated"), "{note}");
         assert!(!old.exists(), "legacy dir must be gone after the move");
         assert_eq!(
@@ -1418,7 +1559,9 @@ mod tests {
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(old.join("stale.txt"), b"old").unwrap();
 
-        let note = migrate_dir(&old, &new).expect("both-present produces a note");
+        let note = migrate_dir(&old, &new)
+            .unwrap()
+            .expect("both-present produces a note");
         assert!(note.contains("left in place"), "{note}");
         assert!(old.join("stale.txt").exists(), "nothing may be deleted");
     }
@@ -1433,7 +1576,7 @@ mod tests {
         std::fs::write(old.join("service-logs").join("a.log"), b"l").unwrap();
 
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err);
+        let note = migrate_children(&old, &new, &err).unwrap();
         assert!(note.contains("per-child"), "{note}");
         assert!(!old.exists(), "emptied legacy root must be removed");
         assert_eq!(
@@ -1455,7 +1598,7 @@ mod tests {
         std::fs::create_dir_all(new.join("crashes").join("blocker")).unwrap();
 
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
-        let note = migrate_children(&old, &new, &err);
+        let note = migrate_children(&old, &new, &err).unwrap_err();
         assert!(note.contains("aborted"), "{note}");
         // config.toml sorted LAST → it never left the old tree before the
         // failure, and anything that did move was rolled back.
@@ -1466,15 +1609,46 @@ mod tests {
         assert!(old.join("crashes").exists());
     }
 
+    /// #3702 — a per-child move that stops midway leaves no NEW folder it
+    /// made: the segment choice keys on that folder being there. A file held
+    /// open with no sharing cannot be renamed on Windows.
+    #[cfg(windows)]
+    #[test]
+    fn a_per_child_move_that_stops_leaves_no_new_folder() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join(OLD_APP);
+        let new = tmp.path().join(NEW_APP);
+        std::fs::create_dir_all(&old).unwrap();
+        for name in ["a.log", "b.log", "config.toml"] {
+            std::fs::write(old.join(name), name).unwrap();
+        }
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(old.join("b.log"))
+            .unwrap();
+
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root locked");
+        let note = migrate_children(&old, &new, &err).unwrap_err();
+        drop(held);
+
+        assert!(note.contains("aborted"), "{note}");
+        assert!(!new.exists(), "{note}");
+        for name in ["a.log", "b.log", "config.toml"] {
+            assert!(old.join(name).is_file(), "{name}: {note}");
+        }
+    }
+
     #[test]
     fn migrate_dir_is_quiet_without_legacy() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(
+        assert_eq!(
             migrate_dir(
                 &tmp.path().join("roomler-agent"),
                 &tmp.path().join("roomler")
-            )
-            .is_none()
+            ),
+            Ok(None)
         );
     }
 
