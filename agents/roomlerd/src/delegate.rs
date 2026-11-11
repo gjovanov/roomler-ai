@@ -55,7 +55,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use roomler_ai_remote_control::models::AgentCaps;
+use roomler_ai_remote_control::models::{AgentCaps, RecordCap, Unavailable};
 use roomler_ai_remote_control::signaling::{ClientMsg, ServerMsg};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -328,6 +328,73 @@ fn cut_to(s: &mut String, max: usize) {
         }
         s.truncate(end);
     }
+}
+
+/// #3695 — the `apps`, `audio` and `permissions` words a worker may give for
+/// its device: the words this build's own builders write
+/// (`encode/caps.rs`: `apps_caps_for`, and `compute_caps`'s audio and
+/// permission words). Its `record` words are those [`RecordCap`] reads. A
+/// word a builder gains is added here too, or a delegated Mac does not pass
+/// it on.
+const WORKER_APPS_WORDS: [&str; 4] = ["status", "list", "focus", "launch"];
+const WORKER_AUDIO_WORDS: [&str; 1] = ["opus"];
+const WORKER_PERMISSION_WORDS: [&str; 3] = ["screen-capture", "input", "no-gui-session"];
+
+/// #3695 — the longest `unavailable["audio"]` code the daemon keeps from its
+/// worker, a word of `[a-z0-9-]` (`no-session`). A code that is not one drops
+/// the reason.
+pub const WORKER_REASON_CODE_MAX: usize = 64;
+
+/// #3695 — the longest `unavailable["audio"]` reason the daemon keeps from
+/// its worker, cut on a character boundary. The reason is one sentence for
+/// the person at the viewer; the longest the agent writes today is under 200
+/// bytes.
+pub const WORKER_REASON_MAX: usize = 512;
+
+/// #3695 — what the daemon keeps of its worker's capabilities: the words that
+/// are the worker's to say, and nothing else. Those are the fields
+/// [`DelegateHost::effective_record`], [`DelegateHost::effective_apps`],
+/// [`DelegateHost::effective_audio`] and [`DelegateHost::effective_permissions`]
+/// hand on; codecs, encoders and every other field stay the daemon's own and
+/// are never read from the worker. Each list keeps the words this build knows,
+/// each once, in the worker's order; `permissions` keeps `None` apart from
+/// `Some([])`, which says the worker holds neither permission.
+fn worker_words(caps: AgentCaps) -> AgentCaps {
+    fn known(words: &[String], allowed: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut kept: Vec<String> = Vec::new();
+        for word in words {
+            if allowed(word) && !kept.contains(word) {
+                kept.push(word.clone());
+            }
+        }
+        kept
+    }
+    let mut kept = AgentCaps {
+        record: known(&caps.record, |w| RecordCap::from_wire(w).is_some()),
+        apps: known(&caps.apps, |w| WORKER_APPS_WORDS.contains(&w)),
+        audio: known(&caps.audio, |w| WORKER_AUDIO_WORDS.contains(&w)),
+        permissions: caps
+            .permissions
+            .as_deref()
+            .map(|words| known(words, |w| WORKER_PERMISSION_WORDS.contains(&w))),
+        has_input_permission: caps.has_input_permission,
+        ..AgentCaps::default()
+    };
+    if let Some(why) = caps.unavailable.get("audio") {
+        let code_ok = !why.code.is_empty()
+            && why.code.len() <= WORKER_REASON_CODE_MAX
+            && why
+                .code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if code_ok {
+            let mut reason = why.reason.clone();
+            cut_to(&mut reason, WORKER_REASON_MAX);
+            kept.unavailable
+                .insert("audio".into(), Unavailable::new(&why.code, &reason));
+        }
+    }
+    kept
 }
 
 /// FR-43 P3a — a worker's line as the daemon uploads it: trimmed, and marked as
@@ -1456,12 +1523,14 @@ impl DelegateHost {
                 // FR-43 P3b — and its person's consent floor.
                 Ok(DelegateFrame::PersonFloor(floor)) => self.note_person_floor(floor),
                 Ok(DelegateFrame::WorkerCaps { caps }) => {
+                    // #3695 — only the words that are the worker's to say.
+                    let caps = worker_words(*caps);
                     tracing::info!(
                         permissions = ?caps.permissions,
                         has_input = caps.has_input_permission,
                         "delegation: worker announced its capabilities"
                     );
-                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(*caps);
+                    *self.inner.worker_caps.lock().expect("worker caps mutex") = Some(caps);
                 }
                 Ok(
                     DelegateFrame::ToWorker { .. }
