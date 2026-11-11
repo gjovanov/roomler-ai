@@ -683,7 +683,7 @@ The same read for every RED and GREEN, so that they compare.
   both sequence diagrams, the state diagram and the old-and-new matrix; `docs/multi-pod-scale-out.md` and
   `docs/deployment.md` say what a roll does to a session now; the window, the scope and the agent's switch are in the
   operator docs; and any page added gets its row in `docs/README.md`'s index.
-- [ ] **AC9, never worse than today.** In integration tests, and once in the field on a test guest: a viewer whose
+- [x] **AC9, never worse than today.** In integration tests, and once in the field on a test guest: a viewer whose
   own socket and peer die together gets its new session with no `agent_busy`, on a device that allows one session,
   and its old session ends at that request. With the window at 0, the server ends at a socket loss what it ends
   today, and neither the registration read nor the sweep ends a row that no detach marked. A row ended by inference
