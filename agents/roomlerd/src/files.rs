@@ -4621,8 +4621,8 @@ mod tests {
         set_files_dir(Some(spelled.clone()));
         assert_eq!(download_dir().unwrap(), dir);
 
-        std::fs::remove_dir_all(&dir).unwrap();
-        std::fs::write(&dir, b"not a folder any more").unwrap();
+        // The folder becomes a file, retried should another test make the folder again.
+        turn_the_folder_into_a_file(&dir, b"not a folder any more");
         let default = default_download_dir(false).unwrap();
         assert_eq!(
             download_dir().unwrap(),
@@ -6340,9 +6340,9 @@ mod tests {
 
     #[tokio::test]
     async fn resume_unknown_id_errors() {
-        // Use a per-test unique id so a sibling test couldn't have
-        // inserted it. No need to reset the registry (which would
-        // race with parallel tests).
+        // A per-test unique id; the registry is never reset (that would race sibling tests).
+        // An unknown id resolves the drop folder: hold its lock (`turn_the_folder_into_a_file`).
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
         let id = format!(
             "rc19-resume-unknown-{}-{}",
             std::process::id(),
@@ -8582,6 +8582,36 @@ CAN_GRAPHICAL=0
                 assert!(!after_panic, "a panicking step ends its impersonation");
                 assert!(!impersonating(), "the runtime's own thread never did");
             });
+        }
+    }
+}
+
+/// #3688 — a test's step that turns its configured drop folder into a file.
+///
+/// The configured folder (`FILES_DIR`) is process-wide, and resolving the drop
+/// folder runs `files_dir::validate` on it, which creates a missing folder,
+/// probes a write and removes the probe. Every test that resolves the drop
+/// folder holds `FILES_DIR_TEST_LOCK` for that: an upload with no folder
+/// chosen, and a resume of an unknown id, which looks for its notes beside the
+/// drop folder (`resume_unknown_id_errors`). A test that did not could create
+/// this folder again between the remove and the write, so the step is retried,
+/// bounded, while the path is still a folder. Once the file stands, a
+/// concurrent `validate` refuses it and creates nothing.
+#[cfg(test)]
+fn turn_the_folder_into_a_file(dir: &std::path::Path, bytes: &[u8]) {
+    let mut tries = 1;
+    loop {
+        let _ = std::fs::remove_dir_all(dir);
+        match std::fs::write(dir, bytes) {
+            Ok(()) => return,
+            Err(e) => {
+                assert!(
+                    tries < 50 && dir.is_dir(),
+                    "{} did not become a file in {tries} tries: {e}",
+                    dir.display()
+                );
+                tries += 1;
+            }
         }
     }
 }
