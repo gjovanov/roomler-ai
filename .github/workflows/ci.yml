@@ -2152,17 +2152,23 @@ jobs:
         with:
           family: recording-ffmpeg
           max-target-mb: "5000"
-      - name: Configure apt retries and refresh the index
+      # 2026-11-11 (#3698): this lane's plain apt waited on the same dead
+      # resolver as the lint lanes (`Temporary failure resolving` for all three
+      # mirror names, 15:57-16:32Z). It now reaches the mirror the same way:
+      # ci-apt.sh probes the names, fails over to a public resolver when the
+      # runner's own has failed, and bounds the refresh and the install.
+      - name: Configure apt retries, reach the mirror, refresh the index
         run: |
           echo 'Acquire::Retries "3";' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
-          sudo apt-get update -qq
+          bash .github/actions/ci-linux-system-deps/ci-apt.sh prepare || echo "::warning::ci-apt.sh prepare failed (rc=$?): the install below still probes the mirror itself"
       - name: Install build deps
         # libclang: bindgen (ffmpeg-sys-next, env-libvpx-sys). libasound2-dev:
         # cpal, for `audio`. cmake: libopus from source (audiopus_sys).
         # libvpx-dev: `vp9-444` (see the job's env). Plain apt, not the cached
         # action — a handful of packages do not pay for a cache key that can
-        # silently restore nothing.
-        run: sudo apt-get install -y --no-install-recommends pkg-config libclang-dev libasound2-dev cmake libvpx-dev
+        # silently restore nothing. Bounded, with one error that says why when
+        # the mirror cannot be reached (#3698).
+        run: bash .github/actions/ci-linux-system-deps/ci-apt.sh fallback pkg-config libclang-dev libasound2-dev cmake libvpx-dev
       # 2026-10-24: `vp9-444-bindgen` under the image's newest libclang (22)
       # makes libvpx's encoder config opaque (see the action).
       - name: Point bindgen at the distro's libclang
