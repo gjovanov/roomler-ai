@@ -942,3 +942,50 @@ jobs:
           echo "Dispatching the wizard seed rehearsal for ${version}"
           gh workflow run release-setup.yml --ref master \
             -f version="${version}" -f publish_release=false -f signing_mode=off
+
+  # ---------------------------------------------------------------------------
+  # 8. Tell the SourceForge listing (FR-143)
+  # ---------------------------------------------------------------------------
+  # sourceforge-publish.yml carries this release to the SourceForge listing and
+  # moves its Download button (docs/sourceforge.md). It has to be DISPATCHED
+  # from here, because it cannot hear this run finish: release-agent.yml starts
+  # this lane with GITHUB_TOKEN, so the run's actor is github-actions[bot], and
+  # GitHub starts no `workflow_run` workflow for such a run. Measured
+  # 2026-11-11: the same self-skipping job re-run on a wizard run a person had
+  # dispatched and on one the token had dispatched; only the first reached a
+  # `workflow_run` listener. `workflow_dispatch` is the documented exception,
+  # the one `reseed` above uses.
+  #
+  # It can never fail a release: the wizard is published before this job
+  # starts, a dispatch that does not go through ends in a warning, and
+  # sourceforge-publish.yml's own schedule publishes whatever is left behind.
+  # SourceForge carries final wizards only, so a pre-release tag sends nothing.
+  sourceforge:
+    name: Dispatch the SourceForge publish
+    if: needs.validate-version.outputs.is_release == 'true'
+    needs: [validate-version, publish-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch sourceforge-publish.yml for this tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate-version.outputs.tag }}
+        run: |
+          set -uo pipefail
+          if ! [[ "$TAG" =~ ^setup-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::${TAG} is not a final setup release: SourceForge carries final wizards only"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if gh workflow run sourceforge-publish.yml --repo "$GITHUB_REPOSITORY" --ref master -f tag="$TAG"; then
+              echo "Dispatched the SourceForge publish for ${TAG}"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed"
+            sleep 10
+          done
+          echo "::warning::could not dispatch the SourceForge publish for ${TAG}. Its schedule publishes it within hours; to do it now: gh workflow run sourceforge-publish.yml -f tag=${TAG}"

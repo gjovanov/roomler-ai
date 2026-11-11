@@ -258,13 +258,24 @@ back into.
 feed; the wizard lane's `refresh-release-cache` busts it, and the 15 min TTL is
 the backstop.
 
-**The SourceForge listing follows the wizard release by itself (FR-143).** When
-the wizard lane finishes on a `setup-v*` ref, `sourceforge-publish.yml` uploads
-that release's 16 assets, moves the listing's Windows, macOS and Linux Download
+**The SourceForge listing follows the wizard release by itself (FR-143).** The
+wizard lane's last job (`sourceforge` in `release-setup.yml`) dispatches
+`sourceforge-publish.yml` for the tag it has just published. That run uploads the
+release's 16 assets, moves the listing's Windows, macOS and Linux Download
 defaults to it and removes versions older than the newest 10. Nothing to do at a
 cut. A failure opens a "SourceForge publish failed" issue and the next green
 publish closes it; `roomler.ai` is never affected. Runbook, the two secrets and
 the manual fallback: `docs/sourceforge.md`.
+⚠️ **A run that `GITHUB_TOKEN` started starts no workflow, not even by
+finishing.** The wizard run's actor is `github-actions[bot]`, so neither
+`on: release` nor `workflow_run` on "Release roomler-setup" ever fires for a real
+release (measured 2026-11-11; a wizard run dispatched from a person's account
+does fire `workflow_run`, which is how a rehearsal can look fine). Anything that
+must follow a wizard release is a `workflow_dispatch` from inside it.
+⚠️ The dispatch job never fails a release, so a lost dispatch is silent. The
+publish workflow's schedule (every 6 hours) publishes the newest setup release
+when the listing does not serve it yet; `gh workflow run sourceforge-publish.yml`
+with no tag does the same at once.
 ⚠️ It needs the secrets `SOURCEFORGE_SSH_KEY` and `SOURCEFORGE_API_KEY`. Without
 them a run warns "SourceForge publish is not configured" and skips, and the
 listing stays on the release someone last moved it to by hand.

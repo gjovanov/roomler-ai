@@ -1,6 +1,6 @@
 # FR-143: SourceForge gets each release's installers from our own workflow, and nothing else
 
-**Issue:** [#3691](https://github.com/gjovanov/roomler-ai/issues/3691) · **Status:** P0 done by hand 2026-11-11, AC3 met; P1 in review; P2: the two credentials stored and the first live publish green 2026-11-11, AC5 met. AC1 waits for two real releases after P1 merges
+**Issue:** [#3691](https://github.com/gjovanov/roomler-ai/issues/3691) · **Status:** P0 done by hand 2026-11-11, AC3 met; P1 merged 2026-11-11 (#3694); P2: the two credentials stored and the first live publish green 2026-11-11, AC5 met. The same evening showed that P1's trigger never fires for a real release, so P1b makes the wizard lane dispatch the publish. AC1 waits for two real releases after P1b merges
 **Related:** FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), which left "SourceForge's per-OS default downloads on future releases" out of scope), FR-6 ([#773](https://github.com/gjovanov/roomler-ai/issues/773), the `seed-cache` release), FR-84 (the wizard's lockstep with the agent release)
 
 ## Goal
@@ -75,7 +75,7 @@ sequenceDiagram
     participant A as SourceForge Release API
     participant L as The listing (best_release.json)
     W->>G: publish 16 assets
-    W-->>P: workflow_run completed, head_branch = setup-v
+    W->>P: workflow_dispatch, tag = setup-v (its last job, P1b)
     P->>G: download the release, read each asset's digest
     P->>P: verify: file = GitHub digest = its .sha256 sidecar
     P->>F: rsync the 16 files into /home/frs/project/roomler-ai/setup-v/
@@ -99,26 +99,44 @@ does the steps in the diagram and stops at the first one that fails.
 
 | choice | why |
 |---|---|
-| `workflow_run` on "Release roomler-setup", not `on: release` | The wizard lane publishes with `GITHUB_TOKEN`, and an event made with that token starts no workflow |
-| not a step inside `release-setup.yml` | A run on a tag executes that file as it stood at the tag. This one runs from the default branch whatever the tag holds |
-| the triggering run's conclusion is not read | The release exists on GitHub with every platform or it does not. A wizard run that published and then failed its cache refresh still has a release to carry |
+| a workflow of its own, not steps inside `release-setup.yml` | A run on a tag executes that file as it stood at the tag. The publish runs from the default branch whatever the tag holds, so a fix to it reaches the next release without a rehearsal of the wizard lane |
+| not `on: release` | The wizard lane publishes with `GITHUB_TOKEN`, and an event made with that token starts no workflow |
 | only the `setup-v<V>` assets | They are what a visitor downloads: the wizard for each platform with its checksum and signature, about 55 MiB. The wizard installs the newest packages itself |
 | only the **newest** setup release takes the defaults and triggers retention | A re-run of an older tag cannot take the button back. It uploads its files and changes nothing else |
 | retention after the listing serves the new files, never before | A default never points into a folder that is gone |
 | the API key in the request body, from a shell builtin into curl's stdin | Never in an argument list or a URL |
 | pinned host keys ([`scripts/sourceforge-known-hosts`](../../scripts/sourceforge-known-hosts)) | The three keys SourceForge publishes. A changed key ends the run |
 
-⚠️ `workflow_run.head_branch` is text the triggering run chose. It reaches the shell only through
-an environment variable, is never printed, and is used only after `valid-tag` has matched it
-against `setup-v<major>.<minor>.<patch>`.
+### P1b: the trigger that fires on a real release
+
+P1 started the publish with `workflow_run` on "Release roomler-setup". It merged at 18:13Z on
+2026-11-11, and within the hour that trigger was shown never to fire for a real release.
+
+**GitHub starts no workflow for a run whose actor is `github-actions[bot]`, not even for that
+run's completion.** `release-agent.yml` dispatches the wizard lane with `GITHUB_TOKEN`
+([`release-agent.yml`](../../.github/workflows/release-agent.yml), the `dispatch-setup-release`
+job), so every real wizard release is such a run. P1's design had the first half of this rule (the
+`on: release` row above) and missed that it covers `workflow_run` too. The field log has the
+measurement: the same self-skipping job re-run on a wizard run a person's account had dispatched
+and on one the token had dispatched, and only the first started the listener. Nothing before the
+merge could have shown it: GitHub fires `workflow_run` only for a workflow on the default branch,
+so every proof of P1 was a dispatch.
+
+| choice | why |
+|---|---|
+| the wizard lane dispatches the publish: a `sourceforge` job at the end of [`release-setup.yml`](../../.github/workflows/release-setup.yml), after `publish-release` | `workflow_dispatch` is the documented exception to the rule above, and the one this lane already uses for its re-seed. The job runs only on a release run, so the release exists with every asset when the publish starts |
+| that job never fails the release | The wizard is published before it starts. Three attempts, then a warning. A pre-release tag sends nothing, since the listing carries final wizards only |
+| `workflow_run` is removed, not kept beside it | It fires only for a wizard run a person's account dispatched, which the new job covers as well. Kept, it would publish such a release twice |
+| a reconcile on a schedule (every 6 hours) and by a dispatch with no tag | A lost dispatch fails nothing, and a tag cut before the job existed sends none. The reconcile takes the newest final setup release and publishes it only when `best_release.json` does not name its three installers. On a schedule it leaves a release younger than 45 minutes to its own dispatch |
+| the reconcile refuses when a button serves a setup release newer than GitHub's newest | That is a release pulled back on GitHub. Moving the button is then a person's decision, so the run fails and the alert opens |
 
 ### Every decision is a pure function
 
 [`scripts/sourceforge-publish.sh`](../../scripts/sourceforge-publish.sh) decides which tag is
 final, which is the newest, which file is whose default, whether a downloaded release is the one
-GitHub holds, and what retention removes. It makes no network call, so `--selftest` cannot reach
-SourceForge: it runs on every pull request that touches these files and at the start of every
-publish.
+GitHub holds, whether the listing is behind, and what retention removes. It makes no network
+call, so `--selftest` cannot reach SourceForge: it runs on every pull request that touches these
+files and at the start of every publish.
 
 Retention removes only what it can name, a folder called exactly `setup-v<major>.<minor>.<patch>`.
 Any other folder is left alone. It refuses to plan at all when the folder just published is not in
@@ -135,10 +153,11 @@ publish failed", a repeat comments on it, and the next green publish closes it.
 | phase | what | kill switch | status |
 |---|---|---|---|
 | P0 | by hand: webhook off, defaults to `setup-v0.4.211`, everything but the ten newest wizards removed, the buttons stripped from GitHub release notes | `gh api -X PATCH repos/gjovanov/roomler-ai/hooks/703998184 -F active=true` brings the import back | done 2026-11-11 |
-| P1 | the workflow, the script and its self-test, the pinned host keys | repository variable `SOURCEFORGE_PUBLISH=off`; without the two secrets a run reports that and skips | in review |
-| P2 | the two credentials, a dry run, the first live publish | the same variable | done 2026-11-11: both secrets stored, the dry run and the live publish of `setup-v0.4.211` green on a runner. Until P1 merges, a release is published by a dispatch from the P1 branch |
+| P1 | the workflow, the script and its self-test, the pinned host keys | repository variable `SOURCEFORGE_PUBLISH=off`; without the two secrets a run reports that and skips | merged 2026-11-11 18:13Z (#3694). Its `workflow_run` trigger never fires for a real release: P1b |
+| P1b | the trigger: the wizard lane dispatches the publish, and a reconcile runs on a schedule and by a dispatch with no tag | the same variable: a dispatched or scheduled run then skips at its first step | in review |
+| P2 | the two credentials, a dry run, the first live publish | the same variable | done 2026-11-11: both secrets stored, the dry run and the live publish of `setup-v0.4.211` green on a runner. Until a release is cut from a master that has P1b, a release is published by hand: `gh workflow run sourceforge-publish.yml -f tag=setup-v<V>` |
 | P3 | the webhook deleted for good | | after AC1 |
-| P4 | docs: [`docs/sourceforge.md`](../sourceforge.md), its `docs/README.md` row, the `ship-it` skill | | with P1 |
+| P4 | docs: [`docs/sourceforge.md`](../sourceforge.md), its `docs/README.md` row, the `ship-it` skill | | merged with P1, corrected for the trigger with P1b |
 
 ## Acceptance criteria
 
@@ -148,7 +167,7 @@ publish failed", a repeat comments on it, and the next green publish closes it.
 - [ ] **AC4**: retention. The publish that makes an eleventh version removes the oldest, and no default pointed into a removed folder.
 - [x] **AC5**: a forced failure opens exactly one issue, and the next green publish closes it. Met 2026-11-11, twice: #3708 opened and closed, then #3709 opened, commented on by a second failure and closed.
 - [ ] **AC6**: the GitHub webhook to SourceForge is deleted, SourceForge's audit trail shows no import after 2026-11-11 14:02Z, and seven days pass with no "Import Failed" mail.
-- [ ] **AC7**: docs. `docs/sourceforge.md` with its `docs/README.md` index row, the `ship-it` skill names the workflow, and FR-129's out-of-scope line points here.
+- [x] **AC7**: docs. `docs/sourceforge.md` with its `docs/README.md` index row, the `ship-it` skill names the workflow, and FR-129's out-of-scope line points here. Met 2026-11-11 with #3694 on master (`681f369c3`), each of the four read there. P1b corrects what they say about the trigger.
 
 ## Open decisions
 
@@ -192,3 +211,6 @@ None. The operator decided all three on 2026-11-11.
 | 2026-11-11 | **The first live publish**, `setup-v0.4.211`, on a runner, 16:49Z (run 43061873042) | Upload: `sent 899 bytes … total size is 58,226,955`, so nothing needed sending, and all 16 files matched by checksum. **The Release API accepted all three defaults on the first attempt**, from a runner, with the stored key. `best_release.json` named the three files at once. Retention: nothing aged out. Nothing on SourceForge changed: the folder's feed still lists its 19 files. Not yet exercised: a transfer that sends bytes, and a retention that removes a folder. Both happen at the next release |
 | 2026-11-11 | The bytes SourceForge serves, 16:52Z: each of the three defaults streamed from `downloads.sourceforge.net` (a mirror answered) and hashed | 3 of 3 equal the release's `.sha256`. This is AC2's read, taken on a release the old import had placed. AC2 stays open until it is taken on a release this workflow uploads |
 | 2026-11-11 | AC5, 16:54Z to 17:29Z. A failure was forced with a tag that has no release (`setup-v0.4.9999`), which never contacts SourceForge | Cycle 1: the failure opened #3708, and the next green publish closed it. Cycle 2: a failure opened #3709, a second failure commented "Failed again" on #3709 and opened nothing, and the next green publish closed it. `best_release.json` read 4 of 4 on `setup-v0.4.211` afterwards |
+| 2026-11-11 | P1 merged, 18:13:11Z: #3694 as `681f369c3`. The CI outage (#3698) had ended with #3704 at 17:27Z and the 0.4.211 version bump (#3689) merged at 17:59:56Z. Master was merged into the branch first, so that CI ran on the head that merged (run 43071287277) | 26 checks passed, 23 of them the `CI` workflow's, none failed. GitHub lists the workflow as `active` on master, and the merge closed nothing. AC7's four documents read on master |
+| 2026-11-11 | **Wrong turn: P1's trigger never fires for a real release.** First sign: a wizard re-seed on `master` (run 43034266868, dispatched by the release lane, so its actor is `github-actions[bot]`) completed at 18:14:10Z, 59 seconds after the merge, and no publish run appeared. Then the measurement: `release-recovery-close`, a job of the wizard lane that skips itself on a run that is not a release, re-run on two finished wizard runs | Run 42877225403 (dispatched from a person's account on a branch, 2026-11-10): its second attempt completed at 18:23:50Z, and **publish run 43077374609 started at 18:23:52Z** with event `workflow_run`, every job skipped as designed. Run 42998949014 (a re-seed the release lane had dispatched, actor `github-actions[bot]`): its second attempt completed at 18:24:28Z and **nothing started**, read again at 18:25Z and 18:27Z. The day's real release run (43031471663, `setup-v0.4.211`) has that same actor. So the rule that an event made with `GITHUB_TOKEN` starts no workflow also covers the completion of a run that token started. P1 would have published no release, and no run would have failed to say so. Nothing went stale: no release was cut in that time, and SourceForge serves `setup-v0.4.211`, GitHub's newest |
+| 2026-11-11 | Until a release is cut from a master that has P1b | A stand-in loop in the working session reads GitHub's newest setup release and `best_release.json` every 10 minutes and dispatches the publish from master once when GitHub is ahead. Without it: `gh workflow run sourceforge-publish.yml -f tag=setup-v<V>` after a release |

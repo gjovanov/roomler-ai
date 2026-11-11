@@ -24,8 +24,8 @@ name: Publish to SourceForge
 # checksum and signature), about 55 MiB a version, the newest SF_KEEP versions.
 #
 # WHAT A RUN DOES, in this order, and it stops at the first step that fails:
-#   1. resolve the tag; skip unless it is a final `setup-v<V>` with a published
-#      GitHub release
+#   1. resolve the tag (the one named, or the newest when reconciling); stop
+#      unless it is a final `setup-v<V>` with a published GitHub release
 #   2. download that release and prove the bytes: each file against GitHub's own
 #      asset digest, each installer against its `.sha256` sidecar
 #   3. upload to /home/frs/project/roomler-ai/<tag>/ over rsync+ssh, to a host
@@ -40,23 +40,31 @@ name: Publish to SourceForge
 # the start of every run.
 #
 # TRIGGERS.
-#  - `workflow_run`: when "Release roomler-setup" finishes on a `setup-v*` ref.
-#    Not `on: release`: the wizard lane publishes with GITHUB_TOKEN, and an event
-#    made with that token starts no workflow. Not a step in release-setup.yml
-#    either: a run on a tag executes that file as it stood at the tag, and a
-#    change there has to be rehearsed against the seed lanes. This file runs
-#    from the default branch whatever the tag holds.
-#    ⚠️ `workflow_run.head_branch` is text the triggering run chose. It reaches
-#    the shell only through an environment variable and is used only after
-#    `valid-tag` has matched it against `setup-v<major>.<minor>.<patch>`.
-#    The run's CONCLUSION is deliberately not consulted: the release either
-#    exists on GitHub with every platform or it does not, and that is what step
-#    1 reads. A wizard run that published and then failed its cache refresh
-#    still has a release SourceForge should carry.
-#  - `workflow_dispatch`: the same for a tag you name. `dry_run` downloads,
+#  - `workflow_dispatch` with a `tag`: publish that release. This is how a
+#    release gets here: release-setup.yml's `sourceforge` job dispatches it, the
+#    last thing a wizard release does. Publishing an OLDER tag uploads its files
+#    and leaves the defaults and every other folder alone. `dry_run` downloads,
 #    verifies and lists SourceForge, and changes nothing: the way to prove new
-#    credentials. Publishing an OLDER tag uploads its files and leaves the
-#    defaults and every other folder alone.
+#    credentials.
+#    ⚠️ NOT `workflow_run`, and not `on: release`. release-agent.yml starts the
+#    wizard lane with GITHUB_TOKEN, so that run's actor is github-actions[bot],
+#    and GitHub starts no workflow for anything such a run causes: not for the
+#    release it publishes, and not for its own completion either. This file
+#    reached master with a `workflow_run` trigger on 2026-11-11, and the same
+#    evening measured it. A leaf job that skips itself was re-run on two
+#    finished wizard runs, 38 seconds apart: the run a person had dispatched
+#    started this workflow 2 seconds after it completed, and the run the token
+#    had dispatched started nothing. Every real release is of the second kind.
+#    `workflow_dispatch` is the documented exception, the one the wizard lane's
+#    re-seed and the agent lane's lockstep job already use.
+#  - `workflow_dispatch` with NO tag, and `schedule`: reconcile. It takes the
+#    newest final setup release and publishes it only if best_release.json does
+#    not already name its three installers. A dispatch can be lost (the job that
+#    sends it must never fail a release), and a wizard run on a tag cut before
+#    that job existed sends none. Either would leave the listing stale with no
+#    failed run to say so, which is the state this workflow exists to end. A
+#    scheduled run leaves a release younger than RECONCILE_MIN_AGE_MIN to its
+#    own dispatch.
 #  - `pull_request` on these files: the self-test only. No secret is in reach.
 #
 # CREDENTIALS (repository secrets, in place since 2026-11-11; docs/sourceforge.md
@@ -77,20 +85,21 @@ name: Publish to SourceForge
 # release-setup.yml's wizard alert).
 
 on:
-  workflow_run:
-    workflows: ['Release roomler-setup']
-    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'The setup release to publish, e.g. setup-v0.4.211'
-        required: true
+        description: 'The setup release to publish, e.g. setup-v0.4.211. Empty: the newest one, and only if the listing does not serve it yet'
+        required: false
         type: string
+        default: ''
       dry_run:
         description: 'Rehearse: download, verify and list SourceForge; upload, set and remove nothing'
         required: false
         type: boolean
         default: false
+  schedule:
+    # The reconcile. Four times a day, off the hour and off cache-janitor's :43.
+    - cron: '23 */6 * * *'
   pull_request:
     paths:
       - '.github/workflows/sourceforge-publish.yml'
@@ -113,6 +122,11 @@ env:
   # Versions kept on SourceForge. About 55 MiB each, so ten is well inside the
   # project's 5 GB limit; scripts/sourceforge-publish.sh refuses fewer than 3.
   SF_KEEP: '10'
+  # A scheduled reconcile leaves a release younger than this many minutes alone:
+  # its own dispatch is the next thing its run does, and that publish can take
+  # twenty minutes to show in best_release.json. Without the wait, a schedule
+  # that fell into that window would publish the same release a second time.
+  RECONCILE_MIN_AGE_MIN: '45'
 
 jobs:
   selftest:
@@ -136,10 +150,7 @@ jobs:
 
   publish:
     name: Publish the setup release to SourceForge
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' &&
-       startsWith(github.event.workflow_run.head_branch, 'setup-v'))
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -149,15 +160,14 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       EVENT_NAME: ${{ github.event_name }}
       INPUT_TAG: ${{ github.event.inputs.tag }}
-      RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
       DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
       SWITCH: ${{ vars.SOURCEFORGE_PUBLISH }}
       SF_USER: ${{ vars.SOURCEFORGE_USER || 'roomler-ai' }}
       HAVE_SSH_KEY: ${{ secrets.SOURCEFORGE_SSH_KEY != '' }}
       HAVE_API_KEY: ${{ secrets.SOURCEFORGE_API_KEY != '' }}
     steps:
-      # The default branch on a workflow_run, the dispatch ref on a dispatch.
-      # Never the ref of the run that triggered this one.
+      # The default branch on a schedule, the dispatch ref on a dispatch. The
+      # wizard lane dispatches on master, never on the tag it has just built.
       - uses: actions/checkout@v4
 
       - name: Self-test the publish decisions
@@ -173,7 +183,7 @@ jobs:
             echo "state=skipped" >> "$GITHUB_OUTPUT"
             exit 0
           }
-          # A dispatch that cannot do what was asked fails; an automatic run
+          # A dispatch that cannot do what was asked fails; a scheduled run
           # that has nothing to do says so and passes.
           refuse() {
             if [ "$EVENT_NAME" = workflow_dispatch ]; then
@@ -183,20 +193,34 @@ jobs:
             skip "$1"
           }
 
-          tag="$RUN_BRANCH"
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then tag="$INPUT_TAG"; fi
-          # The raw value is never printed: it is text the triggering run chose.
+          # The kill switch comes first: off means this run reads nothing either.
+          if [ "$SWITCH" = off ]; then
+            skip "the repository variable SOURCEFORGE_PUBLISH is off"
+          fi
+
+          # Every final release's tag. `newest` takes the highest setup tag from
+          # it, and fails the run when there is none at all.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' > tags.txt
+          newest="$(bash scripts/sourceforge-publish.sh newest < tags.txt)"
+
+          # A tag that was named is published. With no tag (the schedule, or a
+          # dispatch without one) the run reconciles: the newest release, and
+          # only if the listing does not serve it yet.
+          mode=publish
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            mode=reconcile
+            tag="$newest"
+          fi
+          # The raw value is never printed: it is text the dispatcher chose.
           if ! bash scripts/sourceforge-publish.sh valid-tag "$tag"; then
             refuse "not a final setup release tag (setup-v<major>.<minor>.<patch>)"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-          if [ "$SWITCH" = off ]; then
-            skip "the repository variable SOURCEFORGE_PUBLISH is off"
-          fi
-
-          # 404 = no such release (an artifacts-only wizard run). Anything else
-          # is GitHub failing, and has to fail this run rather than skip it.
+          # 404 = no such release. Anything else is GitHub failing, and has to
+          # fail this run rather than skip it.
           if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > release.json 2> gh.err; then
             if grep -q 'HTTP 404' gh.err; then
               refuse "GitHub has no release for $tag"
@@ -210,14 +234,43 @@ jobs:
 
           # Only the newest setup release takes the defaults and triggers
           # retention; an older one is a backfill.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' > tags.txt
-          newest="$(bash scripts/sourceforge-publish.sh newest < tags.txt)"
           if [ "$newest" = "$tag" ]; then
             echo "is_newest=true" >> "$GITHUB_OUTPUT"
           else
             echo "is_newest=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=A backfill::$tag is older than $newest: its files are uploaded, the Download defaults and the other folders are left alone"
+          fi
+
+          if [ "$mode" = reconcile ]; then
+            if [ "$EVENT_NAME" = schedule ]; then
+              published="$(jq -r '.published_at // empty' release.json)"
+              if [ -z "$published" ]; then
+                echo "::error::GitHub gives no publish time for $tag"
+                exit 1
+              fi
+              age_min=$(( ($(date -u +%s) - $(date -u -d "$published" +%s)) / 60 ))
+              if [ "$age_min" -lt "$RECONCILE_MIN_AGE_MIN" ]; then
+                skip "$tag was published $age_min minutes ago: its own dispatch is still due"
+              fi
+            fi
+            j="$(curl -sS -m 30 "https://sourceforge.net/projects/$SF_PROJECT/best_release.json" || true)"
+            if ! jq -e '.platform_releases' <<<"$j" > /dev/null 2>&1; then
+              refuse "SourceForge did not answer best_release.json as JSON, so this run cannot tell whether the listing is behind"
+            fi
+            jq -r '.platform_releases | [.windows.filename, .mac.filename, .linux.filename] | map(. // "") | join("\n")' \
+              <<<"$j" > served.txt
+            # `current` or `behind`. It refuses, and so fails this run, when a
+            # button serves a NEWER setup release than GitHub's newest: that is
+            # a release pulled back on GitHub, and a person has to decide.
+            listing="$(bash scripts/sourceforge-publish.sh listing-state "$tag" < served.txt)"
+            if [ "$listing" = current ]; then
+              skip "the listing already serves $tag on Windows, macOS and Linux"
+            fi
+            echo "the listing serves:"
+            cat served.txt
+            if [ "$EVENT_NAME" = schedule ]; then
+              echo "::warning title=The listing was behind::best_release.json did not name the three installers of $tag, published $age_min minutes ago, so this scheduled run publishes it. The dispatch from its release (release-setup.yml, the sourceforge job) did not do so."
+            fi
           fi
 
           if [ "$DRY_RUN" != true ] && { [ "$HAVE_SSH_KEY" != true ] || [ "$HAVE_API_KEY" != true ]; }; then

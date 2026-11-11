@@ -16,6 +16,8 @@
 #                                        every installer against its .sha256 sidecar
 #   prune-plan    <keep> <current-tag>   folder names on stdin -> the folders to remove,
 #                                        oldest first
+#   listing-state <tag>                  what the listing serves for windows, mac and
+#                                        linux on stdin -> `current` or `behind`
 #   --selftest                           proves each of the above, offline
 #
 # ⚠️ This file makes no network call and must never gain one. `--selftest` runs on
@@ -65,18 +67,26 @@ newest() {
   printf '%s\n' "$all" | tail -n 1
 }
 
-# Which OS's Download default an asset becomes. Exact names only: the Windows
-# `.zip` holds the same EXE and the aarch64 tarball is a second Linux build, and
-# neither may ever win the button by matching a looser pattern.
+# The one file that is an OS's Download default in version <v>. Exact names only:
+# the Windows `.zip` holds the same EXE and the aarch64 tarball is a second Linux
+# build, and neither may ever win the button by matching a looser pattern.
+default_file() {
+  case "$1" in
+    windows) echo "roomler-setup-${2}-x86_64-pc-windows-msvc.exe" ;;
+    mac)     echo "roomler-setup-${2}-universal-apple-darwin.tar.gz" ;;
+    linux)   echo "roomler-setup-${2}-x86_64-unknown-linux-gnu.tar.gz" ;;
+    *)       die "no such platform: '$1'" ;;
+  esac
+}
+
+# Which OS's Download default an asset becomes: nothing for every other asset.
 default_for() {
-  local tag="$1" name="$2" v
+  local tag="$1" name="$2" v os
   valid_tag "$tag" || die "not a final setup release tag: '$tag'"
   v="${tag#setup-v}"
-  case "$name" in
-    "roomler-setup-${v}-x86_64-pc-windows-msvc.exe")      echo windows ;;
-    "roomler-setup-${v}-universal-apple-darwin.tar.gz")   echo mac ;;
-    "roomler-setup-${v}-x86_64-unknown-linux-gnu.tar.gz") echo linux ;;
-  esac
+  for os in windows mac linux; do
+    if [ "$name" = "$(default_file "$os" "$v")" ]; then echo "$os"; fi
+  done
 }
 
 # The three defaults of a release, or a failure naming the one that is missing.
@@ -89,11 +99,7 @@ defaults_plan() {
   [ -d "$dir" ] || die "no such directory: '$dir'"
   v="${tag#setup-v}"
   for os in windows mac linux; do
-    case "$os" in
-      windows) file="roomler-setup-${v}-x86_64-pc-windows-msvc.exe" ;;
-      mac)     file="roomler-setup-${v}-universal-apple-darwin.tar.gz" ;;
-      linux)   file="roomler-setup-${v}-x86_64-unknown-linux-gnu.tar.gz" ;;
-    esac
+    file="$(default_file "$os" "$v")"
     if [ -f "$dir/$file" ]; then
       printf '%s\t%s\n' "$os" "$file"
     else
@@ -183,6 +189,38 @@ prune_plan() {
   n="$(printf '%s\n' "$all" | grep -c . || true)"
   [ "$n" -gt "$keep" ] || return 0
   printf '%s\n' "$all" | head -n "$((n - keep))" | grep -vxF -- "$current" || true
+}
+
+# Whether the listing's three Download buttons are this release's. stdin: the file
+# best_release.json names for windows, for mac and for linux, in that order, one
+# per line (`/setup-v0.4.211/roomler-setup-0.4.211-….exe`; an empty line for a
+# platform that has no default). Prints `current` when all three are exactly this
+# release's defaults, and `behind` when at least one is anything else.
+# It refuses when it cannot tell, and when a button already serves a NEWER setup
+# release: the tag given is then not the newest, and a publish on that premise
+# would move the button backwards.
+listing_state() {
+  local tag="$1" v os line folder i=0 state=current
+  local -a served=()
+  valid_tag "$tag" || die "not a final setup release tag: '$tag'"
+  v="${tag#setup-v}"
+  while IFS= read -r line || [ -n "$line" ]; do
+    served+=("${line%$'\r'}")
+  done
+  [ "${#served[@]}" -eq 3 ] || die "want three lines (windows, mac, linux), got ${#served[@]}"
+  for os in windows mac linux; do
+    line="${served[$i]}"
+    i=$((i + 1))
+    [ "$line" != "/$tag/$(default_file "$os" "$v")" ] || continue
+    state=behind
+    folder="${line#/}"
+    folder="${folder%%/*}"
+    if valid_tag "$folder" && [ "$folder" != "$tag" ] \
+       && [ "$(printf '%s\n%s\n' "$folder" "$tag" | sorted_tags | tail -n 1)" = "$folder" ]; then
+      die "the $os button serves $folder, which is newer than $tag: refusing"
+    fi
+  done
+  echo "$state"
 }
 
 # ----------------------------------------------------------------------------
@@ -347,6 +385,55 @@ selftest() {
   plan x setup-v0.4.211 "${names[@]}";  eq "prune refuses a keep that is not a number" "$rc" 2
   plan 10 seed-cache "${names[@]}";     eq "prune refuses a current tag of another family" "$rc" 2
 
+  # --- listing-state ------------------------------------------------------------
+  # stdin: what best_release.json names for windows, mac and linux, in that order.
+  state() { out="$(printf '%s\n' "${@:2}" | bash "$0" listing-state "$1" 2>"$tmp/err")" && rc=0 || rc=$?; }
+  local w211=/setup-v0.4.211/roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe
+  local m211=/setup-v0.4.211/roomler-setup-0.4.211-universal-apple-darwin.tar.gz
+  local l211=/setup-v0.4.211/roomler-setup-0.4.211-x86_64-unknown-linux-gnu.tar.gz
+  local w210=/setup-v0.4.210/roomler-setup-0.4.210-x86_64-pc-windows-msvc.exe
+  local m210=/setup-v0.4.210/roomler-setup-0.4.210-universal-apple-darwin.tar.gz
+  local l210=/setup-v0.4.210/roomler-setup-0.4.210-x86_64-unknown-linux-gnu.tar.gz
+
+  state setup-v0.4.211 "$w211" "$m211" "$l211"; eq "listing-state: all three are this release's" "$out" current
+  eq "listing-state: and that is exit 0" "$rc" 0
+  state setup-v0.4.211 "$w210" "$m210" "$l210"; eq "listing-state: all three one release back" "$out" behind
+  eq "listing-state: behind is exit 0 too" "$rc" 0
+  state setup-v0.4.211 "$w210" "$m211" "$l211"; eq "listing-state: only windows back" "$out" behind
+  state setup-v0.4.211 "$w211" "$m210" "$l211"; eq "listing-state: only mac back" "$out" behind
+  state setup-v0.4.211 "$w211" "$m211" "$l210"; eq "listing-state: only linux back" "$out" behind
+  state setup-v0.4.211 "$w211" "$m211" "";      eq "listing-state: a platform with no default" "$out" behind
+  # The right folder is not enough: the button has to be the one default file.
+  state setup-v0.4.211 /setup-v0.4.211/roomler-setup-0.4.211-x86_64-pc-windows-msvc.zip "$m211" "$l211"
+  eq "listing-state: the zip is not the windows default" "$out" behind
+  state setup-v0.4.211 "$w211" "$m211" /setup-v0.4.211/roomler-setup-0.4.211-aarch64-unknown-linux-gnu.tar.gz
+  eq "listing-state: the aarch64 tarball is not the linux default" "$out" behind
+  state setup-v0.4.211 "$w211" "$l211" "$m211"; eq "listing-state: the right files on the wrong platforms" "$out" behind
+  state setup-v0.4.211 /agent-v0.4.211/roomler-desktop-0.4.211-x86_64-pc-windows-msvc.exe "$m211" "$l211"
+  eq "listing-state: a file of another release family" "$out" behind
+  out="$(printf '%s\r\n%s\r\n%s\r\n' "$w211" "$m211" "$l211" | bash "$0" listing-state setup-v0.4.211)" && rc=0 || rc=$?
+  eq "listing-state: CR line ends" "$out" current
+  # Version order, not text order: 0.4.9 is older than 0.4.10.
+  state setup-v0.4.10 /setup-v0.4.9/roomler-setup-0.4.9-x86_64-pc-windows-msvc.exe \
+        /setup-v0.4.10/roomler-setup-0.4.10-universal-apple-darwin.tar.gz \
+        /setup-v0.4.10/roomler-setup-0.4.10-x86_64-unknown-linux-gnu.tar.gz
+  eq "listing-state: 0.4.9 is behind 0.4.10" "$out" behind
+
+  # Refusals: a publish on any of these premises could move a button backwards.
+  state setup-v0.4.210 "$w211" "$m211" "$l211"; eq "listing-state refuses a listing that is already newer" "$rc" 2
+  eq "listing-state prints nothing on that refusal" "$out" ''
+  state setup-v0.4.210 "$w210" "$m210" "$l211"; eq "listing-state refuses when one button is newer" "$rc" 2
+  state setup-v0.4.9 /setup-v0.4.10/roomler-setup-0.4.10-x86_64-pc-windows-msvc.exe \
+        /setup-v0.4.9/roomler-setup-0.4.9-universal-apple-darwin.tar.gz \
+        /setup-v0.4.9/roomler-setup-0.4.9-x86_64-unknown-linux-gnu.tar.gz
+  eq "listing-state refuses 0.4.10 as newer than 0.4.9" "$rc" 2
+  state setup-v0.4.211 "$w211" "$m211";                  eq "listing-state refuses two lines" "$rc" 2
+  state setup-v0.4.211 "$w211" "$m211" "$l211" "$l211";  eq "listing-state refuses four lines" "$rc" 2
+  state setup-v0.4.211;                                  eq "listing-state refuses an empty answer" "$rc" 2
+  state seed-cache "$w211" "$m211" "$l211";              eq "listing-state refuses a tag of another family" "$rc" 2
+  state seed-cache "" "" "";                             eq "listing-state refuses it whatever the listing serves" "$rc" 2
+  state setup-v0.4.212-rc.1 "$w211" "$m211" "$l211";     eq "listing-state refuses a pre-release tag" "$rc" 2
+
   if [ "$fail" -ne 0 ]; then
     echo "sourceforge-publish selftest: $fail of $((pass + fail)) checks FAILED" >&2
     return 1
@@ -361,6 +448,7 @@ case "${1:-}" in
   defaults-plan) [ $# -eq 3 ] || die "usage: defaults-plan <tag> <dir>";        defaults_plan "$2" "$3" ;;
   verify)        [ $# -eq 3 ] || die "usage: verify <dir> <digests.tsv>";       verify "$2" "$3" ;;
   prune-plan)    [ $# -eq 3 ] || die "usage: prune-plan <keep> <current-tag>";  prune_plan "$2" "$3" ;;
+  listing-state) [ $# -eq 2 ] || die "usage: listing-state <tag>  (three file names on stdin)"; listing_state "$2" ;;
   --selftest)    selftest ;;
-  *) die "usage: $0 valid-tag|newest|default-for|defaults-plan|verify|prune-plan|--selftest (see the header)" ;;
+  *) die "usage: $0 valid-tag|newest|default-for|defaults-plan|verify|prune-plan|listing-state|--selftest (see the header)" ;;
 esac
