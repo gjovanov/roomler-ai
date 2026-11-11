@@ -42,7 +42,7 @@ fails.
 |---|---|---|
 | 1 | Resolve the tag | Only `setup-v<major>.<minor>.<patch>` with a published, final GitHub release goes on. Anything else is skipped with a notice |
 | 2 | Download and verify | Every file must hash to GitHub's asset digest, and every installer to the value in its own `.sha256` sidecar. The directory and the asset list must name the same files |
-| 3 | Upload | rsync over ssh to a host whose three keys are pinned in `scripts/sourceforge-known-hosts`. Then the same transfer again, dry and by checksum, must find nothing left to send |
+| 3 | Upload | rsync over ssh to a host whose three keys are pinned in `scripts/sourceforge-known-hosts`, comparing by checksum: a file already there with the right bytes is not touched, not even its time. Then the same transfer again, dry, must find nothing left to send |
 | 4 | Set the defaults | Only for the **newest** setup release. One `PUT` per platform to SourceForge's Release API; the API's answer has to list the platform |
 | 5 | Wait for the listing | `best_release.json` must name the three new files within 15 minutes |
 | 6 | Retention | Only after step 5. Removes `setup-v*` folders older than the newest 10 |
@@ -100,23 +100,42 @@ an unknown platform gets.
 
 ## 4. Credentials
 
-Two repository secrets, both the operator's to create. Without them a run reports that and skips;
-it does not fail.
+Two repository secrets, in place since 2026-11-11. Without them a run reports that and skips; it
+does not fail. They are repository secrets and not Kubernetes ones because GitHub Actions is the
+only thing that reads them.
 
 | Secret | Where it comes from | What it can do |
 |---|---|---|
 | `SOURCEFORGE_SSH_KEY` | The private half of a key pair made for this purpose. The public half goes on the SourceForge account: Account Settings → SSH Settings | Upload and remove files in the projects that account administers. No shell: `frs.sourceforge.net` serves sftp, scp and rsync only |
 | `SOURCEFORGE_API_KEY` | Account Settings → "Releases API Key" → Generate | Change file properties, the defaults among them, in those projects |
 
+The ssh key in use is the account's line that ends `roomler-ai-sourceforge-publish-2026-11-11`,
+fingerprint `SHA256:seAEUoRkM9LlmOpUuDaLanu9WQvS2VP/F//svd4V2vs`. Its private half exists only in
+the secret.
+
+**To replace either one:**
+
 ```bash
 # One key pair for this, with no passphrase (a workflow cannot type one).
 ssh-keygen -t ed25519 -N '' -C 'roomler-ai sourceforge publish' -f sf_publish
-# Paste sf_publish.pub into SourceForge: Account Settings → SSH Settings.
+# In SourceForge: Account Settings → SSH Settings. Replace the old line with sf_publish.pub, Save.
 gh secret set SOURCEFORGE_SSH_KEY -R gjovanov/roomler-ai < sf_publish
-# Generate the Releases API key on the same page, then (it prompts, nothing lands in history):
-gh secret set SOURCEFORGE_API_KEY -R gjovanov/roomler-ai
 rm sf_publish sf_publish.pub
+
+# In SourceForge: Account Settings → Preferences → "Releases API Key" → Re-generate.
+# The old key stops working at that moment, so set the secret straight away
+# (it prompts, and nothing lands in the shell history):
+gh secret set SOURCEFORGE_API_KEY -R gjovanov/roomler-ai
+
+# Prove both without changing anything, then for real (the newest release is idempotent):
+gh workflow run sourceforge-publish.yml -f tag=setup-v<V> -f dry_run=true
+gh workflow run sourceforge-publish.yml -f tag=setup-v<V>
 ```
+
+> ⚠️ **The files on SourceForge do not look like ours, and are.** Over sftp every folder the old
+> importer made reads `allura root`, mode 755. The key manages them all the same: it can create a
+> folder at the project root and rename or remove a file inside an importer-made one (both tried
+> on 2026-11-11). The ownership a listing shows is not what decides access.
 
 Two repository variables are optional: `SOURCEFORGE_USER` (the account's login, default
 `roomler-ai`) and the kill switch `SOURCEFORGE_PUBLISH=off`.

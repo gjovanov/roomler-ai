@@ -59,7 +59,8 @@ name: Publish to SourceForge
 #    defaults and every other folder alone.
 #  - `pull_request` on these files: the self-test only. No secret is in reach.
 #
-# CREDENTIALS (repository secrets, both the operator's to create):
+# CREDENTIALS (repository secrets, in place since 2026-11-11; docs/sourceforge.md
+# §4 has how to replace one):
 #   SOURCEFORGE_SSH_KEY  private half of a key whose public half is on the
 #                        SourceForge account (Account Settings → SSH Settings).
 #                        Uploads and removes files; nothing else.
