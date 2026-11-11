@@ -91,7 +91,8 @@ whose first column is `File` names its code and carries **no line numbers** (#36
 survives a move, so a PR that only moves code needs no edit there. CI's
 `scripts/code-map-audit.sh` fails on a name that is no longer in its row's file, on a file
 that is not in the repository, and on a line number. Where a row means a place inside a
-function, it names the function.
+function, it names the function. A spec in this directory is not checked: it is a record of
+the commit it is pinned to, and keeps its `file:line` anchors.
 
 ## Registry
 

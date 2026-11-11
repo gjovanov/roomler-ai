@@ -35,7 +35,9 @@
 #     3. there is no line number: no `:N`, no `path.rs:N`, no `#LN` link.
 #
 #   A table under a "Code map" heading with another first column is not checked: those
-#   maps lead with a description and are #3431's.
+#   maps lead with a description and are #3431's. Nothing under docs/fr/ is checked
+#   either: a spec is a record of the commit it is pinned to, and a later rename must
+#   not send anyone back to edit it.
 #
 #   It is a presence check, on purpose. It does not parse Rust or TypeScript, so it
 #   cannot tell a definition from a mention. A name that moved to another file while
@@ -64,8 +66,10 @@ records() {
   tracked="$(mktemp)"
   docs_list="$(mktemp)"
   git ls-files > "$tracked"
-  # Only docs with such a heading are read. `|| true`: no match is an answer, not an error.
-  git grep -l -i -E '^#+[[:space:]].*code map' -- '*.md' > "$docs_list" 2>/dev/null || true
+  # Only docs with such a heading are read, and never a spec: docs/fr/ holds records. A spec
+  # says what the code was on the commit it is pinned to, so a rename made later must not
+  # send anyone back to edit it. `|| true`: no match is an answer, not an error.
+  git grep -l -i -E '^#+[[:space:]].*code map' -- '*.md' ':(exclude)docs/fr/*' > "$docs_list" 2>/dev/null || true
   local docs=()
   while IFS= read -r d; do
     [ -n "$d" ] && docs+=("$d")
@@ -399,6 +403,21 @@ selftest() {
     echo '| the opener | `src/a.rs:1`, `:3` |'
   } > "$tmp/docs/map.md"
   expect "a table with another first column is left alone" 0 -
+
+  # A spec is a record: its code map may count lines and name what has since gone.
+  write_doc map.md "$good"
+  mkdir -p "$tmp/docs/fr"
+  {
+    echo "## 5. Code map"
+    echo
+    echo "| File | Owns |"
+    echo "|---|---|"
+    echo '| `src/a.rs` | `open_once` (`:1`), as it was on the pinned commit |'
+  } > "$tmp/docs/fr/FR-1-a-spec.md"
+  expect "a spec under docs/fr/ is not checked" 0 -
+  checked="$(cd "$tmp" && records | awk -F'\t' '$1 == "T" { print $2 "/" $3 "/" $4 }')"
+  if [ "$checked" = "1/1/4" ]; then echo "  ✓ … and the living doc beside it still is (1 code map, 1 row, 4 names)"
+  else echo "  ✗ with a spec beside it the audit read $checked (code maps/rows/names), expected 1/1/4"; fails=$((fails + 1)); fi
 
   rm -rf "$tmp"
   trap - EXIT
