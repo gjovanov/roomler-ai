@@ -46,10 +46,13 @@ machine's screen**, unless its owner chose another folder (the desktop app's
 numbered copy instead of replacing it.
 
 :::tip Nobody at the screen
-On a machine whose agent runs as a system service, with nobody signed in at the
-screen, a file lands in the service's own folder instead. On Linux, a file sent
-while someone is signed in at the screen belongs to them, exactly as if they had
-saved it themselves.
+On a Windows machine whose agent runs as a system service, file transfer acts as
+the person signed in at the screen: a file you send belongs to them, exactly as
+if they had saved it themselves, and you can pull back or browse only what they
+may open. With nobody signed in, sending, pulling back and browsing are refused,
+and the session says why. On Linux, a file sent while someone is signed in at
+the screen belongs to them too; with nobody signed in, it lands in the service's
+own folder instead.
 :::
 
 ## When you want a file path rather than a session
