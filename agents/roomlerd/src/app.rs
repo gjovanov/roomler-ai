@@ -2861,6 +2861,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // (operator state preserved — rc.204 semantics); a NEW pair → APPEND a
     // secondary org (with its own freshly minted WG key); `--replace` →
     // legacy whole-primary rebind.
+    let folds = existing.is_some();
     let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
 
     // FR-51 P3 — the CREDENTIAL decided what was minted; say so when it
@@ -2943,7 +2944,14 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     }
 
-    config::save(&target_path, &cfg).map_err(|e| {
+    // #3666 — nothing folded, nothing kept: at the machine location a config
+    // that was not the machine's leaves no `.prev` and no unknown key behind.
+    if folds {
+        config::save(&target_path, &cfg)
+    } else {
+        config::save_fresh(&target_path, &cfg)
+    }
+    .map_err(|e| {
         if machine_global {
             anyhow::anyhow!(
                 "{e}\n\nWriting the machine-global config requires an elevated \
@@ -3158,7 +3166,14 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
             .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
     }
-    config::save(&target, &cfg).context("saving the adopted config")?;
+    // #3666 — nothing folded, nothing kept: at the machine location a config
+    // that was not the machine's leaves no `.prev` and no unknown key behind.
+    if previous.is_none() {
+        config::save_fresh(&target, &cfg)
+    } else {
+        config::save(&target, &cfg)
+    }
+    .context("saving the adopted config")?;
     let what = match &outcome {
         EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
         EnrollOutcome::RefreshedPrimary => {

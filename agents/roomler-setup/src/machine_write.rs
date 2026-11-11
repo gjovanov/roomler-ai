@@ -183,6 +183,8 @@ pub fn write(
     is_system_context: bool,
     flavour: WindowsInstallFlavour,
 ) -> Result<Written, Failure> {
+    // #3666 — nothing folded, nothing kept (`config::save_fresh`).
+    let folds = existing.is_some();
     let crate::enroll_step::Enrolled {
         mut cfg,
         outcome,
@@ -229,8 +231,13 @@ pub fn write(
              enrollment as SYSTEM"
         ));
     }
-    roomlerd::config::save(&config_path.to_path_buf(), &cfg)
-        .map_err(|e| Failure::config(format!("write config.toml: {e}")))?;
+    let config_path = config_path.to_path_buf();
+    if folds {
+        roomlerd::config::save(&config_path, &cfg)
+    } else {
+        roomlerd::config::save_fresh(&config_path, &cfg)
+    }
+    .map_err(|e| Failure::config(format!("write config.toml: {e}")))?;
     Ok(Written {
         agent_id,
         tenant_id,
