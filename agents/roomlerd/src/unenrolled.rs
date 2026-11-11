@@ -472,7 +472,11 @@ mod tests {
         );
         let task = tokio::spawn(signaling::run(
             ctx,
-            crate::delegate::Delegation::Worker(crate::delegate::WorkerLink { inbound, outbound }),
+            crate::delegate::Delegation::Worker(crate::delegate::WorkerLink {
+                inbound,
+                outbound,
+                orders: None,
+            }),
             cfg,
             crate::encode::EncoderPreference::Software,
             stop_rx,

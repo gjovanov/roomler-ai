@@ -24,10 +24,16 @@
 //! agent spawned. A kept peer that is dropped is exactly the leak that once ate
 //! a host's ephemeral port range. So every path out of `kept` closes, the table
 //! closes what it holds even when it is dropped, and a peer is kept only when
-//! four things hold: the device's switch is on ([`survive_enabled`]) and this
-//! loop holds no delegation host ([`connection_keeps`]), the server this
-//! connection spoke to announced a window above 0, and the session was live,
-//! its peer not dead.
+//! three things hold: the device's switch is on ([`survive_enabled`]), the
+//! server this connection spoke to announced a window above 0, and the session
+//! was live, its peer not dead.
+//!
+//! FR-138 P2b — on a supervised Mac a delegated session's peer lives in the GUI
+//! worker, so the daemon's loop holds a RECORD of it instead ([`Record`]): no
+//! peer, but the claim, the deadline and what the server must hear. The worker
+//! keeps the peer on a delegated table of its own ([`SessionTable::for_worker`]),
+//! driven by the daemon's orders (`Detached`, `Resumed`, `Close`), and closes
+//! it there, through the same budget.
 //!
 //! Off is today: with the switch off, or no window ever announced, every exit
 //! closes every peer as `close_all_peers` did, the same order, label and line.
@@ -84,21 +90,24 @@ pub(crate) fn survive_enabled() -> bool {
     tunnel_core::env::flag("RC_SESSIONS_SURVIVE_REATTACH", false)
 }
 
-/// P2a-2 (L11) — whether this connection builds sessions it may keep: the
-/// switch, and no delegation host held by this org's loop. A supervised Mac's
-/// delegated sessions live in its GUI worker, which keeps nothing until P2b,
-/// and a server's end for a session the daemon itself kept would cross to that
-/// worker (`DelegateHost::send_to_worker` hands over a `Terminate` for any
-/// session no org handed over). So until P2b such a loop keeps nothing and
-/// says no `rc-resume`, whatever the switch.
+/// Whether this connection builds sessions it may keep: the switch.
+///
+/// FR-138 P2b lifted P2a-2's L11, which kept nothing in a loop that holds the
+/// delegation host. Such a loop (a supervised Mac's daemon) now keeps too: a
+/// delegated session's peer is kept by the GUI worker on this loop's orders
+/// ([`SessionTable::cross_offer`]), and a server's end for a session the
+/// daemon serves itself no longer crosses to the worker
+/// ([`crate::delegate::served_by_daemon`]). A delegated session it cannot keep
+/// (an older worker's, or one with no worker attached) it does not claim, and
+/// the server ends that at the hello (D1).
 pub(crate) fn connection_keeps(switch_on: bool, delegation_host: bool) -> bool {
     if switch_on && delegation_host {
         info!(
-            "rc: this loop holds the delegation host (a supervised Mac), so it keeps no session \
-             through the control socket's loss until P2b; the switch is on (FR-138)"
+            "rc: this loop holds the delegation host (a supervised Mac); its delegated sessions \
+             are kept by the GUI worker on this loop's orders; the switch is on (FR-138 P2b)"
         );
     }
-    switch_on && !delegation_host
+    switch_on
 }
 
 /// `rc-resume` in the hello's `AgentCaps.rpc`, and in every heartbeat that
@@ -169,7 +178,6 @@ pub(crate) enum ExitKind {
 }
 
 impl ConnExit {
-    #[cfg(test)]
     pub(crate) const ALL: [ConnExit; 17] = [
         ConnExit::Shutdown,
         ConnExit::Sleep,
@@ -235,6 +243,21 @@ impl ConnExit {
             ConnExit::Goodbye => "goodbye",
             ConnExit::KeyRotated => "key_rotated",
         }
+    }
+
+    /// FR-138 P2b — the exit a daemon's `Detached` names, from its label. One
+    /// this build does not know (a newer daemon's) reads as a transient exit,
+    /// or a net change's when the order says the addresses moved, so the
+    /// worker keeps what the daemon will claim and looks at it as it should.
+    pub(crate) fn from_label(label: &str, netchange: bool) -> ConnExit {
+        Self::ALL
+            .into_iter()
+            .find(|e| e.label() == label)
+            .unwrap_or(if netchange {
+                ConnExit::NetChangeProbe
+            } else {
+                ConnExit::ReadError
+            })
     }
 
     /// P2a-2 (M2) — the exit the RX deadline's arm takes, from the pause its
@@ -354,6 +377,11 @@ pub(crate) fn real_end_hook(indicator: crate::indicator::ViewerIndicator) -> End
 /// except what the server must hear anyway, which it hands to the table: the
 /// session's own `Terminate` (the table closes the peer and queues the end),
 /// and its recording's and curtain's activity (queued for the audit, L9).
+///
+/// FR-138 P2b — the link of a daemon's [`Record`], and of a session on a GUI
+/// worker's delegated table, hands the session's own end to the table while
+/// attached too: the record leaves as its end is queued, and the worker's peer
+/// closes itself at once (B6), since after a roll no server echoes its end.
 pub(crate) struct SessionLink {
     tx: mpsc::Sender<ClientMsg>,
     route: watch::Sender<Route>,
@@ -368,14 +396,17 @@ enum Route {
 }
 
 impl SessionLink {
+    /// `own_end_to_table`: the session's own end goes to the table in both
+    /// routes, attached too (FR-138 P2b).
     fn new(
         session_id: ObjectId,
         to: mpsc::Sender<ClientMsg>,
         ended: mpsc::Sender<(ObjectId, ClientMsg)>,
+        own_end_to_table: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel(LINK_CAP);
         let (route, route_rx) = watch::channel(Route::To(to));
-        tokio::spawn(forward(session_id, rx, route_rx, ended));
+        tokio::spawn(forward(session_id, rx, route_rx, ended, own_end_to_table));
         Self { tx, route }
     }
 
@@ -420,11 +451,23 @@ async fn forward(
     mut rx: mpsc::Receiver<ClientMsg>,
     mut route: watch::Receiver<Route>,
     ended: mpsc::Sender<(ObjectId, ClientMsg)>,
+    own_end_to_table: bool,
 ) {
     // `false` once the table let the link go (its session closed): the route
     // stays where it last was, as a direct send's would.
     let mut movable = true;
     while let Some(msg) = rx.recv().await {
+        // FR-138 P2b — a record's or a worker's delegated session: its own end
+        // is the table's in both routes. A full table queue routes it as
+        // before, so it is never lost to the table's being busy.
+        let msg = if own_end_to_table && is_own_end(&msg, session_id) {
+            match ended.try_send((session_id, msg)) {
+                Ok(()) => continue,
+                Err(e) => e.into_inner().1,
+            }
+        } else {
+            msg
+        };
         let mut next = Some(msg);
         while let Some(msg) = next.take() {
             let to = route.borrow_and_update().clone();
@@ -644,58 +687,229 @@ impl<P: TablePeer> SessionTable<P> {
 
     /// FR-138 P2b (A3) — the gate crossed `session_id`'s offer to the worker:
     /// a session whose params crossed `keepable` gets a record, attached to
-    /// this connection.
+    /// this connection, and the worker's replies about it are bound to the
+    /// record's link. Anything else (the switch off, an older worker, no
+    /// connection) gets none and is served as today.
     pub(crate) fn cross_offer(&mut self, session_id: ObjectId) {
-        let _ = session_id;
+        let Some(host) = self.host.clone() else {
+            return;
+        };
+        let hex = session_id.to_hex();
+        if !self.survive || !host.is_keepable(&hex) {
+            return;
+        }
+        let Some(current) = self.current.clone() else {
+            return;
+        };
+        let link = SessionLink::new(session_id, current, self.ended_tx.clone(), true);
+        host.bind(hex, link.sender());
+        let generation = host.generation();
+        if self
+            .records
+            .insert(
+                session_id,
+                Record {
+                    link,
+                    kept: None,
+                    generation,
+                },
+            )
+            .is_some()
+        {
+            debug!(session_id = %session_id, "rc: a delegated session re-offered; its record replaced (FR-138)");
+        }
+        info!(
+            session_id = %session_id,
+            generation,
+            "rc: a delegated session the daemon will claim through its control socket's loss; \
+             the GUI worker keeps its peer (FR-138 P2b)"
+        );
     }
 
     /// FR-138 P2b — whether the table keeps a record of this delegated session.
+    #[cfg(test)]
     pub(crate) fn holds_record(&self, session_id: &ObjectId) -> bool {
         self.records.contains_key(session_id)
     }
 
     /// FR-138 P2b (A7) — the server ended a delegated session: its record goes,
-    /// and the `Terminate` crosses to the worker as today.
+    /// and the `Terminate` crosses to the worker as today, whose delegated
+    /// table says the end and closes after the grace (C1). No `Close`: on its
+    /// own lane it could overtake the `Terminate` and close the peer before
+    /// the end is said.
     pub(crate) fn drop_record(&mut self, session_id: &ObjectId) {
-        if let Some(record) = self.records.remove(session_id)
-            && let Some(host) = &self.host
-        {
+        let Some(record) = self.records.remove(session_id) else {
+            return;
+        };
+        if let Some(host) = &self.host {
             host.unbind(&session_id.to_hex());
-            drop(record);
         }
+        info!(
+            session_id = %session_id,
+            kept_ms = record.kept.as_ref().map(|k| millis(k.since.elapsed())),
+            "rc session closed (delegated): the server ended it; the GUI worker closes its peer \
+             (FR-138 P2b)"
+        );
+    }
+
+    /// FR-138 P2b — the GUI worker's delegated table.
+    pub(crate) fn is_worker(&self) -> bool {
+        self.worker
     }
 
     /// FR-138 P2b (B5) — the worker's half of a detach: the daemon's
     /// `Detached` names the sessions it will claim, and only those are kept,
-    /// until `window` from now at most.
+    /// until `window` from now at most ([`WINDOW_CAP`]). One worker serves
+    /// every org's sessions on a one-row Mac, so another org's stay attached.
+    /// A dead peer closes and its end goes up the channel (M1), as does the
+    /// end of one that cannot be kept, so the daemon does not claim it.
     pub(crate) async fn detach_named(
         &mut self,
         sessions: &[ObjectId],
         exit: ConnExit,
         window: Duration,
     ) {
-        let _ = (sessions, exit, window);
+        let window = window.min(WINDOW_CAP);
+        let now = Instant::now();
+        let netchange = exit.kind() == ExitKind::NetChange;
+        let mut closing: Vec<(ObjectId, P, &'static str, EndReason)> = Vec::new();
+        for session_id in sessions {
+            let Some(live) = self.attached.remove(session_id) else {
+                debug!(
+                    session_id = %session_id,
+                    "rc: a detach names a session this table does not hold attached (FR-138 P2b)"
+                );
+                continue;
+            };
+            let Some(link) = live.link else {
+                closing.push((
+                    *session_id,
+                    live.peer,
+                    "ws_disconnect",
+                    EndReason::AgentDisconnect,
+                ));
+                continue;
+            };
+            if live.peer.is_dead() {
+                closing.push((*session_id, live.peer, "dead", EndReason::Error));
+                continue;
+            }
+            if self.kept.len() >= self.capacity {
+                closing.push((
+                    *session_id,
+                    live.peer,
+                    "over_capacity",
+                    EndReason::AgentDisconnect,
+                ));
+                continue;
+            }
+            if netchange && !live.peer.is_connected() {
+                closing.push((
+                    *session_id,
+                    live.peer,
+                    "netchange_not_connected",
+                    EndReason::AgentDisconnect,
+                ));
+                continue;
+            }
+            link.keep();
+            info!(
+                session_id = %session_id,
+                exit = exit.label(),
+                window_s = window.as_secs(),
+                netchange,
+                "rc session detached (delegated): the daemon will claim it; its peer is kept for \
+                 the daemon's window at most (FR-138 P2b)"
+            );
+            self.kept.insert(
+                *session_id,
+                Kept {
+                    peer: live.peer,
+                    link,
+                    since: now,
+                    deadline: now + window,
+                    netchange,
+                    exit,
+                },
+            );
+        }
+        if netchange && self.next_look.is_none() {
+            self.next_look = Some(now + NETCHANGE_LOOK_EVERY);
+        }
+        for (session_id, peer, why, reason) in closing {
+            (self.on_end)(session_id, RealEnd::Ended);
+            info!(
+                session_id = %session_id,
+                why,
+                exit = exit.label(),
+                "rc session closed at the daemon's detach: it could not be kept (FR-138 P2b)"
+            );
+            close_within_budget(peer.close(), session_id, why).await;
+            self.queue_end(gone(session_id, reason));
+        }
     }
 
     /// FR-138 P2b (B5) — the daemon's `Close`: the session closes, with its real
-    /// end. A session the table does not hold changes nothing.
+    /// end, and nothing goes up (the daemon decided). A session the table does
+    /// not hold changes nothing.
     pub(crate) async fn close_session(&mut self, session_id: ObjectId, why: &'static str) {
-        let _ = (session_id, why);
+        if self.kept.contains_key(&session_id) {
+            return self.close_kept(session_id, why).await;
+        }
+        let Some(live) = self.attached.remove(&session_id) else {
+            debug!(session_id = %session_id, why, "rc: a close for a session this table does not hold (FR-138 P2b)");
+            return;
+        };
+        (self.on_end)(session_id, RealEnd::Ended);
+        info!(
+            session_id = %session_id,
+            why,
+            "rc session closed (delegated): the daemon closed it (FR-138 P2b)"
+        );
+        close_within_budget(live.peer.close(), session_id, why).await;
     }
 
     /// FR-138 P2b (B9, D5) — the channel to the daemon ended while both
-    /// processes live: the attached sessions' links stop waiting, and keep
-    /// what the server must hear, until [`Self::unpause`].
-    pub(crate) fn pause(&mut self) {}
+    /// processes live: the attached sessions' links stop waiting, and hand the
+    /// table what the server must hear, until [`Self::unpause`]. No deadline
+    /// starts: the daemon governs these sessions, and a peer that fails still
+    /// closes itself (B6).
+    pub(crate) fn pause(&mut self) {
+        if self.attached.is_empty() {
+            return;
+        }
+        for live in self.attached.values() {
+            if let Some(link) = &live.link {
+                link.keep();
+            }
+        }
+        info!(
+            count = self.attached.len(),
+            "rc: the channel to the daemon ended; the delegated sessions' links wait for the next \
+             attach and never block (FR-138 P2b)"
+        );
+    }
 
     /// FR-138 P2b (B9) — the channel is back: the attached sessions' links
-    /// point at it again.
-    pub(crate) fn unpause(&mut self) {}
+    /// point at it again. Kept ones stay kept, for the daemon's `Resumed`.
+    pub(crate) fn unpause(&mut self) {
+        let Some(to) = self.current.clone() else {
+            return;
+        };
+        for live in self.attached.values() {
+            if let Some(link) = &live.link {
+                link.point_at(to.clone());
+            }
+        }
+    }
 
-    /// FR-138 P2b (B7) — the person at the device ended a session of a GUI
-    /// worker's delegated table (Disconnect, the idle limit), attached or kept:
-    /// it stops serving at once, and its end goes up the channel, which never
-    /// waits. `false` when the table does not hold it.
+    /// FR-138 P2b (B7) — the person at the device ended a session (Disconnect,
+    /// the idle limit) that this table holds: kept (any table), or attached on
+    /// a GUI worker's delegated table. It stops serving at once, closes after
+    /// `grace`, and its end goes to the server through the table, which never
+    /// waits (F3). A kept one says `rc:ended` on its control channel; an
+    /// attached one does not, since the server tells its viewer. `false` when
+    /// the table does not hold it so.
     pub(crate) fn end_by_device(
         &mut self,
         session_id: ObjectId,
@@ -703,7 +917,204 @@ impl<P: TablePeer> SessionTable<P> {
         why: &'static str,
         grace: Duration,
     ) -> bool {
-        self.end_kept_by_device(session_id, terminate, why, grace)
+        if self.kept.contains_key(&session_id) {
+            return self.end_kept_by_device(session_id, terminate, why, grace);
+        }
+        if !self.worker {
+            return false;
+        }
+        let Some(live) = self.attached.remove(&session_id) else {
+            return false;
+        };
+        (self.on_end)(session_id, RealEnd::HostEnded);
+        live.peer.stop_serving();
+        info!(
+            session_id = %session_id,
+            why,
+            grace_ms = millis(grace),
+            "rc session closed (delegated): ended at the device; its end goes up the channel and \
+             the peer closes after the grace (FR-138 P2b)"
+        );
+        let Live { peer, link } = live;
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            close_within_budget(peer.close(), session_id, why).await;
+            drop(link);
+        });
+        self.queue_end(terminate);
+        true
+    }
+
+    /// FR-138 P2b (A9) — the attach generation of the worker attached now.
+    fn live_generation(&self) -> Option<u64> {
+        self.host.as_ref().map(DelegateHost::generation)
+    }
+
+    /// FR-138 P2b (A9) — the records whose worker is still the one attached:
+    /// a record of an older generation belongs to a worker that is gone, and
+    /// is never claimed, counted or resumed.
+    fn live_records(&self) -> impl Iterator<Item = (&ObjectId, &Record)> {
+        let live = self.live_generation();
+        self.records
+            .iter()
+            .filter(move |(_, r)| Some(r.generation) == live)
+    }
+
+    /// FR-138 P2b — a record leaves: its replies are unbound, and its worker
+    /// told to close the peer (the daemon's deadline, a terminal exit, a claim
+    /// it can no longer make). A `Close` for a session the worker no longer
+    /// holds changes nothing there.
+    fn close_record(&mut self, session_id: ObjectId, why: &'static str) {
+        let Some(record) = self.records.remove(&session_id) else {
+            return;
+        };
+        if let Some(host) = &self.host {
+            let hex = session_id.to_hex();
+            host.unbind(&hex);
+            host.send_order(crate::delegate::DelegateFrame::Close {
+                session_id: hex,
+                reason: why.to_string(),
+            });
+        }
+        info!(
+            session_id = %session_id,
+            why,
+            kept_ms = record.kept.as_ref().map(|k| millis(k.since.elapsed())),
+            "rc session closed (delegated): its record ended; the GUI worker closes its peer \
+             (FR-138 P2b)"
+        );
+    }
+
+    /// FR-138 P2b (A9) — the records of a worker that is gone leave. Their
+    /// worker's process took their peers, and the server hears each end, on
+    /// this connection or the next, the way a dead peer's is said (M1).
+    fn prune_records(&mut self) {
+        let live = self.live_generation();
+        let stale: Vec<ObjectId> = self
+            .records
+            .iter()
+            .filter(|(_, r)| Some(r.generation) != live)
+            .map(|(s, _)| *s)
+            .collect();
+        for session_id in stale {
+            self.close_record(session_id, "worker_gone");
+            self.queue_end(gone(session_id, EndReason::Error));
+        }
+    }
+
+    /// FR-138 P2b (A4) — the daemon's half of a transient exit with a window:
+    /// every attached record of the worker attached now is kept with the same
+    /// deadline, and the worker gets one `Detached` naming them. One past the
+    /// capacity closes. The daemon reads no peer state: the worker applies M1
+    /// and the net-change rule itself.
+    fn detach_records(&mut self, exit: ConnExit, window: Duration, now: Instant) {
+        self.prune_records();
+        let Some(host) = self.host.clone() else {
+            return;
+        };
+        let mut attached: Vec<ObjectId> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.kept.is_none())
+            .map(|(s, _)| *s)
+            .collect();
+        if attached.is_empty() {
+            return;
+        }
+        attached.sort();
+        let mut kept = self.kept.len() + self.records.values().filter(|r| r.kept.is_some()).count();
+        let mut detached: Vec<String> = Vec::new();
+        let mut closing: Vec<ObjectId> = Vec::new();
+        for session_id in attached {
+            if kept >= self.capacity {
+                closing.push(session_id);
+                continue;
+            }
+            let Some(record) = self.records.get_mut(&session_id) else {
+                continue;
+            };
+            record.link.keep();
+            record.kept = Some(RecordKept {
+                since: now,
+                deadline: now + window,
+                exit,
+            });
+            kept += 1;
+            info!(
+                session_id = %session_id,
+                exit = exit.label(),
+                window_s = window.as_secs(),
+                "rc session detached (delegated): the GUI worker keeps its peer until the server \
+                 answers the claim, for the window at most (FR-138 P2b)"
+            );
+            detached.push(session_id.to_hex());
+        }
+        if !detached.is_empty() {
+            let count = detached.len();
+            let told = host.send_order(crate::delegate::DelegateFrame::Detached {
+                sessions: detached,
+                exit: exit.label().to_string(),
+                netchange: exit.kind() == ExitKind::NetChange,
+                keep_ms: millis(window),
+            });
+            if !told {
+                // Its sends then go on reaching this record's link, which
+                // keeps what the server must hear; the claim, the `Resumed`
+                // and the deadline's `Close` still govern the peer.
+                warn!(
+                    count,
+                    "rc: the GUI worker could not be told of the detach; it keeps serving its \
+                     sessions until the daemon's next order (FR-138 P2b)"
+                );
+            }
+        }
+        for session_id in closing {
+            self.close_record(session_id, "over_capacity");
+        }
+    }
+
+    /// FR-138 P2b (A6) — the server accepted the claim of a record. Before the
+    /// daemon's deadline and with its worker still attached: attached again,
+    /// its link pointed at this connection, and the worker told. Otherwise it
+    /// goes, the worker is told to close, and the server hears it is gone.
+    fn resume_record(&mut self, session_id: ObjectId, outbound: &mpsc::Sender<ClientMsg>) -> bool {
+        let live = self.live_generation();
+        let Some(record) = self.records.get_mut(&session_id) else {
+            return false;
+        };
+        let Some(kept) = &record.kept else {
+            debug!(session_id = %session_id, "rc:session.resumed for a delegated session already attached");
+            return true;
+        };
+        let refused = if Some(record.generation) != live {
+            Some("worker_gone")
+        } else if Instant::now() >= kept.deadline {
+            Some("claim_late")
+        } else {
+            None
+        };
+        if let Some(why) = refused {
+            self.close_record(session_id, why);
+            self.queue_end(gone(session_id, EndReason::AgentDisconnect));
+            return false;
+        }
+        let (exit, since) = (kept.exit, kept.since);
+        record.link.point_at(outbound.clone());
+        record.kept = None;
+        let told = self.host.as_ref().is_some_and(|h| {
+            h.send_order(crate::delegate::DelegateFrame::Resumed {
+                session_id: session_id.to_hex(),
+            })
+        });
+        info!(
+            session_id = %session_id,
+            exit = exit.label(),
+            kept_ms = millis(since.elapsed()),
+            told,
+            "rc session resumed (delegated): re-attached to the new connection; the GUI worker \
+             told (FR-138 P2b)"
+        );
+        true
     }
 
     /// A connection is up: its switch, read once. The window starts unannounced
@@ -714,11 +1125,22 @@ impl<P: TablePeer> SessionTable<P> {
         self.survive = survive;
         self.window = None;
         self.current = None;
+        // FR-138 P2b (A9) — what a gone worker held is never claimed.
+        self.prune_records();
         self.close_due().await;
         if !survive {
             let kept: Vec<ObjectId> = self.kept.keys().copied().collect();
             for session_id in kept {
                 self.close_kept(session_id, "switch_off").await;
+            }
+            let kept: Vec<ObjectId> = self
+                .records
+                .iter()
+                .filter(|(_, r)| r.kept.is_some())
+                .map(|(s, _)| *s)
+                .collect();
+            for session_id in kept {
+                self.close_record(session_id, "switch_off");
             }
         }
         self.kept_ids()
@@ -756,13 +1178,20 @@ impl<P: TablePeer> SessionTable<P> {
         self.window
     }
 
-    /// A link for a session this connection builds, pointed at `outbound`.
+    /// A link for a session this connection builds, pointed at `outbound`. On
+    /// a GUI worker's delegated table its own end goes to the table in both
+    /// routes, so its peer closes itself (B6).
     pub(crate) fn link(
         &self,
         session_id: ObjectId,
         outbound: &mpsc::Sender<ClientMsg>,
     ) -> SessionLink {
-        SessionLink::new(session_id, outbound.clone(), self.ended_tx.clone())
+        SessionLink::new(
+            session_id,
+            outbound.clone(),
+            self.ended_tx.clone(),
+            self.worker,
+        )
     }
 
     /// A live session, attached. `link` is `None` for a session never kept.
@@ -845,8 +1274,10 @@ impl<P: TablePeer> SessionTable<P> {
     }
 
     /// Every live session, kept ones included: what counts against capacity.
+    /// FR-138 P2b (A10) — a delegated session's record too, while its worker
+    /// is the one attached.
     pub(crate) fn len(&self) -> usize {
-        self.attached.len() + self.kept.len()
+        self.attached.len() + self.kept.len() + self.live_records().count()
     }
 
     #[cfg(test)]
@@ -859,20 +1290,27 @@ impl<P: TablePeer> SessionTable<P> {
     }
 
     pub(crate) fn has_kept(&self) -> bool {
-        !self.kept.is_empty()
+        !self.kept.is_empty() || self.live_records().any(|(_, r)| r.kept.is_some())
     }
 
-    /// The kept sessions, in a stable order: the hello's claim.
+    /// The kept sessions, in a stable order: the hello's claim. FR-138 P2b
+    /// (A5) — the kept records of the worker attached now with them.
     pub(crate) fn kept_ids(&self) -> Vec<ObjectId> {
         let mut ids: Vec<ObjectId> = self.kept.keys().copied().collect();
+        ids.extend(
+            self.live_records()
+                .filter(|(_, r)| r.kept.is_some())
+                .map(|(s, _)| *s),
+        );
         ids.sort();
         ids
     }
 
     /// A new request would put a session beside a kept peer past the device's
-    /// capacity: it is refused as busy.
+    /// capacity: it is refused as busy. FR-138 P2b (A10) — or beside a kept
+    /// delegated session.
     pub(crate) fn full_beside_kept(&self) -> bool {
-        !self.kept.is_empty() && self.len() >= self.capacity
+        self.has_kept() && self.len() >= self.capacity
     }
 
     /// Take a session out to end it: the server's terminate (a refused claim
@@ -906,6 +1344,9 @@ impl<P: TablePeer> SessionTable<P> {
         if self.attached.contains_key(&session_id) {
             debug!(session_id = %session_id, "rc:session.resumed for a session already attached");
             return true;
+        }
+        if self.records.contains_key(&session_id) {
+            return self.resume_record(session_id, outbound);
         }
         let Some(kept) = self.kept.remove(&session_id) else {
             info!(
@@ -960,9 +1401,9 @@ impl<P: TablePeer> SessionTable<P> {
         let Some(window) = self.window else {
             // M3 — the window comes after the hello, so a connection can end
             // before it: its server never said whether it keeps sessions.
-            if !self.kept.is_empty() {
+            if self.has_kept() {
                 info!(
-                    kept = self.kept.len(),
+                    kept = self.kept_ids().len(),
                     exit = exit.label(),
                     "rc: the connection ended before its server announced a window; the kept \
                      sessions keep their deadlines (FR-138)"
@@ -987,7 +1428,8 @@ impl<P: TablePeer> SessionTable<P> {
                 dead.push(session_id);
                 continue;
             }
-            if self.kept.len() >= self.capacity {
+            // FR-138 P2b — a kept record holds a place as a kept peer does.
+            if self.kept_ids().len() >= self.capacity {
                 closing.push((session_id, live.peer, "over_capacity"));
                 continue;
             }
@@ -1021,6 +1463,8 @@ impl<P: TablePeer> SessionTable<P> {
         if netchange && self.next_look.is_none() {
             self.next_look = Some(now + NETCHANGE_LOOK_EVERY);
         }
+        // FR-138 P2b (A4) — and the delegated sessions the daemon will claim.
+        self.detach_records(exit, window, now);
         for (session_id, peer, why) in closing {
             (self.on_end)(session_id, RealEnd::Ended);
             info!(
@@ -1047,6 +1491,25 @@ impl<P: TablePeer> SessionTable<P> {
         for session_id in kept {
             self.close_kept(session_id, why).await;
         }
+        // FR-138 P2b — and every record: its worker closes the peer.
+        let records: Vec<ObjectId> = self.records.keys().copied().collect();
+        for session_id in records {
+            self.close_record(session_id, why);
+        }
+    }
+
+    /// FR-138 P2b — the records attached to the connection that ended, closed
+    /// with it: a terminal exit, no window (M3), an exit without its arm.
+    fn close_attached_records(&mut self, why: &'static str) {
+        let attached: Vec<ObjectId> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.kept.is_none())
+            .map(|(s, _)| *s)
+            .collect();
+        for session_id in attached {
+            self.close_record(session_id, why);
+        }
     }
 
     /// The attached half of [`Self::close_all`], `close_all_peers` as it was.
@@ -1057,7 +1520,12 @@ impl<P: TablePeer> SessionTable<P> {
     /// the controller could not reconnect ("agent capacity exceeded"). A kept
     /// session's banner stays up, because its session is still live.
     async fn close_attached(&mut self) {
-        self.current = None;
+        // FR-138 P2b — a GUI worker's delegated table speaks up the delegation
+        // channel, which no connection of its own ends.
+        if !self.worker {
+            self.current = None;
+        }
+        self.close_attached_records("ws_disconnect");
         if self.attached.is_empty() {
             return;
         }
@@ -1077,6 +1545,7 @@ impl<P: TablePeer> SessionTable<P> {
     /// of an answer): what it left attached closes. Kept sessions stay.
     pub(crate) async fn close_stranded(&mut self) {
         self.current = None;
+        self.close_attached_records("connection_ended");
         if self.attached.is_empty() {
             return;
         }
@@ -1178,7 +1647,16 @@ impl<P: TablePeer> SessionTable<P> {
     /// this connection's queue for what waits. Pends while nothing is kept and
     /// nothing waits. Cancel-safe, for a `select!` arm.
     pub(crate) async fn next_event(&mut self) -> TableEvent {
-        let deadline = self.kept.values().map(|k| k.deadline).min();
+        let deadline = self
+            .kept
+            .values()
+            .map(|k| k.deadline)
+            .chain(
+                self.records
+                    .values()
+                    .filter_map(|r| r.kept.as_ref().map(|k| k.deadline)),
+            )
+            .min();
         let look = self
             .next_look
             .filter(|_| self.kept.values().any(|k| k.netchange));
@@ -1206,8 +1684,29 @@ impl<P: TablePeer> SessionTable<P> {
         match event {
             TableEvent::Deadline => self.close_due().await,
             TableEvent::Ended(session_id, msg) => {
-                if self.kept.contains_key(&session_id) {
+                if self.records.contains_key(&session_id) {
+                    // FR-138 P2b — a delegated session's own end, from its
+                    // worker (its peer failed, the person ended it) or from
+                    // the channel's end (D6): the record goes, and the server
+                    // hears it, on this connection or after the next hello.
+                    self.close_record(session_id, "ended");
+                    self.queue_end(*msg);
+                } else if self.kept.contains_key(&session_id) {
                     self.close_kept(session_id, "failed").await;
+                    self.queue_end(*msg);
+                } else if self.worker
+                    && let Some(live) = self.attached.remove(&session_id)
+                {
+                    // FR-138 P2b (B6) — a GUI worker's delegated peer that
+                    // failed closes itself: after a roll the server that
+                    // would echo its end no longer holds the session.
+                    (self.on_end)(session_id, RealEnd::Ended);
+                    info!(
+                        session_id = %session_id,
+                        "rc session closed (delegated): its peer ended itself; its end goes up the \
+                         channel (FR-138 P2b)"
+                    );
+                    close_within_budget(live.peer.close(), session_id, "failed").await;
                     self.queue_end(*msg);
                 } else if self.attached.contains_key(&session_id) {
                     // Resumed before this was read: say it on this connection,
@@ -1236,6 +1735,12 @@ impl<P: TablePeer> SessionTable<P> {
                 for session_id in left {
                     self.close_kept(session_id, "netchange_left_connected")
                         .await;
+                    // FR-138 P2b — on a GUI worker's delegated table the
+                    // daemon holds the claim: it hears the session is gone,
+                    // and does not claim it.
+                    if self.worker {
+                        self.queue_end(gone(session_id, EndReason::AgentDisconnect));
+                    }
                 }
                 self.next_look = self
                     .kept
@@ -1256,6 +1761,17 @@ impl<P: TablePeer> SessionTable<P> {
             .collect();
         for session_id in due {
             self.close_kept(session_id, "deadline").await;
+        }
+        // FR-138 P2b (A8, D4) — a kept record past the daemon's deadline: its
+        // worker is told to close, and its own deadline closes it anyway.
+        let due: Vec<ObjectId> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.kept.as_ref().is_some_and(|k| k.deadline <= now))
+            .map(|(s, _)| *s)
+            .collect();
+        for session_id in due {
+            self.close_record(session_id, "deadline");
         }
     }
 
@@ -1295,6 +1811,12 @@ async fn room_on(to: Option<mpsc::Sender<ClientMsg>>) -> Option<mpsc::OwnedPermi
 /// table first, so this reads as a WARN when it ever runs.
 impl<P: TablePeer> Drop for SessionTable<P> {
     fn drop(&mut self) {
+        // FR-138 P2b — a record holds no peer; its binding goes with it.
+        if let Some(host) = &self.host {
+            for session_id in self.records.keys() {
+                host.unbind(&session_id.to_hex());
+            }
+        }
         let mut peers: Vec<(ObjectId, P)> =
             self.attached.drain().map(|(s, l)| (s, l.peer)).collect();
         peers.extend(self.kept.drain().map(|(s, k)| (s, k.peer)));
@@ -2736,7 +3258,7 @@ mod tests {
             .filter_map(|m| match m {
                 ClientMsg::Terminate {
                     session_id, reason, ..
-                } => Some((*session_id, reason.clone())),
+                } => Some((*session_id, *reason)),
                 _ => None,
             })
             .collect()

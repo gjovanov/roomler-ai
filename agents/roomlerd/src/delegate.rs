@@ -129,7 +129,7 @@ pub enum DelegateFrame {
         /// FR-138 P2b — what this worker does with a delegated session beyond
         /// serving it, as words matched by equality ([`KEEP_DELEGATED`]). An
         /// older worker sends none, and an older daemon ignores the field.
-        #[serde(skip)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
     },
     /// Daemon → worker: everything the daemon resolved while answering
@@ -186,7 +186,6 @@ pub enum DelegateFrame {
     /// transient exit, and the daemon will claim these sessions on its next
     /// connection. The worker keeps their peers for `keep_ms` at most, from the
     /// frame's receipt. Sent only to a worker that said [`KEEP_DELEGATED`].
-    #[serde(skip)]
     Detached {
         /// Hex, like every other id this channel carries.
         sessions: Vec<String>,
@@ -199,12 +198,10 @@ pub enum DelegateFrame {
     },
     /// FR-138 P2b — daemon → worker: the server accepted the claim, and the
     /// session goes on.
-    #[serde(skip)]
     Resumed { session_id: String },
     /// FR-138 P2b — daemon → worker: close this session (the daemon's deadline,
     /// a terminal exit, a claim it can no longer make). The worker's own
     /// deadline closes a kept session anyway, so a lost `Close` leaks nothing.
-    #[serde(skip)]
     Close { session_id: String, reason: String },
 }
 
@@ -217,7 +214,13 @@ pub const KEEP_DELEGATED: &str = "keep-delegated";
 /// delegated session's peer through the daemon's control-socket loss, on the
 /// daemon's orders ([`KEEP_DELEGATED`]).
 pub fn worker_features() -> Vec<String> {
-    Vec::new()
+    vec![KEEP_DELEGATED.to_string()]
+}
+
+/// `skip_serializing_if` for a flag whose `false` an older reader already
+/// assumes.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// FR-138 P2b — the daemon's orders about the sessions it will claim, on the
@@ -263,6 +266,23 @@ pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
     match frame {
         DelegateFrame::SessionParams(p) => WorkerLane::Inbound(WorkerInbound::Params(p)),
         DelegateFrame::ToWorker { msg } => WorkerLane::Inbound(WorkerInbound::Msg(msg)),
+        DelegateFrame::Detached {
+            sessions,
+            exit,
+            netchange,
+            keep_ms,
+        } => WorkerLane::Order(WorkerOrder::Detached {
+            sessions,
+            exit,
+            netchange,
+            keep_ms,
+        }),
+        DelegateFrame::Resumed { session_id } => {
+            WorkerLane::Order(WorkerOrder::Resumed { session_id })
+        }
+        DelegateFrame::Close { session_id, reason } => {
+            WorkerLane::Order(WorkerOrder::Close { session_id, reason })
+        }
         other => WorkerLane::Here(other),
     }
 }
@@ -273,8 +293,7 @@ pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
 /// be handed its `Terminate` or `Ice`. Only with the switch on: off, the gate
 /// is byte for byte what it was.
 pub(crate) fn served_by_daemon(switch_on: bool, daemon_holds: bool) -> bool {
-    let _ = (switch_on, daemon_holds);
-    false
+    switch_on && daemon_holds
 }
 
 /// FR-138 P2b (A2) — whether a delegated session's params say `keepable`: the
@@ -282,8 +301,19 @@ pub(crate) fn served_by_daemon(switch_on: bool, daemon_holds: bool) -> bool {
 /// [`KEEP_DELEGATED`], and not an external session, which is never kept
 /// (FR-138 D3). Anything else is served as today.
 pub(crate) fn session_keepable(switch_on: bool, worker_keeps: bool, external: bool) -> bool {
-    let _ = (switch_on, worker_keeps, external);
-    false
+    switch_on && worker_keeps && !external
+}
+
+/// FR-138 P2b (A1) — the session a delegable server message is about.
+pub(crate) fn server_session_id(msg: &ServerMsg) -> Option<bson::oid::ObjectId> {
+    match msg {
+        ServerMsg::SessionCreated { session_id, .. }
+        | ServerMsg::SdpOffer { session_id, .. }
+        | ServerMsg::SdpAnswer { session_id, .. }
+        | ServerMsg::Ice { session_id, .. }
+        | ServerMsg::Terminate { session_id, .. } => Some(*session_id),
+        _ => None,
+    }
 }
 
 /// FR-43 P3b — what the person at a one-row Mac asked of every session: the
@@ -591,7 +621,7 @@ pub struct SessionParams {
     /// peers it keeps on the daemon's orders. Said only to a worker that said
     /// [`KEEP_DELEGATED`], and only with the device's switch on; absent (an
     /// older daemon) reads `false`, which is today.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub keepable: bool,
 }
 
@@ -671,6 +701,12 @@ pub struct WorkerLink {
     /// Checked rather than assumed; a priority queue here would be machinery
     /// for a guarantee nothing needs.
     pub outbound: tokio::sync::mpsc::Sender<ClientMsg>,
+    /// FR-138 P2b — the daemon's orders about the sessions it will claim
+    /// ([`WorkerOrder`]), on their own lane: the signalling loop serves them
+    /// wherever it waits, its own connection down included. Taken once by the
+    /// loop ([`Delegation::worker_side`]); `None` where no attach loop feeds
+    /// one.
+    pub orders: Option<tokio::sync::mpsc::Receiver<WorkerOrder>>,
 }
 
 /// How this process takes part in delegation.
@@ -716,6 +752,21 @@ impl Delegation {
     )> {
         match self {
             Delegation::Worker(link) => Some((&mut link.inbound, &link.outbound)),
+            _ => None,
+        }
+    }
+
+    /// FR-138 P2b (B1) — a worker's delegated side: the orders lane, taken
+    /// out once, and the channel's sender its delegated sessions speak up.
+    /// `None` for every process that is not a worker.
+    pub fn worker_side(
+        &mut self,
+    ) -> Option<(
+        Option<tokio::sync::mpsc::Receiver<WorkerOrder>>,
+        tokio::sync::mpsc::Sender<ClientMsg>,
+    )> {
+        match self {
+            Delegation::Worker(link) => Some((link.orders.take(), link.outbound.clone())),
             _ => None,
         }
     }
@@ -1355,6 +1406,11 @@ impl DelegateHost {
             DelegateFrame::SessionParams(p) => Some(p.session_id.clone()),
             _ => None,
         };
+        // FR-138 P2b — and whether the daemon will claim it, by the same rule.
+        let keepable = match &frame {
+            DelegateFrame::SessionParams(p) if p.keepable => Some(p.session_id.clone()),
+            _ => None,
+        };
         let tx = self
             .inner
             .to_worker
@@ -1383,6 +1439,15 @@ impl DelegateHost {
             note_session(&mut held, session, org);
         }
         drop(held);
+        if let Some(session_id) = keepable {
+            let mut held = self.inner.keepable.lock().expect("keepable mutex");
+            if !held.iter().any(|s| *s == session_id) {
+                held.push_back(session_id);
+                while held.len() > SESSION_ORGS_KEPT {
+                    held.pop_front();
+                }
+            }
+        }
         if let Some(session_id) = recorded {
             let mut held = self
                 .inner
@@ -1495,6 +1560,9 @@ impl DelegateHost {
         // person's floor stays: it only tightens, and the next worker's first
         // frames replace it.
         self.inner.sessions.lock().expect("sessions mutex").clear();
+        // FR-138 P2b — and which sessions the daemon would have claimed: the
+        // next worker never got their params.
+        self.inner.keepable.lock().expect("keepable mutex").clear();
         // Unlink the socket too. The accept loop ends when the listener drops
         // with the process, but a path left behind is an endpoint a later
         // worker could dial and sit on forever waiting for a greeting.
@@ -1707,6 +1775,37 @@ impl DelegateHost {
             .lock()
             .expect("keep_busy_asks mutex")
             .clear();
+        // FR-138 P2b (A9) — and the sessions it kept for the daemon's claim:
+        // a record of this generation belongs to a worker that is gone, whose
+        // process took its peers (or, alive, keeps them paused). Bumped
+        // BEFORE the ends below, so the table that reads one reads the record
+        // as gone. (D6) Each bound record hears its session end as `error`:
+        // attached, the table says it to the server on this connection, and
+        // the viewer stops watching a frozen picture; kept, after the next
+        // hello. The sends never wait.
+        self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        let bound: Vec<(String, tokio::sync::mpsc::Sender<ClientMsg>)> = self
+            .inner
+            .bindings
+            .lock()
+            .expect("bindings mutex")
+            .drain()
+            .collect();
+        for (session, link) in bound {
+            let Ok(session_id) = bson::oid::ObjectId::parse_str(&session) else {
+                continue;
+            };
+            tracing::info!(
+                %session,
+                "delegation: the GUI worker that held a kept-for-claim session is gone; it ends \
+                 as `error` (FR-138 P2b)"
+            );
+            let _ = link.try_send(ClientMsg::Terminate {
+                session_id,
+                reason: roomler_ai_remote_control::models::EndReason::Error,
+                limit: None,
+            });
+        }
     }
 
     /// FR-138 P2b (A2) — whether the attached worker keeps a delegated
@@ -1714,13 +1813,22 @@ impl DelegateHost {
     /// [`KEEP_DELEGATED`], matched by equality. No worker, or an older one:
     /// `false`, and its sessions are served as today.
     pub fn worker_keeps(&self) -> bool {
-        false
+        self.inner
+            .worker_features
+            .lock()
+            .expect("worker features mutex")
+            .iter()
+            .any(|w| w == KEEP_DELEGATED)
     }
 
     /// FR-138 P2b — whether `session`'s params crossed `keepable`.
     pub(crate) fn is_keepable(&self, session: &str) -> bool {
-        let _ = session;
-        false
+        self.inner
+            .keepable
+            .lock()
+            .expect("keepable mutex")
+            .iter()
+            .any(|s| s == session)
     }
 
     /// FR-138 P2b (A9) — the attach generation: bumped each time a channel
@@ -1791,6 +1899,30 @@ impl DelegateHost {
                 "delegation: worker tried to send a message it is not allowed to; dropping"
             );
             return;
+        }
+        // FR-138 P2b (A3) — a session the daemon keeps a record of: into that
+        // record's link, which forwards it to the connection while attached,
+        // and while kept hands what the server must hear to its table and drops
+        // the rest. Never waits, and never falls through to a connection: one
+        // the record has left may be a dead one.
+        if let Some(session) = client_session_of(&msg) {
+            let bound = self
+                .inner
+                .bindings
+                .lock()
+                .expect("bindings mutex")
+                .get(&session)
+                .cloned();
+            if let Some(link) = bound {
+                if link.try_send(msg).is_err() {
+                    tracing::debug!(
+                        %session,
+                        "delegation: a kept-for-claim session's link is full; dropped a reply \
+                         (FR-138 P2b)"
+                    );
+                }
+                return;
+            }
         }
         // FR-43 P3b — back on the WS of the org that handed the session over.
         // A secondary's reply with its WS down is dropped, never sent to the
@@ -3023,6 +3155,7 @@ mod role_tests {
         Delegation::Worker(WorkerLink {
             inbound: in_rx,
             outbound: out_tx,
+            orders: None,
         })
     }
 
@@ -3060,6 +3193,7 @@ mod role_tests {
         let mut role = Delegation::Worker(WorkerLink {
             inbound: in_rx,
             outbound: out_tx,
+            orders: None,
         });
         let sid = bson::oid::ObjectId::new();
         in_tx
