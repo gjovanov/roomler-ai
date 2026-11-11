@@ -560,11 +560,15 @@ person at seat0 in both directions: a received file is written as them (FR-97
 P3d), and a download, a folder download and the drawer's listing are read as
 them (#3688). Each read step runs on a blocking thread with their fsuid, fsgid
 and groups and an empty effective capability set
-(`fs_identity::FsIdentity::begin_reading`), and every handle it opens is held
-to the file asked and kept off the kernel's own file systems before it leaves
-the step. With nobody at seat0, a read is refused with a reason the viewer
-shows, and a received file is the daemon's but never in a folder a controller
-chose. root itself at seat0, a user install and `ROOMLERD_FILES_AS_SEAT_USER=0`
+(`fs_identity::FsIdentity::begin_reading`), and every handle it opens, a
+file's or a folder's, is held to what was asked and kept off the kernel's own
+file systems before it leaves the step; a folder is then listed through its
+handle, never through its path again. A folder download ends with an error
+once the person has left seat0. With nobody at seat0, a read is refused with a
+reason the viewer shows, and a received file is the daemon's, 0600 and root's
+only, but never in a folder a controller chose. A lookup of seat0 that fails or
+runs out of time refuses the read too, saying it could not tell who is there.
+root itself at seat0, a user install and `ROOMLERD_FILES_AS_SEAT_USER=0`
 are the daemon, both ways. Only root sets that switch, in the service's own
 environment (a systemd drop-in); remote config cannot reach it
 ([`desktop-companion.md`](desktop-companion.md) §9.4).

@@ -5046,10 +5046,11 @@ to-activate, so the browser never sees a bait-and-switch.
   listing open what they touch as them, and with nobody signed in they are
   refused with a reason the viewer shows (§9.3 there). Since #3688 a Linux
   system install reads as the person at seat0 too, each step with no
-  capability and every handle held to the file asked, off the kernel's own
-  file systems; with nobody there reads are refused with a reason the viewer
-  shows, and an upload lands in the default folder, never in one the
-  controller chose (§9.4 there).
+  capability and every handle, a file's or a folder's, held to what was
+  asked, off the kernel's own file systems; a folder download ends with an
+  error once they leave seat0. With nobody there reads are refused with a
+  reason the viewer shows, and an upload lands in the default folder, never
+  in one the controller chose, as a file only root may read (§9.4 there).
   Gated by `AgentCaps.files` — `upload · download ·
   download-folder · resume` always, `browse` only while
   `enable_remote_browse` is on. ⚠️ The list is assigned by the daemon in

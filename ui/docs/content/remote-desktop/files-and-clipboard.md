@@ -51,8 +51,11 @@ transfer acts as the person signed in at the screen: a file you send belongs to
 them, exactly as if they had saved it themselves, and you can pull back or
 browse only what they may open. With nobody signed in at the screen, pulling
 back and browsing are refused, and the session says why. On Windows sending is
-refused too; on Linux the file lands in the service's own folder, never in a
-folder you chose or the one the machine's owner set.
+refused too; on Linux the file lands in the service's own folder, where only
+the service may read it, never in a folder you chose or the one the machine's
+owner set. If the person at the screen signs out while you pull back a folder,
+the download stops and says why. If the machine cannot tell who is at the
+screen just then, the session says so: try again.
 
 On a Linux server where nobody signs in at the screen, its administrator can
 turn this off for that one machine. File transfer there then works with the
