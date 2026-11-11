@@ -537,37 +537,6 @@ mod console_tests {
         assert!(e.contains("names no account"), "{e}");
     }
 
-    /// #3688 — the states that really are nobody at the screen say so by
-    /// their type: an empty seat, the login screen, a session that is not a
-    /// person's. A session that names no account, and a lookup that failed,
-    /// are not nobody: who is there is not known, and a viewer is told that.
-    #[test]
-    fn nobody_at_the_screen_is_told_from_a_lookup_that_failed() {
-        use super::is_nobody_at_the_screen;
-        let empty = "Id=seat0\nActiveSession=\nCanGraphical=no\nSessions=\n";
-        let greeter = "Id=c1\nName=gdm\nUser=120\nSeat=seat0\nType=wayland\nClass=greeter\n";
-        let lock = "Id=9\nName=x\nUser=1000\nType=x11\nClass=lock-screen\n";
-        let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
-        assert!(
-            is_nobody_at_the_screen(&seat0_active_session(empty).unwrap_err()),
-            "an empty seat"
-        );
-        assert!(
-            is_nobody_at_the_screen(&session_account("c1", greeter).unwrap_err()),
-            "the login screen"
-        );
-        assert!(
-            is_nobody_at_the_screen(&session_account("9", lock).unwrap_err()),
-            "a session that is not a person's"
-        );
-        assert!(
-            !is_nobody_at_the_screen(&session_account("3", unnamed).unwrap_err()),
-            "a session that names no account"
-        );
-        let failed = anyhow::anyhow!("loginctl show-seat seat0 failed: Failed to connect to bus");
-        assert!(!is_nobody_at_the_screen(&failed), "a lookup that failed");
-    }
-
     /// #3688 — a GNOME or KDE lock keeps the person's own session showing on
     /// seat0, marked `LockedHint=yes`: it is still their person, for a
     /// viewer's reads as for a received file. LightDM's light-locker switches
@@ -2338,5 +2307,42 @@ XMODIFIERS=@im=ibus
     #[test]
     fn non_numeric_greeter_ids_are_kept() {
         assert_eq!(session_ids("c1 42 gdm seat0 - active no -\n"), ["c1"]);
+    }
+}
+
+/// #3688 — seat0's own "nobody" told from a lookup that failed, on every OS,
+/// as `console_tests` are. At the end of the file, so no line above moves.
+#[cfg(test)]
+mod nobody_at_the_screen_tests {
+    use super::{is_nobody_at_the_screen, seat0_active_session, session_account};
+
+    /// The states that really are nobody at the screen say so by their type:
+    /// an empty seat, the login screen, a session that is not a person's. A
+    /// session that names no account, and a lookup that failed, are not
+    /// nobody: who is there is not known, and a viewer is told that.
+    #[test]
+    fn nobody_at_the_screen_is_told_from_a_lookup_that_failed() {
+        let empty = "Id=seat0\nActiveSession=\nCanGraphical=no\nSessions=\n";
+        let greeter = "Id=c1\nName=gdm\nUser=120\nSeat=seat0\nType=wayland\nClass=greeter\n";
+        let lock = "Id=9\nName=x\nUser=1000\nType=x11\nClass=lock-screen\n";
+        let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
+        assert!(
+            is_nobody_at_the_screen(&seat0_active_session(empty).unwrap_err()),
+            "an empty seat"
+        );
+        assert!(
+            is_nobody_at_the_screen(&session_account("c1", greeter).unwrap_err()),
+            "the login screen"
+        );
+        assert!(
+            is_nobody_at_the_screen(&session_account("9", lock).unwrap_err()),
+            "a session that is not a person's"
+        );
+        assert!(
+            !is_nobody_at_the_screen(&session_account("3", unnamed).unwrap_err()),
+            "a session that names no account"
+        );
+        let failed = anyhow::anyhow!("loginctl show-seat seat0 failed: Failed to connect to bus");
+        assert!(!is_nobody_at_the_screen(&failed), "a lookup that failed");
     }
 }
