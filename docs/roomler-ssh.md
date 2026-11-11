@@ -1084,7 +1084,7 @@ server's. These bounds hold whatever the device's clock says:
 4. **A queued grant dies with its connection.** It waits on the connection's
    own queue (`crates/modules/fleet/src/hub.rs:3291`), so a reconnect drops it,
    and a connection that hears nothing for 80 s (`WS_RX_DEADLINE`,
-   `agents/roomlerd/src/signaling.rs:66`, checked at `:2425`) reconnects. On a
+   `agents/roomlerd/src/signaling.rs:66`, checked at `:2427`) reconnects. On a
    live connection a grant cannot be recorded much later than that.
 5. **The table.** Single use, 16 pending at most
    (`agents/roomlerd/src/ssh.rs:2955`), and no window longer than 60 s from
@@ -1156,7 +1156,7 @@ so an answer given while the surfaces went up was refused ("no active prompt"),
 and the native panel went down with it, leaving the question asking with
 nothing on the screen. The window still runs from the show: the prompt starts
 its clock at its first look. A screen-control request and `rc:rpc.exec` arm
-first the same way ([`signaling.rs:4415`](../agents/roomlerd/src/signaling.rs#L4415), [`:5986`](../agents/roomlerd/src/signaling.rs#L5986)), as the recording question does
+first the same way ([`signaling.rs:4428`](../agents/roomlerd/src/signaling.rs#L4428), [`:5999`](../agents/roomlerd/src/signaling.rs#L5999)), as the recording question does
 (`docs/recording.md` §10).
 
 **One question per grant and activity, each under an id of its own (#3442,
