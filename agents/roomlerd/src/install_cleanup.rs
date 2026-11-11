@@ -226,7 +226,10 @@ const INSTALL_DIR_PRODUCT_FILES: &[&str] = &[
 /// P4b: sweep the VACATED pre-rename install directory for the
 /// TARGET flavour's scope (perUser →
 /// `%LOCALAPPDATA%\Programs\roomler-agent`, perMachine →
-/// `%ProgramFiles%\roomler-agent`).
+/// `%ProgramFiles%\roomler-agent`). #3702 — both folders as the system
+/// names them (`updater::install_dir_with_name`: the account's own local
+/// application data folder, the machine's program files folder), never
+/// from the environment; the sweep deletes nothing through a link.
 ///
 /// Policy: conservative. Skip outright when the candidate IS the
 /// directory this process runs from (paranoia guard — impossible
@@ -246,18 +249,29 @@ fn cleanup_vacated_install_dir(target: TargetFlavour, report: &mut CleanupReport
     let Some(dir) =
         crate::updater::install_dir_with_name(flavour, crate::updater::LEGACY_INSTALL_FOLDER_NAME)
     else {
-        report
-            .skipped
-            .push("vacated-dir sweep: install root env var unset".to_string());
+        report.skipped.push(
+            "vacated-dir sweep: the system names no local application data folder for this account"
+                .to_string(),
+        );
         return;
     };
     sweep_vacated_dir(&dir, report, dry_run);
 }
 
 /// The sweep of one vacated install folder, `dir`: what
-/// [`cleanup_vacated_install_dir`] does once it has named it.
+/// [`cleanup_vacated_install_dir`] does once it has named it. A `dir` that
+/// is a folder link, or sits below one, is left as it is, and so is what the
+/// link leads to.
 #[cfg(target_os = "windows")]
 fn sweep_vacated_dir(dir: &Path, report: &mut CleanupReport, dry_run: bool) {
+    if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
+        report.skipped.push(format!(
+            "vacated dir {} left in place: {} is a link",
+            dir.display(),
+            link.display()
+        ));
+        return;
+    }
     if !dir.is_dir() {
         report
             .skipped
