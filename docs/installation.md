@@ -234,7 +234,7 @@ which is GitHub's (`github.com/…/releases/download/…`, redirected to
 `release-assets.githubusercontent.com`, measured 2026-10-18):
 - `install.sh`'s daemon and companion packages (`.deb`, `.rpm`, tarball, `.pkg`);
 - `install.ps1`'s companion, `roomler-desktop.exe` (`scripts/install.ps1:396`);
-- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1384`).
+- every self-update (`download_asset`, `agents/roomlerd/src/updater.rs:1385`).
 
 A host behind an allow-list needs both GitHub hosts for those. `install.ps1`
 also fetches the Visual C++ runtime from `aka.ms` when it is missing
@@ -272,7 +272,7 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3912`, `crates/agent-core/src/config.rs:4303`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3942`, `crates/agent-core/src/config.rs:4303`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
 | the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:993`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
@@ -581,7 +581,7 @@ flowchart TD
 Before FR-66, two callers that expect to find nothing went through `load` and
 printed the destructive remedy about perfectly healthy hosts: the Windows
 supervisor's `netd_enabled()` flag probe
-(`agents/roomlerd/src/win_service/supervisor.rs:1116`), on **every service
+(`agents/roomlerd/src/win_service/supervisor.rs:1120`), on **every service
 start** of every user-context install; and enrollment itself, reusing an
 existing `machine_id` — during the very operation that enrolls the machine.
 The noise also buried the genuine case, which prints the identical line.
@@ -1155,7 +1155,7 @@ sequenceDiagram
 
 **Auto-updates and upgrades** (the open question in #3115). The updater does
 not stop the service before it runs msiexec. `spawn_installer_with_watch`
-(`agents/roomlerd/src/updater.rs:1730`) launches `msiexec /i … /qn` elevated
+(`agents/roomlerd/src/updater.rs:1731`) launches `msiexec /i … /qn` elevated
 (`:2051`, `:2451`) while the service runs; the worker that launched it exits 0,
 and its host stays up (`:409`). Measured on a vmtest Win11 cell, released code,
 with each stop held to the field's 7.8 s:
@@ -1216,11 +1216,11 @@ Windows compares environment names, and is added where there is none. The
 exceptions are `ROOMLERD_ENABLE_SYSTEM_SWAP` and `ROOMLER_NODE_ENABLE_SYSTEM_SWAP`,
 both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 `carry.rs:37`). The installer decides the switch: the updater passes
-`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:1991`),
+`ENABLE_SYSTEM_CONTEXT=1` while it is on (`agents/roomlerd/src/updater.rs:1992`),
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6158`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6188`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1289,7 +1289,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6025`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6055`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1392,7 +1392,7 @@ upgrade the old product goes first: `MajorUpgrade` removes it right after `Insta
 before the new product's cleanup, `service install --as-service` and SystemContext step.
 
 `resolve_config_path` repairs the machine tree for every SYSTEM command
-(`agents/roomlerd/src/app.rs:1142`), so the first `machine tree: repaired` line comes from the
+(`agents/roomlerd/src/app.rs:1145`), so the first `machine tree: repaired` line comes from the
 first of these steps to run: on an install or a repair the cleanup step, and on an upgrade the
 old product's `service uninstall --as-service`, then the new product's cleanup step. It is in
 this log once that step's build has #3230. Which step writes it is read from the source, not
@@ -1403,23 +1403,23 @@ What a step writes, in order. Its own lines have the target `roomler_node_core::
 
 | Line | Fields | Written by |
 |---|---|---|
-| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:606`), right after `logging::init` (`agents/roomlerd/src/app.rs:1569`) |
+| `installer step started: roomlerd <verb and arguments>` | `version`, `pid`, `account` (the process's SID, `S-1-5-18` for LocalSystem) | `begin_step` (`crates/agent-core/src/logging.rs:606`), right after `logging::init` (`agents/roomlerd/src/app.rs:1599`) |
 | everything the verb logs | as the verb logs it | the verb |
 | each answer: `Service registered…`, `Service reconfigured in place…`, `Service deregistered`, the cleanup's summary, the SystemContext verbs' answers | none | `answer` (`crates/agent-core/src/logging.rs:624`): on stdout as before, and inside a step in the log |
-| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:643`), from `main` (`agents/roomlerd/src/app.rs:1375`) |
+| `installer step ended: roomlerd <verb and arguments>`, INFO | `exit_code`, `elapsed_ms`, `result` (the last answer) | `end_step` (`crates/agent-core/src/logging.rs:643`), from `main` (`agents/roomlerd/src/app.rs:1390`) |
 | `installer step failed: roomlerd <verb and arguments>`, ERROR | `exit_code`, `elapsed_ms`, `error` (the whole cause chain) | the same |
 
 `end_step` ends with `logging::finish` (`crates/agent-core/src/logging.rs:675`). It drops the
 file writer's guard, which writes every queued line before the process exits. The guard lives
 in a static, and no exit drops a static: without the flush, one run in six of the test below
 lost the last 1,101 of its 20,000 lines, and the answer and the end line with them. A restart
-exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2233`).
+exit flushes the same way instead of sleeping 200 ms (`agents/roomlerd/src/app.rs:2263`).
 
 One function decides which commands take the installer role: `is_installer_step`
-(`agents/roomlerd/src/app.rs:1404`). It gives the role to `service install` and
+(`agents/roomlerd/src/app.rs:1419`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:7765`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:7795`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1435,7 +1435,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:5938`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:5968`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1454,9 +1454,9 @@ error chain in the file (`crates/agent-core/src/logging.rs:1953`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1646`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7811`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7844`)
+beside `stderr_capture` (`.github/workflows/ci.yml:1649`). In `roomlerd`,
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7841`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7874`)
 pin the role per command and the end line of a failure.
 
 ### Where a step on the service account finds its folders (#3702)
@@ -1466,12 +1466,13 @@ folder they name from the system, never from the environment they were started w
 
 | What | Where it comes from | Code |
 |---|---|---|
-| The folder variables of a process on the service account | Set first thing in `main`, before the process has a second thread: the machine's (`ProgramData`, `ProgramFiles` and the rest) from the kernel and the machine's registry, and `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` of the service account's own profile. A process on any other account keeps the environment the system gave it. | `crates/agent-core/src/appdirs.rs:300`, `agents/roomlerd/src/app.rs:1369` |
+| The folder variables of a process on the service account | Set first thing in `main`, before the process has a second thread: the machine's (`ProgramData`, `ProgramFiles` and the rest) from the kernel and the machine's registry, and `USERPROFILE`, `APPDATA`, `LOCALAPPDATA` of the service account's own profile. A process on any other account keeps the environment the system gave it. | `crates/agent-core/src/appdirs.rs:307`, `agents/roomlerd/src/app.rs:1369` |
 | The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:201`, `crates/agent-core/src/appdirs.rs:212` |
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:263`, `crates/agent-core/src/appdirs.rs:222` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:952` |
-| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile (on Unix the home) the system names for the account the process runs as, by no link below it (`migrate_dir_within`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:724`, `crates/agent-core/src/appdirs.rs:731`, `crates/agent-core/src/appdirs.rs:581`, `crates/agent-core/src/appdirs.rs:849`, `crates/agent-core/src/appdirs.rs:689` |
-| The one-time sweep of the vacated install folder | Rooted as above; a folder that is a link, or sits below one, is left as it is. | `agents/roomlerd/src/install_cleanup.rs:266` |
+| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile (on Unix the home) the system names for the account the process runs as, by no link below it (`migrate_dir_within`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:731`, `crates/agent-core/src/appdirs.rs:738`, `crates/agent-core/src/appdirs.rs:588`, `crates/agent-core/src/appdirs.rs:856`, `crates/agent-core/src/appdirs.rs:696` |
+| The one-time sweep of the vacated install folder | Rooted as above; a folder that is a link, or sits below one, is left as it is. | `agents/roomlerd/src/install_cleanup.rs:267` |
+| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand) | Below the profile of the account whose session the step runs in (`plan_per_user_removal`). A tree that is a link, holds one or is reached through one is left in place with a line that names it (`link_inside`), and the other trees are still handled. On the service account, which `is_service_account` names as the pin does, the step looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. | `agents/roomlerd/src/install_cleanup.rs:435`, `agents/roomlerd/src/install_cleanup.rs:478`, `crates/agent-core/src/appdirs.rs:284` |
 
 **The rule for a service's `Environment` entry.** A variable that this pin sets, named in a
 service's `Environment` value, is replaced for the service account by the folder the system
@@ -1627,7 +1628,7 @@ alternative is no better there. 1.0.29 is the floor `dpkg-shlibdeps` derives fro
 the binary's symbols.
 
 Neither floor can strand a running daemon on the updater's offline `dpkg --install`
-rung (`agents/roomlerd/src/updater.rs:2154`), which is the reason libva and
+rung (`agents/roomlerd/src/updater.rs:2155`), which is the reason libva and
 `iproute2` stay out of `depends`. A host where the daemon runs already has the real
 library and OpenSSL, because without them it cannot start. A healthy install
 upgrades on every rung with no mirror reachable. A stub host stops on that rung, half-configured,
@@ -2407,7 +2408,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3624`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3654`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls
@@ -2654,7 +2655,7 @@ flowchart TD
 
 ⚠️ **Stop through the manager before any file goes.** The stop is a SIGTERM,
 the daemon's clean stop: it takes back the exit routes and the DNS steer it put
-in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2195`),
+in the host (FR-97 P0e's `purge_after_daemon`, `agents/roomlerd/src/app.rs:2225`),
 and an ephemeral device unenrolls itself. Delete the files first and the host
 keeps pins and a steer that nothing installed will ever heal.
 

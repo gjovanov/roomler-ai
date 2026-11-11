@@ -15,7 +15,7 @@ Claims about behaviour were checked against the code at `5f126955b` plus
 
 Every self-update ends in a verdict. The updater spawns a **post-install
 watcher** beside the installer (`updater::spawn_installer_with_watch`,
-`agents/roomlerd/src/updater.rs:1735` → `spawn_watcher`, `:2714`), the watcher
+`agents/roomlerd/src/updater.rs:1736` → `spawn_watcher`, `:2714`), the watcher
 waits the installer out where there is anything to wait for, runs the new
 binary's `--version`, and writes a typed record to `<log_dir>/last-install.json`
 (`post_install::watch`, `agents/roomlerd/src/post_install.rs:297`).
@@ -165,7 +165,7 @@ record's file. Two topologies split roles:
   would report as `NEVER REPORTED` had a SystemContext worker read it.
   ⚠️ **Under SystemContext the worker and its watcher log apart.** The
   worker takes the `service-logs` role (S1b,
-  `agents/roomlerd/src/app.rs:1553`). The watcher it spawns has none and
+  `agents/roomlerd/src/app.rs:1583`). The watcher it spawns has none and
   writes the record into SYSTEM's profile. Read on a per-machine guest, a
   real self-update from candidate 0.4.220 to 0.4.221 left the record
   `InProgress` in SYSTEM's profile past the clean-run threshold, with no
@@ -204,7 +204,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2887`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4226`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4256`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1265`): the two quiet states and a watcher
@@ -228,7 +228,7 @@ $ roomler status
   altogether** — the same inherited pipe kept the exec's reader from EOF and
   made the outgoing worker overrun its stop budget — so `spawn_watcher` gives
   it `/dev/null` for all three on every platform (`without_caller_stdio`,
-  `agents/roomlerd/src/updater.rs:2684`, called at `:2785`). From the first
+  `agents/roomlerd/src/updater.rs:2685`, called at `:2785`). From the first
   update a 0.4.176+ daemon spawns, the journal shows the daemon's own
   `post-install watcher spawned` line and nothing from the watcher; the
   verdict reaches the record file and P3's two readers, and nothing else.
