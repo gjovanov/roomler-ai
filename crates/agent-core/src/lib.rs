@@ -37,6 +37,9 @@ pub mod enrollment;
 /// surface), placement (the SYSTEM/root-inside-the-active-profile rule) and
 /// writability, run by the daemon at set time and at every drop.
 pub mod files_dir;
+/// #3702 — `appdirs` is the one module that reads a folder variable.
+#[cfg(test)]
+mod folder_gate;
 pub mod logging;
 pub mod logs_upload;
 pub mod machine;

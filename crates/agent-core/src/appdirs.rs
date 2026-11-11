@@ -366,6 +366,18 @@ pub fn migrate_legacy_trees(companion_running: bool) {
     let _ = MIGRATION_NOTES.set(notes);
 }
 
+/// #3702 — may the one-time folder move run in this process over `folders`?
+pub fn may_migrate(installer_step: bool, own_profile: Option<&Path>, folders: &[PathBuf]) -> bool {
+    let _ = (installer_step, own_profile, folders);
+    true
+}
+
+/// #3702 — [`migrate_dir`] for a pair in the profile `root`.
+fn migrate_dir_within(root: &Path, old: &Path, new: &Path) -> Option<String> {
+    let _ = root;
+    migrate_dir(old, new)
+}
+
 /// Apply the migration rules to one directory pair. Returns a note for
 /// anything noteworthy (moved / both-present / failed), `None` for the
 /// quiet no-legacy case.
@@ -655,6 +667,99 @@ mod tests {
             .unwrap();
         let printed = String::from_utf8_lossy(&out.stdout);
         assert!(printed.contains(&answer), "{printed}");
+    }
+
+    /// #3702 — the one-time folder move runs only for the account that owns
+    /// the folder: never in an installer step, and only over folders in the
+    /// profile of the account the process runs as.
+    #[test]
+    fn the_folder_move_runs_only_for_the_account_that_owns_the_folder() {
+        let (own, other) = if cfg!(windows) {
+            (
+                Path::new(r"C:\Windows\System32\config\systemprofile"),
+                Path::new(r"C:\Users\u"),
+            )
+        } else {
+            (Path::new("/root"), Path::new("/home/u"))
+        };
+        let config = |profile: &Path| profile.join("AppData").join(ORG).join(OLD_APP);
+        let own_folders = [config(own), own.join("Local").join(ORG).join(OLD_APP)];
+        assert!(may_migrate(false, Some(own), &own_folders));
+        assert!(
+            !may_migrate(true, Some(own), &own_folders),
+            "an installer step"
+        );
+        assert!(
+            !may_migrate(false, Some(own), &[config(own), config(other)]),
+            "a folder in another account's profile"
+        );
+        assert!(
+            !may_migrate(false, None, &own_folders),
+            "no profile the system names"
+        );
+        let sibling = PathBuf::from(format!("{}2", own.display())).join(ORG);
+        assert!(
+            !may_migrate(false, Some(own), &[sibling]),
+            "a folder whose path only starts with the same letters"
+        );
+        #[cfg(windows)]
+        assert!(
+            may_migrate(
+                false,
+                Some(own),
+                &[PathBuf::from(
+                    r"C:\WINDOWS\system32\CONFIG\systemprofile\AppData\roomler"
+                )]
+            ),
+            "Windows names a folder in any case"
+        );
+    }
+
+    /// A folder link at `link` that leads to `target`: a junction on Windows,
+    /// which needs no privilege, a symbolic link elsewhere.
+    fn folder_link(link: &Path, target: &Path) {
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new(system32_tool("cmd.exe"))
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J {}", link.display());
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// #3702 — the move follows no link below the profile: a pair reached
+    /// through one is left where it is, and so is what the link leads to.
+    #[test]
+    fn the_folder_move_follows_no_link_below_the_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(OLD_APP)).unwrap();
+        std::fs::write(elsewhere.join(OLD_APP).join("config.toml"), "x").unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let link = profile.join("AppData");
+        folder_link(&link, &elsewhere);
+        let note = migrate_dir_within(&profile, &link.join(OLD_APP), &link.join(NEW_APP));
+        assert!(
+            elsewhere.join(OLD_APP).join("config.toml").is_file(),
+            "{note:?}"
+        );
+        assert!(!elsewhere.join(NEW_APP).exists(), "{note:?}");
+        assert!(
+            note.as_deref().is_some_and(|n| n.contains("link")),
+            "{note:?}"
+        );
+        // The same pair with no link moves.
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join(OLD_APP)).unwrap();
+        let note = migrate_dir_within(&real, &real.join(OLD_APP), &real.join(NEW_APP));
+        assert!(real.join(NEW_APP).is_dir(), "{note:?}");
     }
 
     #[test]
