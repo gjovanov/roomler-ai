@@ -634,26 +634,27 @@ pub const INSTALL_FOLDER_NAME: &str = "Roomler";
 pub(crate) const LEGACY_INSTALL_FOLDER_NAME: &str = "roomler-agent";
 
 /// Resolve a flavour's MSI install directory for a given folder name:
-/// perUser → `%LOCALAPPDATA%\Programs\<name>`, perMachine →
-/// `%ProgramFiles%\<name>` (the same roots the two wxs files install
-/// under). Callers pass [`INSTALL_FOLDER_NAME`] to find the current
-/// install (post-install watcher fallback) or
-/// [`LEGACY_INSTALL_FOLDER_NAME`] to find the directory a rename-hop
-/// upgrade vacated (`install_cleanup` sweep). `None` when the root
-/// env var is unset (effectively never on a real Windows session).
+/// perUser → `<LocalAppData>\Programs\<name>`, the running account's own
+/// known folder ([`crate::appdirs::local_app_data`]), perMachine →
+/// `C:\Program Files\<name>` as the system names it
+/// ([`crate::appdirs::machine_program_files`]): the same roots the two wxs
+/// files install under. Callers pass [`INSTALL_FOLDER_NAME`] to find the
+/// current install (post-install watcher fallback) or
+/// [`LEGACY_INSTALL_FOLDER_NAME`] to find the directory a rename-hop upgrade
+/// vacated (`install_cleanup` sweep). `None` only for perUser, when the shell
+/// names no `LocalAppData` folder for the account.
 #[cfg(target_os = "windows")]
 pub fn install_dir_with_name(
     flavour: WindowsInstallFlavour,
     folder_name: &str,
 ) -> Option<std::path::PathBuf> {
     match flavour {
-        WindowsInstallFlavour::PerUser => std::env::var_os("LOCALAPPDATA").map(|root| {
-            std::path::PathBuf::from(root)
-                .join("Programs")
-                .join(folder_name)
-        }),
-        WindowsInstallFlavour::PerMachine => std::env::var_os("ProgramFiles")
-            .map(|root| std::path::PathBuf::from(root).join(folder_name)),
+        WindowsInstallFlavour::PerUser => {
+            crate::appdirs::local_app_data().map(|root| root.join("Programs").join(folder_name))
+        }
+        WindowsInstallFlavour::PerMachine => {
+            Some(crate::appdirs::machine_program_files().join(folder_name))
+        }
     }
 }
 

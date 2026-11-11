@@ -92,10 +92,10 @@
 //! before flipping to the live path.
 
 use anyhow::Result;
-// Only the Windows cleanup paths construct PathBuf — gate the import
-// behind cfg so Linux/macOS clippy doesn't flag it as unused.
+// Only the Windows cleanup paths name a path — gate the import behind cfg so
+// Linux/macOS clippy doesn't flag it as unused.
 #[cfg(target_os = "windows")]
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Which MSI flavour is being INSTALLED. The helper cleans the
 /// OPPOSITE flavour's artifacts.
@@ -477,11 +477,13 @@ fn cleanup_per_machine_artifacts(report: &mut CleanupReport, dry_run: bool) {
     //    may not be able to delete it. Scrub BOTH the legacy
     //    `roomler-agent` segment AND the new `roomler` segment (binary
     //    rename, `appdirs.rs`) so a cross-flavour switch doesn't leave the
-    //    other segment's tree behind. Not routed through `appdirs` (which
-    //    resolves to only ONE segment per host).
-    if let Ok(program_data) = std::env::var("PROGRAMDATA") {
+    //    other segment's tree behind. Not routed through `machine_global_dir`
+    //    (which resolves to only ONE segment per host); rooted at the
+    //    machine's folder as the system names it.
+    {
+        let program_data = crate::appdirs::machine_program_data();
         for segment in ["roomler-agent", "roomler"] {
-            let path = PathBuf::from(&program_data)
+            let path = program_data
                 .join("roomler")
                 .join(segment)
                 .join("service-logs");
@@ -629,7 +631,7 @@ mod tests {
             LEGACY_INSTALL_FOLDER_NAME, WindowsInstallFlavour, install_dir_with_name,
         };
         let pu = install_dir_with_name(WindowsInstallFlavour::PerUser, LEGACY_INSTALL_FOLDER_NAME)
-            .expect("LOCALAPPDATA set");
+            .expect("the account's LocalAppData folder");
         assert!(
             pu.ends_with(std::path::Path::new("Programs").join("roomler-agent")),
             "unexpected perUser dir {}",
@@ -639,11 +641,10 @@ mod tests {
             WindowsInstallFlavour::PerMachine,
             LEGACY_INSTALL_FOLDER_NAME,
         )
-        .expect("ProgramFiles set");
-        assert!(
-            pm.ends_with("roomler-agent"),
-            "unexpected perMachine dir {}",
-            pm.display()
+        .expect("the machine's Program Files folder");
+        assert_eq!(
+            pm,
+            crate::appdirs::machine_program_files().join("roomler-agent")
         );
         assert!(
             pm.to_string_lossy()

@@ -1352,6 +1352,11 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    // #3702 — on the service account, the process's folder variables are the
+    // machine's and the service account's own, before this process has a
+    // second thread: the runtime below starts its workers.
+    #[cfg(target_os = "windows")]
+    roomlerd::appdirs::pin_system_folders(roomlerd::win_token::own_user_sid().as_deref());
     if let Some(code) = answer_stall_watch_cost() {
         std::process::exit(code);
     }

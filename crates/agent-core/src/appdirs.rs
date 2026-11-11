@@ -143,21 +143,8 @@ pub fn machine_folder_variables() -> Vec<(&'static str, PathBuf)> {
     let windows = windows_directory();
     let drive: PathBuf = windows.components().take(1).collect();
     let drive_text = drive.to_string_lossy().into_owned();
-    let program_files = hklm_text(
-        r"SOFTWARE\Microsoft\Windows\CurrentVersion",
-        "ProgramFilesDir",
-    )
-    .unwrap_or_else(|| format!(r"{drive_text}\Program Files"));
-    let program_files = PathBuf::from(program_files);
-    // `%SystemDrive%\ProgramData` as it is stored: left unexpanded, and that
-    // one variable filled in from the kernel's answer.
-    let program_data = hklm_text(
-        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
-        "ProgramData",
-    )
-    .map(|v| expand_system_drive(&v, &drive_text))
-    .unwrap_or_else(|| format!(r"{drive_text}\ProgramData"));
-    let program_data = PathBuf::from(program_data);
+    let program_files = registry_program_files(&drive_text);
+    let program_data = registry_program_data(&drive_text);
     vec![
         ("SystemRoot", windows.clone()),
         ("windir", windows),
@@ -168,6 +155,284 @@ pub fn machine_folder_variables() -> Vec<(&'static str, PathBuf)> {
         ("ProgramData", program_data.clone()),
         ("ALLUSERSPROFILE", program_data),
     ]
+}
+
+/// The drive Windows is on (`C:`), from the kernel's answer.
+#[cfg(target_os = "windows")]
+fn system_drive_text() -> String {
+    let drive: PathBuf = windows_directory().components().take(1).collect();
+    drive.to_string_lossy().into_owned()
+}
+
+/// `C:\Program Files`, as the machine's registry names it.
+#[cfg(target_os = "windows")]
+fn registry_program_files(drive: &str) -> PathBuf {
+    PathBuf::from(
+        hklm_text(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion",
+            "ProgramFilesDir",
+        )
+        .unwrap_or_else(|| format!(r"{drive}\Program Files")),
+    )
+}
+
+/// `C:\ProgramData`, as the machine's registry names it.
+#[cfg(target_os = "windows")]
+fn registry_program_data(drive: &str) -> PathBuf {
+    // `%SystemDrive%\ProgramData` as it is stored: left unexpanded, and that
+    // one variable filled in from the kernel's answer.
+    PathBuf::from(
+        hklm_text(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+            "ProgramData",
+        )
+        .map(|v| expand_system_drive(&v, drive))
+        .unwrap_or_else(|| format!(r"{drive}\ProgramData")),
+    )
+}
+
+/// #3702 — the machine's `ProgramData` folder (`C:\ProgramData`), from the
+/// kernel and the machine's registry, never from a variable. Every machine
+/// folder a daemon or one of the package's steps names is rooted here
+/// ([`machine_global_dir`] and the daemon's own files beside it), so the folder
+/// is the machine's whichever account's environment the process was given.
+/// Read each time it is asked for: one registry value.
+#[cfg(target_os = "windows")]
+pub fn machine_program_data() -> PathBuf {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    if let Some(folder) = test_fixture::PROGRAM_DATA.get() {
+        return folder.clone();
+    }
+    registry_program_data(&system_drive_text())
+}
+
+/// #3702 — the machine's `Program Files` folder, read the way
+/// [`machine_program_data`] is: where the per-Machine MSI installs.
+#[cfg(target_os = "windows")]
+pub fn machine_program_files() -> PathBuf {
+    registry_program_files(&system_drive_text())
+}
+
+/// #3702 — the profile folder of the account `sid`, as the machine's registry
+/// names it (`ProfileList\<sid>\ProfileImagePath`), with `%SystemRoot%` and
+/// `%SystemDrive%` filled in from the kernel's answers. `None` when the account
+/// has no profile there, or its path names any other variable, or is not
+/// absolute: no variable is read from the environment.
+#[cfg(target_os = "windows")]
+pub fn profile_of_account(sid: &str) -> Option<PathBuf> {
+    if sid.is_empty() || sid.contains('\\') {
+        return None;
+    }
+    let stored = hklm_text(
+        &format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"),
+        "ProfileImagePath",
+    )?;
+    let windows = windows_directory();
+    let filled = fill_in_system_folders(&stored, &windows.to_string_lossy(), &system_drive_text())?;
+    let path = PathBuf::from(filled);
+    path.is_absolute().then_some(path)
+}
+
+/// `%SystemRoot%` and `%SystemDrive%`, in any case, filled in with `windows`
+/// and `drive`. `None` when anything else in `stored` looks like a variable.
+#[cfg(any(target_os = "windows", test))]
+fn fill_in_system_folders(stored: &str, windows: &str, drive: &str) -> Option<String> {
+    // ASCII lowercasing keeps every byte where it is, so an index found in
+    // `lower` is the same place in `stored`.
+    let lower = stored.to_ascii_lowercase();
+    let mut out = String::with_capacity(stored.len());
+    let mut from = 0;
+    while let Some(found) = lower[from..].find('%') {
+        let at = from + found;
+        out.push_str(&stored[from..at]);
+        let (name, value) = [("%systemroot%", windows), ("%systemdrive%", drive)]
+            .into_iter()
+            .find(|(name, _)| lower[at..].starts_with(name))?;
+        out.push_str(value);
+        from = at + name.len();
+    }
+    out.push_str(&stored[from..]);
+    Some(out)
+}
+
+/// #3702 — the service account's own profile
+/// (`C:\Windows\System32\config\systemprofile`), from
+/// [`profile_of_account`], else where Windows keeps it below
+/// [`system_directory`].
+#[cfg(target_os = "windows")]
+pub fn system_profile() -> PathBuf {
+    profile_of_account(crate::machine_tree::SYSTEM)
+        .unwrap_or_else(|| system_directory().join("config").join("systemprofile"))
+}
+
+/// #3702 — what a process on the service account names its folders by:
+/// [`machine_folder_variables`], and `USERPROFILE`, `APPDATA` and
+/// `LOCALAPPDATA` of [`system_profile`].
+#[cfg(target_os = "windows")]
+pub fn system_folder_variables() -> Vec<(&'static str, PathBuf)> {
+    let profile = system_profile();
+    let mut vars = machine_folder_variables();
+    vars.push(("APPDATA", profile.join("AppData").join("Roaming")));
+    vars.push(("LOCALAPPDATA", profile.join("AppData").join("Local")));
+    vars.push(("USERPROFILE", profile));
+    vars
+}
+
+/// #3702 — the first thing a daemon's `main` does on Windows, before the
+/// process has a second thread. On the service account (`own_sid` is
+/// LocalSystem's) it sets the process's folder variables to
+/// [`system_folder_variables`], so what reads them, in this binary and in
+/// what it links, names the machine's folders and the service account's own
+/// profile, and every process it starts without a block of its own inherits
+/// them. For any other account it does nothing: a person's process keeps the
+/// environment the system gave it. Returns whether it set them.
+///
+/// A service `Environment` entry that names one of these variables does not
+/// reach a process on the service account: the value here replaces it.
+///
+/// This is the second guard. The machine's folders come from
+/// [`machine_program_data`] and [`machine_program_files`], which read the
+/// system and never these variables. A value set here is what every reader
+/// of the process's environment through Windows or Rust sees; C code that
+/// reads its runtime's own copy (`getenv`) keeps the copy that runtime took
+/// when the process started.
+#[cfg(target_os = "windows")]
+pub fn pin_system_folders(own_sid: Option<&str>) -> bool {
+    if own_sid != Some(crate::machine_tree::SYSTEM) {
+        return false;
+    }
+    for (name, value) in system_folder_variables() {
+        // SAFETY: `main` calls this before it starts any thread. Windows
+        // keeps the environment block behind its own lock, and std takes its
+        // own around every read and write of it as well.
+        unsafe { std::env::set_var(name, value) };
+    }
+    true
+}
+
+/// #3702 — the account's own `LocalAppData` known folder, where the per-user
+/// MSI installs (`Programs\<folder>`), as the shell names it for the account
+/// the process runs as. `None` when the shell names none.
+#[cfg(target_os = "windows")]
+pub fn local_app_data() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().to_path_buf())
+}
+
+/// Tests only: the machine's folders under a stand-in the test names itself.
+/// A release build has no such switch, and nothing here reads a variable.
+#[cfg(all(target_os = "windows", any(test, feature = "test-fixtures")))]
+#[doc(hidden)]
+pub mod test_fixture {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    pub(super) static PROGRAM_DATA: OnceLock<PathBuf> = OnceLock::new();
+
+    /// The machine's `ProgramData` is `folder` for the rest of this test
+    /// process: [`super::machine_program_data`] and every machine folder rooted
+    /// at it name the stand-in. Call it first: once the machine tree has been
+    /// named it panics, so a test never goes on with this computer's own tree.
+    pub fn program_data_is(folder: PathBuf) {
+        assert!(
+            super::MACHINE_GLOBAL.get().is_none(),
+            "the machine tree was named before the stand-in was set"
+        );
+        if let Err(folder) = PROGRAM_DATA.set(folder) {
+            assert_eq!(
+                PROGRAM_DATA.get(),
+                Some(&folder),
+                "one stand-in per process"
+            );
+        }
+    }
+}
+
+/// #3702 — is `path` the folder `folder` or below it, named the way Windows
+/// names folders: in any case, `\` and `/` alike? A `..` anywhere is never
+/// below anything. Text only, so it answers the same on every platform.
+pub fn in_windows_folder(path: &Path, folder: &Path) -> bool {
+    fn parts(path: &Path) -> Option<Vec<String>> {
+        let mut parts = Vec::new();
+        for part in path.to_str()?.split(['\\', '/']) {
+            match part {
+                "" | "." => {}
+                ".." => return None,
+                name => parts.push(name.to_lowercase()),
+            }
+        }
+        Some(parts)
+    }
+    match (parts(path), parts(folder)) {
+        (Some(path), Some(folder)) => !folder.is_empty() && path.starts_with(&folder),
+        _ => false,
+    }
+}
+
+/// #3702 — is `path` the folder `folder` or below it? On Windows as
+/// [`in_windows_folder`] answers; elsewhere part by part, exactly.
+pub fn in_folder(path: &Path, folder: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        in_windows_folder(path, folder)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        names_below(path, folder).is_some()
+    }
+}
+
+/// The names from `folder` down to `path`, when `path` is in `folder`
+/// ([`in_folder`]'s rule, a part on Windows in any case). `None` when it is
+/// not, or when a part below `folder` is anything but a name.
+fn names_below<'a>(path: &'a Path, folder: &Path) -> Option<Vec<&'a std::ffi::OsStr>> {
+    use std::path::Component;
+    let same = |a: &std::ffi::OsStr, b: &std::ffi::OsStr| {
+        if cfg!(target_os = "windows") {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        } else {
+            a == b
+        }
+    };
+    let mut parts = path.components();
+    let mut matched = 0;
+    for want in folder.components() {
+        if !same(parts.next()?.as_os_str(), want.as_os_str()) {
+            return None;
+        }
+        matched += 1;
+    }
+    if matched == 0 {
+        return None;
+    }
+    parts
+        .map(|part| match part {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect()
+}
+
+/// #3702 — the first folder link (a symbolic link, or on Windows a junction)
+/// on the way from `folder` down to `path`, `folder` itself not counted;
+/// `path` itself when it is not in `folder`. `None` when the way down holds no
+/// link. A part that is not there ends the walk: nothing below it can be a
+/// link. A part that cannot be read is answered as a link: what cannot be
+/// read is not followed.
+pub fn link_below(folder: &Path, path: &Path) -> Option<PathBuf> {
+    let Some(names) = names_below(path, folder) else {
+        return Some(path.to_path_buf());
+    };
+    let mut at = folder.to_path_buf();
+    for name in names {
+        at.push(name);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return Some(at),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => return Some(at),
+        }
+    }
+    None
 }
 
 /// Fill in `%SystemDrive%`, in any case, and nothing else. Anything else that
@@ -220,17 +485,14 @@ fn hklm_text(key: &str, value: &str) -> Option<String> {
 /// (`config.toml`, `service-logs`, `crashes`, `staging`, ...).
 #[cfg(target_os = "windows")]
 pub fn machine_global_dir() -> PathBuf {
-    static DECISION: OnceLock<PathBuf> = OnceLock::new();
-    DECISION
-        .get_or_init(|| {
-            let base = std::env::var_os("PROGRAMDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join(ORG);
-            resolve_machine_global(&base)
-        })
+    MACHINE_GLOBAL
+        .get_or_init(|| resolve_machine_global(&machine_program_data().join(ORG)))
         .clone()
 }
+
+/// [`machine_global_dir`]'s answer, once named.
+#[cfg(target_os = "windows")]
+static MACHINE_GLOBAL: OnceLock<PathBuf> = OnceLock::new();
 
 /// The machine-global root under `base` (= `%PROGRAMDATA%\roomler`), resolved
 /// new-then-old.
@@ -354,10 +616,7 @@ pub fn migrate_legacy_trees(companion_running: bool) {
         }
         #[cfg(target_os = "windows")]
         {
-            let base = std::env::var_os("PROGRAMDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-                .join(ORG);
+            let base = machine_program_data().join(ORG);
             if let Some(note) = migrate_dir(&base.join(OLD_APP), &base.join(NEW_APP)) {
                 notes.push(note);
             }
@@ -640,7 +899,13 @@ mod tests {
     #[test]
     fn the_machine_folders_ignore_what_the_environment_says() {
         const ANSWER: &str = "ROOMLER_TEST_FOLDERS_ANSWER=";
-        let answer = format!("{ANSWER}{:?}", machine_folder_variables());
+        let answer = format!(
+            "{ANSWER}{:?} {:?} {:?} {:?}",
+            machine_folder_variables(),
+            system_folder_variables(),
+            machine_program_data(),
+            machine_program_files(),
+        );
         if std::env::var_os("ROOMLER_TEST_FOLDERS_CHILD").is_some() {
             println!("{answer}");
             return;
@@ -663,10 +928,93 @@ mod tests {
             .env("SystemDrive", "P:")
             .env("windir", r"C:\poison")
             .env("ComSpec", r"C:\poison\cmd.exe")
+            .env("USERPROFILE", r"C:\poison")
+            .env("APPDATA", r"C:\poison")
+            .env("LOCALAPPDATA", r"C:\poison")
             .output()
             .unwrap();
         let printed = String::from_utf8_lossy(&out.stdout);
         assert!(printed.contains(&answer), "{printed}");
+    }
+
+    /// #3702 — the service account's own profile is where the system keeps
+    /// it, and a person's is in the registry's list too.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_service_accounts_profile_is_the_one_the_system_names() {
+        let profile = system_profile();
+        assert!(
+            in_windows_folder(&profile, &system_directory()),
+            "{}",
+            profile.display()
+        );
+        let vars = system_folder_variables();
+        let named = |n: &str| vars.iter().find(|(name, _)| *name == n).map(|(_, v)| v);
+        assert_eq!(named("USERPROFILE"), Some(&profile));
+        assert_eq!(
+            named("LOCALAPPDATA"),
+            Some(&profile.join("AppData").join("Local"))
+        );
+        assert_eq!(profile_of_account(r"S-1-5-18\..\x"), None);
+        assert_eq!(profile_of_account("S-1-5-0-not-there"), None);
+    }
+
+    #[test]
+    fn only_the_system_folders_are_filled_in_a_profile_path() {
+        let (windows, drive) = (r"D:\Windows", "D:");
+        for (stored, want) in [
+            (
+                r"%SystemRoot%\System32\config\systemprofile",
+                Some(r"D:\Windows\System32\config\systemprofile"),
+            ),
+            (r"%systemdrive%\Users\u", Some(r"D:\Users\u")),
+            (r"C:\Users\u", Some(r"C:\Users\u")),
+            (r"%USERPROFILE%\x", None),
+            (r"C:\Users\%x", None),
+        ] {
+            assert_eq!(
+                fill_in_system_folders(stored, windows, drive).as_deref(),
+                want,
+                "{stored}"
+            );
+        }
+    }
+
+    /// #3702 — a folder and what is below it, by name and in any case on
+    /// Windows; a link on the way down is found.
+    #[test]
+    fn a_path_is_in_a_folder_by_its_parts() {
+        let folder = Path::new(r"C:\Windows\System32\config\systemprofile");
+        assert!(in_windows_folder(
+            Path::new(r"c:/windows/SYSTEM32/config/systemprofile/AppData"),
+            folder
+        ));
+        assert!(in_windows_folder(folder, folder));
+        assert!(!in_windows_folder(
+            Path::new(r"C:\Windows\System32\config\systemprofile2"),
+            folder
+        ));
+        assert!(!in_windows_folder(
+            Path::new(r"C:\Windows\System32\config\systemprofile\..\x"),
+            folder
+        ));
+        assert!(!in_windows_folder(Path::new(r"C:\Users\u"), folder));
+        assert!(!in_windows_folder(folder, Path::new("")));
+
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("below")).unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("a")).unwrap();
+        assert_eq!(link_below(root.path(), &real.join("a").join("b")), None);
+        folder_link(&real.join("link"), &elsewhere);
+        let through = real.join("link").join("below");
+        assert_eq!(link_below(root.path(), &through), Some(real.join("link")));
+        let outside = Path::new(if cfg!(windows) { r"C:\x" } else { "/x" });
+        assert_eq!(
+            link_below(root.path(), outside),
+            Some(outside.to_path_buf())
+        );
     }
 
     /// #3702 — the one-time folder move runs only for the account that owns

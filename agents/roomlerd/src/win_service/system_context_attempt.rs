@@ -144,13 +144,13 @@ impl Attempt {
     }
 }
 
-/// Location where attempts are persisted. `%PROGRAMDATA%\roomler\` on
-/// Windows; the parent directory is created on first write.
+/// Location where attempts are persisted: `C:\ProgramData\roomler\`, the
+/// machine's folder as the system names it
+/// ([`crate::appdirs::machine_program_data`]); the parent directory is created
+/// on first write.
 pub fn path() -> PathBuf {
-    let base = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("roomler")
+    crate::appdirs::machine_program_data()
+        .join("roomler")
         .join("last-system-context-attempt.json")
 }
 
