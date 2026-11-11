@@ -583,9 +583,11 @@ pub fn migration_notes() -> &'static [String] {
 /// ([`may_migrate`]): never in an installer step (`installer_step`), and the
 /// per-user pairs only when each lies in `own_profile`, the profile the
 /// system names for the account this process runs as. The pairs move by
-/// [`migrate_dirs_within`]: all of them or none, none through a link below
-/// its root, the config pair first; the machine pair's root is
-/// [`machine_program_data`].
+/// [`migrate_dirs_within`], which decides for all of them before any pair
+/// moves (none moves through a link below its root), moves the config pair
+/// first and by one rename, and stops at a pair whose move fails: the pairs
+/// before it stay moved, the pairs after it stay in the OLD tree. The
+/// machine pair's root is [`machine_program_data`].
 pub fn migrate_legacy_trees(
     companion_running: bool,
     installer_step: bool,
@@ -757,14 +759,18 @@ fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
     None
 }
 
-/// #3702 — [`migrate_dir`] for every pair in `root`, or for none of
-/// them ([`kept_in_place`]), with `rename` as the rename of a pair's folder
-/// ([`rename_on_disk`] outside tests). The pairs move in the order given,
-/// the config pair first, and a pair whose move fails leaves the pairs
-/// after it where they are. The segment choice ([`tree_exists`]) keys on
-/// the NEW config folder and the NEW local data folder, so it finds a NEW
-/// tree only once the config is in it: the daemon reads the config it had,
-/// from the NEW tree or from the OLD one.
+/// #3702 — [`migrate_dir`] for the pairs in `root`, with `rename` as the
+/// rename of a pair's folder ([`rename_on_disk`] outside tests). Whether
+/// they move is decided for every pair before any pair moves: none moves
+/// when one lies outside `root` or is reached through a link below it
+/// ([`kept_in_place`]). They then move in the order given, the config pair
+/// first and by one rename, and a pair whose move fails ends the move: the
+/// pairs before it stay moved, the pairs after it stay in the OLD tree.
+/// The segment choice ([`tree_exists`]) keys on the NEW config folder and
+/// the NEW local data folder. The move makes the first only whole, by one
+/// rename, and the second only when the config pair's move did not fail:
+/// the daemon reads the config it had, from the NEW tree or from the OLD
+/// one.
 fn migrate_dirs_within(
     root: &Path,
     pairs: &[(PathBuf, PathBuf)],
