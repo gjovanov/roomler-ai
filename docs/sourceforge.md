@@ -80,8 +80,10 @@ schedule, four times a day, and by a dispatch with no tag.
 | | a button serves anything older, or nothing: it publishes the release, as steps 2 to 6 |
 | | a button serves a setup release **newer** than GitHub's newest: the run fails and the alert opens. That is a release pulled back on GitHub, and §5 has what to do |
 
-`best_release.json` unreadable from the runner: a scheduled run skips with a notice, and a
-dispatched one fails, because neither can tell whether the listing is behind.
+A read that is not answered, GitHub's list of releases or `best_release.json`, ends a scheduled
+run with a notice and fails a dispatched one. Neither can tell whether the listing is behind. The
+schedule reads again six hours later, and an alert for a read that timed out would call the
+listing stale when nobody knows that.
 
 ## 2. What SourceForge holds
 

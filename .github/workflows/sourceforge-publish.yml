@@ -184,7 +184,11 @@ jobs:
             exit 0
           }
           # A dispatch that cannot do what was asked fails; a scheduled run
-          # that has nothing to do says so and passes.
+          # that has nothing to do says so and passes. That covers a read
+          # GitHub or SourceForge does not answer, too: someone asked for a
+          # dispatched publish, so it fails loudly, while the schedule reads
+          # again in six hours, and an alert issue for a read that timed out
+          # would say the listing is stale when nobody knows that.
           refuse() {
             if [ "$EVENT_NAME" = workflow_dispatch ]; then
               echo "::error title=SourceForge publish refused::$1"
@@ -198,11 +202,15 @@ jobs:
             skip "the repository variable SOURCEFORGE_PUBLISH is off"
           fi
 
-          # Every final release's tag. `newest` takes the highest setup tag from
-          # it, and fails the run when there is none at all.
-          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' > tags.txt
-          newest="$(bash scripts/sourceforge-publish.sh newest < tags.txt)"
+          # Every final release's tag, and the highest setup tag among them.
+          if ! gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                 --jq '.[] | select((.draft or .prerelease) | not) | .tag_name' > tags.txt 2> gh.err; then
+            cat gh.err >&2
+            refuse "GitHub did not answer with the list of releases"
+          fi
+          if ! newest="$(bash scripts/sourceforge-publish.sh newest < tags.txt)"; then
+            refuse "GitHub's list of releases names no final setup release"
+          fi
 
           # A tag that was named is published. With no tag (the schedule, or a
           # dispatch without one) the run reconciles: the newest release, and
@@ -219,14 +227,13 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-          # 404 = no such release. Anything else is GitHub failing, and has to
-          # fail this run rather than skip it.
+          # 404 = no such release. Anything else is GitHub not answering.
           if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > release.json 2> gh.err; then
             if grep -q 'HTTP 404' gh.err; then
               refuse "GitHub has no release for $tag"
             fi
             cat gh.err >&2
-            exit 1
+            refuse "GitHub did not answer for the release $tag"
           fi
           if [ "$(jq -r '.draft or .prerelease' release.json)" != false ]; then
             refuse "$tag is a draft or a pre-release"
