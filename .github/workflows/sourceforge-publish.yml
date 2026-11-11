@@ -298,12 +298,14 @@ jobs:
         run: |
           set -euo pipefail
           dest="$SF_USER@$SF_HOST:$SF_ROOT/$TAG/"
-          # --checksum: a copy over there with the right size and time and the
-          # wrong bytes is sent again, so a re-run repairs a folder. 55 MiB, so
-          # the hashing costs nothing. -O: the folder's own time is
-          # SourceForge's to change, and must not read as a difference below.
+          # --checksum: a copy over there with the right size and the wrong
+          # bytes is sent again, so a re-run repairs a folder. 55 MiB, so the
+          # hashing costs nothing. No -t and no -p: a file that is already
+          # there with the right bytes is not touched at all, not even its
+          # time. Re-publishing a folder SourceForge's old importer made (its
+          # files belong to another user) therefore changes nothing in it.
           for attempt in 1 2 3; do
-            if rsync -rtO --checksum --timeout=120 --info=stats1 -e "ssh $SF_SSH_OPTS" dist/ "$dest"; then break; fi
+            if rsync -r --checksum --timeout=120 --info=stats1 -e "ssh $SF_SSH_OPTS" dist/ "$dest"; then break; fi
             if [ "$attempt" = 3 ]; then echo "::error::the upload to SourceForge failed three times"; exit 1; fi
             echo "upload attempt $attempt failed; retrying in 30 s"
             sleep 30
@@ -311,7 +313,7 @@ jobs:
           # Proof, by checksum and not by size or time: a dry run of the same
           # transfer. A line starting `<f` is a file rsync would still have to
           # send, which means its content differs or it is missing over there.
-          left="$(rsync -rtOn --timeout=120 --checksum --itemize-changes -e "ssh $SF_SSH_OPTS" dist/ "$dest")"
+          left="$(rsync -rn --timeout=120 --checksum --itemize-changes -e "ssh $SF_SSH_OPTS" dist/ "$dest")"
           if printf '%s\n' "$left" | grep -q '^<f'; then
             echo "::error::SourceForge's copy of $TAG differs from the release after the upload"
             printf '%s\n' "$left"
@@ -329,14 +331,16 @@ jobs:
         run: |
           set -euo pipefail
           # The key travels in the request body, from a shell builtin into
-          # curl's stdin: never in an argument list, never in a URL.
+          # curl's stdin: never in an argument list, never in a URL. A secret
+          # pasted with a trailing newline is still the same key.
+          key="$(printf '%s' "$SF_API_KEY" | tr -d '[:space:]')"
           while IFS=$'\t' read -r os file; do
             url="https://sourceforge.net/projects/$SF_PROJECT/files/$TAG/$file"
             accepted=false
             # A file that rsync has just written can take a few minutes to
             # exist for the API, so "not found" is retried for ten minutes.
             for attempt in $(seq 1 20); do
-              body="$(printf 'default=%s&api_key=%s' "$os" "$SF_API_KEY" \
+              body="$(printf 'default=%s&api_key=%s' "$os" "$key" \
                 | curl -sS -m 60 -X PUT -H 'Accept: application/json' --data-binary @- "$url" || true)"
               if jq -e --arg os "$os" '((.result.x_sf.default // "") | split(",") | index($os)) != null' \
                    <<<"$body" > /dev/null 2>&1; then
