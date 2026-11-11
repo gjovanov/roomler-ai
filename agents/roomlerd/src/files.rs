@@ -287,9 +287,11 @@ pub(crate) enum FsAs {
     /// a read) nobody at seat0 (#3688): every read is refused, saying so.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     Nobody,
-    /// (Linux root, a read) who is at seat0 could not be told (#3688).
+    /// (Linux root, a read) who is at seat0 could not be told (#3688): the
+    /// lookup failed or ran out of its time. Every read is refused with
+    /// [`CANNOT_TELL`], never as if nobody were there. Only a read takes it;
+    /// a received file then takes [`Self::DaemonAlone`], as with nobody.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // RED: a read takes it in the fix.
     CannotTell,
 }
 
@@ -313,6 +315,12 @@ pub(crate) enum Caps {
 /// ([`FsAs::DaemonAlone`]), so this answers only a state nothing produces.
 #[cfg(target_os = "linux")]
 const NOBODY_AT_THE_SCREEN: &str = "Nobody is signed in at this computer's screen";
+
+/// #3688 — why a read is refused on a Linux system install when who is at
+/// seat0 could not be told: the seat0 lookup failed, or did not answer in
+/// time ([`SEAT_LOOKUP_WAIT`]). Not nobody: a retry may well find them.
+#[cfg(target_os = "linux")]
+const CANNOT_TELL: &str = "Could not tell who is signed in at this computer's screen. Try again.";
 
 /// #3048 — said when a step would be taken for someone other than the person
 /// a transfer, or a listing (#3669), began for: they signed out, or another
@@ -472,8 +480,12 @@ impl FsAs {
             return Err(anyhow!(why));
         }
         #[cfg(target_os = "linux")]
-        if matches!(self, Self::DaemonAlone | Self::CannotTell) {
+        if matches!(self, Self::DaemonAlone) {
             return Err(anyhow!(why));
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::CannotTell) {
+            return Err(anyhow!(CANNOT_TELL));
         }
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = why;
@@ -519,8 +531,12 @@ impl FsAs {
             return Some(NOBODY_SIGNED_IN);
         }
         #[cfg(target_os = "linux")]
-        if matches!(self, Self::Nobody | Self::CannotTell) {
+        if matches!(self, Self::Nobody) {
             return Some(NOBODY_AT_THE_SCREEN);
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::CannotTell) {
+            return Some(CANNOT_TELL);
         }
         None
     }
@@ -545,6 +561,18 @@ impl FsAs {
         matches!(self, Self::Daemon)
     }
 
+    /// #3688 — whether a received file is written by the daemon alone: a
+    /// root daemon with nobody at seat0 ([`Self::DaemonAlone`]). Its files
+    /// are born 0600, root's only, wherever they land: on a server that is
+    /// the shared `/tmp`.
+    fn writes_alone(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if matches!(self, Self::DaemonAlone) {
+            return true;
+        }
+        false
+    }
+
     /// #3688 — whether a read's steps hold each handle they open to what
     /// was asked ([`held_to_the_person`], [`folder_held_to_the_person`]):
     /// on Linux, as the person at seat0.
@@ -554,6 +582,39 @@ impl FsAs {
             return true;
         }
         false
+    }
+
+    /// #3688 — before a folder download lists its next folder: whether the
+    /// person at seat0 it began for is still there, by seat0's active uid
+    /// ([`seat0_active_uid`]). They signed out, the login screen or another
+    /// person took seat0, or the seat does not read: the walk ends, saying
+    /// so ([`NOT_THE_PERSON`], a Windows walk's words), never with a zip that
+    /// looks complete. Every other reader goes on.
+    async fn still_at_the_screen(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Self::Person { account, .. } = self {
+            // Asked here, on the thread a test stood a seat in on.
+            #[cfg(test)]
+            let stood_in = stand_in::seat0_uid_now();
+            let uid = account.uid;
+            let there = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                if let Some(at_seat0) = stood_in {
+                    return at_seat0 == Some(uid);
+                }
+                seat0_active_uid() == Some(uid)
+            })
+            .await
+            .unwrap_or(false);
+            if !there {
+                tracing::info!(
+                    uid,
+                    "files: the person a folder download began for has left seat0 — it ends"
+                );
+                return Err(anyhow!(NOT_THE_PERSON));
+            }
+        }
+        Ok(())
     }
 
     /// Run blocking filesystem work as this identity, on a blocking thread:
@@ -577,7 +638,9 @@ impl FsAs {
             #[cfg(target_os = "linux")]
             Self::DaemonAlone => f(),
             #[cfg(target_os = "linux")]
-            Self::Nobody | Self::CannotTell => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+            Self::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+            #[cfg(target_os = "linux")]
+            Self::CannotTell => Err(anyhow!(CANNOT_TELL)),
             #[cfg(target_os = "linux")]
             Self::Person { account, caps, .. } => {
                 // #3688 — a read's step also empties the thread's
@@ -669,11 +732,12 @@ enum Seat {
     },
     /// root itself is signed in at the screen: the daemon is that person.
     Root,
-    /// Nobody, and why: no logind, an empty seat, the login screen, a lock
-    /// that switches seat0 to a greeter, an account that does not resolve.
+    /// Nobody, and why: an empty seat, the login screen, a lock that
+    /// switches seat0 to a greeter, a session that is not a person's, a name
+    /// that resolves to another uid than logind's.
     Nobody(String),
-    /// Not known, and why.
-    #[allow(dead_code)] // RED: the seat0 lookup tells it in the fix.
+    /// Not known, and why: logind could not be asked, the account database
+    /// did not answer, or the lookup failed or ran out of its time.
     CannotTell(String),
 }
 
@@ -688,7 +752,13 @@ fn seat_now() -> Seat {
 }
 
 /// The pure half of [`seat_now`]: what logind `found` at seat0, and the
-/// account and home its name `resolve`s to.
+/// account and home its name `resolve`s to. Nobody only when seat0 itself
+/// says so (`companion::is_nobody_at_the_screen`: an empty seat, the login
+/// screen, a session that is not a person's), or when the name resolves to
+/// another uid than the one logind recorded for the session (a lookup order
+/// that puts another source first, an account deleted and made again): its
+/// rights are not the person's. A lookup that failed, logind's or the
+/// account database's, cannot tell.
 #[cfg(target_os = "linux")]
 fn seat_of(
     found: Result<(String, Option<u32>)>,
@@ -696,15 +766,44 @@ fn seat_of(
 ) -> Seat {
     let (name, uid) = match found {
         Ok(found) => found,
-        Err(e) => return Seat::Nobody(format!("{e:#}")),
+        Err(e) if crate::companion::is_nobody_at_the_screen(&e) => {
+            return Seat::Nobody(format!("{e:#}"));
+        }
+        Err(e) => return Seat::CannotTell(format!("{e:#}")),
     };
     if uid == Some(0) {
         return Seat::Root;
     }
     match resolve(&name) {
+        Ok((account, _)) if uid.is_some_and(|at_seat0| at_seat0 != account.uid) => {
+            Seat::Nobody(format!(
+                "seat0's session is uid {}, but its name {name} resolves to uid {}",
+                uid.unwrap_or_default(),
+                account.uid
+            ))
+        }
         Ok((account, home)) => Seat::Person { account, home },
-        Err(e) => Seat::Nobody(e),
+        Err(e) => Seat::CannotTell(e),
     }
+}
+
+/// #3688 — the uid of seat0's active session, from logind's own record of
+/// the seat (`ACTIVE_UID=` in `/run/systemd/seats/seat0`, which `sd-login`
+/// reads): one small file on a tmpfs, cheap enough to read before every
+/// folder of a walk. `None` when it does not read, or names no uid.
+#[cfg(target_os = "linux")]
+fn seat0_active_uid() -> Option<u32> {
+    seat0_active_uid_in(&std::fs::read_to_string("/run/systemd/seats/seat0").ok()?)
+}
+
+/// The pure half of [`seat0_active_uid`].
+#[cfg(target_os = "linux")]
+fn seat0_active_uid_in(seat: &str) -> Option<u32> {
+    seat.lines()
+        .find_map(|line| line.strip_prefix("ACTIVE_UID="))?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Whether this process is root, and whether `ROOMLERD_FILES_AS_SEAT_USER`
@@ -733,9 +832,13 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             caps: if reading { Caps::Empty } else { Caps::Kept },
         },
         Seat::Root => FsAs::Daemon,
-        Seat::Nobody(why) | Seat::CannotTell(why) if reading => {
+        Seat::Nobody(why) if reading => {
             tracing::debug!(%why, "files: nobody at seat0 — a read is refused");
             FsAs::Nobody
+        }
+        Seat::CannotTell(why) if reading => {
+            tracing::debug!(%why, "files: who is at seat0 is not known — a read is refused");
+            FsAs::CannotTell
         }
         Seat::Nobody(why) | Seat::CannotTell(why) => {
             tracing::debug!(
@@ -748,13 +851,19 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
     }
 }
 
-/// #3688 — how long a read waits for the seat0 lookup.
+/// #3688 — how long a read waits for the seat0 lookup. A listing waits for
+/// it and then for its own timeout ([`DIR_LIST_TIMEOUT_SECS`], 3 s), and the
+/// viewer's drawer gives up on `files:dir` after 5 s, so the two together
+/// must leave room inside that. `files:get` and `files:get-folder` have no
+/// timer of their own in the viewer: their wait only delays the offer.
 #[cfg(target_os = "linux")]
-const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// #3688 — `lookup` on a blocking thread, given `wait` at most: a wedged
-/// logind or account lookup is nobody at the screen, never a stalled async
-/// worker. A lookup past its time finishes on its own thread.
+/// logind or account lookup cannot tell who is at the screen, and never
+/// stalls an async worker. A lookup past its time finishes on its own
+/// thread, so the account database's own caches (SSSD's, nscd's) hold its
+/// answer for the next read's lookup.
 #[cfg(target_os = "linux")]
 async fn seat_within(
     wait: std::time::Duration,
@@ -764,14 +873,14 @@ async fn seat_within(
         Ok(Ok(seat)) => seat,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "files: the seat0 lookup failed — a read is refused");
-            Seat::Nobody(format!("the seat0 lookup failed: {e}"))
+            Seat::CannotTell(format!("the seat0 lookup failed: {e}"))
         }
         Err(_) => {
             tracing::warn!(
                 ?wait,
                 "files: the seat0 lookup did not answer in time — a read is refused"
             );
-            Seat::Nobody(format!("the seat0 lookup did not answer within {wait:?}"))
+            Seat::CannotTell(format!("the seat0 lookup did not answer within {wait:?}"))
         }
     }
 }
@@ -1169,6 +1278,23 @@ pub(crate) fn partial_dir_for(dest_dir: &std::path::Path, id: &str) -> PathBuf {
         }
     }
     dest_dir.join(".roomler-partial").join(id)
+}
+
+/// #3688 — how a received file's own files (its partial, the partial's
+/// notes) are created: new, so a link planted in their place refuses the
+/// open, and with `private` (the daemon alone) 0600 from the first byte. The
+/// umask can only take bits away, and nothing changes the mode after.
+fn new_file(private: bool) -> std::fs::OpenOptions {
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    open
 }
 
 /// rc.22 — detect a "rename crosses devices" error from `tokio::fs::rename`.
@@ -1879,6 +2005,9 @@ impl FilesHandler {
             );
             let rel_for_meta = rel_path.map(str::to_string);
             let person_sid = who.person_sid().map(str::to_string);
+            // #3688 — the daemon alone (nobody at seat0): its files are
+            // born readable by root only, in whatever folder they land.
+            let private = stager.writes_alone();
             stager
                 .run(move || {
                     // B1 fix — reject if an existing partial dir is on disk for
@@ -1920,15 +2049,20 @@ impl FilesHandler {
                     let meta_path = partial_dir.join("meta.json");
                     let meta_bytes = serde_json::to_vec_pretty(&meta)
                         .context("serialising partial meta.json")?;
-                    std::fs::write(&meta_path, &meta_bytes)
-                        .with_context(|| format!("writing {}", meta_path.display()))?;
+                    if private {
+                        use std::io::Write;
+                        new_file(true)
+                            .open(&meta_path)
+                            .and_then(|mut meta| meta.write_all(&meta_bytes))
+                    } else {
+                        std::fs::write(&meta_path, &meta_bytes)
+                    }
+                    .with_context(|| format!("writing {}", meta_path.display()))?;
 
                     // `create_new`: the folder is new, so the file must be too;
                     // a link planted in its place refuses the open.
                     let data_path = partial_dir.join("data");
-                    let file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
+                    let file = new_file(private)
                         .open(&data_path)
                         .with_context(|| format!("creating {}", data_path.display()))?;
                     Ok((meta_path, file))
@@ -3051,16 +3185,7 @@ async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> 
             who.run(move || {
                 let canon = std::fs::canonicalize(&asked)
                     .with_context(|| format!("canonicalising {}", asked.display()))?;
-                #[cfg(target_os = "linux")]
-                if checks {
-                    folder_held_to_the_person(&canon)?;
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = checks;
-                #[cfg(all(test, target_os = "linux"))]
-                stand_in::before_a_folder_opens(&canon);
-                let read = std::fs::read_dir(&canon)
-                    .with_context(|| format!("reading {}", canon.display()))?;
+                let read = folder_listing(&canon, checks)?;
                 Ok((canon, read))
             }),
         )
@@ -3271,18 +3396,9 @@ impl FilesHandler {
                 if !meta.is_dir() {
                     return Err(anyhow!("not a directory: {}", resolved.display()));
                 }
-                #[cfg(target_os = "linux")]
-                if checks {
-                    folder_held_to_the_person(&resolved)?;
-                }
-                #[cfg(not(target_os = "linux"))]
-                let _ = checks;
-                #[cfg(all(test, target_os = "linux"))]
-                stand_in::before_a_folder_opens(&resolved);
                 // A folder the reader may not list is refused here, saying
                 // why, rather than sent as an empty zip that looks complete.
-                std::fs::read_dir(&resolved)
-                    .with_context(|| format!("reading {}", resolved.display()))?;
+                folder_listing(&resolved, checks)?;
                 Ok(resolved)
             })
             .await;
@@ -3380,6 +3496,8 @@ where
         if cancel.is_cancelled() {
             return Err(anyhow!("cancelled by browser"));
         }
+        // #3688 — a person who has left seat0 ends the walk.
+        who.still_at_the_screen().await?;
         // The folder, listed in one step as `who`: no more entries than the
         // cap leaves room for, plus one to trip it.
         let room = ZIP_MAX_ENTRIES.saturating_sub(count).saturating_add(1);
@@ -3391,7 +3509,11 @@ where
         let entries = match listed {
             Ok(entries) => entries,
             Err(e) => {
-                tracing::debug!(dir = %dir.display(), %e, "zip walk: skipping unreadable dir");
+                tracing::debug!(
+                    dir = %dir.display(),
+                    error = %format!("{e:#}"),
+                    "zip walk: skipping unreadable dir"
+                );
                 continue;
             }
         };
@@ -3486,6 +3608,36 @@ where
     Ok(count)
 }
 
+/// #3688 — a folder a read lists, opened as the step's reader. With `checks`
+/// (the person at seat0) it is opened first and its handle held to what was
+/// asked, as a file's is ([`folder_held_to_the_person`]), and it is listed
+/// through that handle: `/proc/self/fd/N` names the open handle, not the
+/// folder's path, so the kernel lists the very folder the handle holds, and a
+/// component swapped for a link since the path resolved is never followed.
+/// Without, the folder is read by its path, as it always was. An open that
+/// fails says so as `reading <dir>`; a handle that is not the folder asked
+/// says why, in the words the viewer shows.
+fn folder_listing(dir: &std::path::Path, checks: bool) -> Result<std::fs::ReadDir> {
+    #[cfg(all(test, target_os = "linux"))]
+    stand_in::before_a_folder_opens(dir);
+    #[cfg(target_os = "linux")]
+    if checks {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)
+            .with_context(|| format!("reading {}", dir.display()))?;
+        folder_held_to_the_person(&held, dir)?;
+        return std::fs::read_dir(format!("/proc/self/fd/{}", held.as_raw_fd()))
+            .with_context(|| format!("reading {}", dir.display()));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = checks;
+    std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))
+}
+
 /// #3669 — one entry of a folder a zip walk lists, as its listing step saw it.
 enum ZipEntry {
     /// A folder, with its canonical path for the cycle check when it has one.
@@ -3501,26 +3653,21 @@ enum ZipEntry {
 /// #3669 — one folder of a zip walk, listed in one step as the reader: each
 /// entry's path and kind, at most `room` of them, the listing ending at its
 /// first error as it always did. `Err` when the reader may not list it, and
-/// (#3688, `checks`) when it is on a kernel file system.
+/// (#3688, `checks`) when its handle is not the folder asked or is on a
+/// kernel file system ([`folder_listing`]).
 fn zip_folder_entries(
     dir: &std::path::Path,
     room: u32,
     checks: bool,
-) -> std::io::Result<Vec<(PathBuf, ZipEntry)>> {
-    #[cfg(target_os = "linux")]
-    if checks {
-        folder_held_to_the_person(dir)?;
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = checks;
-    #[cfg(all(test, target_os = "linux"))]
-    stand_in::before_a_folder_opens(dir);
+) -> Result<Vec<(PathBuf, ZipEntry)>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir)?.take(room as usize) {
+    for entry in folder_listing(dir, checks)?.take(room as usize) {
         let Ok(entry) = entry else {
             break;
         };
-        let path = entry.path();
+        // Named from the folder asked: a listing read through the folder's
+        // handle names its entries after that handle.
+        let path = dir.join(entry.file_name());
         let kind = match entry.metadata() {
             Ok(meta) if meta.is_dir() => ZipEntry::Folder(std::fs::canonicalize(&path).ok()),
             Ok(meta) if meta.is_file() => ZipEntry::File,
@@ -3579,8 +3726,36 @@ const KERNEL_FILE_SYSTEMS: &[(u32, &str)] = &[
 /// refused the person. `Err` says why, in the words the viewer shows.
 #[cfg(target_os = "linux")]
 fn held_to_the_person(file: &std::fs::File, asked: &std::path::Path) -> std::io::Result<()> {
+    held_to(file, asked, "file", "send")
+}
+
+/// #3688 — a folder a read lists as the person at seat0, held to what they
+/// asked for by its handle before anything is listed, as a file is
+/// ([`held_to_the_person`]): never on a kernel file system, and the very
+/// folder asked for, by the kernel's own path for the handle. A link swapped
+/// in after the path was resolved is followed by the open; through a
+/// `/proc/<pid>/fd` link it lands on a folder the daemon holds open, past
+/// the folders that would have refused the person.
+#[cfg(target_os = "linux")]
+fn folder_held_to_the_person(
+    folder: &std::fs::File,
+    asked: &std::path::Path,
+) -> std::io::Result<()> {
+    held_to(folder, asked, "folder", "list")
+}
+
+/// #3688 — `handle` held to `asked`, the `what` ("file", "folder") a read
+/// opened to `does` ("send", "list") it. `Err` says why, in the words the
+/// viewer shows.
+#[cfg(target_os = "linux")]
+fn held_to(
+    handle: &std::fs::File,
+    asked: &std::path::Path,
+    what: &str,
+    does: &str,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    let fd = file.as_raw_fd();
+    let fd = handle.as_raw_fd();
     // SAFETY: `fstatfs` fills the zeroed struct it is handed, for a handle
     // this function borrows.
     let held_on = statfs_with(|st| unsafe { libc::fstatfs(fd, st) })?;
@@ -3590,27 +3765,14 @@ fn held_to_the_person(file: &std::fs::File, asked: &std::path::Path) -> std::io:
     let held = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
     if held != asked {
         return Err(std::io::Error::other(format!(
-            "{}: what opened is not the file asked for, so file transfer does not send it",
+            "{}: what opened is not the {what} asked for, so file transfer does not {does} it",
             asked.display()
         )));
     }
     Ok(())
 }
 
-/// #3688 — a folder a read lists as the person at seat0: never one on a
-/// kernel file system ([`KERNEL_FILE_SYSTEMS`]).
-#[cfg(target_os = "linux")]
-fn folder_held_to_the_person(dir: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::other(format!("{}: a NUL in the path", dir.display())))?;
-    // SAFETY: `statfs` reads a NUL-terminated path that lives across the
-    // call, and fills the zeroed struct it is handed.
-    let listed_on = statfs_with(|st| unsafe { libc::statfs(path.as_ptr(), st) })?;
-    off_the_kernel_file_systems(listed_on, dir)
-}
-
-/// #3688 — the file system type `call` (an `fstatfs` or a `statfs`) reports.
+/// #3688 — the file system type `call` (an `fstatfs` on a handle) reports.
 #[cfg(target_os = "linux")]
 fn statfs_with(call: impl FnOnce(*mut libc::statfs) -> libc::c_int) -> std::io::Result<u32> {
     let mut st = std::mem::MaybeUninit::<libc::statfs>::zeroed();
@@ -3841,7 +4003,9 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
         #[cfg(target_os = "windows")]
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         #[cfg(target_os = "linux")]
-        FsAs::Nobody | FsAs::CannotTell => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+        FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+        #[cfg(target_os = "linux")]
+        FsAs::CannotTell => Err(anyhow!(CANNOT_TELL)),
     }
 }
 
@@ -3861,7 +4025,9 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
         #[cfg(target_os = "windows")]
         FsAs::Nobody => Err(anyhow!(NOBODY_SIGNED_IN)),
         #[cfg(target_os = "linux")]
-        FsAs::Nobody | FsAs::CannotTell => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+        FsAs::Nobody => Err(anyhow!(NOBODY_AT_THE_SCREEN)),
+        #[cfg(target_os = "linux")]
+        FsAs::CannotTell => Err(anyhow!(CANNOT_TELL)),
     }
 }
 
@@ -4019,7 +4185,6 @@ pub(crate) mod stand_in {
     struct StoodSeat {
         thread: std::thread::ThreadId,
         seat: Seat,
-        #[allow(dead_code)] // RED: the walk's check counts it down in the fix.
         stays_for: Option<u32>,
     }
 
@@ -4073,6 +4238,28 @@ pub(crate) mod stand_in {
         held.as_ref()
             .filter(|stood| stood.thread == std::thread::current().id())
             .map(|stood| stood.seat.clone())
+    }
+
+    /// #3688 — seat0's active uid as a folder download finds it, stood in
+    /// for this thread: the seat's, while its person stays, and none after.
+    /// `None` when no seat is stood in here.
+    #[cfg(target_os = "linux")]
+    pub(super) fn seat0_uid_now() -> Option<Option<u32>> {
+        let mut held = SEAT.lock().unwrap_or_else(PoisonError::into_inner);
+        let stood = held
+            .as_mut()
+            .filter(|stood| stood.thread == std::thread::current().id())?;
+        if let Some(left) = stood.stays_for.as_mut() {
+            if *left == 0 {
+                return Some(None);
+            }
+            *left -= 1;
+        }
+        Some(match &stood.seat {
+            Seat::Person { account, .. } => Some(account.uid),
+            Seat::Root => Some(0),
+            Seat::Nobody(_) | Seat::CannotTell(_) => None,
+        })
     }
 
     /// What a read does just before it opens a folder, once: by the
@@ -7463,6 +7650,49 @@ mod seat_user_tests {
         }
     }
 
+    /// #3688 — seat0's active uid is read from logind's own record of the
+    /// seat, as `sd-login` reads it: `ACTIVE_UID=`, which logind writes only
+    /// while a session is active there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seat0s_active_uid_is_logind_s_own_record() {
+        let seat = "# This is private data. Do not parse.
+IS_SEAT0=1
+CAN_MULTI_SESSION=1
+
+                    CAN_TTY=1
+CAN_GRAPHICAL=1
+ACTIVE=2
+ACTIVE_UID=1000
+SESSIONS=2 c1
+
+                    UIDS=1000 120
+";
+        assert_eq!(seat0_active_uid_in(seat), Some(1000));
+        let empty = "# This is private data. Do not parse.
+IS_SEAT0=1
+CAN_MULTI_SESSION=1
+
+                     CAN_TTY=1
+CAN_GRAPHICAL=0
+";
+        assert_eq!(seat0_active_uid_in(empty), None, "no active session");
+        assert_eq!(
+            seat0_active_uid_in(
+                "ACTIVE_UID=
+"
+            ),
+            None
+        );
+        assert_eq!(
+            seat0_active_uid_in(
+                "ACTIVE_UID=gdm
+"
+            ),
+            None
+        );
+    }
+
     /// #3688 — a listing answers inside the viewer's own timer for it: the
     /// drawer gives up on `files:dir` after 5 s (`listDir`,
     /// `ui/src/composables/useRemoteControl.ts`). The seat0 lookup and the
@@ -7603,7 +7833,21 @@ mod seat_user_tests {
         std::fs::write(&asked, b"x").unwrap();
         let file = std::fs::File::open(&asked).unwrap();
         held_to_the_person(&file, &asked).expect("the file asked for passes");
-        folder_held_to_the_person(temp.path()).expect("an ordinary folder passes");
+        let folder = std::fs::canonicalize(temp.path()).unwrap();
+        let held_dir = std::fs::File::open(&folder).unwrap();
+        folder_held_to_the_person(&held_dir, &folder).expect("an ordinary folder passes");
+        let magic_dir = PathBuf::from(format!("/proc/self/fd/{}", held_dir.as_raw_fd()));
+        let through_dir = std::fs::File::open(&magic_dir).unwrap();
+        let Err(swapped_dir) = folder_held_to_the_person(&through_dir, &magic_dir) else {
+            panic!("a folder reached through a /proc link passed as the folder asked");
+        };
+        assert_eq!(
+            swapped_dir.to_string(),
+            format!(
+                "{}: what opened is not the folder asked for, so file transfer does not list it",
+                magic_dir.display()
+            )
+        );
 
         let magic = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
         let through = std::fs::File::open(&magic).unwrap();
@@ -7631,7 +7875,8 @@ mod seat_user_tests {
                 status.display()
             )
         );
-        let Err(on_sys) = folder_held_to_the_person(std::path::Path::new("/sys")) else {
+        let sys = std::path::Path::new("/sys");
+        let Err(on_sys) = folder_held_to_the_person(&std::fs::File::open(sys).unwrap(), sys) else {
             panic!("a sysfs folder passed");
         };
         assert!(

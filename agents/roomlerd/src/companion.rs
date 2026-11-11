@@ -1354,7 +1354,6 @@ impl std::error::Error for NobodyAtTheScreen {}
 
 /// `why`, as seat0's own answer that nobody is at the screen.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
-#[allow(dead_code)] // RED: the seat0 lookup's halves take it in the fix.
 pub(crate) fn nobody_at_the_screen(why: String) -> anyhow::Error {
     anyhow::Error::new(NobodyAtTheScreen(why))
 }
@@ -1362,7 +1361,6 @@ pub(crate) fn nobody_at_the_screen(why: String) -> anyhow::Error {
 /// #3688 — whether `e` is seat0's own answer that nobody is at the screen
 /// ([`NobodyAtTheScreen`]), anywhere in its chain.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
-#[allow(dead_code)] // RED: `files::seat_of` asks it in the fix.
 pub(crate) fn is_nobody_at_the_screen(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| cause.is::<NobodyAtTheScreen>())
 }
@@ -1372,8 +1370,8 @@ pub(crate) fn is_nobody_at_the_screen(e: &anyhow::Error) -> bool {
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn seat0_active_session(seat: &str) -> Result<String> {
     show_field(seat, "ActiveSession").ok_or_else(|| {
-        anyhow::anyhow!(
-            "nobody is signed in at this machine's screen (seat0 has no active session)"
+        nobody_at_the_screen(
+            "nobody is signed in at this machine's screen (seat0 has no active session)".into(),
         )
     })
 }
@@ -1385,15 +1383,19 @@ fn seat0_active_session(seat: &str) -> Result<String> {
 fn session_person(id: &str, session: &str) -> Result<String> {
     match show_field(session, "Class").as_deref() {
         Some("user") => {}
-        Some("greeter") => anyhow::bail!(
-            "nobody is signed in at this machine's screen (the login screen is showing, \
-             session {id})"
-        ),
-        other => anyhow::bail!(
-            "nobody is signed in at this machine's screen (seat0's session {id} is of class \
-             {}, not a person's)",
-            other.unwrap_or("unknown")
-        ),
+        Some("greeter") => {
+            return Err(nobody_at_the_screen(format!(
+                "nobody is signed in at this machine's screen (the login screen is showing, \
+                 session {id})"
+            )));
+        }
+        other => {
+            return Err(nobody_at_the_screen(format!(
+                "nobody is signed in at this machine's screen (seat0's session {id} is of class \
+                 {}, not a person's)",
+                other.unwrap_or("unknown")
+            )));
+        }
     }
     show_field(session, "Name")
         .ok_or_else(|| anyhow::anyhow!("seat0's session {id} names no account"))
