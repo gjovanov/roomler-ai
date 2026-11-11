@@ -947,9 +947,13 @@ pub(crate) fn want_system_worker(
 /// runs: the machine config, or the SYSTEM profile's own. The two rungs the
 /// worker's ladder takes, through the same resolvers, read by the same account
 /// (this host is LocalSystem), so the host and the worker cannot disagree.
+/// #3702 — the profile rung only for a config in the service account's own
+/// profile as the system names it, the rule the worker's ladder keeps.
 fn sc_config_opens() -> bool {
     use roomler_node_core::machine_tree::{MachineTree, Switches};
-    let profile = crate::config::default_config_path().ok();
+    let profile = crate::config::default_config_path()
+        .ok()
+        .filter(|p| crate::appdirs::in_windows_folder(p, &crate::appdirs::system_profile()));
     config_opens_in(&MachineTree::here(), Switches::from_env(), profile)
 }
 
