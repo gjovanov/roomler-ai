@@ -2708,7 +2708,10 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   `<tenant>.json` and `<tenant>.controllers.json` the daemon loads are repaired to SYSTEM and Administrators
   alone and checked with the config ([`repair`, `machine_tree.rs:466`](../crates/agent-core/src/machine_tree.rs#L466)),
   so a key file another account owns keeps the service from running that enrollment as SYSTEM until it is
-  fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked.
+  fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked. #3666:
+  outside a save the repair seals the keys folder and a key file only when that entry gave no account other than
+  an administrator a right to change it as found; one another account could have written stays refused until an
+  elevated Setup or `roomlerd enroll --machine-global` seals it.
 - **The policy is the device owner's**: `roomler config set peer_auth off|audit` (default `audit`), live, and only
   from the person at the console. It is never pushable by the server, and `enforce` is refused by name until P3.
   `off` stops the judging, the remembering and the record; the device still signs its answers.

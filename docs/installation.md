@@ -783,17 +783,41 @@ Details worth knowing:
     the account that confirms its folder-access prompt). What it inherits from
     `%PROGRAMDATA%` stays, so an attended host's daemon still stages received
     files below it;
-  - the machine folder, once it holds the machine config, becomes
-    Administrators', with SYSTEM and Administrators alone; the config, `.prev`
-    and the keys get the same, and the attempt record the same with read for
-    Users (Setup reads it as the person who started it, to say which stage of a
-    failed install failed), not inheriting, so an entry added to a folder above
-    later does not reach them;
+  - the machine folder, once it holds a machine config that was the
+    machine's as found (below), becomes Administrators', with SYSTEM and
+    Administrators alone; the config gets the same, `.prev` and the keys only
+    when that entry was closed as found too, and the attempt record the same
+    with read for Users (Setup reads it as the person who started it, to say
+    which stage of a failed install failed), not inheriting, so an entry added
+    to a folder above later does not reach them;
   - an entry owned by an administrator's own account is given to the
     Administrators group, the computer's own account database deciding (an
     account of this computer directly or through a group, a domain account
     only when the group names it directly). One owned by any other account is
     left as it is.
+
+  **The as-found rule** (#3666). A seal makes the check pass on whatever an
+  entry holds, so the repair reads the tree before it seals anything. A
+  machine config is the machine's as found only when `%PROGRAMDATA%\roomler`
+  gave no account other than an administrator a right through which the
+  machine folder in it can be replaced (to delete what `%PROGRAMDATA%\roomler`
+  holds, to delete it, or to change its permissions or owner; the right to add
+  files and folders that `%PROGRAMDATA%` hands Users does not count), and the
+  machine folder and the config gave none a right to add to or
+  change them, their owners included. Generic rights count as what they map
+  to, a deny never offsets an allow, and an entry kind the check does not read
+  counts against it. An administrator here is SYSTEM, the Administrators
+  group, TrustedInstaller, or an account the computer's own account database
+  names, as above. Outside a save the repair takes the machine folder only
+  when its config was the machine's as found, and while the folder holds a
+  config it keeps such a replace right on `%PROGRAMDATA%\roomler` as it is,
+  for the check to refuse at every start and tick. A config that was not the
+  machine's is never run, never folded into (below), and `roomlerd re-enroll`
+  and `roomlerd org` refuse it with nothing sent. Such a device stays without
+  SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
+  enroll --machine-global` writes a fresh config: an Explorer prompt confirmed
+  by an account that is an administrator only through a domain group is the
+  realistic way there.
 
   Then it checks the tree: each entry a plain folder or file, owned by SYSTEM
   or Administrators, and changeable by no other account (`.prev` where it is
@@ -831,8 +855,11 @@ Details worth knowing:
   `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
   that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:836`): one
-  that is not is set aside, and a fresh one is written in its place.
+  administrators once the repair has run (`machine_tree.rs:836`), and was the
+  machine's as found before it (#3666; Setup reads it before it seals
+  `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
+  written in its place, keeping no `.prev` and no key this build does not know
+  from the files it replaces.
 - **The private network is on by default for the two machine roles** (FR-84 S2):
   the Advanced **overlay** box follows the role — checked for *Daemon — system* and
   *Daemon — machine*, unchecked for *Daemon — per user* (the WireGuard adapter
