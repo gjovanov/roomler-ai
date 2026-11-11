@@ -152,9 +152,11 @@ publish failed", a repeat comments on it, and the next green publish closes it.
 ## Open decisions
 
 - **D1: the SourceForge button in GitHub release notes.** The integration appended a "Download"
-  button to the notes of every release, `seed-cache` included. On the releases whose folders P0
-  removed, it now leads to a missing folder. Strip it from all of them (one edit per release, about
-  260), or leave them? Recommended: strip. With the webhook off, an edit reaches nobody.
+  button to the notes of each release it imported through the webhook: 67 releases, counted
+  2026-11-11 (32 `agent-v*`, 32 `setup-v*`, one `tunnel-v*`, `seed-cache` and
+  `vendored-ffmpeg-9.0.1`). On the 56 whose folders P0 removed it now answers 404, the newest agent
+  release among them. Strip it from all 67 (one edit per release), or leave them? Recommended:
+  strip. With the webhook off, an edit reaches nobody.
 - **D2: the two `tunnel-v*` folders** left on SourceForge, the retired tunnel CLI's releases.
   Recommended: remove.
 - **D3: should SourceForge also carry the `agent-v` packages** (MSI, `.deb`, `.pkg`)? Recommended:
