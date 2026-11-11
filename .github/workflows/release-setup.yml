@@ -966,8 +966,10 @@ jobs:
     needs: [validate-version, publish-release]
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # The same pair `reseed` dispatches with.
     permissions:
       actions: write
+      contents: read
     steps:
       - name: Dispatch sourceforge-publish.yml for this tag
         shell: bash
