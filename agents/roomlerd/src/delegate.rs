@@ -231,6 +231,25 @@ pub fn worker_features() -> Vec<String> {
     vec![KEEP_DELEGATED.to_string()]
 }
 
+/// FR-138 P2b — the feature words the daemon knows. A word a worker gains is
+/// added here too, or the daemon never hears it.
+const WORKER_FEATURE_WORDS: [&str; 1] = [KEEP_DELEGATED];
+
+/// FR-138 P2b — what the daemon keeps of its worker's feature words, as
+/// [`worker_words`] keeps its capability words (#3706): the words this build
+/// knows ([`WORKER_FEATURE_WORDS`]), each once, in the worker's order,
+/// matched by equality. Any other word is dropped, a near miss of a known
+/// word too.
+fn worker_feature_words(features: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for word in features {
+        if WORKER_FEATURE_WORDS.contains(&word.as_str()) && !kept.contains(word) {
+            kept.push(word.clone());
+        }
+    }
+    kept
+}
+
 /// `skip_serializing_if` for a flag whose `false` an older reader already
 /// assumes.
 fn is_false(b: &bool) -> bool {
@@ -1651,8 +1670,8 @@ impl DelegateHost {
         // FR-138 P2b — what P2b holds for the channel ends with it however
         // `run` ended, a write or read error too, and BEFORE the flag clears,
         // so the next worker to attach never shares this one's generation or
-        // bindings. (What `run` clears on a clean end alone is master's; an
-        // error end leaving it set is F4, outside the switch.)
+        // bindings. (What `run` clears however the channel ended, the sender,
+        // the caps and the questions, is master's.)
         let cause = match &result {
             Ok(()) => "closed".to_string(),
             Err(e) => e.to_string(),
@@ -1760,6 +1779,8 @@ impl DelegateHost {
                 Ok(DelegateFrame::WorkerCaps { caps, features }) => {
                     // #3695 — only the words that are the worker's to say.
                     let caps = worker_words(*caps);
+                    // FR-138 P2b — and of its feature words, the known ones.
+                    let features = worker_feature_words(&features);
                     tracing::info!(
                         permissions = ?caps.permissions,
                         has_input = caps.has_input_permission,
@@ -1818,7 +1839,8 @@ impl DelegateHost {
 
     /// FR-138 P2b — the channel to the worker ended, `cause` its why: what P2b
     /// holds for it goes with it. Run by [`Self::serve`] on EVERY end of
-    /// [`Self::run`], an I/O error's too (a worker gone mid-write is EPIPE).
+    /// [`Self::run`], an I/O error's too (a worker gone mid-write is EPIPE),
+    /// and a line over [`DELEGATE_LINE_MAX`]'s.
     /// Before, only a clean end ran it, and a record of a worker gone that way
     /// kept its generation: counted, claimed at the next roll, with no peer
     /// behind it. With the switch off nothing here was ever set, so it changes
