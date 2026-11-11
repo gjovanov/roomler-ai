@@ -1,6 +1,6 @@
 # FR-143: SourceForge gets each release's installers from our own workflow, and nothing else
 
-**Issue:** [#3691](https://github.com/gjovanov/roomler-ai/issues/3691) · **Status:** P0 done by hand 2026-11-11; P1 in review; P2 waits for two credentials from the operator
+**Issue:** [#3691](https://github.com/gjovanov/roomler-ai/issues/3691) · **Status:** P0 done by hand 2026-11-11, AC3 met; P1 in review; P2 waits for two credentials from the operator
 **Related:** FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), which left "SourceForge's per-OS default downloads on future releases" out of scope), FR-6 ([#773](https://github.com/gjovanov/roomler-ai/issues/773), the `seed-cache` release), FR-84 (the wizard's lockstep with the agent release)
 
 ## Goal
@@ -88,8 +88,9 @@ sequenceDiagram
 ### P0: by hand, 2026-11-11
 
 The webhook was switched off, the defaults moved to `setup-v0.4.211`, and the CI cache, the
-vendored FFmpeg build, every `agent-v*` folder and all but the newest 10 `setup-v*` folders removed
-from SourceForge. The field log has each step.
+vendored FFmpeg build, every `agent-v*` folder, the two `tunnel-v*` folders and all but the newest
+10 `setup-v*` folders removed from SourceForge. The button the integration had appended to 67
+releases' notes on GitHub was stripped. The field log has each step.
 
 ### P1: the workflow
 
@@ -133,17 +134,17 @@ publish failed", a repeat comments on it, and the next green publish closes it.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | by hand: webhook off, defaults to `setup-v0.4.211`, the cache and the old folders removed | `gh api -X PATCH repos/gjovanov/roomler-ai/hooks/703998184 -F active=true` brings the import back | done 2026-11-11 |
+| P0 | by hand: webhook off, defaults to `setup-v0.4.211`, everything but the ten newest wizards removed, the buttons stripped from GitHub release notes | `gh api -X PATCH repos/gjovanov/roomler-ai/hooks/703998184 -F active=true` brings the import back | done 2026-11-11 |
 | P1 | the workflow, the script and its self-test, the pinned host keys | repository variable `SOURCEFORGE_PUBLISH=off`; without the two secrets a run reports that and skips | in review |
 | P2 | the operator's two credentials, a dry run, the first live publish | the same variable | waits for the operator |
-| P3 | the webhook deleted for good, D1 and D2 applied | | after AC1 |
+| P3 | the webhook deleted for good | | after AC1 |
 | P4 | docs: [`docs/sourceforge.md`](../sourceforge.md), its `docs/README.md` row, the `ship-it` skill | | with P1 |
 
 ## Acceptance criteria
 
 - [ ] **AC1**: after a real release, `best_release.json` names that release's Windows, macOS and Linux installers within 15 minutes of the wizard run finishing, with no manual step. Read on two consecutive releases. The failing read is in the evidence table: 0.4.197 while production served 0.4.210.
 - [ ] **AC2**: the bytes SourceForge serves are the release's. For one release, each of the three defaults downloaded from SourceForge hashes to the value in the GitHub release's `.sha256`.
-- [ ] **AC3**: SourceForge's Files hold `setup-v*` folders only, at most 10, and its Large Files page reports the project under 5 GB. The failing read: 85.5 GB in 265 folders.
+- [x] **AC3**: SourceForge's Files hold `setup-v*` folders only, at most 10, and its Large Files page reports the project under 5 GB. The failing read: 85.5 GB in 265 folders. Met 2026-11-11 15:01Z: ten folders, `setup-v0.4.202` to `0.4.211`, and "Project's total usage size 1.6 GB".
 - [ ] **AC4**: retention. The publish that makes an eleventh version removes the oldest, and no default pointed into a removed folder.
 - [ ] **AC5**: a forced failure opens exactly one issue, and the next green publish closes it.
 - [ ] **AC6**: the GitHub webhook to SourceForge is deleted, SourceForge's audit trail shows no import after 2026-11-11 14:02Z, and seven days pass with no "Import Failed" mail.
@@ -151,16 +152,17 @@ publish failed", a repeat comments on it, and the next green publish closes it.
 
 ## Open decisions
 
-- **D1: the SourceForge button in GitHub release notes.** The integration appended a "Download"
-  button to the notes of each release it imported through the webhook: 67 releases, counted
-  2026-11-11 (32 `agent-v*`, 32 `setup-v*`, one `tunnel-v*`, `seed-cache` and
-  `vendored-ffmpeg-9.0.1`). On the 56 whose folders P0 removed it now answers 404, the newest agent
-  release among them. Strip it from all 67 (one edit per release), or leave them? Recommended:
-  strip. With the webhook off, an edit reaches nobody.
-- **D2: the two `tunnel-v*` folders** left on SourceForge, the retired tunnel CLI's releases.
-  Recommended: remove.
-- **D3: should SourceForge also carry the `agent-v` packages** (MSI, `.deb`, `.pkg`)? Recommended:
-  no. The wizard is the supported download, and an agent release is 177 MiB.
+None. The operator decided all three on 2026-11-11.
+
+- **D1: the SourceForge button in GitHub release notes: strip all of them.** The integration had
+  appended a "Download" button to the notes of each release it imported through the webhook: 67
+  releases (32 `agent-v*`, 32 `setup-v*`, one `tunnel-v*`, `seed-cache` and
+  `vendored-ffmpeg-9.0.1`). On the 56 whose folders P0 removed it answered 404, the newest agent
+  release among them. Done the same day; see the field log.
+- **D2: the two `tunnel-v*` folders on SourceForge**, releases of the standalone tunnel CLI that the
+  import had brought over: **remove both.** Done the same day.
+- **D3: SourceForge carries the wizard only**, not the `agent-v` packages (MSI, `.deb`, `.pkg`).
+  The wizard is the supported download, and an agent release is 177 MiB.
 
 ## Out of scope
 
@@ -178,4 +180,7 @@ publish failed", a repeat comments on it, and the next green publish closes it.
 | 2026-11-11 | P0, the removals, after re-reading the webhook (off) and `best_release.json` (4 of 4). Each is the request SourceForge's own trash icon sends. The old releases went in batches of 10, each batch re-reading the listing and refusing unless the newest ten `setup-v*` folders were `0.4.202` to `0.4.211` | `vendored-ffmpeg-9.0.1` and `seed-cache` at 14:14Z, then **155 `agent-v*` and 97 `setup-v*` folders**, done 14:26:14Z with no error. Left: the ten `setup-v0.4.202` to `0.4.211` and the two `tunnel-v*` (D2) |
 | 2026-11-11 | Wrong turn: `seed-cache` came back | An import SourceForge had started at 14:02:29Z, from the last deliveries before the switch, was still copying the cache when the folder was removed at 14:14Z, and went on writing into it: 48 files and 24.3 GiB by 14:27Z, one of them an asset CI uploaded at 14:06Z. Switching the webhook off stops new imports, not one in flight. The Audit Trail's last "import files" row and the folder's file count are the two things to read before removing an imported folder. The count stood at 52 files and 26.5 GiB from 14:28:29Z; the eight assets it lacked were all ones CI had uploaded after 14:06Z. Removed again at **14:31:04Z**, and the listing read 12 folders with no `seed-cache` on every read after that |
 | 2026-11-11 | SourceForge's Large Files page after the removals, 14:35Z | **"Project's total usage size 1.9 GB."** It read 85.5 GB before, and 25.5 GB at 14:26Z with the returned cache on it. 12 folders: `setup-v0.4.202` to `0.4.211` and the two `tunnel-v*`, so AC3 waits on D2 |
+| 2026-11-11 | D2: the two `tunnel-v*` folders, 14:54:56Z | Removed. The listing is the ten `setup-v0.4.202` to `0.4.211` folders and nothing else |
+| 2026-11-11 | D1: the button, 14:57Z to 15:00Z. Planned first for all 67: each body had exactly one button, at its very end, linking to its own tag's folder, and the original of every release was kept. One edit per release, sending the body alone, tried on `agent-v0.4.180` before the other 66 | **67 of 67 without the button, and every other field of every release unchanged** (tag, name, draft, pre-release, target, dates, assets), re-read from GitHub and compared with the kept originals. 136 to 145 characters went from each. GitHub's `/releases/latest` named `setup-v0.4.211` before the first edit and after the last. No release anywhere mentions SourceForge now. The webhook delivered nothing: its last delivery is still 14:01:16Z |
+| 2026-11-11 | AC3, 15:01:40Z | SourceForge's Large Files page: "Project's total usage size 1.6 GB". Ten folders, all `setup-v*`. The Audit Trail's last import row is still 14:02:29Z |
 | 2026-11-11 | P1 before any credential exists | `--selftest` 62 checks on Linux and Git-Bash; 13 mutations of the script, 10 fail the self-test and the other 3 are refused by a second check (a missing sidecar, a digest that is not hex, a path in an asset name). The workflow's own `run:` blocks, extracted verbatim and pointed at a throwaway sshd on 127.0.0.1: the listing, the upload and its checksum proof, the proof failing on a remote file with the right size and time and other bytes and a re-run repairing it, retention as a dry run, for real (an empty folder and file names with spaces included) and with a default still pointing into an aged-out folder, and a changed host key ending the run. The API answer's test against the documented success and error shapes and an HTML challenge page. What this does not cover: SourceForge's own ssh and API, which wait for P2 |
