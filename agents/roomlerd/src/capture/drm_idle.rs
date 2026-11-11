@@ -43,6 +43,10 @@
 
 use std::time::{Duration, Instant};
 
+// A field test for #3686: these lines only move the code below them.
+// Nothing here is renamed, so no doc needs an edit.
+// This branch is never merged.
+
 /// The longest a frame is skipped for: a change no sampled row crosses is
 /// delivered this late at worst. FR-29's bound for the X11 damage skip.
 pub const MAX_SKIP: Duration = Duration::from_millis(1000);
