@@ -958,7 +958,7 @@ jobs:
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
           sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" tarball_owner
 
-      - name: Files on a Linux system install (FR-97 P3d, #3688) — as root, received files born the person's, reads taken as them
+      - name: "Files on a Linux system install (FR-97 P3d, #3688) — as root, received files born the person's, reads taken as them"
         # FR-97 P3d. A root daemon writes a received file into the person's
         # folder with the thread's fsuid, fsgid and groups switched to theirs,
         # and a link planted in that folder gets only their rights (the test's
