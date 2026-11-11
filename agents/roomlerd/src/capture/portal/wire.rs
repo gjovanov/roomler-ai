@@ -168,4 +168,18 @@ mod tests {
         h.width = 0;
         assert!(FrameHeader::decode(&h.encode()).is_err());
     }
+
+    /// #3695 — the payload is the rows the header describes: `stride` bytes
+    /// for each of `height` rows, no more and no less.
+    #[test]
+    fn a_payload_that_is_not_its_headers_rows_is_refused() {
+        let mut h = hdr();
+        let rows = h.stride * h.height;
+        for len in [rows - 1, h.stride * (h.height - 1), rows + 4] {
+            h.len = len;
+            assert!(FrameHeader::decode(&h.encode()).is_err(), "len {len}");
+        }
+        h.len = rows;
+        assert!(FrameHeader::decode(&h.encode()).is_ok());
+    }
 }

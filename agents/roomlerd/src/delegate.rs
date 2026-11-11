@@ -1581,6 +1581,110 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// #3695 — attach a worker with `secret`; the client's reader and writer.
+    async fn attached(
+        host: &DelegateHost,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        let secret = host.mint();
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (rd, wr) = tokio::io::split(server);
+        let h = host.clone();
+        let task = tokio::spawn(async move { h.serve(&secret, Box::new(rd), Box::new(wr)).await });
+        let (crd, cwr) = tokio::io::split(client);
+        let mut lines = BufReader::new(crd).lines();
+        let greeting = lines.next_line().await.unwrap().unwrap();
+        assert!(greeting.contains("\"attached\""), "got {greeting}");
+        (task, lines, cwr)
+    }
+
+    /// #3695 — the frame reader has a limit: a line over it closes the
+    /// channel, and nothing behind it is answered.
+    #[tokio::test]
+    async fn a_line_over_the_limit_closes_the_channel() {
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let writer = tokio::spawn(async move {
+            let _ = cwr.write_all(&vec![b' '; 4 * 1024 * 1024 + 1]).await;
+            let _ = cwr.write_all(b"\n{\"t\":\"ping\"}\n").await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed, no pong");
+        task.await.unwrap();
+        drop(writer);
+    }
+
+    /// #3695 — the log frame's limit bounds what is read: a frame over it
+    /// closes the channel before any of its lines reach the sink.
+    #[tokio::test]
+    async fn a_log_frame_over_the_limit_reaches_no_sink() {
+        let host = DelegateHost::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        host.set_worker_log_sink(tx);
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let msg = "x".repeat(48 * 1024);
+        let frame = DelegateFrame::WorkerLogs {
+            lines: (0..101)
+                .map(|_| log_line(&msg, bson::Document::new()))
+                .collect(),
+        };
+        let writer = tokio::spawn(async move {
+            let _ = write_frame(&mut cwr, &frame).await;
+            let _ = cwr.write_all(b"{\"t\":\"ping\"}\n").await;
+            cwr
+        });
+        assert_eq!(lines.next_line().await.unwrap(), None, "closed, no pong");
+        task.await.unwrap();
+        assert!(rx.try_recv().is_err(), "no line of the frame was kept");
+        drop(writer);
+    }
+
+    /// #3695 — what the daemon takes from its worker's capabilities is known
+    /// words, each once, and a reason of bounded length.
+    #[tokio::test]
+    async fn the_workers_capability_words_are_known_words_only() {
+        use roomler_ai_remote_control::models::Unavailable;
+        let host = DelegateHost::new();
+        let (task, mut lines, mut cwr) = attached(&host).await;
+        let mut caps = AgentCaps {
+            record: vec!["remote".into(), "remote".into(), "everything".into()],
+            apps: vec!["status".into(), "x".repeat(1 << 16)],
+            audio: vec!["opus".into(), "pcm".into()],
+            permissions: Some(vec!["screen-capture".into(), "root".into()]),
+            has_input_permission: true,
+            ..Default::default()
+        };
+        caps.unavailable.insert(
+            "audio".into(),
+            Unavailable::new("no-session", &"why ".repeat(1000)),
+        );
+        let frame = DelegateFrame::WorkerCaps {
+            caps: Box::new(caps),
+        };
+        write_frame(&mut cwr, &frame).await.unwrap();
+        cwr.write_all(b"{\"t\":\"ping\"}\n").await.unwrap();
+        let pong = lines.next_line().await.unwrap().unwrap();
+        assert!(pong.contains("\"pong\""), "got {pong}");
+
+        assert_eq!(host.effective_record(), Some(vec!["remote".to_string()]));
+        assert_eq!(host.effective_apps(), Some(vec!["status".to_string()]));
+        let audio = host.effective_audio().unwrap();
+        assert_eq!(audio.audio, vec!["opus".to_string()]);
+        let why = audio.why.unwrap();
+        assert_eq!(why.code, "no-session");
+        assert!(why.reason.len() <= 512, "{}", why.reason.len());
+        assert_eq!(
+            host.effective_permissions(),
+            Some((vec!["screen-capture".to_string()], true))
+        );
+        drop(cwr);
+        drop(lines);
+        task.await.unwrap();
+    }
+
     fn log_line(msg: &str, fields: bson::Document) -> crate::logs_upload::LogLine {
         crate::logs_upload::LogLine {
             ts: bson::DateTime::now(),

@@ -1582,6 +1582,22 @@ pub mod helper {
             assert!(e.contains("exited before announcing a stream"), "{e}");
         }
 
+        /// #3695 — the handshake's line reader has a limit: a line over it
+        /// ends the read with the limit named, before anything behind it.
+        #[test]
+        fn a_handshake_line_over_the_limit_is_refused() {
+            let failed = format!(
+                "{STREAM_FAILED_MARKER}{}\n",
+                serde_json::to_string("declined").unwrap()
+            );
+            let mut input = "x".repeat(64 * 1024 + 1);
+            input.push('\n');
+            input.push_str(&failed);
+            let mut r = std::io::Cursor::new(input);
+            let e = read_stream_handshake(&mut r).unwrap_err().to_string();
+            assert!(e.contains("65536"), "{e}");
+        }
+
         /// #1719 run B: only a root daemon drops privilege; a per-user daemon
         /// IS the session's owner and runs the helper as itself; anyone else
         /// is refused with both uids named.
