@@ -538,6 +538,23 @@ answer only ever stops a device: a deny is never credited, and a domain account
 that is an administrator only through a domain group reads as no administrator,
 because an answer that needed a domain controller would flap SYSTEM mode.
 
+### A viewer's file transfer acts as the person at the screen (#3048, #3669)
+
+On a Windows background-service install the worker is LocalSystem. What a
+viewer's file transfer touches on the person's side runs through `FsAs`
+(`agents/roomlerd/src/files.rs`): a received file is placed, and a download, a
+folder download and the drawer's listing are read, as the person signed in to
+the session the worker serves, their token impersonated on a blocking thread for
+one step at a time. With nobody signed in, each is refused with a reason the
+viewer shows ([`desktop-companion.md`](desktop-companion.md) §9.2, §9.3). A
+worker that cannot read its own token is taken for LocalSystem here: the answer
+is then the person or nobody, never the worker itself. Only the service's own
+staging is written as the service. A new file verb takes the
+same path: `FsAs::now()` for a write, `FsAs::for_read()` for a read, and every
+call on the person's side inside `FsAs::run`. The person's token is the boundary;
+`validate_outgoing_path`'s denylists and `is_agent_secret` stay, as a second
+line.
+
 ### An enrollment token is spent once, through one owner (#3328)
 
 **A single-use enrollment token enrolls once**, at every door: the daemon's

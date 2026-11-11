@@ -231,6 +231,10 @@ fn process_home() -> Option<String> {
 /// permissions. With nobody signed in, a received file is refused
 /// ([`NOBODY_SIGNED_IN`]), never written as LocalSystem. The same switch keeps
 /// the daemon's own identity.
+///
+/// #3669 — a viewer's reads there take the same person ([`FsAs::for_read`]):
+/// a download, a folder download and the drawer's listing open everything
+/// they touch as them, and with nobody signed in they are refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
     /// This process: every macOS install, every user install, a Windows
@@ -262,8 +266,9 @@ pub(crate) enum FsAs {
 }
 
 /// #3048 — said when a step would be taken for someone other than the person
-/// the transfer began for: they signed out, or another person signed in.
-pub(crate) const NOT_THE_PERSON: &str = "the person this transfer began for is not signed in";
+/// a transfer, or a listing (#3669), began for: they signed out, or another
+/// person signed in.
+pub(crate) const NOT_THE_PERSON: &str = "the person this began for is no longer signed in";
 
 /// #3048 — why a received file is refused on a machine-wide Windows install
 /// with nobody signed in. The viewer shows it in its `files:error`.
@@ -271,20 +276,45 @@ pub(crate) const NOT_THE_PERSON: &str = "the person this transfer began for is n
 pub(crate) const NOBODY_SIGNED_IN: &str =
     "Nobody is signed in to this computer to receive the file";
 
-/// #3048 — who a transfer starting now writes as on Windows: the person signed
-/// in to this process's session when it is LocalSystem; nobody when no one is;
-/// the daemon itself otherwise, or with `ROOMLERD_FILES_AS_SEAT_USER=0`. Pure,
-/// so the decision is a test.
+/// #3669 — why a download (a file, or a folder as one zip) is refused on a
+/// machine-wide Windows install with nobody signed in. The viewer shows it in
+/// its `files:error`.
+pub(crate) const NOBODY_SIGNED_IN_TO_SEND: &str =
+    "Nobody is signed in to this computer to send the file";
+
+/// #3669 — why the drawer lists nothing on a machine-wide Windows install
+/// with nobody signed in. The viewer shows it in its `files:dir-error`.
+pub(crate) const NOBODY_SIGNED_IN_TO_BROWSE: &str =
+    "Nobody is signed in to this computer to browse its files";
+
+/// #3669 — whether `e` is, anywhere in its chain, an access refusal.
+#[cfg(target_os = "windows")]
+fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
+
+/// #3048 — who a transfer starting now acts as on Windows, from what this
+/// process's own token said (`win_identity::own_token_is_local_system`): the
+/// person signed in to this process's session when it is LocalSystem; nobody
+/// when no one is; the daemon itself when it is another account, or with
+/// `ROOMLERD_FILES_AS_SEAT_USER=0`. #3669 — a token that could not be read
+/// counts as LocalSystem, so the answer is then the person or nobody, never
+/// the worker itself. `person` is asked only when it is needed. Pure, so the
+/// decision is a test.
 #[cfg(target_os = "windows")]
 fn fs_as_for(
-    local_system: bool,
+    own_token: Option<bool>,
     switch_on: bool,
-    person: Option<crate::win_identity::SessionPerson>,
+    person: impl FnOnce() -> Option<crate::win_identity::SessionPerson>,
 ) -> FsAs {
-    if !local_system || !switch_on {
+    if own_token == Some(false) || !switch_on {
         return FsAs::Daemon;
     }
-    match person {
+    match person() {
         Some(p) => FsAs::Person {
             sid: p.sid,
             profile: p.profile,
@@ -312,16 +342,72 @@ impl FsAs {
                 }
             }
         }
-        // #3048 — only a LocalSystem process asks for the session's person.
-        #[cfg(target_os = "windows")]
-        if crate::win_identity::process_is_local_system() {
-            return fs_as_for(
-                true,
-                tunnel_core::env::flag("FILES_AS_SEAT_USER", true),
-                crate::win_identity::session_person(),
-            );
+        Self::session_or_daemon()
+    }
+
+    /// #3669 — who a read starting now (a download, a folder download, a
+    /// listing) runs as: on a machine-wide Windows install, the person a
+    /// write takes, by the same function, so a read and a write cannot take
+    /// different people; everywhere else the daemon, as before. A Windows
+    /// test stands a reader in for this answer (`stand_in::reader`), so its
+    /// entry points are tested with the person, not only the daemon.
+    pub(crate) fn for_read() -> Self {
+        #[cfg(all(test, target_os = "windows"))]
+        if let Some(who) = stand_in::reader_now() {
+            return who;
         }
-        Self::Daemon
+        Self::session_or_daemon()
+    }
+
+    /// #3048 — on Windows, the person signed in to this process's session
+    /// when it is LocalSystem (or cannot tell, #3669), nobody when no one is;
+    /// the daemon itself otherwise, or with `ROOMLERD_FILES_AS_SEAT_USER=0`.
+    fn session_or_daemon() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            fs_as_for(
+                crate::win_identity::own_token_is_local_system(),
+                tunnel_core::env::flag("FILES_AS_SEAT_USER", true),
+                crate::win_identity::session_person,
+            )
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::Daemon
+        }
+    }
+
+    /// #3669 — a read is refused before anything is touched when nobody is
+    /// signed in on a machine-wide Windows install; `why` is what the viewer
+    /// is told.
+    fn refuse_read(&self, why: &'static str) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        if matches!(self, Self::Nobody) {
+            return Err(anyhow!(why));
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = why;
+        Ok(())
+    }
+
+    /// #3669 — a read refused to the person says so, naming what was asked
+    /// for: the viewer shows only an error's outermost line, which would
+    /// otherwise be a bare "reading …". It says Windows refused, not that
+    /// the person may not: their rights are one cause, and an EDR or DLP
+    /// filter answers with the same code. The daemon's errors stay as they
+    /// were.
+    fn explain_refusal<T>(&self, asked: &str, read: Result<T>) -> Result<T> {
+        #[cfg(target_os = "windows")]
+        if matches!(self, Self::Person { .. }) && read.as_ref().is_err_and(is_permission_denied) {
+            return read.with_context(|| {
+                format!(
+                    "{asked}: Windows refused to open it for the person signed in to this computer"
+                )
+            });
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = asked;
+        read
     }
 
     /// #3048 — the reason a transfer is refused before anything is touched:
@@ -1305,6 +1391,10 @@ pub(crate) struct OutgoingTransfer {
     /// today (which reads-until-EOF).
     #[allow(dead_code)]
     pub size: u64,
+    /// #3669 — a download's file, opened as its reader when it began; the
+    /// pump takes it ([`FilesHandler::open_outgoing`]). None for a folder,
+    /// whose walk opens each file itself.
+    pub file: Option<std::fs::File>,
     /// #1730 — a TOKEN, not a flag: the pumps race every await against it.
     /// A flag read between awaits was never read by a pump parked inside
     /// one (a send on a channel whose peer vanished never returns), so a
@@ -2179,29 +2269,21 @@ impl FilesHandler {
     /// between chunks; calling [`Self::cancel_outgoing`] flips the
     /// flag and the next loop iteration will exit.
     pub async fn begin_outgoing(&self, id: String, path: &str) -> Result<OutgoingOffer> {
-        let resolved = validate_outgoing_path(path).context("validating outgoing path")?;
-        if is_agent_secret(&resolved) {
-            return Err(anyhow!(
-                "{} holds the agent's own credentials — file transfer never sends it",
-                resolved.display()
-            ));
-        }
+        self.begin_outgoing_as(FsAs::for_read(), id, path).await
+    }
 
-        // Stat to surface a real error before we set state, AND get
-        // the size for the offer.
-        let meta = tokio::fs::metadata(&resolved)
-            .await
-            .with_context(|| format!("stat {}", resolved.display()))?;
-        if !meta.is_file() {
-            return Err(anyhow!("not a regular file: {}", resolved.display()));
-        }
-        let size = meta.len();
-        if size > MAX_TRANSFER_BYTES {
-            return Err(anyhow!(
-                "file size {size} exceeds the {} B cap",
-                MAX_TRANSFER_BYTES
-            ));
-        }
+    /// [`Self::begin_outgoing`], read as `who` (#3669): the file is opened in
+    /// one step as them, before the offer, and the pump reads that handle.
+    pub(crate) async fn begin_outgoing_as(
+        &self,
+        who: FsAs,
+        id: String,
+        path: &str,
+    ) -> Result<OutgoingOffer> {
+        who.refuse_read(NOBODY_SIGNED_IN_TO_SEND)?;
+        let asked = path.to_string();
+        let opened = who.run(move || open_to_send(&asked)).await;
+        let (resolved, size, file) = who.explain_refusal(path, opened)?;
 
         let name = resolved
             .file_name()
@@ -2223,6 +2305,7 @@ impl FilesHandler {
             id: id.clone(),
             path: resolved.clone(),
             size,
+            file: Some(file),
             cancel: cancel.clone(),
             _active_guard: ActiveTransferGuard::new(),
         });
@@ -2234,14 +2317,16 @@ impl FilesHandler {
             size: Some(size),
             mime,
             cancel,
+            who,
         })
     }
 
-    /// Open the outgoing transfer's file for reading. Caller pumps
-    /// chunks via the returned handle.
+    /// The outgoing transfer's file, opened when the transfer began (as its
+    /// reader, #3669), handed to the pump once. Caller pumps chunks via the
+    /// returned handle.
     pub async fn open_outgoing(&self, id: &str) -> Result<File> {
-        let guard = self.outgoing.lock().await;
-        let Some(state) = guard.as_ref() else {
+        let mut guard = self.outgoing.lock().await;
+        let Some(state) = guard.as_mut() else {
             return Err(anyhow!("no active outgoing transfer"));
         };
         if state.id != id {
@@ -2250,9 +2335,11 @@ impl FilesHandler {
                 state.id
             ));
         }
-        File::open(&state.path)
-            .await
-            .with_context(|| format!("opening {}", state.path.display()))
+        let file = state
+            .file
+            .take()
+            .ok_or_else(|| anyhow!("{} is already being sent", state.path.display()))?;
+        Ok(File::from_std(file))
     }
 
     /// Stop the active outgoing transfer if its id matches: its pump
@@ -2292,6 +2379,51 @@ pub struct OutgoingOffer {
     pub size: Option<u64>,
     pub mime: Option<&'static str>,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// #3669 — who the transfer reads as, fixed when it began: a folder's
+    /// walk opens every entry as them.
+    pub(crate) who: FsAs,
+}
+
+/// #3669 — the one step a download takes on the host before its offer, run
+/// as the reader: the path resolved and held to the denylists, the agent's
+/// own secrets refused, the file opened, and the handle stated and capped.
+/// Windows checks access when a handle is opened, so the pump that reads
+/// through this one needs no identity.
+fn open_to_send(asked: &str) -> Result<(PathBuf, u64, std::fs::File)> {
+    let resolved = validate_outgoing_path(asked).context("validating outgoing path")?;
+    if is_agent_secret(&resolved) {
+        return Err(anyhow!(
+            "{} holds the agent's own credentials — file transfer never sends it",
+            resolved.display()
+        ));
+    }
+    // The path is stated first only to keep what is not a file from being
+    // opened at all: a folder's open fails on Windows with the code a refused
+    // open has, and a FIFO's open on Unix waits for a writer.
+    let not_a_file = || anyhow!("not a regular file: {}", resolved.display());
+    let meta =
+        std::fs::metadata(&resolved).with_context(|| format!("stat {}", resolved.display()))?;
+    if !meta.is_file() {
+        return Err(not_a_file());
+    }
+    let file = std::fs::File::open(&resolved)
+        .with_context(|| format!("opening {}", resolved.display()))?;
+    // The checks that count are on the handle that is sent, not the path:
+    // the path may have been swapped between that stat and the open.
+    let meta = file
+        .metadata()
+        .with_context(|| format!("stat {}", resolved.display()))?;
+    if !meta.is_file() {
+        return Err(not_a_file());
+    }
+    let size = meta.len();
+    if size > MAX_TRANSFER_BYTES {
+        return Err(anyhow!(
+            "file size {size} exceeds the {} B cap",
+            MAX_TRANSFER_BYTES
+        ));
+    }
+    Ok((resolved, size, file))
 }
 
 // ---------------------------------------------------------------------------
@@ -2507,9 +2639,13 @@ fn agent_state_run(path: &std::path::Path) -> Option<String> {
 }
 
 /// A secret-bearing file of the agent's own: never leaves the host by file
-/// transfer, whatever the daemon's privilege. The rest of its state — logs,
-/// crash dumps, uploads — stays reachable: that is how a supporter fetches
-/// them from the drawer.
+/// transfer, whatever the daemon's privilege. This is a second line, not the
+/// boundary. The rest of its state (logs, crash dumps, uploads) is not
+/// refused here, so the drawer reaches it wherever the reader may. A Windows
+/// background-service install reads as the person signed in (#3669), and its
+/// machine-wide folder is SYSTEM's and the Administrators' alone, so the
+/// person is refused there and an administrator fetches those files with
+/// `roomler exec`.
 fn is_agent_secret(path: &std::path::Path) -> bool {
     let Some(name) = path.file_name().map(|n| n.to_string_lossy()) else {
         return false;
@@ -2595,6 +2731,13 @@ pub const STAGING_SENTINEL: &str = "<staging>";
 /// agree on which spellings mean "the roots", or the drawer labels a real
 /// listing a roots view and drives into bare entry names.
 pub async fn list_dir(path: &str) -> Result<DirListing> {
+    list_dir_as(&FsAs::for_read(), path).await
+}
+
+/// [`list_dir`], read as `who` (#3669). With nobody signed in it is refused
+/// outright, the roots view included, so the drawer says so as it opens.
+pub(crate) async fn list_dir_as(who: &FsAs, path: &str) -> Result<DirListing> {
+    who.refuse_read(NOBODY_SIGNED_IN_TO_BROWSE)?;
     if path.is_empty() || path == "~" {
         return Ok(DirListing {
             path: roots_label(),
@@ -2603,32 +2746,43 @@ pub async fn list_dir(path: &str) -> Result<DirListing> {
         });
     }
     if path == STAGING_SENTINEL {
-        return list_staging().await;
+        return list_staging(who).await;
     }
-    list_canonical(&PathBuf::from(path)).await
+    list_canonical(who, &PathBuf::from(path)).await
 }
 
-/// Canonicalise, enumerate and shape one directory. Shared by the plain path
-/// arm and the staging sentinel so the two can never drift in timeout, entry
-/// cap or error wording.
-async fn list_canonical(pb: &std::path::Path) -> Result<DirListing> {
-    let canon =
-        std::fs::canonicalize(pb).with_context(|| format!("canonicalising {}", pb.display()))?;
-    let parent = canon.parent().map(|p| p.to_string_lossy().to_string());
-    let read = tokio::time::timeout(
-        std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS),
-        tokio::fs::read_dir(&canon),
-    )
-    .await
-    .map_err(|_| anyhow!("listing timed out"))?
-    .with_context(|| format!("reading {}", canon.display()))?;
-
-    let entries = collect_dir_entries(read).await;
-    Ok(DirListing {
-        path: canon.to_string_lossy().to_string(),
-        parent,
-        entries,
-    })
+/// Canonicalise, enumerate and shape one directory, as `who`. Shared by the
+/// plain path arm and the staging sentinel so the two can never drift in
+/// timeout, entry cap or error wording.
+async fn list_canonical(who: &FsAs, pb: &std::path::Path) -> Result<DirListing> {
+    let listed = async {
+        // #3669 — resolving and opening the folder is one step as `who`,
+        // under the timeout that always bounded the open. Resolving moved
+        // off the async worker with it, so a share that hangs cannot stall
+        // one. The entries are read after, untimed as before, through the
+        // handle that step opened.
+        let asked = pb.to_path_buf();
+        let (canon, read) = tokio::time::timeout(
+            std::time::Duration::from_secs(DIR_LIST_TIMEOUT_SECS),
+            who.run(move || {
+                let canon = std::fs::canonicalize(&asked)
+                    .with_context(|| format!("canonicalising {}", asked.display()))?;
+                let read = std::fs::read_dir(&canon)
+                    .with_context(|| format!("reading {}", canon.display()))?;
+                Ok((canon, read))
+            }),
+        )
+        .await
+        .map_err(|_| anyhow!("listing timed out"))??;
+        let entries = who.run(move || Ok(collect_dir_entries(read))).await?;
+        Ok::<_, anyhow::Error>(DirListing {
+            parent: canon.parent().map(|p| p.to_string_lossy().to_string()),
+            path: canon.to_string_lossy().to_string(),
+            entries,
+        })
+    }
+    .await;
+    who.explain_refusal(&pb.to_string_lossy(), listed)
 }
 
 /// Resolve [`STAGING_SENTINEL`] against THIS host's layout.
@@ -2646,8 +2800,13 @@ async fn list_canonical(pb: &std::path::Path) -> Result<DirListing> {
 /// contract is "always lands somewhere real", so then the nearest ancestor
 /// that exists is listed, `%PROGRAMDATA%` at the furthest. No wider than the
 /// plain path arm, which lists any directory the caller names.
+///
+/// #3669 — the folder is found as the service, and listed as `who`: on a
+/// machine-wide install the service's folder is SYSTEM's and the
+/// Administrators', so a person without an elevated administrator's rights
+/// is refused, and told so.
 #[cfg(target_os = "windows")]
-async fn list_staging() -> Result<DirListing> {
+async fn list_staging(who: &FsAs) -> Result<DirListing> {
     let staging = staging_root_windows();
     let target = if staging.is_dir() {
         staging
@@ -2655,7 +2814,7 @@ async fn list_staging() -> Result<DirListing> {
         let root = crate::appdirs::machine_global_dir();
         nearest_existing_dir(&root).unwrap_or(root)
     };
-    list_canonical(&target).await
+    list_canonical(who, &target).await
 }
 
 /// The deepest directory that exists on `path`'s way up: `path` itself when
@@ -2673,26 +2832,26 @@ fn nearest_existing_dir(path: &std::path::Path) -> Option<PathBuf> {
 /// so there is no single staging root to open. Say so rather than inventing a
 /// path that would then be wrong in a new way.
 #[cfg(not(target_os = "windows"))]
-async fn list_staging() -> Result<DirListing> {
+async fn list_staging(_who: &FsAs) -> Result<DirListing> {
     Err(anyhow!(
         "this host has no single staging root — non-Windows agents stage \
          alongside each destination"
     ))
 }
 
-async fn collect_dir_entries(mut read: tokio::fs::ReadDir) -> Vec<DirEntryView> {
+/// The entries of a folder [`list_canonical`] opened: at most 10 000, the
+/// listing ending at its first error.
+fn collect_dir_entries(read: std::fs::ReadDir) -> Vec<DirEntryView> {
     let mut entries: Vec<DirEntryView> = Vec::new();
-    let mut count: usize = 0;
-    while let Ok(Some(entry)) = read.next_entry().await {
-        count += 1;
-        if count > 10_000 {
+    for entry in read.take(10_000) {
+        let Ok(entry) = entry else {
             break;
-        }
+        };
         let name = match entry.file_name().to_str() {
             Some(s) => s.to_string(),
             None => continue, // skip non-UTF-8 names
         };
-        let meta = match entry.metadata().await {
+        let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue, // permission denied / vanished — skip
         };
@@ -2797,13 +2956,36 @@ impl FilesHandler {
     /// (folder zips have unknown size up front — it's a streaming
     /// stream).
     pub async fn begin_outgoing_zip(&self, id: String, path: &str) -> Result<OutgoingOffer> {
-        let resolved = validate_outgoing_path(path).context("validating folder path")?;
-        let meta = tokio::fs::metadata(&resolved)
-            .await
-            .with_context(|| format!("stat {}", resolved.display()))?;
-        if !meta.is_dir() {
-            return Err(anyhow!("not a directory: {}", resolved.display()));
-        }
+        self.begin_outgoing_zip_as(FsAs::for_read(), id, path).await
+    }
+
+    /// [`Self::begin_outgoing_zip`], read as `who` (#3669): the folder is
+    /// resolved and opened for listing in one step as them, and the offer
+    /// carries them to the walk.
+    pub(crate) async fn begin_outgoing_zip_as(
+        &self,
+        who: FsAs,
+        id: String,
+        path: &str,
+    ) -> Result<OutgoingOffer> {
+        who.refuse_read(NOBODY_SIGNED_IN_TO_SEND)?;
+        let asked = path.to_string();
+        let checked = who
+            .run(move || {
+                let resolved = validate_outgoing_path(&asked).context("validating folder path")?;
+                let meta = std::fs::metadata(&resolved)
+                    .with_context(|| format!("stat {}", resolved.display()))?;
+                if !meta.is_dir() {
+                    return Err(anyhow!("not a directory: {}", resolved.display()));
+                }
+                // A folder the reader may not list is refused here, saying
+                // why, rather than sent as an empty zip that looks complete.
+                std::fs::read_dir(&resolved)
+                    .with_context(|| format!("reading {}", resolved.display()))?;
+                Ok(resolved)
+            })
+            .await;
+        let resolved = who.explain_refusal(path, checked)?;
         let folder_name = resolved
             .file_name()
             .and_then(|s| s.to_str())
@@ -2824,6 +3006,7 @@ impl FilesHandler {
             id: id.clone(),
             path: resolved.clone(),
             size: 0, // unknown for streaming zip
+            file: None,
             cancel: cancel.clone(),
             _active_guard: ActiveTransferGuard::new(),
         });
@@ -2834,6 +3017,7 @@ impl FilesHandler {
             size: None,
             mime: Some("application/zip"),
             cancel,
+            who,
         })
     }
 }
@@ -2854,9 +3038,16 @@ impl FilesHandler {
 /// for log/source folders can use a normal compress-then-download
 /// workflow — that's not the use case for the live remote-control
 /// drawer.
-pub async fn walk_and_zip<W>(
+///
+/// #3669 — every step that touches the folder runs as `who`, the reader the
+/// download began for: the root resolved, each folder listed, each file
+/// opened. What they may not open is left out, as an unreadable entry always
+/// was; a step whose identity fails (they signed out) ends the walk with an
+/// error, so a zip is never cut short to look complete.
+pub(crate) async fn walk_and_zip<W>(
     writer: W,
     root: &std::path::Path,
+    who: &FsAs,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<u32>
 where
@@ -2867,8 +3058,15 @@ where
     use std::collections::HashSet;
     use tokio_util::compat::FuturesAsyncWriteCompatExt;
 
-    let root_canon = std::fs::canonicalize(root)
-        .with_context(|| format!("canonicalising {}", root.display()))?;
+    who.refuse_read(NOBODY_SIGNED_IN_TO_SEND)?;
+    let root_canon = {
+        let root = root.to_path_buf();
+        who.run(move || {
+            std::fs::canonicalize(&root)
+                .with_context(|| format!("canonicalising {}", root.display()))
+        })
+        .await?
+    };
 
     let mut zip = ZipFileWriter::with_tokio(writer);
     let mut stack: Vec<PathBuf> = vec![root_canon.clone()];
@@ -2880,14 +3078,21 @@ where
         if cancel.is_cancelled() {
             return Err(anyhow!("cancelled by browser"));
         }
-        let mut read_dir = match tokio::fs::read_dir(&dir).await {
-            Ok(r) => r,
+        // The folder, listed in one step as `who`: no more entries than the
+        // cap leaves room for, plus one to trip it.
+        let room = ZIP_MAX_ENTRIES.saturating_sub(count).saturating_add(1);
+        let listed = {
+            let dir = dir.clone();
+            who.run(move || Ok(zip_folder_entries(&dir, room))).await?
+        };
+        let entries = match listed {
+            Ok(entries) => entries,
             Err(e) => {
                 tracing::debug!(dir = %dir.display(), %e, "zip walk: skipping unreadable dir");
                 continue;
             }
         };
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
+        for (path, kind) in entries {
             if cancel.is_cancelled() {
                 return Err(anyhow!("cancelled by browser"));
             }
@@ -2897,26 +3102,20 @@ where
                     "folder exceeds {ZIP_MAX_ENTRIES} entries — refusing to stream"
                 ));
             }
-            let path = entry.path();
-            let meta = match entry.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue, // permission denied — skip
-            };
-
-            if meta.is_dir() {
-                // Cycle protection: canonical path already visited?
-                // (Else branch — already-visited — is a silent skip:
-                // symlink loop or hard-linked dir.)
-                if let Ok(canon) = std::fs::canonicalize(&path)
-                    && visited.insert(canon)
-                {
-                    stack.push(path);
+            match kind {
+                // Cycle protection: canonical path already visited? (Else —
+                // already visited, or no canonical path — a silent skip: a
+                // symlink loop or a hard-linked dir.)
+                ZipEntry::Folder(canon) => {
+                    if let Some(canon) = canon
+                        && visited.insert(canon)
+                    {
+                        stack.push(path);
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            if !meta.is_file() {
-                continue; // skip pipes / sockets / device files
+                ZipEntry::Skip => continue,
+                ZipEntry::File => {}
             }
             if is_agent_secret(&path) {
                 // A folder download of e.g. the machine-global root carries
@@ -2940,12 +3139,17 @@ where
                 continue;
             }
 
-            // Open the file + stream into a zip entry. Failures on
-            // a single file are logged at debug and skipped — we
-            // don't want one unreadable file to abort the whole
-            // archive.
-            let mut src = match tokio::fs::File::open(&path).await {
-                Ok(f) => f,
+            // Open the file in a step of its own as `who`, and stream it
+            // into a zip entry through that handle. A file that will not
+            // open is logged at debug and skipped — one unreadable file
+            // should not abort the whole archive — but an identity that
+            // fails ends the walk.
+            let opened = {
+                let path = path.clone();
+                who.run(move || Ok(std::fs::File::open(&path))).await?
+            };
+            let mut src = match opened {
+                Ok(f) => tokio::fs::File::from_std(f),
                 Err(e) => {
                     tracing::debug!(file = %path.display(), %e, "zip walk: skipping unreadable file");
                     continue;
@@ -2977,6 +3181,41 @@ where
         return Err(anyhow!("zip finalise failed: {e}"));
     }
     Ok(count)
+}
+
+/// #3669 — one entry of a folder a zip walk lists, as its listing step saw it.
+enum ZipEntry {
+    /// A folder, with its canonical path for the cycle check when it has one.
+    Folder(Option<PathBuf>),
+    /// A regular file.
+    File,
+    /// Anything else, or an entry whose metadata would not read: skipped, and
+    /// counted. `DirEntry::metadata` does not follow a link, so a link is
+    /// one too.
+    Skip,
+}
+
+/// #3669 — one folder of a zip walk, listed in one step as the reader: each
+/// entry's path and kind, at most `room` of them, the listing ending at its
+/// first error as it always did. `Err` when the reader may not list it.
+fn zip_folder_entries(
+    dir: &std::path::Path,
+    room: u32,
+) -> std::io::Result<Vec<(PathBuf, ZipEntry)>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)?.take(room as usize) {
+        let Ok(entry) = entry else {
+            break;
+        };
+        let path = entry.path();
+        let kind = match entry.metadata() {
+            Ok(meta) if meta.is_dir() => ZipEntry::Folder(std::fs::canonicalize(&path).ok()),
+            Ok(meta) if meta.is_file() => ZipEntry::File,
+            _ => ZipEntry::Skip,
+        };
+        out.push((path, kind));
+    }
+    Ok(out)
 }
 
 /// Byte-count snapshot emitted after a chunk that crossed a progress
@@ -3255,6 +3494,134 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
     {
         let _ = log;
         Ok(std::env::temp_dir())
+    }
+}
+
+/// #3669 — who the Windows tests stand in, shared with the peer's tests,
+/// which drive a folder download through its pump.
+///
+/// A test runner is not SYSTEM and has no session user to ask for. So
+/// [`stand_in::person`] is the runner's own SID through a low-integrity copy
+/// of its token, the runner itself (at medium or high) plays the daemon, and
+/// [`stand_in::label_no_read_up`] makes a file or a folder one only the
+/// daemon may read. [`stand_in::reader`] stands a reader in for what
+/// [`FsAs::for_read`] answers: the public entry points (`begin_outgoing`,
+/// `begin_outgoing_zip`, `list_dir`) would otherwise always read as the
+/// daemon here, and could not be told from ones that never ask.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) mod stand_in {
+    use super::FsAs;
+    use crate::win_identity::PersonToken;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// The reader stood in, with the thread it answers on: one at a time.
+    static READER: Mutex<Option<(std::thread::ThreadId, FsAs)>> = Mutex::new(None);
+
+    /// The tests that stand a reader in take turns, each for as long as its
+    /// stand-in lives.
+    static TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// While this lives, `FsAs::for_read()` answers its reader on the thread
+    /// that stood it in.
+    pub(crate) struct Reader {
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            *READER.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Stand `who` in for what `FsAs::for_read()` answers, on this thread
+    /// only. A `#[tokio::test]` polls its whole body on its own thread, and
+    /// the tests that run beside it, which read through `for_read()` on
+    /// threads of their own, keep the daemon.
+    pub(crate) async fn reader(who: FsAs) -> Reader {
+        let turn = TURN.lock().await;
+        *READER.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((std::thread::current().id(), who));
+        Reader { _turn: turn }
+    }
+
+    /// The reader stood in for this thread, if there is one.
+    pub(super) fn reader_now() -> Option<FsAs> {
+        let held = READER.lock().unwrap_or_else(PoisonError::into_inner);
+        held.as_ref()
+            .filter(|(thread, _)| *thread == std::thread::current().id())
+            .map(|(_, who)| who.clone())
+    }
+
+    /// The person: the runner's own SID, through a low-integrity copy of
+    /// its token, with `downloads` as their Downloads.
+    pub(crate) fn person(profile: &Path, downloads: &Path) -> FsAs {
+        with_token(
+            profile,
+            downloads,
+            PersonToken::Fixed(Arc::new(low_integrity_token())),
+        )
+    }
+
+    /// [`person`], who signs out after `steps` steps: every step after
+    /// those is refused, as it is once a person has gone.
+    pub(crate) fn person_signing_out_after(steps: u32, profile: &Path) -> FsAs {
+        with_token(
+            profile,
+            profile,
+            PersonToken::SignsOutAfter {
+                token: Arc::new(low_integrity_token()),
+                steps_left: Arc::new(std::sync::atomic::AtomicU32::new(steps)),
+            },
+        )
+    }
+
+    fn low_integrity_token() -> crate::win_token::Owned {
+        crate::win_token::low_integrity_copy().expect("a low-integrity token")
+    }
+
+    fn with_token(profile: &Path, downloads: &Path, token: PersonToken) -> FsAs {
+        FsAs::Person {
+            sid: crate::win_token::own_user_sid().expect("our own SID"),
+            profile: profile.to_path_buf(),
+            downloads: Some(downloads.to_path_buf()),
+            token,
+        }
+    }
+
+    /// `path` made one that only the daemon may read: a medium label that
+    /// refuses reading up (`S:(ML;;NRNW;;;ME)`). The low-integrity person
+    /// can neither read it nor list it; the runner can. An unlabelled file
+    /// is the person's own.
+    pub(crate) fn label_no_read_up(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
+        };
+        let sddl: Vec<u16> = "S:(ML;;NRNW;;;ME)".encode_utf16().chain(Some(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated SDDL string and an out-param; the
+        // descriptor is freed below.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(ok != 0, "the no-read-up label as a descriptor");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated path and the descriptor made above.
+        let set = unsafe { SetFileSecurityW(wide.as_ptr(), LABEL_SECURITY_INFORMATION, sd) };
+        let why = std::io::Error::last_os_error();
+        // SAFETY: allocated by the conversion, freed once.
+        unsafe { LocalFree(sd as _) };
+        assert!(set != 0, "labelling {}: {why}", path.display());
     }
 }
 
@@ -3857,7 +4224,10 @@ mod tests {
         let (zip_writer, mut zip_reader) = tokio::io::duplex(64 * 1024);
         let cancel = tokio_util::sync::CancellationToken::new();
         let root = base.clone();
-        let walk = tokio::spawn(async move { walk_and_zip(zip_writer, &root, cancel).await });
+        let walk =
+            tokio::spawn(
+                async move { walk_and_zip(zip_writer, &root, &FsAs::Daemon, cancel).await },
+            );
         let drain = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut out = Vec::new();
@@ -4395,6 +4765,163 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&base).await;
     }
 
+    /// #3669 — while it lives, `path` (a file or a folder) cannot be opened
+    /// to be read or listed: on Unix its mode is 000; on Windows a handle
+    /// shares it with no one. (A DACL would not do there: a shell that
+    /// enabled its backup privilege reads through any.)
+    struct Unopenable {
+        #[cfg(unix)]
+        path: PathBuf,
+        #[cfg(unix)]
+        mode: u32,
+        #[cfg(windows)]
+        _held: std::fs::File,
+    }
+
+    impl Unopenable {
+        fn new(path: &std::path::Path) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(path).unwrap().permissions().mode();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+                Self {
+                    path: path.to_path_buf(),
+                    mode,
+                }
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_FLAG_BACKUP_SEMANTICS: the flag that opens a folder,
+                // and a file the same as without it.
+                const OPEN_A_FOLDER_TOO: u32 = 0x0200_0000;
+                let held = std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .custom_flags(OPEN_A_FOLDER_TOO)
+                    .open(path)
+                    .unwrap();
+                Self { _held: held }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Unopenable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    /// #3669 — on every install, a folder that cannot be listed is refused
+    /// when its download begins, naming it, where it used to be offered and
+    /// then sent as an empty zip that looked complete. A runner that lists it
+    /// anyway (root through mode 000) skips.
+    #[tokio::test]
+    async fn an_unlistable_folder_is_refused_when_its_download_begins() {
+        let temp = tempfile::tempdir().unwrap();
+        let shut = temp.path().join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::write(shut.join("inside.txt"), b"x").unwrap();
+        let held = Unopenable::new(&shut);
+        if std::fs::read_dir(&shut).is_ok() {
+            eprintln!(
+                "SKIPPED an_unlistable_folder_is_refused_when_its_download_begins: this runner \
+                 lists a folder it was refused (root reads through mode 000), so this test \
+                 proved nothing here"
+            );
+            return;
+        }
+        let begun = FilesHandler::new()
+            .begin_outgoing_zip("z3669-0".into(), &shut.to_string_lossy())
+            .await;
+        drop(held);
+        let Err(refused) = begun else {
+            panic!("a folder that cannot be listed was offered");
+        };
+        assert!(
+            format!("{refused}").starts_with("reading "),
+            "the reason names the folder: {refused:#}"
+        );
+        let io = refused
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .unwrap_or_else(|| panic!("an I/O refusal: {refused:#}"));
+        #[cfg(unix)]
+        assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied, "{io}");
+        #[cfg(windows)]
+        assert_eq!(io.raw_os_error(), Some(32), "a sharing violation: {io}");
+    }
+
+    /// #3669 — on every install, a download opens its file when it begins,
+    /// before its offer: a file that will not open is refused at once,
+    /// naming it, where it used to be offered and then fail in the pump. A
+    /// runner that opens it anyway (root through mode 000) skips.
+    #[tokio::test]
+    async fn a_file_that_will_not_open_is_refused_before_its_offer() {
+        let temp = tempfile::tempdir().unwrap();
+        let shut = temp.path().join("shut.txt");
+        std::fs::write(&shut, b"x").unwrap();
+        let held = Unopenable::new(&shut);
+        if std::fs::File::open(&shut).is_ok() {
+            eprintln!(
+                "SKIPPED a_file_that_will_not_open_is_refused_before_its_offer: this runner \
+                 opens a file it was refused (root reads through mode 000), so this test \
+                 proved nothing here"
+            );
+            return;
+        }
+        let begun = FilesHandler::new()
+            .begin_outgoing("o3669-0".into(), &shut.to_string_lossy())
+            .await;
+        drop(held);
+        let Err(refused) = begun else {
+            panic!("a file that will not open was offered");
+        };
+        assert!(
+            format!("{refused}").starts_with("opening "),
+            "the reason names the file: {refused:#}"
+        );
+    }
+
+    /// #3669 — on every install, a listing resolves its path inside its timed
+    /// step, on a blocking thread, never on the async worker: with the one
+    /// blocking thread busy, a path that does not exist answers "listing
+    /// timed out", where it used to be resolved, and refused, on the worker
+    /// itself. So a share that hangs while it resolves holds a blocking
+    /// thread, not a worker.
+    #[test]
+    fn a_listing_resolves_its_path_off_the_async_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("not-there").to_string_lossy().into_owned();
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (busy, is_busy) = tokio::sync::oneshot::channel::<()>();
+            let holder = tokio::task::spawn_blocking(move || {
+                let _ = busy.send(());
+                let _ = held.recv();
+            });
+            is_busy.await.unwrap();
+            let listed = list_dir_as(&FsAs::Daemon, &missing).await;
+            // Free the thread before any assertion, or a failure would hang
+            // the runtime's drop instead of failing.
+            release.send(()).unwrap();
+            holder.await.unwrap();
+            let Err(why) = listed else {
+                panic!("a path that does not exist was listed");
+            };
+            assert_eq!(format!("{why}"), "listing timed out", "{why:#}");
+        });
+    }
+
     #[tokio::test]
     async fn walk_and_zip_round_trip() {
         // Build a 3-file folder, zip it, parse the zip back and
@@ -4429,7 +4956,7 @@ mod tests {
         let folder_clone = folder.clone();
         let cancel_clone = cancel.clone();
         let walk_handle = tokio::spawn(async move {
-            crate::files::walk_and_zip(zip_writer, &folder_clone, cancel_clone).await
+            crate::files::walk_and_zip(zip_writer, &folder_clone, &FsAs::Daemon, cancel_clone).await
         });
         let drain_handle = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
@@ -5511,6 +6038,22 @@ mod seat_user_tests {
         }
     }
 
+    /// #3669 — a read runs as someone other than the daemon only on a
+    /// machine-wide Windows install, whose worker is LocalSystem; every other
+    /// install reads as the daemon, as it always has. A test process is never
+    /// LocalSystem, so here a read is the daemon's on every OS, and on Windows
+    /// it takes whom a write takes.
+    #[test]
+    fn reads_take_the_daemon_unless_local_system() {
+        assert_eq!(FsAs::for_read(), FsAs::Daemon);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            FsAs::for_read(),
+            FsAs::now(),
+            "a read and a write take the same person"
+        );
+    }
+
     /// #3048 — the Windows twin of `as_root`: a machine-wide (SystemContext)
     /// worker writes a received file AS the person signed in to its session.
     ///
@@ -5526,20 +6069,9 @@ mod seat_user_tests {
     #[cfg(target_os = "windows")]
     mod as_the_session_person {
         use super::*;
+        use crate::files::stand_in::{self, label_no_read_up, person};
         use crate::win_identity::{PersonToken, SessionPerson};
         use std::path::Path;
-
-        /// The person: the runner's own SID, through a low-integrity copy of
-        /// its token, with `downloads` as their Downloads.
-        fn person(profile: &Path, downloads: &Path) -> FsAs {
-            let token = crate::win_token::low_integrity_copy().expect("a low-integrity token");
-            FsAs::Person {
-                sid: crate::win_token::own_user_sid().expect("our own SID"),
-                profile: profile.to_path_buf(),
-                downloads: Some(downloads.to_path_buf()),
-                token: PersonToken::Fixed(std::sync::Arc::new(token)),
-            }
-        }
 
         fn system32(tool: &str, args: &[&std::ffi::OsStr]) {
             let out = std::process::Command::new(crate::appdirs::system32_tool(tool))
@@ -5751,7 +6283,7 @@ mod seat_user_tests {
                 .await
                 .expect_err("another person's transfer");
             assert!(
-                format!("{refused:#}").contains("not signed in"),
+                format!("{refused:#}").contains(NOT_THE_PERSON),
                 "{refused:#}"
             );
 
@@ -5798,9 +6330,11 @@ mod seat_user_tests {
             );
         }
 
-        /// Who a transfer writes as: the person signed in, on a LocalSystem
-        /// worker; nobody there refuses; anything else, or the switch off, is
-        /// the daemon itself.
+        /// Who a transfer acts as: the person signed in, on a LocalSystem
+        /// worker; nobody there refuses; another account, or the switch off,
+        /// is the daemon itself, which never asks for the person. #3669 — a
+        /// worker that could not read its own token counts as LocalSystem:
+        /// the person, or nobody, never itself (fail closed).
         #[test]
         fn fs_as_for_takes_the_person_only_as_local_system() {
             let p = SessionPerson {
@@ -5808,21 +6342,30 @@ mod seat_user_tests {
                 profile: r"C:\Users\p".into(),
                 downloads: Some(r"C:\Users\p\Downloads".into()),
             };
+            let them = FsAs::Person {
+                sid: p.sid.clone(),
+                profile: p.profile.clone(),
+                downloads: p.downloads.clone(),
+                token: PersonToken::Session,
+            };
+            assert_eq!(fs_as_for(Some(true), true, || Some(p.clone())), them);
+            assert_eq!(fs_as_for(Some(true), true, || None), FsAs::Nobody);
+            let not_asked = || -> Option<SessionPerson> { panic!("the person was asked for") };
+            assert_eq!(fs_as_for(Some(false), true, not_asked), FsAs::Daemon);
             assert_eq!(
-                fs_as_for(true, true, Some(p.clone())),
-                FsAs::Person {
-                    sid: p.sid.clone(),
-                    profile: p.profile.clone(),
-                    downloads: p.downloads.clone(),
-                    token: PersonToken::Session,
-                }
-            );
-            assert_eq!(fs_as_for(true, true, None), FsAs::Nobody);
-            assert_eq!(fs_as_for(false, true, Some(p.clone())), FsAs::Daemon);
-            assert_eq!(
-                fs_as_for(true, false, Some(p)),
+                fs_as_for(Some(true), false, not_asked),
                 FsAs::Daemon,
                 "the switch keeps the daemon's own identity"
+            );
+            assert_eq!(
+                fs_as_for(None, true, || Some(p.clone())),
+                them,
+                "an unreadable token takes the person"
+            );
+            assert_eq!(
+                fs_as_for(None, true, || None),
+                FsAs::Nobody,
+                "an unreadable token with no one signed in refuses"
             );
         }
 
@@ -5845,15 +6388,13 @@ mod seat_user_tests {
             std::fs::create_dir_all(&redirected).unwrap();
             let machine = crate::appdirs::machine_global_dir().join("uploads");
             let worker = |known: Option<&Path>| {
-                fs_as_for(
-                    true,
-                    true,
+                fs_as_for(Some(true), true, || {
                     Some(SessionPerson {
                         sid: "S-1-5-21-1-2-3-1001".into(),
                         profile: profile.clone(),
                         downloads: known.map(Path::to_path_buf),
-                    }),
-                )
+                    })
+                })
             };
             // (their known folder, where a file lands, what the card shows)
             let cases = [
@@ -5873,6 +6414,341 @@ mod seat_user_tests {
                     "the card, with the known folder {known:?}"
                 );
             }
+        }
+
+        /// What the viewer is told when Windows refuses a read to the person.
+        fn not_allowed(path: &Path) -> String {
+            format!(
+                "{}: Windows refused to open it for the person signed in to this computer",
+                path.display()
+            )
+        }
+
+        /// The zip of `root`, walked as `who`.
+        async fn zip_as(who: &FsAs, root: &Path) -> Vec<u8> {
+            use tokio::io::AsyncReadExt;
+            let (zip_writer, mut zip_reader) = tokio::io::duplex(64 * 1024);
+            let (who, root) = (who.clone(), root.to_path_buf());
+            let walk = tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                walk_and_zip(zip_writer, &root, &who, cancel).await
+            });
+            let mut zip = Vec::new();
+            zip_reader.read_to_end(&mut zip).await.unwrap();
+            walk.await.unwrap().expect("walk_and_zip");
+            zip
+        }
+
+        /// #3669 — a download is opened as the person: their own file is
+        /// offered and its bytes are the ones sent; a file only the daemon may
+        /// read is refused, saying why; the daemon itself is offered that file
+        /// (the control).
+        #[tokio::test]
+        async fn a_download_opens_the_file_as_the_person() {
+            use tokio::io::AsyncReadExt;
+            let temp = tempfile::tempdir().unwrap();
+            let theirs = temp.path().join("theirs.txt");
+            let not_theirs = temp.path().join("daemon-only.txt");
+            std::fs::write(&theirs, b"the person's file").unwrap();
+            std::fs::write(&not_theirs, b"only the daemon reads this file").unwrap();
+            label_no_read_up(&not_theirs);
+            let me = person(temp.path(), temp.path());
+            let at = |p: &Path| p.to_string_lossy().into_owned();
+            let h = FilesHandler::new();
+
+            let offer = h
+                .begin_outgoing_as(me.clone(), "r3669-1".into(), &at(&theirs))
+                .await
+                .expect("the person's own file");
+            assert_eq!(offer.size, Some(17));
+            let mut sent = Vec::new();
+            h.open_outgoing("r3669-1")
+                .await
+                .expect("the open file")
+                .read_to_end(&mut sent)
+                .await
+                .unwrap();
+            assert_eq!(sent, b"the person's file");
+            h.finish_outgoing("r3669-1").await;
+
+            let Err(refused) = h
+                .begin_outgoing_as(me, "r3669-2".into(), &at(&not_theirs))
+                .await
+            else {
+                panic!("a file only the daemon may read was offered to the person");
+            };
+            assert_eq!(format!("{refused}"), not_allowed(&not_theirs));
+
+            h.begin_outgoing_as(FsAs::Daemon, "r3669-3".into(), &at(&not_theirs))
+                .await
+                .expect("the daemon reads it");
+            h.finish_outgoing("r3669-3").await;
+        }
+
+        /// #3669 — a folder download opens every entry as the person, not only
+        /// its root: their file is in the zip; a file only the daemon may
+        /// read, and one inside a folder only the daemon may list, are left
+        /// out, as an unreadable file always was; the daemon itself zips all
+        /// three (the control). A folder the person may not list is refused
+        /// when the download begins, saying why, never sent as an empty zip.
+        #[tokio::test]
+        async fn a_folder_download_opens_every_entry_as_the_person() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("folder");
+            let shut = root.join("daemon-only");
+            std::fs::create_dir_all(&shut).unwrap();
+            std::fs::write(root.join("theirs.txt"), b"the person's file").unwrap();
+            std::fs::write(root.join("not-theirs.txt"), b"only the daemon reads this").unwrap();
+            std::fs::write(shut.join("inside.txt"), b"only the daemon lists this").unwrap();
+            label_no_read_up(&root.join("not-theirs.txt"));
+            label_no_read_up(&shut);
+            let me = person(temp.path(), temp.path());
+            let has = |zip: &[u8], needle: &[u8]| zip.windows(needle.len()).any(|w| w == needle);
+
+            let theirs = zip_as(&me, &root).await;
+            assert!(has(&theirs, b"the person's file"), "their file is in");
+            assert!(
+                !has(&theirs, b"only the daemon reads this"),
+                "a file they may not read is not"
+            );
+            assert!(
+                !has(&theirs, b"only the daemon lists this"),
+                "nor one inside a folder they may not list"
+            );
+            let all = zip_as(&FsAs::Daemon, &root).await;
+            for needle in [
+                &b"the person's file"[..],
+                b"only the daemon reads this",
+                b"only the daemon lists this",
+            ] {
+                assert!(has(&all, needle), "the daemon zips {needle:?}");
+            }
+
+            let Err(refused) = FilesHandler::new()
+                .begin_outgoing_zip_as(me, "z3669-1".into(), &shut.to_string_lossy())
+                .await
+            else {
+                panic!("a folder the person may not list was offered to them");
+            };
+            assert_eq!(format!("{refused}"), not_allowed(&shut));
+        }
+
+        /// #3669 — the drawer lists a folder as the person: theirs lists; one
+        /// only the daemon may list is refused, saying why; the daemon itself
+        /// lists it (the control).
+        #[tokio::test]
+        async fn a_listing_runs_as_the_person() {
+            let temp = tempfile::tempdir().unwrap();
+            let theirs = temp.path().join("theirs");
+            let shut = temp.path().join("daemon-only");
+            std::fs::create_dir(&theirs).unwrap();
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(theirs.join("a.txt"), b"a").unwrap();
+            std::fs::write(shut.join("b.txt"), b"b").unwrap();
+            label_no_read_up(&shut);
+            let me = person(temp.path(), temp.path());
+            let at = |p: &Path| p.to_string_lossy().into_owned();
+
+            let listed = list_dir_as(&me, &at(&theirs))
+                .await
+                .expect("their folder lists");
+            let names: Vec<_> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["a.txt"]);
+            let Err(refused) = list_dir_as(&me, &at(&shut)).await else {
+                panic!("a folder only the daemon may list was listed for the person");
+            };
+            assert_eq!(format!("{refused}"), not_allowed(&shut));
+            let control = list_dir_as(&FsAs::Daemon, &at(&shut))
+                .await
+                .expect("the daemon lists it");
+            assert_eq!(control.entries.len(), 1);
+        }
+
+        /// #3669 — the wiring, not only the step: `begin_outgoing`, which
+        /// `files:get` calls, reads as whoever `FsAs::for_read()` answers.
+        /// With the person stood in, their own file is offered as theirs, and
+        /// a file only the daemon may read is refused, saying why. An entry
+        /// point that read as the daemon would offer it.
+        #[tokio::test]
+        async fn files_get_reads_as_the_reader_for_read_answers() {
+            let temp = tempfile::tempdir().unwrap();
+            let theirs = temp.path().join("theirs.txt");
+            let not_theirs = temp.path().join("daemon-only.txt");
+            std::fs::write(&theirs, b"the person's file").unwrap();
+            std::fs::write(&not_theirs, b"only the daemon reads this file").unwrap();
+            label_no_read_up(&not_theirs);
+            let _as = stand_in::reader(person(temp.path(), temp.path())).await;
+            let h = FilesHandler::new();
+
+            let offer = h
+                .begin_outgoing("e3669-1".into(), &theirs.to_string_lossy())
+                .await
+                .expect("the person's own file");
+            let me = crate::win_token::own_user_sid();
+            assert_eq!(offer.who.person_sid(), me.as_deref(), "offered as theirs");
+            h.finish_outgoing("e3669-1").await;
+            let Err(refused) = h
+                .begin_outgoing("e3669-2".into(), &not_theirs.to_string_lossy())
+                .await
+            else {
+                panic!("files:get offered a file only the daemon may read: it read as the daemon");
+            };
+            assert_eq!(format!("{refused}"), not_allowed(&not_theirs));
+        }
+
+        /// #3669 — `list_dir`, which `files:dir` calls, lists as whoever
+        /// `FsAs::for_read()` answers: with the person stood in, their folder
+        /// lists, and one only the daemon may list is refused, saying why.
+        #[tokio::test]
+        async fn files_dir_lists_as_the_reader_for_read_answers() {
+            let temp = tempfile::tempdir().unwrap();
+            let theirs = temp.path().join("theirs");
+            let shut = temp.path().join("daemon-only");
+            std::fs::create_dir(&theirs).unwrap();
+            std::fs::create_dir(&shut).unwrap();
+            std::fs::write(theirs.join("a.txt"), b"a").unwrap();
+            std::fs::write(shut.join("b.txt"), b"b").unwrap();
+            label_no_read_up(&shut);
+            let _as = stand_in::reader(person(temp.path(), temp.path())).await;
+
+            let listed = list_dir(&theirs.to_string_lossy())
+                .await
+                .expect("their folder lists");
+            let names: Vec<_> = listed.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, ["a.txt"]);
+            let Err(refused) = list_dir(&shut.to_string_lossy()).await else {
+                panic!(
+                    "files:dir listed a folder only the daemon may list: it listed as the daemon"
+                );
+            };
+            assert_eq!(format!("{refused}"), not_allowed(&shut));
+        }
+
+        /// #3669 — a person who signs out partway through a folder download
+        /// ends its walk in an error, after the entries already written:
+        /// `walk_and_zip` returns `Err`, so the pump sends `files:error`,
+        /// never the `files:eof` that would pass a short zip off as whole.
+        /// The steps: the root resolved (1) and listed (2), the first file
+        /// opened (3); by the second file they have gone.
+        #[tokio::test]
+        async fn a_walk_whose_person_signs_out_ends_in_an_error_not_a_short_zip() {
+            use tokio::io::AsyncReadExt;
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("folder");
+            std::fs::create_dir(&root).unwrap();
+            // NTFS lists a folder in name order.
+            std::fs::write(root.join("a.txt"), b"the first file").unwrap();
+            std::fs::write(root.join("b.txt"), b"the second file").unwrap();
+            let who = stand_in::person_signing_out_after(3, temp.path());
+            let (zip_writer, mut zip_reader) = tokio::io::duplex(64 * 1024);
+            let walk = tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                walk_and_zip(zip_writer, &root, &who, cancel).await
+            });
+            let mut zip = Vec::new();
+            zip_reader.read_to_end(&mut zip).await.unwrap();
+            let walked = walk.await.unwrap();
+            let has = |needle: &[u8]| zip.windows(needle.len()).any(|w| w == needle);
+            assert!(has(b"the first file"), "the entry written before they went");
+            assert!(!has(b"the second file"), "none after");
+            assert!(
+                !has(b"PK\x05\x06"),
+                "no end record: never passed off as whole"
+            );
+            let why = walked.expect_err("the walk ends in an error");
+            assert_eq!(format!("{why}"), NOT_THE_PERSON);
+        }
+
+        /// #3669 — with nobody signed in, every read is refused before
+        /// anything is touched, with a reason the viewer shows: a download, a
+        /// folder download and its walk say there is no one to send it as;
+        /// the drawer (a folder, the roots, the staging button) says there is
+        /// no one to browse as.
+        #[tokio::test]
+        async fn nobody_signed_in_refuses_every_read_with_a_reason() {
+            const SEND: &str = "Nobody is signed in to this computer to send the file";
+            const BROWSE: &str = "Nobody is signed in to this computer to browse its files";
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp.path().join("x.txt");
+            std::fs::write(&file, b"x").unwrap();
+            let folder = temp.path().to_string_lossy().into_owned();
+            let h = FilesHandler::new();
+
+            let Err(get) = h
+                .begin_outgoing_as(FsAs::Nobody, "n3669-1".into(), &file.to_string_lossy())
+                .await
+            else {
+                panic!("a download began with nobody signed in");
+            };
+            assert_eq!(format!("{get}"), SEND);
+            let Err(zip) = h
+                .begin_outgoing_zip_as(FsAs::Nobody, "n3669-2".into(), &folder)
+                .await
+            else {
+                panic!("a folder download began with nobody signed in");
+            };
+            assert_eq!(format!("{zip}"), SEND);
+            let (zip_writer, _zip_reader) = tokio::io::duplex(64 * 1024);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let walked = walk_and_zip(zip_writer, temp.path(), &FsAs::Nobody, cancel).await;
+            assert_eq!(format!("{}", walked.expect_err("a walk as nobody")), SEND);
+            for path in [folder.as_str(), "", "~", STAGING_SENTINEL] {
+                let Err(dir) = list_dir_as(&FsAs::Nobody, path).await else {
+                    panic!("{path:?} was listed with nobody signed in");
+                };
+                assert_eq!(format!("{dir}"), BROWSE, "{path:?}");
+            }
+        }
+
+        /// Whether this thread is impersonating now: it has a token of its own.
+        fn impersonating() -> bool {
+            use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_TOKEN};
+            use windows_sys::Win32::Security::TOKEN_QUERY;
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+            let mut token = std::ptr::null_mut();
+            // SAFETY: this thread's pseudo-handle and an out-param, closed below.
+            if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0 {
+                // SAFETY: the token just opened, closed once.
+                unsafe { CloseHandle(token) };
+                return true;
+            }
+            let why = std::io::Error::last_os_error();
+            assert_eq!(
+                why.raw_os_error(),
+                Some(ERROR_NO_TOKEN as i32),
+                "no token of its own: {why}"
+            );
+            false
+        }
+
+        /// #3669 — the lifetime #3048's steps have, pinned for the reads that
+        /// now take them: a step as the person impersonates on its blocking
+        /// thread, and the next job on that same thread does not, after a
+        /// step that panicked too. No other thread ever carries the token.
+        #[test]
+        fn a_step_as_the_person_never_outlives_itself() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let me = person(temp.path(), temp.path());
+            let probe = || Ok((impersonating(), std::thread::current().id()));
+            runtime.block_on(async {
+                let (inside, thread) = me.run(probe).await.unwrap();
+                assert!(inside, "a step as the person impersonates");
+                let (after, next) = FsAs::Daemon.run(probe).await.unwrap();
+                assert_eq!(next, thread, "the one blocking thread");
+                assert!(!after, "the next job on it does not");
+                let panicked = me
+                    .run(|| -> Result<()> { panic!("a step that panics") })
+                    .await;
+                assert!(panicked.is_err(), "a panicking step fails");
+                let (after_panic, next) = FsAs::Daemon.run(probe).await.unwrap();
+                assert_eq!(next, thread, "the same thread, kept after the panic");
+                assert!(!after_panic, "a panicking step ends its impersonation");
+                assert!(!impersonating(), "the runtime's own thread never did");
+            });
         }
     }
 }
