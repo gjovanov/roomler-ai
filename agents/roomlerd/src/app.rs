@@ -2861,6 +2861,7 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
     // (operator state preserved — rc.204 semantics); a NEW pair → APPEND a
     // secondary org (with its own freshly minted WG key); `--replace` →
     // legacy whole-primary rebind.
+    let folds = existing.is_some();
     let (mut cfg, outcome) = enrollment::apply_enrollment(existing, fresh, label, replace)?;
 
     // FR-51 P3 — the CREDENTIAL decided what was minted; say so when it
@@ -2943,7 +2944,14 @@ async fn enroll_cmd(config_path: &Path, opts: EnrollOptions<'_>) -> Result<()> {
         }
     }
 
-    config::save(&target_path, &cfg).map_err(|e| {
+    // #3666 — nothing folded, nothing kept: at the machine location a config
+    // that was not the machine's leaves no `.prev` and no unknown key behind.
+    if folds {
+        config::save(&target_path, &cfg)
+    } else {
+        config::save_fresh(&target_path, &cfg)
+    }
+    .map_err(|e| {
         if machine_global {
             anyhow::anyhow!(
                 "{e}\n\nWriting the machine-global config requires an elevated \
@@ -3158,7 +3166,14 @@ fn adopt_enrollment_cmd(config_path: &Path, from: &Path, take: &[String]) -> Res
         roomlerd::config_surface::apply(&mut cfg, key, value.as_deref())
             .map_err(|e| anyhow::anyhow!("--take {key}: {e}"))?;
     }
-    config::save(&target, &cfg).context("saving the adopted config")?;
+    // #3666 — nothing folded, nothing kept: at the machine location a config
+    // that was not the machine's leaves no `.prev` and no unknown key behind.
+    if previous.is_none() {
+        config::save_fresh(&target, &cfg)
+    } else {
+        config::save(&target, &cfg)
+    }
+    .context("saving the adopted config")?;
     let what = match &outcome {
         EnrollOutcome::FreshPrimary => "written fresh (no config was here)".to_string(),
         EnrollOutcome::RefreshedPrimary => {
@@ -3247,6 +3262,9 @@ async fn re_enroll_cmd(
             config_path.display()
         );
     }
+    // #3666 — a machine config is loaded, and its server sent a token, only
+    // when it was the machine's as found.
+    config::machine_config_as_found(config_path)?;
     let existing = config::load(config_path).context("loading existing config")?;
     // rc.52 BLOCKER-6: preserve the EXISTING machine_id verbatim — do
     // NOT re-derive from `config_path`. `derive_machine_id` hashes the
@@ -3345,6 +3363,9 @@ async fn re_enroll_cmd(
 /// changes on its next start. Runtime org verbs over the LocalAPI land with
 /// the desktop org-management UI in a later phase.
 fn org_cmd(config_path: &PathBuf, action: OrgAction) -> Result<()> {
+    // #3666 — a machine config is loaded, and changed or its servers sent a
+    // token, only when it was the machine's as found.
+    config::machine_config_as_found(config_path)?;
     let mut cfg = config::load(config_path).with_context(|| {
         format!(
             "loading config at {} (run `roomlerd enroll` first)",
@@ -8369,7 +8390,10 @@ mod tests {
     /// through one function (`win_service::supervisor::rung_opens`), so they
     /// cannot disagree: both refuse a machine config another account may
     /// change while the repair is off, and both take it once the repair has
-    /// put it back to SYSTEM and Administrators.
+    /// put it back to SYSTEM and Administrators. #3666 — the repair puts back
+    /// only a config an administrator's entry reached (here this elevated
+    /// account's own); one another account could write, it leaves, and both
+    /// refuse it with the repair on too.
     #[cfg(target_os = "windows")]
     #[test]
     fn the_host_and_the_worker_refuse_the_same_config() {
@@ -8379,30 +8403,39 @@ mod tests {
         if !elevated_or_skip("the host and the worker on one config") {
             return;
         }
-        let root = tempfile::tempdir().expect("tempdir");
-        let tree = enrolled_tree(root.path());
-        assert!(icacls(&tree.config(), &["/grant", "*S-1-5-32-546:(M)"]));
-        let mg = tree.config();
-        let absent = root.path().join("systemprofile").join("config.toml");
-        for switches in [
-            Switches {
-                repair: false,
-                check: true,
-            },
-            Switches::ON,
-        ] {
-            let host = config_opens_in(&tree, switches, Some(absent.clone()));
-            let ladder_opened = std::cell::Cell::new(None);
-            let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
-                let opens = rung_opens(&tree, switches, p);
-                if p == mg {
-                    ladder_opened.set(Some(opens));
-                }
-                opens
-            });
-            assert_eq!(picked, mg);
-            assert_eq!(Some(host), ladder_opened.get(), "{switches:?}");
-            assert_eq!(host, switches.repair, "{switches:?}");
+        for (account, an_administrator) in [(me(), true), (GUESTS.to_string(), false)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let tree = enrolled_tree(root.path());
+            assert!(icacls(
+                &tree.config(),
+                &["/grant", &format!("*{account}:(M)")]
+            ));
+            let mg = tree.config();
+            let absent = root.path().join("systemprofile").join("config.toml");
+            for switches in [
+                Switches {
+                    repair: false,
+                    check: true,
+                },
+                Switches::ON,
+            ] {
+                let host = config_opens_in(&tree, switches, Some(absent.clone()));
+                let ladder_opened = std::cell::Cell::new(None);
+                let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
+                    let opens = rung_opens(&tree, switches, p);
+                    if p == mg {
+                        ladder_opened.set(Some(opens));
+                    }
+                    opens
+                });
+                assert_eq!(picked, mg);
+                assert_eq!(Some(host), ladder_opened.get(), "{account}: {switches:?}");
+                assert_eq!(
+                    host,
+                    switches.repair && an_administrator,
+                    "{account}: {switches:?}"
+                );
+            }
         }
     }
 

@@ -1794,7 +1794,13 @@ jobs:
       # companion_spawn); should one appear
       # on the runner, those move to a second `--test-threads=1` step `--skip`ped
       # here — never the whole suite serial.
+      # #3666 — the machine tree's NTFS cases in this suite (the host and the
+      # worker on one config, the supervisor's open machine folder) set owners,
+      # which takes this runner's elevated token: here a runner that is not
+      # elevated fails them instead of skipping them.
       - name: Agent unit tests on Windows (the whole --lib suite)
+        env:
+          ROOMLERD_TEST_REQUIRE_ELEVATED: "1"
         run: |
           cargo test -p roomlerd --lib --features overlay-l3,ssh-server,system-context --no-fail-fast
 

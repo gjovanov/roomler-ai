@@ -162,7 +162,7 @@ step's words (`steps.rs:305`); the download's ticks and a script's lines have
 panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
-in a person's words (`label_existing`, `orchestrator_agent.rs:1878`,
+in a person's words (`label_existing`, `orchestrator_agent.rs:1880`,
 `orchestrator_unix.rs:1227`; `orchestrator_tunnel.rs:410`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
@@ -272,14 +272,14 @@ new name. Two changes close it:
 
 | Where | What it does |
 |---|---|
-| the daemon's start (`agents/roomlerd/src/app.rs:3891`, `crates/agent-core/src/config.rs:4277`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:673`, `:991`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the daemon's start (`agents/roomlerd/src/app.rs:3912`, `crates/agent-core/src/config.rs:4303`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:993`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** Once that config is there, the daemon keeps its folder to
 SYSTEM and Administrators (#3073, #3609), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1292`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1294`), and the
 install refuses it before anything is downloaded (`:295`). Before the enroll it
 also stops on a config it may not read (`agents/roomler-setup/src/machine_write.rs:157`,
 never reported as a damaged config) or a folder it may not write (`:160`). The
@@ -465,10 +465,10 @@ sequenceDiagram
 | | What it does |
 |---|---|
 | the channel (`crates/roomler-setup-core/src/step_channel.rs:166`) | a named pipe the wizard makes before the prompt, named after the step's random stage folder: the first and only instance, local clients only, and SYSTEM and Administrators alone may open it. The wizard takes one connection, the step's: its process id must be the one the shell returned (`:188`). The step opens it with identification as its security quality of service (`:255`), so the wizard can tell who connected and never act as it |
-| what crosses | the server's answer to the enroll (`Issued`, `crates/agent-core/src/enrollment.rs:197`: the server, the device and organization ids, the agent token, the machine id and name, ephemeral) and the five Advanced options, nothing else. The step builds the config with the one literal `enroll` uses (`Issued::into_config`), folds it into the machine config it read itself, and writes only the machine path: no path and no other key is on the wire (`machine_write.rs:500`, `:591`) |
-| who writes | `ConfigWriter::new` (`machine_write.rs:281`): the step's channel when there is one; an elevated wizard in its own process; and a limited wizard never, which stops the install instead (nothing enrolled, the token unused) |
+| what crosses | the server's answer to the enroll (`Issued`, `crates/agent-core/src/enrollment.rs:197`: the server, the device and organization ids, the agent token, the machine id and name, ephemeral) and the five Advanced options, nothing else. The step builds the config with the one literal `enroll` uses (`Issued::into_config`), folds it into the machine config it read itself, and writes only the machine path: no path and no other key is on the wire (`machine_write.rs:507`, `:598`) |
+| who writes | `ConfigWriter::new` (`machine_write.rs:288`): the step's channel when there is one; an elevated wizard in its own process; and a limited wizard never, which stops the install instead (nothing enrolled, the token unused) |
 | a wizard that goes away | the step reads the end of the channel and exits without writing. The service is installed and waits for a machine enrollment ([the SystemContext checklist](operator-systemcontext-smoke.md), step 2a); Setup run again writes it |
-| a step that does not finish | it ends itself after 20 minutes, never in the middle of the write (`machine_write.rs:435`) |
+| a step that does not finish | it ends itself after 20 minutes, never in the middle of the write (`machine_write.rs:442`) |
 | the step's exit codes after the install | `0x5245_0001`-`0x5245_0004` (`agents/roomler-setup/src/package_step.rs:112`): the installer ran and the enrollment was not written, so Setup says to run it again with the same token |
 
 **The enroll says how it was installed** (FR-102 P3, the install trace in
@@ -783,17 +783,41 @@ Details worth knowing:
     the account that confirms its folder-access prompt). What it inherits from
     `%PROGRAMDATA%` stays, so an attended host's daemon still stages received
     files below it;
-  - the machine folder, once it holds the machine config, becomes
-    Administrators', with SYSTEM and Administrators alone; the config, `.prev`
-    and the keys get the same, and the attempt record the same with read for
-    Users (Setup reads it as the person who started it, to say which stage of a
-    failed install failed), not inheriting, so an entry added to a folder above
-    later does not reach them;
+  - the machine folder, once it holds a machine config that was the
+    machine's as found (below), becomes Administrators', with SYSTEM and
+    Administrators alone; the config gets the same, `.prev` and the keys only
+    when that entry was closed as found too, and the attempt record the same
+    with read for Users (Setup reads it as the person who started it, to say
+    which stage of a failed install failed), not inheriting, so an entry added
+    to a folder above later does not reach them;
   - an entry owned by an administrator's own account is given to the
     Administrators group, the computer's own account database deciding (an
     account of this computer directly or through a group, a domain account
     only when the group names it directly). One owned by any other account is
     left as it is.
+
+  **The as-found rule** (#3666). A seal makes the check pass on whatever an
+  entry holds, so the repair reads the tree before it seals anything. A
+  machine config is the machine's as found only when `%PROGRAMDATA%\roomler`
+  gave no account other than an administrator a right through which the
+  machine folder in it can be replaced (to delete what `%PROGRAMDATA%\roomler`
+  holds, to delete it, or to change its permissions or owner; the right to add
+  files and folders that `%PROGRAMDATA%` hands Users does not count), and the
+  machine folder and the config gave none a right to add to or
+  change them, their owners included. Generic rights count as what they map
+  to, a deny never offsets an allow, and an entry kind the check does not read
+  counts against it. An administrator here is SYSTEM, the Administrators
+  group, TrustedInstaller, or an account the computer's own account database
+  names, as above. Outside a save the repair takes the machine folder only
+  when its config was the machine's as found, and while the folder holds a
+  config it keeps such a replace right on `%PROGRAMDATA%\roomler` as it is,
+  for the check to refuse at every start and tick. A config that was not the
+  machine's is never run, never folded into (below), and `roomlerd re-enroll`
+  and `roomlerd org` refuse it with nothing sent. Such a device stays without
+  SYSTEM mode until the entry is removed and an elevated Setup or `roomlerd
+  enroll --machine-global` writes a fresh config: an Explorer prompt confirmed
+  by an account that is an administrator only through a domain group is the
+  realistic way there.
 
   Then it checks the tree: each entry a plain folder or file, owned by SYSTEM
   or Administrators, and changeable by no other account (`.prev` where it is
@@ -821,18 +845,21 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4485`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4592`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
   again for that owner, so the entry `%PROGRAMDATA%` hands whoever made it
-  names Administrators (`machine_tree.rs:680`). A link is refused, never taken
+  names Administrators (`machine_tree.rs:868`). A link is refused, never taken
   over. What that person made below them stays theirs. Setup also seals
   `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
   that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:836`): one
-  that is not is set aside, and a fresh one is written in its place.
+  administrators once the repair has run (`machine_tree.rs:1064`), and was the
+  machine's as found before it (#3666; Setup reads it before it seals
+  `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
+  written in its place, keeping no `.prev` and no key this build does not know
+  from the files it replaces.
 - **The private network is on by default for the two machine roles** (FR-84 S2):
   the Advanced **overlay** box follows the role — checked for *Daemon — system* and
   *Daemon — machine*, unchecked for *Daemon — per user* (the WireGuard adapter
@@ -1193,7 +1220,7 @@ both spellings the daemon reads (`crates/tunnel-core/src/env.rs:197`,
 and otherwise KeepSystemContext follows the record of the last
 `enable-system-context` or `disable-system-context`. A carried switch never
 overrides that decision, so `set-service-env-var` says to use those two verbs for
-it (`agents/roomlerd/src/app.rs:6137`). A block larger than 64 KiB is not carried
+it (`agents/roomlerd/src/app.rs:6158`). A block larger than 64 KiB is not carried
 (`carry.rs:47`). An entry with no `=` after its name is left out alone, because
 the restore refuses any block that holds one, and the log names it by the name
 characters it starts with, never what follows (`carry.rs:219`, `carriable`).
@@ -1262,7 +1289,7 @@ restore writes only the new entry's `Environment`.
 **The one new way an upgrade can fail.** An entry the old release ran with but
 the new one cannot start with used to be dropped, and the upgrade succeeded. Now
 it is carried, and every SystemContext action restarts the service and waits up
-to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6004`,
+to 120 s for RUNNING (`agents/roomlerd/src/app.rs:6025`,
 `agents/roomlerd/src/win_service/environment.rs:409`):
 
 | The run | The action that runs | What that entry does to the upgrade |
@@ -1392,7 +1419,7 @@ One function decides which commands take the installer role: `is_installer_step`
 (`agents/roomlerd/src/app.rs:1404`). It gives the role to `service install` and
 `service uninstall` with `--as-service`, to `cleanup-legacy-install --target-flavour perMachine`,
 and to the three SystemContext verbs. `the_installer_role_is_what_each_msi_runs_as_local_system`
-(`agents/roomlerd/src/app.rs:7744`) reads every custom action with an `ExeCommand` in both WiX
+(`agents/roomlerd/src/app.rs:7765`) reads every custom action with an `ExeCommand` in both WiX
 files, parses the command with the CLI's own parser, and holds `Impersonate='no'` to the
 installer role and `Impersonate='yes'` to none, so a verb added to either MSI cannot miss it.
 
@@ -1408,7 +1435,7 @@ whole stack with no level, which tracing reads as TRACE in every daemon that kee
 and `init_keeps_the_level_of_the_default_filter` keeps one out. With no log folder it can
 write, the console keeps them too. One line moved:
 `service uninstall --as-service` logs `Companion login start removed.` rather than printing it
-(`agents/roomlerd/src/app.rs:5917`), and its answer stays `Service deregistered`.
+(`agents/roomlerd/src/app.rs:5938`), and its answer stays `Service deregistered`.
 
 Read the log with `roomler logs --source installer` on the device, or through `roomler exec`
 ([Fleet RPC](fleet-rpc.md)). One table names every service role's log, `ServiceLogRole::ALL`
@@ -1428,8 +1455,8 @@ step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A da
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
 beside `stderr_capture` (`.github/workflows/ci.yml:1645`). In `roomlerd`,
-`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7790`) and
-`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7823`)
+`the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7811`) and
+`a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7844`)
 pin the role per command and the end line of a failure.
 
 ## Linux
@@ -2356,7 +2383,7 @@ described above.
 ⚠️ **A stopped (`SIGSTOP`) worker cannot stand in for an old one.** When its
 daemon dies, the worker's process group becomes orphaned with a stopped member,
 so the kernel sends the whole group SIGHUP and then SIGCONT (POSIX). roomlerd
-handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3603`), so
+handles SIGTERM and SIGINT, not SIGHUP (`agents/roomlerd/src/app.rs:3624`), so
 the worker is gone before the next daemon's reap looks. That exit is abrupt, and
 the next worker counts it as a crash (`crash_count=1`). This is harmless while
 `last_known_good_version` is the running release: `should_rollback` never rolls

@@ -522,6 +522,22 @@ those children mark everything above stderr close-on-exec before they exec, and 
 Windows a terminal session's own pipe handles are not inheritable
 ([`roomler-ssh.md`](roomler-ssh.md#interactive-sessions-p4a-unix-p4b-windows)).
 
+### A Windows machine config is the machine's only as found (#3609, #3666)
+
+The service runs the machine enrollment as SYSTEM, so it takes it only from
+`%PROGRAMDATA%\roomler\roomler` files that SYSTEM and Administrators alone may
+change, and it repairs drift before it checks. A repair seals whatever an entry
+holds, so it first reads the tree as found
+([`installation.md`](installation.md), the as-found rule): the parent gave no
+account other than an administrator a right to replace the machine folder, and
+the folder and the config none to add to or change them. A config that fails is
+never sealed, run, folded into a new enrollment, or re-enrolled from (its server
+would receive the token); an elevated Setup or `roomlerd enroll --machine-global`
+writes a fresh one that keeps no `.prev` and no unknown key of the old. A wrong
+answer only ever stops a device: a deny is never credited, and a domain account
+that is an administrator only through a domain group reads as no administrator,
+because an answer that needed a domain controller would flap SYSTEM mode.
+
 ### An enrollment token is spent once, through one owner (#3328)
 
 **A single-use enrollment token enrolls once**, at every door: the daemon's
