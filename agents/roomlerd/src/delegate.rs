@@ -846,16 +846,10 @@ impl DelegateHost {
     #[cfg(unix)]
     async fn serve_stream(&self, stream: UnixStream) {
         let (rd, wr) = tokio::io::split(stream);
-        let mut lines = BufReader::new(rd).lines();
-        let offered = match lines.next_line().await {
-            Ok(Some(line)) => line.trim().to_string(),
-            _ => {
-                tracing::debug!("delegation: connection closed before offering a secret");
-                return;
-            }
+        let Some((offered, rd)) = read_attach(rd).await else {
+            return;
         };
-        self.serve(&offered, Box::new(lines.into_inner()), Box::new(wr))
-            .await;
+        self.serve(&offered, Box::new(rd), Box::new(wr)).await;
     }
 
     /// Mint a fresh secret, replacing any previous one.
@@ -1490,6 +1484,21 @@ impl DelegateHost {
     }
 }
 
+/// Read the attach line off a fresh connection: the secret a worker offers,
+/// and the reader positioned at the first frame after it. `None` when the
+/// connection ends before offering one.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn read_attach<R: AsyncRead + Unpin>(rd: R) -> Option<(String, BufReader<R>)> {
+    let mut lines = BufReader::new(rd).lines();
+    match lines.next_line().await {
+        Ok(Some(line)) => Some((line.trim().to_string(), lines.into_inner())),
+        _ => {
+            tracing::debug!("delegation: connection closed before offering a secret");
+            None
+        }
+    }
+}
+
 /// Write one newline-delimited frame and flush it.
 ///
 /// Flushing per frame is deliberate: this channel is latency-sensitive at
@@ -1683,6 +1692,20 @@ mod tests {
         drop(cwr);
         drop(lines);
         task.await.unwrap();
+    }
+
+    /// #3695 — the attach line has a limit: a line over it is refused, and
+    /// one within it leaves the reader at the frame after it.
+    #[tokio::test]
+    async fn an_attach_line_over_the_limit_is_refused() {
+        let over = format!("{}\n{{\"t\":\"ping\"}}\n", "a".repeat(1024 + 1));
+        assert!(read_attach(over.as_bytes()).await.is_none());
+
+        let at = format!("{}\n{{\"t\":\"ping\"}}\n", "a".repeat(1024));
+        let (offered, rest) = read_attach(at.as_bytes()).await.expect("within it");
+        assert_eq!(offered.len(), 1024);
+        let next = rest.lines().next_line().await.unwrap();
+        assert_eq!(next.as_deref(), Some("{\"t\":\"ping\"}"));
     }
 
     fn log_line(msg: &str, fields: bson::Document) -> crate::logs_upload::LogLine {

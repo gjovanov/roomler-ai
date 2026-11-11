@@ -1424,12 +1424,9 @@ pub mod helper {
         // the pipe would otherwise deadlock against our own wait.
         let out = child.stdout.take();
         let reader = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = String::new();
-            if let Some(mut s) = out {
-                let _ = s.read_to_string(&mut buf);
-            }
-            buf
+            out.map(read_answer)
+                .and_then(|answer| answer.ok())
+                .unwrap_or_default()
         });
 
         let deadline = std::time::Instant::now() + timeout;
@@ -1456,6 +1453,13 @@ pub mod helper {
         }
 
         Ok(reader.join().unwrap_or_default())
+    }
+
+    /// The helper's answer: its whole stdout, read to the end.
+    fn read_answer(mut out: impl std::io::Read) -> std::io::Result<String> {
+        let mut buf = String::new();
+        out.read_to_string(&mut buf)?;
+        Ok(buf)
     }
 
     /// Pull the status out of the child's stdout.
@@ -1595,6 +1599,19 @@ pub mod helper {
             input.push_str(&failed);
             let mut r = std::io::Cursor::new(input);
             let e = read_stream_handshake(&mut r).unwrap_err().to_string();
+            assert!(e.contains("65536"), "{e}");
+        }
+
+        /// #3695 — the helper's one-shot answer (the probe, the screencast
+        /// session report, the notification probe) is read up to a limit: an
+        /// answer over it is refused with the limit named, and one at it is
+        /// read whole.
+        #[test]
+        fn an_answer_over_the_limit_is_refused() {
+            let at = "x".repeat(64 * 1024);
+            assert_eq!(read_answer(at.as_bytes()).unwrap(), at);
+            let over = "x".repeat(64 * 1024 + 1);
+            let e = read_answer(over.as_bytes()).unwrap_err().to_string();
             assert!(e.contains("65536"), "{e}");
         }
 
