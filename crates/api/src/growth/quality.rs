@@ -160,9 +160,10 @@ pub struct SessionRow {
     /// P9c — as the agent recorded it; `None` reads as [`UNKNOWN_CARRIER`].
     pub carrier: Option<String>,
     /// FR-138 — nobody saw the end (`end_source` is set: the registration
-    /// read, the sweep, the dead-row close). Its `ended_at` is only the row's
-    /// own last clock, so it is no duration and its `agent_disconnect` is no
-    /// failure a pod saw: it is counted as [`INFERRED_END`].
+    /// read, the sweep, the dead-row close, a detached session's redial). Its
+    /// `ended_at` is only the row's own last clock, so it is no duration and
+    /// its `agent_disconnect` is no failure a pod saw: it is counted as
+    /// [`INFERRED_END`].
     pub inferred: bool,
 }
 
@@ -1349,10 +1350,11 @@ mod tests {
     }
 
     /// FR-138 (review 2, N12) — a row whose end was inferred (`end_source`:
-    /// the registration read, the sweep, the dead-row close) adds no
-    /// duration, since its `ended_at` is only its own last clock, and its end
-    /// is counted as `inferred`, never as the `agent_disconnect` failure a
-    /// pod saw. It still went live. The projection reads the field.
+    /// the registration read, the sweep, the dead-row close, a detached
+    /// session's redial) adds no duration, since its `ended_at` is only its
+    /// own last clock, and its end is counted as `inferred`, never as the
+    /// `agent_disconnect` failure a pod saw. It still went live. The
+    /// projection reads the field.
     #[test]
     fn an_inferred_end_adds_no_duration_and_no_failure() {
         let at = |s: &str| DateTime::from_millis(ms(s));

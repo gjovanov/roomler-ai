@@ -311,6 +311,12 @@ mod rc_resume_pd_tests;
 /// today.
 #[cfg(test)]
 mod rc_resume_rejoin_tests;
+/// FR-138 (D5 = A) — a redial's `replaces` of a session no hub on its pod
+/// holds: a detached row ends `agent_disconnect`, marked `end_source:
+/// redial`, which the device's own end after its hello replaces; an attached
+/// one stays `controller_hangup`.
+#[cfg(test)]
+mod rc_resume_replaces_tests;
 /// FR-138 P1b-2, part two — the rest of the server's resume: the sweep, the
 /// re-announce on a scope change, and the dead-row close.
 #[cfg(test)]
