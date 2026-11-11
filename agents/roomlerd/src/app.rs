@@ -8369,7 +8369,10 @@ mod tests {
     /// through one function (`win_service::supervisor::rung_opens`), so they
     /// cannot disagree: both refuse a machine config another account may
     /// change while the repair is off, and both take it once the repair has
-    /// put it back to SYSTEM and Administrators.
+    /// put it back to SYSTEM and Administrators. #3666 — the repair puts back
+    /// only a config an administrator's entry reached (here this elevated
+    /// account's own); one another account could write, it leaves, and both
+    /// refuse it with the repair on too.
     #[cfg(target_os = "windows")]
     #[test]
     fn the_host_and_the_worker_refuse_the_same_config() {
@@ -8379,30 +8382,39 @@ mod tests {
         if !elevated_or_skip("the host and the worker on one config") {
             return;
         }
-        let root = tempfile::tempdir().expect("tempdir");
-        let tree = enrolled_tree(root.path());
-        assert!(icacls(&tree.config(), &["/grant", "*S-1-5-32-546:(M)"]));
-        let mg = tree.config();
-        let absent = root.path().join("systemprofile").join("config.toml");
-        for switches in [
-            Switches {
-                repair: false,
-                check: true,
-            },
-            Switches::ON,
-        ] {
-            let host = config_opens_in(&tree, switches, Some(absent.clone()));
-            let ladder_opened = std::cell::Cell::new(None);
-            let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
-                let opens = rung_opens(&tree, switches, p);
-                if p == mg {
-                    ladder_opened.set(Some(opens));
-                }
-                opens
-            });
-            assert_eq!(picked, mg);
-            assert_eq!(Some(host), ladder_opened.get(), "{switches:?}");
-            assert_eq!(host, switches.repair, "{switches:?}");
+        for (account, an_administrator) in [(me(), true), (GUESTS.to_string(), false)] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let tree = enrolled_tree(root.path());
+            assert!(icacls(
+                &tree.config(),
+                &["/grant", &format!("*{account}:(M)")]
+            ));
+            let mg = tree.config();
+            let absent = root.path().join("systemprofile").join("config.toml");
+            for switches in [
+                Switches {
+                    repair: false,
+                    check: true,
+                },
+                Switches::ON,
+            ] {
+                let host = config_opens_in(&tree, switches, Some(absent.clone()));
+                let ladder_opened = std::cell::Cell::new(None);
+                let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
+                    let opens = rung_opens(&tree, switches, p);
+                    if p == mg {
+                        ladder_opened.set(Some(opens));
+                    }
+                    opens
+                });
+                assert_eq!(picked, mg);
+                assert_eq!(Some(host), ladder_opened.get(), "{account}: {switches:?}");
+                assert_eq!(
+                    host,
+                    switches.repair && an_administrator,
+                    "{account}: {switches:?}"
+                );
+            }
         }
     }
 

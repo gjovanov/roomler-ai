@@ -17,10 +17,10 @@
 //! - **[`repair`]** puts the chain back, in-process and by handle, never
 //!   through a junction or a symbolic link and with no `icacls` child (#3291).
 //!   An entry for another account on the parent is cut to read and execute
-//!   ([`parent_cut`]); the machine folder, once it holds a machine config or a
-//!   save is writing one, becomes Administrators' with SYSTEM and
-//!   Administrators alone; the config, its `.prev`, the keys folder and the key
-//!   files get the same, and the attempt record the same with read for Users
+//!   ([`parent_cut`]); the machine folder, once it holds a config that was the
+//!   machine's as found or a save is writing one, becomes Administrators' with
+//!   SYSTEM and Administrators alone; the config, its `.prev`, the keys folder
+//!   and the key files get the same, and the attempt record the same with read for Users
 //!   (Setup reads it as the person who started it), not inheriting, so an
 //!   entry added to a folder above later does not reach them. An entry owned by a
 //!   member of the computer's Administrators group, read from the computer's
@@ -28,6 +28,20 @@
 //!   group; a domain's only when the group names it directly), is given to the
 //!   group; one owned by any other account is never taken over, and is left
 //!   as it is.
+//! - **The as-found rule** (#3666): a seal makes the check pass on whatever
+//!   an entry holds, so R reads before it seals. A config is the machine's as
+//!   found ([`as_found`], [`the_machines`]) only when the parent gave no
+//!   account other than an administrator a right to replace the machine
+//!   folder ([`REPLACE`]), and the folder and the config gave none a right to
+//!   add to or change them ([`PLANT`]), owners included ([`closed_as_found`]).
+//!   Outside a save R takes the folder only then; it seals a `.prev`, and
+//!   outside a save the keys, only when that entry was closed as found; and
+//!   while the folder holds a config it keeps such a replace right on the
+//!   parent, for the check to refuse. An elevated writer folds only into a
+//!   config that was the machine's as found ([`may_fold`]), and `roomlerd
+//!   re-enroll` and `roomlerd org` load only such a one. A device whose
+//!   config was not stays without SYSTEM mode until an elevated Setup or
+//!   `roomlerd enroll --machine-global` writes a fresh one.
 //! - **[`check`]** then judges the same chain: plain folders and files only,
 //!   each owned by SYSTEM or Administrators, none that another account may
 //!   change ([`verdict`]); `.prev` where it is loaded. The service host and
@@ -203,32 +217,74 @@ pub fn verdict(sd: &Sd, counts: u32, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// #3666 — RED seam: master reads the owner alone.
+/// #3666 — was an entry closed to every account other than an administrator
+/// of this computer AS FOUND, before any repair: `Ok` only when its owner is
+/// an administrator (any other owner may change the DACL), it has a DACL, and
+/// no allow-ACE that applies to it gives an account that is not an
+/// administrator a right in `counts` ([`PLANT`] or [`REPLACE`]), generic
+/// rights mapped first. An inherit-only ACE does not apply to the entry; an
+/// inherited one does. A deny is never credited: an allow counts whatever a
+/// deny beside it says, so a wrong answer can only stop a device, never
+/// trust a file. An ACE of any other kind is a refusal (this check fails
+/// closed). `administrator` answers for a SID; `what` names the entry in the
+/// reason.
 pub fn closed_as_found(
     sd: &Sd,
     counts: u32,
     what: &str,
     administrator: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
-    let _ = counts;
-    if administrator(&sd.owner) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !administrator(&sd.owner) {
+        return Err(format!(
             "{what} is owned by an account that is not an administrator of this computer"
-        ))
+        ));
     }
+    let Some(aces) = &sd.dacl else {
+        return Err(format!("{what} has no DACL, so everyone may change it"));
+    };
+    let may = if counts == REPLACE {
+        "replace what it holds, or take it over"
+    } else {
+        "add to it or change it"
+    };
+    for ace in aces {
+        if ace.flags & INHERIT_ONLY != 0 {
+            continue;
+        }
+        match ace.kind {
+            ACE_DENY => {}
+            ACE_ALLOW => {
+                if map_generic(ace.mask) & counts != 0 && !administrator(&ace.sid) {
+                    return Err(format!(
+                        "{what} lets an account that is not an administrator of this computer {may}"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{what} carries an access rule of a kind this check does not read (type {other})"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
-/// #3666 — RED seam: master asks about the config's owner alone.
+/// #3666 — is the machine config the machine's, as found: the parent closed
+/// to [`REPLACE`], and the machine folder and the config closed to [`PLANT`]
+/// ([`closed_as_found`]). A config an administrator sealed says nothing about
+/// who chose what it holds when it sits in a folder another account could
+/// add it to, or in one that account could swap in through the parent. `Err`
+/// is the first entry that is not closed, and why.
 pub fn the_machines(
     parent: (&Sd, &str),
     folder: (&Sd, &str),
     config: (&Sd, &str),
     administrator: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
-    let _ = (parent, folder);
-    closed_as_found(config.0, PLANT, config.1, administrator)
+    closed_as_found(parent.0, REPLACE, parent.1, &administrator)?;
+    closed_as_found(folder.0, PLANT, folder.1, &administrator)?;
+    closed_as_found(config.0, PLANT, config.1, &administrator)
 }
 
 /// R's plan for the parent: its explicit ACEs, with each allow-ACE that lets
@@ -242,8 +298,13 @@ pub fn the_machines(
 /// hands Users stays, so a person's daemon may still stage below the parent.
 /// `None` when there is nothing to cut, or an ACE of a kind the plan cannot
 /// write back (the check refuses that one).
+///
+/// #3666 — an allow-ACE for which `spare` says yes is kept as it is: while the
+/// machine folder holds a config, R keeps a right to replace it that an
+/// account other than an administrator holds, so the check refuses the parent
+/// at this tick and every one after. Cut in the same pass, the check that
+/// follows would pass a sealed folder moved in through that right.
 pub fn parent_cut(sd: &Sd, spare: impl Fn(&Ace) -> bool) -> Option<Vec<Ace>> {
-    let _ = spare;
     let aces = sd.dacl.as_ref()?;
     let mut cut = false;
     let mut plan = Vec::new();
@@ -252,6 +313,10 @@ pub fn parent_cut(sd: &Sd, spare: impl Fn(&Ace) -> bool) -> Option<Vec<Ace>> {
             return None;
         }
         let mapped = map_generic(ace.mask);
+        if ace.kind == ACE_ALLOW && spare(ace) {
+            plan.push(ace.clone());
+            continue;
+        }
         if ace.kind == ACE_ALLOW
             && !trusted(&ace.sid)
             && ace.sid != CREATOR_OWNER
@@ -427,8 +492,11 @@ pub struct Repairs {
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
-    /// `%ProgramData%\roomler`: [`parent_cut`], inheritance as it is.
-    Parent,
+    /// `%ProgramData%\roomler`: [`parent_cut`], inheritance as it is. #3666 —
+    /// `spare`: the machine folder held a config when R began and no save is
+    /// writing one, so a right to replace the folder that an account other
+    /// than an administrator holds is kept, for the check to refuse.
+    Parent { spare: bool },
     /// The machine folder: Administrators', SYSTEM and Administrators alone,
     /// `(OI)(CI)`, not inheriting.
     Folder,
@@ -508,6 +576,18 @@ fn is_exactly(sd: &Sd, want: &[Ace]) -> bool {
 /// write, which never takes anything from SYSTEM or Administrators, and only
 /// then its owner; a file gets both in one call (`win::write_sd`). The files
 /// go before the folders that hold them.
+///
+/// #3666 — what R seals, it reads as found first, because a seal makes the
+/// check pass on whatever the entry holds:
+/// - outside a save it takes the machine folder only when the config in it
+///   was the machine's as found ([`as_found`]);
+/// - a `.prev`, and outside a save the keys folder and each key file, only
+///   when that entry itself was closed as found;
+/// - while the folder holds a config and no save is writing, the parent's cut
+///   spares a right to replace the folder that an account other than an
+///   administrator holds (`Role::Parent`).
+///
+/// What it leaves, it says once in `left`, and the check refuses.
 #[cfg(windows)]
 pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
     let mut out = Repairs::default();
@@ -519,18 +599,34 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
             return out;
         }
     };
+    // Read before anything changes. Any answer but "not there" counts as a
+    // config: a wrong answer may only keep a right the check then refuses.
+    let holds_a_config = !matches!(
+        std::fs::symlink_metadata(tree.config()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
     match win::open(tree.folder(), win::Kind::Dir, false, true) {
         Ok(Some(folder)) => {
-            if writing || holds_a_config_it_may_take(tree, &mut out) {
-                for path in [tree.config(), tree.prev()] {
-                    repair_path(&path, win::Kind::File, Role::Private, &mut out);
-                }
+            if writing || holds_the_machines_config(tree, &mut out) {
+                repair_path(&tree.config(), win::Kind::File, Role::Private, &mut out);
+                repair_path_if_closed(&tree.prev(), win::Kind::File, Role::Private, &mut out);
                 match win::open(&tree.keys(), win::Kind::Dir, false, true) {
                     Ok(Some(keys)) => {
                         for key in key_files(&tree.keys()) {
-                            repair_path(&key, win::Kind::File, Role::Private, &mut out);
+                            if writing {
+                                repair_path(&key, win::Kind::File, Role::Private, &mut out);
+                            } else {
+                                repair_path_if_closed(
+                                    &key,
+                                    win::Kind::File,
+                                    Role::Private,
+                                    &mut out,
+                                );
+                            }
                         }
-                        repair_entry(&tree.keys(), &keys, Role::PrivateDir, &mut out);
+                        if writing || closed_entry(&tree.keys(), &keys, &mut out) {
+                            repair_entry(&tree.keys(), &keys, Role::PrivateDir, &mut out);
+                        }
                     }
                     Ok(None) => {}
                     Err(why) => out.left.push(why),
@@ -542,33 +638,71 @@ pub fn repair(tree: &MachineTree, writing: bool) -> Repairs {
         Err(why) => out.left.push(why),
     }
     repair_path(&tree.record(), win::Kind::File, Role::Record, &mut out);
-    repair_entry(tree.parent(), &parent, Role::Parent, &mut out);
+    let spare = !writing && holds_a_config;
+    repair_entry(tree.parent(), &parent, Role::Parent { spare }, &mut out);
     out
 }
 
-/// Does the machine folder hold a config R may make the machine's: one owned
-/// by SYSTEM, Administrators or an administrator. Until it does, the folder is
-/// a waiting or attended host's, where the person's own daemon stages files,
-/// and R leaves it as `%ProgramData%` hands it down. A config another account
-/// put there does not make it the machine's.
+/// #3666 — does the machine folder hold a config that was the machine's as
+/// found ([`as_found`]): the only folder R takes outside a save. Until it
+/// does, the folder is a waiting or attended host's, where the person's own
+/// daemon stages files, and R leaves it as `%ProgramData%` hands it down. A
+/// config another account could have put there, or chosen what it holds, does
+/// not make it the machine's: taken, the check would pass it.
 #[cfg(windows)]
-fn holds_a_config_it_may_take(tree: &MachineTree, out: &mut Repairs) -> bool {
-    let config = tree.config();
-    let entry = match win::open(&config, win::Kind::File, false, false) {
-        Ok(Some(entry)) => entry,
-        Ok(None) => return false,
-        Err(why) => {
-            out.left.push(why);
+fn holds_the_machines_config(tree: &MachineTree, out: &mut Repairs) -> bool {
+    match as_found(tree) {
+        Ok(()) => true,
+        Err(Refusal::Absent) => false,
+        Err(Refusal::NotPrivate(why)) => {
+            out.left.push(format!(
+                "{} is left as it is: the config it holds was not the machine's as found ({why})",
+                tree.folder().display()
+            ));
+            false
+        }
+    }
+}
+
+/// #3666 — was the entry R opened at `path` closed to [`PLANT`] as found
+/// ([`closed_as_found`])? When it was not, why is said once in `left`.
+#[cfg(windows)]
+fn closed_entry(path: &Path, entry: &win::Entry, out: &mut Repairs) -> bool {
+    let sd = match win::read_sd(&entry.file) {
+        Ok(sd) => sd,
+        Err(e) => {
+            out.left
+                .push(format!("{}: reading its security: {e}", path.display()));
             return false;
         }
     };
-    match win::read_sd(&entry.file) {
-        Ok(sd) => win::classify(&sd.owner) != win::Owner::Other,
-        Err(e) => {
-            out.left
-                .push(format!("{}: reading its security: {e}", config.display()));
+    match closed_as_found(
+        &sd,
+        PLANT,
+        &path.display().to_string(),
+        win::is_administrator,
+    ) {
+        Ok(()) => true,
+        Err(why) => {
+            out.left.push(format!("{why}; it is left as it is"));
             false
         }
+    }
+}
+
+/// #3666 — [`repair_path`] for an entry sealed only when it was closed as
+/// found ([`closed_entry`]): one another account could have written is left
+/// as it is, for the check (or, for `.prev`, [`read_checked`]) to refuse.
+#[cfg(windows)]
+fn repair_path_if_closed(path: &Path, kind: win::Kind, role: Role, out: &mut Repairs) {
+    match win::open(path, kind, false, true) {
+        Ok(Some(entry)) => {
+            if closed_entry(path, &entry, out) {
+                repair_entry(path, &entry, role, out);
+            }
+        }
+        Ok(None) => {}
+        Err(why) => out.left.push(why),
     }
 }
 
@@ -605,7 +739,13 @@ fn repair_entry(path: &Path, entry: &win::Entry, role: Role, out: &mut Repairs) 
     // SYSTEM made it, as it always was.
     let take = owner == win::Owner::Admin || (role == Role::Folder && sd.owner == SYSTEM);
     let dacl = match role {
-        Role::Parent => parent_cut(&sd, |_| false).map(|aces| (aces, sd.protected)),
+        Role::Parent { spare } => parent_cut(&sd, |ace| {
+            spare
+                && ace.flags & INHERIT_ONLY == 0
+                && map_generic(ace.mask) & REPLACE != 0
+                && !win::is_administrator(&ace.sid)
+        })
+        .map(|aces| (aces, sd.protected)),
         Role::Folder | Role::PrivateDir => {
             let flags = OBJECT_INHERIT | CONTAINER_INHERIT;
             (!is_sealed(&sd, flags)).then(|| (sealed_aces(flags), true))
@@ -629,7 +769,9 @@ fn repair_entry(path: &Path, entry: &win::Entry, role: Role, out: &mut Repairs) 
     let what = match (take, &dacl) {
         (true, Some(_)) => "given to Administrators, and its DACL set",
         (true, None) => "given to Administrators",
-        (false, _) if role == Role::Parent => "another account's entry cut to read and execute",
+        (false, _) if matches!(role, Role::Parent { .. }) => {
+            "another account's entry cut to read and execute"
+        }
         (false, _) if role == Role::Record => {
             "its DACL set to SYSTEM and Administrators, and read for Users"
         }
@@ -823,6 +965,39 @@ fn check_config(tree: &MachineTree) -> Result<(), Refusal> {
     judge(&config, &file, WRITE_LIKE)
 }
 
+/// #3666 — is the machine config under `tree` the machine's AS FOUND, before
+/// any repair ([`the_machines`]): what R asks before it takes the machine
+/// folder, what an elevated writer asks before it folds into the config
+/// ([`may_fold`]), and what `roomlerd re-enroll` and `roomlerd org` ask before
+/// they load it. [`Refusal::Absent`] with no config; an entry that is a link,
+/// or one this process may not open or read, is [`Refusal::NotPrivate`].
+#[cfg(windows)]
+pub fn as_found(tree: &MachineTree) -> Result<(), Refusal> {
+    match std::fs::symlink_metadata(tree.config()) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Refusal::Absent),
+        _ => {}
+    }
+    fn read(path: &Path, kind: win::Kind) -> Result<(Sd, String), Refusal> {
+        let Some(entry) = open_entry(path, kind, false)? else {
+            return Err(Refusal::Absent);
+        };
+        let sd = win::read_sd(&entry.file).map_err(|e| {
+            Refusal::NotPrivate(format!("{}: reading its security: {e}", path.display()))
+        })?;
+        Ok((sd, path.display().to_string()))
+    }
+    let parent = read(tree.parent(), win::Kind::Dir)?;
+    let folder = read(tree.folder(), win::Kind::Dir)?;
+    let config = read(&tree.config(), win::Kind::File)?;
+    the_machines(
+        (&parent.0, &parent.1),
+        (&folder.0, &folder.1),
+        (&config.0, &config.1),
+        win::is_administrator,
+    )
+    .map_err(Refusal::NotPrivate)
+}
+
 /// [`win::open`] for the check: read only, and a failure is a refusal.
 #[cfg(windows)]
 fn open_entry(
@@ -878,8 +1053,26 @@ pub fn machine_config_opens(tree: &MachineTree, switches: Switches) -> bool {
 /// place (`config::MergeBase::NotPrivate`). `Ok` with no config there. With the
 /// check switched off a refusal is logged and the config folded into, as
 /// before #3609.
+///
+/// #3666 — and first of all, before the repair changes anything, the config
+/// must have been the machine's as found ([`as_found`]): the repair seals
+/// what it is given, so after it the check alone cannot tell a config an
+/// administrator chose from one another account moved into an open folder.
+/// A config that was not is refused with no repair; with the check switched
+/// off that is logged, and the fold goes on as before.
 #[cfg(windows)]
 pub fn may_fold(tree: &MachineTree, switches: Switches) -> Result<(), String> {
+    match as_found(tree) {
+        Ok(()) | Err(Refusal::Absent) => {}
+        Err(Refusal::NotPrivate(why)) if !switches.check => {
+            tracing::warn!(
+                reason = %why,
+                "machine tree: the machine config was not the machine's as found; \
+                 ROOMLERD_MACHINE_TREE_CHECK=0, so an enrollment is folded into it anyway"
+            );
+        }
+        Err(Refusal::NotPrivate(why)) => return Err(why),
+    }
     if switches.repair {
         log_repairs(&repair(tree, true));
     }
@@ -1453,14 +1646,23 @@ mod win {
         Other,
     }
 
+    /// #3666 — TrustedInstaller is an administrator, with no lookup: no
+    /// person signs in as it.
     pub(super) fn classify(sid: &str) -> Owner {
         if super::trusted(sid) {
             Owner::Trusted
-        } else if is_admin(sid) {
+        } else if sid == super::TRUSTED_INSTALLER || is_admin(sid) {
             Owner::Admin
         } else {
             Owner::Other
         }
+    }
+
+    /// #3666 — the `administrator` question of [`super::closed_as_found`]:
+    /// SYSTEM, the Administrators group, TrustedInstaller, or a member of the
+    /// group as this computer's own account database reads it.
+    pub(super) fn is_administrator(sid: &str) -> bool {
+        classify(sid) != Owner::Other
     }
 
     /// Whether `sid` is an account of this computer in its Administrators
@@ -2012,7 +2214,12 @@ pub mod test_support {
                 std::env::var_os("ROOMLERD_TEST_REQUIRE_ELEVATED").is_none(),
                 "this lane must run elevated for {case}"
             );
-            eprintln!("skipped {case}: this token cannot set an owner; run elevated");
+            // Loud, so a local run cannot pass for a run of the case: the
+            // elevated CI lane sets ROOMLERD_TEST_REQUIRE_ELEVATED and runs it.
+            eprintln!(
+                "SKIPPED {case}: not elevated (this token cannot set an owner), so this \
+                 test proved nothing here; run it elevated, as CI's elevated lane does"
+            );
         }
         ok
     }
@@ -2113,9 +2320,19 @@ pub mod test_support {
         super::MachineTree::under(&parent)
     }
 
-    /// [`waiting_tree`] with a machine config, a previous copy, and a key
-    /// file, made by this process.
+    /// #3666 — [`unsealed_tree`] as an elevated save leaves it (Setup,
+    /// `roomlerd enroll --machine-global`): repaired as one is writing, so
+    /// its config is the machine's as found.
     pub fn enrolled_tree(root: &Path) -> super::MachineTree {
+        let tree = unsealed_tree(root);
+        super::repair(&tree, true);
+        tree
+    }
+
+    /// [`waiting_tree`] with a machine config, a previous copy, and a key
+    /// file, made by this process, and nothing repaired: the machine folder
+    /// still lets Users add to it, so its config is not the machine's as found.
+    pub fn unsealed_tree(root: &Path) -> super::MachineTree {
         let tree = waiting_tree(root);
         std::fs::write(tree.config(), "agent_token = \"t\"\n").expect("the config");
         std::fs::write(tree.prev(), "agent_token = \"p\"\n").expect("its previous copy");
@@ -2695,10 +2912,19 @@ mod tests {
             assert!(read_checked(&tree.prev(), 1 << 20).is_err());
         }
 
+        /// Whether `path`'s DACL holds an entry for `sid`, read as R reads it:
+        /// by SID, whatever alias SDDL would print for it.
+        fn grants(path: &Path, kind: win::Kind, sid: &str) -> bool {
+            read(path, kind).dacl.unwrap().iter().any(|a| a.sid == sid)
+        }
+
         /// An account's entry on the machine folder (Explorer's prompt leaves
-        /// `(OI)(CI)F`) makes the check refuse, and the repair takes it off:
-        /// the folder is Administrators', protected, SYSTEM and
-        /// Administrators alone, and the check passes again.
+        /// `(OI)(CI)F`) makes the check refuse. #3666 — an administrator's own
+        /// entry, the prompt's usual case, the repair takes off: the folder is
+        /// Administrators', protected, SYSTEM and Administrators alone, and
+        /// the check passes again. Another account's it leaves until an
+        /// elevated save, since that account could have chosen what the
+        /// config holds.
         #[test]
         fn an_entry_for_another_account_on_the_machine_folder_is_refused_until_repaired() {
             if !elevated_or_skip("the machine folder's repair") {
@@ -2708,26 +2934,36 @@ mod tests {
             let tree = enrolled_tree(root.path());
             repair(&tree, false);
             assert_eq!(check(&tree), Ok(()), "a repaired tree passes");
-            assert!(icacls(
-                tree.folder(),
-                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
-            ));
-            let why = check(&tree).expect_err("another account may change the machine folder");
-            assert!(
-                why.contains(&tree.folder().display().to_string()),
-                "the reason names the entry: {why}"
-            );
-            repair(&tree, false);
-            let folder = sddl(tree.folder());
-            assert_eq!(owner(&folder), "BA", "{folder}");
-            assert!(sealed(&folder, true), "{folder}");
-            assert_eq!(check(&tree), Ok(()));
+            for (account, an_administrator) in [(me(), true), (GUESTS.to_string(), false)] {
+                assert!(icacls(
+                    tree.folder(),
+                    &["/grant", &format!("*{account}:(OI)(CI)F")]
+                ));
+                let why = check(&tree).expect_err("another account may change the machine folder");
+                assert!(
+                    why.contains(&tree.folder().display().to_string()),
+                    "the reason names the entry: {why}"
+                );
+                repair(&tree, false);
+                if !an_administrator {
+                    assert!(check(&tree).is_err(), "left until an elevated save");
+                    assert!(grants(tree.folder(), win::Kind::Dir, &account));
+                    repair(&tree, true);
+                }
+                let folder = sddl(tree.folder());
+                assert_eq!(owner(&folder), "BA", "{account}: {folder}");
+                assert!(sealed(&folder, true), "{account}: {folder}");
+                assert_eq!(check(&tree), Ok(()), "{account}");
+            }
         }
 
         /// The design's R cell, with the owner rule the operator chose: on the
-        /// parent the account's entry is cut to read and execute, below it the
-        /// account is gone, an entry an administrator's own account owns is
-        /// given to Administrators, and SYSTEM keeps the record it owns.
+        /// parent an administrator's own entry is cut to read and execute
+        /// (#3666: another account's replace right is kept while a config is
+        /// there, `a_replace_right_on_the_parent_is_kept_while_a_config_is_there`),
+        /// below it the account is gone, an entry an administrator's own
+        /// account owns is given to Administrators, and SYSTEM keeps the
+        /// record it owns.
         #[test]
         fn repair_cuts_an_accounts_entry_and_keeps_every_other_owner() {
             if !elevated_or_skip("the parent's repair") {
@@ -2735,31 +2971,34 @@ mod tests {
             }
             let root = tempfile::tempdir().unwrap();
             let tree = enrolled_tree(root.path());
+            let me = me();
             std::fs::write(tree.record(), b"{}").unwrap();
             assert!(icacls(&tree.record(), &["/setowner", "*S-1-5-18"]));
             assert!(icacls(
                 tree.parent(),
-                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+                &["/grant", &format!("*{me}:(OI)(CI)F")]
             ));
             assert!(icacls(
                 tree.folder(),
-                &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
+                &["/grant", &format!("*{me}:(OI)(CI)F")]
             ));
             repair(&tree, false);
-            let parent = sddl(tree.parent());
+            let parent = read(tree.parent(), win::Kind::Dir).dacl.unwrap();
             assert!(
-                aces(&parent).contains(&"A;OICI;0x1200a9;;;BG".to_string()),
-                "cut to read and execute on the parent: {parent}"
+                parent.iter().any(|a| a.sid == me
+                    && a.mask == READ_EXECUTE
+                    && a.flags == OBJECT_INHERIT | CONTAINER_INHERIT),
+                "cut to read and execute on the parent: {parent:?}"
             );
-            for entry in [
-                tree.folder().to_path_buf(),
-                tree.config(),
-                tree.prev(),
-                tree.keys(),
-                tree.record(),
+            for (entry, kind) in [
+                (tree.folder().to_path_buf(), win::Kind::Dir),
+                (tree.config(), win::Kind::File),
+                (tree.prev(), win::Kind::File),
+                (tree.keys(), win::Kind::Dir),
+                (tree.record(), win::Kind::File),
             ] {
                 let got = sddl(&entry);
-                assert!(!names(&got, GUESTS), "{}: {got}", entry.display());
+                assert!(!grants(&entry, kind, &me), "{}: {got}", entry.display());
                 assert!(protected(&got), "{}: {got}", entry.display());
             }
             assert_eq!(
@@ -2972,13 +3211,15 @@ mod tests {
                 return;
             }
             let root = tempfile::tempdir().unwrap();
-            let tree = enrolled_tree(root.path());
+            // #3666 — unsealed, and repaired as a save does: the daemon's own
+            // repair takes no folder that still lets Users add to it.
+            let tree = unsealed_tree(root.path());
             let crashes = tree.folder().join("crashes");
             std::fs::create_dir(&crashes).unwrap();
             std::fs::write(crashes.join("a.json"), b"x").unwrap();
             assert!(icacls(tree.folder(), &["/setowner", "*S-1-5-18", "/T"]));
             disable_dacl_override_privileges();
-            repair(&tree, false);
+            repair(&tree, true);
             let folder = sddl(tree.folder());
             assert_eq!(owner(&folder), "BA", "{folder}");
             assert!(sealed(&folder, true), "{folder}");

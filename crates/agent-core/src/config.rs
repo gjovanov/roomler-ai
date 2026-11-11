@@ -7093,17 +7093,34 @@ tenant_id = "tid2"
             }
         }
 
-        /// A config of an administrator's that another account's entry on its
-        /// folder reaches (Explorer's prompt) is repaired first, and then
-        /// folded: the device's settings carry over.
+        /// A config of an administrator's that an administrator's own entry
+        /// on its folder reaches (Explorer's prompt, its usual case) is
+        /// repaired first, and then folded: the device's settings carry over.
+        /// #3666 — one that another account's entry reaches is not folded:
+        /// that account could have chosen what it holds.
         #[test]
         fn a_drifted_machine_config_is_folded_once_repaired() {
             if !elevated_or_skip("a drifted machine config, folded") {
                 return;
             }
             let root = tempfile::tempdir().unwrap();
-            let tree = enrolled_tree(root.path());
+            let tree = unsealed_tree(root.path());
             std::fs::write(tree.config(), minimal_toml()).unwrap();
+            crate::machine_tree::repair(&tree, true);
+            let me = me();
+            // Inheritance on, so the folder's entry reaches the config.
+            assert!(icacls(&tree.config(), &["/inheritance:e"]));
+            assert!(icacls(
+                tree.folder(),
+                &["/grant", &format!("*{me}:(OI)(CI)F")]
+            ));
+            match base(&tree) {
+                MergeBase::Loaded(cfg) => assert_eq!(cfg.machine_name, "devbox"),
+                other => panic!("{other:?}"),
+            }
+            let config = sddl(&tree.config());
+            assert!(sealed(&config, false), "repaired before the fold: {config}");
+            assert!(icacls(&tree.config(), &["/inheritance:e"]));
             assert!(icacls(
                 tree.folder(),
                 &["/grant", "*S-1-5-32-546:(OI)(CI)F"]
@@ -7113,14 +7130,12 @@ tenant_id = "tid2"
                 "it reaches the config"
             );
             match base(&tree) {
-                MergeBase::Loaded(cfg) => assert_eq!(cfg.machine_name, "devbox"),
-                other => panic!("{other:?}"),
+                MergeBase::NotPrivate { reason } => assert!(
+                    reason.contains(&tree.folder().display().to_string()),
+                    "{reason}"
+                ),
+                other => panic!("folded: {other:?}"),
             }
-            let config = sddl(&tree.config());
-            assert!(
-                !names(&config, GUESTS),
-                "repaired before the fold: {config}"
-            );
         }
 
         /// A config that does not load is recovered from its last good copy
