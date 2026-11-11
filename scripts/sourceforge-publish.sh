@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# sourceforge-publish.sh — every DECISION of the SourceForge publish step (FR-143).
+#
+# .github/workflows/sourceforge-publish.yml does the network half: it downloads a
+# `setup-v<V>` release from GitHub, uploads it to SourceForge, sets the per-OS
+# Download defaults and removes the versions that have aged out. What it uploads,
+# which file becomes whose default and which folders it removes are decided here,
+# as functions of their arguments and stdin alone:
+#
+#   valid-tag     <tag>                  exit 0 for a final setup release tag, 1 otherwise
+#   newest                               tag names on stdin -> the highest final setup tag
+#   default-for   <tag> <asset-name>     prints windows | mac | linux, or nothing
+#   defaults-plan <tag> <dir>            prints "<os><TAB><file>" for the three defaults,
+#                                        fails when the release lacks one of them
+#   verify        <dir> <digests.tsv>    every file against GitHub's asset digest, and
+#                                        every installer against its .sha256 sidecar
+#   prune-plan    <keep> <current-tag>   folder names on stdin -> the folders to remove,
+#                                        oldest first
+#   --selftest                           proves each of the above, offline
+#
+# ⚠️ This file makes no network call and must never gain one. `--selftest` runs on
+# every pull request that touches it and on any developer's machine; a test of a
+# script that can reach SourceForge is a test that one day deletes a release there.
+# The workflow owns ssh, rsync and curl, and its `dry_run` input is how those are
+# rehearsed.
+#
+# ⚠️ prune-plan removes only what it can NAME: a folder called exactly
+# `setup-v<major>.<minor>.<patch>`. Anything else on SourceForge (a folder someone
+# made by hand, another release family, a stray file) is left alone, because a
+# retention job that guesses is how a listing loses the one file it needed.
+
+set -euo pipefail
+
+readonly TAG_RE='^setup-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+readonly HEX64_RE='^[0-9a-f]{64}$'
+# A retention of one or two versions is a typo, not a policy: the Download
+# default has to survive a release that is pulled back.
+readonly KEEP_FLOOR=3
+
+die() { echo "sourceforge-publish: $*" >&2; exit 2; }
+
+valid_tag() { [[ "${1:-}" =~ $TAG_RE ]]; }
+
+# Final setup tags from stdin, oldest first, by version and not by text: 0.4.9 is
+# older than 0.4.10. Everything that is not such a tag is dropped.
+sorted_tags() {
+  local line name all=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in 'sftp>'*) continue ;; esac
+    line="${line%/}"
+    name="${line##*/}"
+    valid_tag "$name" || continue
+    all+="${name#setup-v}"$'\n'
+  done
+  printf '%s' "$all" | LC_ALL=C sort -u -t. -k1,1n -k2,2n -k3,3n | sed 's/^/setup-v/'
+}
+
+# The highest final setup tag among the names on stdin. Only that release may
+# take the Download defaults, so a re-run of an older one cannot take them back.
+newest() {
+  local all
+  all="$(sorted_tags)"
+  [ -n "$all" ] || die "no final setup release tag in the list"
+  printf '%s\n' "$all" | tail -n 1
+}
+
+# Which OS's Download default an asset becomes. Exact names only: the Windows
+# `.zip` holds the same EXE and the aarch64 tarball is a second Linux build, and
+# neither may ever win the button by matching a looser pattern.
+default_for() {
+  local tag="$1" name="$2" v
+  valid_tag "$tag" || die "not a final setup release tag: '$tag'"
+  v="${tag#setup-v}"
+  case "$name" in
+    "roomler-setup-${v}-x86_64-pc-windows-msvc.exe")      echo windows ;;
+    "roomler-setup-${v}-universal-apple-darwin.tar.gz")   echo mac ;;
+    "roomler-setup-${v}-x86_64-unknown-linux-gnu.tar.gz") echo linux ;;
+  esac
+}
+
+# The three defaults of a release, or a failure naming the one that is missing.
+# A wizard release is every platform or none (release-setup.yml), so a release
+# without one of these is broken, and moving two buttons to it would leave the
+# third on an older version than its neighbours.
+defaults_plan() {
+  local tag="$1" dir="$2" v os file missing=0
+  valid_tag "$tag" || die "not a final setup release tag: '$tag'"
+  [ -d "$dir" ] || die "no such directory: '$dir'"
+  v="${tag#setup-v}"
+  for os in windows mac linux; do
+    case "$os" in
+      windows) file="roomler-setup-${v}-x86_64-pc-windows-msvc.exe" ;;
+      mac)     file="roomler-setup-${v}-universal-apple-darwin.tar.gz" ;;
+      linux)   file="roomler-setup-${v}-x86_64-unknown-linux-gnu.tar.gz" ;;
+    esac
+    if [ -f "$dir/$file" ]; then
+      printf '%s\t%s\n' "$os" "$file"
+    else
+      echo "sourceforge-publish: $tag has no $os installer ($file)" >&2
+      missing=1
+    fi
+  done
+  return "$missing"
+}
+
+sha256_of() { sha256sum -- "$1" | cut -d' ' -f1; }
+
+# Proves the directory holds exactly the release GitHub holds.
+#   digests.tsv: "<asset-name><TAB>sha256:<hex>", one line per asset, from the API.
+# Three checks, each of which has to hold for every file:
+#   1. the directory and the asset list name the same files, no more and no fewer;
+#   2. each file hashes to GitHub's digest for that asset;
+#   3. each installer hashes to the value in its own `.sha256` sidecar, which is
+#      the number the release lane computed before it uploaded anything.
+verify() {
+  local dir="$1" digests="$2" bad=0 name want got side listed
+  [ -d "$dir" ] || die "no such directory: '$dir'"
+  [ -s "$digests" ] || die "the digest list is empty or missing: '$digests'"
+
+  listed="$(cut -f1 "$digests" | tr -d '\r' | LC_ALL=C sort)"
+  if [ "$(printf '%s\n' "$listed" | uniq -d | wc -l)" -ne 0 ]; then
+    echo "verify: the digest list names an asset twice" >&2
+    bad=1
+  fi
+  local present
+  present="$(cd "$dir" && find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+  if [ "$listed" != "$present" ]; then
+    echo "verify: the directory and the release's asset list differ:" >&2
+    diff <(printf '%s\n' "$listed") <(printf '%s\n' "$present") | sed 's/^/  /' >&2 || true
+    bad=1
+  fi
+
+  while IFS=$'\t' read -r name want; do
+    name="${name%$'\r'}"; want="${want%$'\r'}"
+    [ -n "$name" ] || continue
+    case "$name" in */*|.*) echo "verify: refusing the asset name '$name'" >&2; bad=1; continue ;; esac
+    want="${want#sha256:}"
+    if ! [[ "$want" =~ $HEX64_RE ]]; then
+      echo "verify: no usable digest from GitHub for $name" >&2; bad=1; continue
+    fi
+    [ -f "$dir/$name" ] || continue          # already reported by check 1
+    got="$(sha256_of "$dir/$name")"
+    if [ "$got" != "$want" ]; then
+      echo "verify: $name does not match GitHub's digest" >&2; bad=1; continue
+    fi
+    case "$name" in
+      *.sha256|*.asc) ;;
+      *)
+        if [ ! -f "$dir/$name.sha256" ]; then
+          echo "verify: $name has no .sha256 sidecar" >&2; bad=1; continue
+        fi
+        side="$(tr -d '\r' < "$dir/$name.sha256" | awk 'NR==1 {print tolower($1)}')"
+        if [ "$side" != "$got" ]; then
+          echo "verify: $name does not match its .sha256 sidecar" >&2; bad=1; continue
+        fi
+        ;;
+    esac
+    echo "ok  $name"
+  done < "$digests"
+
+  return "$bad"
+}
+
+# Which folders retention removes. stdin: one name per line, as `sftp ls -1`
+# prints them (a path prefix, a trailing slash, CRs and the batch echo are all
+# tolerated). Prints the `setup-v*` folders that are neither among the newest
+# <keep> nor the one just published, oldest first.
+prune_plan() {
+  local keep="$1" current="$2" all n
+  [[ "$keep" =~ ^[0-9]+$ ]] || die "keep must be a whole number, got '$keep'"
+  [ "$keep" -ge "$KEEP_FLOOR" ] || die "keep must be at least $KEEP_FLOOR, got $keep"
+  valid_tag "$current" || die "not a final setup release tag: '$current'"
+
+  all="$(sorted_tags)"
+
+  # The folder just published has to be there. If it is not, the listing is not
+  # the one this run wrote to, and nothing may be removed on its strength.
+  if ! printf '%s\n' "$all" | grep -qxF -- "$current"; then
+    die "$current is not in the listing: refusing to prune"
+  fi
+
+  n="$(printf '%s\n' "$all" | grep -c . || true)"
+  [ "$n" -gt "$keep" ] || return 0
+  printf '%s\n' "$all" | head -n "$((n - keep))" | grep -vxF -- "$current" || true
+}
+
+# ----------------------------------------------------------------------------
+# --selftest
+# ----------------------------------------------------------------------------
+selftest() {
+  local pass=0 fail=0 tmp out rc
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" EXIT
+
+  ok()  { pass=$((pass + 1)); }
+  bad() { fail=$((fail + 1)); echo "FAIL: $*" >&2; }
+  eq()  { if [ "$2" = "$3" ]; then ok; else bad "$1: want '$3', got '$2'"; fi; }
+  # Runs a subcommand in a child, so a `die` ends the child and not the selftest.
+  # Through `bash`, so it does not depend on this file's execute bit.
+  run() { out="$(bash "$0" "$@" 2>"$tmp/err")" && rc=0 || rc=$?; }
+
+  # --- valid-tag ------------------------------------------------------------
+  local t
+  for t in setup-v0.4.211 setup-v1.0.0 setup-v10.20.30; do
+    run valid-tag "$t"; eq "valid-tag $t" "$rc" 0
+  done
+  for t in '' setup-v0.4 setup-v0.4.211-rc.1 setup-v0.4.211.1 setup-v0.04.1 agent-v0.4.211 \
+           'setup-v0.4.211 ' 'setup-v0.4.211;id' 'setup-v0.4.211/..' seed-cache v0.4.211; do
+    run valid-tag "$t"; eq "valid-tag rejects '$t'" "$rc" 1
+  done
+
+  # --- newest ---------------------------------------------------------------
+  out="$(printf '%s\n' setup-v0.4.9 setup-v0.4.211 setup-v0.4.10 agent-v0.4.999 setup-v0.4.212-rc.1 seed-cache \
+        | bash "$0" newest)" && rc=0 || rc=$?
+  eq "newest: by version, final tags only" "$out" setup-v0.4.211
+  out="$(printf '%s\n' setup-v0.9.0 setup-v0.10.0 setup-v1.0.0 setup-v0.99.99 | bash "$0" newest)" && rc=0 || rc=$?
+  eq "newest: across minor and major" "$out" setup-v1.0.0
+  out="$(printf '%s\n' agent-v0.4.211 seed-cache | bash "$0" newest 2>"$tmp/err")" && rc=0 || rc=$?
+  eq "newest refuses a list with no setup tag" "$rc" 2
+
+  # --- default-for ----------------------------------------------------------
+  run default-for setup-v0.4.211 roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe;      eq "windows default" "$out" windows
+  run default-for setup-v0.4.211 roomler-setup-0.4.211-universal-apple-darwin.tar.gz;   eq "mac default" "$out" mac
+  run default-for setup-v0.4.211 roomler-setup-0.4.211-x86_64-unknown-linux-gnu.tar.gz; eq "linux default" "$out" linux
+  local n
+  for n in roomler-setup-0.4.211-x86_64-pc-windows-msvc.zip \
+           roomler-setup-0.4.211-aarch64-unknown-linux-gnu.tar.gz \
+           roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe.sha256 \
+           roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe.asc \
+           roomler-setup-0.4.210-x86_64-pc-windows-msvc.exe \
+           roomler-desktop-0.4.211-x86_64-pc-windows-msvc.exe \
+           roomler-release-pubkey.asc; do
+    run default-for setup-v0.4.211 "$n"; eq "no default for $n" "$out" ''
+  done
+  run default-for agent-v0.4.211 x; eq "default-for refuses a foreign tag" "$rc" 2
+
+  # --- a release on disk, with its digest list --------------------------------
+  local rel="$tmp/rel" dig="$tmp/digests.tsv" f
+  mkdir -p "$rel"
+  for f in roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe \
+           roomler-setup-0.4.211-x86_64-pc-windows-msvc.zip \
+           roomler-setup-0.4.211-universal-apple-darwin.tar.gz \
+           roomler-setup-0.4.211-x86_64-unknown-linux-gnu.tar.gz \
+           roomler-setup-0.4.211-aarch64-unknown-linux-gnu.tar.gz; do
+    printf 'payload of %s\n' "$f" > "$rel/$f"
+    printf '%s  %s\n' "$(sha256_of "$rel/$f")" "$f" > "$rel/$f.sha256"
+    printf 'signature of %s\n' "$f" > "$rel/$f.asc"
+  done
+  printf 'the public key\n' > "$rel/roomler-release-pubkey.asc"
+  write_digests() {
+    : > "$dig"
+    local g
+    for g in "$rel"/*; do printf '%s\tsha256:%s\n' "${g##*/}" "$(sha256_of "$g")" >> "$dig"; done
+  }
+  write_digests
+
+  # --- defaults-plan ----------------------------------------------------------
+  run defaults-plan setup-v0.4.211 "$rel"
+  eq "defaults-plan exit" "$rc" 0
+  eq "defaults-plan lines" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 3
+  eq "defaults-plan windows" "$(printf '%s\n' "$out" | awk -F'\t' '$1=="windows"{print $2}')" \
+     roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe
+  eq "defaults-plan mac" "$(printf '%s\n' "$out" | awk -F'\t' '$1=="mac"{print $2}')" \
+     roomler-setup-0.4.211-universal-apple-darwin.tar.gz
+  eq "defaults-plan linux" "$(printf '%s\n' "$out" | awk -F'\t' '$1=="linux"{print $2}')" \
+     roomler-setup-0.4.211-x86_64-unknown-linux-gnu.tar.gz
+  mv "$rel/roomler-setup-0.4.211-universal-apple-darwin.tar.gz" "$tmp/held"
+  run defaults-plan setup-v0.4.211 "$rel"; eq "defaults-plan fails without the mac installer" "$rc" 1
+  mv "$tmp/held" "$rel/roomler-setup-0.4.211-universal-apple-darwin.tar.gz"
+  run defaults-plan setup-v0.4.210 "$rel"; eq "defaults-plan fails for another version" "$rc" 1
+
+  # --- verify -----------------------------------------------------------------
+  run verify "$rel" "$dig"; eq "verify accepts an intact release" "$rc" 0
+  eq "verify names every file" "$(printf '%s\n' "$out" | grep -c '^ok  ')" 16
+
+  local exe="$rel/roomler-setup-0.4.211-x86_64-pc-windows-msvc.exe"
+  cp "$exe" "$tmp/exe.bak"; cp "$exe.sha256" "$tmp/side.bak"
+  # Only GitHub's digest disagrees: the file and its sidecar were changed together,
+  # which is what a swap on the way from GitHub would look like.
+  printf 'tampered\n' >> "$exe"
+  printf '%s  %s\n' "$(sha256_of "$exe")" "${exe##*/}" > "$exe.sha256"
+  run verify "$rel" "$dig"; eq "verify refuses a file that differs from GitHub's digest" "$rc" 1
+  # Only the sidecar disagrees: GitHub's digests are those of the files on disk.
+  cp "$tmp/side.bak" "$exe.sha256"; write_digests
+  run verify "$rel" "$dig"; eq "verify refuses a file that differs from its sidecar" "$rc" 1
+  cp "$tmp/exe.bak" "$exe"; write_digests
+  run verify "$rel" "$dig"; eq "verify accepts the restored release" "$rc" 0
+
+  printf 'stray\n' > "$rel/extra.bin"
+  run verify "$rel" "$dig"; eq "verify refuses a file the release does not list" "$rc" 1
+  rm "$rel/extra.bin"
+
+  mv "$rel/roomler-release-pubkey.asc" "$tmp/held"
+  run verify "$rel" "$dig"; eq "verify refuses a missing asset" "$rc" 1
+  mv "$tmp/held" "$rel/roomler-release-pubkey.asc"
+
+  mv "$exe.sha256" "$tmp/held"; write_digests
+  run verify "$rel" "$dig"; eq "verify refuses an installer with no sidecar" "$rc" 1
+  mv "$tmp/held" "$exe.sha256"; write_digests
+
+  sed -i 's/\tsha256:[0-9a-f]*$/\t/' "$dig"
+  run verify "$rel" "$dig"; eq "verify refuses an asset list without digests" "$rc" 1
+  write_digests
+  printf '../escape\tsha256:%s\n' "$(sha256_of "$exe")" >> "$dig"
+  run verify "$rel" "$dig"; eq "verify refuses a path in an asset name" "$rc" 1
+  write_digests
+  run verify "$rel" "$tmp/none.tsv"; eq "verify refuses a missing digest list" "$rc" 2
+
+  # --- prune-plan ---------------------------------------------------------------
+  plan() { out="$(printf '%s\n' "${@:3}" | bash "$0" prune-plan "$1" "$2" 2>"$tmp/err")" && rc=0 || rc=$?; }
+  local names=() i
+  for i in 199 200 201 202 203 204 205 206 207 208 209 210 211; do names+=("setup-v0.4.$i"); done
+
+  plan 10 setup-v0.4.211 "${names[@]}"
+  eq "prune: 13 folders, keep 10" "$(echo $out)" "setup-v0.4.199 setup-v0.4.200 setup-v0.4.201"
+  plan 13 setup-v0.4.211 "${names[@]}"; eq "prune: exactly keep folders" "$out" ''
+  plan 20 setup-v0.4.211 "${names[@]}"; eq "prune: fewer than keep" "$out" ''
+
+  # Version order, not text order: 0.4.9 is older than 0.4.10 and 0.4.100.
+  plan 3 setup-v0.4.100 setup-v0.4.100 setup-v0.4.9 setup-v0.4.10 setup-v0.4.99 setup-v0.10.0 setup-v0.4.8
+  eq "prune: numeric order" "$(echo $out)" "setup-v0.4.8 setup-v0.4.9 setup-v0.4.10"
+
+  # Everything that is not a setup release folder is left alone.
+  plan 3 setup-v0.4.211 "${names[@]}" seed-cache agent-v0.4.211 tunnel-v0.4.192 vendored-ffmpeg-9.0.1 \
+       setup-v0.4.5-rc.1 'setup-v0.4.5 copy' README.md setup-v
+  eq "prune: only named setup folders" "$(echo $out | tr ' ' '\n' | grep -vc '^setup-v0\.4\.[0-9]*$')" 0
+  eq "prune: count with strangers present" "$(echo $out | wc -w | tr -d ' ')" 10
+
+  # The folder just published is never removed, even when it is not among the newest.
+  plan 3 setup-v0.4.200 "${names[@]}"
+  eq "prune: a republished old tag survives" "$(echo $out | tr ' ' '\n' | grep -cx 'setup-v0.4.200')" 0
+  eq "prune: and the rest of the old ones go" "$(echo $out | wc -w | tr -d ' ')" 9
+
+  # sftp's own output shape: an echo line, path prefixes, trailing slashes, CRs, duplicates.
+  out="$(printf 'sftp> ls -1 /home/frs/project/x/\r\n/home/frs/project/x/setup-v0.4.1/\r\n/home/frs/project/x/setup-v0.4.2\r\n/home/frs/project/x/setup-v0.4.3\n/home/frs/project/x/setup-v0.4.4\nsetup-v0.4.4\n/home/frs/project/x/seed-cache\n' \
+        | bash "$0" prune-plan 3 setup-v0.4.4)" && rc=0 || rc=$?
+  eq "prune: sftp listing" "$out" setup-v0.4.1
+
+  # Refusals: each of these would otherwise remove something on a wrong premise.
+  plan 10 setup-v0.4.212 "${names[@]}"; eq "prune refuses when the current tag is not listed" "$rc" 2
+  eq "prune prints nothing on that refusal" "$out" ''
+  plan 10 setup-v0.4.211;               eq "prune refuses an empty listing" "$rc" 2
+  plan 2 setup-v0.4.211 "${names[@]}";  eq "prune refuses a keep under the floor" "$rc" 2
+  plan 0 setup-v0.4.211 "${names[@]}";  eq "prune refuses keep 0" "$rc" 2
+  plan x setup-v0.4.211 "${names[@]}";  eq "prune refuses a keep that is not a number" "$rc" 2
+  plan 10 seed-cache "${names[@]}";     eq "prune refuses a current tag of another family" "$rc" 2
+
+  if [ "$fail" -ne 0 ]; then
+    echo "sourceforge-publish selftest: $fail of $((pass + fail)) checks FAILED" >&2
+    return 1
+  fi
+  echo "sourceforge-publish selftest: $pass checks passed"
+}
+
+case "${1:-}" in
+  valid-tag)     [ $# -eq 2 ] || die "usage: valid-tag <tag>";                  valid_tag "$2" ;;
+  newest)        [ $# -eq 1 ] || die "usage: newest  (tag names on stdin)";     newest ;;
+  default-for)   [ $# -eq 3 ] || die "usage: default-for <tag> <asset-name>";   default_for "$2" "$3" ;;
+  defaults-plan) [ $# -eq 3 ] || die "usage: defaults-plan <tag> <dir>";        defaults_plan "$2" "$3" ;;
+  verify)        [ $# -eq 3 ] || die "usage: verify <dir> <digests.tsv>";       verify "$2" "$3" ;;
+  prune-plan)    [ $# -eq 3 ] || die "usage: prune-plan <keep> <current-tag>";  prune_plan "$2" "$3" ;;
+  --selftest)    selftest ;;
+  *) die "usage: $0 valid-tag|newest|default-for|defaults-plan|verify|prune-plan|--selftest (see the header)" ;;
+esac

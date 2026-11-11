@@ -1346,7 +1346,8 @@ All seven open decisions were resolved as the spec recommended
 - Replacing `install.sh`, `install.ps1` or the MSI.
 - SourceForge's per-OS default downloads on future releases. They were set by hand on
   `setup-v0.4.180` (see the log); repeating that per release is a `ship-it` follow-up, not this
-  FR.
+  FR. It became [FR-143](FR-143-sourceforge-publish.md) on 2026-11-11: a workflow moves them on
+  every release.
 
 ## Field-verification log
 
