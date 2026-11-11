@@ -287,6 +287,33 @@ pub enum WorkerOrder {
     Attached,
 }
 
+impl WorkerOrder {
+    /// FR-138 P2b (second review LOW-B) — the order's kind, for a line that
+    /// says which order was lost.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Detached { .. } => "detached",
+            Self::Resumed { .. } => "resumed",
+            Self::Close { .. } => "close",
+            Self::Ended { .. } => "ended",
+            Self::Paused { .. } => "paused",
+            Self::Attached => "attached",
+        }
+    }
+
+    /// FR-138 P2b (second review LOW-B) — the sessions the order names, for
+    /// the same line. None for the channel's own `Paused` and `Attached`.
+    pub fn session_ids(&self) -> Vec<String> {
+        match self {
+            Self::Detached { sessions, .. } => sessions.clone(),
+            Self::Resumed { session_id }
+            | Self::Close { session_id, .. }
+            | Self::Ended { session_id, .. } => vec![session_id.clone()],
+            Self::Paused { .. } | Self::Attached => Vec::new(),
+        }
+    }
+}
+
 /// FR-138 P2b — where a frame from the daemon goes in the worker.
 #[derive(Debug)]
 pub enum WorkerLane {
@@ -1843,8 +1870,9 @@ impl DelegateHost {
     /// and a line over [`DELEGATE_LINE_MAX`]'s.
     /// Before, only a clean end ran it, and a record of a worker gone that way
     /// kept its generation: counted, claimed at the next roll, with no peer
-    /// behind it. With the switch off nothing here was ever set, so it changes
-    /// nothing.
+    /// behind it. With the switch off it changes nothing: the worker's word it
+    /// clears is read only with the switch on, no record reads the generation
+    /// it bumps, and the bindings it drains are empty.
     fn records_channel_ended(&self, cause: &str) {
         // The worker's word goes with it: a session asked next is not
         // keepable until a worker says it again.
@@ -1936,10 +1964,12 @@ impl DelegateHost {
             .remove(session);
     }
 
-    /// FR-138 P2b — an order about a session the daemon will claim
+    /// FR-138 P2b — an order about a session the daemon holds a record of
     /// ([`DelegateFrame::Detached`], [`DelegateFrame::Resumed`],
-    /// [`DelegateFrame::Close`]). Never waits: a full queue costs the order, and
-    /// the worker's own deadline closes the peer anyway. `false` with no worker.
+    /// [`DelegateFrame::Close`], [`DelegateFrame::Ended`]). Never waits: a full
+    /// queue costs the order. A session the worker keeps still closes at its
+    /// own deadline, and the `Ended` of an attached session has the server's
+    /// `Terminate` crossing beside it. `false` with no worker.
     pub(crate) fn send_order(&self, frame: DelegateFrame) -> bool {
         let tx = self
             .inner

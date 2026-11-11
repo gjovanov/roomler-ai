@@ -470,12 +470,18 @@ async fn attach_once(
                             }
                         }
                         // FR-138 P2b — the daemon's orders about the sessions
-                        // it will claim. Never waits: a lost order leaks
-                        // nothing, since the delegated table's own deadline
-                        // closes what it keeps.
+                        // it holds a record of. Never waits: a full lane costs
+                        // the order, and the line names it. A session the
+                        // delegated table keeps still closes at its own
+                        // deadline, and the `Ended` of an attached session has
+                        // the server's `Terminate` crossing beside it.
                         Ok(WorkerLane::Order(order)) => {
+                            let kind = order.kind();
+                            let sessions = order.session_ids();
                             if !lane.order(order) {
                                 tracing::warn!(
+                                    order = kind,
+                                    ?sessions,
                                     "delegation: orders queue full or closed; dropped an order (FR-138 P2b)"
                                 );
                             }

@@ -927,10 +927,16 @@ impl<P: TablePeer> SessionTable<P> {
     /// these sessions as `error` when the channel ended (D6), so the server has
     /// ended them, and the peer of an ended session must close: every one
     /// closes, attached and kept, through the budget, with its real end. Their
-    /// links stop waiting first. Nothing goes up the channel: the daemon said
-    /// it. The line names the cause, so a later read can count the blips that
-    /// ended sessions with both processes alive. Surviving a blip, re-bound at
-    /// the next attach, would be a design change. Empty with the switch off.
+    /// links stop waiting first. (Second review LOW-A) Each then says it is
+    /// gone up the channel, `agent_disconnect`, through the queue that never
+    /// waits: a `Paused` served late, after the next attach built a session,
+    /// closes that one too (the table cannot tell one attach from the other),
+    /// and the daemon must drop the record it made for it. For a session of
+    /// the attach that ended, it repeats the daemon's `error`, harmlessly. A
+    /// line names each session and the cause, and one counts them, so a later
+    /// read can count the blips that ended sessions with both processes alive.
+    /// Surviving a blip, re-bound at the next attach, would be a design
+    /// change. Empty with the switch off.
     pub(crate) async fn close_at_channel_end(&mut self, cause: &str) {
         self.pause();
         let attached: Vec<(ObjectId, Live<P>)> = self.attached.drain().collect();
@@ -946,11 +952,25 @@ impl<P: TablePeer> SessionTable<P> {
              ended each as `error` (FR-138 P2b)"
         );
         for (session_id, live) in attached {
+            info!(
+                session_id = %session_id,
+                cause,
+                "rc session closed (delegated, attached): the channel to the daemon ended \
+                 (FR-138 P2b)"
+            );
             (self.on_end)(session_id, RealEnd::Ended);
             close_within_budget(live.peer.close(), session_id, "channel_ended").await;
+            self.queue_end(gone(session_id, EndReason::AgentDisconnect));
         }
         for session_id in kept {
+            info!(
+                session_id = %session_id,
+                cause,
+                "rc session closed (delegated, kept): the channel to the daemon ended \
+                 (FR-138 P2b)"
+            );
             self.close_kept(session_id, "channel_ended").await;
+            self.queue_end(gone(session_id, EndReason::AgentDisconnect));
         }
     }
 
@@ -994,7 +1014,10 @@ impl<P: TablePeer> SessionTable<P> {
     }
 
     /// FR-138 P2b (B9) — the channel is back: the attached sessions' links
-    /// point at it again. Kept ones stay kept, for the daemon's `Resumed`.
+    /// point at it. Since `Paused` closes every delegated session it finds
+    /// (review MEDIUM-1), a session here was built after it, on this attach,
+    /// and its link already points at the channel; kept ones, a later
+    /// `Detached`'s, stay kept for the daemon's `Resumed`.
     pub(crate) fn unpause(&mut self) {
         let Some(to) = self.current.clone() else {
             return;
@@ -4216,8 +4239,9 @@ mod tests {
     /// FR-138 P2b (review MEDIUM-1) — the channel to the daemon ends with both
     /// processes alive: the daemon has ended every one of these sessions as
     /// `error` (D6), so the worker closes each peer, attached and kept, with
-    /// its real end, and says nothing up the channel, since the daemon said
-    /// it. Nothing is left for the next attach.
+    /// its real end. Nothing is left for the next attach. (Second review
+    /// LOW-A: each also says it is gone up the channel, `agent_disconnect`,
+    /// which for these repeats the daemon's `error` harmlessly.)
     #[tokio::test]
     async fn p2b_review_a_channel_end_closes_every_delegated_session() {
         let mut w = worker_rig(2).await;
@@ -4243,10 +4267,14 @@ mod tests {
             sorted(vec![(a, RealEnd::Ended), (b, RealEnd::Ended)]),
             "each real end ran"
         );
-        assert!(
-            drain(&mut w.channel).is_empty(),
-            "nothing goes up: the daemon said it"
-        );
+        let mut said = ends_said(&drain(&mut w.channel));
+        said.sort_by_key(|(s, _)| *s);
+        let mut gone = vec![
+            (a, EndReason::AgentDisconnect),
+            (b, EndReason::AgentDisconnect),
+        ];
+        gone.sort_by_key(|(s, _)| *s);
+        assert_eq!(said, gone, "each says it is gone (second review LOW-A)");
         w.table
             .obey(WorkerOrder::Attached, &tx, Duration::ZERO)
             .await;
@@ -4270,6 +4298,61 @@ mod tests {
             ends_said(&drain(&mut w.channel)),
             vec![(a, EndReason::AgentDisconnect)],
             "the daemon hears it is gone"
+        );
+    }
+
+    /// FR-138 P2b (second review LOW-A) — a `Paused` the worker serves late,
+    /// after the next attach built a session (its loop was busy, and the new
+    /// offer was read first), closes that session too: the table cannot tell
+    /// one attach from the other. Each session it closes says it is gone up
+    /// the channel, `agent_disconnect`, through the queue that never waits,
+    /// so the daemon drops the record the new attach made instead of keeping
+    /// it live, counted, with no peer behind it. For a session of the attach
+    /// that ended, it repeats the daemon's own `error` (D6), which is harmless.
+    #[tokio::test]
+    async fn p2b_review2_a_late_paused_says_each_session_it_closes_is_gone() {
+        // The worker's table: the session the new attach built.
+        let mut w = worker_rig(1).await;
+        let a = w.sessions[0].id;
+        // The daemon's record of it, made as it crossed.
+        let mut r = record_rig(8, Some(60), 0).await;
+        assert!(r.host.send_params(
+            None,
+            DelegateFrame::SessionParams(Box::new(keepable_params(a)))
+        ));
+        r.table.cross_offer(a, r.table.live_generation());
+        while r.frames.try_recv().is_ok() {}
+        assert_eq!(r.table.len(), 1, "the record counts");
+
+        // The previous attach's `Paused`, served late.
+        let tx = w.tx.clone();
+        w.table
+            .obey(
+                WorkerOrder::Paused {
+                    cause: "Broken pipe (os error 32)".into(),
+                },
+                &tx,
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(w.sessions[0].peer.closes(), 1, "closed");
+        let up = drain(&mut w.channel);
+        assert_eq!(
+            ends_said(&up),
+            vec![(a, EndReason::AgentDisconnect)],
+            "its end goes up the channel"
+        );
+
+        // The daemon hears it on the channel and drops the record.
+        for msg in up {
+            r.host.relay_upstream(msg);
+        }
+        serve_for(&mut r.table, Duration::from_millis(300)).await;
+        assert_eq!(r.table.len(), 0, "the record goes");
+        assert_eq!(
+            ends_said(&drain(&mut r.conn)),
+            vec![(a, EndReason::AgentDisconnect)],
+            "the server hears the end"
         );
     }
 }
