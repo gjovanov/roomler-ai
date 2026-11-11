@@ -191,19 +191,19 @@ flowchart TB
   (P2); clipboard content and change events; the layout snapshot; the display-match state; its log lines
   (`WorkerLogs`, `delegate.rs:164-171`). Nothing else: no LocalAPI verb, no config, no consent answer, no exec.
   The features only NARROW: root advertises a word when its own gate allows it AND the worker says it can serve
-  it, as `PersonFloor` only tightens (`delegate.rs:172-188`). That is not how a Mac's root takes `WorkerCaps`: it
-  replaces its record, apps, audio and permission words with the worker's wholesale (`delegate.rs:1170-1221`,
-  `:1389-1396`), because there the worker holds the peer. The Linux worker never sends an `AgentCaps`.
-- **What bounds root applies, per message** (code for today's, inferred for the rest). This is a boundary from a
-  person's account into a root process, and today's two readers across it are not bounded enough to copy:
+  it, as `PersonFloor` only tightens (`delegate.rs:172-188`). Root alone decides every word the worker does not
+  serve, and the Linux worker never sends an `AgentCaps`.
+- **What bounds root applies, per message** (inferred design; the caps it reuses are code). This is a boundary
+  from a person's account into a root process: every message root reads from the worker has a length limit,
+  enforced by root, per the table:
 
-| message | bound on the root side | today |
-|---|---|---|
-| every frame | a length prefix, read and checked against its type's cap BEFORE anything is allocated; over the cap closes the channel; an unknown type is skipped and counted | ⚠️ the delegate reads newline-delimited JSON with `BufReader::lines()`, no length cap (`delegate.rs:1344`, `:1356`); the helper's handshake reads up to 64 lines of any length (`capture/portal/mod.rs:1205-1223`) |
-| handshake, features, layout, display state, a clipboard change event | one control frame, at most 64 KiB; the layout at most `MAX_GROUPS` (4) entries (`input/layout_x11.rs:51`), each token and tag at most 64 bytes; the display state one mode from the list root sent | the layout's strings carry no cap (`input/layout_x11.rs:94-101`) |
-| clipboard content | root applies the caps the data channel already has: text 1 MiB, PNG 8 MiB and 4096 x 4096 pixels, HTML 4 MiB, the native set 16 MiB (`clipboard.rs:1449`, `:1551-1570`); UTF-8 checked | applied today where the clipboard is read (`clipboard.rs:865-871`, `:1237`), which would be the worker, so root checks again |
-| log lines | as `WorkerLogs`: 100 a frame, each message cut to 8 KiB and marked by root (`delegate.rs:259-290`, `:742-758`), inside the frame cap above | the cut comes after the whole frame is parsed (`delegate.rs:752`) |
-| pixels (P2) | the helper's header checks: magic, at most 256 MiB, a non-zero size, a stride of at least four bytes a pixel (`capture/portal/wire.rs:54-57`, `:75-109`); P2 adds that the payload is exactly `stride x height`, the size the worker announced at open, at most 8192 on a side, into a buffer root reuses | ⚠️ nothing checks the payload against `stride x height`: the software encoder checks the format and the size (`encode/openh264_backend.rs:449-463`) and then slices each row by the stride (`:552-553`), which panics on a short payload; the NV12 conversion does check it (`encode/color.rs:54-61`). The helper's path has this gap today |
+| message | bound on the root side |
+|---|---|
+| every frame | a length prefix, read and checked against its type's cap BEFORE anything is allocated; over the cap closes the channel; an unknown type is skipped and counted |
+| handshake, features, layout, display state, a clipboard change event | one control frame, at most 64 KiB; the layout at most `MAX_GROUPS` (4) entries (`input/layout_x11.rs:51`), each token and tag at most 64 bytes; the display state one mode from the list root sent |
+| clipboard content | root applies the caps the data channel already has: text 1 MiB, PNG 8 MiB and 4096 x 4096 pixels, HTML 4 MiB, the native set 16 MiB (`clipboard.rs:1449`, `:1551-1570`); UTF-8 checked. The worker applies the same caps where it reads the clipboard (`clipboard.rs:865-871`, `:1237`), and root checks again |
+| log lines | as `WorkerLogs`: 100 a frame, each message cut to 8 KiB and marked by root (`delegate.rs:259-290`, `:742-758`), inside the frame cap above |
+| pixels (P2) | root checks every frame's payload length against its stride and height before any consumer reads it: the payload is exactly `stride x height`, at most 256 MiB; the header carries the magic, the size the worker announced at open (non-zero, at most 8192 on a side) and a stride of at least four bytes a pixel; the frame lands in a buffer root reuses |
 - **What the worker accepts from root**: open or close a source; input events; clipboard read and write; a layout
   token; a display mode. Only while root's guard is `Open` for the worker's session (inferred).
 - **Why that boundary**: a process running as the person can already call the person socket (`crates/localapi/src/lib.rs:3350`,
