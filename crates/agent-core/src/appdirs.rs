@@ -775,7 +775,10 @@ fn migrate_dirs_within(
     }
     let mut notes = Vec::new();
     for (at, (old, new)) in pairs.iter().enumerate() {
-        match migrate_dir(old, new, &mut rename) {
+        // The first pair holds `config.toml`: one rename moves its folder
+        // whole, or the folder stays. The pairs after it may move child by
+        // child.
+        match migrate_dir(old, new, at > 0, &mut rename) {
             Ok(note) => notes.extend(note),
             Err(note) => {
                 notes.push(note);
@@ -804,10 +807,13 @@ fn rename_on_disk(from: &Path, to: &Path) -> std::io::Result<()> {
 /// rename of its folder: `Ok` with a note for anything noteworthy (moved, or
 /// left beside a NEW folder that is already there), `Ok(None)` for the quiet
 /// no-legacy case, `Err` with a note when the move failed and the legacy
-/// folder is still where it was.
+/// folder is still where it was. A rename the system refuses
+/// (`PermissionDenied`) moves the folder's children one by one when
+/// `per_child` ([`migrate_children`]), and is an `Err` otherwise.
 fn migrate_dir(
     old: &Path,
     new: &Path,
+    per_child: bool,
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<Option<String>, String> {
     if !old.exists() {
@@ -833,7 +839,7 @@ fn migrate_dir(
             old.display(),
             new.display()
         ))),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(e) if per_child && e.kind() == std::io::ErrorKind::PermissionDenied => {
             // Field finding (DEVBOX, 2026-07-27): renaming the TOP dir was
             // denied by an external ROOT-handle (an AV / indexer
             // directory-watch — no roomler process held anything, ACLs
@@ -1587,7 +1593,7 @@ mod tests {
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("config.toml"), b"agent_token = \"x\"").unwrap();
 
-        let note = migrate_dir(&old, &new, rename_on_disk)
+        let note = migrate_dir(&old, &new, true, rename_on_disk)
             .unwrap()
             .expect("a move produces a note");
         assert!(note.starts_with("migrated"), "{note}");
@@ -1608,7 +1614,7 @@ mod tests {
         std::fs::create_dir_all(&new).unwrap();
         std::fs::write(old.join("stale.txt"), b"old").unwrap();
 
-        let note = migrate_dir(&old, &new, rename_on_disk)
+        let note = migrate_dir(&old, &new, true, rename_on_disk)
             .unwrap()
             .expect("both-present produces a note");
         assert!(note.contains("left in place"), "{note}");
@@ -1696,6 +1702,7 @@ mod tests {
             migrate_dir(
                 &tmp.path().join("roomler-agent"),
                 &tmp.path().join("roomler"),
+                true,
                 rename_on_disk
             ),
             Ok(None)
