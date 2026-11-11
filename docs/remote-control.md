@@ -1776,9 +1776,9 @@ composition.
 
 ⚠️ **A paste has one owner too** (#2910). Two `paste` listeners sit on
 `window`: the files drawer's `onWindowPasteForDrawer`
-(`RemoteControl.vue:3461`), registered at mount (`:5735`), and the deferred
+(`RemoteControl.vue:3461`), registered at mount (`:5737`), and the deferred
 Ctrl+V's `onPaste` (`useRemoteControl.ts:12837`), registered later by
-`attachInput` (`:12779`). Same node, same phase, so the drawer's runs
+`attachInput` (`:13077`). Same node, same phase, so the drawer's runs
 **first** — and `preventDefault` stops no other listener on the same node.
 With the drawer open, a Ctrl+V over the stage with files on the clipboard
 uploaded every file twice: into the drawer's directory, then again into the
@@ -1786,7 +1786,7 @@ default folder. Now each half steps aside for the other: `drawerPasteFiles`
 (`useRemoteControl.ts:15496`) returns nothing for a paste already consumed,
 and `routeDeferredPaste` (`:15470`) answers `taken` for one the drawer
 consumed — the deferred chord is dropped, with no keystroke and no second
-upload (`:12551`). Whichever listener runs first owns the paste, so a future
+upload (`:12849`). Whichever listener runs first owns the paste, so a future
 change to the registration order cannot bring the double back. With the
 drawer open, a files paste that does reach `onPaste` — one aimed at the soft
 keyboard's textarea, which the drawer leaves to it as a form field — uploads
@@ -3734,15 +3734,15 @@ socket handed in, so every row below is a unit test. The composable wires it (`u
 |---|---|---|
 | `rc:session.created` carries `resume_secs` | The session may be held, for that many seconds at most, capped at the agent's own 120 s. An external session (FR-52, D3) never is | `holdWindowFor`, `ui/src/composables/rcSessionHold.ts:62`; `useRemoteControl.ts:9192` |
 | This page's socket drops while the session is live, or the session goes live while it is down | The hold starts. Its deadline is the drop plus `resume_secs` plus 5 s, because a dying pod may never send `rc:session.detached` | the status watch, `useRemoteControl.ts:9989`; `:10464` |
-| `rc:session.detached {resume_by}` | The hold starts if it has not, and the chip reads `connected · server link down` with this page's socket up. The deadline becomes `resume_by` plus 5 s, and a rejoin goes out a second later | `useRemoteControl.ts:9492`; `classifyDegraded`, `:980` |
+| `rc:session.detached {resume_by}` | The hold starts if it has not, and the chip reads `connected · server link down` with this page's socket up. The deadline becomes `resume_by` plus 5 s, and a rejoin goes out a second later. The page also notes that the server called the session detached, until an `rc:session.resumed` or the hold's next arm or disarm, and the hold's own end leaves the note: until then no automatic redial of the session hangs up first (D5 = A, below) | `useRemoteControl.ts:9492`; `classifyDegraded`, `:980`; `deviceDetached`, `ui/src/composables/rcSessionHold.ts:309` |
 | The socket is back | `rc:session.rejoin {session_id}` at once, on the socket that just opened | `socketUp`, `ui/src/composables/rcSessionHold.ts:267` |
 | `rc:session.detached` again, the answer to a rejoin | Asks again a second later, until the deadline. Never without an answer, so a server that drops rejoins gets one rejoin a socket | `detached`, `ui/src/composables/rcSessionHold.ts:276` |
 | `rc:session.resumed` | The hold ends `resumed` and the chip clears. No `rc.connect` record, because no attempt starts | `useRemoteControl.ts:9498` |
 | `rc:terminate` | The hold ends `ended` with its reason, and the rest is today's: a retryable reason starts the ladder, a final one closes and says why. An admin's end now has a sentence (§2.5 of the spec) | `useRemoteControl.ts:9509`; `friendlyEndReason`, `:946` |
 | `rc:ended {reason, limit}` on the control channel | Read as an `rc:terminate` for the session: a retryable reason starts the ladder, a final one closes with no ladder and drops the replay arguments, so a reload resumes nothing either. The first of `rc:terminate` and `rc:ended` for a session wins, and the second does nothing. One from a peer the page has since replaced ends nothing | `onDeviceEnded`, `useRemoteControl.ts:5706`; `claimEnd`, `:5691` |
 | An `rc:error` | The server refused the rejoin: the hold ends `ended` with the code, and the page redials. A held session sends nothing but its rejoins, ICE included, so the error is never about a stray candidate | `useRemoteControl.ts:9599`; `:10443` |
-| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. A `derp` session lands here at a roll (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9771` |
-| The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts | `onExpired`, `useRemoteControl.ts:5604` |
+| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. For a session the server called detached it sends no `rc:terminate controller_hangup` first (D5 = A): its device is away, so the session ended on the device's side, and the request's `replaces` ends the row as that (§11.18). A `derp` session lands here at a roll (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9771`; the skipped hangup, `:9759` |
+| The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts, with no hangup first for a session the server called detached, as above | `onExpired`, `useRemoteControl.ts:5604` |
 
 ⚠️ **`resume_by` is on the server's clock, never this browser's** (#3511). It is read once, at receipt, against
 this browser's wall clock, and what is left is bounded to `[0, resume_secs]` (`holdRemainingMs`,
@@ -3752,11 +3752,15 @@ The first `resume_by` a hold hears replaces the socket-loss fallback, and a repe
 later, since a recount against a skewed clock would every second.
 
 **A redial names what it replaces.** A server may keep a resumable session past its viewer's socket, so a redial's
-best-effort hangup no longer frees its slot on its own: it goes nowhere while the page's socket is down.
+best-effort hangup no longer frees its slot on its own: it goes nowhere while the page's socket is down. Before a
+redial of a session the server called detached it is not sent at all (D5 = A, the operator, 2026-11-11). Its device
+is away, so a hangup could free nothing on it, and it wrote `controller_hangup` for a session nobody hung up
+(FR-138's AC4, cell (d), #3604): the request's `replaces` ends that row `agent_disconnect`, inferred, and gives
+the org's slot back before the request's gate (§11.18).
 
 | Rule | Where |
 |---|---|
-| A redial of a session the server called resumable, for any reason, keeps its id and sends it as `replaces` on every `rc:session.request` until an `rc:session.created` answers one. The hangup stays | `scheduleReconnect`, `useRemoteControl.ts:9771`; the request, `:11848`; answered, `:9193` |
+| A redial of a session the server called resumable, for any reason, keeps its id and sends it as `replaces` on every `rc:session.request` until an `rc:session.created` answers one. The hangup stays, except before a redial of a session the server called detached; a person's Disconnect always sends it | `scheduleReconnect`, `useRemoteControl.ts:9771`; the skipped hangup, `:9759`; the request, `:11848`; answered, `:9193`; `disconnect`, `:11949` |
 | A user's own Connect, a hangup, a failure or a final end replaces nothing, so every other request is the one a page before FR-138 sent | `useRemoteControl.ts:10125`, `:9664`, `:11962` |
 | A reload that takes a redial over (§11.15) carries the id to the next load, by shape only, and that load's first request names it. A reload of a live resumable session names that session | `withReloadReplaces`, `useRemoteControl.ts:9873`; `RcResumeArgs.replaces`, `ui/src/utils/staleBuildPolicy.ts:206`; `resumeAfterReload`, `useRemoteControl.ts:9930` |
 
@@ -3792,7 +3796,8 @@ What stays as it was:
 - **The redial ladder, the stage mount and `rc.connect`.** A redial is today's, with one more field on its request.
   A held session writes no `rc.connect` record, and a redial writes today's.
 - **Off is today.** With no `resume_secs` the hold is never armed: no rejoin, no deadline, `rc:session.detached`
-  ignored, no `replaces` and no `rc.resume`. A test compares the redial's request with the first one, field for field.
+  ignored, so every automatic redial hangs up first, no `replaces` and no `rc.resume`. A test compares the redial's
+  request with the first one, field for field.
 
 The tests: `rcSessionHold.spec.ts` (the machine), `useRemoteControl.hold.spec.ts` (the composable end to end, with
 a fake peer), `rcResumeRecord.spec.ts`, `rcPaintGap.spec.ts`, `rcPaintGapWorkers.spec.ts` and
@@ -3965,8 +3970,11 @@ slot first (claimed before the hub's own dispatch), the pod that holds the devic
 claims one (`before_request`, `crates/modules/remote/src/row_end.rs:203`; `Hub::end_replaced`,
 `crates/modules/fleet/src/hub/hold.rs:284`; `Hub::reap_held_for`, `:323`). The hub's own orphan reap spares a held
 session against another person's request and never takes a session with no controller for an orphan
-(`crates/modules/fleet/src/hub.rs:1642`). A redial sends `replaces` again on every attempt until it is answered,
-so it may name a session that has already ended: that ends nothing and refuses nothing, and the request goes on.
+(`crates/modules/fleet/src/hub.rs:1642`). When no pod holds the session the redial names, because its device's
+socket went (the row is detached), it ends at its row instead, as `agent_disconnect`, inferred, and its slot is given
+back there, still before the gate (D5 = A; the end table below). A redial sends `replaces` again on every attempt until it is
+answered, so it may name a session that has already ended: that ends nothing and refuses nothing, and the request
+goes on.
 
 **The FR-115 slot through a gap** (review 1: M5, L5, L2, and `refuse_claim`'s race; PR D's review: MEDIUM 1 and 2,
 LOW 4 to 7). A detached session is held by no pod, so nobody renews its lease, and that lease is its slot: a request
@@ -4037,9 +4045,10 @@ receives the event:
 |---|---|---|
 | an admin's, `POST …/session/{id}/terminate` (`admin_end`, `:141`); the answer says `row_ended`. A write that failed answers 503 and asks to try again, since the device's claim may still resume the session (`Written::Failed`, `:57`; review 2, N10) | the route's org | the `terminate` control event, as before, published before the 503, so a pod that holds the session still ends it |
 | the controller's own `rc:terminate` (`controller_end`, `:166`) | the person | `controller_terminate`, which the holding pod applies only to that org and that person (`crates/modules/fleet/src/ctrl.rs:126`) |
-| a redial's `replaces` | the person and the device | `controller_terminate` |
+| a redial's `replaces` of a session not detached (`before_request`, `crates/modules/remote/src/row_end.rs:203`) | the person and the device | `controller_terminate` |
+| a redial's `replaces` of a session its device's socket left detached (D5 = A; `replaced_detached`, `crates/modules/remote/src/row_end.rs:257`). The page knew, sent no hangup first, and gave the session up only once its peer went or its own deadline passed, so the session ended on the device's side | the person and the device, live and detached | `controller_terminate` with `agent_disconnect`, as insurance: the row is ended `agent_disconnect` at its own last clock (`detached_at`), marked `end_source: redial`, only as it was read (`end_replaced_detached`, `crates/services/src/dao/remote_session.rs:624`), and its FR-115 slot is given back before the request's gate. A write that matches nothing (a claim resumed the session, or the sweep ended it) takes the row above's path. ⚠️ The detach reaches the row through the audit sink, which batches for up to 200 ms, so a redial inside that gap reads the row attached and ends it `controller_hangup` |
 | the device's own, after its hello, for a session its registration ended unseen (`device_end`, `crates/modules/remote/src/resume.rs:714`) | the device | none: the device's reason (`host_disconnect`, `idle_timeout`/`idle`, `error`) replaces the inferred `agent_disconnect`, `end_source` is cleared, and `ended_at` stays the row's own last clock, since the frame carries no time (`replace_inferred_end`, `crates/services/src/dao/remote_session.rs:480`) |
-| the device's own, for a session whose end was inferred BEFORE this connection: by the sweep, or by an earlier connection's registration (review 2, N5; `earlier_inferred_end`, `crates/modules/remote/src/resume.rs:775`) | the device, and an end inferred as `registration` or `sweep` | none: as above (`replace_earlier_inferred_end`, `crates/services/src/dao/remote_session.rs:425`). Never the one-time close's rows (`backfill`): that end is an operator's, taken only once the row's own clock has stood still for an hour at least and its device has had a session since, long after any device stopped keeping the session (a window is 120 s at most), and no inference from the device's connection going |
+| the device's own, for a session whose end was inferred BEFORE this connection: by the sweep, by an earlier connection's registration (review 2, N5; `earlier_inferred_end`, `crates/modules/remote/src/resume.rs:775`), or by its viewer's redial while it was detached (D5 = A) | the device, and an end inferred as `registration`, `sweep` or `redial` (`inferred_by_device_loss`, `crates/services/src/dao/remote_session.rs:770`) | none: as above (`replace_earlier_inferred_end`, `crates/services/src/dao/remote_session.rs:425`). Never the one-time close's rows (`backfill`): that end is an operator's, taken only once the row's own clock has stood still for an hour at least and its device has had a session since, long after any device stopped keeping the session (a window is 120 s at most), and no inference from the device's connection going |
 
 Each writes the audit's `session_ended` as its trail, which projects nothing onto the row
 (`AuditSink::record_trail`, `crates/remote_control/src/audit.rs:100`).
@@ -4122,8 +4131,8 @@ still went live and still counts as requested, but it adds no duration and its e
 
 **An end someone asks for never overwrites an inferred one** (review 2, N11). The audit's projection writes such an
 end (an admin's, the controller's, the device's, a consent verdict) only to a row with no `end_source`
-(`end_session`, `crates/remote_control/src/audit.rs:312`). An inferred end (the registration read's, the sweep's or the
-one-time close's) was written because the session was over, by the best evidence there was, and a later asked end can only come from a copy some pod still held of a session
+(`end_session`, `crates/remote_control/src/audit.rs:312`). An inferred end (the registration read's, the sweep's, a
+detached session's redial's or the one-time close's) was written because the session was over, by the best evidence there was, and a later asked end can only come from a copy some pod still held of a session
 already ended (a half-open socket kept it), whose reason and `now` would rewrite the row's end and leave the mark on
 it. An asked end still replaces an earlier SEEN end, as every end did before FR-138, and at window 0 that is
 load-bearing: FR-27 audits a device with no prompt surface as `consent_timeout` and then ends it `no_prompt_surface`
@@ -4136,6 +4145,7 @@ on the same row (`crates/modules/fleet/src/hub.rs:2258`), and the growth digest'
 | window 0 | no window is announced and no `resume_secs` is told; a socket loss of either end ends its sessions as before; every claim is refused at once and nothing is read; a rejoin is dropped unanswered, as an older server drops it; no end is written to a row no hub holds; the sweep ends only a row a detach marked, and a scope change is told to nobody. Review 2's one change at window 0 is N11's: an asked end leaves an inferred end alone, and at window 0 a row carries one only if a window detached it earlier or the one-time close ended it. The later edges change nothing at window 0: the stale-lease check reads no row and no scope, no row is marked `external`, no lease is kept past its expiry, and an admin's end answers as before. What makes every expiry only grow runs at every window but decides nothing at 0: only the pod that holds a session writes its lease, every writer writes 90 s from its own now, and its scores and expiries only grow, so the renewal's and the restore's `GT` and `NX` never refuse a write and the claim's `PTTL` reads never skip one (should a pod's wall clock step back by more than a renewal period, the round reads the lease as missing, and the hub, which still holds the session, restores it, keeping the later score). Each command carries one more word, and the claim script one more read; no outcome differs |
 | a device without `rc-resume`, or outside the scope | as window 0, for that device |
 | an older viewer | ignores `resume_secs` and never rejoins: its own socket's loss keeps the session for the window, which then ends it marked `hold_expired` (AC5 allows as today, or at the window), and its next request reaps it as the same person's |
+| a page from before D5 = A | hangs up before it redials a session the server called detached, so the row reads `controller_hangup`, as before: the hangup ends it first (`controller_end`), and the redial's `replaces` then finds the row ended |
 
 The integration tests are `crates/tests/src/rc_resume_claim_tests.rs` (the device's side),
 `crates/tests/src/rc_resume_rejoin_tests.rs` (the viewer's side, and the ends written to the row),
@@ -4144,7 +4154,9 @@ The integration tests are `crates/tests/src/rc_resume_claim_tests.rs` (the devic
 L1, N5, N17, N9, N11) and `crates/tests/src/rc_resume_pd_tests.rs` (the edges the reviews deferred: M5 and its
 window-0 guard, `refuse_claim`'s race, L2, L5, L6 with D3 at the claim, N10 and N14; then PR D's review: MEDIUM 1,
 LOW 4, 5, 7 and 8, the renewal's `GT`, whose removal fails a test, a session whose slot another took during the gap,
-and a viewer removed from the org during the gap, refused within 5 s). MEDIUM 2's ordering, LOW 3's fence and L13's
+and a viewer removed from the org during the gap, refused within 5 s), and `crates/tests/src/rc_resume_replaces_tests.rs`
+(D5 = A: a redial's `replaces` of a detached session, the device's own end after its hello replacing that inference,
+and an attached session held on another pod, still `controller_hangup`). MEDIUM 2's ordering, LOW 3's fence and L13's
 twin are unit tests in the hub (`crates/modules/fleet/src/hub/resume.rs`); L13's twin also passes without the fix,
 so it is a guard rather than a proof.
 
