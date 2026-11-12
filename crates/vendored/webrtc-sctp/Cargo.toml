@@ -32,6 +32,8 @@
 #     A write holds its stream's `write_turn` from its shutdown check until
 #     its chunks are queued, and the reset waits for that turn on its task,
 #     so it never goes ahead of a write the check let through.
+#   - src/stream/stream_test.rs: the regression test for that order (a
+#     reset taken while a write holds its turn queues behind the write).
 
 [package]
 edition = "2021"
