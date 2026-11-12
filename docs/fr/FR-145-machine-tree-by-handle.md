@@ -101,8 +101,8 @@ flowchart TD
 
 Home: `crates/agent-core/src/machine_tree/held.rs`, a child module of `machine_tree.rs` (already 4,000 lines),
 re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It reuses `win::open`,
-`win::open_below`, `win::delete_by_handle`, `win::set_sd` (`machine_tree.rs:1859`) and `sealed_aces`
-(`:518-535`). Windows only.
+`win::open_below`, `win::delete_by_handle`, `win::set_sd` (`machine_tree.rs:1904`) and `sealed_aces`
+(`:545-562`). Windows only.
 
 **As built in P1 (#3758, accepted 2026-11-12):** the module is public, `machine_tree::held`, and the re-export is
 `machine_tree::{HeldEntry, HeldPath, Seal, TreeRemoval, Why}`. The refusal stays
@@ -133,8 +133,8 @@ short name, and that is the name a test's lines show.
 
 | `Seal` | Owner and DACL | Used for |
 |---|---|---|
-| `Private` | owner Administrators; protected; SYSTEM and Administrators full control, inherited by what is made below (`sealed_aces`, `machine_tree.rs:518-535`) | the companion's launch marker |
-| `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`, as `record_aces` gives the attempt record, `machine_tree.rs:537-551`) | `service-logs` and its files, `crashes` (D10), the attempt record, the machine attention file, the presence lock |
+| `Private` | owner Administrators; protected; SYSTEM and Administrators full control, inherited by what is made below (`sealed_aces`, `machine_tree.rs:545-562`) | the companion's launch marker |
+| `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`, as `record_aces` gives the attempt record, `machine_tree.rs:564-578`) | `service-logs` and its files, `crashes` (D10), the attempt record, the machine attention file, the presence lock |
 
 Notes on the calls:
 
@@ -148,7 +148,7 @@ Notes on the calls:
   the flag did.
 - A held folder is opened with list, traverse, read-attributes, `READ_CONTROL` and `SYNCHRONIZE`; with
   `WRITE_DAC` and `WRITE_OWNER` too when it is a leaf the policy may seal, and `DELETE` when it may be moved aside
-  or removed. #3743's `win::open` asks for `READ_CONTROL` alone (`machine_tree.rs:1475`), so `held.rs` opens its
+  or removed. #3743's `win::open` asks for `READ_CONTROL` alone (`machine_tree.rs:1520`), so `held.rs` opens its
   own handles and wraps them in a `HeldFolder` rather than widening the anchor reader's.
 - **As built in P1 (accepted 2026-11-12), a reader's way through a folder it may not list:** a name that a read walk
   (`walk`, `open_dir`, `below`) passes through, and that the caller may not open with that set, is held with
@@ -167,14 +167,14 @@ Notes on the calls:
   crash record walks three or four components; a log rotation opens one file below a folder already held.
 - A token that may not name Administrators as an owner (an unelevated test) gets `STATUS_INVALID_OWNER`; the helper
   then makes the entry with the protected DACL and the caller as its owner, as `seal_new_file`'s doc already
-  allows (`machine_tree.rs:1208-1218`). SYSTEM and an elevated administrator always get Administrators.
+  allows (`machine_tree.rs:1235-1245`). SYSTEM and an elevated administrator always get Administrators.
 
 ### The leaf policy (D2): what SYSTEM finds where it writes
 
 | Found at the leaf | What happens | What a person or an operator sees |
 |---|---|---|
 | nothing | made sealed | nothing |
-| a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle (`win::set_sd`, as `adopt_machine_folder` does, `machine_tree.rs:832`). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators; any other such entry is deleted by handle. Names the service does not use are left alone and never opened. As built, the site names its own: `keep_only_plain` after `resealed()`, the crash recorder with `*.json` and `*.tmp` | nothing; the files in it stay |
+| a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle (`win::set_sd`, as `adopt_machine_folder` does, `machine_tree.rs:859`). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators; any other such entry is deleted by handle. Names the service does not use are left alone and never opened. As built, the site names its own: `keep_only_plain` after `resealed()`, the crash recorder with `*.json` and `*.tmp` | nothing; the files in it stay |
 | a folder another account owns | moved aside by handle (`FileRenameInformation`, `RootDirectory` = the parent's handle) as `<name>.moved-<unix>`, and a sealed one made. Nothing in it is deleted or changes owner. One WARN names it | a `<name>.moved-<unix>` entry beside the new folder, its content still that account's |
 | a link (a junction or a symbolic link) | the link entry itself moved aside by handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; whatever the link led to is untouched |
 | anything else that is not a folder: a plain file, a file link, a hard link (as built in P1, accepted 2026-11-12) | the entry moved aside by its own handle (opened with `FILE_OPEN_REPARSE_POINT` and `DELETE`), and a sealed folder made: a file link moves as itself, a hard link moves only that name. One WARN | a `<name>.moved-<unix>` entry, its content unchanged |
@@ -182,17 +182,17 @@ Notes on the calls:
 
 ### P1: crash records
 
-`crashes_dir_for(ctx)` (`crash_recorder.rs:300-312`) answers one of two: the machine tree, on Windows when the
-writer runs as SYSTEM (the supervisor's records, `:314-317`, and a SYSTEM process's own below
+`crashes_dir_for(ctx)` (`crash_recorder.rs:345-357`) answers one of two: the machine tree, on Windows when the
+writer runs as SYSTEM (the supervisor's records, `:359-362`, and a SYSTEM process's own below
 `service-logs\crashes`); or a plain path otherwise (the person's own daemon in its profile; macOS and Linux
 unchanged).
 
 | Site | Today | After |
 |---|---|---|
-| `record_inner` (`crash_recorder.rs:207-296`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
-| `scan_dir`, `should_suppress` (`:361-363`, `:476-477`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
-| `quarantine` (`:424-433`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
-| the uploader's deletes (`crash_uploader.rs:123`, `:135`, `:354-355`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
+| `record_inner` (`crash_recorder.rs:231-341`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
+| `scan_dir`, `should_suppress` (`:571-573`, `:768-769`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
+| `quarantine` (`:714-723`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
+| the uploader's deletes (`crash_uploader.rs:126`, `:141`, `:351-352`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
 
 A refusal is logged once per process start (`crash_recorder: crash records left alone: <at> is a link`, or
 `… ends elsewhere (<final path>)`), counted with the suppression tally, and the crash goes unrecorded. It is never
@@ -202,9 +202,9 @@ written anywhere else.
 
 | Arm | Today | After |
 |---|---|---|
-| per-Machine (`install_cleanup.rs:569-605`) | `exists()`, then `remove_dir_all` of both segments' `service-logs` | `HeldPath::base(machine_program_data())`, `walk(["roomler", segment])`, `remove_tree("service-logs", dry_run)` |
-| per-user (`:435-481`, `:514-532`) | each tree checked by path, then removed by path | for each of the four trees: `HeldPath::base(profile)`, `walk(["AppData", area, "roomler"])`, `remove_tree(segment, dry_run)`. The walk that finds no link is the walk whose handles delete; `link_below` and `link_inside` leave this arm |
-| the vacated install folder (`:267-320`) | `link_component`, then `remove_file` and `remove_dir` by path | `HeldPath::base(<the install root's parent>)` (`machine_program_files()` for a per-Machine install; for a per-User one, the profile from `profile_of_account(own SID)` and `AppData\Local\Programs`), `walk`, `remove_file` per product file, `remove_empty_dir`. The running-exe guard stays |
+| per-Machine (`install_cleanup.rs:661-700`) | `exists()`, then `remove_dir_all` of both segments' `service-logs` | `HeldPath::base(machine_program_data())`, `walk(["roomler", segment])`, `remove_tree("service-logs", dry_run)` |
+| per-user (`:509-551`, `:561-579`) | each tree checked by path, then removed by path | for each of the four trees: `HeldPath::base(profile)`, `walk(["AppData", area, "roomler"])`, `remove_tree(segment, dry_run)`. The walk that finds no link is the walk whose handles delete; `link_below` and `link_inside` leave this arm |
+| the vacated install folder (`:286-362`) | `link_component`, then `remove_file` and `remove_dir` by path | `HeldPath::base(<the install root's parent>)` (`machine_program_files()` for a per-Machine install; for a per-User one, the profile from `profile_of_account(own SID)` and `AppData\Local\Programs`), `walk`, `remove_file` per product file, `remove_empty_dir`. The running-exe guard stays |
 
 The report keeps today's words ("not present", "left in place: <path> is a link") and gains a line wherever a walk
 meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its first pass only, with today's
@@ -223,15 +223,15 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
 3. No profile recorded: nothing is removed, and the report says why, in words that tell the cases apart: "the
    system records no profile for the session's account", or "cannot tell the session's account". Today's "no
    active interactive session" stays for its own case.
-4. `active_user_profile_root` and `user_name_for_session` are deleted (`user_profile.rs:63-67`, `:88`; the clean-up
-   is the only caller, `install_cleanup.rs:377`), with their test (`user_profile.rs:162`). No code builds
-   `C:\Users\<name>` any more.
+4. `active_user_profile_root` and `user_name_for_session` are deleted (at master `84a93e740`: `user_profile.rs:63-67`,
+   `:88`; the clean-up is the only caller, `install_cleanup.rs:377`), with their test (`user_profile.rs:162`). No
+   code builds `C:\Users\<name>` any more.
 5. The profile is the per-user removal's `HeldPath::base`: a profile folder whose final path is elsewhere is
    refused with a report line (D1).
 
 ### P1: #3743's readers (D6)
 
-`PrivateFolder::open` (`machine_tree.rs:1342-1353`) becomes `HeldPath::base(&machine_program_data())` and `walk`,
+`PrivateFolder::open` (`machine_tree.rs:1371-1385`) becomes `HeldPath::base(&machine_program_data())` and `walk`,
 plus its verdict, and the earlier anchor files' deletes (`exec_service.rs:1277-1292`) the same, so their way down
 is by handle too. #3743's elevated tests already cover both.
 
@@ -274,7 +274,7 @@ above).
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
 | the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7461`) reads through the same `HeldPath` (D4) |
 | the machine config's saves (`crates/agent-core/src/config.rs:3774`, `:4454`, `:4640`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
-| the repair's and the adoption's opens (`machine_tree.rs:592-594`, `:832-834`) | `win::open` of the whole path | `HeldPath::walk` |
+| the repair's and the adoption's opens (`machine_tree.rs:619-621`, `:859-861`) | `win::open` of the whole path | `HeldPath::walk` |
 | the one-time segment move (`appdirs.rs:591`, `:808`, `:819`, `:917`, `:1032`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
 
@@ -282,7 +282,7 @@ above).
 
 `ROOMLERD_MACHINE_TREE_HELD=0` (or `false`, `no`, `off`; `ROOMLER_NODE_MACHINE_TREE_HELD` is read too): a third
 field of `Switches`, beside FR-94's `ROOMLERD_MACHINE_TREE_REPAIR` and `ROOMLERD_MACHINE_TREE_CHECK`
-(`machine_tree.rs:351-375`), read through `switched_off("MACHINE_TREE_HELD")` (`:377-382`), from the process
+(`machine_tree.rs:369-402`), read through `switched_off("MACHINE_TREE_HELD")` (`:404-409`), from the process
 environment only (the service's `Environment` block), never from the config.
 
 - Off: the crash recorder (P1), the log writer and the other `service-logs` writers (P2), and the P3 writers write
@@ -302,10 +302,10 @@ them.
 
 - Junctions (`mklink /J`) need no privilege, so most cases run on every Windows lane. A case that needs an owner
   other than the test's own account, Administrators as an owner at creation, or a symbolic link starts with #3743's
-  `test_support::elevated_or_skip` (`machine_tree.rs:2488-2510`): a loud skip locally, a failure in the lane that
+  `test_support::elevated_or_skip` (`machine_tree.rs:2533-2555`): a loud skip locally, a failure in the lane that
   sets `ROOMLERD_TEST_REQUIRE_ELEVATED`.
-- The swap case uses #3743's `test_support::between_check_and_use` (`machine_tree.rs:2646-2648`), run from
-  `HeldPath`'s step loop as `HeldFolder::file` runs it (`:1275-1276`). **As built in P1 (accepted 2026-11-12):**
+- The swap case uses #3743's `test_support::between_check_and_use` (`machine_tree.rs:2691-2693`), run from
+  `HeldPath`'s step loop as `HeldFolder::file` runs it (`:1302-1303`). **As built in P1 (accepted 2026-11-12):**
   the hook runs once, when a walk holds its last name, before the first act below it, and not at every step:
   D6 puts #3743's readers on the walk, and #3743's swap cases (`exec_service`'s
   `the_copy_reads_the_file_of_the_folder_it_checked` and
@@ -314,9 +314,9 @@ them.
 - GitHub's Windows runners set `TEMP` to an 8.3 short path, so T4's control pins the `GetLongPathNameW` compare;
   without it every tempdir-based case would fail in CI.
 - ⚠️ `roomler-node-core`'s Windows cases run elevated in one step only, filtered to `machine_tree::tests` and three
-  others (`.github/workflows/ci.yml:1920-1922`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:1876`). P1 adds
+  others (`.github/workflows/ci.yml:1940-1942`; `ROOMLERD_TEST_REQUIRE_ELEVATED` job-wide at `:1896`). P1 adds
   `machine_tree::held::tests` and `crash_recorder::tests` to that filter, or the new cases never run on Windows.
-  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:1828-1832`).
+  The `install_cleanup` cases run in the daemon's whole `--lib` step (`ci.yml:1848-1852`).
 
 | # | Test | Where | What it holds | Elevated | RED at the seam |
 |---|---|---|---|---|---|
@@ -368,7 +368,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:1922`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
+| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:1942`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
 | P2 | service logs: `HeldRollingWriter` and every other `service-logs` writer (the prune, the panic and stderr files, the caps cache, the install outcome, the wedged MSI log, the update marker) | the same switch: `RollingFileAppender` and today's writers | not started |
 | P3 | the rest: the attempt record, the machine attention file, the launch marker, the presence lock, the machine config's saves, the repair's and the adoption's opens; the segment move (D7); the gate (D8) | the same switch | not started |
 | Docs | the docs below, each in the PR of the phase it describes, the rest by P3 | none | not started |
@@ -376,7 +376,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 The docs:
 
-- `docs/installation.md`, the clean-up's row (`docs/installation.md:1475`) and wherever it describes
+- `docs/installation.md`, the clean-up's row (`docs/installation.md:1476`) and wherever it describes
   `cleanup-legacy-install`: every removal acts through the folder it checked and leaves a path with a link on it,
   with a report line; the per-user arm reads the profile the system records for the session's account, and removes
   nothing when none is recorded.
@@ -386,7 +386,7 @@ The docs:
 - `.claude/rules/security.md`: the one-line rule for new code.
 - `docs/operator-systemcontext-smoke.md` (`:302-305`, `:401-402`): the folders are sealed (SYSTEM and
   Administrators write, Users read), and what a `<name>.moved-<unix>` entry means.
-- The module docs: `machine_tree.rs:3-65`, `install_cleanup.rs:19-40`, `crash_recorder.rs:17-36`,
+- The module docs: `machine_tree.rs:3-77`, `install_cleanup.rs:19-42`, `crash_recorder.rs:17-60`,
   `win_identity.rs:16-20`.
 - `docs/README.md`: the `security-baseline.md` row names the rule.
 - FR specs that mention these folders are dated history and stay as they are.
@@ -439,7 +439,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1315-1317`). Options: in this FR; a design pass of
   its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
   layout is that pass's to decide.
-- **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1342-1353`; the earlier anchor
+- **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1371-1385`; the earlier anchor
   files' deletes, `exec_service.rs:1277-1292`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
 - **D7. The one-time segment move** (`appdirs.rs:591`, `:808`, `:819`, `:917`, `:1032`). Options: onto a rename by
@@ -452,7 +452,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
   as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
-  drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:346`); without read
+  drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:556`); without read
   those records would stay on the device. Only the write side closes.
 
 ## Out of scope

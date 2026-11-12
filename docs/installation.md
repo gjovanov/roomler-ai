@@ -850,12 +850,12 @@ Details worth knowing:
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
   again for that owner, so the entry `%PROGRAMDATA%` hands whoever made it
-  names Administrators (`machine_tree.rs:868`). A link is refused, never taken
+  names Administrators (`machine_tree.rs:895`). A link is refused, never taken
   over. What that person made below them stays theirs. Setup also seals
   `%PROGRAMDATA%\roomler` (rc.52), by path, so only once it is a plain folder
   that belongs to Administrators. And with `roomlerd adopt-enrollment` they carry an
   existing machine config over only when it is private to the computer's
-  administrators once the repair has run (`machine_tree.rs:1064`), and was the
+  administrators once the repair has run (`machine_tree.rs:1091`), and was the
   machine's as found before it (#3666; Setup reads it before it seals
   `%PROGRAMDATA%\roomler`): one that is not is set aside, and a fresh one is
   written in its place, keeping no `.prev` and no key this build does not know

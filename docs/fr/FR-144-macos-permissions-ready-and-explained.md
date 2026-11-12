@@ -76,7 +76,7 @@ the Mac answered them; on 15.7.7 a typed space pressed "Open System Settings" (#
 - TCC binds a grant to the app's code requirement. When the signing identity changed on 2026-09-08, `tccd` logged
   `Failed to match existing code requirement for subject com.roomler.agent and service kTCCServiceScreenCapture`
   while the entry stayed listed and on (`docs/fr/FR-80-a-session-with-no-pixels-says-why.md:27-33`). A release's
-  Developer ID signature keeps the grants across our updates (`docs/installation.md:2245-2247`; field: no prompt
+  Developer ID signature keeps the grants across our updates (`docs/installation.md:2246-2247`; field: no prompt
   across the 0.4.200 update, #971's AC4 read).
 - The agent cannot tell "never granted" from "stale": both read `false` (`crates/agent-core/src/tcc.rs:56-58`),
   and the viewer's sentence only warns that "A macOS update or a change to the app's code signature invalidates an
