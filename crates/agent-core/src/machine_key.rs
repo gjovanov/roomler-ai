@@ -21,9 +21,12 @@
 //!
 //! The writer ([`create_sealed`]) makes the key with a protected DACL of
 //! SYSTEM and Administrators alone (`O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)`),
-//! and an administrator's writer takes over and empties one it finds that
-//! fails the check. Every read and write goes through a handle the check was
-//! made on.
+//! below a parent it makes owned by Administrators. A writer allowed to take
+//! a key over ([`Takeover::Remake`]) deletes one it finds that fails the check
+//! and makes it again, sealed, never sealing it where it stands, so a handle
+//! opened while it was loose reaches nothing. A registry link at the key or at
+//! its parent is refused, never followed. Every read and write goes through a
+//! handle the check was made on.
 
 use crate::machine_tree::{ACE_ALLOW, ACE_DENY, INHERIT_ONLY, Sd};
 
@@ -188,7 +191,9 @@ fn unread(what: &str, kind: u8) -> String {
 }
 
 #[cfg(windows)]
-pub use win::{Hive, Key, KeyPath, create_sealed, open_checked, open_for_change};
+pub use win::{
+    Hive, Key, KeyPath, Takeover, adopt_parent, create_sealed, open_checked, open_for_change,
+};
 
 /// Tests only: the step of a takeover after which every later takeover in this
 /// process stops with an error, as a crash there would. `0`: none.
@@ -198,33 +203,48 @@ static STOP_TAKEOVER_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// The Windows half: open, create, read and write a key by handle.
 #[cfg(windows)]
 mod win {
+    use windows_sys::Wdk::System::Registry::NtDeleteKey;
     use windows_sys::Win32::Foundation::{
-        ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE,
-        LocalFree,
+        ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, HANDLE, LocalFree,
+        RtlNtStatusToDosError,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_REGISTRY_KEY,
         SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-        PSID, SECURITY_ATTRIBUTES,
+        GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES,
     };
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY, REG_CREATED_NEW_KEY, REG_OPTION_NON_VOLATILE,
-        REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumValueW,
-        RegGetValueW, RegOpenKeyExW, RegSetValueExW,
+        REG_OPTION_OPEN_LINK, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW,
+        RegGetValueW, RegOpenKeyExW, RegQueryInfoKeyW, RegQueryValueExW, RegSetValueExW,
     };
 
     use super::{
-        KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_READ, KEY_SECRET, KEY_SET_VALUE, READ_CONTROL,
-        WRITE_DAC, WRITE_OWNER, parent_verdict, verdict,
+        DELETE, KEY_CREATE_SUB_KEY, KEY_QUERY_VALUE, KEY_READ, KEY_SECRET, KEY_SET_VALUE,
+        READ_CONTROL, WRITE_OWNER, parent_verdict, verdict,
     };
 
     /// The sealed key: Administrators own it, SYSTEM and Administrators alone
     /// may touch it, inheritance off. `CI` hands the same to a subkey.
     pub(super) const SEALED_SDDL: &str = "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)";
+
+    /// The parent, when the writer makes it: Administrators as its owner,
+    /// whoever makes it, and no DACL of its own, so it takes what
+    /// `HKLM\SOFTWARE` hands down (CREATOR OWNER's entry then names
+    /// Administrators too). Without the owner, a policy that gives what an
+    /// administrator makes to the administrator's own account ("Object
+    /// creator") would leave a parent the check refuses.
+    const PARENT_SDDL: &str = "O:BA";
+
+    /// The value a registry link holds its target in. A key opened with
+    /// `REG_OPTION_OPEN_LINK` that holds it is the link itself.
+    const LINK_VALUE: &str = "SymbolicLinkValue";
+
+    /// The most a value carried across a takeover may hold, in bytes.
+    const MAX_CARRIED: u32 = 64 * 1024;
 
     /// Which hive a key is in. A test build may name the person's own hive,
     /// for a stand-in key no test run ever makes under `HKLM`.
@@ -397,8 +417,35 @@ mod win {
             }
         }
 
-        /// The names of every value the key holds.
+        /// Whether the key holds a value `name`, of any type. Names are
+        /// compared as the registry compares them: without regard to case.
+        pub fn has(&self, name: &str) -> Result<bool, String> {
+            let value = wide(name);
+            // SAFETY: a live key opened with KEY_QUERY_VALUE; no type, data or
+            // size is asked for, which only says whether the value is there.
+            let rc = unsafe {
+                RegQueryValueExW(
+                    self.hkey,
+                    value.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            match rc {
+                ERROR_SUCCESS | ERROR_MORE_DATA => Ok(true),
+                ERROR_FILE_NOT_FOUND => Ok(false),
+                rc => Err(format!("{} {name}: {}", self.shown, os_error(rc))),
+            }
+        }
+
+        /// The names of every value the key holds (tests only: a name that
+        /// is not text comes back altered).
+        #[cfg(any(test, feature = "test-fixtures"))]
         pub fn names(&self) -> Result<Vec<String>, String> {
+            use windows_sys::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+            use windows_sys::Win32::System::Registry::RegEnumValueW;
             let mut names = Vec::new();
             for index in 0.. {
                 // 16,383 characters is the longest value name there is.
@@ -435,45 +482,97 @@ mod win {
             Ok(names)
         }
 
-        /// Make this key the sealed one: Administrators as its owner and the
-        /// protected DACL of SYSTEM and Administrators alone, by handle, in
-        /// one call. The handle carries `WRITE_OWNER` and `WRITE_DAC`.
-        fn seal(&self) -> Result<(), String> {
-            let sd = Descriptor::from_sddl(SEALED_SDDL)
-                .map_err(|e| format!("the sealed key's security: {e}"))?;
-            let mut owner: PSID = std::ptr::null_mut();
-            let mut dacl: *mut ACL = std::ptr::null_mut();
-            let mut present = 0;
-            let mut defaulted = 0;
-            // SAFETY: the descriptor made above; `owner` and `dacl` point into
-            // it, which lives until the end of this function.
-            let ok = unsafe {
-                GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) != 0
-                    && GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) != 0
-            };
-            if !ok {
+        /// `Err` when this key is a registry link. Every key here is opened
+        /// with `REG_OPTION_OPEN_LINK`, so a link is opened as itself and never
+        /// followed; this refuses it, so nothing is read from one or written
+        /// into one.
+        fn refuse_link(&self) -> Result<(), String> {
+            if self.has(LINK_VALUE)? {
                 return Err(format!(
-                    "the sealed key's security: {}",
+                    "{} is a registry link, which roomlerd never makes: refusing it (delete it \
+                     from an elevated prompt)",
+                    self.shown
+                ));
+            }
+            Ok(())
+        }
+
+        /// How many keys are below this one.
+        fn subkeys(&self) -> Result<u32, String> {
+            let mut count = 0u32;
+            // SAFETY: a live key opened with KEY_QUERY_VALUE; every out-param
+            // but the subkey count is optional.
+            let rc = unsafe {
+                RegQueryInfoKeyW(
+                    self.hkey,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &mut count,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc != ERROR_SUCCESS {
+                return Err(format!("{}: {}", self.shown, os_error(rc)));
+            }
+            Ok(count)
+        }
+
+        /// Delete this key through its handle, opened with `DELETE`: every
+        /// other handle to it fails from then on (`ERROR_KEY_DELETED`),
+        /// whatever it was opened for. A key with a key below it is not
+        /// deleted.
+        fn delete_itself(self) -> Result<(), String> {
+            // SAFETY: a live key opened with DELETE; closed by Drop after.
+            let status = unsafe { NtDeleteKey(self.handle()) };
+            if status < 0 {
+                // SAFETY: a pure conversion of a status code.
+                let code = unsafe { RtlNtStatusToDosError(status) };
+                return Err(format!("deleting {}: {}", self.shown, os_error(code)));
+            }
+            Ok(())
+        }
+
+        /// Make Administrators this key's owner, through its handle, opened
+        /// with `WRITE_OWNER`. The DACL stays as it is.
+        fn give_to_administrators(&self) -> Result<(), String> {
+            let sd = Descriptor::from_sddl("O:BA")
+                .map_err(|e| format!("Administrators as an owner: {e}"))?;
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut defaulted = 0;
+            // SAFETY: the descriptor made above; `owner` points into it, which
+            // lives until the end of this function.
+            if unsafe { GetSecurityDescriptorOwner(sd.0, &mut owner, &mut defaulted) } == 0 {
+                return Err(format!(
+                    "Administrators as an owner: {}",
                     std::io::Error::last_os_error()
                 ));
             }
-            // SAFETY: a live key opened with WRITE_OWNER and WRITE_DAC; the
-            // owner and DACL point into `sd`.
+            // SAFETY: a live key opened with WRITE_OWNER; `owner` points into
+            // `sd`.
             let rc = unsafe {
                 SetSecurityInfo(
                     self.handle(),
                     SE_REGISTRY_KEY,
-                    OWNER_SECURITY_INFORMATION
-                        | DACL_SECURITY_INFORMATION
-                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    OWNER_SECURITY_INFORMATION,
                     owner,
                     std::ptr::null_mut(),
-                    dacl,
+                    std::ptr::null_mut(),
                     std::ptr::null(),
                 )
             };
             if rc != ERROR_SUCCESS {
-                return Err(format!("taking {} over: {}", self.shown, os_error(rc)));
+                return Err(format!(
+                    "giving {} to Administrators: {}",
+                    self.shown,
+                    os_error(rc)
+                ));
             }
             Ok(())
         }
@@ -510,7 +609,9 @@ mod win {
         }
     }
 
-    /// Open `sub` below `root` with `access` (64-bit view). `Ok(None)`: it is
+    /// Open `sub` below `root` with `access` (64-bit view) and the right to
+    /// read its values, the last name in `sub` opened itself
+    /// (`REG_OPTION_OPEN_LINK`), and refuse a registry link. `Ok(None)`: it is
     /// not there.
     pub(super) fn open(
         root: HKEY,
@@ -522,49 +623,57 @@ mod win {
         let mut hkey: HKEY = std::ptr::null_mut();
         // SAFETY: a NUL-terminated subkey; `hkey` is a valid out-pointer,
         // closed by `Key`'s Drop.
-        let rc =
-            unsafe { RegOpenKeyExW(root, name.as_ptr(), 0, access | KEY_WOW64_64KEY, &mut hkey) };
+        let rc = unsafe {
+            RegOpenKeyExW(
+                root,
+                name.as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                access | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut hkey,
+            )
+        };
         match rc {
-            ERROR_SUCCESS => Ok(Some(Key { hkey, shown })),
+            ERROR_SUCCESS => {
+                let key = Key { hkey, shown };
+                key.refuse_link()?;
+                Ok(Some(key))
+            }
             ERROR_FILE_NOT_FOUND => Ok(None),
             rc => Err(format!("{shown}: {}", os_error(rc))),
         }
     }
 
-    /// Create `sub` below `root`, or open it: with `sddl` when it is made
-    /// here, with what `root` hands down when `sddl` is `None`. Whether it
-    /// was made here.
+    /// Create `sub` below `root` with `sddl`, or open the key there, as
+    /// [`open`] opens it (itself, and a registry link refused), with `access`
+    /// and the right to read its values. Whether it was made here: `sddl`
+    /// applies only then.
     fn create(
         root: HKEY,
         sub: &str,
         access: u32,
-        sddl: Option<&str>,
+        sddl: &str,
         shown: String,
     ) -> Result<(Key, bool), String> {
-        let sd = sddl
-            .map(Descriptor::from_sddl)
-            .transpose()
-            .map_err(|e| format!("{shown}: its security: {e}"))?;
-        let sa = sd.as_ref().map(|sd| SECURITY_ATTRIBUTES {
+        let sd = Descriptor::from_sddl(sddl).map_err(|e| format!("{shown}: its security: {e}"))?;
+        let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.0,
             bInheritHandle: 0,
-        });
+        };
         let name = wide(sub);
         let mut hkey: HKEY = std::ptr::null_mut();
         let mut disposition = 0u32;
-        // SAFETY: a NUL-terminated subkey; the attributes, when given, point
-        // into `sd`, alive across the call; `hkey` is closed by `Key`'s Drop.
+        // SAFETY: a NUL-terminated subkey; the attributes point into `sd`,
+        // alive across the call; `hkey` is closed by `Key`'s Drop.
         let rc = unsafe {
             RegCreateKeyExW(
                 root,
                 name.as_ptr(),
                 0,
                 std::ptr::null(),
-                REG_OPTION_NON_VOLATILE,
-                access | KEY_WOW64_64KEY,
-                sa.as_ref()
-                    .map_or(std::ptr::null(), |sa| sa as *const SECURITY_ATTRIBUTES),
+                REG_OPTION_NON_VOLATILE | REG_OPTION_OPEN_LINK,
+                access | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &sa,
                 &mut hkey,
                 &mut disposition,
             )
@@ -572,7 +681,9 @@ mod win {
         if rc != ERROR_SUCCESS {
             return Err(format!("{shown}: {}", os_error(rc)));
         }
-        Ok((Key { hkey, shown }, disposition == REG_CREATED_NEW_KEY))
+        let key = Key { hkey, shown };
+        key.refuse_link()?;
+        Ok((key, disposition == REG_CREATED_NEW_KEY))
     }
 
     fn security(key: &Key, shown: &str) -> Result<crate::machine_tree::Sd, String> {
@@ -614,64 +725,162 @@ mod win {
         Ok(Some(key))
     }
 
+    /// What the writer does with a key that is there and fails [`verdict`].
+    #[derive(Debug, Clone, Copy)]
+    pub enum Takeover<'a> {
+        /// Leave it as it is, and fail.
+        Never,
+        /// Delete it and make it again, sealed, with the `REG_SZ` values named
+        /// in `keep` written back first, before anything else is.
+        Remake { keep: &'a [&'a str] },
+    }
+
     /// The writer: the key `path`, made sealed when it is not there, opened to
-    /// read and write its values. Its parent is made when missing, with what
-    /// its own parent hands down (`HKLM\SOFTWARE`'s: Users may read), and must
-    /// pass [`parent_verdict`]: a key below a parent another account may
-    /// change is never written.
+    /// read and write its values. Its parent is made when missing, owned by
+    /// Administrators and with what its own parent hands down
+    /// (`HKLM\SOFTWARE`'s: Users may read), and must pass [`parent_verdict`]: a
+    /// key below a parent another account may change is never written. A
+    /// registry link at the key or at its parent is refused, never followed.
     ///
     /// A key that is there and fails [`verdict`] (an administrator loosened
-    /// it, or it was made by hand) is an `Err` when `take_over` is false. With
-    /// `take_over` (an elevated administrator's writer) it is taken over: the
-    /// sealed owner and DACL, by handle, and then every value it holds is
-    /// deleted, so nothing that was in it while it was open is kept. An
-    /// account other than SYSTEM or Administrators that owns the key keeps the
-    /// writer out (the open is refused); the error says so.
-    pub fn create_sealed(path: &KeyPath, take_over: bool) -> Result<Key, String> {
+    /// it, or it was made by hand) is an `Err` with [`Takeover::Never`]. With
+    /// [`Takeover::Remake`] it is deleted and made again, sealed, never sealed
+    /// where it stands: a deleted key fails every handle opened to it while it
+    /// was loose, so nothing written through one after this, or put in the key
+    /// before it, is ever read as the key's. The values named in `keep` are
+    /// read first and written back first. The key is deleted before the new
+    /// one is made, so a stop at any step leaves no key, or a sealed key that
+    /// holds no value of the loose one but those. A key with a key below it,
+    /// which roomlerd never makes, is not taken over. An account other than
+    /// SYSTEM or Administrators that owns the key keeps the writer out (the
+    /// open is refused); the error says so.
+    pub fn create_sealed(path: &KeyPath, takeover: Takeover<'_>) -> Result<Key, String> {
+        let shown = path.shown();
         let (parent, _) = create(
             path.hive.root(),
             &path.parent,
             KEY_READ | KEY_CREATE_SUB_KEY,
-            None,
+            PARENT_SDDL,
             path.parent_shown(),
         )?;
         parent_verdict(
             &security(&parent, &path.parent_shown())?,
             &path.parent_shown(),
         )?;
-        let (key, made) = create(
-            parent.hkey,
-            &path.name,
-            KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-            Some(SEALED_SDDL),
-            path.shown(),
-        )
-        .map_err(|e| {
+        let access = KEY_SET_VALUE
+            | READ_CONTROL
+            | match takeover {
+                Takeover::Never => 0,
+                Takeover::Remake { .. } => DELETE,
+            };
+        let deny_hint = |e: String| {
             format!(
                 "{e} (if another account made this key, delete it from an elevated prompt and \
                  try again)"
             )
-        })?;
-        if made {
+        };
+        let Some(key) = open(parent.hkey, &path.name, access, shown.clone()).map_err(deny_hint)?
+        else {
+            return made_here(&parent, path, access);
+        };
+        let Err(why) = verdict(&security(&key, &shown)?, KEY_SECRET, &shown) else {
             return Ok(key);
+        };
+        let Takeover::Remake { keep } = takeover else {
+            return Err(why);
+        };
+        if key.subkeys()? > 0 {
+            return Err(format!(
+                "{why}, and it holds a key below it, which roomlerd never makes: delete it from \
+                 an elevated prompt and try again"
+            ));
         }
-        if let Err(why) = verdict(&security(&key, &path.shown())?, KEY_SECRET, &path.shown()) {
-            if !take_over {
-                return Err(why);
-            }
-            key.seal()?;
-            stop_point(1)?;
-            let stray = key.names()?;
-            for name in &stray {
-                key.delete(name)?;
-            }
-            stop_point(2)?;
-            tracing::warn!(
-                key = %path.shown(), reason = %why, removed = ?stray,
-                "machine key: took the key over and emptied it"
-            );
+        let kept: Vec<(&str, String)> = keep
+            .iter()
+            .filter_map(|name| match key.read(name, MAX_CARRIED) {
+                Ok(Some(text)) => Some((*name, text)),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!(%e, "machine key: a value the takeover could not keep");
+                    None
+                }
+            })
+            .collect();
+        key.delete_itself()?;
+        stop_point(1)?;
+        let fresh = made_here(&parent, path, access)?;
+        stop_point(2)?;
+        for (name, text) in &kept {
+            fresh.write(name, text)?;
+        }
+        stop_point(3)?;
+        tracing::warn!(
+            key = %shown, reason = %why, kept = ?kept.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            "machine key: the key failed the check; deleted it and made it again, sealed"
+        );
+        Ok(fresh)
+    }
+
+    /// The key `path` below `parent`, made here, sealed. One another writer
+    /// made there meanwhile is used only when it passes the check.
+    fn made_here(parent: &Key, path: &KeyPath, access: u32) -> Result<Key, String> {
+        let shown = path.shown();
+        let (key, made) = create(parent.hkey, &path.name, access, SEALED_SDDL, shown.clone())?;
+        if !made {
+            verdict(&security(&key, &shown)?, KEY_SECRET, &shown)?;
         }
         Ok(key)
+    }
+
+    /// `anchor create`'s repair of a parent its caller's own account owns: a
+    /// policy that gives what an administrator makes to the administrator's
+    /// account ("Object creator") may have made it so before this build gave
+    /// the parent its owner. When the parent of `path` is there, `caller` (the
+    /// elevated caller's own SID) owns it, and with Administrators as its owner
+    /// it would pass [`parent_verdict`], Administrators are made its owner,
+    /// through its handle. Whether it was. Nothing else about it changes, and
+    /// a parent that fails for any other reason is left as it is.
+    pub fn adopt_parent(path: &KeyPath, caller: &str) -> Result<bool, String> {
+        let shown = path.parent_shown();
+        // Only the owner stands in the way: the caller owns it, it fails as
+        // it is, and it would pass with Administrators as its owner.
+        let owner_alone = |parent: &Key| -> Result<bool, String> {
+            let sd = security(parent, &shown)?;
+            if sd.owner != caller || parent_verdict(&sd, &shown).is_ok() {
+                return Ok(false);
+            }
+            let as_administrators = crate::machine_tree::Sd {
+                owner: crate::machine_tree::ADMINISTRATORS.to_string(),
+                ..sd
+            };
+            Ok(parent_verdict(&as_administrators, &shown).is_ok())
+        };
+        let Some(parent) = open(path.hive.root(), &path.parent, READ_CONTROL, shown.clone())?
+        else {
+            return Ok(false);
+        };
+        if !owner_alone(&parent)? {
+            return Ok(false);
+        }
+        // Again on the handle the owner is changed through.
+        let Some(parent) = open(
+            path.hive.root(),
+            &path.parent,
+            READ_CONTROL | WRITE_OWNER,
+            shown.clone(),
+        )?
+        else {
+            return Ok(false);
+        };
+        if !owner_alone(&parent)? {
+            return Ok(false);
+        }
+        parent.give_to_administrators()?;
+        tracing::warn!(
+            key = %shown, from = caller,
+            "machine key: gave the parent its caller's own account owned to Administrators"
+        );
+        Ok(true)
     }
 
     /// Tests only: stop a takeover after its step `step` with an error, as a

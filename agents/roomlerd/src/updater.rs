@@ -1080,8 +1080,8 @@ fn stage_dir_as_current_user() -> std::io::Result<PathBuf> {
 /// Deliberately its own copy rather than a shared import:
 /// `win_service::stop_event` builds its descriptor inline for one event, which
 /// is not reachable from every Windows build the way this fix must be.
-/// `exec_service.rs` carries the same duplicate for the same reason (its own
-/// doc comment says so); this is the third copy, not the first.
+/// `exec_service.rs` has one of the same shape for its pipes (`win::Sddl`);
+/// since #3737 it makes no folder (the anchor is a registry key).
 #[cfg(target_os = "windows")]
 struct ProtectedDirSd {
     sa: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
@@ -1090,9 +1090,9 @@ struct ProtectedDirSd {
 
 #[cfg(target_os = "windows")]
 impl ProtectedDirSd {
-    /// `O:BA` — owner explicitly Administrators, same as the exec-service
-    /// anchor dir's `DIR_SDDL` (`exec_service.rs`) and for the identical
-    /// reason: an owner always keeps WRITE_DAC on its own object regardless
+    /// `O:BA` — owner explicitly Administrators, as the registry key holding
+    /// the SYSTEM service's anchor has (#3737, `machine_key.rs`), and for the
+    /// same reason: an owner always keeps WRITE_DAC on its own object regardless
     /// of the DACL, so leaving the owner field out would default it to
     /// whichever token happened to call `CreateDirectoryW` — correct when
     /// that is SYSTEM (the only caller [`running_as_system`] permits in
@@ -4844,9 +4844,9 @@ mod tests {
     }
 
     /// Read back `dir`'s owner + DACL and confirm only SYSTEM or
-    /// BUILTIN\Administrators have any write-like access — the same shape as
-    /// `exec_service`'s `check_private`, duplicated here for the same reason
-    /// [`ProtectedDirSd`] is (see its doc comment).
+    /// BUILTIN\Administrators have any write-like access — the rule of
+    /// `machine_tree::verdict` (FR-94's reader), written out here for the
+    /// same reason [`ProtectedDirSd`] is (see its doc comment).
     #[cfg(target_os = "windows")]
     fn assert_dacl_is_system_and_admins_only(dir: &std::path::Path) {
         use std::os::windows::ffi::OsStrExt;

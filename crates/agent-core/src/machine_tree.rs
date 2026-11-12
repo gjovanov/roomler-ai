@@ -1217,75 +1217,180 @@ pub fn seal_new_file(file: &std::fs::File) -> std::io::Result<()> {
     win::set_sd(file, true, Some((&sealed_aces(0), true)))
 }
 
-/// FR-94's reader, shared (it moved here from `roomlerd`'s `exec_service`):
-/// read `path`, a file in `dir`, if neither is a link and both are owned by
-/// SYSTEM or Administrators with no write-like ACE for anyone else. Checked on
-/// the handle the content is read from: a name can be swapped between a check
-/// and a read, an open file cannot. `Ok(None)` = not there. `what` names the
-/// file in errors.
+/// #3737 — a folder held open by its own handle, never through a link at its
+/// name, and the files in it opened below that handle: what was checked on the
+/// folder holds for every file opened in it, whatever happens to the folder's
+/// name meanwhile (a move, a junction in its place). Closed on drop.
+#[cfg(windows)]
+pub struct HeldFolder {
+    entry: win::Entry,
+    path: PathBuf,
+}
+
+/// What a file of a [`HeldFolder`] is opened for. Either way its owner, DACL
+/// and attributes can be read through the handle.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFor {
+    /// Its content.
+    Read,
+    /// Deleting it, through this handle.
+    Delete,
+}
+
+/// A file of a [`HeldFolder`], opened below the folder's handle. Closed on
+/// drop.
+#[cfg(windows)]
+pub struct HeldFile {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl HeldFolder {
+    /// Open `dir` itself (`FILE_FLAG_OPEN_REPARSE_POINT`, with
+    /// `FILE_FLAG_BACKUP_SEMANTICS` to open a folder at all). `Ok(None)`: it is
+    /// not there. `Err`: it is a link (a junction or a symbolic link), or not a
+    /// folder, or it could not be opened.
+    pub fn open(dir: &Path) -> Result<Option<Self>, String> {
+        Ok(
+            win::open(dir, win::Kind::Dir, false, false)?.map(|entry| Self {
+                entry,
+                path: dir.to_path_buf(),
+            }),
+        )
+    }
+
+    /// The folder's owner and DACL, read through its handle.
+    pub fn security(&self) -> Result<Sd, String> {
+        win::read_sd(&self.entry.file)
+            .map_err(|e| format!("{}: reading its security: {e}", self.path.display()))
+    }
+
+    /// The file `name` in this folder, opened below the folder's handle, so
+    /// the folder's name is not looked up again, and never through a link: a
+    /// file that is a junction or a symbolic link, or is a folder, is an
+    /// `Err`. `Ok(None)`: there is no such file.
+    pub fn file(&self, name: &str, open_for: OpenFor) -> Result<Option<HeldFile>, String> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        test_support::run_between();
+        let path = self.path.join(name);
+        Ok(
+            win::open_below(&self.entry.file, name, &path, open_for == OpenFor::Delete)?
+                .map(|file| HeldFile { file, path }),
+        )
+    }
+}
+
+#[cfg(windows)]
+impl HeldFile {
+    /// The file's owner and DACL, read through its handle.
+    pub fn security(&self) -> Result<Sd, String> {
+        win::read_sd(&self.file)
+            .map_err(|e| format!("{}: reading its security: {e}", self.path.display()))
+    }
+
+    /// The file's content as text, through this handle, when it is at most
+    /// `max_len` bytes. Opened [`OpenFor::Read`]. `what` names it in errors.
+    pub fn read_text(&self, what: &str, max_len: u64) -> Result<String, String> {
+        let len = self
+            .file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", self.path.display()))?
+            .len();
+        if len > max_len {
+            return Err(format!("{what} is too large to be one"));
+        }
+        let bytes = win::read_to_end(&self.file, &self.path, max_len)?;
+        String::from_utf8(bytes).map_err(|e| format!("reading {what}: {e}"))
+    }
+
+    /// Delete the file through this handle (`FileDispositionInfo`), never by
+    /// its name. Opened [`OpenFor::Delete`].
+    pub fn delete(self) -> Result<(), String> {
+        win::delete_by_handle(&self.file).map_err(|e| format!("{}: {e}", self.path.display()))
+    }
+}
+
+/// FR-94's reader, shared (it moved here from `roomlerd`'s `exec_service`),
+/// by handle: a folder with no link on the way to it, owned by SYSTEM or
+/// Administrators with no write-like ACE for anyone else, judged once on the
+/// handle it is held by, and its files read below that handle under the same
+/// rule. #3737 — the SYSTEM service's one-time copy of an anchor from its
+/// first home takes only the exact owner and DACL `roomlerd anchor create` gave
+/// the folder and each file, so both are kept for it.
+#[cfg(windows)]
+pub struct PrivateFolder {
+    held: HeldFolder,
+    sd: Sd,
+}
+
+/// A file [`PrivateFolder::read`] took: its text, and the owner and DACL it was
+/// judged by, read through the handle the text came through.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateFile {
+    pub text: String,
+    pub sd: Sd,
+}
+
+#[cfg(windows)]
+impl PrivateFolder {
+    /// `dir`, held open and judged. `Ok(None)`: it is not there. `Err`: a link
+    /// on the way, or an owner or DACL that says nobody should act on what it
+    /// holds.
+    pub fn open(dir: &Path) -> Result<Option<Self>, String> {
+        if let Some(link) = crate::recording_dir::link_component(dir) {
+            return Err(format!("{} is a link", link.display()));
+        }
+        let Some(held) = HeldFolder::open(dir)? else {
+            return Ok(None);
+        };
+        let sd = win::read_sd(&held.entry.file)
+            .map_err(|e| format!("the anchor's directory: reading its security: {e}"))?;
+        verdict(&sd, WRITE_LIKE, "the anchor's directory")?;
+        Ok(Some(Self { held, sd }))
+    }
+
+    /// The folder's owner and DACL, as judged.
+    pub fn sd(&self) -> &Sd {
+        &self.sd
+    }
+
+    /// The file `name` in this folder, read below the folder's handle when it
+    /// is at most `max_len` bytes and is owned by SYSTEM or Administrators
+    /// with no write-like ACE for anyone else. `Ok(None)`: it is not there.
+    /// `what` names it in errors.
+    pub fn read(
+        &self,
+        name: &str,
+        what: &str,
+        max_len: u64,
+    ) -> Result<Option<PrivateFile>, String> {
+        let Some(file) = self.held.file(name, OpenFor::Read)? else {
+            return Ok(None);
+        };
+        let sd =
+            win::read_sd(&file.file).map_err(|e| format!("{what}: reading its security: {e}"))?;
+        verdict(&sd, WRITE_LIKE, what)?;
+        let text = file.read_text(what, max_len)?;
+        Ok(Some(PrivateFile { text, sd }))
+    }
+}
+
+/// [`PrivateFolder`] in one call: the text of the file `name` in `dir`.
+/// `Ok(None)` = the folder or the file is not there.
 #[cfg(windows)]
 pub fn read_private(
     dir: &Path,
-    path: &Path,
+    name: &str,
     what: &str,
     max_len: u64,
 ) -> Result<Option<String>, String> {
-    read_private_judged(dir, path, what, max_len).map(|read| read.map(|r| r.text))
-}
-
-/// What [`read_private_judged`] read: the text, and the owner and DACL of the
-/// folder and of the file, as judged on the handles the text came through.
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrivateRead {
-    pub text: String,
-    pub folder: Sd,
-    pub file: Sd,
-}
-
-/// [`read_private`], and the security it judged. #3737 — the SYSTEM service's
-/// one-time copy of an anchor from its first home takes only the exact
-/// owner and DACL `roomlerd anchor create` gave the folder and the file, so it
-/// needs both, read through the same handles as the text.
-#[cfg(windows)]
-pub fn read_private_judged(
-    dir: &Path,
-    path: &Path,
-    what: &str,
-    max_len: u64,
-) -> Result<Option<PrivateRead>, String> {
-    if let Some(link) = crate::recording_dir::link_component(path) {
-        return Err(format!("{} is a link", link.display()));
-    }
-    let Some(dir_entry) = win::open(dir, win::Kind::Dir, false, false)? else {
+    let Some(folder) = PrivateFolder::open(dir)? else {
         return Ok(None);
     };
-    let folder = win::read_sd(&dir_entry.file)
-        .map_err(|e| format!("the anchor's directory: reading its security: {e}"))?;
-    verdict(&folder, WRITE_LIKE, "the anchor's directory")?;
-    #[cfg(any(test, feature = "test-fixtures"))]
-    test_support::run_between();
-    let Some(file) = win::open(path, win::Kind::File, true, false)? else {
-        return Ok(None);
-    };
-    let len = file
-        .file
-        .metadata()
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .len();
-    if len > max_len {
-        return Err(format!("{what} is too large to be one"));
-    }
-    let file_sd =
-        win::read_sd(&file.file).map_err(|e| format!("{what}: reading its security: {e}"))?;
-    verdict(&file_sd, WRITE_LIKE, what)?;
-    let bytes = win::read_to_end(&file.file, path, max_len)?;
-    let text = String::from_utf8(bytes).map_err(|e| format!("reading {what}: {e}"))?;
-    Ok(Some(PrivateRead {
-        text,
-        folder,
-        file: file_sd,
-    }))
+    Ok(folder.read(name, what, max_len)?.map(|file| file.text))
 }
 
 /// #3737 — the owner and DACL of the object behind `handle` (`object`: its
@@ -1420,6 +1525,135 @@ mod win {
             .read_to_end(&mut bytes)
             .map_err(|e| format!("reading {}: {e}", path.display()))?;
         Ok(bytes)
+    }
+
+    /// #3737 — the file `name` in the folder behind `dir`, opened below that
+    /// handle (`NtOpenFile` with the folder as its root, so the folder's name
+    /// is never looked up again), never through a link
+    /// (`FILE_OPEN_REPARSE_POINT`, and a reparse point is refused) and never a
+    /// folder (`FILE_NON_DIRECTORY_FILE`). `delete`: with `DELETE`, to delete
+    /// it through this handle; otherwise with the right to read its content.
+    /// Either way with its owner, DACL and attributes. `Ok(None)`: there is no
+    /// such file. `path` names it in errors.
+    pub(super) fn open_below(
+        dir: &std::fs::File,
+        name: &str,
+        path: &Path,
+        delete: bool,
+    ) -> Result<Option<std::fs::File>, String> {
+        use std::os::windows::io::{FromRawHandle as _, RawHandle};
+        use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+        use windows_sys::Wdk::Storage::FileSystem::{
+            FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+            NtOpenFile,
+        };
+        use windows_sys::Win32::Foundation::{
+            RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+            UNICODE_STRING,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, SYNCHRONIZE,
+        };
+        use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+        /// Names are matched as Windows matches a path: without regard to case.
+        const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+
+        if name.is_empty() || name == "." || name == ".." || name.contains(['\\', '/', ':']) {
+            return Err(format!("{name:?} is not the name of a file in a folder"));
+        }
+        let mut wide: Vec<u16> = name.encode_utf16().collect();
+        let bytes = u16::try_from(wide.len() * 2)
+            .map_err(|_| format!("{name:?} is too long to be a file name"))?;
+        let object_name = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir.as_raw_handle() as HANDLE,
+            ObjectName: &object_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let access = READ_CONTROL
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE
+            | if delete { DELETE } else { FILE_READ_DATA };
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: a plain-data struct the call fills in; all zeroes is a valid
+        // value of it.
+        let mut io: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        // SAFETY: `attributes` points at `object_name`, which points into
+        // `wide`; both outlive the call. `dir` is a live folder handle. The
+        // handle written to `handle` is owned by the `File` made below.
+        let status = unsafe {
+            NtOpenFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut io,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        if status == STATUS_OBJECT_NAME_NOT_FOUND {
+            return Ok(None);
+        }
+        if status == STATUS_FILE_IS_A_DIRECTORY {
+            return Err(format!("{} is a folder, not a plain file", path.display()));
+        }
+        if status < 0 {
+            // SAFETY: a pure conversion of a status code.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                std::io::Error::from_raw_os_error(code as i32)
+            ));
+        }
+        // SAFETY: the handle NtOpenFile just gave this process, opened for
+        // synchronous I/O; the `File` closes it, once.
+        let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{} is a link (a junction or a symbolic link), not a plain file",
+                path.display()
+            ));
+        }
+        if meta.is_dir() {
+            return Err(format!("{} is a folder, not a plain file", path.display()));
+        }
+        Ok(Some(file))
+    }
+
+    /// #3737 — delete the file behind `file`, opened with `DELETE`, through its
+    /// handle (`FileDispositionInfo`): the name it goes from is the one the
+    /// handle was opened by, never one looked up again.
+    pub(super) fn delete_by_handle(file: &std::fs::File) -> std::io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        };
+        let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+        // SAFETY: a live handle opened with DELETE; `info` is the struct the
+        // class names, alive across the call.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as HANDLE,
+                FileDispositionInfo,
+                (&raw const info).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     fn sid_string(sid: PSID) -> std::io::Result<String> {
@@ -2255,7 +2489,9 @@ pub mod test_support {
         let probe = tempfile_dir();
         let file = probe.join("probe");
         std::fs::write(&file, b"x").expect("a probe file");
-        let ok = icacls(&file, &["/setowner", "*S-1-5-18"]);
+        // A few tries: many cases ask at once, each starting `icacls`, and an
+        // unelevated token fails every time anyway.
+        let ok = (0..3).any(|_| icacls(&file, &["/setowner", "*S-1-5-18"]));
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&probe);
         if !ok {
@@ -2273,14 +2509,18 @@ pub mod test_support {
         ok
     }
 
+    /// A probe folder of this call's own: the process, the time, and a count,
+    /// so two cases asking in the same instant never share (and delete) one.
     fn tempfile_dir() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "roomler-machine-tree-probe-{}-{}",
+            "roomler-machine-tree-probe-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).expect("a probe folder");
         dir
