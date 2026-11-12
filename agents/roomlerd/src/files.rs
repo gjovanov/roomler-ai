@@ -275,10 +275,10 @@ fn process_home() -> Option<String> {
 /// ways.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
-    /// This process: every macOS install, every user install, a Windows
+    /// This process: every user install, a Mac's GUI worker (its system
+    /// daemon declines the channel, #3757: `peer::files_channel`), a Windows
     /// worker that is not LocalSystem, a Linux root daemon with root itself
-    /// signed in at seat0, and any install with
-    /// `ROOMLERD_FILES_AS_SEAT_USER=0`.
+    /// signed in at seat0, and any install with `ROOMLERD_FILES_AS_SEAT_USER=0`.
     Daemon,
     /// (Linux root, a received file) nobody at seat0 (#3688): written as the
     /// daemon, as [`Self::Daemon`] is, but never in a folder a controller

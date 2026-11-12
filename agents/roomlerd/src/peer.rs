@@ -1324,14 +1324,14 @@ impl AgentPeer {
                     "clipboard" => {
                         attach_clipboard_handler(dc, session_id, permissions, &session_end)
                     }
-                    // Multi-user P3 — same enforcement for FILES. New viewers
-                    // request the FILES bit by default; a session narrowed to
-                    // view-effective gets explicit errors instead of silent
-                    // transfers.
-                    "files" if !permissions.contains(Permissions::FILES) => {
-                        attach_files_denied(dc, session_id, &session_end)
+                    // Multi-user P3 — same enforcement for FILES (new viewers
+                    // ask for the bit by default), and #3757: a Mac's root
+                    // daemon declines the channel of a session no GUI worker
+                    // serves. Both are `attach_files`'s.
+                    "files" => {
+                        let served = files_channel_here();
+                        attach_files(dc, session_id, permissions, served, &session_end)
                     }
-                    "files" => attach_files_handler(dc, session_id, &session_end),
                     // FR-85 P3b — the same attach-time gate for RECORD: the
                     // hub strips it unless the controller may record AND this
                     // device's owner opted in, and a grant without it gets a
@@ -12944,6 +12944,165 @@ async fn send_clipboard_image(
     }
 }
 
+/// #3757 — why a macOS system install's root daemon declines a session's
+/// `files` channel ([`FilesChannel::Declined`]): on a Mac, file transfer runs
+/// in the GUI worker, as the person signed in at the screen (FR-43 P2b), and
+/// no worker serves this session. It says what to do: once someone is signed
+/// in, the next session is the worker's; a Mac with two rows serves its
+/// screen and files on the person's own row. The viewer shows it on the
+/// transfer, or in the drawer.
+pub(crate) const FILES_IN_THE_PERSONS_SESSION: &str = "File transfer on this Mac needs someone \
+     signed in at its screen and runs in their session, not in this one. Reconnect once someone \
+     is signed in, or connect to the Mac's user-session agent.";
+
+/// #3757 — whether the process that holds a session's peer serves the
+/// session's `files` channel ([`files_channel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilesChannel {
+    /// Served here, as before.
+    Served,
+    /// Declined: every request on the channel is answered with this reason
+    /// ([`attach_files_declined`]), and nothing on the host is touched.
+    Declined(&'static str),
+}
+
+/// #3757 — who serves a session's `files` channel, asked where the channel
+/// opens: in the process that holds the session's peer. `root` is the
+/// effective uid this process's file access runs under (`geteuid() == 0`).
+///
+/// On a macOS system install the root daemon hands a session to the GUI
+/// worker in the session of the person signed in at the screen (FR-43 P2b):
+/// the offer crosses, the worker builds the peer, and every channel of that
+/// session, this one included, opens in the worker, which runs as that
+/// person (the supervisor starts none for the login window, and starts it
+/// with `sudo -u`). An offer no worker takes builds its peer in the root
+/// daemon. So a `files` channel that opens in a root process on a Mac
+/// belongs to a session no worker serves: it is declined with a reason the
+/// viewer shows, and consent, the grant and the session go on as they were.
+/// A worker that attaches later does not move that peer, and one that leaves
+/// never hands its own to the daemon; a new offer is decided again where it
+/// lands. Every other process serves the channel as before. Pure, so the
+/// rule is a test on every OS.
+pub(crate) fn files_channel(on_macos: bool, root: bool) -> FilesChannel {
+    if on_macos && root {
+        FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION)
+    } else {
+        FilesChannel::Served
+    }
+}
+
+/// [`files_channel`] for this process, by its own effective uid.
+pub(crate) fn files_channel_here() -> FilesChannel {
+    files_channel(cfg!(target_os = "macos"), effective_uid_is_root())
+}
+
+/// #3757 — whether this process's file access runs as root: its effective
+/// uid is 0. Never on Windows.
+fn effective_uid_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: `geteuid` reads this process's own credentials.
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// #3757 — a session's `files` channel, by its grant and by whether this
+/// process serves it ([`files_channel`]). A grant without FILES gets the
+/// FILES-denied channel first, as before (Multi-user P3: new viewers ask for
+/// the bit by default, and a session narrowed to view-effective gets
+/// explicit errors instead of silent transfers). A session this process
+/// serves gets the file-transfer handler, as before; a declined one gets a
+/// channel that answers every request with the reason and touches nothing on
+/// the host ([`attach_files_declined`]).
+pub(crate) fn attach_files(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    permissions: roomler_ai_remote_control::permissions::Permissions,
+    served: FilesChannel,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
+    use roomler_ai_remote_control::permissions::Permissions;
+    if !permissions.contains(Permissions::FILES) {
+        attach_files_denied(dc, session_id, session_end);
+        return;
+    }
+    match served {
+        FilesChannel::Served => attach_files_handler(dc, session_id, session_end),
+        FilesChannel::Declined(why) => attach_files_declined(dc, session_id, why, session_end),
+    }
+}
+
+/// #3757 — a `files` channel this process declines
+/// ([`FilesChannel::Declined`]): every request is answered with
+/// `why`, in the frame the viewer's waiter for that request settles on
+/// ([`declined_reply`]), and a binary chunk is dropped. Nothing on the host
+/// is read or written, and the channel stays open: the session goes on.
+pub(crate) fn attach_files_declined(
+    dc: Arc<RTCDataChannel>,
+    session_id: bson::oid::ObjectId,
+    why: &'static str,
+    session_end: &tokio_util::sync::CancellationToken,
+) {
+    info!(
+        session = %session_id,
+        "files DC declined: on a Mac, file transfer runs in the GUI worker, and none serves this session"
+    );
+    let dc_for_handler = dc.clone();
+    dc.on_message(Box::new(move |msg| {
+        let dc = dc_for_handler.clone();
+        Box::pin(async move {
+            if !msg.is_string {
+                return; // a chunk for a transfer that was never accepted
+            }
+            if let Some(reply) = declined_reply(&msg.data, why) {
+                let _ = dc.send_text(reply).await;
+            }
+        })
+    }));
+    // The stub holds its channel too: let go when the session ends.
+    on_session_end(&dc, session_end, || async {});
+}
+
+/// #3757 — what a declined `files` channel answers one control frame with,
+/// carrying `why`: `files:dir-error` for a listing (the drawer's waiter
+/// settles on its `req_id`), `files:error` for anything else (a transfer's
+/// waiter settles on its `id`). A frame that does not parse is answered with
+/// no id, as the FILES-denied channel answers it. Pure.
+fn declined_reply(frame: &[u8], why: &str) -> Option<String> {
+    let parsed = std::str::from_utf8(frame)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+    let field = |key: &str| -> String {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let listing = parsed
+        .as_ref()
+        .and_then(|v| v.get("t"))
+        .and_then(|t| t.as_str())
+        == Some("files:dir");
+    let reply = if listing {
+        serde_json::to_string(&crate::files::FilesOutgoing::DirError {
+            req_id: &field("req_id"),
+            message: why,
+        })
+    } else {
+        serde_json::to_string(&crate::files::FilesOutgoing::Error {
+            id: &field("id"),
+            message: why,
+        })
+    };
+    reply.ok()
+}
+
 /// Wire the `files` DC to a per-session file-transfer handler. Strings
 /// carry control frames (`files:begin`/`files:end` + agent replies);
 /// binary frames are chunk payloads appended to the current in-flight
@@ -16899,5 +17058,417 @@ pub(crate) mod files_log_tests {
             text.contains(r"z1\nSECOND LINE from an id"),
             "the id, escaped: {text}"
         );
+    }
+}
+
+/// #3757 — a Mac's root daemon declines the `files` channel of a session no
+/// GUI worker serves, with a reason the viewer shows, and every other process
+/// serves it as before. On every lane's lib tests, and in the macOS job as
+/// the runner's user and again under sudo (`as_root`), where this process's
+/// own effective uid decides.
+#[cfg(test)]
+mod files_channel_tests {
+    use super::FILES_IN_THE_PERSONS_SESSION as WHY;
+    use super::*;
+    use roomler_ai_remote_control::permissions::Permissions;
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
+    use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+
+    /// What the FILES-denied channel says (Multi-user P3), unchanged.
+    const NOT_GRANTED: &str = "FILES permission not granted for this session";
+
+    /// The decision: a root process on a Mac holds the peer of a session no
+    /// GUI worker serves, so it declines the channel with the reason. Red on
+    /// master, where every process served it.
+    #[test]
+    fn a_macs_root_daemon_declines_the_files_channel() {
+        assert_eq!(files_channel(true, true), FilesChannel::Declined(WHY));
+    }
+
+    /// Every other process serves the channel as before: a GUI worker (the
+    /// one a delegated session's peer lives in) and a per-user install run as
+    /// the person, and Linux and Windows keep their own rules (#3688, #3669).
+    #[test]
+    fn every_other_process_serves_it_as_before() {
+        for (on_macos, root) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                files_channel(on_macos, root),
+                FilesChannel::Served,
+                "on macOS: {on_macos}, root: {root}"
+            );
+        }
+    }
+
+    /// The reason says what to do: once someone is signed in at the Mac, a
+    /// new session runs in their session; a two-row Mac serves its screen and
+    /// files on the person's own row.
+    #[test]
+    fn the_reason_tells_the_viewer_what_to_do() {
+        for words in [
+            "needs someone signed in at its screen",
+            "Reconnect once someone is signed in",
+            "user-session agent",
+        ] {
+            assert!(WHY.contains(words), "{words:?} is not in {WHY:?}");
+        }
+    }
+
+    /// This process's own facts: on a Mac its effective uid decides, and
+    /// every other OS serves. The macOS job runs it as the runner's user
+    /// (served) and under sudo (declined).
+    #[test]
+    fn this_process_follows_its_own_effective_uid() {
+        let expected = if cfg!(target_os = "macos") && euid_is_root() {
+            FilesChannel::Declined(WHY)
+        } else {
+            FilesChannel::Served
+        };
+        assert_eq!(files_channel_here(), expected);
+    }
+
+    fn euid_is_root() -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: reads this process's own credentials.
+            unsafe { libc::geteuid() == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// The declined channel's answer to one control frame, as JSON.
+    fn reply_to(frame: &[u8]) -> Value {
+        let reply = declined_reply(frame, WHY).expect("a declined frame is answered");
+        serde_json::from_str(&reply).expect("the answer is JSON")
+    }
+
+    /// A listing's answer is the drawer's: `files:dir-error` on its `req_id`.
+    #[test]
+    fn a_declined_listing_is_answered_on_its_req_id() {
+        let frame = json!({"t": "files:dir", "req_id": "ls-1", "path": "/"});
+        assert_eq!(
+            reply_to(frame.to_string().as_bytes()),
+            json!({"t": "files:dir-error", "req_id": "ls-1", "message": WHY})
+        );
+    }
+
+    /// Every other request is answered on its `id`, the transfer's waiter.
+    #[test]
+    fn every_other_request_is_answered_on_its_id() {
+        for frame in [
+            json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": 3}),
+            json!({"t": "files:end", "id": "up-1"}),
+            json!({"t": "files:get", "id": "dl-1", "path": "/etc/hosts"}),
+            json!({"t": "files:get-folder", "id": "zip-1", "path": "/", "format": "zip"}),
+            json!({"t": "files:resume", "id": "up-1", "offset": 0}),
+            json!({"t": "files:cancel", "id": "dl-1"}),
+        ] {
+            let id = frame["id"].clone();
+            assert_eq!(
+                reply_to(frame.to_string().as_bytes()),
+                json!({"t": "files:error", "id": id, "message": WHY}),
+                "{frame}"
+            );
+        }
+    }
+
+    /// A frame that does not parse is answered with no id, as the
+    /// FILES-denied channel answers it.
+    #[test]
+    fn a_frame_that_does_not_parse_is_answered_without_an_id() {
+        for frame in [&b"not json"[..], &[0xff, 0xfe, 0x00][..], &b"{\"t\":7}"[..]] {
+            assert_eq!(
+                reply_to(frame),
+                json!({"t": "files:error", "id": "", "message": WHY}),
+                "{frame:?}"
+            );
+        }
+    }
+
+    /// A viewer's `files` channel to a device end routed by [`attach_files`],
+    /// both in this process. Every candidate travels in the SDP (no trickle),
+    /// as `media_share`'s `viewer_channel` does.
+    struct Pair {
+        /// The viewer's peer, then the device's.
+        pcs: [Arc<RTCPeerConnection>; 2],
+        viewer: Arc<RTCDataChannel>,
+        heard: mpsc::UnboundedReceiver<String>,
+        session_end: CancellationToken,
+    }
+
+    impl Pair {
+        async fn open(permissions: Permissions, served: FilesChannel) -> Self {
+            let pc = || async {
+                Arc::new(
+                    APIBuilder::new()
+                        .build()
+                        .new_peer_connection(RTCConfiguration::default())
+                        .await
+                        .expect("a peer connection"),
+                )
+            };
+            let (viewer_pc, device_pc) = (pc().await, pc().await);
+            let viewer = viewer_pc
+                .create_data_channel("files", None)
+                .await
+                .expect("a files channel");
+            let (heard_tx, heard) = mpsc::unbounded_channel();
+            viewer.on_message(Box::new(move |msg| {
+                let heard_tx = heard_tx.clone();
+                Box::pin(async move {
+                    if msg.is_string
+                        && let Ok(s) = std::str::from_utf8(&msg.data)
+                    {
+                        let _ = heard_tx.send(s.to_string());
+                    }
+                })
+            }));
+            let (dc_tx, dc_rx) = tokio::sync::oneshot::channel();
+            let dc_tx = std::sync::Mutex::new(Some(dc_tx));
+            device_pc.on_data_channel(Box::new(move |dc| {
+                if let Some(tx) = dc_tx.lock().unwrap().take() {
+                    let _ = tx.send(dc);
+                }
+                Box::pin(async {})
+            }));
+            let offer = viewer_pc.create_offer(None).await.expect("an offer");
+            let mut gathered = viewer_pc.gathering_complete_promise().await;
+            viewer_pc
+                .set_local_description(offer)
+                .await
+                .expect("the offer");
+            let _ = gathered.recv().await;
+            let offer = viewer_pc.local_description().await.expect("a local offer");
+            device_pc
+                .set_remote_description(offer)
+                .await
+                .expect("the offer");
+            let answer = device_pc.create_answer(None).await.expect("an answer");
+            let mut gathered = device_pc.gathering_complete_promise().await;
+            device_pc
+                .set_local_description(answer)
+                .await
+                .expect("the answer");
+            let _ = gathered.recv().await;
+            let answer = device_pc.local_description().await.expect("a local answer");
+            viewer_pc
+                .set_remote_description(answer)
+                .await
+                .expect("the answer");
+            let device = tokio::time::timeout(Duration::from_secs(30), dc_rx)
+                .await
+                .expect("the files channel never reached the device")
+                .expect("the channel's sender");
+            // The production router, as `AgentPeer`'s `on_data_channel` calls it.
+            let session_end = CancellationToken::new();
+            attach_files(
+                device,
+                bson::oid::ObjectId::new(),
+                permissions,
+                served,
+                &session_end,
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while viewer.ready_state() != RTCDataChannelState::Open {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the viewer's files channel never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Self {
+                pcs: [viewer_pc, device_pc],
+                viewer,
+                heard,
+                session_end,
+            }
+        }
+
+        async fn ask(&self, frame: &Value) {
+            self.viewer
+                .send_text(frame.to_string())
+                .await
+                .expect("the viewer's frame went out");
+        }
+
+        /// The next `n` frames the viewer heard, fewer if they stop coming.
+        async fn heard(&mut self, n: usize) -> Vec<Value> {
+            let mut got = Vec::new();
+            while got.len() < n {
+                match tokio::time::timeout(Duration::from_secs(20), self.heard.recv()).await {
+                    Ok(Some(text)) => got.push(serde_json::from_str(&text).unwrap_or(Value::Null)),
+                    _ => break,
+                }
+            }
+            got
+        }
+
+        /// Anything more the viewer hears within `wait`.
+        async fn more_within(&mut self, wait: Duration) -> Vec<String> {
+            let mut got = Vec::new();
+            while let Ok(Some(text)) = tokio::time::timeout(wait, self.heard.recv()).await {
+                got.push(text);
+            }
+            got
+        }
+
+        /// The session ends, and both peers are closed: a peer that is only
+        /// dropped frees nothing (its sockets belong to its ICE agent's tasks).
+        async fn close(self) {
+            self.session_end.cancel();
+            for pc in self.pcs {
+                let _ = pc.close().await;
+            }
+        }
+    }
+
+    /// Through the router, over a real channel, as the root daemon's peer
+    /// opens it: each request is answered with the reason in the frame its
+    /// waiter settles on, a chunk is dropped, nothing lands in or leaves the
+    /// folder asked about, and the channel and its peer stay up and go on
+    /// answering. Red on master, where the file-transfer handler served it.
+    #[tokio::test]
+    async fn a_declined_channel_answers_each_request_with_the_reason_and_stays_up() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let file = temp.path().join("b.txt");
+        std::fs::write(&file, b"hello").expect("a file to ask for");
+        let folder = temp.path().to_string_lossy().into_owned();
+        let file = file.to_string_lossy().into_owned();
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            files_channel(true, true),
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "ls-1", "path": folder}))
+            .await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-1", "name": "a.txt", "size": 3, "dest_path": folder}))
+            .await;
+        pair.viewer
+            .send(&Bytes::from_static(b"abc"))
+            .await
+            .expect("the chunk went out");
+        pair.ask(&json!({"t": "files:end", "id": "up-1"})).await;
+        pair.ask(&json!({"t": "files:get", "id": "dl-1", "path": file}))
+            .await;
+        pair.ask(&json!({"t": "files:get-folder", "id": "zip-1", "path": folder, "format": "zip"}))
+            .await;
+        pair.ask(&json!({"t": "files:resume", "id": "up-1", "offset": 0}))
+            .await;
+        let answered = pair.heard(6).await;
+        let unasked = pair.more_within(Duration::from_millis(500)).await;
+        // Still up: the channel and its peer, and a request after all of it is
+        // answered too.
+        let channel = pair.viewer.ready_state();
+        let peer = pair.pcs[1].connection_state();
+        pair.ask(&json!({"t": "files:dir", "req_id": "ls-2", "path": folder}))
+            .await;
+        let after = pair.heard(1).await;
+        pair.close().await;
+        let left: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("the folder reads")
+            .map(|e| {
+                e.expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        let error = |id: &str| json!({"t": "files:error", "id": id, "message": WHY});
+        assert_eq!(
+            answered,
+            vec![
+                json!({"t": "files:dir-error", "req_id": "ls-1", "message": WHY}),
+                error("up-1"),
+                error("up-1"),
+                error("dl-1"),
+                error("zip-1"),
+                error("up-1"),
+            ]
+        );
+        assert!(unasked.is_empty(), "the chunk was answered: {unasked:?}");
+        assert_eq!(left, vec!["b.txt".to_string()], "the folder changed");
+        assert_eq!(channel, RTCDataChannelState::Open, "the channel closed");
+        assert_eq!(
+            peer,
+            RTCPeerConnectionState::Connected,
+            "the peer went down"
+        );
+        assert_eq!(
+            after,
+            vec![json!({"t": "files:dir-error", "req_id": "ls-2", "message": WHY})]
+        );
+    }
+
+    /// The path a worker-served session takes is unchanged: a session this
+    /// process serves gets the file-transfer handler, which lists the folder.
+    #[tokio::test]
+    async fn a_served_channel_keeps_the_file_transfer_handler() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(temp.path().join("b.txt"), b"hello").expect("a file to list");
+        let folder = temp.path().to_string_lossy().into_owned();
+        let mut pair = Pair::open(
+            Permissions::default() | Permissions::FILES,
+            FilesChannel::Served,
+        )
+        .await;
+        pair.ask(&json!({"t": "files:dir", "req_id": "ls-1", "path": folder}))
+            .await;
+        let answered = pair.heard(1).await;
+        pair.close().await;
+
+        let listing = answered.first().expect("the listing was answered");
+        assert_eq!(listing["t"], "files:dir-list", "{listing}");
+        assert_eq!(listing["req_id"], "ls-1", "{listing}");
+        let names: Vec<&str> = listing["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["b.txt"], "{listing}");
+    }
+
+    /// A session whose grant lacks FILES keeps the FILES-denied channel and
+    /// its words, whoever serves it: the grant is asked first, as before.
+    #[tokio::test]
+    async fn a_session_without_files_keeps_the_not_granted_channel() {
+        let mut pair = Pair::open(Permissions::default(), files_channel(true, true)).await;
+        pair.ask(&json!({"t": "files:begin", "id": "up-9", "name": "a.txt", "size": 3}))
+            .await;
+        let answered = pair.heard(1).await;
+        pair.close().await;
+
+        assert_eq!(
+            answered,
+            vec![json!({"t": "files:error", "id": "up-9", "message": NOT_GRANTED})]
+        );
+    }
+
+    /// Under sudo on a Mac (the macOS job's step): this process is root, so
+    /// it declines. With `ROOMLERD_TEST_REQUIRE_ROOT` set, a run that is not
+    /// root fails here instead of passing by skipping.
+    #[cfg(target_os = "macos")]
+    mod as_root {
+        use super::*;
+
+        fn as_root() -> bool {
+            let root = euid_is_root();
+            if !root && std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_some() {
+                panic!("ROOMLERD_TEST_REQUIRE_ROOT is set and this test is not running as root");
+            }
+            root
+        }
+
+        #[test]
+        fn a_root_process_on_a_mac_declines_the_files_channel() {
+            if !as_root() {
+                return;
+            }
+            assert_eq!(files_channel_here(), FilesChannel::Declined(WHY));
+        }
     }
 }

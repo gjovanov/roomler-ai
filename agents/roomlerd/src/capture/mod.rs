@@ -753,7 +753,7 @@ impl CaptureUnavailableCode {
                 if cfg!(target_os = "macos") {
                     "This agent runs as a system daemon, which has no desktop session and \
                      therefore no screen to capture. Connect to this machine's user-session \
-                     agent instead. Remote shell and file transfer work here."
+                     agent instead. Remote shell works here."
                 } else {
                     "This host has no display to capture (headless, or no desktop session). \
                      Remote shell and file transfer still work."

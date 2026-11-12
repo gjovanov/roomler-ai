@@ -1454,7 +1454,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1953`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1672`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1692`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7845`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7878`)
 pin the role per command and the end line of a failure.
@@ -2329,6 +2329,85 @@ runs no overlay of its own) and, since #2892, says so: the address lines read
 `(the root daemon's)` and a `network` line names that daemon. The per-user
 half's own enrollments stay "overlay OFF" — they are off the mesh by design, and
 the line under them says that instead of prescribing netstack.
+
+### Which account each step of the package's script writes as (#3702)
+
+The package's post-install script runs as root, at an install by hand and at
+every self-update through the update helper. Root writes only in system
+folders: `/Applications`, `/Library`, `/etc` and `/var/log`. What belongs to the person at the console, the two
+login items in `~/Library/LaunchAgents`, is made, written and removed by that
+person's own account, so the system applies that account's rights and nothing
+more.
+
+| Step | Writes as | Where | Anchor |
+|---|---|---|---|
+| Sweep the bundles of earlier layouts | root | `/Applications`, `/Library/Roomler` | `agents/roomlerd/packaging/macos/postinstall:33-36`, `:51-61` |
+| Move or copy the system config and log folders | root | `/etc`, `/var/log` | `agents/roomlerd/packaging/macos/postinstall:79-108` |
+| Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u '#<uid>'`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:229-345`, `:381`, `:471` |
+| Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:358` |
+| Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:161` |
+| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:539-542`, `:547`, `:614-617`, `:633`, `:641`, `:568`, `:652` |
+
+- **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
+  groups; `launchctl asuser` changes only the bootstrap context. `-n` because
+  root needs no password and a run by the update helper has no terminal.
+- **A login item is placed only as launchd loads it**: a regular file, not a
+  link, with one name, owned by the console user, mode 644. A link or a file of
+  another owner at its path is removed by the person's account first, so
+  nothing is written through it; a folder there, or anything that account
+  cannot remove, leaves the item SKIPPED. An item the person already owns is
+  rewritten in place, which also works in a `~/Library/LaunchAgents` that is
+  not the person's own folder.
+- **An item that cannot be placed is reported, not fatal.** The script prints
+  `SKIPPED the login item …` with the reason, does not load that item (nor stop a
+  running companion), and the install still succeeds. Root changes nothing in
+  `~/Library/LaunchAgents` itself: when that folder is the reason (a link, not a
+  folder, missing and the person's account could not make it, or another
+  account's), the message says which
+  (`agents/roomlerd/packaging/macos/postinstall:269-302`). A home that `dscl`
+  did not give as an absolute path is named as the reason instead, never the
+  folder its path would land on.
+- **A command is printed only for an administrator's own home.** The script
+  prints a `sudo` line for a folder only when root's tests and reads find all of
+  this (`agents/roomlerd/packaging/macos/postinstall:252-258`): the person at the
+  console is a member of `admin` (`dseditgroup -o checkmember`), so that person
+  runs it for themselves; the home is an absolute path to a real folder, not a
+  link; and its `Library` is a real folder of the person's own, not a link. The
+  line is then, for a missing folder,
+  `sudo mkdir -p "<folder>" && sudo chown <name> "<folder>"`, and for a real
+  folder of root's (root's only, never another person's),
+  `sudo chown <name> "<folder>"`, to run before installing again.
+  Otherwise no command is printed: the message says the folder has to be the
+  person's own before the next install, and names this section.
+- **When no command is printed**, an administrator of the Mac checks with
+  `ls -ld` that the home, its `Library` and `Library/LaunchAgents` are folders,
+  not links, and that `Library` is the person's own; only then makes the folder
+  the person's (`sudo chown`, after `sudo mkdir` where it is missing), and the
+  package is installed again.
+- **A rewrite that fails over the person's own item keeps it.** The item already
+  there stays placed and is loaded, a `WARNING` carries the copy's error, and
+  the last line does not say "installed and started". The person's account
+  compares the item with the package's (`cmp -s`): where they are not equal (a
+  copy that stopped part way, or an older item), the `WARNING` says the item may
+  be incomplete instead of that it stays in place.
+- **On a Mac whose root daemon runs the GUI worker**, an agent item the person's
+  account cannot remove is a `WARNING` with the same folder message. Under the
+  same conditions, and where `~/Library/LaunchAgents` is a real folder, it also
+  prints `sudo rm -f "<item>"`, which removes only that item; otherwise it names
+  this section, and an administrator removes that one item by hand after the
+  same `ls -ld` checks.
+- **No scratch file.** `launchctl bootstrap`'s error text is kept in a shell
+  variable (`BOOTSTRAP_ERR`, `UPDATE_ERR`, `:161`, `:633`, `:641`), so the script
+  writes nothing to `/tmp`.
+
+`installer-smoke`'s macOS job holds this on a real install: the runner's own
+companion item starts as a link to a root-owned file, and after the install that
+file is unchanged while both items are regular files of the console user with
+mode 644. A later install over an agent item the person made immutable logs the
+`WARNING`, which says the item stays in place (it is equal to the package's),
+not "installed and started", and the agent is still loaded. A last step fails if
+the script is missing or any command in it names a path in `/tmp`. No step of
+the job prints or checks a `sudo` line.
 
 ### Two configurations — which one the app and the CLI edit (#2871)
 
