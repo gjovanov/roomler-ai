@@ -1470,9 +1470,32 @@ folder they name from the system, never from the environment they were started w
 | The machine's data and program folders | `machine_program_data`, `machine_program_files`: the machine's registry, on the kernel's system drive. The machine tree, the SystemContext attempt record, the per-Machine install folder, the peer-presence marker and the cleanup step's service-log sweep are rooted there. | `crates/agent-core/src/appdirs.rs:201`, `crates/agent-core/src/appdirs.rs:212` |
 | The service account's profile | `system_profile`: the machine's profile list entry for `S-1-5-18` (`profile_of_account`), else `config\systemprofile` in the system directory. | `crates/agent-core/src/appdirs.rs:263`, `crates/agent-core/src/appdirs.rs:222` |
 | The SystemContext ladder's second rung | The profile config, only when it lies in that profile; the service host asks the same question. | `agents/roomlerd/src/app.rs:1111`, `agents/roomlerd/src/win_service/supervisor.rs:952` |
-| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile (on Unix the home) the system names for the account the process runs as, by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:731`, `crates/agent-core/src/appdirs.rs:738`, `crates/agent-core/src/appdirs.rs:588`, `crates/agent-core/src/appdirs.rs:856`, `crates/agent-core/src/appdirs.rs:696` |
+| The one-time folder move | Only for the account that owns the folders (`may_migrate`): never in an installer step, and only over folders in the profile the system names for the account the process runs as (its profile list entry, found by its SID; on Unix its home in the account database, `own_home`), by no link below it (`kept_in_place`). On Linux the move of root's config into `/etc/roomler` keeps the same rule. A folder left in place says why in the daemon's log, and the read-both resolution keeps working. | `crates/agent-core/src/appdirs.rs:732`, `crates/agent-core/src/appdirs.rs:741`, `crates/agent-core/src/appdirs.rs:591`, `crates/agent-core/src/appdirs.rs:917`, `crates/agent-core/src/appdirs.rs:697` |
 | The one-time sweep of the vacated install folder | Rooted as above; a folder that is a link, or sits below one, is left as it is. | `agents/roomlerd/src/install_cleanup.rs:267` |
-| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand) | Below the profile of the account whose session the step runs in (`plan_per_user_removal`). A tree that is a link, holds one or is reached through one is left in place with a line that names it (`link_inside`), and the other trees are still handled. On the service account, which `is_service_account` names as the pin does, the step looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. | `agents/roomlerd/src/install_cleanup.rs:435`, `agents/roomlerd/src/install_cleanup.rs:478`, `crates/agent-core/src/appdirs.rs:284` |
+| The per-user data trees of the cleanup step (`cleanup-legacy-install --target-flavour perMachine`, run by hand; the package's own custom action stops at the same-flavour check) | The step deletes the per-user package's Scheduled Tasks it finds (`Roomler` and the one under the retired name), then removes the four data trees (the `roomler` app segment and the retired one, each under `AppData\Local` and `AppData\Roaming`) below `C:\Users\<name>` of the person signed in to the step's session (`plan_per_user_removal`). A tree that is a link, holds one or is reached through one is left in place with a line that names it (`link_inside`), and the other trees are still handled. When the step cannot read the SID of the account it runs as, or runs on the service account, which `is_service_account` names as the pin does, it looks up no profile and removes no tree, the Scheduled Task clean-up still runs, and its line says both. With nobody signed in to its session it removes no tree either. | `agents/roomlerd/src/install_cleanup.rs:177`, `agents/roomlerd/src/install_cleanup.rs:341`, `agents/roomlerd/src/install_cleanup.rs:435`, `agents/roomlerd/src/install_cleanup.rs:487`, `crates/agent-core/src/appdirs.rs:284` |
+
+**How the folder move runs.** It runs when `roomlerd` starts, before logging starts and before
+anything asks for one of its folders (`agents/roomlerd/src/app.rs:1549`), and not while the
+desktop companion runs (`crates/agent-core/src/appdirs.rs:597`). The per-user pairs are the
+config folder, then the Roaming data, then the Local data (on Linux the config, then the data; on
+macOS one folder); the machine folder is a pair of its own (`crates/agent-core/src/appdirs.rs:606`,
+`crates/agent-core/src/appdirs.rs:677`). Whether the pairs move is decided for all of them before
+any moves: none moves when a folder of a pair with a legacy folder lies outside its root (the
+profile, or the machine's data folder) or is reached through a link below it
+(`crates/agent-core/src/appdirs.rs:741`). They then move in that order (`migrate_dirs_within`,
+`crates/agent-core/src/appdirs.rs:774`):
+
+- A pair whose NEW folder is already there is left in place, and the move goes on
+  (`crates/agent-core/src/appdirs.rs:828`).
+- The first pair, which holds `config.toml`, moves by one rename or not at all. When that move
+  fails, there is no NEW config folder, nothing after it moves, the daemon reads its config from
+  the OLD tree, and the next start tries again. The empty `%APPDATA%\roomler\roomler` made for
+  the rename can stay: which tree is used is decided by the NEW config folder and the NEW local
+  data folder only (`crates/agent-core/src/appdirs.rs:52`).
+- A later pair whose folder rename the system refuses moves child by child (`migrate_children`,
+  `crates/agent-core/src/appdirs.rs:1032`); when that fails, it renames the moved entries back
+  and its note says whether every one went back. A later pair whose move fails stops the move:
+  the pairs before it stay in the NEW tree, the pairs after it in the OLD one.
 
 **The rule for a service's `Environment` entry.** A variable that this pin sets, named in a
 service's `Environment` value, is replaced for the service account by the folder the system
