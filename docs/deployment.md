@@ -206,7 +206,7 @@ What a roll does to a live session now:
 
 | The session | All three switches on | Any one off |
 |---|---|---|
-| on `direct` or `turn` | kept: the same row, no redial, no prompt; on a supervised Mac, from agent 0.4.215. Seven field rolls read a pause in the picture of 13 to 262 ms | ends `agent_disconnect`, and the page redials into a new session |
+| on `direct` or `turn` | kept: the same row, no redial, no prompt; on a supervised Mac, from agent 0.4.215. Eight sessions over seven field rolls read a pause in the picture of 13 to 262 ms | ends `agent_disconnect`, and the page redials into a new session |
 | on `derp` | redials, since `/derp` is pod-local; the new request ends the old row | the same |
 | external (FR-52), not yet live, or begun before its device entered the scope | ends as before | the same |
 
