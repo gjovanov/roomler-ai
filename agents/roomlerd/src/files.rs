@@ -4513,9 +4513,14 @@ fn root_may_place_in(
     folder: &std::path::Path,
     held: &std::fs::File,
 ) -> Result<(), String> {
-    if default_download_dir_as(who, false).is_ok_and(|default| default == folder) {
-        let uid = own_euid();
-        return staging::may_receive(held, uid, uid == 0);
+    match default_download_dir_as(who, false) {
+        Ok(default) if default == folder => {
+            let uid = own_euid();
+            return staging::may_receive(held, uid, uid == 0);
+        }
+        // The default folder itself fails its rule now: say that.
+        Err(e) if !matches!(who, FsAs::Daemon) => return Err(format!("{e:#}")),
+        _ => {}
     }
     if !matches!(who, FsAs::Daemon) {
         return Err(format!(

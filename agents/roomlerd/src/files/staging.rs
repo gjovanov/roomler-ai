@@ -219,21 +219,33 @@ fn own(held: &File, dir: bool) -> Result<(), &'static str> {
 /// before this rule).
 fn open_staging(base: &File, base_path: &Path, create: bool) -> Result<File> {
     let shown = base_path.join(STAGING);
-    if create {
-        match mkdir_at(base, STAGING, 0o700) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
-            Err(e) => {
-                return Err(anyhow::Error::from(e).context(format!("creating {}", shown.display())));
+    // Twice at most when making it: another upload's end removes an empty
+    // `.roomler-partial`, and may do so between the make and the open.
+    let mut tries = if create { 2 } else { 1 };
+    let staging = loop {
+        tries -= 1;
+        if create {
+            match mkdir_at(base, STAGING, 0o700) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+                Err(e) => {
+                    return Err(
+                        anyhow::Error::from(e).context(format!("creating {}", shown.display()))
+                    );
+                }
             }
         }
-    }
-    let staging = match open_at(
-        base,
-        STAGING,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    ) {
+        match open_at(
+            base,
+            STAGING,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && tries > 0 => continue,
+            opened => break opened,
+        }
+    };
+    let staging = match staging {
         Ok(staging) => staging,
         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
             return Err(anyhow!(
