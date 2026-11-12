@@ -37,6 +37,14 @@
 //!
 //! Off is today: with the switch off, or no window ever announced, every exit
 //! closes every peer as `close_all_peers` did, the same order, label and line.
+//!
+//! FR-138 P4-0 — and the switch alone changes nothing else either. The server's
+//! end said peer to peer (C1), a delegated session offered `keepable` and its
+//! record (P2b), and the daemon serving a message about a session it holds (A1)
+//! each wait for a window this connection's server announced and has not
+//! withdrawn ([`SessionTable::window_open`]). So a device the resume scope does
+//! not cover, or no longer covers, behaves exactly as with the switch off, and
+//! the scope alone stages the fleet once the switch's default is on.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -85,7 +93,10 @@ const SAY_BUDGET: Duration = Duration::from_secs(2);
 
 /// The device's switch: `rc_sessions_survive_reattach` in the config, or
 /// `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`. Default off. Device-side and not
-/// pushable: `DesiredConfig` has no such field. Read once per connection.
+/// pushable: `DesiredConfig` has no such field. Read once per connection. On,
+/// it says `rc-resume` and changes nothing else until a window is announced
+/// (P4-0). A supervised Mac's GUI worker reads the root's value
+/// (`macos_supervisor::WORKER_ENV_FORWARD`).
 pub(crate) fn survive_enabled() -> bool {
     tunnel_core::env::flag("RC_SESSIONS_SURVIVE_REATTACH", false)
 }
@@ -99,12 +110,14 @@ pub(crate) fn survive_enabled() -> bool {
 /// daemon serves itself no longer crosses to the worker
 /// ([`crate::delegate::served_by_daemon`]). A delegated session it cannot keep
 /// (an older worker's, or one with no worker attached) it does not claim, and
-/// the server ends that at the hello (D1).
+/// the server ends that at the hello (D1). P4-0: nothing of it happens until
+/// this connection's server announces a window ([`SessionTable::window_open`]).
 pub(crate) fn connection_keeps(switch_on: bool, delegation_host: bool) -> bool {
     if switch_on && delegation_host {
         info!(
-            "rc: this loop holds the delegation host (a supervised Mac); its delegated sessions \
-             are kept by the GUI worker on this loop's orders; the switch is on (FR-138 P2b)"
+            "rc: this loop holds the delegation host (a supervised Mac) and its switch is on; \
+             while its server announces a window, its delegated sessions are kept by the GUI \
+             worker on this loop's orders (FR-138 P2b)"
         );
     }
     switch_on
@@ -704,15 +717,24 @@ impl<P: TablePeer> SessionTable<P> {
     /// FR-138 P2b (A3) — the gate crossed `session_id`'s offer to the worker:
     /// a session whose params crossed `keepable` gets a record, attached to
     /// this connection, and the worker's replies about it are bound to the
-    /// record's link. Anything else (the switch off, an older worker, no
-    /// connection) gets none and is served as today. `generation` is the
-    /// attach generation the gate read ([`Self::live_generation`]).
+    /// record's link. Anything else (the switch off, no window open on this
+    /// connection, an older worker, no connection) gets none and is served as
+    /// today. `generation` is the attach generation the gate read
+    /// ([`Self::live_generation`]).
+    ///
+    /// P4-0 — the params said `keepable` only under a window
+    /// ([`Self::window_open`], the `Request` arm), and the offer needs one too:
+    /// with none the record would only ever be closed, and its `Close` and
+    /// `Ended` would reach the worker where the switch off sends nothing. A
+    /// window withdrawn between the two leaves the worker a session the daemon
+    /// orders nothing about, which still closes: on its own end (B6), its
+    /// `Terminate`, or the channel's end.
     pub(crate) fn cross_offer(&mut self, session_id: ObjectId, generation: Option<u64>) {
         let Some(host) = self.host.clone() else {
             return;
         };
         let hex = session_id.to_hex();
-        if !self.survive || !host.is_keepable(&hex) {
+        if !self.window_open() || !host.is_keepable(&hex) {
             return;
         }
         let (Some(current), Some(generation)) = (self.current.clone(), generation) else {
@@ -1335,6 +1357,29 @@ impl<P: TablePeer> SessionTable<P> {
         self.survive
     }
 
+    /// FR-138 P4-0 — this connection's server announced a window and has not
+    /// withdrawn it. What everything new waits for, where the switch alone
+    /// once decided: the server's end said peer to peer (C1,
+    /// [`Self::close_terminated`]), a delegated session offered `keepable` and
+    /// its record ([`Self::cross_offer`]), and the daemon serving a session it
+    /// holds ([`Self::keeping`]). Read at the moment of each decision, so a
+    /// window announced after a session went live counts from then, and one
+    /// withdrawn counts no more. It implies the switch: [`Self::set_window`]
+    /// ignores a window while the switch is off.
+    pub(crate) fn window_open(&self) -> bool {
+        self.survive && self.window.is_some()
+    }
+
+    /// FR-138 P4-0 — A1's gate (`crate::delegate::served_by_daemon`): this loop
+    /// keeps sessions now. A window is open, or a session is still kept from an
+    /// earlier connection, which only a window could have kept and whose peer
+    /// is this loop's to close: a `Terminate` for it that crossed to a worker
+    /// would leave it open until its deadline. With neither, the gate is
+    /// today's, as with the switch off.
+    pub(crate) fn keeping(&self) -> bool {
+        self.window_open() || self.has_kept()
+    }
+
     /// `rc:agent.resume_window`: the window, capped at [`WINDOW_CAP`], or `None`
     /// when withdrawn (0). Ignored with the switch off.
     pub(crate) fn set_window(&mut self, secs: u32) -> Option<Duration> {
@@ -1414,7 +1459,13 @@ impl<P: TablePeer> SessionTable<P> {
     /// of its own, so the loop waits for neither.
     ///
     /// Off is today: with the switch off it closes here, within the budget,
-    /// and says nothing.
+    /// and says nothing. P4-0 — and so it does with no window open on this
+    /// connection ([`Self::window_open`]): none announced, as to a device the
+    /// resume scope does not cover, or one withdrawn. A session kept under an
+    /// earlier connection's window is no exception: with no window its claim
+    /// is refused `agent_disconnect` at the hello, an end its viewer redials
+    /// after anyway. A GUI worker's delegated table says it always: it holds
+    /// only what the daemon offered `keepable`, which takes the daemon's window.
     pub(crate) async fn close_terminated(
         &self,
         peer: P,
@@ -1423,7 +1474,7 @@ impl<P: TablePeer> SessionTable<P> {
         limit: Option<&str>,
         grace: Duration,
     ) {
-        if !self.survive {
+        if !(self.worker || self.window_open()) {
             close_within_budget(peer.close(), session_id, "terminate").await;
             return;
         }
@@ -4798,5 +4849,34 @@ mod tests {
                 "the switch alone gates nothing new: `{stale}`"
             );
         }
+    }
+
+    /// FR-138 P4-0 — what the gates read. `window_open`: the switch and a
+    /// window this connection was announced and has not had withdrawn, read at
+    /// the decision, so one announced late counts from then. `keeping` (A1):
+    /// that, or a session still kept from an earlier connection, whose peer is
+    /// this loop's to close whatever the next connection is announced.
+    #[tokio::test]
+    async fn p4_0_the_gates_read_the_window_at_the_decision() {
+        let off = rig(false, Some(60), 0).await;
+        assert!(
+            !off.table.window_open() && !off.table.keeping(),
+            "a window told to a device whose switch is off opens nothing"
+        );
+        for w in NO_WINDOW {
+            let r = no_window_rig(true, w, 0).await;
+            assert!(!r.table.window_open() && !r.table.keeping(), "{w:?}");
+        }
+        let mut r = rig(true, None, 1).await;
+        r.table.set_window(60);
+        assert!(r.table.window_open() && r.table.keeping(), "announced late");
+        r.table.end_connection(ConnExit::ReadError).await;
+        let (claim, _tx, _rx) = reconnect(&mut r.table).await;
+        assert_eq!(claim.len(), 1);
+        assert!(!r.table.window_open(), "each connection starts with none");
+        assert!(r.table.keeping(), "a kept session is still this loop's");
+        r.table.close_all("test_end").await;
+        assert!(!r.table.keeping(), "nothing kept, no window: today's gate");
+        assert_eq!(r.closes(), 1);
     }
 }

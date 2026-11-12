@@ -341,6 +341,10 @@ pub const WORKER_ENV_FORWARD: &[&str] = &[
     // FR-130 — the colour description's switch: the worker's encoders write
     // it, and its probe says `color-described` in the hello it computes.
     "COLOR_DESCRIPTION",
+    // FR-138 P4-0 — the remote-control sessions' switch, one per device: the
+    // worker's own session table and its hello follow the root's value, never
+    // the person's config, so the root's off is the worker's off.
+    "RC_SESSIONS_SURVIVE_REATTACH",
 ];
 
 /// The worker's `ROOMLERD_<suffix>=<value>` assignments: every
