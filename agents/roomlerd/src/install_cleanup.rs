@@ -1172,6 +1172,91 @@ mod tests {
         }
     }
 
+    /// FR-145 T14 (b), R145 — the swap at the act: once the walk holds
+    /// `AppData\Local\roomler`, after every check a walk or a re-check by
+    /// path could make, that folder is renamed aside and a junction put at
+    /// its name (`between_check_and_use`). The tree removed is the held
+    /// folder's, now `roomler.aside\roomler-agent`; nothing the junction
+    /// leads to is removed, and the next walk through the junction is
+    /// refused with a line. A removal by path after the walk fails this
+    /// case either way: through the junction it deletes what it leads to,
+    /// and a re-check that refuses leaves the held tree in place. Its own
+    /// process, as the hook is process-wide.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    #[test]
+    fn the_per_user_removal_acts_through_the_folder_it_holds() {
+        use roomler_node_core::machine_tree::test_support::between_check_and_use;
+        const SWAP: &str = "ROOMLERD_TEST_CLEANUP_SWAP";
+        const CHECKED: &str = "per-user swap case: checked";
+        if std::env::var_os(SWAP).is_none() {
+            let test =
+                "install_cleanup::tests::the_per_user_removal_acts_through_the_folder_it_holds";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture", "--test-threads=1"])
+                .env(SWAP, "1")
+                .output()
+                .unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{said}");
+            assert!(said.contains(CHECKED), "the child ran the case: {said}");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        make_trees(&profile);
+        let elsewhere = root.path().join("elsewhere");
+        for segment in SEGMENTS {
+            std::fs::create_dir_all(elsewhere.join(segment)).unwrap();
+            std::fs::write(elsewhere.join(segment).join("keep.txt"), "x").unwrap();
+        }
+        let plan = plan_for(Some(A_PERSON), &profile);
+        let local = profile.join("AppData").join("Local").join("roomler");
+        let aside = local.with_file_name("roomler.aside");
+        let (from, to, target) = (local.clone(), aside.clone(), elsewhere.clone());
+        between_check_and_use(move || {
+            std::fs::rename(&from, &to).expect("the held folder moves aside");
+            junction(&from, &target);
+        });
+        let mut report = CleanupReport::default();
+        remove_per_user_trees(plan, &mut report, false);
+
+        assert!(
+            aside.is_dir(),
+            "the swap ran, once a walk held the folder: {report:?}"
+        );
+        for segment in SEGMENTS {
+            assert!(
+                elsewhere.join(segment).join("keep.txt").is_file(),
+                "nothing the junction leads to is removed: {report:?}"
+            );
+        }
+        assert!(
+            !aside.join("roomler-agent").exists(),
+            "the held folder's tree is the one removed: {report:?}"
+        );
+        assert!(
+            aside.join("roomler").join("keep.txt").is_file(),
+            "the next walk meets the junction and removes nothing: {report:?}"
+        );
+        let named = local.display().to_string();
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|line| line.contains(&named) && line.contains("link")),
+            "a line names the link: {report:?}"
+        );
+        let roaming = profile.join("AppData").join("Roaming").join("roomler");
+        for segment in SEGMENTS {
+            assert!(!roaming.join(segment).exists(), "{report:?}");
+        }
+        println!("{CHECKED}");
+    }
+
     /// FR-145 T15 — the per-user clean-up reads the profile the system records
     /// for the session's account: that profile's trees are removed, and a
     /// folder named after the session's user is untouched. With no profile
