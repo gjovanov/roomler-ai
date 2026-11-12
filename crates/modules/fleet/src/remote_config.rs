@@ -52,8 +52,9 @@ pub struct DesiredConfigBody {
     #[serde(default)]
     pub rc_media_legacy: Option<String>,
     /// Every other key in the body, kept only to be refused if it is a device
-    /// owner's ([`names_a_device_owned_key`]). Dropped silently, an `external_*`
-    /// key would answer 200 as if the push had taken. Never stored or logged.
+    /// owner's ([`names_a_device_owned_key`], [`DeviceSwitch::named_in`]).
+    /// Dropped silently, such a key would answer 200 as if the push had taken.
+    /// Never stored or logged.
     #[serde(flatten)]
     pub rest: std::collections::BTreeMap<String, serde_json::Value>,
 }
@@ -87,9 +88,41 @@ pub enum ConfigDenyReason {
     CannotGrantSsh,
     /// FR-52 — the body names an `external_*` key, which no server may push.
     DeviceOwnedKey,
-    /// FR-135 §7.1 — the body names `rc_media_canary`, the switch that turns a
-    /// media path's new code on early, which is the device's.
-    DeviceOwnedSwitch,
+    /// FR-135 §7.1, FR-138 — the body names one of the device's own switches,
+    /// which no server may push. One code for each, and words naming its key.
+    DeviceOwnedSwitch(DeviceSwitch),
+}
+
+/// A switch that is the device's own: each turns new code on, which is the
+/// device's decision or a release's, so no server may push it. A body naming
+/// one is refused by the switch's WHOLE name ([`DeviceSwitch::named_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceSwitch {
+    /// FR-135 §7.1 — `rc_media_canary`, a media path's new code on early. It
+    /// shares no prefix with the pushable `rc_media_legacy`.
+    MediaCanary,
+    /// FR-138 — `rc_sessions_survive_reattach`, a live session kept through
+    /// the loss of the control socket. The server stages the fleet through
+    /// its resume scope instead.
+    SessionsSurviveReattach,
+}
+
+impl DeviceSwitch {
+    const ALL: [Self; 2] = [Self::MediaCanary, Self::SessionsSurviveReattach];
+
+    /// The switch's key in the device's config.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::MediaCanary => "rc_media_canary",
+            Self::SessionsSurviveReattach => "rc_sessions_survive_reattach",
+        }
+    }
+
+    /// The switch a body names, by equality: a key that only starts like one,
+    /// or that one only starts like, is not it.
+    fn named_in(rest: &std::collections::BTreeMap<String, serde_json::Value>) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| rest.contains_key(s.key()))
+    }
 }
 
 impl ConfigDenyReason {
@@ -99,7 +132,7 @@ impl ConfigDenyReason {
             Self::CannotGrantExec => "cannot_grant_exec",
             Self::CannotGrantSsh => "cannot_grant_ssh",
             Self::DeviceOwnedKey => "device_owned_key",
-            Self::DeviceOwnedSwitch => "device_owned_switch",
+            Self::DeviceOwnedSwitch(_) => "device_owned_switch",
         }
     }
 
@@ -118,9 +151,14 @@ impl ConfigDenyReason {
                 "External access is the device owner's to set, on the device: no server can \
                  push an external_* key"
             }
-            Self::DeviceOwnedSwitch => {
+            Self::DeviceOwnedSwitch(DeviceSwitch::MediaCanary) => {
                 "rc_media_canary turns a media path's new code on early, which is the \
                  device's decision or a release's: no server can push it"
+            }
+            Self::DeviceOwnedSwitch(DeviceSwitch::SessionsSurviveReattach) => {
+                "rc_sessions_survive_reattach keeps a live remote session through the loss \
+                 of the device's control socket, which is the device's decision or a \
+                 release's: no server can push it"
             }
         }
     }
@@ -314,11 +352,11 @@ pub async fn set_desired_config(
     let verdict = decide(perms, &agent.desired_config, &requested).and_then(|()| {
         if names_a_device_owned_key(&body.rest) {
             Err(ConfigDenyReason::DeviceOwnedKey)
-        } else if body.rest.contains_key("rc_media_canary") {
-            // FR-135 §7.1 — by WHOLE name: it shares no prefix with the
-            // pushable `rc_media_legacy`, and a 200 would say a push took that
-            // never will.
-            Err(ConfigDenyReason::DeviceOwnedSwitch)
+        } else if let Some(switch) = DeviceSwitch::named_in(&body.rest) {
+            // FR-135 §7.1, FR-138 — by WHOLE name: `rc_media_canary` shares no
+            // prefix with the pushable `rc_media_legacy`, and a 200 would say a
+            // push took that never will.
+            Err(ConfigDenyReason::DeviceOwnedSwitch(switch))
         } else {
             Ok(())
         }
@@ -346,10 +384,11 @@ pub async fn set_desired_config(
                 "desired-config: an external_* key was pushed — refused, it is the device's"
             );
         }
-        if reason == ConfigDenyReason::DeviceOwnedSwitch {
+        if let ConfigDenyReason::DeviceOwnedSwitch(switch) = reason {
             tracing::warn!(
                 tenant = %tenant_id, agent = %agent_id, admin = %auth.user_id,
-                "desired-config: rc_media_canary was pushed — refused, it is the device's"
+                "desired-config: {} was pushed — refused, it is the device's",
+                switch.key()
             );
         }
         return Err(ApiError::Forbidden(reason.message().to_string()));
@@ -735,6 +774,37 @@ mod tests {
                     "{value:?}"
                 );
             }
+        }
+    }
+
+    /// FR-135 §7.1, FR-138 — a body naming one of the device's own switches is
+    /// refused by the switch's WHOLE name, under the one code
+    /// `device_owned_switch`, in words that name that switch and no other. A
+    /// key that only starts like a switch, or that one only starts like, is
+    /// not it: `ssh` is a prefix of `ssh-consent`, and the two differ.
+    #[test]
+    fn a_device_switch_is_refused_by_its_whole_name() {
+        let body = |key: &str| {
+            std::collections::BTreeMap::from([(key.to_owned(), serde_json::json!(true))])
+        };
+        for switch in DeviceSwitch::ALL {
+            assert_eq!(DeviceSwitch::named_in(&body(switch.key())), Some(switch));
+            let reason = ConfigDenyReason::DeviceOwnedSwitch(switch);
+            assert_eq!(reason.wire(), "device_owned_switch");
+            let words = reason.message();
+            assert!(words.starts_with(switch.key()), "{words}");
+            for other in DeviceSwitch::ALL.into_iter().filter(|o| *o != switch) {
+                assert!(!words.contains(other.key()), "{words}");
+            }
+        }
+        for near in [
+            "rc_sessions_survive_reattach_v2",
+            "rc_sessions_survive",
+            "x_rc_sessions_survive_reattach",
+            "rc_media_canary_x",
+            "rc_media",
+        ] {
+            assert_eq!(DeviceSwitch::named_in(&body(near)), None, "{near}");
         }
     }
 
