@@ -230,8 +230,8 @@ view), and nothing else. The service reads it through `exec_service::store`
 | Value | Holds | Written by |
 |---|---|---|
 | `Anchor` | the anchor: server origin, org, device, the service's credential, `exec_enabled`, the SSH ceiling (JSON, as `anchor.json` held it) | `roomlerd anchor create`, `exec` and `ssh`, elevated, and Setup's elevated anchor step (FR-104); the SYSTEM service when it renews its credential, and once at an upgrade (the copy below) |
-| `SshHostKey` | the service's SSH host key (FR-105, OpenSSH PEM) | `anchor create` and `anchor ssh` when the ceiling is above off; the SYSTEM service when SSH is on and there is none |
-| `LegacyCopy` | what the one-time copy did: `at`, `outcome` (`copied`, `none` or `refused`), `why`, `agent_id`, `anchored_at`. No secret | the SYSTEM service at its first start on a build with #3737; `anchor create` when it is not there |
+| `SshHostKey` | the service's SSH host key (FR-105, OpenSSH PEM) | `anchor create` and `anchor ssh` when the ceiling is above off; the SYSTEM service whenever the device is anchored and the key holds none, whatever the ceiling (its endpoint publisher makes one) |
+| `LegacyCopy` | what the one-time copy did: `at`, `outcome` (`pending`, `copied`, `none` or `refused`; `removed` after `anchor remove`), `why`, `agent_id`, `anchored_at`, and `earlier`, the outcomes it had before. No secret | the SYSTEM service at its first start on a build with #3737; `anchor create` when it is not there; `anchor remove` updates it |
 
 - **What the service takes.** It reads the key only when SYSTEM or
   Administrators own it (TrustedInstaller counts), no rule in its DACL lets
@@ -239,14 +239,29 @@ view), and nothing else. The service reads it through `exec_service::store`
   `HKLM\SOFTWARE\Roomler`, lets no other account change it, counting what the
   parent hands down to a key made below it later. Only SYSTEM and
   Administrators may create a key below `HKLM\SOFTWARE`, and a key never moves
-  from one parent to another.
+  from one parent to another. Both keys are opened themselves
+  (`REG_OPTION_OPEN_LINK`): a registry link at `Roomler` or `ExecService` is
+  refused, never followed, by the reader and by every writer.
 - **What the writer makes.** The key is created with exactly
-  `O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)`. An administrator's writer that finds a
-  key failing the check takes it over (that owner and DACL, by handle) and
-  deletes every value in it before it writes; the SYSTEM service's copy never
-  takes a key over. Every write is read back through the service's own check,
-  so an anchor the service would not use is an error at `anchor create`, not a
-  device that quietly stays unanchored.
+  `O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)`, below a parent the writer creates
+  owned by Administrators (`O:BA`, the DACL what `HKLM\SOFTWARE` hands down),
+  whoever creates it: a policy that gives what an administrator makes to the
+  administrator's own account would otherwise leave a parent the check
+  refuses. `anchor create` gives an existing parent that its caller's own
+  account owns to Administrators, by handle, when that alone stands in the
+  way; a parent that fails for any other reason is left as it is.
+- **A key that fails the check** is made again by a writer: deleted, through
+  the handle it was judged on, and created again with that exact owner and
+  DACL, never sealed where it stands. Deleting it makes every handle opened
+  while it was loose fail, so nothing written through one later, or put in
+  the key before, is read as the key's. Its `LegacyCopy` is read first and
+  written back first, so the copy stays shut. The steps run in that order, so
+  a stop at any of them leaves no key, or a sealed key that holds nothing of
+  the loose one but its `LegacyCopy`. A key with a key below it, which
+  roomlerd never makes, is not made again: delete it from an elevated prompt.
+  The SYSTEM service's copy never makes a key again. Every write is read back
+  through the service's own check, so an anchor the service would not use is
+  an error at `anchor create`, not a device that quietly stays unanchored.
 - **No file is read as an anchor**, and no switch makes one be. Builds before
   #3737 kept the anchor in `%ProgramData%\roomler\roomler\exec-service\anchor.json`
   and the host key beside it. Only the one-time copy reads them, once.
@@ -260,7 +275,7 @@ flowchart TD
   S[service start] --> M{LegacyCopy value?}
   M -- yes --> D[doorbell up; the anchor comes from the key only]
   M -- no --> W[write LegacyCopy = pending]
-  W -- fails --> F[logged; nothing copied] --> D
+  W -- fails --> F[logged; nothing copied; the next start tries again] --> D
   W --> K{"ROOMLERD_EXEC_ANCHOR_COPY=0?"}
   K -- yes --> R
   K -- no --> A{Anchor value there already?}
@@ -272,12 +287,17 @@ flowchart TD
   V -- fail --> R[LegacyCopy = refused, and why] --> D
 ```
 
-- The marker is written before anything is read, so the copy runs at most once
-  per machine, and nothing that appears in the machine folder later is copied.
+- The marker is written before anything is read, so nothing is ever copied
+  without it, and a start that finds it copies nothing: nothing that appears
+  in the machine folder after it is copied. A start that cannot write it, or
+  cannot make the key (its parent fails the check, say), copies nothing, and
+  the copy runs again at the next start, until it has recorded an outcome.
 - It takes the folder and the file only with the owner and DACL every build
   gave them (`O:BA`, a protected DACL of SYSTEM and Administrators alone), the
-  host key under the same rule, and an anchor at an https origin: a loopback
-  origin is a lab's.
+  host key under the same rule, and an anchor at an https origin that is not
+  on this machine: `localhost`, a name below `.localhost`, a loopback or an
+  unspecified address is a lab's origin. The files are read below the handle
+  the folder was judged on, so the folder judged is the folder read.
 - It writes the anchor as this build's writer would, the keys a newer build
   added kept, and leaves the files where they are.
 - The service log says what it did, once: `exec-service: one-time anchor copy`,
@@ -287,7 +307,8 @@ flowchart TD
 the check, leaves the device unanchored as far as the service is concerned:
 
 - the service's health answers `anchored: false` with a `problem` that says why
-  (for a refused copy, the reason and the command to anchor again), and the
+  (for a refused copy, the reason and the command to anchor again; for a copy
+  that started and did not finish, `pending`, the same command), and the
   worker logs `exec-service: the SYSTEM service's anchor is not used` with it;
 - the worker stops offering `exec-system` at its next heartbeat, so commands
   take the worker path (`ran_as=worker`), or are refused with `SystemRequired`
@@ -296,15 +317,26 @@ the check, leaves the device unanchored as far as the service is concerned:
 - the device page still reads *Anchored*: that is the server's record.
 
 The way back is `roomlerd anchor create … --force` from an elevated prompt, or
-Setup with an anchor-capable token.
+Setup with an anchor-capable token. `anchor remove` retires the report: the
+marker then reads `removed`, with when, and keeps what it said before in
+`earlier`.
 
 **Rollback.** A build before #3737 reads only the file, which the copy left in
 place, and its credential is still live: a renewal never revokes the earlier
 credential of the same anchor. `anchor create` and `anchor remove` on a build
-with #3737 delete the file and the host key beside it (never through a link),
-so a rollback after either finds no anchor and takes the worker path, rather
-than offering an anchor the server no longer accepts. The `exec-service` folder
-itself stays.
+with #3737 delete the file and the host key beside it, so a rollback after
+either finds no anchor and takes the worker path, rather than offering an
+anchor the server no longer accepts. They delete by handle, and only where an
+earlier build left the files: `exec-service` is opened itself (a junction or a
+symbolic link there, or on the way to it, is refused) and must have exactly
+the owner and DACL `anchor create` gave it, which no account but SYSTEM or an
+administrator can give a folder; each file is opened below that folder's
+handle, never through a link, and deleted through its own handle only when it
+is a plain file with exactly the owner and DACL `anchor create` gave it.
+Anything else is left as it is, and logged. The `exec-service` folder itself
+stays. After a downgrade, remove an anchor with the newer build, or run
+`anchor remove` again after the upgrade: an older build's `anchor remove`
+changes only the file, so the upgrade finds the key's anchor again.
 
 **Kill switch.** `ROOMLERD_EXEC_ANCHOR_COPY=0` in the service's own
 `Environment`: the first start copies nothing and records `refused`, "switched

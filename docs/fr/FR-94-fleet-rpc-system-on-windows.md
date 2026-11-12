@@ -130,9 +130,10 @@ stateDiagram-v2
 > made with a protected DACL of SYSTEM and Administrators alone, no longer files under `%PROGRAMDATA%`. The
 > service reads them only from that key, when SYSTEM or Administrators own it, its DACL lets no other account
 > change it or read its values, and its parent lets no other account change it (`crates/agent-core/src/machine_key.rs`).
-> The first start of a build with #3737 copies an `exec-service\anchor.json` an earlier build wrote, once, in
-> the exact shape `roomlerd anchor create` gave it, and records what it did in `LegacyCopy`; nothing reads that
-> file after. Kill switch: `ROOMLERD_EXEC_ANCHOR_COPY=0`. The text below, and §10's rows, are the design as it
+> The service's first start on a build with #3737 copies an `exec-service\anchor.json` an earlier build wrote in
+> the exact shape `roomlerd anchor create` gave it, and records what it did in `LegacyCopy`, written before anything
+> is read: a start that finds it copies nothing, and nothing reads that file after. Kill switch:
+> `ROOMLERD_EXEC_ANCHOR_COPY=0`. The text below, and §10's rows, are the design as it
 > shipped first, kept as history: [`fleet-rpc.md`](../fleet-rpc.md#where-the-anchor-lives-3737) has the current one.
 
 - **P1 — the machine trust anchor.** `%PROGRAMDATA%\roomler\…\service.toml` holds:
