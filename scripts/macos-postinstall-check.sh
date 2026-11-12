@@ -186,8 +186,7 @@ CASE=""
 CASE_FAILED=0
 
 fresh_mac() {
-    rm -rf /Library /Applications /Users /etc/roomler /etc/roomler-agent \
-        /var/log/roomler /var/log/roomler-agent "$STATE"
+    rm -rf /Library /Applications /Users /etc/roomler /var/log/roomler "$STATE"
     mkdir -p "$RES" "$LD" "$STATE/loaded" /Users/tester/Library
     cp /src/packaging/com.roomler.*.plist "$RES/"
     chown -R tester /Users/tester
