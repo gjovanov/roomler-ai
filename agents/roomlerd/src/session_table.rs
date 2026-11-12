@@ -3513,8 +3513,8 @@ mod tests {
         let code = signaling_code();
         for (needle, what) in [
             (
-                "served_by_daemon(peers.keeps_sessions()",
-                "A1: the gate asks the table first, with the switch",
+                "served_by_daemon(peers.keeping()",
+                "A1: the gate asks the table first, while it keeps (P4-0)",
             ),
             ("session_keepable(", "A2: the params say keepable"),
             ("peers.cross_offer(", "A3: a crossed offer gets its record"),
@@ -3626,16 +3626,18 @@ mod tests {
         assert!(r.table.kept_ids().is_empty());
     }
 
-    /// FR-138 P2b (R5, M3) — a connection that ends before its server announced
-    /// a window closes the records it built, in the worker too.
+    /// FR-138 P2b (R5, M3), P4-0 — a connection whose server announced no
+    /// window makes no record of a delegated session, so its end tells the
+    /// worker nothing. A record made under a window that was withdrawn since
+    /// closes in the worker at the exit
+    /// (`p4_0_a_record_made_under_a_window_withdrawn_since_closes_at_the_exit`).
     #[tokio::test]
-    async fn p2b_with_no_window_a_record_is_closed_not_kept() {
+    async fn p2b_with_no_window_no_record_is_made() {
         let mut r = record_rig(8, None, 1).await;
-        assert!(r.table.holds_record(&r.ids[0]), "the offer made its record");
+        assert!(!r.table.holds_record(&r.ids[0]), "no window, no record");
         r.table.end_connection(ConnExit::ReadError).await;
         assert!(r.table.kept_ids().is_empty());
-        assert_eq!(closes_of(&sent(&mut r.frames)), hexes(&r.ids));
-        assert!(!r.table.holds_record(&r.ids[0]));
+        assert!(sent(&mut r.frames).is_empty(), "the worker is told nothing");
     }
 
     /// FR-138 P2b (R6, A6) — `resumed` re-attaches a kept record, points its
@@ -4380,5 +4382,421 @@ mod tests {
             vec![(a, EndReason::AgentDisconnect)],
             "the server hears the end"
         );
+    }
+
+    // ─── FR-138 P4-0: the switch on with no window is the switch off ───────
+    //
+    // P4 flips the switch's default on, and from then the resume scope must be
+    // the only thing that changes what a device does: a device the scope does
+    // not cover is announced no window. So everything the switch alone used to
+    // gate waits for a window this connection's server announced and has not
+    // withdrawn. Each test below compares the switch on with no window (none
+    // announced, one announced as 0, one withdrawn) against the switch off, on
+    // what can be seen of a session: its peer's closes, whether it stopped
+    // serving and what it said on its control channel, the end hook, the log
+    // lines with their ids masked, what stays held or kept, what the server
+    // hears after the next hello, and what the GUI worker is told. Written
+    // first: at the seam C1 and the delegation host's records read the switch
+    // alone.
+
+    use crate::peer::files_log_tests::Logged;
+
+    /// How the window stands when the device decides.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum NoWindow {
+        /// The server announced none: a device the scope does not cover.
+        Unannounced,
+        /// It announced 0.
+        Zero,
+        /// It announced one and the scope's reconcile withdrew it (0) before
+        /// the decision. A session the test builds is built under it.
+        Withdrawn,
+    }
+
+    const NO_WINDOW: [NoWindow; 3] = [NoWindow::Unannounced, NoWindow::Zero, NoWindow::Withdrawn];
+
+    /// `n` live sessions on a connection whose switch is `on`, the window
+    /// standing as `w` once they are built.
+    async fn no_window_rig(on: bool, w: NoWindow, n: usize) -> Rig {
+        let built_under = (w == NoWindow::Withdrawn).then_some(60);
+        let mut r = rig(on, built_under, n).await;
+        if w != NoWindow::Unannounced {
+            r.table.set_window(0);
+        }
+        r
+    }
+
+    /// The lines `log` holds, each 24-hex id masked: two runs build different
+    /// sessions.
+    fn masked_lines(log: &Logged) -> Vec<String> {
+        log.text()
+            .lines()
+            .map(|line| {
+                let mut out = String::with_capacity(line.len());
+                let mut run = String::new();
+                for c in line.chars().chain(std::iter::once('\n')) {
+                    if c.is_ascii_hexdigit() {
+                        run.push(c);
+                        continue;
+                    }
+                    out.push_str(if run.len() == 24 { "<id>" } else { &run });
+                    run.clear();
+                    if c != '\n' {
+                        out.push(c);
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
+    /// What the next connection sees of the last one: its hello's claim, and
+    /// what the server hears right after the hello.
+    async fn next_hello<P: TablePeer>(table: &mut SessionTable<P>) -> (usize, usize) {
+        let on = table.keeps_sessions();
+        let (tx, mut heard) = mpsc::channel(64);
+        let claim = table.begin_connection(on).await.len();
+        table.connected(&tx);
+        (claim, drain(&mut heard).len())
+    }
+
+    /// What can be seen of a connection's end on the device.
+    #[derive(Debug, PartialEq)]
+    struct EndSurface {
+        /// Per peer: its closes, whether it stopped serving, what it said.
+        peers: Vec<(usize, bool, Vec<serde_json::Value>)>,
+        /// The end hook: the banner, the lock, the recording.
+        ends: Vec<RealEnd>,
+        /// What the end logged, ids masked.
+        lines: Vec<String>,
+        /// What still counts against the capacity, and what is kept.
+        held: usize,
+        kept: usize,
+        /// Sent on the connection that ended.
+        on_the_old: usize,
+        /// The next hello's claim, and what the server hears after it.
+        claim: usize,
+        heard: usize,
+    }
+
+    async fn end_surface(mut r: Rig, exit: ConnExit) -> EndSurface {
+        let log = Logged::start(tracing::Level::INFO);
+        r.table.end_connection(exit).await;
+        let lines = masked_lines(&log);
+        drop(log);
+        let peers = r
+            .sessions
+            .iter()
+            .map(|s| (s.peer.closes(), s.peer.stopped(), s.peer.said()))
+            .collect();
+        let ends = r.ends.all().into_iter().map(|(_, e)| e).collect();
+        let (held, kept) = (r.table.len(), r.table.kept_ids().len());
+        let on_the_old = drain(&mut r.conn).len();
+        let (claim, heard) = next_hello(&mut r.table).await;
+        EndSurface {
+            peers,
+            ends,
+            lines,
+            held,
+            kept,
+            on_the_old,
+            claim,
+            heard,
+        }
+    }
+
+    /// The daemon's own table at each of the seventeen arms: the switch on
+    /// with no window ends a connection exactly as the switch off does, the
+    /// same closes, hook calls, lines (`torn down peers`, and no detach line),
+    /// nothing kept and nothing queued for the server.
+    #[tokio::test]
+    async fn p4_0_with_no_window_every_arm_ends_as_with_the_switch_off() {
+        for exit in ConnExit::ALL {
+            let off = end_surface(rig(false, None, 2).await, exit).await;
+            assert_eq!(
+                off.peers,
+                vec![(1, false, vec![]), (1, false, vec![])],
+                "{exit:?}: off closes every peer"
+            );
+            assert_eq!(
+                off.lines
+                    .iter()
+                    .filter(|l| l.contains("torn down peers"))
+                    .count(),
+                1,
+                "{exit:?}: {:?}",
+                off.lines
+            );
+            for w in NO_WINDOW {
+                let on = end_surface(no_window_rig(true, w, 2).await, exit).await;
+                assert_eq!(
+                    on, off,
+                    "{exit:?}, {w:?}: the switch on with no window is the switch off"
+                );
+            }
+        }
+    }
+
+    /// What can be seen of the server's end of a session (C1) on the device.
+    #[derive(Debug, PartialEq)]
+    struct TerminateSurface {
+        /// Closed before the call returned.
+        closed_at_once: usize,
+        stopped: bool,
+        /// Once the grace and more passed.
+        closes: usize,
+        said: Vec<serde_json::Value>,
+        lines: Vec<String>,
+    }
+
+    /// The `Terminate` arm on the rig's first session: taken out, then C1.
+    async fn terminate_surface(mut r: Rig) -> TerminateSurface {
+        let id = r.sessions[0].id;
+        let peer = r.sessions[0].peer.clone();
+        let log = Logged::start(tracing::Level::INFO);
+        let taken = r.table.take(&id, "terminate").expect("the table holds it");
+        r.table
+            .close_terminated(
+                taken,
+                id,
+                &EndReason::AdminTerminated,
+                Some("max_duration"),
+                Duration::from_secs(1),
+            )
+            .await;
+        let closed_at_once = peer.closes();
+        let stopped = peer.stopped();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        TerminateSurface {
+            closed_at_once,
+            stopped,
+            closes: peer.closes(),
+            said: peer.said(),
+            lines: masked_lines(&log),
+        }
+    }
+
+    /// C1 — the server's end of an attached session (a kick, the maximum
+    /// length) on a connection with no window closes the peer at once and
+    /// says nothing on its channel, as with the switch off. With a window,
+    /// one announced after the session went live too, it is said peer to peer
+    /// first and the peer closes after the grace.
+    #[tokio::test(start_paused = true)]
+    async fn p4_0_with_no_window_the_servers_end_closes_at_once_as_off() {
+        let off = terminate_surface(rig(false, None, 1).await).await;
+        assert_eq!(
+            (off.closed_at_once, off.stopped, off.closes),
+            (1, false, 1),
+            "{off:?}"
+        );
+        assert!(off.said.is_empty(), "{off:?}");
+        for w in NO_WINDOW {
+            let on = terminate_surface(no_window_rig(true, w, 1).await).await;
+            assert_eq!(
+                on, off,
+                "{w:?}: the switch on with no window is the switch off"
+            );
+        }
+        let mut r = rig(true, None, 1).await;
+        r.table.set_window(60);
+        let late = terminate_surface(r).await;
+        assert_eq!(
+            (late.closed_at_once, late.stopped, late.closes),
+            (0, true, 1),
+            "a window announced after the session went live: {late:?}"
+        );
+        assert_eq!(
+            late.said,
+            vec![serde_json::json!(
+                {"t": "rc:ended", "reason": "admin_terminated", "limit": "max_duration"}
+            )]
+        );
+    }
+
+    /// C1 for a session kept under a window whose next connection is
+    /// announced none (the scope withdrew the device during the gap): the
+    /// server refuses the claim and the peer closes at once, as off closes.
+    /// Announced before the answer, as the server announces it to a device it
+    /// covers, the end is said first.
+    #[tokio::test(start_paused = true)]
+    async fn p4_0_a_kept_sessions_end_on_a_connection_with_no_window_closes_at_once() {
+        for announced in [false, true] {
+            let mut r = rig(true, Some(60), 1).await;
+            r.table.end_connection(ConnExit::ReadError).await;
+            let (claim, _tx, _rx) = reconnect(&mut r.table).await;
+            assert_eq!(claim.len(), 1, "announced={announced}: claimed");
+            if announced {
+                r.table.set_window(60);
+            }
+            let s = terminate_surface(r).await;
+            assert_eq!(s.closes, 1, "announced={announced}: {s:?}");
+            if announced {
+                assert_eq!((s.closed_at_once, s.stopped), (0, true), "{s:?}");
+                assert_eq!(s.said.len(), 1, "{s:?}");
+            } else {
+                assert_eq!((s.closed_at_once, s.stopped), (1, false), "{s:?}");
+                assert!(s.said.is_empty(), "{s:?}");
+            }
+        }
+    }
+
+    /// A daemon loop that holds the delegation host with a worker attached,
+    /// and `n` delegated sessions whose params crossed `keepable` (the most a
+    /// P2b worker is ever offered) and whose offers crossed, on a connection
+    /// whose switch is `on`, the window standing as `w` at the offer.
+    async fn host_rig(on: bool, w: NoWindow, n: usize) -> RecordRig {
+        let host = DelegateHost::new();
+        let mut frames = host.attach_for_test();
+        let mut table: SessionTable<Fake> = SessionTable::new(8, Ends::default().hook());
+        table.set_host(host.clone());
+        let (tx, conn) = mpsc::channel(64);
+        assert!(table.begin_connection(on).await.is_empty());
+        table.connected(&tx);
+        host.set_outbound(None, tx.clone());
+        if w == NoWindow::Withdrawn {
+            table.set_window(60);
+        }
+        if w != NoWindow::Unannounced {
+            table.set_window(0);
+        }
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let id = ObjectId::new();
+            assert!(host.send_params(
+                None,
+                DelegateFrame::SessionParams(Box::new(keepable_params(id)))
+            ));
+            table.cross_offer(id, table.live_generation());
+            ids.push(id);
+        }
+        ids.sort();
+        while frames.try_recv().is_ok() {}
+        RecordRig {
+            table,
+            host,
+            frames,
+            conn,
+            ids,
+        }
+    }
+
+    /// The kind of each frame the worker was told, in order.
+    fn told(frames: &[DelegateFrame]) -> Vec<&'static str> {
+        frames
+            .iter()
+            .map(|f| match f {
+                DelegateFrame::Detached { .. } => "detached",
+                DelegateFrame::Resumed { .. } => "resumed",
+                DelegateFrame::Close { .. } => "close",
+                DelegateFrame::Ended { .. } => "ended",
+                _ => "other",
+            })
+            .collect()
+    }
+
+    /// What can be seen of the delegation host on the daemon.
+    #[derive(Debug, PartialEq)]
+    struct HostSurface {
+        records: usize,
+        /// What counts against the device's capacity.
+        len: usize,
+        /// What the worker is told of a server's end of one session and of
+        /// the connection's end.
+        told: Vec<&'static str>,
+        lines: Vec<String>,
+        kept: usize,
+        claim: usize,
+        heard: usize,
+    }
+
+    async fn host_surface(mut r: RecordRig, exit: ConnExit) -> HostSurface {
+        let records = r.ids.iter().filter(|s| r.table.holds_record(s)).count();
+        let len = r.table.len();
+        let log = Logged::start(tracing::Level::INFO);
+        // As the `Terminate` arm calls it for every server end.
+        r.table
+            .drop_record(&r.ids[0], &EndReason::AdminTerminated, None);
+        r.table.end_connection(exit).await;
+        let lines = masked_lines(&log);
+        drop(log);
+        let told = told(&sent(&mut r.frames));
+        let kept = r.table.kept_ids().len();
+        let (claim, heard) = next_hello(&mut r.table).await;
+        HostSurface {
+            records,
+            len,
+            told,
+            lines,
+            kept,
+            claim,
+            heard: heard + drain(&mut r.conn).len(),
+        }
+    }
+
+    /// The delegation host (a supervised Mac), at each of the seventeen arms:
+    /// with no window at the offer the daemon makes no record, so a server's
+    /// end orders the worker nothing and the connection's end sends it no
+    /// `Close`, as with the switch off.
+    #[tokio::test]
+    async fn p4_0_with_no_window_the_delegation_host_is_the_switch_off() {
+        for exit in ConnExit::ALL {
+            let off = host_surface(host_rig(false, NoWindow::Unannounced, 2).await, exit).await;
+            assert_eq!((off.records, off.len), (0, 0), "{exit:?}: {off:?}");
+            assert!(off.told.is_empty(), "{exit:?}: {off:?}");
+            for w in NO_WINDOW {
+                let on = host_surface(host_rig(true, w, 2).await, exit).await;
+                assert_eq!(
+                    on, off,
+                    "{exit:?}, {w:?}: the switch on with no window is the switch off"
+                );
+            }
+        }
+    }
+
+    /// A record made under a window that the scope's reconcile withdrew before
+    /// the connection ended: nothing is kept, and the worker is told to close
+    /// it, the way the daemon's own table closes what it built (M3).
+    #[tokio::test]
+    async fn p4_0_a_record_made_under_a_window_withdrawn_since_closes_at_the_exit() {
+        for exit in ConnExit::ALL {
+            let mut r = record_rig(8, Some(60), 1).await;
+            assert!(r.table.holds_record(&r.ids[0]), "{exit:?}: made");
+            assert_eq!(r.table.set_window(0), None);
+            r.table.end_connection(exit).await;
+            assert!(r.table.kept_ids().is_empty(), "{exit:?}");
+            let frames = sent(&mut r.frames);
+            assert_eq!(told(&frames), vec!["close"], "{exit:?}");
+            assert_eq!(closes_of(&frames), hexes(&r.ids), "{exit:?}");
+            assert!(!r.table.holds_record(&r.ids[0]), "{exit:?}");
+        }
+    }
+
+    /// FR-138 P4-0 — the signalling loop asks the window, not the switch: a
+    /// delegated session is offered `keepable` only under a window (A2), and
+    /// A1's routing serves a held session itself only while the table keeps.
+    #[test]
+    fn p4_0_the_signalling_loop_gates_on_the_window() {
+        let code = signaling_code();
+        for (needle, what) in [
+            (
+                "keepable:crate::delegate::session_keepable(peers.window_open(),",
+                "A2: offered keepable only under a window",
+            ),
+            (
+                "!crate::delegate::served_by_daemon(peers.keeping(),",
+                "A1: the daemon serves what it holds while it keeps",
+            ),
+        ] {
+            assert!(code.contains(needle), "{what}: `{needle}`");
+        }
+        for stale in [
+            "session_keepable(peers.keeps_sessions()",
+            "served_by_daemon(peers.keeps_sessions()",
+        ] {
+            assert!(
+                !code.contains(stale),
+                "the switch alone gates nothing new: `{stale}`"
+            );
+        }
     }
 }

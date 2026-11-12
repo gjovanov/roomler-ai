@@ -1483,6 +1483,24 @@ mod tests {
         }
     }
 
+    /// FR-138 P4-0 — one device, one switch: the root's
+    /// `rc_sessions_survive_reattach`, set in its environment or its config,
+    /// binds the supervised worker, whose own table would otherwise follow the
+    /// person's config. Its off reaches the worker as off.
+    #[test]
+    fn the_roots_resume_switch_binds_the_worker() {
+        assert!(WORKER_ENV_FORWARD.contains(&"RC_SESSIONS_SURVIVE_REATTACH"));
+        for value in ["0", "off", "1"] {
+            assert_eq!(
+                worker_env_args(
+                    |s| (s == "RC_SESSIONS_SURVIVE_REATTACH").then(|| value.to_string())
+                ),
+                vec![format!("ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH={value}")],
+                "{value}"
+            );
+        }
+    }
+
     fn base() -> Inputs {
         Inputs {
             enabled: true,
