@@ -584,12 +584,12 @@ impl FsAs {
         false
     }
 
-    /// #3688 — before a folder download lists its next folder: whether the
-    /// person at seat0 it began for is still there, by seat0's active uid
-    /// ([`seat0_active_uid`]). They signed out, the login screen or another
-    /// person took seat0, or the seat does not read: the walk ends, saying
-    /// so ([`NOT_THE_PERSON`], a Windows walk's words), never with a zip that
-    /// looks complete. Every other reader goes on.
+    /// #3688 — before a folder download lists its next folder, or opens its
+    /// next file: whether the person at seat0 it began for is still there, by
+    /// seat0's active uid ([`seat0_active_uid`]). They signed out, the login
+    /// screen or another person took seat0, or the seat does not read: the
+    /// walk ends, saying so ([`NOT_THE_PERSON`], a Windows walk's words), never
+    /// with a zip that looks complete. Every other reader goes on.
     async fn still_at_the_screen(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         if let Self::Person { account, .. } = self {
@@ -734,9 +734,9 @@ enum Seat {
     Root,
     /// Nobody, and why: an empty seat, the login screen, a lock that
     /// switches seat0 to a greeter, a session that is not a person's, a name
-    /// that resolves to another uid than logind's.
+    /// that resolves to another uid than logind's, a host with no logind.
     Nobody(String),
-    /// Not known, and why: logind could not be asked, the account database
+    /// Not known, and why: logind did not answer, the account database
     /// did not answer, or the lookup failed or ran out of its time.
     CannotTell(String),
 }
@@ -752,13 +752,13 @@ fn seat_now() -> Seat {
 }
 
 /// The pure half of [`seat_now`]: what logind `found` at seat0, and the
-/// account and home its name `resolve`s to. Nobody only when seat0 itself
-/// says so (`companion::is_nobody_at_the_screen`: an empty seat, the login
-/// screen, a session that is not a person's), or when the name resolves to
-/// another uid than the one logind recorded for the session (a lookup order
-/// that puts another source first, an account deleted and made again): its
-/// rights are not the person's. A lookup that failed, logind's or the
-/// account database's, cannot tell.
+/// account and home its name `resolve`s to. Nobody only when seat0 says so
+/// (`companion::is_nobody_at_the_screen`: an empty seat, the login screen, a
+/// session that is not a person's, a host with no logind and so no seat), or
+/// when the name resolves to another uid than logind recorded for the session
+/// (a lookup order that puts another source first, an account deleted and
+/// made again): its rights are not the person's. Any other failed lookup,
+/// logind's or the account database's, cannot tell.
 #[cfg(target_os = "linux")]
 fn seat_of(
     found: Result<(String, Option<u32>)>,
@@ -840,12 +840,12 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             tracing::debug!(%why, "files: who is at seat0 is not known — a read is refused");
             FsAs::CannotTell
         }
-        Seat::Nobody(why) | Seat::CannotTell(why) => {
-            tracing::debug!(
-                %why,
-                "files: nobody at seat0 — received files are written as the daemon, \
-                 in the default folder"
-            );
+        Seat::Nobody(why) => {
+            tracing::debug!(%why, "files: nobody at seat0 — a write is the daemon's");
+            FsAs::DaemonAlone
+        }
+        Seat::CannotTell(why) => {
+            tracing::debug!(%why, "files: who is at seat0 is not known — a write is the daemon's");
             FsAs::DaemonAlone
         }
     }
@@ -3299,20 +3299,20 @@ async fn list_staging(_who: &FsAs) -> Result<DirListing> {
 }
 
 /// The entries of a folder [`list_canonical`] opened: at most 10 000, the
-/// listing ending at its first error.
+/// listing ending at its first error. #3688 — a listing through a folder's
+/// handle (`/proc/self/fd/N`, [`folder_listing`]) names its entries after that
+/// handle, so read only `file_name()` and `metadata()` here, never `path()`.
 fn collect_dir_entries(read: std::fs::ReadDir) -> Vec<DirEntryView> {
     let mut entries: Vec<DirEntryView> = Vec::new();
     for entry in read.take(10_000) {
         let Ok(entry) = entry else {
             break;
         };
-        let name = match entry.file_name().to_str() {
-            Some(s) => s.to_string(),
-            None => continue, // skip non-UTF-8 names
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue; // skip non-UTF-8 names
         };
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue, // permission denied / vanished — skip
+        let Ok(meta) = entry.metadata() else {
+            continue; // permission denied / vanished — skip
         };
         let is_dir = meta.is_dir();
         let size = if is_dir { None } else { Some(meta.len()) };
@@ -3552,8 +3552,8 @@ where
             Ok(entries) => entries,
             Err(e) => {
                 tracing::debug!(
-                    dir = %dir.display(),
-                    error = %format!("{e:#}"),
+                    dir = ?dir,
+                    error = ?format!("{e:#}"),
                     "zip walk: skipping unreadable dir"
                 );
                 continue;
@@ -3587,7 +3587,7 @@ where
             if is_agent_secret(&path) {
                 // A folder download of e.g. the machine-global root carries
                 // its logs and crash dumps — never the agent's credentials.
-                tracing::debug!(file = %path.display(), "zip walk: skipping the agent's own secret");
+                tracing::debug!(file = ?path, "zip walk: skipping the agent's own secret");
                 continue;
             }
 
@@ -3606,11 +3606,11 @@ where
                 continue;
             }
 
-            // Open the file in a step of its own as `who`, and stream it
-            // into a zip entry through that handle. A file that will not
-            // open is logged at debug and skipped — one unreadable file
-            // should not abort the whole archive — but an identity that
-            // fails ends the walk.
+            // #3688 — a person who has left seat0 ends the walk before its next
+            // file too. Each file opens in a step of its own as `who`, and
+            // streams into a zip entry through that handle. One that will not
+            // open is skipped, logged at debug; an identity that fails ends the walk.
+            who.still_at_the_screen().await?;
             let opened = {
                 let path = path.clone();
                 who.run(move || Ok(open_zip_entry(&path, checks))).await?
@@ -3618,7 +3618,7 @@ where
             let mut src = match opened {
                 Ok(f) => tokio::fs::File::from_std(f),
                 Err(e) => {
-                    tracing::debug!(file = %path.display(), %e, "zip walk: skipping unreadable file");
+                    tracing::debug!(file = ?path, e = ?e.to_string(), "zip walk: skipping unreadable file");
                     continue;
                 }
             };
@@ -7243,10 +7243,11 @@ mod seat_user_tests {
         /// #3688 — a folder download ends with `files:error`, never
         /// `files:eof`, once the person it began for has left seat0 (signed
         /// out, or the login screen or another person took it): before it
-        /// lists each folder it asks who is there. Here they are there for
-        /// the first folder and gone by the second, so the first folder's
-        /// file is in, the second's is not, and the viewer is told why, in
-        /// the words a Windows walk uses.
+        /// lists each folder, and before it opens each file, it asks who is
+        /// there. Here they are there for the first folder (its listing and
+        /// its file) and gone by the second, so the first folder's file is
+        /// in, the second's is not, and the viewer is told why, in the words
+        /// a Windows walk uses.
         #[tokio::test]
         async fn a_person_who_leaves_the_screen_mid_folder_ends_it_with_an_error_not_eof() {
             use crate::peer::folder_download_as_the_person_tests::download;
@@ -7261,7 +7262,7 @@ mod seat_user_tests {
             std::fs::write(later.join("second.txt"), b"the second folder's file").unwrap();
             let got = {
                 let seat = at_the_screen(&person, home.path());
-                let _as = stand_in::seat_leaving_after(seat, 1).await;
+                let _as = stand_in::seat_leaving_after(seat, 2).await;
                 download(&root_dir).await
             };
             let said = got.said();
@@ -7665,15 +7666,15 @@ mod seat_user_tests {
             |_: &str| -> std::result::Result<(crate::fs_identity::Account, PathBuf), String> {
                 panic!("no account is resolved for nobody")
             };
-        let no_logind = seat_of(
+        let unanswered = seat_of(
             Err(anyhow!(
                 "loginctl show-seat seat0 failed: Failed to connect to bus"
             )),
             not_asked,
         );
         assert!(
-            matches!(no_logind, Seat::CannotTell(_)),
-            "logind could not be asked: {no_logind:?}"
+            matches!(unanswered, Seat::CannotTell(_)),
+            "logind did not answer: {unanswered:?}"
         );
         let empty = seat_of(
             Err(crate::companion::nobody_at_the_screen(

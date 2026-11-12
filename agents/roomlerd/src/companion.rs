@@ -1268,17 +1268,35 @@ fn loginctl_show(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// The pure half of [`loginctl_show`] when `loginctl` did not start.
+/// The pure half of [`loginctl_show`] when `loginctl` did not start. #3688 —
+/// not installed at all, it is a host with no logind, so no seat: nobody is at
+/// its screen ([`NobodyAtTheScreen`]). Any other failure to start it cannot
+/// tell who is there.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 pub(crate) fn loginctl_did_not_start(e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return nobody_at_the_screen(format!(
+            "nobody is signed in at this machine's screen (it has no seat: loginctl is not \
+             installed, {e})"
+        ));
+    }
     anyhow::Error::new(e).context("spawning loginctl (is systemd-logind running?)")
 }
 
 /// The pure half of [`loginctl_show`] when `loginctl <args>` failed, from
-/// what it wrote to stderr.
+/// what it wrote to stderr. #3688 — a host systemd did not boot (a container,
+/// WSL without systemd) has no logind, so no seat: nobody is at its screen
+/// ([`NobodyAtTheScreen`]). Any other failure (the bus or logind not
+/// answering, a timeout) cannot tell who is there.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 pub(crate) fn loginctl_failed(args: &[&str], stderr: &str) -> anyhow::Error {
-    anyhow::anyhow!("loginctl {} failed: {}", args.join(" "), stderr.trim())
+    let failed = format!("loginctl {} failed: {}", args.join(" "), stderr.trim());
+    if stderr.contains("System has not been booted with systemd") {
+        return nobody_at_the_screen(format!(
+            "nobody is signed in at this machine's screen (it has no seat: {failed})"
+        ));
+    }
+    anyhow::anyhow!(failed)
 }
 
 /// The pure half of [`seat0_uid`]: seat0's active session out of `show-seat
@@ -1312,10 +1330,11 @@ fn session_person_uid(id: &str, session: &str) -> Result<u32> {
 }
 
 /// #3688 — seat0's own answer that nobody is at this machine's screen: an
-/// empty seat, the login screen, a session that is not a person's. A lookup
-/// that failed (logind could not be asked, a session that names no account)
-/// is not one: who is there is then not known, and a viewer's read says so,
-/// rather than that nobody is.
+/// empty seat, the login screen, a session that is not a person's; or a host
+/// with no logind at all, so no seat ([`loginctl_did_not_start`],
+/// [`loginctl_failed`]). Any other lookup that failed (logind did not answer,
+/// a session that names no account) is not one: who is there is then not
+/// known, and a viewer's read says so, rather than that nobody is.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 #[derive(Debug)]
 struct NobodyAtTheScreen(String);
