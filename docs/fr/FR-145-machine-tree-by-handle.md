@@ -1,6 +1,6 @@
 # FR-145: The Windows machine folder by handle — SYSTEM never writes, creates, renames or removes through a link, seals what it makes, and finds a person's profile by their SID
 
-**Issue:** [#3752](https://github.com/gjovanov/roomler-ai/issues/3752) · **Status:** claimed 2026-11-12. Spec only, nothing built; P1 first. D1–D10 take their defaults (2026-11-12), and the operator may overturn any of them
+**Issue:** [#3752](https://github.com/gjovanov/roomler-ai/issues/3752) · **Status:** P1 in progress, [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) (2026-11-12). D1–D10 take their defaults (2026-11-12), and the operator may overturn any of them
 **Builds on:** #3743 (`machine_tree`'s handle code: a folder held by its own handle, a file opened below it, a delete by handle), FR-94 ([#2035](https://github.com/gjovanov/roomler-ai/issues/2035): `machine_tree`'s repair, check and kill switches), #3702 (`appdirs::machine_program_data` and `appdirs::profile_of_account`: the machine's folders and a profile as the system records them)
 **Related:** #3737
 
@@ -335,7 +335,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:1922`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | not started |
+| P1 | the seam commit with T11–T15 failing; `machine_tree::held` with T1–T10; the crash records (create, write, rename, quarantine, reads, the uploader's deletes); the clean-up's per-Machine arm, per-user arm and vacated-folder sweep on `HeldPath`; the per-user arm's profile by SID; #3743's readers (D6); the CI filter (`ci.yml:1922`) | `ROOMLERD_MACHINE_TREE_HELD=0`: the crash recorder writes as today, with a WARN. None for the clean-up | in progress: [#3758](https://github.com/gjovanov/roomler-ai/pull/3758) |
 | P2 | service logs: `HeldRollingWriter` and every other `service-logs` writer (the prune, the panic and stderr files, the caps cache, the install outcome, the wedged MSI log, the update marker) | the same switch: `RollingFileAppender` and today's writers | not started |
 | P3 | the rest: the attempt record, the machine attention file, the launch marker, the presence lock, the machine config's saves, the repair's and the adoption's opens; the segment move (D7); the gate (D8) | the same switch | not started |
 | Docs | the docs below, each in the PR of the phase it describes, the rest by P3 | none | not started |
