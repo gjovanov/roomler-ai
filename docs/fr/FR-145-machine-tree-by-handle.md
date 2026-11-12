@@ -318,7 +318,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 | L1 a crash record lands | per-Machine, SystemContext, enrolled | as an administrator, end the worker (`taskkill /F`), which the supervisor records | a new `<ts>-<pid>.json` in `%ProgramData%\roomler\roomler\crashes`; `icacls` shows that folder sealed (`Seal::Readable`, D10); the crash is on the device's server-side crash list after the worker's next start |
 | L2 an upgrade keeps the folders | per-Machine, on the previous release, with `crashes` and `service-logs` there | upgrade to the candidate | the same folders, no `.moved-*`, now sealed; the old log files still there; the tray of an account that is not an administrator lists and opens them ("Open Logs Folder") |
 | L3 the logs write and age | L2's host | leave it across a UTC midnight (or move the guest's clock); as an administrator, add a `roomlerd-service.log.<date>` 15 days old | a new daily file per role (`roomlerd-service.log`, `roomlerd.log`, `roomlerd-netd.log`); the 15-day-old file pruned at the next start (`KEEP_DAYS` is 14, `logging.rs:77`); the tray's diagnostics bundle holds the service logs |
-| L4 a machine folder a per-User install made first | a per-User install first (its daemon makes the machine folder for file-transfer staging), then the per-Machine one | a file transfer as the person; restart the service | service logs and a crash record (L1's step) land; the person's file transfer still completes |
+| L4 a machine folder a per-User install made first | a per-User install first (its daemon makes the machine folder), then the per-Machine one | a file transfer as the person; restart the service | service logs and a crash record (L1's step) land; the person's file transfer still completes |
 | L5 the per-Machine arm cleans | a per-Machine host | as an elevated operator, `roomlerd cleanup-legacy-install --target-flavour perUser` from the per-Machine exe | both segments' `service-logs` removed, with the report's lines as before |
 | L6 the per-user arm cleans the recorded profile | a per-User install by an account whose profile folder is not `C:\Users\<name>` (a renamed account, or `<name>.000`) | elevated, `roomlerd cleanup-legacy-install --target-flavour perMachine` by hand | the four trees under the profile `ProfileList` records are removed, and nothing else under `C:\Users` changes; with nobody signed in, the report says no profile was looked up |
 | L7 the kill switch | L1's host, `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment | L1's step, and a restart | the record and the logs land as on the previous release, and one WARN names the switch |
@@ -403,9 +403,9 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
   reader reads (`app.rs:7461`) for no gain.
-- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1315-1317`), which SYSTEM and the person's own
-  daemon both write. Options: seal it, which fails the person's uploads; per-account roots, SYSTEM's own sealed
-  through `HeldPath`; leave it. **Default: per-account roots, in a design pass of its own**, outside this FR.
+- **D5. File-transfer staging** (`agents/roomlerd/src/files.rs:1315-1317`). Options: in this FR; a design pass of
+  its own. **Default: a design pass of its own**, outside this FR: staging has a pipeline of its own, and its
+  layout is that pass's to decide.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1342-1353`; the earlier anchor
   files' deletes, `exec_service.rs:1277-1292`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
