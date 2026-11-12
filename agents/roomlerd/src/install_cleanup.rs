@@ -423,13 +423,14 @@ fn per_user_trees(profile_root: &Path) -> [std::path::PathBuf; 4] {
     ]
 }
 
-/// #3702 — the plan for a person's data trees ([`per_user_trees`]) below the
-/// profile `profile_root` names, for a step running as the account whose SID
-/// is `own_sid`. When the step cannot tell which account that is (`None`), or
-/// it is the service account (the only profile that account names is its
-/// own), it removes none and asks `profile_root` nothing. A tree that is a link, holds one, or is reached
-/// through one below the profile (`appdirs::link_below`, [`link_inside`]) is
-/// left in place with a line that names it; the others are still planned.
+/// #3702 — the plan for the data trees ([`per_user_trees`]) below
+/// `profile_root`, the profile of the person signed in to this process's
+/// session. When the step cannot read the SID of the account it runs as
+/// (`None`), or that account is the service account, it removes none and
+/// asks `profile_root` nothing. A tree that is a link, holds one, or is
+/// reached through one below the profile (`appdirs::link_below`,
+/// [`link_inside`]) is left in place with a line that names it; the others
+/// are still planned.
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 fn plan_per_user_removal(
     own_sid: Option<&str>,

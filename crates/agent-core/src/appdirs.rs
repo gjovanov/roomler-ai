@@ -1024,12 +1024,11 @@ pub fn system_config_notes() -> &'static [String] {
         .unwrap_or(&[])
 }
 
-/// Per-child fallback for a root-locked legacy dir. `config.toml` moves
-/// LAST, and any mid-way failure rolls the already-moved entries back and
-/// removes the NEW folder this move made (`Err`) — so the tree is always
-/// either wholly OLD or wholly NEW (an empty or half-empty
-/// NEW tree would win the NEW-first resolution and strand the enrolled
-/// config in the abandoned OLD one).
+/// Per-child move of a data pair whose folder rename the system refused
+/// (never the first pair, which holds `config.toml`). A failure midway
+/// renames the moved entries back and removes the NEW folder this move
+/// made; either can fail in turn, and the note's `rolled back` says only
+/// whether every rename back succeeded.
 fn migrate_children(old: &Path, new: &Path, root_err: &std::io::Error) -> Result<String, String> {
     let Ok(entries) = std::fs::read_dir(old) else {
         return Err(format!(
