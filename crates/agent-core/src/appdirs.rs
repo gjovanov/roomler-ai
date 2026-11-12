@@ -48,19 +48,40 @@ const NEW_APP: &str = "roomler";
 // re-enrolls as a stranger. See docs/fr/FR-21.
 pub(crate) const OLD_APP: &str = "roomler-agent";
 
-/// True if a NEW-segment `ProjectDirs` tree is present on disk.
-fn tree_exists(app: &str) -> bool {
-    ProjectDirs::from(QUALIFIER, ORG, app)
-        .is_some_and(|d| d.config_dir().exists() || d.data_local_dir().exists())
+/// The tree an account's processes use, chosen from that account's folders:
+/// `config_dir` and `data_local_dir` name a tree's config folder and local
+/// data folder by its app segment (`None` where the platform names none), and
+/// `exists` is the filesystem. A tree is present when either folder exists:
+/// the NEW one when it is present, else the OLD one when it is present, else
+/// the NEW one (a fresh install). Pure, so the rule tests on every platform.
+fn segment_of(
+    config_dir: impl Fn(&str) -> Option<PathBuf>,
+    data_local_dir: impl Fn(&str) -> Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> &'static str {
+    let found = |dir: Option<PathBuf>| dir.is_some_and(|dir| exists(&dir));
+    let present = |app: &str| found(config_dir(app)) || found(data_local_dir(app));
+    if !present(NEW_APP) && present(OLD_APP) {
+        OLD_APP
+    } else {
+        NEW_APP
+    }
 }
 
-/// Whether to use the OLD segment for the per-user tree. Cached: the filesystem
-/// answer is stable within a process, and caching guarantees every consumer in
-/// one run agrees (no split trees). NEW-if-present wins; else OLD-if-present;
-/// else NEW (fresh install).
+/// Whether to use the OLD segment for the per-user tree: [`segment_of`] over
+/// this account's own `ProjectDirs`. Cached: the filesystem answer is stable
+/// within a process, and caching guarantees every consumer in one run agrees
+/// (no split trees).
 fn use_old_segment() -> bool {
     static DECISION: OnceLock<bool> = OnceLock::new();
-    *DECISION.get_or_init(|| !tree_exists(NEW_APP) && tree_exists(OLD_APP))
+    *DECISION.get_or_init(|| {
+        let dirs = |app: &str| ProjectDirs::from(QUALIFIER, ORG, app);
+        segment_of(
+            |app| dirs(app).map(|d| d.config_dir().to_path_buf()),
+            |app| dirs(app).map(|d| d.data_local_dir().to_path_buf()),
+            Path::exists,
+        ) == OLD_APP
+    })
 }
 
 /// The resolved per-user app segment ("roomler" for fresh/migrated hosts,
@@ -529,12 +550,35 @@ pub(crate) fn resolve_machine_global(base: &Path) -> PathBuf {
 /// Windows only, like the workers that need it.
 #[cfg(target_os = "windows")]
 pub fn data_local_dir_in_profile(profile: &Path) -> PathBuf {
-    profile
-        .join("AppData")
-        .join("Local")
-        .join(ORG)
-        .join(app_segment())
-        .join("data")
+    let app_data = profile.join("AppData");
+    data_local_dir_in(
+        &app_data.join("Roaming"),
+        &app_data.join("Local"),
+        Path::exists,
+    )
+}
+
+/// [`data_local_dir_in_profile`] for the account whose Roaming and Local
+/// AppData folders are `roaming` and `local`, with `exists` as the filesystem.
+#[cfg(any(target_os = "windows", test))]
+fn data_local_dir_in(roaming: &Path, local: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    // RED seam (#3747): master's answer, the calling process's own segment.
+    let _ = (roaming, exists);
+    local.join(ORG).join(app_segment()).join("data")
+}
+
+/// #3747 — the config folder of the account whose Roaming AppData folder is
+/// `roaming` and whose Local AppData folder is `local` (`None` when not
+/// known).
+#[cfg(any(target_os = "windows", test))]
+pub fn config_dir_in_profile(
+    roaming: &Path,
+    local: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    // RED seam (#3747): master's answer, the new tree whatever is there.
+    let _ = (local, exists);
+    roaming.join(ORG).join(NEW_APP).join("config")
 }
 
 /// The SCM-service log directory (`%PROGRAMDATA%\roomler\<segment>\service-logs`).
@@ -766,7 +810,7 @@ fn kept_in_place(root: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<String> {
 /// ([`kept_in_place`]). They then move in the order given, the config pair
 /// first and by one rename, and a pair whose move fails ends the move: the
 /// pairs before it stay moved, the pairs after it stay in the OLD tree.
-/// The segment choice ([`tree_exists`]) keys on the NEW config folder and
+/// The segment choice ([`segment_of`]) keys on the NEW config folder and
 /// the NEW local data folder. The move makes the first only whole, by one
 /// rename, and the second only when the config pair's move did not fail:
 /// the daemon reads the config it had, from the NEW tree or from the OLD
@@ -1106,6 +1150,143 @@ mod tests {
         assert_eq!(macos_config_dir_in_home(home, |_| true), current);
     }
 
+    /// #3747 — a person's Roaming and Local AppData folders.
+    fn persons_app_data() -> (PathBuf, PathBuf) {
+        let app_data = Path::new(r"C:\Users\person").join("AppData");
+        (app_data.join("Roaming"), app_data.join("Local"))
+    }
+
+    /// One of the four folders the tree choice keys on in that person's
+    /// profile, laid out as `ProjectDirs` lays them out on Windows: `OC` and
+    /// `NC` the old and new config folder, `OD` and `ND` the old and new
+    /// local data folder.
+    fn folder(name: &str) -> PathBuf {
+        let (roaming, local) = persons_app_data();
+        let (base, app, leaf) = match name {
+            "OC" => (roaming, OLD_APP, "config"),
+            "NC" => (roaming, NEW_APP, "config"),
+            "OD" => (local, OLD_APP, "data"),
+            "ND" => (local, NEW_APP, "data"),
+            other => panic!("no folder {other}"),
+        };
+        base.join(ORG).join(app).join(leaf)
+    }
+
+    /// `exists` for that profile when it holds exactly the folders `held`
+    /// names (`"OC ND"`).
+    fn holding(held: &str) -> impl Fn(&Path) -> bool {
+        let folders: Vec<PathBuf> = held.split_whitespace().map(folder).collect();
+        move |path| folders.iter().any(|f| f == path)
+    }
+
+    /// The tree the person's own process picks ([`segment_of`] over its
+    /// `ProjectDirs`) when the profile holds `held`.
+    fn own_pick(held: &str) -> &'static str {
+        let (roaming, local) = persons_app_data();
+        segment_of(
+            |app| Some(roaming.join(ORG).join(app).join("config")),
+            |app| Some(local.join(ORG).join(app).join("data")),
+            holding(held),
+        )
+    }
+
+    /// #3747 — the local data folder a process names in another account's
+    /// profile (the SystemContext worker's keep-busy store) is the one that
+    /// account's own processes pick, whatever the naming process picked for
+    /// itself.
+    #[test]
+    fn a_profiles_local_data_folder_is_its_owners_tree() {
+        let (roaming, local) = persons_app_data();
+        for held in ["OC", "OC OD"] {
+            assert_eq!(
+                data_local_dir_in(&roaming, &local, holding(held)),
+                folder("OD"),
+                "only the old tree: {held}"
+            );
+        }
+        for held in ["NC", "NC ND"] {
+            assert_eq!(
+                data_local_dir_in(&roaming, &local, holding(held)),
+                folder("ND"),
+                "the new tree: {held}"
+            );
+        }
+    }
+
+    /// #3747 — the service host reads the console user's config in the tree
+    /// that holds it: the old one when only that exists, the new one when it
+    /// exists. Whether it knows the person's local folder changes nothing.
+    #[test]
+    fn the_service_host_reads_the_console_users_config_in_their_tree() {
+        let (roaming, local) = persons_app_data();
+        for local in [None, Some(local.as_path())] {
+            for held in ["OC", "OC OD"] {
+                assert_eq!(
+                    config_dir_in_profile(&roaming, local, holding(held)),
+                    folder("OC"),
+                    "only the old tree: {held}, local folder {local:?}"
+                );
+            }
+            for held in ["NC", "NC ND"] {
+                assert_eq!(
+                    config_dir_in_profile(&roaming, local, holding(held)),
+                    folder("NC"),
+                    "the new tree: {held}, local folder {local:?}"
+                );
+            }
+        }
+    }
+
+    /// #3747 — an old config folder beside a new local data folder, with no
+    /// new config folder, is the old tree: for the account's own process and
+    /// for a process that names that account's folders. The enrollment is in
+    /// the old config folder.
+    #[test]
+    fn an_old_config_folder_beats_a_new_data_folder() {
+        let (roaming, local) = persons_app_data();
+        for held in ["OC ND", "OC OD ND"] {
+            assert_eq!(own_pick(held), OLD_APP, "its own process: {held}");
+            assert_eq!(
+                config_dir_in_profile(&roaming, Some(&local), holding(held)),
+                folder("OC"),
+                "its config, named by another account: {held}"
+            );
+            assert_eq!(
+                data_local_dir_in(&roaming, &local, holding(held)),
+                folder("OD"),
+                "its local data, named by another account: {held}"
+            );
+        }
+    }
+
+    /// #3747 — every other row of the rule stays as it was.
+    #[test]
+    fn the_rule_keeps_its_unchanged_rows() {
+        for (held, want) in [
+            // Nothing: a fresh install.
+            ("", NEW_APP),
+            // Only the new tree.
+            ("NC", NEW_APP),
+            ("NC ND", NEW_APP),
+            // Both config folders.
+            ("OC NC", NEW_APP),
+            ("OC NC OD", NEW_APP),
+            ("OC NC ND", NEW_APP),
+            ("OC NC OD ND", NEW_APP),
+            // No config folder in either tree: the data folders decide.
+            ("OD", OLD_APP),
+            ("ND", NEW_APP),
+            ("OD ND", NEW_APP),
+            // The other rows that do not change.
+            ("NC OD", NEW_APP),
+            ("NC OD ND", NEW_APP),
+            ("OC", OLD_APP),
+            ("OC OD", OLD_APP),
+        ] {
+            assert_eq!(own_pick(held), want, "{held:?}");
+        }
+    }
+
     /// FR-129 C — what the wizard's Windows path names by full path is there.
     #[cfg(target_os = "windows")]
     #[test]
@@ -1346,8 +1527,9 @@ mod tests {
         (home.join(OLD_APP), home.join(NEW_APP))
     }
 
-    /// Whether the segment choice ([`tree_exists`]) finds the tree whose
-    /// config folder is `config` and whose local data folder is `data`.
+    /// Whether either folder the segment choice ([`segment_of`]) keys on
+    /// exists in the tree whose config folder is `config` and whose local
+    /// data folder is `data`.
     fn tree_present(config: &Path, data: &Path) -> bool {
         config.exists() || data.exists()
     }
@@ -1503,7 +1685,7 @@ mod tests {
         );
     }
 
-    // `tree_exists` / segment resolution touch the real HOME/APPDATA, so we
+    // `use_old_segment` / segment resolution touch the real HOME/APPDATA, so we
     // don't assert on live paths here (that would be environment-dependent).
     // Instead lock the pure new-then-old PRECEDENCE with an injected predicate,
     // mirroring the `node_env` fallback-order test in tunnel-core.
