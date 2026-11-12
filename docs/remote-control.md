@@ -892,7 +892,7 @@ sequenceDiagram
 - **The frame goes through the input arbiter like a key**, so it needs the
   input floor and the session's input permission, as typing does. The injector
   then checks again
-  ([`enigo_backend.rs:282`](../agents/roomlerd/src/input/enigo_backend.rs#L282)):
+  ([`enigo_backend.rs:298`](../agents/roomlerd/src/input/enigo_backend.rs#L298)):
   the policy can change between the hello and the click, and a viewer is not
   trusted to have read the hello.
 - **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
@@ -1652,9 +1652,17 @@ The arbiter opens the OS injector at the first event, then keeps it. If no backe
 | macOS | the Accessibility grant, read live with `AXIsProcessTrusted` | once a second |
 | Elsewhere | nothing to ask: only opening one tells (a Linux daemon before its display or `/dev/uinput` exists) | after 1 s, doubling to once a minute |
 
-A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1119`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:508`).
+A new session's first event looks at once, from the shortest wait again (`Regrant`, `agents/roomlerd/src/input/arbiter.rs:1121`; `os_grants_input`, `agents/roomlerd/src/input/mod.rs:511`).
 
-⚠️ A root daemon with no `DISPLAY` can never open enigo, and each failed open warns. The doubling is what keeps that host to one warning a minute.
+⚠️ A root daemon with no `DISPLAY` can never open enigo, so since #3787 its open is not tried. With no `DISPLAY`, x11rb answers `DisplayNotSet` before any I/O, and enigo printed that and `no successful connection` at ERROR on every try. `agents/roomlerd/src/input/no_display.rs` says why instead, once a session:
+
+| Who is at the screen (the desktop brief) | The line |
+|---|---|
+| nobody signed in at a graphical session: a login screen, a tty, no seat | INFO `input: no X display to open: … nobody is signed in …` |
+| a person signed in on X11 or Wayland, or the brief not read yet | ERROR `input: no X display to open: … though a graphical session is signed in …` |
+| the same kind again within the session (warm, a first event, each regrant, each keep-busy op) | DEBUG |
+
+With `DISPLAY` set the open runs as before, and a failed one still prints enigo's ERROR lines and warns. The doubling still bounds the regrant tries: about nine in a session's first minute, then one a minute while events arrive.
 
 Off macOS only a Noop reports no permission, because enigo, SystemContext and uinput all report it once they open. So this can never drop an injector that works.
 
@@ -1889,7 +1897,7 @@ logged in fast 4 times out of 4.
 `caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
 long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
 foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
-from `agents/roomlerd/src/input/enigo_backend.rs:231`), so the letters after it
+from `agents/roomlerd/src/input/enigo_backend.rs:247`), so the letters after it
 take the new state (read with CapsLock toggled twice inside a run of typing,
 `abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
 0.9 s, because the attach was costing about 2.5 ms a character.
@@ -5503,7 +5511,7 @@ to drop straight to VK_PACKET (which conhost ignores). Now
 
 The same chip and picker on an X11 desktop, through the same two messages. On
 Linux `input::layout` *is* `input::layout_x11`
-(`agents/roomlerd/src/input/mod.rs:97`), so the peer's emitter
+(`agents/roomlerd/src/input/mod.rs:100`), so the peer's emitter
 (`agents/roomlerd/src/peer.rs:1575`) and its `rc:layout.set` arm
 (`agents/roomlerd/src/peer.rs:11537`) serve both platforms.
 
@@ -5573,7 +5581,7 @@ there is no control to grey, so the chip does not appear, as before P3e.
 ### 18.3.3 The keyboard layout on a Mac (FR-97 P2d-2a)
 
 The same chip and picker again. On macOS `input::layout` *is*
-`input::layout_mac` (`agents/roomlerd/src/input/mod.rs:104`), behind the same
+`input::layout_mac` (`agents/roomlerd/src/input/mod.rs:107`), behind the same
 peer emitter and `rc:layout.set` arm, now built for all three platforms.
 
 The constraint that shapes it is the thread. Text Input Sources (Carbon's

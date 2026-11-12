@@ -678,10 +678,16 @@ pub fn open_default() -> Box<dyn InputInjector + Send> {
     #[cfg(feature = "enigo-input")]
     {
         match enigo_backend::EnigoInjector::new() {
-            Ok(e) => return Box::new(e),
-            Err(e) => {
-                tracing::warn!(%e, "enigo init failed — input injection disabled");
+            Ok(e) => {
+                no_display::forget();
+                return Box::new(e);
             }
+            // #3787 — no display to open: one line a session, at its kind's
+            // level, where enigo printed an ERROR pair on every try.
+            Err(e) => match no_display::kind_of(&e) {
+                Some(kind) => no_display::say(kind),
+                None => tracing::warn!(%e, "enigo init failed — input injection disabled"),
+            },
         }
     }
     #[cfg(not(feature = "enigo-input"))]
