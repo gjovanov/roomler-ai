@@ -1249,7 +1249,7 @@ checks its imports with a negative control, and checks that it carries the
 payload's signature (`.github/workflows/release-agent.yml:2202`). `ROOMLER_TEST_CA_FAIL=capture` or
 `=restore` (`main.wxs:561`) fails one of the two on purpose; installer-smoke uses
 it to show an upgrade completing through either failure
-(`.github/workflows/installer-smoke.yml:1027`). Its only effect is that nothing is
+(`.github/workflows/installer-smoke.yml:1040`). Its only effect is that nothing is
 carried.
 
 ```mermaid
