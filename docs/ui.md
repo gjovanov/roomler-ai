@@ -135,10 +135,14 @@ flowchart TB
 - **Clipboard bridge**: text / HTML / image / native formats, chunked over a DC,
   hash + echo-gate dedupe, auto-sync on focus; optional local-agent loopback
   bridge for full-fidelity RTF.
-- **File transfer**: chunked uploads/downloads, folder download (streamed zip),
-  resumable, cancellable; the Remote files drawer browses the host — its roots
-  view is the empty path (the drives on Windows, a single `/` on Unix), and `/`
-  itself is a directory (`isRootsRequest`, #2870).
+- **File transfer**: chunked uploads/downloads, a folder upload by a drop (each
+  file's path names the folder once, #3725), folder download (streamed zip),
+  resumable uploads, cancellable either way; the Remote files drawer browses the
+  host — its roots view is the empty path (the drives on Windows, a single `/` on
+  Unix), and `/` itself is a directory (`isRootsRequest`, #2870). A Transfers
+  row moves only through `moveTransfer`: a finished or cancelled row is final,
+  and its bar never moves back (#3726,
+  [remote-control.md §18.2](remote-control.md#182-data-channel-handlers-0131--0133)).
 - **Recording** (FR-85): Record, the REC chip and the device's recordings,
   over a `record` channel opened only when the grant kept `RECORD`; a stripped
   grant shows a disabled control that says why
@@ -162,7 +166,7 @@ step-down, is in [`remote-control.md` §5.4](remote-control.md#54-above-60-fps-t
   60 Hz").
 - **The pick** is stored per browser (`roomler-rc-fps`,
   `composables/frameRate.ts:30`) and sent again each time the control channel
-  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8106`), so
+  opens (`sendFrameRatePreference`, `composables/useRemoteControl.ts:8105`), so
   a reload asks again without a click.
 - **The hint under it is the agent's answer**, from `rc:video-info`
   (`frameRateSummary`, `composables/frameRate.ts:149`): "120 fps"; "120 fps, on
@@ -315,7 +319,7 @@ inside a fullscreen viewer too).
 | the person's hands | a plain reload waits until no key, click or wheel for 5 s | `BUSY_MS`, `staleBuildWatch.ts:72` |
 
 **The resume.** A remote session that a cut put on its redial (`scheduleReconnect`) is handed
-over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9900`), the args its
+over: its pending retry is stopped (`holdRedial`, `useRemoteControl.ts:9899`), the args its
 redial would have used (with the held session it replaces, FR-138's `replaces`,
 [remote-control.md §11.17](remote-control.md#1117-a-session-outlives-its-control-socket-the-viewers-half-fr-138-p1c))
 are written to sessionStorage with the time, the path and the
@@ -325,10 +329,10 @@ reload that has not happened 20 s later gives the redial back and deletes the re
 or an F5 inside the minute would open the session a second time beside the redial. The next
 load takes the record out of storage before any page renders (`installStaleBuildWatch`,
 `staleBuildWatch.ts:515`, called before the router at `main.ts:46`). The viewer claims it once
-it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5500`): once,
+it has its device and the person (`resumeAfterNewBuild`, `RemoteControl.vue:5505`): once,
 under a minute old, on the first page that load rendered, for the same person, device,
 organization and path (`resumeArgsFor`, `staleBuildPolicy.ts:318`). It resumes through the
-redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9925`), never as a first
+redial's own ladder (`resumeAfterReload`, `useRemoteControl.ts:9924`), never as a first
 connect: a first connect starts the ladder at 0, and `rc:error` retries `agent_offline` only
 past it, so a tab that reloaded while its device restarted for an update would have stopped
 there, where the redial keeps trying. Its record is `after_drop`, out of FR-22's

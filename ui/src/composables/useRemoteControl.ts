@@ -7178,42 +7178,41 @@ export function useRemoteControl(
   }
 
   // Reactive list of in-flight + recently-finished file transfers. The
-  // Transfers chip in RemoteControl.vue binds to this. Entries auto-prune
-  // after 10 s in a terminal state so the panel doesn't grow unboundedly
-  // over a long session.
-  type TransferStatus =
-    | 'queued'
-    | 'running'
-    /** rc.19: DC closed mid-upload but the agent has the resume cap;
-     *  the wrapper is waiting for the WebRTC peer to reconnect so
-     *  it can issue `files:resume`. Operator sees "Reconnecting N/6". */
-    | 'reconnecting'
-    | 'complete'
-    | 'error'
-    | 'cancelled'
-  interface Transfer {
-    id: string
-    kind: 'upload' | 'download'
-    name: string
-    bytes: number
-    total: number | null
-    status: TransferStatus
-    error?: string
-  }
-  const transfers = ref<Transfer[]>([])
-  function pushTransfer(t: Transfer) {
+  // Transfers chip in RemoteControl.vue binds to this. A row leaves 10 s
+  // after it settles, so the panel doesn't grow unboundedly over a long
+  // session.
+  const transfers = ref<TransferRow[]>([])
+  const transferPrune = new Map<string, ReturnType<typeof setTimeout>>()
+  function pushTransfer(t: TransferRow) {
     transfers.value = [...transfers.value, t]
   }
-  function patchTransfer(id: string, patch: Partial<Transfer>) {
-    transfers.value = transfers.value.map((t) => (t.id === id ? { ...t, ...patch } : t))
-    if (patch.status === 'complete' || patch.status === 'error' || patch.status === 'cancelled') {
-      // Auto-prune after 10 s in a terminal state. rc.19 'reconnecting'
-      // is explicitly NOT terminal Ã¢ÂÂ the wrapper transitions out of it
-      // either back to 'running' (resume accepted) or to 'error' (6
-      // attempts exhausted), at which point this branch fires again.
-      setTimeout(() => {
-        transfers.value = transfers.value.filter((t) => t.id !== id)
-      }, 10_000)
+  /** #3726 — every change to a row goes through `moveTransfer`, the one
+   *  place that knows a settled row is final and a running row's bytes
+   *  never move back. A move that does not apply changes nothing. */
+  function patchTransfer(id: string, move: TransferMove) {
+    const before = transfers.value.find((t) => t.id === id)
+    if (!before) return
+    const after = moveTransfer(before, move)
+    if (after === before) return
+    transfers.value = transfers.value.map((t) => (t.id === id ? after : t))
+    // A row leaves 10 s after it settles. rc.19 'reconnecting' is not
+    // settled: the wrapper moves it back to 'running' (resume accepted)
+    // or to 'error'. A failed row that the resume path runs again keeps
+    // its place.
+    const timer = transferPrune.get(id)
+    if (transferSettled(after.status)) {
+      if (timer === undefined) {
+        transferPrune.set(
+          id,
+          setTimeout(() => {
+            transferPrune.delete(id)
+            transfers.value = transfers.value.filter((t) => t.id !== id)
+          }, 10_000)
+        )
+      }
+    } else if (timer !== undefined) {
+      clearTimeout(timer)
+      transferPrune.delete(id)
     }
   }
 
@@ -10649,7 +10648,7 @@ export function useRemoteControl(
       if (msg.t === 'files:complete') {
         const entry = settleEntry(id)
         if (entry?.kind === 'upload') {
-          patchTransfer(id, { status: 'complete', bytes: Number(msg.bytes ?? 0) })
+          patchTransfer(id, { t: 'complete', bytes: Number(msg.bytes ?? 0) })
           entry.resolve({ path: String(msg.path ?? ''), bytes: Number(msg.bytes ?? 0) })
         }
       } else if (msg.t === 'files:error') {
@@ -10669,7 +10668,7 @@ export function useRemoteControl(
         // Errors can land for either an upload OR a download.
         const entry = settleEntry(id)
         if (!entry) return
-        patchTransfer(id, { status: 'error', error: errMsg })
+        patchTransfer(id, { t: 'fail', error: errMsg })
         if (entry.kind === 'upload') {
           entry.reject(new Error(errMsg))
         } else {
@@ -10682,15 +10681,19 @@ export function useRemoteControl(
           entry.reject(new Error(errMsg))
         }
       } else if (msg.t === 'files:progress') {
-        const bytes = Number(msg.bytes ?? 0)
-        patchTransfer(id, { status: 'running', bytes })
-        // rc.19: each progress envelope is a durable-bytes ack
-        // (agent calls sync_data per 1 MiB before emitting).
-        // Update the upload entry so a future resume request
-        // claims the right offset.
+        // #3726 — an upload's bar is what the device has written: its
+        // `files:progress` (every 256 KiB), the same count a resume asks
+        // to start from (rc.19). The send loop's own offset is no longer a
+        // second writer: it runs up to 4 MiB ahead (what sits in the
+        // channel's buffer), and between the two the bar went back and
+        // forth (field: 13 → 1 → 22 → 4 → 25 %). A download's progress is
+        // the device's send count, which the browser's own count
+        // (`appendDownloadChunk`) already says, so it moves nothing.
         const entry = filesRegistry.get(id)
         if (entry?.kind === 'upload') {
+          const bytes = Number(msg.bytes ?? 0)
           entry.bytesAcked = bytes
+          patchTransfer(id, { t: 'bytes', bytes })
         }
       } else if (msg.t === 'files:resumed') {
         // rc.19: agent Ã¢ÂÂ browser reply confirming the byte offset
@@ -10705,7 +10708,9 @@ export function useRemoteControl(
           waiter.resolve(Number(msg.accepted_offset ?? 0))
         }
       } else if (msg.t === 'files:accepted') {
-        patchTransfer(id, { status: 'running' })
+        // An accept that lands after the person's Cancel moves nothing:
+        // `moveTransfer` keeps a settled row where it is.
+        patchTransfer(id, { t: 'start' })
       } else if (msg.t === 'files:offer') {
         const entry = filesRegistry.get(id)
         if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
@@ -10714,7 +10719,7 @@ export function useRemoteControl(
         entry.mime = typeof msg.mime === 'string' ? msg.mime : undefined
         activeDownloadId = id
         patchTransfer(id, {
-          status: 'running',
+          t: 'start',
           name: entry.name,
           total: entry.expectedSize,
         })
@@ -10739,7 +10744,7 @@ export function useRemoteControl(
           () => {
             const settled = settleEntry(id)
             if (settled?.kind === 'download') {
-              patchTransfer(id, { status: 'complete', bytes: totalBytes })
+              patchTransfer(id, { t: 'complete', bytes: totalBytes })
               settled.resolve({ name: entry.name, bytes: totalBytes })
             }
           },
@@ -10747,7 +10752,7 @@ export function useRemoteControl(
             const settled = settleEntry(id)
             if (settled?.kind === 'download') {
               const errMsg = err instanceof Error ? err.message : String(err)
-              patchTransfer(id, { status: 'error', error: errMsg })
+              patchTransfer(id, { t: 'fail', error: errMsg })
               settled.reject(new Error(errMsg))
             }
           }
@@ -10781,12 +10786,12 @@ export function useRemoteControl(
           // `files:resume`. Transition to 'pending-resume' so a
           // late files:complete on a stale DC can't double-settle.
           entry.status = 'pending-resume'
-          patchTransfer(id, { status: 'reconnecting', error: 'waiting for reconnect' })
+          patchTransfer(id, { t: 'reconnect', detail: 'waiting for reconnect' })
           continue
         }
         const settled = settleEntry(id)
         if (!settled) continue
-        patchTransfer(id, { status: 'error', error: errMsg })
+        patchTransfer(id, { t: 'fail', error: errMsg })
         if (settled.kind === 'upload') {
           settled.reject(new Error(errMsg))
         } else if (settled.kind === 'download') {
@@ -13374,8 +13379,10 @@ export function useRemoteControl(
       } catch {
         throw makeChannelClosedError(file, offset)
       }
+      // #3726 — no row write here: `offset` counts what was handed to the
+      // channel, up to 4 MiB of it still in the browser's buffer. The row
+      // reads the device's `files:progress` instead (one writer).
       offset = end
-      patchTransfer(id, { status: 'running', bytes: offset })
     }
     if (isCancelled()) return
     const ch = channels.files
@@ -13492,7 +13499,8 @@ export function useRemoteControl(
    * single fresh-begin attempt with the original fail-fast error.
    *
    * #2929 — every upload source (a files paste, a drop on the stage or
-   * on the drawer, the drawer's button, the folder picker) ends here,
+   * on the drawer, the toolbar's file picker, the drawer's Upload here;
+   * a folder arrives only by a drop) ends here,
    * so this is where uploads queue: a transfer shows in the panel at
    * once, as 'queued', and sends its `files:begin` only on its turn.
    */
@@ -13538,7 +13546,7 @@ export function useRemoteControl(
       const localFail = (err: Error) => {
         const settled = settleEntry(id)
         if (settled) {
-          patchTransfer(id, { status: 'error', error: err.message })
+          patchTransfer(id, { t: 'fail', error: err.message })
           settled.reject(err)
         }
       }
@@ -13640,14 +13648,11 @@ export function useRemoteControl(
           // 'pending-resume' if this is a fresh-id fallback after a
           // resume error).
           if (e.kind === 'upload') e.status = 'pending'
-          patchTransfer(id, { status: 'running' })
+          patchTransfer(id, { t: 'start' })
         } else {
           // Resume attempt. supportsResume is already guaranteed
           // true by the catch-block guard below.
-          patchTransfer(id, {
-            status: 'reconnecting',
-            error: `attempt ${attempt + 1}`,
-          })
+          patchTransfer(id, { t: 'reconnect', detail: `attempt ${attempt + 1}` })
           // Transition back to 'pending' so files:complete settles
           // through the normal path.
           if (e.kind === 'upload') e.status = 'pending'
@@ -13655,7 +13660,11 @@ export function useRemoteControl(
           const accepted = await sendResume(ch, requested)
           startOffset = accepted
           if (e.kind === 'upload') e.bytesAcked = accepted
-          patchTransfer(id, { status: 'running', bytes: startOffset })
+          // #3726 — the row reads the device's accepted offset, which may
+          // be below what it showed: that is where the device's copy ends.
+          // A Cancel during the handshake stays: `moveTransfer` keeps a
+          // cancelled row where it is, and the pump below sends nothing.
+          patchTransfer(id, { t: 'resume', offset: startOffset })
         }
         await innerPump(file, startOffset, id)
         // files:end is sent by innerPump on success; the listener
@@ -13677,10 +13686,7 @@ export function useRemoteControl(
             }
             // Channel closed mid-flight with resume cap Ã¢ÂÂ wait for
             // reconnect and retry.
-            patchTransfer(id, {
-              status: 'reconnecting',
-              error: `attempt ${attempt + 1}`,
-            })
+            patchTransfer(id, { t: 'reconnect', detail: `attempt ${attempt + 1}` })
             // rc.23 Ã¢ÂÂ wait forever for the peer to come back. The
             // resume loop is the operator's "DC stays open" promise;
             // legacy 30 s timeout could fire while the agent was
@@ -13783,8 +13789,9 @@ export function useRemoteControl(
   function appendDownloadChunk(entry: DownloadEntry, buf: ArrayBuffer) {
     if (entry.status === 'settled') return
     entry.bytesReceived += buf.byteLength
+    // #3726 — a download's ONE byte count: what has arrived here.
     patchTransfer(entry === filesRegistry.get(activeDownloadId ?? '') ? (activeDownloadId as string) : '', {
-      status: 'running',
+      t: 'bytes',
       bytes: entry.bytesReceived,
     })
     if (entry.saveMode === 'stream' && entry.writable) {
@@ -13808,7 +13815,7 @@ export function useRemoteControl(
           const settled = settleEntry(id)
           if (settled?.kind === 'download') {
             const msg = `download exceeds ${Math.round(DOWNLOAD_BLOB_HARD_CAP / (1024 * 1024 * 1024))} GiB browser-memory cap (use Chrome for streaming downloads)`
-            patchTransfer(id, { status: 'error', error: msg })
+            patchTransfer(id, { t: 'fail', error: msg })
             settled.reject(new Error(msg))
           }
           activeDownloadId = null
@@ -13936,7 +13943,7 @@ export function useRemoteControl(
         const settled = settleEntry(id)
         if (settled?.kind === 'download') {
           const msg = e instanceof Error ? e.message : String(e)
-          patchTransfer(id, { status: 'error', error: msg })
+          patchTransfer(id, { t: 'fail', error: msg })
           if (writable) void writable.abort(msg).catch(() => {})
           settled.reject(new Error(msg))
         }
@@ -14024,7 +14031,7 @@ export function useRemoteControl(
         const settled = settleEntry(id)
         if (settled?.kind === 'download') {
           const msg = e instanceof Error ? e.message : String(e)
-          patchTransfer(id, { status: 'error', error: msg })
+          patchTransfer(id, { t: 'fail', error: msg })
           if (writable) void writable.abort(msg).catch(() => {})
           settled.reject(new Error(msg))
         }
@@ -14032,28 +14039,43 @@ export function useRemoteControl(
     })
   }
 
-  /** Ask the agent to cancel an in-flight download. Best-effort: the
-   *  agent flips its AtomicBool and the next chunk-loop iteration
-   *  exits. The Promise rejects via the resulting `files:error`. */
+  /** Cancel a download (#3726). The row reads Cancelled at once, as an
+   *  upload's does, and the Promise rejects with a cancel. The device is
+   *  asked to stop (`files:cancel`); since #1730 it stops its pump and
+   *  answers nothing, so the viewer settles the transfer itself. It used
+   *  to wait for a `files:error` that never came: the row stayed running
+   *  and the save target stayed open. The save target is aborted, as for
+   *  a failed download, and a Blob download drops what it held. What the
+   *  device had already sent arrives after this and is dropped:
+   *  `activeDownloadId` no longer names the transfer, and its entry is
+   *  settled, so nothing writes to the aborted target. */
   function cancelDownload(id: string): void {
+    const entry = filesRegistry.get(id)
+    if (!entry || entry.kind !== 'download' || entry.status === 'settled') return
+    const settled = settleEntry(id)
+    if (settled?.kind !== 'download') return
+    if (id === activeDownloadId) activeDownloadId = null
+    if (settled.writable) void settled.writable.abort('cancelled').catch(() => {})
+    settled.blobs = []
     const ch = channels.files
-    if (!ch || ch.readyState !== 'open') return
-    try {
-      ch.send(JSON.stringify({ t: 'files:cancel', id }))
-    } catch {
-      /* dropped */
+    if (ch && ch.readyState === 'open') {
+      try {
+        ch.send(JSON.stringify({ t: 'files:cancel', id }))
+      } catch {
+        /* dropped: the channel is closing, and its close stops the pump */
+      }
     }
+    patchTransfer(id, { t: 'cancel' })
+    settled.reject(transferCancelledError())
   }
 
-  /** Cancel an in-flight upload. Settles the registry entry locally
-   *  (rejects the Promise + flags the Transfer panel row as
-   *  cancelled). The browser-side `pump()` loop checks `readyState`
-   *  + the entry status before each chunk send, so by settling here
-   *  the next iteration short-circuits and stops sending bytes. The
-   *  agent will see the DC stay open with no more chunks; eventually
-   *  its existing short-transfer-on-end logic / DC-close cleanup
-   *  handles the half-uploaded file (left on disk under Downloads/
-   *  for the operator to delete or resume manually).
+  /** Cancel an upload (#3726). Settles the registry entry locally: the
+   *  row reads Cancelled and stays so, and `uploadFiles` reports a
+   *  cancel, not a failure. The pump checks the entry before each chunk,
+   *  so it sends no more. The device is not told (no `files:cancel`): it
+   *  still writes and acknowledges what was in flight, and those late
+   *  `files:progress` frames move nothing (`moveTransfer`); the partial
+   *  waits in staging for the agent's startup sweep (older than 24 h).
    *
    *  Symmetric with `cancelDownload` so the Transfers panel can
    *  render a single "Cancel" affordance regardless of direction. */
@@ -14062,8 +14084,8 @@ export function useRemoteControl(
     if (!entry || entry.kind !== 'upload' || entry.status === 'settled') return
     const settled = settleEntry(id)
     if (settled?.kind === 'upload') {
-      patchTransfer(id, { status: 'cancelled', error: 'cancelled by operator' })
-      settled.reject(new Error('cancelled by operator'))
+      patchTransfer(id, { t: 'cancel' })
+      settled.reject(transferCancelledError())
     }
   }
 
@@ -14144,16 +14166,15 @@ export function useRemoteControl(
    *  `uploadOne`; the queue continues on individual failures so a
    *  bad file doesn't sink the rest. Resolves with one result per
    *  input file (in order) carrying either the agent-reported path +
-   *  bytes (success) or an error message (failure).
+   *  bytes (success) or an error message (failure), `cancelled` when
+   *  the person cancelled it (#3726).
    *
    *  Accepts either bare `File` items (flat upload Ã¢ÂÂ file lands in
    *  Downloads/) or `{ file, relPath }` pairs (folder upload Ã¢ÂÂ agent
    *  recreates the directory structure under Downloads/<root>/).
    *  Mixing is allowed Ã¢ÂÂ useful when a drag&drop event has both
    *  individual files and one or more folders. */
-  type UploadResult =
-    | { ok: true; name: string; path: string; bytes: number }
-    | { ok: false; name: string; error: string }
+  type UploadResult = UploadOutcome
   // `relPath` carries the folder-upload structure (file-DC v2.1).
   // `destPath` is the path-targeted upload root (file-DC v2.2) Ã¢ÂÂ when
   // set, the file lands under `<destPath>/`. The two stack: a folder
@@ -14178,11 +14199,12 @@ export function useRemoteControl(
         const r = await uploadOne(f, relPath, destPath)
         results.push({ ok: true, name: reportName, path: r.path, bytes: r.bytes })
       } catch (e) {
-        results.push({
-          ok: false,
-          name: reportName,
-          error: e instanceof Error ? e.message : String(e),
-        })
+        // #3726 — a Cancel the person chose is reported as one.
+        results.push(
+          isTransferCancelled(e)
+            ? { ok: false, name: reportName, error: 'cancelled', cancelled: true }
+            : { ok: false, name: reportName, error: e instanceof Error ? e.message : String(e) },
+        )
       }
     }
     return results
@@ -14196,8 +14218,16 @@ export function useRemoteControl(
    *  walk at 5000 files / 32 levels of depth to refuse pathological
    *  inputs (huge `node_modules` etc.) before they swamp the queue.
    *
-   *  Returns `null` on entries that aren't directories (caller
-   *  should treat as a single file via `entry.file()`). */
+   *  Callers pass a dropped folder and its own name as `rootName`.
+   *
+   *  #3725 — each entry carries its OWN path: the dropped folder is
+   *  `rootName`, and a child is its parent's path plus its name, so a
+   *  file reads `<folder>/<file>` or `<folder>/<sub>/<file>`. The walk
+   *  used to seed the folder with its name as the parent's path and
+   *  then append its name again for its children, so every file
+   *  landed one level too deep (`<folder>/<folder>/<file>`), and the
+   *  device places exactly the `rel_path` it is given. An empty
+   *  subfolder adds nothing: no message makes a folder on the device. */
   type FolderWalkEntry = { file: File; relPath: string }
   async function walkFolderEntry(
     entry: FileSystemEntry,
@@ -14206,10 +14236,10 @@ export function useRemoteControl(
     const out: FolderWalkEntry[] = []
     const MAX_FILES = 5000
     const MAX_DEPTH = 32
-    type Pending = { entry: FileSystemEntry; relParent: string; depth: number }
-    const queue: Pending[] = [{ entry, relParent: rootName, depth: 0 }]
+    type Pending = { entry: FileSystemEntry; path: string; depth: number }
+    const queue: Pending[] = [{ entry, path: rootName, depth: 0 }]
     while (queue.length > 0) {
-      const { entry: cur, relParent, depth } = queue.shift() as Pending
+      const { entry: cur, path, depth } = queue.shift() as Pending
       if (depth > MAX_DEPTH) continue
       if (cur.name.startsWith('.')) continue // skip dotfiles / dotdirs
       if (cur.isFile) {
@@ -14217,7 +14247,7 @@ export function useRemoteControl(
         const f: File = await new Promise((resolve, reject) =>
           fileEntry.file(resolve, reject)
         )
-        out.push({ file: f, relPath: `${relParent}/${cur.name}` })
+        out.push({ file: f, relPath: path })
         if (out.length >= MAX_FILES) break
       } else if (cur.isDirectory) {
         const dirEntry = cur as FileSystemDirectoryEntry
@@ -14231,7 +14261,7 @@ export function useRemoteControl(
           for (const child of batch) {
             queue.push({
               entry: child,
-              relParent: `${relParent}/${cur.name}`,
+              path: `${path}/${child.name}`,
               depth: depth + 1,
             })
           }
@@ -15538,10 +15568,120 @@ export function createUploadQueue(): () => UploadPlace {
   }
 }
 
-/** One file's outcome from `uploadFiles`. */
+/** Where a row of the Transfers panel stands. */
+export type TransferStatus =
+  | 'queued'
+  | 'running'
+  /** rc.19: the channel closed mid-upload and the device can resume; the
+   *  upload waits for the peer to come back to send `files:resume`. The
+   *  panel reads "Reconnecting — attempt N". */
+  | 'reconnecting'
+  | 'complete'
+  | 'error'
+  | 'cancelled'
+
+/** A row of the Transfers panel (`transfers`). */
+export interface TransferRow {
+  id: string
+  kind: 'upload' | 'download'
+  name: string
+  bytes: number
+  total: number | null
+  status: TransferStatus
+  error?: string
+}
+
+/** What may move a Transfers row (#3726), each from one place:
+ *  - `start`: an upload's `files:begin` went out, the device accepted it
+ *    (`files:accepted`), or it offered a download (`files:offer`, with the
+ *    download's name and size);
+ *  - `bytes`: the transfer's ONE byte count. For an upload, what the device
+ *    has written (its `files:progress`), never the send loop's offset, which
+ *    runs up to 4 MiB ahead in the channel's buffer. For a download, what has
+ *    arrived in the browser, never the device's send count;
+ *  - `reconnect`: the channel dropped and the upload waits to resume;
+ *  - `resume`: the resume path runs it again from the device's accepted offset;
+ *  - `complete`, `fail`: the transfer ended, or failed;
+ *  - `cancel`: the person's Cancel. */
+export type TransferMove =
+  | { t: 'start'; name?: string; total?: number | null }
+  | { t: 'bytes'; bytes: number }
+  | { t: 'reconnect'; detail: string }
+  | { t: 'resume'; offset: number }
+  | { t: 'complete'; bytes: number }
+  | { t: 'fail'; error: string }
+  | { t: 'cancel' }
+
+/** A settled row leaves the panel 10 s later. */
+export function transferSettled(status: TransferStatus): boolean {
+  return status === 'complete' || status === 'error' || status === 'cancelled'
+}
+
+/** The one place a Transfers row moves (#3726). Returns `row` itself when
+ *  the move does not apply, so the caller can tell nothing changed.
+ *  - Complete and cancelled are final. The device still writes and
+ *    acknowledges what was in flight when the person pressed Cancel, and
+ *    those late frames put the row back to running (field: 0.4 s after a
+ *    Cancel the row read "20% — 99.8 MB" again, its Cancel button back). No
+ *    later progress, accept, error or resume moves it now.
+ *  - A failed row runs again only through the resume path (`resume`), never
+ *    on a late frame from the attempt that failed.
+ *  - While a transfer runs its bytes never move back. Its one writer only
+ *    grows; this holds the bar if a frame ever comes out of order. The one
+ *    step back is `resume`: the row then reads the device's accepted offset,
+ *    after it read Reconnecting, because the device's copy ends there and
+ *    the upload goes on from there. */
+export function moveTransfer(row: TransferRow, move: TransferMove): TransferRow {
+  if (row.status === 'complete' || row.status === 'cancelled') return row
+  if (row.status === 'error' && move.t !== 'resume') return row
+  switch (move.t) {
+    case 'start':
+      if (row.status === 'running' && move.name === undefined && move.total === undefined) return row
+      return {
+        ...row,
+        status: 'running',
+        error: undefined,
+        name: move.name ?? row.name,
+        total: move.total === undefined ? row.total : move.total,
+      }
+    case 'bytes':
+      return row.status === 'running' && move.bytes > row.bytes ? { ...row, bytes: move.bytes } : row
+    case 'reconnect':
+      return row.status === 'reconnecting' && row.error === move.detail
+        ? row
+        : { ...row, status: 'reconnecting', error: move.detail }
+    case 'resume':
+      return { ...row, status: 'running', bytes: move.offset, error: undefined }
+    case 'complete':
+      return { ...row, status: 'complete', bytes: move.bytes, error: undefined }
+    case 'fail':
+      return { ...row, status: 'error', error: move.error }
+    case 'cancel':
+      return { ...row, status: 'cancelled', error: undefined }
+  }
+}
+
+/** Marks the rejection of a transfer the person cancelled. */
+const TRANSFER_CANCELLED_TAG = '__rc_transfer_cancelled__'
+
+/** The rejection of a transfer the person cancelled (#3726), so that
+ *  `uploadFiles` and the view say "cancelled", never "failed". */
+export function transferCancelledError(): Error {
+  const err = new Error('Cancelled')
+  ;(err as Error & { [k: string]: unknown })[TRANSFER_CANCELLED_TAG] = true
+  return err
+}
+
+/** Whether `e` is a transfer the person cancelled (#3726). */
+export function isTransferCancelled(e: unknown): boolean {
+  return !!(e && typeof e === 'object' && (e as Record<string, unknown>)[TRANSFER_CANCELLED_TAG])
+}
+
+/** One file's outcome from `uploadFiles`. `cancelled`: the person cancelled
+ *  it (#3726), which is said as a cancel, never as a failure. */
 export type UploadOutcome =
   | { ok: true; name: string; path: string; bytes: number }
-  | { ok: false; name: string; error: string }
+  | { ok: false; name: string; error: string; cancelled?: boolean }
 
 /** A host path as compared: no Windows verbatim prefix (`\\?\`), forward
  *  slashes, no trailing slash, and case-folded when it is a Windows path (a
@@ -15585,28 +15725,39 @@ function uploadLandingFolder(path: string, name: string): string {
 /** What the viewer tells the person when `uploadFiles` returns. Before
  *  #2930 a file the host had put in Downloads, instead of the folder the
  *  person chose, was reported as a plain success; before #3048 a success
- *  did not say where the file landed. */
+ *  did not say where the file landed; before #3726 a Cancel the person
+ *  chose read "Upload failed: cancelled by operator". A cancel is said as
+ *  one: on its own as `info`, beside other outcomes as "; N cancelled". */
 export function uploadOutcomeMessage(
   results: UploadOutcome[],
   requested: number,
   destPath?: string,
-): { level: 'success' | 'warning' | 'error'; text: string } {
+): { level: 'success' | 'warning' | 'error' | 'info'; text: string } {
   const ok = results.filter((r): r is Extract<UploadOutcome, { ok: true }> => r.ok)
-  const failed = results.filter((r): r is Extract<UploadOutcome, { ok: false }> => !r.ok)
+  const notOk = results.filter((r): r is Extract<UploadOutcome, { ok: false }> => !r.ok)
+  const cancelled = notOk.filter((r) => r.cancelled)
+  const failed = notOk.filter((r) => !r.cancelled)
+  const andCancelled = cancelled.length > 0 ? `; ${cancelled.length} cancelled` : ''
   if (failed.length > 0) {
     const first = failed[0]
     if (ok.length === 0) {
       return {
         level: 'error',
         text:
-          failed.length === 1
+          (failed.length === 1
             ? `Upload failed: ${first.error}`
-            : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`,
+            : `${failed.length} uploads failed (first: ${first.name} — ${first.error})`) + andCancelled,
       }
     }
     return {
       level: 'error',
-      text: `Uploaded ${ok.length}/${requested} — ${failed.length} failed (e.g. ${first.name}: ${first.error})`,
+      text: `Uploaded ${ok.length}/${requested} — ${failed.length} failed (e.g. ${first.name}: ${first.error})${andCancelled}`,
+    }
+  }
+  if (ok.length === 0 && cancelled.length > 0) {
+    return {
+      level: 'info',
+      text: cancelled.length === 1 ? `Upload cancelled: ${cancelled[0].name}` : `${cancelled.length} uploads cancelled`,
     }
   }
   const elsewhere = destPath ? ok.filter((r) => !uploadLandedIn(r.path, destPath)) : []
@@ -15618,7 +15769,7 @@ export function uploadOutcomeMessage(
         : elsewhere.length === ok.length
           ? `${ok.length} files to ${folder}`
           : `${ok.length} files, ${elsewhere.length} of them to ${folder}`
-    return { level: 'warning', text: `Uploaded ${what} instead: the host refused ${destPath}` }
+    return { level: 'warning', text: `Uploaded ${what} instead: the host refused ${destPath}${andCancelled}` }
   }
   // #3048 — where it landed, by path. On a machine-wide Windows install that
   // is the signed-in person's Downloads, which may be on a share.
@@ -15628,7 +15779,7 @@ export function uploadOutcomeMessage(
     count === 0 ? '' : count === 1 ? ` to ${folders[0]}` : ` to ${count} folders (first: ${folders[0]})`
   return {
     level: 'success',
-    text: ok.length === 1 ? `Uploaded ${ok[0].name}${where}` : `Uploaded ${ok.length} files${where}`,
+    text: (ok.length === 1 ? `Uploaded ${ok[0].name}${where}` : `Uploaded ${ok.length} files${where}`) + andCancelled,
   }
 }
 

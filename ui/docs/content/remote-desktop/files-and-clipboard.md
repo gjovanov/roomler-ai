@@ -26,17 +26,28 @@ follow you.
 
 ## File transfer
 
-Drag a file onto the session window to send it to the remote machine, or use the
-session toolbar's transfer panel to pull one back.
+Drag files or a whole folder onto the session window to send them to the remote
+machine, or open **Remote files** from the session toolbar to pull one back.
 
 :::badges
-- **Resumable** icon:download — a transfer that is interrupted picks up where it stopped rather than starting again.
+- **Resumable** icon:download — an upload that is interrupted picks up where it stopped rather than starting again.
 - **Direct** icon:network — bytes ride the same peer-to-peer channel as the video, so the server never holds the file.
 - **Both directions** icon:copy — send and retrieve within one session.
 :::
 
-Progress is shown per transfer, and a transfer continues while you keep working
-in the session.
+A folder arrives as itself. Drop `Reports`, which holds `q3.pdf` and a subfolder
+`old` with `q2.pdf`, and the remote machine gets `Reports/q3.pdf` and
+`Reports/old/q2.pdf`. An empty subfolder is not created there, and hidden files
+(names that start with a dot) stay behind.
+
+Each transfer has a row in the session toolbar's transfers list, and a transfer
+continues while you keep working in the session. A row's percentage counts what
+has reached the other end, so it only moves forward. An upload that has to
+reconnect starts again from what the remote machine kept, and its row shows that
+point. **Cancel** on a row stops that transfer, in either direction, and the row
+reads **Cancelled**. A file you stop sending never shows up half-written in the
+folder: what arrived is kept aside in a hidden `.roomler-partial` folder, which
+Roomler clears of anything older than a day when it starts.
 
 ## What the far end sees
 
