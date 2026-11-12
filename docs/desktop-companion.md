@@ -515,7 +515,8 @@ screen will land **right now**, with **Open folder**, **Change…** (the native 
 which can create a folder) and **Use default**. The setting is `files_dir`; unset, the ladder
 is the active user's Downloads, then the service's own fallback (a Windows background service
 with nobody signed in refuses the file instead, §9.2; on Linux the service's own folder is never
-one another account can write, §9.5). It is **live**: every
+one another account can write, §9.5; a Mac's system daemon transfers no file itself, and a
+session no GUI worker serves is told why, §9.6). It is **live**: every
 transfer reads the current value, so a change needs no restart.
 
 ⚠️ `files_dir` is a security control, because the daemon writing the file can be SYSTEM or
@@ -935,6 +936,62 @@ daemon that is root placing in the configured or a chosen folder
 (`a_root_daemon_places_in_the_configured_or_a_chosen_folder`, root), and an end the rule refuses,
 whose partial survives it (`an_end_the_rule_refuses_keeps_its_partial_for_a_resume`). The umask
 test runs again in a child process of its own under umask 0002.
+
+### 9.6 A Mac's system install transfers files only in the person's session (#3757)
+
+On a Mac with a system install, the root daemon holds the enrollment and hands each remote-control
+session to the GUI worker it runs in the session of the person signed in at the screen (FR-43 P2b,
+[remote-control.md §11.16.1](remote-control.md#11161-a-supervised-macs-delegated-sessions-fr-138-p2b)).
+The session's peer, and with it every data channel, then lives in the worker, which runs as that
+person: a file a viewer sends lands in their folder and is theirs, and a download or the drawer reads
+with their rights, as on a per-user install. A session no worker serves has its peer in the root
+daemon instead: nobody is signed in at the screen yet, or the Mac has two rows and this is its
+`-daemon` row, which supervises no worker, or it is a secondary organization's session on a Mac that
+is not one row (only the primary's sessions cross there). Until #3757 the root daemon served that
+session's `files` channel itself, both ways. It now declines it:
+
+```mermaid
+flowchart TD
+    O["rc:sdp.offer reaches the root daemon"] --> W{"a GUI worker takes it?<br/>DelegateHost::send_to_worker"}
+    W -- "yes" --> P["the worker builds the peer,<br/>running as the person at the screen"]
+    P --> S["files channel served as before,<br/>with that person's rights"]
+    W -- "no worker serves it" --> D["the root daemon builds the peer"]
+    D --> G{"the files channel opens:<br/>a Mac, effective uid 0?<br/>files_channel"}
+    G -- "yes" --> X["declined: each request answered with the reason,<br/>files:dir-error in the drawer, files:error on a transfer;<br/>nothing read or written, the session goes on"]
+    G -- "no" --> S
+```
+
+| What | Where (`agents/roomlerd/src/peer.rs`) | Why |
+|---|---|---|
+| The decision | `files_channel` (`agents/roomlerd/src/peer.rs:12986`), asked as the channel opens (`files_channel_here`, `:12995`, from the `"files"` arm, `:1331`) | a Mac process whose effective uid, the uid its file access runs under, is 0 declines; every other process serves. It needs no word from the delegation: a session's data channels live in its peer, an offer a worker takes builds that peer in the worker (`agents/roomlerd/src/signaling.rs:3944`), which runs as the person (the supervisor starts none for the login window, `agents/roomlerd/src/macos_supervisor.rs:596`, and starts it with `sudo -u`), and an offer no worker takes builds it in the root daemon (`signaling.rs:4848`) |
+| Mid-session | the peer stays where its offer was answered | a worker that attaches later moves no peer, so a declined channel stays declined until the session ends, and the next session is the worker's. A worker that leaves takes its own peer with it, never to the daemon. A new offer is decided again wherever it lands |
+| The channel | `attach_files` (`agents/roomlerd/src/peer.rs:13021`), `attach_files_declined` (`:13044`), `declined_reply` (`:13075`) | a grant without FILES gets the FILES-denied channel first, as before. A declined one answers each request with the reason in the frame its waiter in the viewer settles on: `files:dir-error` for a listing, `files:error` for an upload, a download, a folder download, a resume, an end or a cancel; a chunk is dropped. Nothing on the host is read or written, and nothing ends the channel or the session |
+| The reason | `FILES_IN_THE_PERSONS_SESSION` (`agents/roomlerd/src/peer.rs:12954`) | "File transfer on this Mac needs someone signed in at its screen and runs in their session, not in this one. Reconnect once someone is signed in, or connect to the Mac's user-session agent." |
+| What stays | the device's caps (`agents/roomlerd/src/encode/caps.rs:4482`) | the row still offers file transfer: on a one-row Mac it is the row the worker serves whenever someone is signed in, and the hub puts FILES in a grant, which consent names, from these words when a session is asked. Consent, the session request and every other channel are unchanged |
+
+What a viewer notices:
+
+- **Before anyone signs in at the Mac's screen**, a session shows no screen, and Files shows the
+  reason in the drawer and on every transfer. The session stays up. Reconnect once someone is signed
+  in: the next session is the worker's.
+- **On a two-row Mac's `-daemon` row** the same, whoever is signed in: the person's own row serves
+  the screen and files.
+- **A session that began before the person signed in** keeps its declined channel until it ends.
+- **The no-screen sentence** that daemon sends (`no_display`, `agents/roomlerd/src/capture/mod.rs:754`)
+  ends "Remote shell works here.", where it said file transfer worked there too.
+- Windows, Linux, a per-user Mac and every session a GUI worker serves are unchanged.
+
+**Tested**: `peer::files_channel_tests` (`agents/roomlerd/src/peer.rs:17070`), on every lane's lib
+tests: the decision and its reason's words; each request's answer (`declined_reply`); and through
+the router over an in-process peer pair, both peers closed after each test, a declined channel that
+answers each request with the reason, leaves the folder asked about as it was and stays up
+(`a_declined_channel_answers_each_request_with_the_reason_and_stays_up`), a served one that lists the
+folder (`a_served_channel_keeps_the_file_transfer_handler`), and a grant without FILES that keeps its
+own words (`a_session_without_files_keeps_the_not_granted_channel`). The row's offer:
+`encode::caps::tests::a_macs_root_half_still_offers_file_transfer`. In the macOS job the module runs as
+the runner's user and again under sudo with `ROOMLERD_TEST_REQUIRE_ROOT=1`, where the Mac's own
+effective uid declines (`as_root::a_root_process_on_a_mac_declines_the_files_channel`); the step fails
+unless that test ran.
 
 ## 10. Starting after install, and the Welcome flow
 
