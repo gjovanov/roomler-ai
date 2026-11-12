@@ -291,6 +291,8 @@ pub(super) fn stage(
     data_mode: u32,
 ) -> Result<(Held, File)> {
     let staging = open_staging(&base, base_path, true)?;
+    #[cfg(test)]
+    super::stand_in::before_the_id_is_made(base_path);
     let shown = base_path.join(STAGING).join(id);
     match mkdir_at(&staging, id, 0o700) {
         Ok(()) => {}
