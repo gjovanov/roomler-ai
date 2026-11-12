@@ -109,7 +109,7 @@ re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It r
 | `HeldPath::base(base)` | opens the base itself (a reparse point refused); `GetFinalPathNameByHandleW` must equal `GetLongPathNameW(base)`, both without `\\?\` and compared case-insensitively; a `\\?\UNC\` path is refused |
 | `open_dir(name)`, `walk(names)` | each name opened below the previous handle (`NtCreateFile` with `RootDirectory`, `FILE_OPEN`, `FILE_DIRECTORY_FILE` and `FILE_OPEN_REPARSE_POINT`), a reparse point refused, its final path checked. `Ok(None)` when a name is not there. Makes nothing |
 | `sealed_dir(name, seal)`, `walk_sealed(names, seal)` | as `walk`, and a folder that is not there is made with the seal's security descriptor in `OBJECT_ATTRIBUTES` (`FILE_OPEN_IF`): sealed from its creation, with no moment in between. The last name gets the leaf policy below |
-| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:394-420`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:515-523`) stays in one place |
+| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:394-420`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:515-523`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
 | `write_file(name, bytes, seal)` | a fresh temp below the held folder (`FILE_CREATE`, so an entry already there is never written into), written and flushed (#2955), then renamed onto `name` with `FileRenameInformation` whose `RootDirectory` is the held folder. A folder at `name` fails the rename, and the temp is deleted by handle |
 | `write_file_new(name, bytes, seal)` | `FILE_CREATE` straight into `name`: the first writer wins (`Ok(false)` when it was there) |
 | `append_file(name, seal)` | for logs: `FILE_OPEN_IF` and append. A file already there must be a plain file with one link, owned by SYSTEM or Administrators; otherwise it is deleted by handle and made again |
@@ -149,7 +149,7 @@ Notes on the calls:
 | Found at the leaf | What happens | What a person or an operator sees |
 |---|---|---|
 | nothing | made sealed | nothing |
-| a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle (`win::set_sd`, as `adopt_machine_folder` does, `machine_tree.rs:832`). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators; any other such entry is deleted by handle. Names the service does not use are left alone and never opened | nothing; the files written before the seal keep their own DACL |
+| a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle (`win::set_sd`, as `adopt_machine_folder` does, `machine_tree.rs:832`). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators; any other such entry is deleted by handle. Names the service does not use are left alone and never opened | nothing; the files in it stay |
 | a folder another account owns | moved aside by handle (`FileRenameInformation`, `RootDirectory` = the parent's handle) as `<name>.moved-<unix>`, and a sealed one made. Nothing in it is deleted or changes owner. One WARN names it | a `<name>.moved-<unix>` entry beside the new folder, its content still that account's |
 | a link (a junction or a symbolic link) | the link entry itself moved aside by handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; whatever the link led to is untouched |
 | above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:223-238`, `fallback_log_dir` `:326-332`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
@@ -237,6 +237,10 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
 
 ### P3: the rest
 
+The attempt record lives in the machine folder's parent, and the attention file and the launch marker in the
+machine folder itself: their walk opens those folders and never applies the leaf policy to them (`HeldPath::machine`
+above).
+
 | Site | Today | After |
 |---|---|---|
 | the SystemContext attempt record (`agents/roomlerd/src/win_service/system_context_attempt.rs:151-155`, `:178-197`) | `create_dir_all(parent)`, `create_fresh(tmp)`, `seal_new_record`, `fs::rename` | `HeldPath` on the machine parent, `write_file(.., Seal::Readable)` |
@@ -292,7 +296,7 @@ them.
 | T5 | `a_write_replaces_the_name_and_never_writes_through_it` | same | at the name, (a) a file symbolic link, (b) a junction, (c) a hard link: (a) and (c) replace the name and leave what it led to byte-identical; (b) is refused, nothing left behind. Control: a plain file is replaced | (a) yes | new API |
 | T6 | `an_append_never_writes_into_a_hard_link` | same | a log name that is a hard link to another file: the line goes to a new file of one link, and the other file is unchanged | no | new API |
 | T7 | `a_junction_where_the_leaf_goes_is_moved_aside` | same | `crashes` is a junction: a real, sealed `crashes`, the junction as `crashes.moved-*`, nothing where it led | no | new API |
-| T8 | `an_open_leaf_ours_is_sealed_in_place` | same | an Administrators-owned `crashes` with an inherited DACL and a file in it: the same folder, sealed (`test_support::sealed`), the file kept | yes | new API |
+| T8 | `an_open_leaf_ours_is_sealed_in_place` | same | an Administrators-owned folder with an inherited DACL and a file in it: `sealed_dir(.., Seal::Private)` keeps the same folder, sealed (`test_support::sealed`), and the file | yes | new API |
 | T9 | `a_leaf_another_account_owns_is_moved_aside` | same | `crashes` owned by another local account, with a file in it: moved aside with its file and owner; the new one sealed | yes | new API |
 | T10 | `a_tree_removal_follows_no_link_and_leaves_what_holds_one` | same | a tree holding a junction: what it leads to is kept, `left` names it, the root stays. Control: a tree with none is removed | no | new API |
 | T11 | `a_crash_record_lands_in_a_sealed_crashes_never_through_a_junction` | `crash_recorder.rs` tests | `crashes` is a junction: the record lands in a new, sealed `crashes`, with no `.json` or `.tmp` where the junction led. A junction above it: refused, nothing written anywhere, one WARN | no | yes |
@@ -414,7 +418,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D9. Phasing.** Options: one PR; phases. **Default: P1, P2 and P3 as above**, each its own PR (P1 may take more
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
-  as well (`Seal::Readable`), as today. **Default: Users read and list.** A worker that runs as the signed-in person
+  as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
   drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:346`); without read
   those records would stay on the device. Only the write side closes.
 
