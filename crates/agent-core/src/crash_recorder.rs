@@ -722,6 +722,28 @@ fn quarantine(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
     Ok(target)
 }
 
+// ─── The uploader's verdicts ──────────────────────────────────────────────
+
+/// The uploader's ledger (#1748): one line for each record that got a final
+/// verdict but that this process may not delete, so it is never sent again.
+/// It lives in the uploading process's log folder.
+pub const VERDICTS_FILE: &str = "crash-verdicts.txt";
+
+/// Append `line` to [`VERDICTS_FILE`] in `dir`.
+pub fn append_verdict(dir: &Path, line: &str) -> std::io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(VERDICTS_FILE))?;
+    writeln!(f, "{line}")
+}
+
+/// [`VERDICTS_FILE`] in `dir`: empty when it is not there or cannot be read
+/// (the cost is one more send, never a lost crash).
+pub fn read_verdicts(dir: &Path) -> String {
+    fs::read_to_string(dir.join(VERDICTS_FILE)).unwrap_or_default()
+}
+
 // ─── Crash-loop suppression ────────────────────────────────────────────────
 
 /// Why a record_inner attempt declined to write. Stored in the
@@ -1852,6 +1874,53 @@ mod tests {
             );
             let refused = written.expect_err("a junction above crashes is refused");
             assert!(refused.to_string().contains("link"), "{refused}");
+            println!("{CHECKED}");
+        }
+
+        /// The uploader's ledger in a SYSTEM worker's `service-logs` (R145):
+        /// (a) its name is a hard link to a file outside: the verdict goes to
+        /// a new file of one name, and the file outside is unchanged; (b)
+        /// `service-logs` is a junction: nothing is written where it leads.
+        /// Control: the verdict is there to read in both.
+        #[test]
+        fn a_verdict_is_never_written_through_a_hard_link_or_a_junction() {
+            use super::super::{VERDICTS_FILE, append_verdict, read_verdicts};
+            let Some(root) = child() else {
+                return run(
+                    "a_verdict_is_never_written_through_a_hard_link_or_a_junction",
+                    "the uploader's ledger and a link",
+                );
+            };
+            let elsewhere = root.join("elsewhere");
+            let logs = crate::appdirs::machine_global_dir().join("service-logs");
+            std::fs::create_dir_all(&logs).unwrap();
+
+            // (a) the ledger's name is a hard link to a file outside.
+            let outside = elsewhere.join("outside.txt");
+            std::fs::write(&outside, b"outside\n").unwrap();
+            std::fs::hard_link(&outside, logs.join(VERDICTS_FILE)).unwrap();
+            let linked = append_verdict(&logs, "12:34 1-2.json");
+            let outside_now = std::fs::read(&outside).unwrap();
+            let read_a = read_verdicts(&logs);
+
+            // (b) `service-logs` is a junction to a folder outside.
+            std::fs::rename(&logs, root.join("service-logs-aside")).unwrap();
+            junction(&logs, &elsewhere);
+            let through = append_verdict(&logs, "56:78 3-4.json");
+            let led_to = std::fs::read_to_string(elsewhere.join(VERDICTS_FILE)).ok();
+            let read_b = read_verdicts(&logs);
+
+            assert!(
+                outside_now == b"outside\n" && led_to.is_none(),
+                "no verdict is written through a link: (a) the file outside \
+                 now holds {:?} ({linked:?}); (b) where the junction leads: \
+                 {led_to:?} ({through:?})",
+                String::from_utf8_lossy(&outside_now)
+            );
+            assert!(linked.is_ok() && through.is_ok(), "{linked:?} {through:?}");
+            assert_eq!(read_a, "12:34 1-2.json\n", "(a) the new ledger");
+            assert_eq!(read_b, "56:78 3-4.json\n", "(b) the new ledger");
+            assert!(!is_link(&logs), "service-logs is a real folder again");
             println!("{CHECKED}");
         }
     }

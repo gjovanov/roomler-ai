@@ -82,7 +82,7 @@ const INTER_REQUEST_DELAY: Duration = Duration::from_millis(1100);
 /// drain: this task runs for the life of the process, and the token it
 /// started with may since have been renewed.
 pub async fn drain_and_upload(cfg: &AgentConfig, token: &crate::token_slot::TokenSlot) {
-    let ledger = verdicts_path();
+    let ledger = verdicts_dir();
     let settled = ledger.as_deref().map(load_settled).unwrap_or_default();
     let pending = without_settled(crash_recorder::pending_all(), &settled);
     if pending.is_empty() {
@@ -255,8 +255,9 @@ async fn classify_status_for_test(status: StatusCode, body: &str) -> UploadOutco
     classify_status(status, || async move { owned }).await
 }
 
-/// Where the verdicts on undeletable sidecars are kept: this process's own
-/// log folder, which it can always write. `None` without file logging.
+/// The folder that keeps the verdicts on undeletable sidecars
+/// ([`crash_recorder::VERDICTS_FILE`]): this process's own log folder, which
+/// it can always write. `None` without file logging.
 ///
 /// A sidecar gets a FINAL verdict when it is uploaded, or rejected as
 /// permanent. Normally it is then deleted. One this process may not delete is
@@ -266,31 +267,23 @@ async fn classify_status_for_test(status: StatusCode, body: &str) -> UploadOutco
 /// sent it again: a rejected report as another 4xx forever (field: the
 /// supervised MacBook, one 2026-09-08 report re-sent every five minutes), and
 /// an accepted one as a duplicate crash.
-fn verdicts_path() -> Option<std::path::PathBuf> {
-    crate::logging::log_dir().map(|d| d.join("crash-verdicts.txt"))
+fn verdicts_dir() -> Option<std::path::PathBuf> {
+    crate::logging::log_dir()
 }
 
-/// Every recorded signature. A missing or unreadable ledger is an empty one:
-/// the cost is one more send, never a lost crash.
-fn load_settled(ledger: &Path) -> std::collections::HashSet<String> {
-    std::fs::read_to_string(ledger)
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+/// Every signature recorded in the ledger in `dir`. A missing or unreadable
+/// ledger is an empty one: the cost is one more send, never a lost crash.
+fn load_settled(dir: &Path) -> std::collections::HashSet<String> {
+    crash_recorder::read_verdicts(dir)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
-fn record_settled(ledger: &Path, sig: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ledger)?;
-    writeln!(f, "{sig}")
+fn record_settled(dir: &Path, sig: &str) -> std::io::Result<()> {
+    crash_recorder::append_verdict(dir, sig)
 }
 
 /// The queue less every sidecar that already has a final verdict. A
@@ -331,7 +324,7 @@ fn settle(
         Some(l) if record_settled(l, &sidecar.signature()).is_ok() => tracing::warn!(
             file = %path.display(),
             error = %err,
-            ledger = %l.display(),
+            ledger = %l.join(crash_recorder::VERDICTS_FILE).display(),
             "crash_uploader: {verdict}, but this process may not delete the sidecar \
              (typically one another account wrote, e.g. a root process run with this \
              user's HOME); its verdict is recorded so it is not sent again. Remove it \
@@ -379,12 +372,12 @@ mod tests {
         let path = dir.path().join("1788894634-71069.json");
         std::fs::write(&path, b"{}").unwrap();
         let sidecar = plain(&path);
-        let ledger = dir.path().join("crash-verdicts.txt");
+        let ledger = dir.path();
 
-        settle(&sidecar, Some(&ledger), "rejected (4xx)", denied);
+        settle(&sidecar, Some(ledger), "rejected (4xx)", denied);
 
         assert!(path.exists(), "the test's remove refused, so it stays");
-        let left = without_settled(vec![(plain(&path), ())], &load_settled(&ledger));
+        let left = without_settled(vec![(plain(&path), ())], &load_settled(ledger));
         assert!(
             left.is_empty(),
             "a settled sidecar must not be queued again: {left:?}"
@@ -398,17 +391,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("1.json");
         std::fs::write(&path, b"{}").unwrap();
-        let ledger = dir.path().join("crash-verdicts.txt");
+        let ledger = dir.path();
 
         settle(
             &plain(&path),
-            Some(&ledger),
+            Some(ledger),
             "uploaded",
             crash_recorder::Sidecar::remove,
         );
 
         assert!(!path.exists());
-        assert!(!ledger.exists(), "nothing to record for a deleted sidecar");
+        assert!(
+            !ledger.join(crash_recorder::VERDICTS_FILE).exists(),
+            "nothing to record for a deleted sidecar"
+        );
     }
 
     /// A new crash is never mistaken for a settled one: only the recorded
@@ -420,18 +416,18 @@ mod tests {
         let new = dir.path().join("200-2.json");
         std::fs::write(&old, b"{}").unwrap();
         std::fs::write(&new, b"{}").unwrap();
-        let ledger = dir.path().join("crash-verdicts.txt");
+        let ledger = dir.path();
 
         let none = without_settled(
             vec![(plain(&old), ()), (plain(&new), ())],
-            &load_settled(&ledger),
+            &load_settled(ledger),
         );
         assert_eq!(none.len(), 2, "no ledger yet: nothing is skipped");
 
-        settle(&plain(&old), Some(&ledger), "rejected (4xx)", denied);
+        settle(&plain(&old), Some(ledger), "rejected (4xx)", denied);
         let left = without_settled(
             vec![(plain(&old), ()), (plain(&new), ())],
-            &load_settled(&ledger),
+            &load_settled(ledger),
         );
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].0.path(), new);
