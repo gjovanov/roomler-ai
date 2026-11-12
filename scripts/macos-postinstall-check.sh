@@ -104,12 +104,24 @@ case "$sub" in
     print)
         f=$(job "$1")
         [ -f "$f" ] || { echo "Could not find service \"${1##*/}\" in domain" >&2; exit 113; }
-        # One write, as a buffered launchctl makes for an answer this short.
-        # Written line by line, a reader that stops early (`grep -q`) ends the
-        # writer on SIGPIPE, and under the script's pipefail that reads as
-        # "not running" (noted on #3783; whether launchctl can be caught that
-        # way is not known).
-        printf '%s = {\n%s\n}\n' "$1" "$(cat "$f")"
+        if [ -f "$state/in-pieces/$(basename "$f")" ]; then
+            # In pieces, as a launchctl whose answer outgrows one buffer writes
+            # it: the job's lines, then more, each after a real pause. A reader
+            # that stops at the match (`grep -q`) is gone by the next write,
+            # which ends this writer on SIGPIPE (or fails, where SIGPIPE is
+            # ignored), so its status is not 0. A reader that reads to the end
+            # sees the whole answer and a 0.
+            printf '%s = {\n' "$1" || exit
+            while IFS= read -r line; do printf '%s\n' "$line" || exit; done <"$f"
+            for n in 1 2 3 4 5 6 7 8 9 10; do
+                /bin/sleep 0.05
+                printf '\tendpoint %s = {}\n' "$n" || exit
+            done
+            printf '}\n'
+        else
+            # One write, as a buffered launchctl makes for an answer this short.
+            printf '%s = {\n%s\n}\n' "$1" "$(cat "$f")"
+        fi
         ;;
     bootout)
         f=$(job "$1")
@@ -196,6 +208,9 @@ fresh_mac() {
 
 console() { printf '%s' "$1" >"$STATE/console"; }
 loaded() { printf '\tstate = %s\n' "$2" >"$STATE/loaded/$(printf '%s' "$1" | tr '/' '_')"; }
+unloaded() { rm -f "$STATE/loaded/$(printf '%s' "$1" | tr '/' '_')"; }
+# launchctl writes its answer about this job in pieces (see the stand-in).
+in_pieces() { mkdir -p "$STATE/in-pieces"; : >"$STATE/in-pieces/$(printf '%s' "$1" | tr '/' '_')"; }
 marker() { mkdir -p /etc/roomler && touch "/etc/roomler/$1"; }
 enrolled() { mkdir -p /etc/roomler && printf '%s\n' "${1:-}" >/etc/roomler/config.toml; }
 # What an earlier install left: both LaunchDaemons, older than this payload's.
@@ -279,11 +294,35 @@ daemon_reloaded() {
     is_the_payloads "$LD/com.roomler.daemon.plist"
     said "roomler system daemon installed"
 }
+# The update helper's three states, each with what the script must do to it.
+# Loaded and idle: re-cycled, a bootout then a bootstrap on this payload's
+# plist (it clears a latched failed init). The installer smoke no longer
+# re-installs over a loaded helper (#3788), so these cases are CI's only
+# cover of the re-cycle.
 helper_recycled() {
     in_order "$HELPER_OUT" "$HELPER_IN"
+    times_called 1 "$HELPER_OUT"
+    times_called 1 "$HELPER_IN"
     loaded_now system/com.roomler.update
     is_the_payloads "$LD/com.roomler.update.plist"
     said "roomler update helper re-cycled"
+}
+# Not loaded: a bootstrap only, since a bootout has nothing to end.
+helper_bootstrapped() {
+    not_called "$HELPER_OUT"
+    times_called 1 "$HELPER_IN"
+    loaded_now system/com.roomler.update
+    is_the_payloads "$LD/com.roomler.update.plist"
+    said "roomler update helper installed (unattended self-update"
+    not_said "re-cycled"
+}
+# Running: an update is in flight, and the job is this script's own ancestor.
+# A bootout would end the install that is running, so it is never booted out.
+helper_left_running() {
+    not_called "$HELPER_OUT"
+    not_called "$HELPER_IN"
+    loaded_now system/com.roomler.update
+    said "roomler update helper is running (this very install) — leaving it"
 }
 # Nobody signed in: nothing of the person's half, said in the log.
 persons_half_skipped() {
@@ -308,7 +347,7 @@ login_window_two_rows() {
 }
 
 # --- N1: an update at the login window ---------------------------------------
-start "login window: an update reloads the root daemon and re-arms the helper"
+start "login window, helper idle: an update reloads the root daemon and re-cycles the helper"
 login_window_two_rows
 run
 rc_is 0
@@ -318,22 +357,42 @@ helper_recycled
 in_order "$DAEMON_IN" "$HELPER_OUT"
 done_case
 
+start "login window, helper not loaded: an update bootstraps it, with no bootout"
+login_window_two_rows
+unloaded system/com.roomler.update
+run
+rc_is 0
+persons_half_skipped
+daemon_reloaded
+helper_bootstrapped
+done_case
+
 # --- N2: the update helper's own run, nobody signed in ------------------------
-start "login window: the helper that runs this install is left running"
+start "login window, helper running: the helper that runs this install is never booted out"
 login_window_two_rows
 loaded system/com.roomler.update running
 run
 rc_is 0
 persons_half_skipped
 daemon_reloaded
-not_called "$HELPER_OUT"
-not_called "$HELPER_IN"
-loaded_now system/com.roomler.update
-said "roomler update helper is running (this very install) — leaving it"
+helper_left_running
+done_case
+
+# launchctl's answer in pieces: the guard must still read "running". Piped into
+# `grep -q` under pipefail it read "idle" and booted out the running install.
+start "login window, helper running, its answer written in pieces: still never booted out"
+login_window_two_rows
+loaded system/com.roomler.update running
+in_pieces system/com.roomler.update
+run
+rc_is 0
+persons_half_skipped
+daemon_reloaded
+helper_left_running
 done_case
 
 # --- N5: opted out of auto-update ---------------------------------------------
-start "login window: the opt-out marker removes the idle helper"
+start "login window, opted out, helper idle: the opt-out marker removes the helper"
 login_window_two_rows
 marker disable-auto-update
 run
@@ -346,7 +405,7 @@ absent "$LD/com.roomler.update.plist"
 said "roomler update helper REMOVED"
 done_case
 
-start "login window: the opt-out marker leaves a running helper loaded"
+start "login window, opted out, helper running: the opt-out marker leaves it loaded"
 login_window_two_rows
 marker disable-auto-update
 loaded system/com.roomler.update running
@@ -354,6 +413,20 @@ run
 rc_is 0
 daemon_reloaded
 not_called "$HELPER_OUT"
+absent "$LD/com.roomler.update.plist"
+said "the loaded job unloads at next boot"
+done_case
+
+start "login window, opted out, helper running, its answer written in pieces: it stays loaded"
+login_window_two_rows
+marker disable-auto-update
+loaded system/com.roomler.update running
+in_pieces system/com.roomler.update
+run
+rc_is 0
+daemon_reloaded
+not_called "$HELPER_OUT"
+loaded_now system/com.roomler.update
 absent "$LD/com.roomler.update.plist"
 said "the loaded job unloads at next boot"
 done_case
@@ -488,7 +561,7 @@ signed_in_two_rows() {
     loaded system/com.roomler.update "not running"
 }
 
-start "signed in: an update makes the same calls as before #3783"
+start "signed in, helper idle: an update makes the same calls as before #3783 and re-cycles the helper"
 signed_in_two_rows
 run
 rc_is 0
@@ -506,14 +579,33 @@ is_the_payloads "$LA/com.roomler.agent.plist"
 is_the_payloads "$LA/com.roomler.desktop.plist"
 done_case
 
-start "signed in: the helper that runs this install is left running"
+start "signed in, helper not loaded: an update bootstraps it, with no bootout"
+signed_in_two_rows
+unloaded system/com.roomler.update
+run
+rc_is 0
+said "roomlerd installed and started for tester (uid=501)"
+daemon_reloaded
+helper_bootstrapped
+done_case
+
+start "signed in, helper running: the helper that runs this install is never booted out"
 signed_in_two_rows
 loaded system/com.roomler.update running
 run
 rc_is 0
 daemon_reloaded
-not_called "$HELPER_OUT"
-said "roomler update helper is running (this very install) — leaving it"
+helper_left_running
+done_case
+
+start "signed in, helper running, its answer written in pieces: still never booted out"
+signed_in_two_rows
+loaded system/com.roomler.update running
+in_pieces system/com.roomler.update
+run
+rc_is 0
+daemon_reloaded
+helper_left_running
 done_case
 
 start "signed in: the root daemon owns the GUI worker, so the agent's login item goes"

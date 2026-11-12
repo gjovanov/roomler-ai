@@ -631,13 +631,29 @@ fi
 # then re-run the installer (same absence-removes semantics as the daemon
 # marker — the opposite polarity, because the default is the opposite).
 #
-# ⚠️ NEVER bootout a loaded com.roomler.update here: during a self-update
+# ⚠️ NEVER bootout a RUNNING com.roomler.update here: during a self-update
 # THIS script is a grandchild of that very job, and booting it kills the
-# whole process group — `installer` included, mid-payload. Bootstrap only
-# when not yet loaded; a changed plist takes effect at next boot.
+# whole process group — `installer` included, mid-payload. A running helper
+# is left alone and a changed plist takes effect at its next load; only an
+# idle one is re-cycled (below). `update_helper_running` is the one test.
 # ---------------------------------------------------------------------------
 UPDATE_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist"
 UPDATE_PLIST_TARGET="/Library/LaunchDaemons/com.roomler.update.plist"
+
+# Is the helper's job RUNNING now (an update in flight, so the job is this
+# script's own ancestor)? launchctl's whole answer is read first, then
+# matched. #3783: it used to be piped into `grep -q`, which exits at the
+# match; a launchctl still writing then dies of SIGPIPE, and under
+# `set -o pipefail` the failed pipeline read as "not running", the one wrong
+# answer here, since it boots out the job running this install. A job that
+# is not loaded prints nothing, which reads as not running, as before.
+update_helper_running() {
+  UPDATE_STATE=$(launchctl print system/com.roomler.update 2>/dev/null || true)
+  case "$UPDATE_STATE" in
+    *"state = running"*) return 0 ;;
+  esac
+  return 1
+}
 
 # FR-46 — dual-read, and note the SENSE: this is an OPT-OUT. Reading only the
 # current path would install the auto-update helper on a Mac whose operator
@@ -662,7 +678,7 @@ if [ ! -f /etc/roomler/disable-auto-update ] && [ ! -f /etc/roomler-agent/disabl
       # ignoring" — the updater was dead until a manual bootout). A
       # bootout+bootstrap clears the latch AND applies the refreshed plist,
       # so every install ends with a provably-armed updater.
-      if launchctl print system/com.roomler.update 2>/dev/null | grep -q "state = running"; then
+      if update_helper_running; then
         echo "roomler update helper is running (this very install) — leaving it; plist applies at its next load"
       else
         launchctl bootout system/com.roomler.update 2>/dev/null || true
@@ -702,7 +718,7 @@ else
     helper_idle=0
     i=0
     while [ "$i" -lt 10 ]; do
-      if ! launchctl print system/com.roomler.update 2>/dev/null | grep -q "state = running"; then
+      if ! update_helper_running; then
         helper_idle=1
         break
       fi
