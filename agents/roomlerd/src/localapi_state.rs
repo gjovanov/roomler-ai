@@ -1371,40 +1371,42 @@ impl LocalApiState for DaemonState {
             };
         };
         let _guard = lock.lock().await;
+        // FR-84 D4 — `files_dir` names a folder this daemon will WRITE
+        // remote-supplied files into, as the identity it runs under. The
+        // surface's `apply` checks the shape; placement (a SYSTEM/root
+        // writer stays inside the active user's profile — the pipe admits
+        // interactive non-admins) and creatable-and-writable need THIS
+        // process's identity and its disk, so they run here, before
+        // anything is persisted: a refused value is never saved to be
+        // silently ignored at use time, and the reason goes back verbatim.
+        let files = if key == "files_dir" {
+            match crate::files::FilesDirSet::check(value).await {
+                Ok(files) => Some(files),
+                Err(message) => return Response::Error { message },
+            }
+        } else {
+            None
+        };
         let path = path.clone();
         let key = key.to_string();
         let value = value.map(str::to_string);
+        let reseed_files = files.is_some();
         let saved = tokio::task::spawn_blocking(move || {
             let mut cfg =
                 crate::config::load(&path).map_err(|e| format!("loading config: {e:#}"))?;
-            // FR-84 D4 — `files_dir` names a folder this daemon will WRITE
-            // remote-supplied files into, as the identity it runs under. The
-            // surface's `apply` checks the shape; placement (a SYSTEM/root
-            // writer stays inside the active user's profile — the pipe admits
-            // interactive non-admins) and creatable-and-writable need THIS
-            // process's identity and its disk, so they run here, before
-            // anything is persisted: a refused value is never saved to be
-            // silently ignored at use time, and the reason goes back verbatim.
-            if key == "files_dir"
-                && let Some(v) = value.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                crate::files::validate_files_dir_setting(v)?;
-            }
             crate::config_surface::apply(&mut cfg, &key, value.as_deref())?;
             crate::config::save(&path, &cfg).map_err(|e| format!("saving config: {e:#}"))?;
             // FR-84 D4 — `files_dir` is LIVE: every transfer reads the
             // process-global this re-seeds, so the next drop already uses
-            // the new folder. The status answer is recomputed HERE, on the
-            // blocking thread, so the read right after the set shows it.
-            // Only a set OF `files_dir` re-seeds it (#2886): `files.rs` says a
-            // hand edit of the file is picked up at the next start, exactly
-            // as every other key, so a set of some other key must not make
-            // one live — and in a binary of parallel tests, every other
-            // `config_set` was resetting the global under the test that
-            // had just set it (the "re-seeded for the next drop" flake).
-            if key == "files_dir" {
+            // the new folder. Only a set OF `files_dir` re-seeds it (#2886):
+            // `files.rs` says a hand edit of the file is picked up at the
+            // next start, exactly as every other key, so a set of some other
+            // key must not make one live — and in a binary of parallel
+            // tests, every other `config_set` was resetting the global under
+            // the test that had just set it (the "re-seeded for the next
+            // drop" flake).
+            if reseed_files {
                 crate::files::set_files_dir(cfg.files_dir.clone());
-                crate::files::refresh_effective_files_dir();
             }
             let entry = crate::config_surface::entry_for(&cfg, &key)
                 .ok_or_else(|| format!("unknown config key {key:?}"))?;
@@ -1414,6 +1416,11 @@ impl LocalApiState for DaemonState {
         .unwrap_or_else(|e| Err(format!("config set task join: {e}")));
         match saved {
             Ok((entry, cfg)) => {
+                // The status answer is recomputed before the answer, so the
+                // read right after the set shows it.
+                if let Some(files) = files {
+                    files.refresh_status().await;
+                }
                 // Re-seed the LIVE gate-4 flags from what was just written,
                 // still under the write lock. Everything else on this surface
                 // genuinely is restart-required; `exec_enabled` and
