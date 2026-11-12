@@ -221,12 +221,13 @@ PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.agent
 PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
 
 # The login items belong to the person at the console, so that person's own
-# account makes, writes and removes them. `sudo -u` runs the tool with the
-# account's uid, gid and groups, so the system applies that account's rights
-# and nothing more; `launchctl asuser` changes only the bootstrap context, not
-# the uid. `-n`: root needs no password, and nothing may wait on a prompt.
+# account makes, writes and removes them. `sudo -u '#<uid>'` runs the tool with
+# the uid the checks below compare against, and with that account's gid and
+# groups, so the system applies that account's rights and nothing more;
+# `launchctl asuser` changes only the bootstrap context, not the uid. `-n`:
+# root needs no password, and nothing may wait on a prompt.
 as_person() {
-  /usr/bin/sudo -n -u "$CONSOLE_USER" -- "$@"
+  /usr/bin/sudo -n -u "#$CONSOLE_UID" -- "$@"
 }
 
 # A login item as launchd loads it: a regular file, not a link, with one name,
@@ -240,31 +241,67 @@ in_the_way() {
   { [ -L "$1" ] || [ -e "$1" ]; } && ! persons_own_file "$1"
 }
 
-# Place one login item as the person: anything in the way is removed first, so
-# nothing is written through it; an item the person owns is rewritten in place.
-# Placed means a file of the person's with mode 644. Otherwise it says SKIPPED
-# and why, and returns 1: the caller then neither loads the item nor fails.
+# When the folder is why an item cannot be added or removed, say which case it
+# is and the one line the person runs before installing again. Root changes
+# nothing under a home, this folder included. Returns 1, and says nothing, when
+# the folder is the person's own.
+DIR_ERR=""
+folder_not_the_persons() {
+  if [ -L "$LAUNCH_AGENTS_DIR" ]; then
+    echo "  $LAUNCH_AGENTS_DIR is a link, and the login items go only into a folder"
+    echo "  of $CONSOLE_USER's own: make it one, then install again"
+  elif [ ! -e "$LAUNCH_AGENTS_DIR" ]; then
+    echo "  $LAUNCH_AGENTS_DIR is missing, and the account of $CONSOLE_USER could not make it${DIR_ERR:+: $DIR_ERR}"
+    echo "  As $CONSOLE_USER, run this, then install again:"
+    echo "    sudo mkdir -p \"$LAUNCH_AGENTS_DIR\" && sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+  elif [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
+    echo "  $LAUNCH_AGENTS_DIR is not a folder: make it a folder of $CONSOLE_USER's own,"
+    echo "  then install again"
+  elif [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR")" != "$CONSOLE_UID" ]; then
+    echo "  $LAUNCH_AGENTS_DIR belongs to $(stat -f '%Su' "$LAUNCH_AGENTS_DIR" 2>/dev/null || echo 'another account'), not to $CONSOLE_USER,"
+    echo "  so the account of $CONSOLE_USER cannot add or remove an item in it."
+    echo "  As $CONSOLE_USER, run this, then install again:"
+    echo "    sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+  else
+    return 1
+  fi
+}
+
+# Place one login item as the person: anything in the way is removed first
+# where the person's account can remove it, so nothing is written through it;
+# an item the person owns is rewritten in place. Placed means a file of the
+# person's with mode 644. Otherwise it says SKIPPED and why, and returns 1: the
+# caller then neither loads the item nor fails. A rewrite that fails over an
+# item of the person's leaves that item placed, says so in a WARNING, and sets
+# ITEM_STALE=1 for the caller.
+ITEM_STALE=0
 place_login_item() {
-  item_source="$1"; item_target="$2"; item_err=""
-  as_person /bin/mkdir -p "$LAUNCH_AGENTS_DIR" >/dev/null 2>&1 || true
+  item_source="$1"; item_target="$2"; item_err=""; ITEM_STALE=0
+  DIR_ERR=$(as_person /bin/mkdir -p "$LAUNCH_AGENTS_DIR" 2>&1) || true
   if [ -L "$LAUNCH_AGENTS_DIR" ] || [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
-    echo "SKIPPED the login item $item_target: $LAUNCH_AGENTS_DIR is not a folder"
+    echo "SKIPPED the login item $item_target:"
+    folder_not_the_persons || true
     return 1
   fi
   if in_the_way "$item_target"; then
-    as_person /bin/rm -f "$item_target" >/dev/null 2>&1 || true
+    item_err=$(as_person /bin/rm -f "$item_target" 2>&1) || true
   fi
   if in_the_way "$item_target"; then
-    item_err="the account of $CONSOLE_USER could not remove what is at that path"
+    item_err="the account of $CONSOLE_USER could not remove what is at that path${item_err:+: $item_err}"
   else
     item_err=$(as_person /bin/cp "$item_source" "$item_target" 2>&1 &&
-      as_person /bin/chmod 644 "$item_target" 2>&1) || true
+      as_person /bin/chmod 644 "$item_target" 2>&1) || ITEM_STALE=1
   fi
   if persons_own_file "$item_target" && [ "$(stat -f '%Lp' "$item_target")" = 644 ]; then
+    if [ "$ITEM_STALE" = 1 ]; then
+      echo "WARNING: the account of $CONSOLE_USER could not rewrite the login item $item_target,"
+      echo "  so the one already there stays in place: $item_err"
+    fi
     return 0
   fi
   echo "SKIPPED the login item $item_target: it is not a file of $CONSOLE_USER with mode 644"
   [ -z "$item_err" ] || echo "  $item_err"
+  folder_not_the_persons || true
   return 1
 }
 
@@ -279,11 +316,15 @@ if daemon_supervises_gui_worker; then
   # always booted this exact label out as its first act. The change is that we
   # no longer bootstrap it back.
   launchctl bootout "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null || true
-  as_person /bin/rm -f "$PLIST_TARGET" >/dev/null 2>&1 || true
+  rm_err=$(as_person /bin/rm -f "$PLIST_TARGET" 2>&1) || true
   if [ -L "$PLIST_TARGET" ] || [ -e "$PLIST_TARGET" ]; then
-    echo "WARNING: the account of $CONSOLE_USER could not remove $PLIST_TARGET,"
-    echo "  and launchd loads it at the next login. Remove it by hand:"
-    echo "    sudo rm -f $PLIST_TARGET"
+    echo "WARNING: the account of $CONSOLE_USER could not remove \"$PLIST_TARGET\","
+    echo "  so launchd loads it at the next login and the per-user agent comes back."
+    [ -z "$rm_err" ] || echo "  $rm_err"
+    folder_not_the_persons || true
+    echo "  To finish one row by hand (it moves the item aside; it says its plan and"
+    echo "  asks first), run:"
+    echo "    sudo roomlerd one-row"
   fi
   echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID); the GUI worker"
   echo "  is owned by the ROOT DAEMON (macos_supervise_gui_worker = true in"
@@ -304,13 +345,16 @@ else
   # so launchd starts it at the next login regardless. Trading a working install
   # for a launchctl edge case (a session that exists but will not accept a
   # bootstrap) is the wrong way round.
-  if replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
-    echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
-  else
+  if ! replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
     echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
     echo "  bootstrap failed after retries: $BOOTSTRAP_ERR"
     echo "  The plist is in place, so it will start at the next login, or now via:"
     echo "    launchctl bootstrap gui/$CONSOLE_UID $PLIST_TARGET"
+  elif [ "$ITEM_STALE" = 1 ]; then
+    echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), and started on the"
+    echo "  login item that was already there, which this install could not rewrite"
+  else
+    echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
   fi
 fi
 

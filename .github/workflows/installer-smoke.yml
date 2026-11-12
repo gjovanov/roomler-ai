@@ -1670,14 +1670,14 @@ jobs:
           if sudo cmp -s "$scratch" "$RUNNER_TEMP/login-item-expected"; then
             echo "  the link's target holds the bytes it had"
           else
-            echo "::error::the install wrote into the file the companion's login-item link pointed at"
+            echo "::error::the link's target does not hold its bytes"
             fail=1
           fi
           was=$(sudo stat -f '%Su:%Sg:%Lp' "$scratch")
           if [ "$was" = "root:wheel:600" ]; then
             echo "  the link's target keeps owner and mode ($was)"
           else
-            echo "::error::the link's target is now $was; it was root:wheel:600"
+            echo "::error::the link's target is $was, not root:wheel:600"
             fail=1
           fi
           for item in com.roomler.agent.plist com.roomler.desktop.plist; do
@@ -1992,17 +1992,63 @@ jobs:
             || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
           echo "  opt-in restores the helper"
 
-      # The package's script keeps launchctl's error text in a variable, so no
-      # install leaves a file of its own in /tmp.
-      - name: No install left a roomler-*.err file in /tmp
+      # A rewrite that fails over a login item of the person's: the script keeps
+      # the item that is there, still loads it, and says so in a WARNING
+      # instead of "installed and started". The person makes their own item
+      # immutable (uchg), so the person's copy over it fails.
+      - name: A login item the person cannot rewrite is kept, loaded and reported
         run: |
           set -euo pipefail
-          left=$(find /private/tmp -maxdepth 1 -name 'roomler-*.err' 2>/dev/null || true)
-          if [ -n "$left" ]; then
-            echo "::error::left in /tmp after the installs: $left"
+          console_user=$(stat -f "%Su" /dev/console 2>/dev/null || echo "")
+          if [ -z "$console_user" ] || [ "$console_user" = root ]; then
+            echo "::warning::no GUI session on this runner, so there is no login item to read"
+            exit 0
+          fi
+          uid=$(id -u "$console_user")
+          home=$(dscl . -read /Users/"$console_user" NFSHomeDirectory | awk '{print $2}')
+          item="$home/Library/LaunchAgents/com.roomler.agent.plist"
+          test -f "$item" || { echo "::error::no login item at $item to start from"; exit 1; }
+          sudo -u "$console_user" chflags uchg "$item"
+          trap 'sudo -u "$console_user" chflags nouchg "$item" || true' EXIT
+          before=$(sudo wc -l /var/log/install.log | awk '{print $1}')
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          lines=$(sudo tail -n +"$((before + 1))" /var/log/install.log | grep 'postinstall:' || true)
+          echo "--- this install's postinstall lines ---"
+          printf '%s\n' "$lines" | sed 's/^.*postinstall: /    /'
+          fail=0
+          if printf '%s\n' "$lines" | grep -qF "WARNING: the account of $console_user could not rewrite the login item $item"; then
+            echo "  the log carries the WARNING"
+          else
+            echo "::error::the log has no WARNING for the login item that could not be rewritten"
+            fail=1
+          fi
+          if printf '%s\n' "$lines" | grep -qF 'roomlerd installed and started for'; then
+            echo "::error::the log says installed and started, on a login item that could not be rewritten"
+            fail=1
+          else
+            echo "  the log does not say installed and started"
+          fi
+          if launchctl print "gui/$uid/com.roomler.agent" >/dev/null 2>&1; then
+            echo "  com.roomler.agent is loaded in gui/$uid"
+          else
+            echo "::error::com.roomler.agent is not loaded in gui/$uid"
+            fail=1
+          fi
+          exit "$fail"
+
+      # The package's script keeps launchctl's error text in a variable, so no
+      # command in it names a path in /tmp.
+      - name: The package's script names no path in /tmp
+        run: |
+          set -euo pipefail
+          s=agents/roomlerd/packaging/macos/postinstall
+          hits=$(grep -nE '(^|[^[:alnum:]_])(/private)?/tmp/' "$s" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::$s names a path in /tmp:"
+            printf '%s\n' "$hits"
             exit 1
           fi
-          echo "  no roomler-*.err in /tmp"
+          echo "  no command in $s names a path in /tmp"
 
       # FR-6 wave 22 (#773): the job's LAST step. Only a master push
       # publishes, and an unchanged cache is not re-uploaded; see the action.

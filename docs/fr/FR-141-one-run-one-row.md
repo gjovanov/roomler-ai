@@ -59,7 +59,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
 - **The wizard cannot see a Mac's root daemon before it enrolls.** `root_identity::query` answers on Linux only
   (`agents/roomler-setup/src/root_identity.rs:67-79`), so on a Mac that is already one row or supervised the
   wizard would enroll a new person's half and start a LaunchAgent that the package's guard removes
-  (`agents/roomlerd/packaging/macos/postinstall:187-294`). Inferred, never run.
+  (`agents/roomlerd/packaging/macos/postinstall:188-335`). Inferred, never run.
 
 ### Linux today (code)
 
