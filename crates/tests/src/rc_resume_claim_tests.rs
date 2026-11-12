@@ -13,6 +13,8 @@
 //!   reaches resumes it at the next fencing number, or ends it with the reason
 //!   (an end written during the gap, the gate a request runs, the org's
 //!   maximum length, another device's session);
+//! * **a removed device**: its redial is refused at the upgrade, so it claims
+//!   nothing, and its viewer's next rejoin ends the session;
 //! * **fencing**: a late detach from the pod that lost the session does not
 //!   touch the row another pod resumed;
 //! * **the registration read**: a row an earlier connection left open is ended
@@ -22,7 +24,8 @@
 //!   pod left open stays open.
 //!
 //! AC4's bound is asserted where the harness can see it: a claim is answered
-//! within 5 s of the hello that carries it.
+//! within 5 s of the hello that carries it, and a removed device's session
+//! ends within 5 s of its refused redial.
 
 use std::time::{Duration, Instant};
 
@@ -34,6 +37,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::fixtures::seed::SeededTenant;
 use crate::fixtures::test_app::TestApp;
+use crate::rc_resume_rejoin_tests::{rejoin, rejoin_answer};
 
 // FR-138 P1b-2 — the helpers below are shared with `rc_resume_rejoin_tests`,
 // the viewer's half, which drives the same two pods.
@@ -130,6 +134,16 @@ pub(crate) async fn hello_with(
 ) -> Ws {
     let url = format!("ws://{}/ws?token={}&role=agent", app.addr, urlencode(token));
     let (mut ws, _) = connect_async(&url).await.expect("agent ws");
+    ws.send(Message::Text(
+        hello_frame(rpc, kept, max_sessions).to_string().into(),
+    ))
+    .await
+    .expect("the hello");
+    ws
+}
+
+/// The device's `rc:agent.hello`, advertising `rpc` and claiming back `kept`.
+fn hello_frame(rpc: &[&str], kept: &[ObjectId], max_sessions: u8) -> Value {
     let mut hello = json!({
         "t": "rc:agent.hello",
         "machine_name": "fr138 test box",
@@ -145,10 +159,7 @@ pub(crate) async fn hello_with(
     if !kept.is_empty() {
         hello["kept_sessions"] = json!(kept.iter().map(|s| s.to_hex()).collect::<Vec<_>>());
     }
-    ws.send(Message::Text(hello.to_string().into()))
-        .await
-        .expect("the hello");
-    ws
+    hello
 }
 
 /// The next frame of type `t` on `ws` within `within`, or `None`.
@@ -445,6 +456,56 @@ async fn store_max_secs(app: &TestApp, seeded: &SeededTenant, secs: i64) {
         )
         .await
         .unwrap();
+}
+
+/// The agent's `PEER_CLOSE_BUDGET` (`agents/roomlerd/src/signaling.rs`), in
+/// ms: AC4's outer bound is the window plus this.
+const CLOSE_BUDGET_MS: i64 = 5_000;
+
+/// What the server answered a removed device's redial.
+#[derive(Debug)]
+enum Redial {
+    /// Refused before the upgrade, with this HTTP status.
+    Refused(u16),
+    /// Upgraded, then ended by the server, after these frames.
+    Ended(Vec<Value>),
+}
+
+/// The device redials `app` and says hello, advertising `rc-resume` and
+/// claiming back `kept`, as the daemon does; then reads until the server
+/// ends the socket. Panics if the socket is still served after [`WITHIN`].
+async fn redial(app: &TestApp, token: &str, kept: &[ObjectId]) -> Redial {
+    let url = format!("ws://{}/ws?token={}&role=agent", app.addr, urlencode(token));
+    let mut ws = match connect_async(&url).await {
+        Ok((ws, _)) => ws,
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            return Redial::Refused(resp.status().as_u16());
+        }
+        Err(e) => panic!("the redial failed oddly: {e}"),
+    };
+    // The server may have closed the socket already: the send's result is
+    // not the answer, what the socket carries is.
+    let _ = ws
+        .send(Message::Text(
+            hello_frame(&[RESUME], kept, 2).to_string().into(),
+        ))
+        .await;
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + WITHIN;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                    frames.push(v);
+                }
+            }
+            Ok(Some(Ok(Message::Close(_))) | Some(Err(_)) | None) => {
+                return Redial::Ended(frames);
+            }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => panic!("a removed device's socket is still served: {frames:?}"),
+        }
+    }
 }
 
 /// The claim, on the other pod. A live session whose device's control socket
@@ -1067,6 +1128,165 @@ async fn a_controller_removed_from_the_org_during_the_gap_is_refused_at_the_clai
         !r.contains_key("end_source"),
         "a refusal is an end someone saw: {r}"
     );
+}
+
+/// AC4 — the device's removal while its socket is down, through the route the
+/// UI uses (`DELETE …/agent/{id}`, fleet's `delete_agent`), on pod 2 during
+/// the gap, once for each kind of device. Its redial is refused at the
+/// upgrade, so no pod registers it and the claim its hello carries is never
+/// read: an ephemeral device's row is deleted outright and its token is
+/// refused 401 (the daemon's `AuthRejected`, as in the field's cell (b)); a
+/// permanent device's tombstone hears `rc:goodbye agent_deleted`.
+///
+/// Neither the removal nor the refusal writes the detached row: no hub holds
+/// the device, so the removal's kick ends nothing. The viewer's rejoin does.
+/// The page asks once a second while it holds, and the gate it runs (at most
+/// once per 5 s for it) finds the device removed (`resume_gate`): the row ends
+/// `admin_terminated` with no `end_source` (`row_end::revoked`), an end the
+/// server decided, as cell (b) read, and the viewer is told so. The end lands
+/// within 5 s of the refused redial and before the window plus the close
+/// budget, and nothing resumes the session. With no viewer asking, the sweep
+/// ends the row at the window, as `agent_disconnect` with `end_source: sweep`
+/// (`rc_resume_sweep_tests`). The device's half, its kept peer closed at the
+/// refusal, is the agent's unit tests
+/// `a_refused_token_closes_every_peer_kept_ones_included` and
+/// `a_terminal_exit_closes_kept_sessions_too`: the device here holds no peer.
+#[tokio::test]
+async fn a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends() {
+    let (app1, app2) = pair(WINDOW).await;
+    scope_all(&app1).await;
+    for (kind, ephemeral) in [("a permanent device", false), ("an ephemeral device", true)] {
+        let tag = if ephemeral { "eph" } else { "perm" };
+        let seeded = app1.seed_tenant(&format!("fr138gone{tag}")).await;
+        let (agent_id, token) = enroll(&app1, &seeded, &format!("fr138-gone-{tag}")).await;
+        if ephemeral {
+            assert!(
+                app1.state
+                    .fleet()
+                    .agents
+                    .set_ephemeral(agent_id, None)
+                    .await
+                    .unwrap(),
+                "{kind}: marked ephemeral"
+            );
+        }
+
+        let mut agent = hello(&app1, &token, &[RESUME], &[]).await;
+        let (mut ctl, sid) = go_live(&app1, &seeded.admin.access_token, agent_id, &mut agent).await;
+        wait_row(&app1, sid, "the session goes live", open).await;
+        drop_socket(agent).await;
+        let told = next_of(&mut ctl, "rc:session.detached", WITHIN)
+            .await
+            .unwrap_or_else(|| panic!("{kind}: the viewer is told the session is kept"));
+        let resume_by = told["resume_by"].as_i64().expect("resume_by, unix ms");
+        wait_row(&app1, sid, "the row records the detach", detached).await;
+
+        // The viewer holds and asks for the session back, as the page does:
+        // the gate runs, the device is there, so it is told to wait for it.
+        rejoin(&mut ctl, sid).await;
+        let waiting = rejoin_answer(&mut ctl, sid, WITHIN)
+            .await
+            .unwrap_or_else(|| panic!("{kind}: the rejoin is answered"));
+        let gated_at = tokio::time::Instant::now();
+        assert_eq!(
+            waiting["t"], "rc:session.detached",
+            "{kind}: before the removal the viewer waits for the device: {waiting}"
+        );
+        assert_eq!(waiting["resume_by"].as_i64(), Some(resume_by), "{kind}");
+
+        // The removal comes later in the gap, as cell (b)'s came 8 s in, after
+        // the gate's 5 s for this viewer: the asks inside them run no gate.
+        tokio::time::sleep_until(gated_at + Duration::from_millis(5_300)).await;
+        assert!(
+            detached(&row(&app1, sid).await),
+            "{kind}: kept until the removal"
+        );
+        let removed_at = now_ms();
+        let resp = app2
+            .auth_delete(
+                &format!("/api/tenant/{}/agent/{}", seeded.tenant_id, agent_id),
+                &seeded.admin.access_token,
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{kind}: the device is removed");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["deleted"], true, "{kind}: {body}");
+
+        // The device redials, on pod 2, and claims its session back.
+        let answer = redial(&app2, &token, &[sid]).await;
+        let refused_at = now_ms();
+        let refused = Instant::now();
+        match (ephemeral, &answer) {
+            (true, Redial::Refused(status)) => {
+                assert_eq!(*status, 401, "{kind}: its token is refused at the upgrade");
+            }
+            (false, Redial::Ended(frames)) => {
+                assert!(
+                    frames
+                        .iter()
+                        .any(|f| f["t"] == "rc:goodbye" && f["reason"] == "agent_deleted"),
+                    "{kind}: the upgrade says why it refuses: {frames:?}"
+                );
+                assert!(
+                    !frames.iter().any(|f| f["t"] == "rc:agent.resume_window"
+                        || f["session_id"] == sid.to_hex().as_str()),
+                    "{kind}: no window, and no answer to the claim: {frames:?}"
+                );
+            }
+            (_, other) => panic!("{kind}: the redial was answered {other:?}"),
+        }
+        for (pod, app) in [("pod 1", &app1), ("pod 2", &app2)] {
+            let hub = &app.state.fleet().rc_hub;
+            assert!(
+                !hub.is_agent_online(agent_id),
+                "{kind}: {pod} registered the removed device"
+            );
+            assert!(
+                hub.session_snapshot(sid).is_none(),
+                "{kind}: {pod} holds its session"
+            );
+        }
+
+        // The viewer's next ask: the gate finds the device removed.
+        rejoin(&mut ctl, sid).await;
+        let end = rejoin_answer(&mut ctl, sid, WITHIN)
+            .await
+            .unwrap_or_else(|| panic!("{kind}: the rejoin is answered"));
+        assert!(
+            refused.elapsed() < WITHIN,
+            "{kind}: AC4: within 5 s of the refused redial"
+        );
+        assert_eq!(end["t"], "rc:terminate", "{kind}: {end}");
+        assert_eq!(end["reason"], "admin_terminated", "{kind}: {end}");
+
+        let r = wait_row(
+            &app1,
+            sid,
+            &format!("{kind}: the removal ends the row"),
+            ended,
+        )
+        .await;
+        assert_eq!(end_reason(&r), Some("admin_terminated"), "{kind}: {r}");
+        assert!(
+            !r.contains_key("end_source"),
+            "{kind}: an end the server decided, not one it inferred: {r}"
+        );
+        assert_eq!(attach_seq(&r), 0, "{kind}: nothing claimed it: {r}");
+        let ended_at = r.get_datetime("ended_at").unwrap().timestamp_millis();
+        assert!(
+            (removed_at..=refused_at + 5_000).contains(&ended_at),
+            "{kind}: AC4: the end lands after the removal and within 5 s of the refused redial: {r}"
+        );
+        assert!(
+            ended_at <= resume_by + CLOSE_BUDGET_MS,
+            "{kind}: AC4: never later than the window plus the close budget: {r}"
+        );
+        let k = kinds(&wait_audit(&app1, sid, "session_ended").await);
+        assert!(k.iter().any(|k| k == "session_detached"), "{kind}: {k:?}");
+        assert!(!k.iter().any(|k| k == "session_resumed"), "{kind}: {k:?}");
+    }
 }
 
 /// FR-101 — a resumed session keeps the maximum length it went live under:
