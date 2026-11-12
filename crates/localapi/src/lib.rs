@@ -4230,7 +4230,7 @@ async fn accept_pipe(
 // ---- Unix: socket in the per-user runtime dir, chmod 0600 -----------------
 
 /// The LocalAPI socket file name (under the per-user runtime dir).
-#[cfg(unix)]
+#[cfg_attr(not(unix), allow(dead_code))]
 const LOCALAPI_SOCKET_NAME: &str = "roomler.sock";
 
 /// Well-known home for a SYSTEM (root) daemon's control socket.
@@ -4273,6 +4273,57 @@ pub(crate) fn unix_socket_candidates() -> [std::path::PathBuf; 2] {
     [user_socket_path(), system_socket_path()]
 }
 
+/// What `lstat` says about a directory an endpoint could live in, as plain
+/// facts, so the rule that reads them is tested on every platform.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirFacts {
+    pub(crate) is_dir: bool,
+    pub(crate) is_symlink: bool,
+    pub(crate) uid: u32,
+    pub(crate) mode: u32,
+}
+
+/// The per-user endpoint for the account `euid`, from its runtime dir or
+/// its temp dir.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn per_user_socket_path_for(
+    euid: u32,
+    runtime_dir: Option<std::path::PathBuf>,
+    temp_dir: std::path::PathBuf,
+    facts: &dyn Fn(&std::path::Path) -> Option<DirFacts>,
+) -> Option<std::path::PathBuf> {
+    let _ = (euid, facts);
+    Some(match runtime_dir {
+        Some(dir) => dir.join(LOCALAPI_SOCKET_NAME),
+        None => temp_dir.join("roomler").join(LOCALAPI_SOCKET_NAME),
+    })
+}
+
+/// Whether a client running as `caller` keeps a socket whose server runs
+/// as `server`.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn server_uid_trusted(server: u32, caller: u32) -> bool {
+    let _ = (server, caller);
+    true
+}
+
+/// The endpoints a daemon serves: the system socket when it could bind it,
+/// and the per-user one.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn unix_endpoints(
+    system: &std::path::Path,
+    system_bound: bool,
+    per_user: Option<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut endpoints = Vec::new();
+    if system_bound {
+        endpoints.push(system.to_path_buf());
+    }
+    endpoints.extend(per_user);
+    endpoints
+}
+
 /// Bind the daemon's control socket, preferring the SYSTEM path.
 ///
 /// Which path is right depends on whether this process is privileged, and
@@ -4293,21 +4344,24 @@ async fn serve_unix(
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let system = system_socket_path();
-    match prepare_unix_listener(&system) {
+    let bound = prepare_unix_listener(&system);
+    let plan = unix_endpoints(&system, bound.is_ok(), Some(user_socket_path()));
+    match bound {
         Ok(listener) => {
             tracing::info!(
                 path = %system.display(),
                 "localapi: system-daemon socket (privileged); a user session reaches it here"
             );
-            let legacy = user_socket_path();
-            if let Ok(l) = prepare_unix_listener(&legacy) {
-                let st = state.clone();
-                let sd = shutdown.clone();
-                tracing::info!(
-                    path = %legacy.display(),
-                    "localapi: also serving the legacy per-user path (pre-split CLIs)"
-                );
-                tokio::spawn(async move { accept_unix(l, legacy, st, sd).await });
+            for legacy in plan.into_iter().filter(|p| *p != system) {
+                if let Ok(l) = prepare_unix_listener(&legacy) {
+                    let st = state.clone();
+                    let sd = shutdown.clone();
+                    tracing::info!(
+                        path = %legacy.display(),
+                        "localapi: also serving the legacy per-user path (pre-split CLIs)"
+                    );
+                    tokio::spawn(async move { accept_unix(l, legacy, st, sd).await });
+                }
             }
             accept_unix(listener, system, state, shutdown).await
         }
@@ -4316,7 +4370,13 @@ async fn serve_unix(
                 path = %system.display(), error = %e,
                 "localapi: not privileged for the system socket; using the per-user path"
             );
-            serve_unix_at(user_socket_path(), state, shutdown).await
+            match plan.into_iter().next() {
+                Some(path) => serve_unix_at(path, state, shutdown).await,
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "localapi: no per-user endpoint for this account",
+                )),
+            }
         }
     }
 }
@@ -4782,17 +4842,66 @@ pub async fn connect() -> std::io::Result<Client> {
         // invisible to a user session on macOS, where the per-user path lives
         // under ROOT's `/var/folders/…` — the CLI would report "not running"
         // for a daemon that is running perfectly well.
-        let mut last: Option<std::io::Error> = None;
-        for path in unix_socket_candidates() {
-            match connect_unix_at(path).await {
-                Ok(client) => return Ok(client),
-                Err(e) => last = Some(e),
-            }
-        }
-        Err(last.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket")
-        }))
+        // SAFETY: geteuid never fails.
+        let caller = unsafe { libc::geteuid() };
+        connect_first_trusted(unix_socket_candidates().to_vec(), caller, |_, stream| {
+            Ok(stream.peer_cred()?.uid())
+        })
+        .await
     }
+}
+
+/// [`connect`]'s Unix loop: the first of `paths` that answers AND is served
+/// by an account [`server_uid_trusted`] keeps for `caller`. `server_uid`
+/// reads the serving account off a connected stream (the kernel's peer
+/// credentials in production; tests may report another).
+#[cfg(unix)]
+pub(crate) async fn connect_first_trusted<F>(
+    paths: Vec<std::path::PathBuf>,
+    caller: u32,
+    server_uid: F,
+) -> std::io::Result<Client>
+where
+    F: Fn(&std::path::Path, &tokio::net::UnixStream) -> std::io::Result<u32>,
+{
+    let mut last: Option<std::io::Error> = None;
+    let mut refused: Option<std::io::Error> = None;
+    for path in paths {
+        let stream = match tokio::net::UnixStream::connect(&path).await {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        match server_uid(&path, &stream) {
+            Ok(server) if server_uid_trusted(server, caller) => {
+                return Ok(Client::new(Box::new(stream)));
+            }
+            Ok(server) => {
+                let e = untrusted_socket(&path, server, caller);
+                tracing::warn!(error = %e, "localapi: a socket served by another account was not used");
+                refused.get_or_insert(e);
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(refused
+        .or(last)
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no LocalAPI socket")))
+}
+
+/// The refusal for a socket whose server runs as `server`.
+#[cfg(unix)]
+fn untrusted_socket(path: &std::path::Path, server: u32, caller: u32) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is served by uid {server}, which is neither this account (uid {caller}) nor root, \
+             so it was not used",
+            path.display()
+        ),
+    )
 }
 
 /// The OTHER daemon's socket, when this host runs two and [`connect`] would
@@ -4977,6 +5086,51 @@ pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Clien
 pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
     let stream = tokio::net::UnixStream::connect(path).await?;
     Ok(Client::new(Box::new(stream)))
+}
+
+/// [`connect_unix_at`] for a client running as `caller`.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn connect_unix_checked(
+    path: std::path::PathBuf,
+    caller: u32,
+) -> std::io::Result<Client> {
+    connect_first_trusted(vec![path], caller, |_, stream| {
+        Ok(stream.peer_cred()?.uid())
+    })
+    .await
+}
+
+/// Whether a client running as the account `caller_sid` keeps a pipe whose
+/// owner is `owner_sid` (both as `S-1-…` text).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pipe_owner_trusted(owner_sid: &str, caller_sid: &str) -> bool {
+    let _ = (owner_sid, caller_sid);
+    true
+}
+
+/// The access a pipe client asks for.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+const PIPE_CLIENT_ACCESS: u32 =
+    windows_sys::Win32::Foundation::GENERIC_READ | windows_sys::Win32::Foundation::GENERIC_WRITE;
+
+/// The flags a pipe client opens with.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+const PIPE_CLIENT_FLAGS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
+    | windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT
+    | windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
+/// [`connect_windows_at`] for a client running as the account `caller_sid`.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn connect_windows_checked(
+    pipe_name: &str,
+    caller_sid: &str,
+) -> std::io::Result<Client> {
+    let _ = caller_sid;
+    connect_windows_at(pipe_name).await
 }
 
 /// FR-97 P2g — [`connect_unix_at`], kept only when the process serving the
@@ -9711,6 +9865,497 @@ mod tests {
         sd_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── who may serve a LocalAPI endpoint (#3736) ───────────────────
+
+    /// A client keeps a socket only when its own account or root serves it.
+    #[test]
+    fn a_socket_another_account_serves_is_not_trusted() {
+        assert!(!server_uid_trusted(1001, 1000), "another person's socket");
+        assert!(!server_uid_trusted(65534, 1000), "nobody's socket");
+        assert!(
+            !server_uid_trusted(1000, 0),
+            "root never keeps a person's socket"
+        );
+    }
+
+    /// Controls: the caller's own per-user daemon and the root daemon.
+    #[test]
+    fn the_callers_own_account_and_root_are_trusted() {
+        assert!(server_uid_trusted(1000, 1000), "the caller's own daemon");
+        assert!(server_uid_trusted(0, 1000), "the system daemon");
+        assert!(server_uid_trusted(0, 0), "root reaching the system daemon");
+    }
+
+    /// A directory only `uid` owns and writes.
+    fn private_dir_facts(uid: u32) -> DirFacts {
+        DirFacts {
+            is_dir: true,
+            is_symlink: false,
+            uid,
+            mode: 0o040700,
+        }
+    }
+
+    /// `/tmp`: root's, and every account may write it.
+    const SHARED_TEMP: DirFacts = DirFacts {
+        is_dir: true,
+        is_symlink: false,
+        uid: 0,
+        mode: 0o041777,
+    };
+
+    /// The per-user candidate of `euid` whose own directory is `dir`, read
+    /// from the field this OS takes it from: the runtime dir off macOS, the
+    /// per-user temp folder on macOS.
+    fn per_user_candidate(euid: u32, dir: &str, facts: DirFacts) -> Option<std::path::PathBuf> {
+        let lstat = move |_: &std::path::Path| Some(facts);
+        if cfg!(target_os = "macos") {
+            per_user_socket_path_for(euid, None, dir.into(), &lstat)
+        } else {
+            per_user_socket_path_for(euid, Some(dir.into()), "/tmp".into(), &lstat)
+        }
+    }
+
+    #[test]
+    fn a_root_caller_with_no_runtime_dir_has_no_per_user_candidate() {
+        let shared = |_: &std::path::Path| Some(SHARED_TEMP);
+        assert_eq!(
+            per_user_socket_path_for(0, None, "/tmp".into(), &shared),
+            None,
+            "never a path under the shared temp dir"
+        );
+        let own = |_: &std::path::Path| Some(private_dir_facts(0));
+        assert_eq!(
+            per_user_socket_path_for(0, None, "/var/folders/zz/T".into(), &own),
+            None,
+            "root goes straight to the system socket"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_the_per_user_candidate_is_the_runtime_dir_only() {
+        let own = |_: &std::path::Path| Some(private_dir_facts(1000));
+        assert_eq!(
+            per_user_socket_path_for(1000, None, "/tmp".into(), &own),
+            None,
+            "no runtime dir: no temp-dir fallback"
+        );
+        assert_eq!(
+            per_user_socket_path_for(1000, Some("/run/user/1000".into()), "/tmp".into(), &own),
+            Some("/run/user/1000/roomler.sock".into())
+        );
+    }
+
+    #[test]
+    fn the_per_user_dir_is_the_callers_own_and_private() {
+        let (dir, expected) = if cfg!(target_os = "macos") {
+            (
+                "/var/folders/ab/cd/T",
+                "/var/folders/ab/cd/T/roomler/roomler.sock",
+            )
+        } else {
+            ("/run/user/1000", "/run/user/1000/roomler.sock")
+        };
+        assert_eq!(
+            per_user_candidate(1000, dir, private_dir_facts(1000)),
+            Some(expected.into()),
+            "its own, 0700"
+        );
+        for (facts, why) in [
+            (private_dir_facts(1001), "another account's directory"),
+            (
+                private_dir_facts(0),
+                "root's directory is not this account's",
+            ),
+            (
+                DirFacts {
+                    mode: 0o040770,
+                    ..private_dir_facts(1000)
+                },
+                "group-writable",
+            ),
+            (
+                DirFacts {
+                    mode: 0o040702,
+                    ..private_dir_facts(1000)
+                },
+                "world-writable",
+            ),
+            (SHARED_TEMP, "a shared temp dir"),
+            (
+                DirFacts {
+                    is_dir: false,
+                    is_symlink: true,
+                    ..private_dir_facts(1000)
+                },
+                "a link",
+            ),
+            (
+                DirFacts {
+                    is_dir: false,
+                    ..private_dir_facts(1000)
+                },
+                "not a directory",
+            ),
+        ] {
+            assert_eq!(per_user_candidate(1000, dir, facts), None, "{why}");
+        }
+        let missing = |_: &std::path::Path| None;
+        let gone = if cfg!(target_os = "macos") {
+            per_user_socket_path_for(1000, None, dir.into(), &missing)
+        } else {
+            per_user_socket_path_for(1000, Some(dir.into()), "/tmp".into(), &missing)
+        };
+        assert_eq!(gone, None, "a directory that is not there");
+    }
+
+    #[test]
+    fn the_system_daemon_serves_no_endpoint_under_the_temp_dir() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        let shared = |_: &std::path::Path| Some(SHARED_TEMP);
+        let root_per_user = per_user_socket_path_for(0, None, "/tmp".into(), &shared);
+        assert_eq!(
+            unix_endpoints(system, true, root_per_user),
+            vec![system.to_path_buf()],
+            "the system socket alone"
+        );
+        assert_eq!(
+            unix_endpoints(system, true, Some("/run/user/0/roomler.sock".into())),
+            vec![system.to_path_buf()],
+            "no second, per-user endpoint beside it"
+        );
+    }
+
+    #[test]
+    fn a_daemon_with_no_private_dir_serves_no_endpoint() {
+        let system = std::path::Path::new("/var/run/roomler/roomler.sock");
+        let shared = |_: &std::path::Path| Some(SHARED_TEMP);
+        // No runtime dir off macOS; a shared temp folder on macOS.
+        let per_user = per_user_socket_path_for(1000, None, "/tmp".into(), &shared);
+        assert!(
+            unix_endpoints(system, false, per_user).is_empty(),
+            "nothing in a shared temp dir"
+        );
+        // Control: a per-user daemon with its own runtime dir serves there.
+        let own: std::path::PathBuf = "/run/user/1000/roomler.sock".into();
+        assert_eq!(unix_endpoints(system, false, Some(own.clone())), vec![own]);
+    }
+
+    /// A directory for one test's sockets: this account's, 0700.
+    #[cfg(unix)]
+    fn test_socket_dir(tag: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("roomler-3736-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// Serve the mock daemon on `path` until the sender flips.
+    #[cfg(unix)]
+    async fn serve_mock_at(
+        path: std::path::PathBuf,
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let (tx, rx) = watch::channel(false);
+        let state: Arc<dyn LocalApiState> = Arc::new(Mock);
+        let p = path.clone();
+        let srv = tokio::spawn(async move { serve_unix_at(p, state, rx).await });
+        for _ in 0..200 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (tx, srv)
+    }
+
+    /// A listener that accepts and never answers, as a socket that is not
+    /// the daemon's might.
+    #[cfg(unix)]
+    fn hold_silently(listener: tokio::net::UnixListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        })
+    }
+
+    /// The real kernel credentials, for a caller that is NOT the account
+    /// serving the socket. (As root the server would be root, which every
+    /// caller keeps: the root-only test below covers a real other uid.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connect_refuses_a_socket_another_account_serves() {
+        // SAFETY: geteuid never fails.
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            return;
+        }
+        let dir = test_socket_dir("refuse");
+        let path = dir.join("roomler.sock");
+        let (tx, srv) = serve_mock_at(path.clone()).await;
+        let caller = me.wrapping_add(4242).max(1);
+        let refused = connect_unix_checked(path.clone(), caller).await;
+        let e = refused
+            .err()
+            .expect("a socket another account serves is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        let text = e.to_string();
+        assert!(
+            text.contains(&path.display().to_string()) && text.contains(&format!("uid {me}")),
+            "names the path and the serving uid: {text}"
+        );
+        // Control: the account that serves it keeps it.
+        let mut client = connect_unix_checked(path.clone(), me)
+            .await
+            .expect("its own account's socket");
+        assert_eq!(client.status().await.unwrap().name, "devbox");
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The loop: a socket served by another account is skipped, and the
+    /// client goes on to the next candidate, the system socket in
+    /// production. The serving uid of the first is reported as another
+    /// account's (that read is the seam); the second is read from the kernel.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_socket_falls_through_to_the_next_candidate() {
+        // SAFETY: geteuid never fails.
+        let me = unsafe { libc::geteuid() };
+        let other = me.wrapping_add(4242).max(1);
+        let dir = test_socket_dir("fallthrough");
+        let first = dir.join("first.sock");
+        let second = dir.join("second.sock");
+        let silent = hold_silently(tokio::net::UnixListener::bind(&first).unwrap());
+        let (tx, srv) = serve_mock_at(second.clone()).await;
+        let reported = |p: &std::path::Path, s: &tokio::net::UnixStream| {
+            if p == first {
+                Ok(other)
+            } else {
+                Ok(s.peer_cred()?.uid())
+            }
+        };
+        let mut client = connect_first_trusted(vec![first.clone(), second.clone()], me, &reported)
+            .await
+            .expect("the next candidate is reached");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), client.status())
+            .await
+            .expect("answered by the second socket, not the silent first")
+            .unwrap();
+        assert_eq!(status.name, "devbox");
+        // With nothing else to try, the refusal is what the caller hears.
+        let e = connect_first_trusted(vec![first.clone()], me, &reported)
+            .await
+            .err()
+            .expect("only a refused socket: an error");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains(&format!("uid {other}")), "{e}");
+        silent.abort();
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bind and listen on `path` with THIS thread's effective uid switched to
+    /// `uid`, then switch back. A raw `setresuid` changes only the calling
+    /// thread, and the real and saved uids stay root's, so the way back is
+    /// allowed. The kernel records the listener's credentials at `listen()`.
+    #[cfg(target_os = "linux")]
+    fn listen_as(
+        path: &std::path::Path,
+        uid: u32,
+    ) -> std::io::Result<std::os::unix::net::UnixListener> {
+        const KEEP: libc::c_long = -1;
+        // SAFETY: the raw syscall changes only this thread's ids.
+        if unsafe { libc::syscall(libc::SYS_setresuid, KEEP, uid as libc::c_long, KEEP) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let bound = std::os::unix::net::UnixListener::bind(path);
+        // SAFETY: as above; the saved uid is root's.
+        let back = unsafe { libc::syscall(libc::SYS_setresuid, KEEP, 0 as libc::c_long, KEEP) };
+        assert_eq!(back, 0, "this thread is root again");
+        bound
+    }
+
+    /// Root only (CI's sudo step; skipped otherwise, unless
+    /// `ROOMLERD_TEST_REQUIRE_ROOT` says it must run): a socket a real other
+    /// uid serves is refused by the kernel's credentials, and the client
+    /// still reaches root's socket after it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn as_root_a_socket_another_uid_serves_is_refused_and_roots_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid never fails.
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(
+                std::env::var_os("ROOMLERD_TEST_REQUIRE_ROOT").is_none(),
+                "ROOMLERD_TEST_REQUIRE_ROOT is set: this test must run as root"
+            );
+            return;
+        }
+        const NOBODY: u32 = 65534;
+        let dir = std::env::temp_dir().join(format!("roomler-3736-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(dir.join("other"), std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let other = dir.join("other").join("roomler.sock");
+        let system = dir.join("roomler.sock");
+        let o = other.clone();
+        let std_listener = std::thread::spawn(move || listen_as(&o, NOBODY))
+            .join()
+            .unwrap()
+            .expect("listen as another uid");
+        std_listener.set_nonblocking(true).unwrap();
+        let silent = hold_silently(tokio::net::UnixListener::from_std(std_listener).unwrap());
+        let (tx, srv) = serve_mock_at(system.clone()).await;
+
+        let e = connect_unix_checked(other.clone(), 0)
+            .await
+            .err()
+            .expect("another uid's socket is refused");
+        assert!(e.to_string().contains(&format!("uid {NOBODY}")), "{e}");
+        let mut client = connect_first_trusted(vec![other.clone(), system.clone()], 0, |_, s| {
+            Ok(s.peer_cred()?.uid())
+        })
+        .await
+        .expect("root's socket is reached");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), client.status())
+            .await
+            .expect("answered by root's socket")
+            .unwrap();
+        assert_eq!(status.name, "devbox");
+        silent.abort();
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), srv).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A client keeps a pipe only when SYSTEM, the Administrators group or
+    /// its own account owns it.
+    #[test]
+    fn a_pipe_another_account_owns_is_not_trusted() {
+        let person = "S-1-5-21-1-2-3-1000";
+        assert!(
+            !pipe_owner_trusted("S-1-5-21-1-2-3-1001", person),
+            "another person's pipe"
+        );
+        assert!(!pipe_owner_trusted("S-1-5-19", person), "LocalService");
+        assert!(
+            !pipe_owner_trusted(person, "S-1-5-18"),
+            "SYSTEM never keeps a person's pipe"
+        );
+        assert!(
+            !pipe_owner_trusted("", person),
+            "an owner that could not be read"
+        );
+        assert!(
+            !pipe_owner_trusted("", ""),
+            "two unknowns are not one account"
+        );
+    }
+
+    /// Controls: SYSTEM's, the Administrators group's and the caller's own.
+    #[test]
+    fn system_administrators_and_the_callers_own_pipe_are_trusted() {
+        let person = "S-1-5-21-1-2-3-1000";
+        assert!(pipe_owner_trusted("S-1-5-18", person), "SYSTEM");
+        assert!(pipe_owner_trusted("S-1-5-32-544", person), "Administrators");
+        assert!(pipe_owner_trusted(person, person), "the caller's own");
+        assert!(pipe_owner_trusted("S-1-5-18", "S-1-5-18"), "SYSTEM's own");
+    }
+
+    /// This process's own account, as `S-1-…` text.
+    #[cfg(windows)]
+    fn own_sid() -> String {
+        process_token(std::process::id())
+            .and_then(|t| t.sid)
+            .expect("this process's SID")
+    }
+
+    /// Serve the mock daemon once on a pipe that `owner_sid` owns.
+    #[cfg(windows)]
+    fn serve_pipe_owned_by(pipe: &str, owner_sid: &str) -> tokio::task::JoinHandle<()> {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let mut sec = PipeSecurity::new(&format!("O:{owner_sid}D:(A;;GA;;;WD)")).unwrap();
+        // SAFETY: `sec` outlives the create, and the kernel copies the descriptor.
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(pipe, sec.as_ptr())
+        }
+        .unwrap();
+        tokio::spawn(async move {
+            let _sec = sec;
+            if server.connect().await.is_ok() {
+                let _ = serve_connection(server, &Mock).await;
+            }
+        })
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn connect_refuses_a_pipe_another_account_owns() {
+        let me = own_sid();
+        let pipe = format!(r"\\.\pipe\roomler-test-3736-other-{}", std::process::id());
+        let _srv = serve_pipe_owned_by(&pipe, &me);
+        let e = connect_windows_checked(&pipe, "S-1-5-21-1-2-3-4242")
+            .await
+            .err()
+            .expect("a pipe another account owns is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+        let text = e.to_string();
+        assert!(
+            text.contains(&pipe) && text.contains(&me),
+            "names the pipe and its owner: {text}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn connect_keeps_a_pipe_its_own_account_owns() {
+        let me = own_sid();
+        let pipe = format!(r"\\.\pipe\roomler-test-3736-own-{}", std::process::id());
+        let _srv = serve_pipe_owned_by(&pipe, &me);
+        let mut client = connect_windows_checked(&pipe, &me)
+            .await
+            .expect("its own account's pipe");
+        assert_eq!(client.status().await.unwrap().name, "devbox");
+    }
+
+    /// The pipe client asks for reading and writing data, nothing that
+    /// creates an instance or changes the pipe, at identification level, so
+    /// the server can tell who it is and never act as it.
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_client_opens_with_read_and_write_data_at_identification_level() {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_APPEND_DATA, FILE_FLAG_OVERLAPPED, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+            FILE_WRITE_EA, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        };
+        assert_eq!(PIPE_CLIENT_ACCESS, GENERIC_READ | FILE_WRITE_DATA);
+        assert_eq!(
+            PIPE_CLIENT_ACCESS
+                & (GENERIC_WRITE | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA),
+            0,
+            "never the create-instance right, nor a right to change the pipe"
+        );
+        assert_eq!(
+            PIPE_CLIENT_FLAGS,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION
+        );
     }
 
     // ─── srflx health ────────────────────────────────────────────────
