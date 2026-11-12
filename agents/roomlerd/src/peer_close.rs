@@ -27,18 +27,22 @@ pub(crate) const PEER_CLOSE_CEILING: Duration = Duration::from_secs(60);
 
 /// `pc.close()` on a task of its own, bounded by [`PEER_CLOSE_CEILING`]. A
 /// caller that stops waiting no longer cuts the close short: it runs to the
-/// end, and says so when that end came past the budget, or never came. The
-/// close's own result goes back to a caller still waiting for it.
+/// end, and says so when that end came past the budget, in a panic, or never
+/// came. Its own result goes back to a caller still waiting for it.
 pub(crate) async fn close(
     pc: Arc<RTCPeerConnection>,
     session: bson::oid::ObjectId,
 ) -> Result<(), webrtc::Error> {
     let started = Instant::now();
     let close = tokio::spawn(async move {
-        let result = tokio::time::timeout(PEER_CLOSE_CEILING, pc.close()).await;
+        // A panic is caught here, not where the task is joined: a caller past
+        // its budget has dropped the handle, and the panic reached stderr only.
+        let closing = std::panic::AssertUnwindSafe(pc.close());
+        let closing = futures::FutureExt::catch_unwind(closing);
+        let result = tokio::time::timeout(PEER_CLOSE_CEILING, closing).await;
         let took_ms = started.elapsed().as_millis() as u64;
         match result {
-            Ok(result) => {
+            Ok(Ok(result)) => {
                 if took_ms > PEER_CLOSE_BUDGET.as_millis() as u64 {
                     info!(
                         session = %session,
@@ -47,6 +51,24 @@ pub(crate) async fn close(
                     );
                 }
                 result
+            }
+            // What the close had not reached yet stays alive, and a service
+            // has no stderr to read the panic from.
+            Ok(Err(payload)) => {
+                let panic = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                warn!(
+                    session = %session,
+                    took_ms,
+                    %panic,
+                    "peer close panicked — what it did not reach stays alive (#3716)"
+                );
+                Err(webrtc::Error::new(format!(
+                    "the peer's close panicked: {panic}"
+                )))
             }
             Err(_) => {
                 warn!(
@@ -58,27 +80,6 @@ pub(crate) async fn close(
             }
         }
     });
-    match close.await {
-        Ok(result) => result,
-        // The close panicked: what it had not reached yet stays alive, and the
-        // panic itself went only to stderr, which a service has nowhere.
-        Err(e) if e.is_panic() => {
-            let payload = e.into_panic();
-            let panic = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_default();
-            warn!(
-                session = %session,
-                %panic,
-                "peer close panicked — what it did not reach stays alive (#3716)"
-            );
-            Err(webrtc::Error::new(format!(
-                "the peer's close panicked: {panic}"
-            )))
-        }
-        // The runtime going down, which takes the rest with it.
-        Err(_) => Ok(()),
-    }
+    // A JoinError is the runtime going down, which takes the rest with it.
+    close.await.unwrap_or(Ok(()))
 }
