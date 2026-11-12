@@ -136,6 +136,10 @@ pub mod media_plan;
 /// heartbeat's new fields and the session's summary.
 pub mod media_window;
 pub mod mem_trim;
+/// #3716 — a peer whose media path is dead when it closes still frees
+/// everything it holds.
+#[cfg(test)]
+mod peer_close_tests;
 pub mod power;
 pub mod remote_config;
 pub mod unenrolled;
