@@ -471,7 +471,10 @@ impl HeldPath {
 
     /// The leaf was there, SYSTEM's or Administrators', and this walk sealed
     /// it in place: what an earlier build left in it is still there, and a
-    /// site scrubs the names it uses ([`HeldPath::keep_only_plain`]).
+    /// site scrubs the names it uses ([`HeldPath::keep_only_plain`]) in the
+    /// same call. A process that ends between the seal and the scrub leaves
+    /// a sealed folder no later walk scrubs: an earlier record keeps the DACL
+    /// it had, as before FR-145, and every act below it is still by handle.
     pub fn resealed(&self) -> bool {
         self.resealed
     }
