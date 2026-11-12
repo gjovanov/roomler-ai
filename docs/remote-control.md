@@ -250,7 +250,7 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
 > - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3859`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:458`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1466`, `delegate.rs:1510`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4844`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1466`, `delegate.rs:1510`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4874`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -2696,7 +2696,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   with its protections: public keys only, 16 per user (the oldest goes first), 256 users. They are why a later
   `enforce` can ask only about a browser the device has never met.
 - **A config does not move by itself** (#3387). A SystemContext worker runs the machine's own enrollment and
-  nothing else ([`pick_config_path`, `app.rs:1109`](../agents/roomlerd/src/app.rs#L1109)), so no daemon copies a
+  nothing else ([`pick_config_path`, `app.rs:1111`](../agents/roomlerd/src/app.rs#L1111)), so no daemon copies a
   person's config, or its `peer-auth/`, to the machine-global path any more: the copy after a healthy run and the
   key adoption #3096 added to it are gone. A key is read from its file or made there
   ([`load_or_make`, `peer_auth.rs:681`](../agents/roomlerd/src/peer_auth.rs#L681)). An administrator who moves an
@@ -6067,7 +6067,7 @@ wedged.
 
 | Log | Written by | Lives |
 |---|---|---|
-| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:1832`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
+| `<msi>.log` | the first attempt (`next_msi_log`, `agents/roomlerd/src/updater.rs:1833`) | next to the MSI, until the startup sweep removes the staging dir, 1 h or more later |
 | `<msi>.2.log`, `<msi>.3.log` | each later attempt on the same path | the same |
 | `<log_dir>/msi-wedged.log` | the watcher, copied before its retry (`keep_wedged_log`, `agents/roomlerd/src/post_install.rs:629`) | until the next wedge moves it to `msi-wedged.prev.log` |
 
@@ -6153,7 +6153,7 @@ is the one table that decides, on every start:
 | How the last run ended | Who can say | `PreviousRun` | Counts |
 |---|---|---|---|
 | It marked itself clean (`mark_clean_shutdown`) or reached `CLEAN_RUN_THRESHOLD_SECS=300` (`record_clean_run_at`) | `last_run_unhealthy` is false | `Clean` | no |
-| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1089)) | `EndedByItsHost` | no |
+| Its service host watched it end, and that was not the worker failing: exit 0, a requested restart, the agent deleted, a session teardown (`0x40010004`), or the host ended it itself | the SCM host, by `run --prior-end <word>` ([`worker_end_is_no_crash`](../agents/roomlerd/src/win_service/supervisor.rs#L1093)) | `EndedByItsHost` | no |
 | The OS restarted during it: a restart, a power cut, a kernel fault | `last_run_boot` differs from [`boot_id::current`](../crates/agent-core/src/boot_id.rs#L17) | `EndedWithTheOs` | no |
 | Anything else: a kill, an access violation, a panic, a stall | nobody | `Crashed` | **yes** |
 | Either boot unknown, and no word from a host | nobody | `Crashed` | **yes** |
@@ -6187,7 +6187,7 @@ which has no API (`boot_id.rs`). Measured on a Win11 guest: the registry's
 copy and KUSER both read 7 before three restarts and 10 after.
 
 ⚠️ **The bookkeeping runs after preflight**
-([`agents/roomlerd/src/app.rs:4269`](../agents/roomlerd/src/app.rs#L4269),
+([`agents/roomlerd/src/app.rs:4299`](../agents/roomlerd/src/app.rs#L4299),
 a 15 s budget). A daemon that dies before it is not counted, and marks
 nothing. This is the one crash loop the ladder cannot see.
 
@@ -6225,7 +6225,7 @@ again. That flag reads "handled" on Windows, where nothing is attempted.
 It is cleared by `record_clean_run_at`, so one sentinel per clean-run
 cycle. The rest depends on whether the installer here can go back at
 all (`updater::ROLLBACK_CAN_DOWNGRADE`,
-[`agents/roomlerd/src/updater.rs:1621`](../agents/roomlerd/src/updater.rs#L1621), #3289):
+[`agents/roomlerd/src/updater.rs:1622`](../agents/roomlerd/src/updater.rs#L1622), #3289):
 
 | Platform | What it does | Read |
 |---|---|---|
@@ -6683,8 +6683,8 @@ sequenceDiagram
   wall clock. On the vmtest guest whose clock had been corrected backwards by
   nine hours, the 0.4.132 orphan read as nine hours *younger* than the host that
   replaced it, so an "older than this host" rule would have left it running.
-- **When it runs.** Once before the first spawn (`supervisor.rs:1444`). Again in
-  the `Stop` arm (`supervisor.rs:1586`) before it gives up: if that pass ended an
+- **When it runs.** Once before the first spawn (`supervisor.rs:1448`). Again in
+  the `Stop` arm (`supervisor.rs:1590`) before it gives up: if that pass ended an
   orphan, the supervisor respawns instead of stopping.
 - **How the orphan ends.** `TerminateProcess` through the handle it was read
   with, waited on for up to 5 s (`terminate_and_wait`, `orphan.rs:353`).

@@ -98,7 +98,7 @@ in-process rather than running one command it could hand to `sudo`, so there is
 nothing to escalate. A per-user tarball install therefore never updated (#2046)
 until FR-96 gave it a root helper ([below](#the-update-half-of-a-per-user-install-fr-96)).
 The `.deb`'s ladder for a non-root daemon is `pkexec`, then `sudo -n`
-(`updater.rs:1874-1888`).
+(`updater.rs:1875-1889`).
 
 1. Extract to a staging dir under the same filesystem as `/usr`.
 2. **Assert the expected members exist** before touching anything installed —
@@ -132,7 +132,7 @@ its own updater's next check installed the release a second time.
 Since #2724, on Linux, the command restarts the daemon running beside it once its
 install has completed, the way `roomler restart` does
 (`restart_daemon_beside_self_update`, `agents/roomlerd/src/app.rs:6422`, called
-at `app.rs:6369`):
+at `app.rs:6399`):
 
 ```mermaid
 sequenceDiagram
@@ -551,8 +551,8 @@ FR-117 P1 gives it the daemon's version through the same owner, trust path and c
 | Host | Who moves the companion | When |
 |---|---|---|
 | system install | the root daemon, inside `run_periodic` (`agents/roomlerd/src/updater.rs:3238`) | after every check that installs nothing; at the start after an update (`:3126`, the cooldown would otherwise make it wait the full interval); after an operator's push (`:3177`) |
-| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3805`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
-| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3054`, `package_needs_sync`) |
+| per-user install, helper enabled | `roomlerd update-helper` (`updater.rs:3806`) | every run, BEFORE the install cooldown: the run the daemon's restart wakes right after an update is exactly the one that must move it |
+| per-user daemon itself | nobody: it cannot install | at its start, a skew it can see wakes the helper (`updater.rs:3055`, `package_needs_sync`) |
 | non-root daemon, no helper | nobody | one INFO line, never a password prompt |
 
 - **In the updater's loop, never beside it.** The daemon's own install and the companion's run in

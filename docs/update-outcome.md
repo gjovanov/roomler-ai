@@ -33,7 +33,7 @@ reading was wrong about which mattered:
 | | What | Fixed |
 |---|---|---|
 | 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:288`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
-| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2656`) |
+| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2657`) |
 
 ## 2. The record
 
@@ -212,7 +212,7 @@ $ roomler status
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
   /usr/bin/roomlerd reports roomlerd 0.4.172)` on the watcher's stdout
-  (`post_install_watch_cmd`, `app.rs:2514`), which journald captured on a
+  (`post_install_watch_cmd`, `app.rs:2544`), which journald captured on a
   systemd host, beside the watcher's `post-install watcher started` tracing
   line on its stderr. This is the line the P7 field log read on 2026-10-19
   and the rows of §7 read on 10-26; it was the only reader before P3.

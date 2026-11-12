@@ -563,7 +563,7 @@ file is a *normal* answer for that caller.
 
 | Reader | For | When the file is absent or unreadable |
 |---|---|---|
-| `config::load` (`crates/agent-core/src/config.rs:3480`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3524`) |
+| `config::load` (`crates/agent-core/src/config.rs:3478`) | the config the process **runs on** | promotes `config.toml.prev` if it parses — ERROR *"…RECOVERED from the previous good copy"*, and the host carries on; with no usable previous copy, ERROR *"…the host must be re-enrolled"* (`:3522`) |
 | `config::read_if_present` (`:3554`) | a **probe** for a file that may legitimately not exist | `None`, and at most a `debug!` |
 
 ```mermaid
@@ -845,7 +845,7 @@ Details worth knowing:
   step that ran the installer for one started without elevation) and
   `roomlerd enroll --machine-global` take the machine folder and
   `%PROGRAMDATA%\roomler` for Administrators before they save
-  (`crates/agent-core/src/config.rs:4592`): the repair takes over nothing
+  (`crates/agent-core/src/config.rs:4590`): the repair takes over nothing
   another account owns, and a person's daemon may have made both to stage
   received files before the service ever ran. The folder's owner and nothing
   else; for `%PROGRAMDATA%\roomler` its owner, and what it inherits derived
@@ -1454,7 +1454,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1953`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1649`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1652`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7841`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7874`)
 pin the role per command and the end line of a failure.
