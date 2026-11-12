@@ -416,7 +416,7 @@ What it leaves as it was:
   fatal goodbye and a duplicate-instance loser. Nothing waits on them, and a
   purge they cut short would have no next start behind it. A requested restart
   waits too, because `purge_after_daemon` runs the whole purge before it
-  (`agents/roomlerd/src/app.rs:1310`, `:1307`).
+  (`agents/roomlerd/src/app.rs:1310`, `:1317`).
 - Linux waits as before. A daemon outside systemd (a container, a hand run)
   would leave `resolvectl revert` running beside its replacement's steer, and
   the link config dies with `roomler0` anyway. macOS has nothing to purge.
