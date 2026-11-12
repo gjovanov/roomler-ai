@@ -241,27 +241,61 @@ in_the_way() {
   { [ -L "$1" ] || [ -e "$1" ]; } && ! persons_own_file "$1"
 }
 
+# A command printed below for the person to run with sudo, on a path under the
+# home, is printed only when this holds: the person at the console is an
+# administrator of this Mac, so they run it for themselves, and the path names
+# the folder it reads as (the home an absolute path to a real folder, its
+# Library a real folder of the person's own, neither a link). Root only tests
+# and reads here. Call it only as an `if` condition. Where it does not hold,
+# no command is printed and the message names the section of the docs.
+INSTALL_DOC="docs/installation.md, section \"Which account each step of the package's script writes as\""
+sudo_line_fits() {
+  /usr/sbin/dseditgroup -o checkmember -m "$CONSOLE_USER" admin >/dev/null 2>&1 || return 1
+  case "$CONSOLE_HOME" in /*[!/]) ;; *) return 1 ;; esac
+  { [ ! -L "$CONSOLE_HOME" ] && [ -d "$CONSOLE_HOME" ]; } || return 1
+  { [ ! -L "$CONSOLE_HOME/Library" ] && [ -d "$CONSOLE_HOME/Library" ]; } || return 1
+  [ "$(stat -f '%u' "$CONSOLE_HOME/Library" 2>/dev/null)" = "$CONSOLE_UID" ]
+}
+no_command_line() {
+  echo "  It has to be a folder of $CONSOLE_USER's own before the next install;"
+  echo "  see $INSTALL_DOC."
+}
+
 # When the folder is why an item cannot be added or removed, say which case it
-# is and the one line the person runs before installing again. Root changes
-# nothing under a home, this folder included. Returns 1, and says nothing, when
-# the folder is the person's own.
+# is and, where `sudo_line_fits`, the one line the person runs before
+# installing again. Root changes nothing under a home, this folder included.
+# Returns 1, and says nothing, when the folder is the person's own.
 DIR_ERR=""
 folder_not_the_persons() {
-  if [ -L "$LAUNCH_AGENTS_DIR" ]; then
-    echo "  $LAUNCH_AGENTS_DIR is a link, and the login items go only into a folder"
-    echo "  of $CONSOLE_USER's own: make it one, then install again"
+  if [ "${CONSOLE_HOME#/}" = "$CONSOLE_HOME" ]; then
+    # The folder's path is then not under a home at all: name the home.
+    echo "  The home of $CONSOLE_USER could not be read as an absolute path, so no"
+    echo "  login item can go under it; see $INSTALL_DOC."
+  elif [ -L "$LAUNCH_AGENTS_DIR" ]; then
+    echo "  $LAUNCH_AGENTS_DIR is a link, not a folder."
+    no_command_line
   elif [ ! -e "$LAUNCH_AGENTS_DIR" ]; then
     echo "  $LAUNCH_AGENTS_DIR is missing, and the account of $CONSOLE_USER could not make it${DIR_ERR:+: $DIR_ERR}"
-    echo "  As $CONSOLE_USER, run this, then install again:"
-    echo "    sudo mkdir -p \"$LAUNCH_AGENTS_DIR\" && sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+    if sudo_line_fits; then
+      echo "  $CONSOLE_USER is an administrator of this Mac and can run this, then install again:"
+      echo "    sudo mkdir -p \"$LAUNCH_AGENTS_DIR\" && sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+    else
+      no_command_line
+    fi
   elif [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
-    echo "  $LAUNCH_AGENTS_DIR is not a folder: make it a folder of $CONSOLE_USER's own,"
-    echo "  then install again"
+    echo "  $LAUNCH_AGENTS_DIR is not a folder."
+    no_command_line
   elif [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR")" != "$CONSOLE_UID" ]; then
     echo "  $LAUNCH_AGENTS_DIR belongs to $(stat -f '%Su' "$LAUNCH_AGENTS_DIR" 2>/dev/null || echo 'another account'), not to $CONSOLE_USER,"
     echo "  so the account of $CONSOLE_USER cannot add or remove an item in it."
-    echo "  As $CONSOLE_USER, run this, then install again:"
-    echo "    sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+    # chown follows a link, and hands over whatever the folder is: only a real
+    # folder of root's (this branch is past the link and not-a-folder tests).
+    if [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR" 2>/dev/null)" = 0 ] && sudo_line_fits; then
+      echo "  $CONSOLE_USER is an administrator of this Mac and can run this, then install again:"
+      echo "    sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+    else
+      no_command_line
+    fi
   else
     return 1
   fi
@@ -272,8 +306,9 @@ folder_not_the_persons() {
 # an item the person owns is rewritten in place. Placed means a file of the
 # person's with mode 644. Otherwise it says SKIPPED and why, and returns 1: the
 # caller then neither loads the item nor fails. A rewrite that fails over an
-# item of the person's leaves that item placed, says so in a WARNING, and sets
-# ITEM_STALE=1 for the caller.
+# item of the person's leaves that item placed, says so in a WARNING (which
+# says it may be incomplete where the person's `cmp` does not find it equal to
+# this package's), and sets ITEM_STALE=1 for the caller.
 ITEM_STALE=0
 place_login_item() {
   item_source="$1"; item_target="$2"; item_err=""; ITEM_STALE=0
@@ -295,7 +330,11 @@ place_login_item() {
   if persons_own_file "$item_target" && [ "$(stat -f '%Lp' "$item_target")" = 644 ]; then
     if [ "$ITEM_STALE" = 1 ]; then
       echo "WARNING: the account of $CONSOLE_USER could not rewrite the login item $item_target,"
-      echo "  so the one already there stays in place: $item_err"
+      if as_person /usr/bin/cmp -s "$item_source" "$item_target" >/dev/null 2>&1; then
+        echo "  so the one already there stays in place: $item_err"
+      else
+        echo "  and the one there does not compare equal to this package's, so it may be incomplete: $item_err"
+      fi
     fi
     return 0
   fi
@@ -321,11 +360,16 @@ if daemon_supervises_gui_worker; then
     echo "WARNING: the account of $CONSOLE_USER could not remove \"$PLIST_TARGET\","
     echo "  so launchd loads it at the next login and the per-user agent comes back."
     [ -z "$rm_err" ] || echo "  $rm_err"
-    folder_not_the_persons || true
-    echo "  To remove only this item by hand, run: sudo rm -f \"$PLIST_TARGET\""
-    echo "  To finish one row by hand (it moves the item aside; it says its plan and"
-    echo "  asks first), run:"
-    echo "    sudo roomlerd one-row"
+    folder_said=0
+    if folder_not_the_persons; then folder_said=1; fi
+    # Through a link in the folder's place, rm acts in another folder: the
+    # line is printed only for a real folder.
+    if [ ! -L "$LAUNCH_AGENTS_DIR" ] && [ -d "$LAUNCH_AGENTS_DIR" ] && sudo_line_fits; then
+      echo "  $CONSOLE_USER is an administrator of this Mac and can remove only this item with:"
+      echo "    sudo rm -f \"$PLIST_TARGET\""
+    elif [ "$folder_said" = 0 ]; then
+      echo "  See $INSTALL_DOC."
+    fi
   fi
   echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID); the GUI worker"
   echo "  is owned by the ROOT DAEMON (macos_supervise_gui_worker = true in"
@@ -350,7 +394,7 @@ else
     echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
     echo "  bootstrap failed after retries: $BOOTSTRAP_ERR"
     echo "  The plist is in place, so it will start at the next login, or now via:"
-    echo "    launchctl bootstrap gui/$CONSOLE_UID $PLIST_TARGET"
+    echo "    launchctl bootstrap gui/$CONSOLE_UID \"$PLIST_TARGET\""
   elif [ "$ITEM_STALE" = 1 ]; then
     echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), and started on the"
     echo "  login item that was already there, which this install could not rewrite"

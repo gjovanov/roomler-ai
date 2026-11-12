@@ -2022,6 +2022,14 @@ jobs:
             echo "::error::the log has no WARNING for the login item that could not be rewritten"
             fail=1
           fi
+          # Every install in this job writes the item from this same package, so
+          # the person's cmp finds the kept item equal to the package's.
+          if printf '%s\n' "$lines" | grep -qF 'so the one already there stays in place'; then
+            echo "  the WARNING says the item there stays in place (equal to the package's)"
+          else
+            echo "::error::the WARNING does not say that the item there stays in place, though it is the package's own"
+            fail=1
+          fi
           if printf '%s\n' "$lines" | grep -qF 'roomlerd installed and started for'; then
             echo "::error::the log says installed and started, on a login item that could not be rewritten"
             fail=1
@@ -2042,6 +2050,7 @@ jobs:
         run: |
           set -euo pipefail
           s=agents/roomlerd/packaging/macos/postinstall
+          test -f "$s" || { echo "::error::$s is missing, so there is nothing to read"; exit 1; }
           hits=$(grep -nE '(^|[^[:alnum:]_])(/private)?/tmp/' "$s" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
           if [ -n "$hits" ]; then
             echo "::error::$s names a path in /tmp:"
