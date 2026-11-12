@@ -29,7 +29,7 @@ updates, and not one recorded an outcome.
 **1. The watcher waits for its own parent to die, and that death is what kills it.**
 
 `install_tarball_linux` completes the entire install **synchronously** and returns
-`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2062`). That pid is
+`Ok(std::process::id())` — *the daemon's own pid* (`updater.rs:2063`). That pid is
 handed to the watcher as `--installer-pid`, and `watch()` calls
 `wait_for_pid(installer_pid, INSTALLER_BUDGET)` unconditionally
 (`post_install.rs:294`), polling `kill(pid, 0)` for up to 600 s
@@ -44,7 +44,7 @@ nothing being waited *for*: the install finished before the watcher existed. The
 **2. The cgroup teardown then removes any chance of finishing.** Both packaged
 units ship with no `KillMode` (`packaging/linux/roomlerd.service`,
 `roomler.service`) ⇒ systemd's default `control-group`. `spawn_watcher` launches
-the watcher as a plain child (`updater.rs:2437`) on the reasoning that it "is
+the watcher as a plain child (`updater.rs:2438`) on the reasoning that it "is
 reparented to init and runs to completion on its own" — but reparenting to PID 1
 does not leave the cgroup. `docs/fr/FR-36-wayland-capture.md:371` already recorded
 this exact lesson for a different subsystem.
@@ -125,7 +125,7 @@ flowchart LR
 |---|---|
 | The wire word, `LastInstallStatus` — the six words a record can hold, spelled as the file spells them (`WatcherStopped` since #3302), plus `Absent` and `Unreadable`, and the 25 min line past which an `InProgress` never reported | `crates/localapi/src/lib.rs:536`; `NodeStatus.last_install`, `:476` |
 | The read, fresh from disk every time, of the newest record in the two dirs `outcome_paths` lists (#3302) | `post_install::last_install_status` (`agents/roomlerd/src/post_install.rs:1450`), its pure half `summarize` (`:1469`) |
-| The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4226`) |
+| The startup line and its level | `log_at_startup` (`:1281`), `startup_level` (`:1265`); called right after `agent starting` (`agents/roomlerd/src/app.rs:4256`) |
 | The status answer | `DaemonState::status` (`agents/roomlerd/src/localapi_state.rs:995`) |
 | The `last update` line, one sentence per word | `last_install_line` (`agents/roomler-cli/src/localclient.rs:2898`), printed under `version` (`:2497`) |
 
@@ -187,7 +187,7 @@ sequenceDiagram
 | Piece | Where |
 |---|---|
 | The word, per connection | `AgentCaps::update_mode` (`crates/remote_control/src/models.rs:360`); `UpdateRefusal` and `update_refusal()` (`:576`, `:1255`) |
-| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5709`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:2924`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:2906`), else `self` |
+| Computed from the two facts the `UpdateNow` arm checks (`agents/roomlerd/src/signaling.rs:5709`) | `updater::update_mode` (`agents/roomlerd/src/updater.rs:2925`): `primary_org` on a secondary enrollment, `off` when no trigger is installed (`:2907`), else `self` |
 | Stamped at **every** announcement | `stub_caps` (`signaling.rs:7078`, `:7094`) |
 | Refused up front | `device_refusal` (`crates/modules/fleet/src/agent.rs:1729`): a 409 on one device (`:1776`), a `refused` row with its `refused_code` in a bulk (`:1908`) |
 | Shown before the click | `ui/src/utils/updateRefusal.ts`; `AgentsSection.vue` disables "Update now" with the reason and lists those devices in the Update-all dialog |

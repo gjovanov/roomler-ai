@@ -15,7 +15,7 @@ Claims about behaviour were checked against the code at `5f126955b` plus
 
 Every self-update ends in a verdict. The updater spawns a **post-install
 watcher** beside the installer (`updater::spawn_installer_with_watch`,
-`agents/roomlerd/src/updater.rs:1735` → `spawn_watcher`, `:2714`), the watcher
+`agents/roomlerd/src/updater.rs:1736` → `spawn_watcher`, `:2714`), the watcher
 waits the installer out where there is anything to wait for, runs the new
 binary's `--version`, and writes a typed record to `<log_dir>/last-install.json`
 (`post_install::watch`, `agents/roomlerd/src/post_install.rs:297`).
@@ -33,7 +33,7 @@ reading was wrong about which mattered:
 | | What | Fixed |
 |---|---|---|
 | 1 | Both Linux install paths complete **inside the daemon** (the tarball path inline, the `.deb` path `wait()`ing on `apt-get`), so the pid handed to the watcher was the daemon's own or a corpse. Polling it made the watcher's only exit condition **its parent's death**, which is also what tears down the unit's cgroup (`KillMode=control-group`) and kills it | P1, #1400: `should_wait_for_installer` skips the wait for an install that already finished (`post_install.rs:288`); #1457 dropped the 2 s settle for the same case, the whole remaining window |
-| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2656`) |
+| 2 | On the `.deb` path there was **no watcher to kill**: `apt` replaces `/usr/bin/roomlerd`, the running image is unlinked, `current_exe()` reads `/usr/bin/roomlerd (deleted)`, and `Command::spawn` on that path fails ENOENT. 21 `post-install watcher spawn failed` in seven days against zero `post-install watcher started` | P2, #1427: `strip_deleted_suffix` recovers the path and the spawn refuses a path that is not there (`updater.rs:2657`) |
 
 ## 2. The record
 
@@ -165,7 +165,7 @@ record's file. Two topologies split roles:
   would report as `NEVER REPORTED` had a SystemContext worker read it.
   ⚠️ **Under SystemContext the worker and its watcher log apart.** The
   worker takes the `service-logs` role (S1b,
-  `agents/roomlerd/src/app.rs:1553`). The watcher it spawns has none and
+  `agents/roomlerd/src/app.rs:1583`). The watcher it spawns has none and
   writes the record into SYSTEM's profile. Read on a per-machine guest, a
   real self-update from candidate 0.4.220 to 0.4.221 left the record
   `InProgress` in SYSTEM's profile past the clean-run threshold, with no
@@ -204,7 +204,7 @@ $ roomler status
   the sentence per word, `last_install_line`, `:2887`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
-  called from `run_cmd`, `agents/roomlerd/src/app.rs:4226`). `journalctl -u
+  called from `run_cmd`, `agents/roomlerd/src/app.rs:4256`). `journalctl -u
   roomlerd -g "last install"`, `roomler logs --grep "last install"`, or the
   dashboard's log viewer, since WARN lines ride the centralized upload. The
   level is `startup_level`'s (`:1265`): the two quiet states and a watcher
@@ -212,7 +212,7 @@ $ roomler status
 - **The watcher's own line — a surface that ends at 0.4.176.** Written as
   the verdict lands: `post-install verdict: SucceededVerified (new binary at
   /usr/bin/roomlerd reports roomlerd 0.4.172)` on the watcher's stdout
-  (`post_install_watch_cmd`, `app.rs:2514`), which journald captured on a
+  (`post_install_watch_cmd`, `app.rs:2544`), which journald captured on a
   systemd host, beside the watcher's `post-install watcher started` tracing
   line on its stderr. This is the line the P7 field log read on 2026-10-19
   and the rows of §7 read on 10-26; it was the only reader before P3.
@@ -228,7 +228,7 @@ $ roomler status
   altogether** — the same inherited pipe kept the exec's reader from EOF and
   made the outgoing worker overrun its stop budget — so `spawn_watcher` gives
   it `/dev/null` for all three on every platform (`without_caller_stdio`,
-  `agents/roomlerd/src/updater.rs:2684`, called at `:2785`). From the first
+  `agents/roomlerd/src/updater.rs:2685`, called at `:2785`). From the first
   update a 0.4.176+ daemon spawns, the journal shows the daemon's own
   `post-install watcher spawned` line and nothing from the watcher; the
   verdict reaches the record file and P3's two readers, and nothing else.

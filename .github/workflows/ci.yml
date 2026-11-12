@@ -1642,11 +1642,14 @@ jobs:
       # whose tests otherwise run only on Linux and on the Mac's machine id.
       # #3230 — and the installer log of the per-Machine MSI's own steps, a
       # Windows log, whose folder test is `cfg(windows)`.
+      # #3702 — and the machine's folders and the service account's profile as
+      # the system names them, the one-time folder move's gate and its link
+      # refusal: `appdirs`' Windows tests run in no other lane.
       - name: The per-user launcher and its stderr on Windows — clippy + unit tests (#3292)
         if: ${{ !cancelled() }}
         run: |
           cargo clippy -p roomlerdw -p roomler-node-core --all-targets -- -D warnings
-          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log
+          cargo test -p roomler-node-core --lib -- logging::tests::stderr_capture logging::tests::installer_log appdirs::tests
       - name: LocalAPI on Windows — clippy + unit tests (FR-92 P10b)
         if: ${{ !cancelled() }}
         run: |

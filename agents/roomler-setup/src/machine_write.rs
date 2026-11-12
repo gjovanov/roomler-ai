@@ -942,7 +942,7 @@ mod tests {
                 );
                 assert!(icacls(&dir, &["/reset"]), "{}", dir.display());
             }
-            run_the_child(THIS_TEST, root.path(), &program_data);
+            run_the_child(THIS_TEST, root.path());
         }
 
         /// G7, the same install on a host where a person's daemon staged a
@@ -975,7 +975,7 @@ mod tests {
                 );
             }
             let staging_owner = owner(&sddl(&staging));
-            run_the_child(PERSON_TEST, root.path(), &program_data);
+            run_the_child(PERSON_TEST, root.path());
             assert_eq!(
                 owner(&sddl(&staging)),
                 staging_owner,
@@ -1011,7 +1011,7 @@ mod tests {
                 std::fs::write(&file, planted).unwrap();
                 set_dacl(&file, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
             }
-            run_the_child(PLANTED_TEST, root.path(), &program_data);
+            run_the_child(PLANTED_TEST, root.path());
             assert!(
                 !folder.join("config.toml.prev").exists(),
                 "no .prev is kept"
@@ -1030,12 +1030,12 @@ mod tests {
             program_data
         }
 
-        /// Run `test` in a child process whose `%ProgramData%` is the stand-in.
-        fn run_the_child(test: &str, root: &Path, program_data: &Path) {
+        /// Run `test` in a child process that takes the stand-in under `root` for
+        /// the machine's `ProgramData` ([`the_wizard_and_its_step`]).
+        fn run_the_child(test: &str, root: &Path) {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([test, "--exact", "--nocapture", "--test-threads=1"])
                 .env(ROOT, root)
-                .env("PROGRAMDATA", program_data)
                 .output()
                 .unwrap();
             let said = format!(
@@ -1048,6 +1048,9 @@ mod tests {
         }
 
         fn the_wizard_and_its_step(root: &Path) {
+            // The stand-in `stand_in` made, before anything names the machine
+            // tree.
+            roomler_node_core::appdirs::test_fixture::program_data_is(root.join("ProgramData"));
             let config_path = roomlerd::config::machine_global_config_path();
             assert!(
                 config_path.starts_with(root),

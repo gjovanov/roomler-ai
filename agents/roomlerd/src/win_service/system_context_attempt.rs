@@ -144,13 +144,13 @@ impl Attempt {
     }
 }
 
-/// Location where attempts are persisted. `%PROGRAMDATA%\roomler\` on
-/// Windows; the parent directory is created on first write.
+/// Location where attempts are persisted: `C:\ProgramData\roomler\`, the
+/// machine's folder as the system names it
+/// ([`crate::appdirs::machine_program_data`]); the parent directory is created
+/// on first write.
 pub fn path() -> PathBuf {
-    let base = std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("roomler")
+    crate::appdirs::machine_program_data()
+        .join("roomler")
         .join("last-system-context-attempt.json")
 }
 
@@ -355,6 +355,59 @@ mod tests {
         let s = p.to_string_lossy().to_lowercase();
         assert!(s.contains("roomler"));
         assert!(s.ends_with("last-system-context-attempt.json"));
+    }
+
+    /// #3702 — the machine's folders, as a step on the service account names
+    /// them, come from the system: the same test in a child process whose
+    /// variables name other folders, as another account's environment would,
+    /// reads the same answer.
+    #[test]
+    fn the_machine_folders_a_step_names_come_from_the_system() {
+        const ANSWER: &str = "ROOMLER_TEST_MACHINE_ROOTS=";
+        const CHILD: &str = "ROOMLER_TEST_MACHINE_ROOTS_CHILD";
+        let roots = vec![
+            crate::appdirs::machine_global_dir(),
+            path(),
+            crate::updater::install_dir_with_name(
+                crate::updater::WindowsInstallFlavour::PerMachine,
+                crate::updater::INSTALL_FOLDER_NAME,
+            )
+            .unwrap_or_default(),
+        ];
+        #[cfg(feature = "system-context")]
+        let roots = {
+            let mut roots = roots;
+            roots.push(crate::system_context::peer_presence::marker_path());
+            roots
+        };
+        let answer = format!("{ANSWER}{roots:?}");
+        if std::env::var_os(CHILD).is_some() {
+            println!("{answer}");
+            return;
+        }
+        assert!(!answer.contains("poison"), "{answer}");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "win_service::system_context_attempt::tests::the_machine_folders_a_step_names_come_from_the_system",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        for name in [
+            "ProgramData",
+            "ALLUSERSPROFILE",
+            "ProgramFiles",
+            "ProgramW6432",
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+        ] {
+            child.env(name, r"C:\poison");
+        }
+        let out = child.output().unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout);
+        assert!(printed.contains(&answer), "{printed}");
     }
 
     fn rec(command: &str, stage: Stage) -> Attempt {

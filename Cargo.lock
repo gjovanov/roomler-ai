@@ -8760,6 +8760,7 @@ dependencies = [
  "serde_ignored",
  "serde_json",
  "sha2 0.10.9",
+ "syn 2.0.117",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

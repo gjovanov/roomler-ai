@@ -1096,7 +1096,9 @@ enum ServiceAction {
 ///    - the machine-global `%PROGRAMDATA%` config, when it opens: the
 ///      canonical one, readable before anyone signs in;
 ///    - else the SYSTEM profile's own config (`roomlerd enroll` run as SYSTEM
-///      without `--machine-global`), when it opens;
+///      without `--machine-global`), when it lies in the service account's
+///      own profile as the system names it (`system_profile`,
+///      `appdirs::system_profile`) and opens;
 ///    - else the machine-global path, so `config::load` fails with an honest
 ///      "not found" naming where the machine's enrollment belongs.
 ///
@@ -1111,6 +1113,7 @@ fn pick_config_path(
     is_system_context: bool,
     machine_global: Option<&std::path::Path>,
     default: &std::path::Path,
+    system_profile: &std::path::Path,
     opens: impl Fn(&std::path::Path) -> bool,
 ) -> PathBuf {
     if let Some(p) = explicit {
@@ -1120,7 +1123,7 @@ fn pick_config_path(
         if opens(mg) {
             return mg.to_path_buf();
         }
-        if opens(default) {
+        if roomlerd::appdirs::in_windows_folder(default, system_profile) && opens(default) {
             return default.to_path_buf();
         }
         return mg.to_path_buf();
@@ -1174,6 +1177,7 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
             is_sc,
             Some(machine_global.as_path()),
             &default,
+            &roomlerd::appdirs::system_profile(),
             |p| match roomlerd::win_service::supervisor::rung(&tree, switches, p) {
                 Ok(()) => true,
                 Err(roomler_node_core::machine_tree::Refusal::NotPrivate(why)) => {
@@ -1199,10 +1203,16 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     #[cfg(not(all(feature = "system-context", target_os = "windows")))]
     {
         // No SystemContext + no machine-global config concept on this
-        // build — the ladder collapses to `explicit > default`.
-        Ok(pick_config_path(explicit, false, None, &default, |p| {
-            std::fs::File::open(p).is_ok()
-        }))
+        // build — the ladder collapses to `explicit > default`, and the
+        // service account's profile is never asked for.
+        Ok(pick_config_path(
+            explicit,
+            false,
+            None,
+            &default,
+            &default,
+            |p| std::fs::File::open(p).is_ok(),
+        ))
     }
 }
 
@@ -1352,6 +1362,11 @@ fn shut_down_runtime(rt: tokio::runtime::Runtime) {
 /// than dropped (#2718, [`shut_down_runtime`]).
 #[cfg(not(all(target_os = "macos", feature = "viewer-indicator-macos")))]
 pub fn main() -> Result<()> {
+    // #3702 — on the service account, the process's folder variables are the
+    // machine's and the service account's own, before this process has a
+    // second thread: the runtime below starts its workers.
+    #[cfg(target_os = "windows")]
+    roomlerd::appdirs::pin_system_folders(roomlerd::win_token::own_user_sid().as_deref());
     if let Some(code) = answer_stall_watch_cost() {
         std::process::exit(code);
     }
@@ -1506,6 +1521,9 @@ async fn daemon_main() -> Result<()> {
     #[cfg(target_os = "windows")]
     let _timer_guard = win_timer::TimerResolutionGuard::request_1ms();
 
+    // Reads no appdirs: every default of `Cli` is a constant.
+    let cli = Cli::parse();
+
     // RETIRED-NAME-ANCHOR: a migration note names BOTH halves by necessity.
     // docs/fr/FR-21
     // S1b — one-shot legacy-tree migration (`roomler-agent` → `roomler`).
@@ -1513,12 +1531,26 @@ async fn daemon_main() -> Result<()> {
     // before ANY appdirs consumer (segment decisions are OnceLock-cached per
     // process). Skipped while the desktop companion is running — it may hold
     // open handles in the tree; the read-both resolution keeps everything
-    // working until the next start retries.
+    // working until the next start retries. #3702 — it runs only for the
+    // account that owns the folders: never in an installer step, and only
+    // over folders in the profile (on Unix the home) the system names for
+    // the account this process runs as.
     #[cfg(target_os = "windows")]
     let companion_running = roomlerd::companion::desktop_running();
     #[cfg(not(target_os = "windows"))]
     let companion_running = false;
-    roomlerd::appdirs::migrate_legacy_trees(companion_running);
+    let installer_step =
+        cfg!(target_os = "windows") && cli.command.as_ref().is_some_and(is_installer_step);
+    #[cfg(target_os = "windows")]
+    let own_profile = roomlerd::win_token::own_user_sid()
+        .and_then(|sid| roomlerd::appdirs::profile_of_account(&sid));
+    #[cfg(unix)]
+    let own_profile = roomlerd::appdirs::own_home();
+    roomlerd::appdirs::migrate_legacy_trees(
+        companion_running,
+        installer_step,
+        own_profile.as_deref(),
+    );
 
     // Same one-shot, same reason, different axis: a Linux SYSTEM install's
     // config belongs at `/etc/roomler/config.toml` (what the packaged unit
@@ -1526,9 +1558,7 @@ async fn daemon_main() -> Result<()> {
     // or any config read, and before logging::init, so it collects notes the
     // same way.
     #[cfg(target_os = "linux")]
-    roomlerd::appdirs::migrate_system_config();
-
-    let cli = Cli::parse();
+    roomlerd::appdirs::migrate_system_config(own_profile.as_deref());
 
     // S1b — the SCM service host, netd, the SystemContext worker and the
     // per-Machine MSI's own steps log into the machine-global `service-logs`
@@ -8293,6 +8323,12 @@ mod tests {
 
     // ─── rc.52: config-path resolution ladder ──────────────────────────────
 
+    /// The service account's profile the ladder's cases are given, as the
+    /// system names it on a stock install.
+    fn system_profile() -> &'static Path {
+        Path::new(r"C:\Windows\System32\config\systemprofile")
+    }
+
     #[test]
     // RETIRED-NAME-ANCHOR-BEGIN
     // These cases feed the PRE-RENAME machine-global config path on purpose: that is
@@ -8311,6 +8347,7 @@ mod tests {
                 r"C:\ProgramData\roomler\roomler-agent\config.toml",
             )),
             Path::new(r"C:\Users\u\AppData\config.toml"),
+            system_profile(),
             |_| true, // everything opens — explicit still wins
         );
         assert_eq!(got, explicit);
@@ -8320,7 +8357,7 @@ mod tests {
     fn pick_config_path_system_context_prefers_machine_global() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, |_| true);
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |_| true);
         assert_eq!(got, mg);
     }
 
@@ -8330,7 +8367,9 @@ mod tests {
         // machine-global path even if it exists.
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Users\u\AppData\config.toml");
-        let got = pick_config_path(None, false, Some(mg), default, |p| p == mg || p == default);
+        let got = pick_config_path(None, false, Some(mg), default, system_profile(), |p| {
+            p == mg || p == default
+        });
         assert_eq!(got, default);
     }
 
@@ -8352,7 +8391,7 @@ mod tests {
                     || (p == default && bits & 2 != 0)
                     || (p == person && bits & 4 != 0)
             };
-            let got = pick_config_path(None, true, Some(mg), default, on);
+            let got = pick_config_path(None, true, Some(mg), default, system_profile(), on);
             assert_ne!(got, person, "opens bits {bits:03b}");
             assert!(
                 got == mg || got == default,
@@ -8360,7 +8399,9 @@ mod tests {
             );
         }
         // The case the person's rung served: only the person's config is there.
-        let got = pick_config_path(None, true, Some(mg), default, |p| p == person);
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |p| {
+            p == person
+        });
         assert_eq!(got, mg);
     }
 
@@ -8372,10 +8413,17 @@ mod tests {
     fn pick_config_path_system_context_names_the_machine_path_when_nothing_exists() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, |_| false);
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |_| false);
         assert_eq!(got, mg);
         let user_default = Path::new(r"C:\Users\u\AppData\Roaming\roomler\config.toml");
-        let got = pick_config_path(None, false, Some(mg), user_default, |_| false);
+        let got = pick_config_path(
+            None,
+            false,
+            Some(mg),
+            user_default,
+            system_profile(),
+            |_| false,
+        );
         assert_eq!(got, user_default);
     }
 
@@ -8386,8 +8434,30 @@ mod tests {
     fn pick_config_path_system_context_keeps_the_system_profile_rung() {
         let mg = Path::new(r"C:\ProgramData\roomler\roomler-agent\config.toml");
         let default = Path::new(r"C:\Windows\System32\config\systemprofile\config.toml");
-        let got = pick_config_path(None, true, Some(mg), default, |p| p == default);
+        let got = pick_config_path(None, true, Some(mg), default, system_profile(), |p| {
+            p == default
+        });
         assert_eq!(got, default);
+    }
+
+    /// #3702 — the second rung is the SYSTEM profile's own config, and only
+    /// that: a SystemContext process whose profile config resolves anywhere
+    /// else names the machine path, whatever opens there.
+    #[test]
+    fn pick_config_path_system_context_takes_a_profile_config_only_in_the_system_profile() {
+        let mg = Path::new(r"C:\ProgramData\roomler\roomler\config.toml");
+        let elsewhere = Path::new(r"C:\Users\u\AppData\Roaming\roomler\roomler\config\config.toml");
+        let got = pick_config_path(None, true, Some(mg), elsewhere, system_profile(), |p| {
+            p == elsewhere
+        });
+        assert_eq!(got, mg);
+        // The same config in the service account's own profile, named in
+        // another case, is the second rung.
+        let in_profile = Path::new(r"c:\WINDOWS\system32\config\SYSTEMPROFILE\config.toml");
+        let got = pick_config_path(None, true, Some(mg), in_profile, system_profile(), |p| {
+            p == in_profile
+        });
+        assert_eq!(got, in_profile);
     }
 
     /// #3609 — the service host and the worker's ladder read the machine rung
@@ -8425,13 +8495,20 @@ mod tests {
             ] {
                 let host = config_opens_in(&tree, switches, Some(absent.clone()));
                 let ladder_opened = std::cell::Cell::new(None);
-                let picked = pick_config_path(None, true, Some(mg.as_path()), &absent, |p| {
-                    let opens = rung_opens(&tree, switches, p);
-                    if p == mg {
-                        ladder_opened.set(Some(opens));
-                    }
-                    opens
-                });
+                let picked = pick_config_path(
+                    None,
+                    true,
+                    Some(mg.as_path()),
+                    &absent,
+                    &root.path().join("systemprofile"),
+                    |p| {
+                        let opens = rung_opens(&tree, switches, p);
+                        if p == mg {
+                            ladder_opened.set(Some(opens));
+                        }
+                        opens
+                    },
+                );
                 assert_eq!(picked, mg);
                 assert_eq!(Some(host), ladder_opened.get(), "{account}: {switches:?}");
                 assert_eq!(

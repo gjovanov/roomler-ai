@@ -31,14 +31,14 @@ reports a companion (`agents.companion_version`, read on mars, 18:20Z):
 
 **The CLI is in sync by construction.** It ships inside every daemon package: the MSI's `roomler.exe` shim, the
 `.pkg`, the `.deb`'s asset map, and the tarball, where `usr/bin/roomler` is a required member (`TARBALL_REQUIRED`,
-`agents/roomlerd/src/updater.rs:2320`). Measured 2026-10-20: `roomler 0.4.147` on Windows, on the MacBook and on the
+`agents/roomlerd/src/updater.rs:2321`). Measured 2026-10-20: `roomler 0.4.147` on Windows, on the MacBook and on the
 Asahi tarball install.
 
 **Root cause.** `companion::refresh_if_stale` (`agents/roomlerd/src/companion.rs:1060`) is Windows-only "by design".
 Its premise (`companion.rs:1067-1078`) is that on Linux "the companion is its own `roomler-desktop` .deb that apt
 upgrades". That is false: there is no apt or dnf repository. `install.sh` installs the companion once, from a release
 asset (`desktop_install`, `scripts/install.sh:824`), and the daemon's updater picks only the daemon's own asset
-(`is_daemon_asset`, `updater.rs:978`, on purpose: FR-27's companion-as-daemon freeze). So the companion package moves
+(`is_daemon_asset`, `updater.rs:979`, on purpose: FR-27's companion-as-daemon freeze). So the companion package moves
 only when a person re-runs the installer. The dashboard has shown the skew since FR-27 (`companion_version`), and
 until today the fleet had none to show.
 
@@ -64,15 +64,15 @@ flowchart TD
 - **Linux: the companion tracks the daemon**, the invariant Windows has had since S1a (`companion.rs:3-29`). The one
   process that installs updates as root on the host also moves an installed `roomler-desktop` package to its **own**
   version (`CARGO_PKG_VERSION`), never "latest": the companion follows the daemon, not the feed.
-  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3684`, FR-96). That is a system install's root
-    daemon, or `roomlerd update-helper` (`updater.rs:3954`) for a per-user install. A per-user daemon that sees the
+  - **Who:** the owner `decide_update_owner` already names (`updater.rs:3685`, FR-96). That is a system install's root
+    daemon, or `roomlerd update-helper` (`updater.rs:3955`) for a per-user install. A per-user daemon that sees the
     skew touches the helper's wake file (`/var/tmp/roomler-update-check`): a wake, never an instruction. A non-root
     daemon with no helper skips, with one log line, never a password prompt (D3).
   - **What:** the package database that owns the companion picks the format (`installed_version_inner`,
     `companion.rs:346`, reads dpkg then rpm). The asset is `roomler-desktop-<own>-<arch>-unknown-linux-gnu.<deb|rpm>`
-    from release `agent-v<own>` (`fetch_release_by_tag`, `updater.rs:1759`). The 0.4.147 release carries all four, each
+    from release `agent-v<own>` (`fetch_release_by_tag`, `updater.rs:1760`). The 0.4.147 release carries all four, each
     with `.asc` and `.sha256`.
-  - **Trust:** the same `download_asset` (`updater.rs:1559`) as the daemon's own update: the digest, the `.asc` against
+  - **Trust:** the same `download_asset` (`updater.rs:1560`) as the daemon's own update: the digest, the `.asc` against
     the key pinned in the binary, and the version binding. FR-97 P6a reads a `.deb`'s version, and P1 adds the `.rpm`
     reader (`rpm -qp --qf %{VERSION}`); `artifact_version.rs:139` has none today. A fresh private staging dir, as for
     the daemon (#2055).
@@ -88,7 +88,7 @@ flowchart TD
     after a sync, so the dashboard's skew clears at the next heartbeat.
 - **When:** at the owner's start, and again on a 4 h tick, so a failed sync no longer waits for the next restart.
 - **Windows: the same retry.** `refresh_if_stale` runs once, at the start of whichever process owns the refresh (#1686:
-  the SCM host, `win_service/mod.rs:511`, or the worker, `app.rs:4462`). It now runs on the same 4 h tick in that
+  the SCM host, `win_service/mod.rs:511`, or the worker, `app.rs:4492`). It now runs on the same 4 h tick in that
   process. It costs one file read when the version marker matches.
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` on both platforms gives back today's behaviour.
 
