@@ -137,7 +137,8 @@ the operation. The fixed wait can only ever fall back to today's roll.
 
 Two things the lane never does: it never writes `latest` (that is the self-host `full` image
 without `saas`, owned by `publish-selfhost-image.yml`), and it never deploys — a roll re-homes
-every long-lived socket on the replaced pod (agents, RC sessions, tunnels, DERP), so which merge
+every long-lived socket on the replaced pod (agents, RC sessions, tunnels, DERP; a live RC session
+can [outlive it](#a-roll-and-a-live-remote-session-fr-138)), so which merge
 becomes prod, and when, stays a decision. Retention on GHCR is `ghcr-retention.yml` (Mondays):
 untagged BuildKit cache manifests and `hosted-*` tags beyond the newest 20 — never `latest`, `v*`,
 a per-arch or per-profile tag, `buildcache-*`, or an attestation (GHCR stores those untagged,
@@ -159,6 +160,84 @@ database and every country reads `unknown`. Do **not** fall back to dropping
 `GeoLite2-Country.mmdb` into `files/geoip/` by hand: MaxMind's EULA forbids handing GeoLite data
 to third parties, so it must never reach an image anyone else can pull, and the image no longer
 reads that path anyway.
+
+### A roll and a live remote session (FR-138)
+
+Before FR-138 a roll ended every live remote-control session on the pods it replaced. The pixels
+never crossed the server, but the device closed its peers when its control socket dropped, and the
+page opened a new session: 4.7 to 9.0 s without a picture, a new row, and on a device that asks, a
+new consent prompt. A session can now outlive the roll. The device keeps its peer, the page holds the
+session, and both claim it back on whichever pod they reach next
+([remote-control.md §11.19](remote-control.md#1119-a-session-outlives-its-control-socket-the-roll-old-meets-new-and-the-floor-fr-138),
+[FR-138](fr/FR-138-the-session-outlives-its-control-socket.md)). Three switches decide, and nothing
+is kept unless all three are on:
+
+| Switch | Where it lives | Default | Who sets it | Off, fast |
+|---|---|---|---|---|
+| **The window**, `rc.session_resume_secs` (`ROOMLER__RC__SESSION_RESUME_SECS`), in seconds | the server's config, read once at boot (`crates/config/src/settings.rs:1069`) | 0: off, and the scope is not read | whoever deploys the server | 0, for the whole fleet. It lands only with the roll that restarts the pods, so the scope is faster |
+| **The resume scope**, `GET` / `PUT /api/admin/rc-resume-scope`, entries of kind `all`, `org` or `device` ([api.md](api.md)) | the `rc_resume_scope` collection | empty | a platform admin. Anyone else gets the 404 every `/api/admin/*` route gives | a `PUT` without the entry, or with no entries at all. Every pod tells each device it no longer covers a window of 0 on its live connection, with no roll (`reannounce`, `crates/modules/fleet/src/resume_scope.rs:255`) |
+| **The device's switch**, `rc_sessions_survive_reattach` (`ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH`) | the device's config, read when the daemon starts (`crates/agent-core/src/config_surface.rs:726`) | off | whoever administers the device, on the device: `roomler config set rc_sessions_survive_reattach true`, then `roomler restart`. Remote config cannot set it ([remote-config.md](remote-config.md#6-shape)) | `roomler config set rc_sessions_survive_reattach false`, or `roomler config clear rc_sessions_survive_reattach`, then `roomler restart`. `ROOMLERD_RC_SESSIONS_SURVIVE_REATTACH` in the service's environment wins over the key |
+
+Production runs the window at 60 s, with a scope that names a few test devices (FR-138's P3).
+Whatever the setting says, the server announces at most 120 s (`MAX_WINDOW_SECS`,
+`crates/modules/fleet/src/resume_scope.rs:377`), and the device keeps a peer no longer than that
+either (`WINDOW_CAP`, `agents/roomlerd/src/session_table.rs:62`).
+
+⚠️ **The `PUT` replaces the whole list.** Read the list first and send it back with your change: a
+list of one entry leaves exactly one device or org in the scope. An id that names no org or device
+is not refused, and matches nothing.
+
+```sh
+# The window this pod runs, and the list.
+curl -sS "$SERVER/api/admin/rc-resume-scope" -H "Authorization: Bearer $OPERATOR_TOKEN"
+# The whole list, replaced: an org and one device.
+curl -sS -X PUT "$SERVER/api/admin/rc-resume-scope" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"entries": [{"kind": "org", "id": "<org id>", "note": "why"}, {"kind": "device", "id": "<device id>"}]}'
+# Off for every device, at once, with no roll.
+curl -sS -X PUT "$SERVER/api/admin/rc-resume-scope" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" -H 'Content-Type: application/json' -d '{"entries": []}'
+```
+
+A withdrawn window stops new keeps only. A session its device kept before the withdrawal is
+refused at its next claim, or closes at its own deadline, whichever comes first.
+
+What a roll does to a live session now:
+
+| The session | All three switches on | Any one off |
+|---|---|---|
+| on `direct` or `turn` | kept: the same row, no redial, no prompt; on a supervised Mac, from agent 0.4.215. Seven field rolls read a pause in the picture of 13 to 262 ms | ends `agent_disconnect`, and the page redials into a new session |
+| on `derp` | redials, since `/derp` is pod-local; the new request ends the old row | the same |
+| external (FR-52), not yet live, or begun before its device entered the scope | ends as before | the same |
+
+**Before a roll**, read:
+
+| What | Why | Where |
+|---|---|---|
+| The open sessions | A roll ends every session it does not keep: one on `derp`, an external one, and any on a device outside the scope or without the switch. Each is a person whose session drops | the `remote_sessions` rows in phase `active`, with their `carrier` and `external`, read bounded through `scripts/prod-mongo-read.sh`, never from a client inside the database pod ([production-mongo-reads.md](production-mongo-reads.md)) |
+| The window and the scope | which devices are told a window | `GET /api/admin/rc-resume-scope` |
+| Each such device's switch | a device says `rc-resume` only with its switch on | `capabilities.rpc` on its `agents` row, as its last hello reported it |
+
+**After a roll**, run `scripts/fr138-roll-read.sh --from <the promote's dispatch> --to <both pods
+Ready>`. It is read-only, and for each session live across the roll it prints the row's end or the
+same row kept, the page's `rc.connect` records with `after_drop` and its `rc.resume` record
+(`outcome`, `gap_ms`), any consent prompt, the device's detach, resume and close lines, and AC7's
+count of the sessions the roll ended. A kept session reads as the same row, live, its `attach_seq`
+one higher, with no `rc.connect` record after the cut and one `rc.resume` with `outcome=resumed`. An
+ended one reads `agent_disconnect`, seen at the loss or inferred (`end_source` `registration`,
+`sweep` or `redial`), or `controller_hangup` with `limit: hold_expired` on its `session_ended` audit
+when the device resumed it but its viewer never came back. Take `--from` at the dispatch: an
+inferred end is dated by the row's own last clock, which can come a stats interval before the cut.
+
+On each device the leak signature reads: every `rc session detached` line is followed by exactly one
+`rc session resumed` or `rc session closed` line for the same session, no `peer close overran its
+budget` line names a kept peer, and the daemon's UDP socket count is back at its baseline once the
+session has really ended.
+
+⚠️ **The rollback floor.** No server rollback goes to an image built before `79cf1019b` (P1a,
+#3607). Production has written the new audit kinds since 2026-11-10, and an older image cannot list
+the audit of a session that holds them. What a rollback above the floor still costs is in
+[remote-control.md §11.19](remote-control.md#1119-a-session-outlives-its-control-socket-the-roll-old-meets-new-and-the-floor-fr-138).
 
 ## The country database the image carries (#1896)
 
@@ -266,6 +345,7 @@ nesting), loaded via the `config` crate. The ones that matter first:
 | `ROOMLER__MEDIASOUP__ANNOUNCED_IP_MAP` | `<node_ip>=<public_ip>,…` — per-pod announced IP resolution for multi-node clusters |
 | `ROOMLER__STRIPE__*` / `ROOMLER__CLAUDE__*` / `ROOMLER__S3__*` / SMTP / OAuth | Integrations |
 | `ROOMLER__STATS__GEOIP_MMDB` | The country database for the user analytics. **The image already sets it** to the DB-IP database it carries; set it only to use your own `.mmdb`, or to empty to turn lookups off. See [the country database](#the-country-database-the-image-carries-1896) |
+| `ROOMLER__RC__SESSION_RESUME_SECS` | How long a live remote session may outlive its device's control socket, in seconds: 0 (the default) is off, and at most 120 s is announced. Only devices in the resume scope are told it. See [a roll and a live remote session](#a-roll-and-a-live-remote-session-fr-138) |
 
 Rate limiting (per-IP governor + per-account brute-force gate) and JWT TTLs are
 also settings — see `crates/config/src/settings.rs` for the full surface.
@@ -419,6 +499,9 @@ The multi-pod design is settled and documented in
 
 - WS sessions, the rc/tunnel hubs, DERP sockets, and mediasoup rooms are
   **pod-local**; chat/notifications/presence fan out via Redis.
+- A live remote session's state between pods is its `remote_sessions` row: the pod a
+  device's claim reaches rebuilds the session from it, so a session can outlive the pod
+  that held it ([above](#a-roll-and-a-live-remote-session-fr-138)).
 - The front LB keeps a tenant's users, agents, and rooms on one pod with a
   **consistent hash on the tenant id** (`/ws` and `/derp` accept a `tid=` hint);
   plain HTTP keeps per-request failover.

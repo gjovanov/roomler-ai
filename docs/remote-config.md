@@ -426,6 +426,20 @@ if it had taken. It is set on the device
 new code for, or whose requirement is on the old path, is refused and named in
 the plan's `refused`.
 
+⚠️ **`rc_sessions_survive_reattach`, FR-138's switch that keeps a live remote
+session through the loss of the control socket, is not pushable either.** It
+stays the device's decision, as `ws_flat_redial` and
+`tunnel_peers_survive_reattach` do: `DesiredConfig` has no such field
+(`crates/remote_control/src/models.rs:2777`), and the daemon reads the key when it
+starts (`crates/agent-core/src/config_surface.rs:726`). Unlike `rc_media_canary`,
+a body that names it is not refused by name: the key is dropped unread with the
+body's other unknown keys (`rest`, `crates/modules/fleet/src/remote_config.rs:58`),
+so the answer cannot tell anyone that it changed nothing. Set it on the device
+(`roomler config set rc_sessions_survive_reattach true`, then `roomler restart`).
+The fleet is staged server-side instead, through the resume scope, which a platform
+admin keeps
+([deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138)).
+
 ⚠️ **The reach is the opt-in's.** A device that has not set
 `remote_config_enabled` refuses every push, this one included (§2), and most
 devices have not ([FR-135](fr/FR-135-one-rc-media-pipeline.md) §7.1 measured 4
