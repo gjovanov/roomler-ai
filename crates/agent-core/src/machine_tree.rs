@@ -60,12 +60,30 @@
 //!   enrollment only into a config that passes the check after the repair
 //!   ([`may_fold`]); any other is replaced by a fresh one.
 //!
+//! - **[`HeldPath`]** (FR-145, the child module [`held`]) is how a process
+//!   running as SYSTEM, or elevated, acts below the machine's folders: every
+//!   component opened relative to the handle above it, never through a link,
+//!   its final path checked; what it makes sealed from creation; what it
+//!   writes made fresh and renamed into place by handle; a removal deleting
+//!   what the same walk opened. #3737's readers ([`PrivateFolder`]) walk the
+//!   same way. The crash records and the install clean-up act through it
+//!   (FR-145 P1); the service logs and the other SYSTEM writers follow in P2
+//!   and P3.
+//!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`
-//! stops the repair, `ROOMLERD_MACHINE_TREE_CHECK=0` makes the check log only.
+//! stops the repair, `ROOMLERD_MACHINE_TREE_CHECK=0` makes the check log only,
+//! and `ROOMLERD_MACHINE_TREE_HELD=0` sends the writers that moved onto
+//! [`HeldPath`] back to their writes by path, with one WARN ([`Switches::held`]).
 
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
+
+/// FR-145 — a path below a known base, reached and acted on by handle only.
+#[cfg(windows)]
+pub mod held;
+#[cfg(windows)]
+pub use held::{HeldEntry, HeldPath, Seal, TreeRemoval, Why};
 
 /// `S-1-5-18`, LocalSystem.
 pub const SYSTEM: &str = "S-1-5-18";
@@ -347,29 +365,38 @@ pub fn is_local_account(sid: &str, machine_domain: &str) -> bool {
         .is_some_and(|rid| !rid.is_empty() && rid.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// The two kill switches.
+/// The three kill switches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Switches {
     pub repair: bool,
     pub check: bool,
+    /// FR-145: the writers that moved onto [`HeldPath`] use it. Off, they
+    /// write by path as before it, with one WARN naming the switch. The
+    /// install clean-up's removals have no switch: a removal that follows a
+    /// link has no safe old way to return to.
+    pub held: bool,
 }
 
 impl Switches {
-    /// Both on: what a device runs with when nobody switched either off.
+    /// All on: what a device runs with when nobody switched any off.
     pub const ON: Self = Self {
         repair: true,
         check: true,
+        held: true,
     };
 
-    /// `ROOMLERD_MACHINE_TREE_REPAIR=0` stops the repair and
-    /// `ROOMLERD_MACHINE_TREE_CHECK=0` makes the check log only (`0`, `false`,
-    /// `no` or `off`; `ROOMLER_NODE_` is read too, as for every knob). Read
-    /// from the process environment and nothing else: the config is what the
-    /// check is about, so it can never switch the check off.
+    /// `ROOMLERD_MACHINE_TREE_REPAIR=0` stops the repair,
+    /// `ROOMLERD_MACHINE_TREE_CHECK=0` makes the check log only and
+    /// `ROOMLERD_MACHINE_TREE_HELD=0` sends [`HeldPath`]'s writers back to
+    /// their writes by path (`0`, `false`, `no` or `off`; `ROOMLER_NODE_` is
+    /// read too, as for every knob). Read from the process environment and
+    /// nothing else: the config is what the check is about, so it can never
+    /// switch the check off.
     pub fn from_env() -> Self {
         Self {
             repair: !switched_off("MACHINE_TREE_REPAIR"),
             check: !switched_off("MACHINE_TREE_CHECK"),
+            held: !switched_off("MACHINE_TREE_HELD"),
         }
     }
 }
@@ -1338,12 +1365,17 @@ pub struct PrivateFile {
 impl PrivateFolder {
     /// `dir`, held open and judged. `Ok(None)`: it is not there. `Err`: a link
     /// on the way, or an owner or DACL that says nobody should act on what it
-    /// holds.
+    /// holds. FR-145 (D6): reached from the machine's `ProgramData` by handle,
+    /// each folder on the way opened below the one above it
+    /// ([`HeldPath::walk`]), so no name is looked up twice.
     pub fn open(dir: &Path) -> Result<Option<Self>, String> {
-        if let Some(link) = crate::recording_dir::link_component(dir) {
-            return Err(format!("{} is a link", link.display()));
-        }
-        let Some(held) = HeldFolder::open(dir)? else {
+        Self::open_under(&crate::appdirs::machine_program_data(), dir)
+    }
+
+    /// [`PrivateFolder::open`], with `dir` reached from `base` (a test names a
+    /// base of its own). `Err` when `dir` is not below `base`.
+    pub fn open_under(base: &Path, dir: &Path) -> Result<Option<Self>, String> {
+        let Some(held) = held_below(base, dir)? else {
             return Ok(None);
         };
         let sd = win::read_sd(&held.entry.file)
@@ -1391,6 +1423,19 @@ pub fn read_private(
         return Ok(None);
     };
     Ok(folder.read(name, what, max_len)?.map(|file| file.text))
+}
+
+/// FR-145 (D6) — the folder `dir`, held by its own handle at the end of a
+/// walk from `base` ([`HeldPath::base`], then [`HeldPath::walk`]): every
+/// folder on the way opened below the one above it, never through a link, its
+/// final path checked. `Ok(None)`: a folder on the way, or `dir`, is not
+/// there. `Err` names a link, a folder that ends elsewhere, or a `dir` not
+/// below `base`.
+#[cfg(windows)]
+pub fn held_below(base: &Path, dir: &Path) -> Result<Option<HeldFolder>, String> {
+    HeldPath::below(base, dir)
+        .map(|held| held.map(HeldPath::into_folder))
+        .map_err(|refused| refused.to_string())
 }
 
 /// #3737 — the owner and DACL of the object behind `handle` (`object`: its
@@ -1778,10 +1823,10 @@ mod win {
     }
 
     /// A security descriptor made from SDDL, freed on drop.
-    struct Descriptor(PSECURITY_DESCRIPTOR);
+    pub(super) struct Descriptor(pub(super) PSECURITY_DESCRIPTOR);
 
     impl Descriptor {
-        fn from_sddl(sddl: &str) -> std::io::Result<Self> {
+        pub(super) fn from_sddl(sddl: &str) -> std::io::Result<Self> {
             let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: a NUL-terminated string; `sd` receives a LocalAlloc'd

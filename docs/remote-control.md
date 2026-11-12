@@ -2706,7 +2706,7 @@ before FR-100 P3; the record is what the fleet's audit week is counted over.
   identity did not change.
 - **On a machine-wide install the keys share the machine config's check** (#3609). `peer-auth\` and each
   `<tenant>.json` and `<tenant>.controllers.json` the daemon loads are repaired to SYSTEM and Administrators
-  alone and checked with the config ([`repair`, `machine_tree.rs:592`](../crates/agent-core/src/machine_tree.rs#L592)),
+  alone and checked with the config ([`repair`, `machine_tree.rs:619`](../crates/agent-core/src/machine_tree.rs#L619)),
   so a key file another account owns keeps the service from running that enrollment as SYSTEM until it is
   fixed. Any other file in the folder (a backup, a temporary file) is neither repaired nor checked. #3666:
   outside a save the repair seals the keys folder and a key file only when that entry gave no account other than
@@ -5890,11 +5890,11 @@ is silent while it waits.
   own log line about 1 stall in 6, measured on a Windows dev box on
   2026-10-19.
 - The sidecar is fsync'd before its rename
-  (`crates/agent-core/src/crash_recorder.rs:287`, #2955). Without that,
+  (`crates/agent-core/src/crash_recorder.rs:332`, #2955). Without that,
   a power loss could persist a NUL-filled file that no parser reads; one
   was seen, skipped at every start for two weeks. A sidecar that does
   not parse is now moved once into `crashes/malformed/`
-  (`crash_recorder.rs:424`), so it is kept but not re-warned.
+  (`crash_recorder.rs:724`), so it is kept but not re-warned.
 
 **What the first named stall found** (#2551). The first stall to name
 its stage came on 2026-10-22, under 0.4.151, and read
@@ -5967,7 +5967,7 @@ sequenceDiagram
 | Each pump's age and stage, read with `try_lock`: the thread that holds the pump lock may be one of the stuck ones | `pump_ages_now` `:392` |
 | Every thread's stack, read from outside the stuck code: `/usr/bin/sample` on macOS, `/proc/self/task` on Linux, nothing on Windows yet | `thread_dump::capture`, `agents/roomlerd/src/thread_dump.rs:63` |
 | Condensed per thread to the leaf end of its heaviest path, 16 frames, with identical stacks folded and a 24 KiB cap | `condense_sample` `:191`, `condense_procfs` `:412` |
-| Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:124` |
+| Written after the log tail, because the 64 KiB envelope trims from the oldest log line, so the stacks survive whole | `record_with_appendix`, `crates/agent-core/src/crash_recorder.rs:148` |
 | The whole report stays beside the log as `stall-<unix>-<pid>.threads.txt`, the newest 3 | `FULL_REPORTS_KEPT`, `thread_dump.rs:46` |
 
 - The summary reads `runtime stalled: the async watchdog has not

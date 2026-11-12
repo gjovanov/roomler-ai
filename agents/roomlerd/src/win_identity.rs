@@ -14,10 +14,10 @@
 //! `worker_role` does.
 //!
 //! The profile comes from the session user's TOKEN, never from their name:
-//! `system_context::user_profile::active_user_profile_root` builds
-//! `C:\Users\<name>`, which is wrong for a redirected profile and — worse,
-//! for a security rule — names ANOTHER account's folder when a local and a
-//! domain account share a name (`C:\Users\alice` vs `C:\Users\alice.CORP`).
+//! `C:\Users\<name>` is wrong for a redirected profile and — worse, for a
+//! security rule — names ANOTHER account's folder when a local and a domain
+//! account share a name (`C:\Users\alice` vs `C:\Users\alice.CORP`). The
+//! install clean-up finds a profile by SID too (FR-145, `user_profile.rs`).
 
 #![cfg(target_os = "windows")]
 
