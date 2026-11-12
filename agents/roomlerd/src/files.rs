@@ -5233,6 +5233,34 @@ pub(crate) mod stand_in {
             ));
     }
 
+    // #3688 — what `staging::keeps_modes`'s probe meets between making its
+    // folder and opening it, once, on the thread that stood it in.
+    #[cfg(target_os = "linux")]
+    type ProbeStep = Box<dyn FnOnce(&Path)>;
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        static BEFORE_THE_PROBE_OPENS: std::cell::RefCell<Option<ProbeStep>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// #3688 — once `staging::keeps_modes`'s probe has made its folder, and
+    /// before it opens it, `step` runs with that folder's path (through the
+    /// folder it was made in): another account removing it, or putting a
+    /// folder of its own in its place.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn before_the_probe_opens(step: impl FnOnce(&Path) + 'static) {
+        BEFORE_THE_PROBE_OPENS.with(|s| *s.borrow_mut() = Some(Box::new(step)));
+    }
+
+    /// Runs what this thread set with [`before_the_probe_opens`], once.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn the_probe_is_made(probe: &Path) {
+        if let Some(step) = BEFORE_THE_PROBE_OPENS.with(|s| s.borrow_mut().take()) {
+            step(probe);
+        }
+    }
+
     /// Runs what a test set for `base` with
     /// [`staging_goes_before_the_id_is_made`], once.
     #[cfg(target_os = "linux")]
@@ -11266,6 +11294,260 @@ CAN_GRAPHICAL=0
                     .map_err(|e| e.to_string()),
                 Ok(ours),
                 "`~` expands against its account's home"
+            );
+        }
+
+        /// #3688 — `keeps_modes`'s probe, met by another account between
+        /// making its folder and opening it, answers nothing: a probe removed
+        /// before it opens, or (as root) replaced by another account's folder
+        /// that every account may write, leaves the answer "keeps modes", so
+        /// the folder's owner and modes still count; and that other folder's
+        /// mode is left as it is.
+        #[test]
+        fn a_probe_that_does_not_open_as_it_was_made_answers_nothing() {
+            let target = tempfile::tempdir().unwrap();
+            chmod(target.path(), 0o777);
+            let held = staging::open_folder(target.path()).unwrap();
+            staging::forget_what_keeps_modes();
+            stand_in::before_the_probe_opens(|probe| std::fs::remove_dir(probe).unwrap());
+            let removed = staging::keeps_modes(&held);
+            staging::forget_what_keeps_modes();
+            let mut swapped = None;
+            if as_root() {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                let theirs = target.path().join("theirs");
+                std::fs::create_dir(&theirs).unwrap();
+                std::fs::write(theirs.join("kept"), b"x").unwrap();
+                chmod(&theirs, 0o777);
+                std::os::unix::fs::chown(&theirs, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                stand_in::before_the_probe_opens(move |probe| {
+                    std::fs::remove_dir(probe).unwrap();
+                    std::fs::rename(&theirs, probe).unwrap();
+                });
+                let answer = staging::keeps_modes(&held);
+                staging::forget_what_keeps_modes();
+                let left = std::fs::read_dir(target.path())
+                    .unwrap()
+                    .flatten()
+                    .find(|e| e.path().join("kept").exists())
+                    .map(|e| mode_and_owner(&e.path()).0);
+                swapped = Some((answer, left));
+            }
+            assert_eq!(
+                (removed, swapped),
+                (true, as_root().then_some((true, Some(0o777)))),
+                "no answer from a probe that did not open as made; another account's folder untouched"
+            );
+        }
+
+        /// #3688 — root's private staging folder sits in root's own
+        /// `/var/lib/roomler` (stood in under the test's home): opened from its
+        /// parent without following a link, root's, and no other account may
+        /// write it; made 0755 when absent. Another account's, one others may
+        /// write, or a link there refuses the upload, saying why.
+        #[tokio::test]
+        async fn roots_private_staging_sits_only_in_roots_own_var_lib_roomler() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let _fat = stand_in::modes_kept(Some(false));
+            let roomler = home.path().join("var/lib/roomler");
+            std::fs::create_dir_all(roomler.parent().unwrap()).unwrap();
+            let nobody =
+                crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+            let elsewhere = tempfile::tempdir().unwrap();
+            let h = FilesHandler::new();
+            let mut refused = Vec::new();
+            for n in 0..3 {
+                let _ = std::fs::remove_dir_all(&roomler);
+                let _ = std::fs::remove_file(&roomler);
+                if n == 2 {
+                    std::os::unix::fs::symlink(elsewhere.path(), &roomler).unwrap();
+                } else {
+                    std::fs::create_dir(&roomler).unwrap();
+                    chmod(&roomler, if n == 0 { 0o755 } else { 0o777 });
+                }
+                if n == 0 {
+                    std::os::unix::fs::chown(&roomler, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                }
+                let id = tid(&format!("var-lib-{n}"));
+                let begun = h
+                    .begin_as(FsAs::DaemonAlone, id.clone(), "v.txt".into(), 1, None, None)
+                    .await;
+                if begun.is_ok() {
+                    h.abort().await;
+                }
+                forget(&[&id]);
+                refused.push(begun.err().map(|e| format!("{e:#}")));
+            }
+            let shown = roomler.display();
+            let why = |why: &str| {
+                Some(format!(
+                    "{shown} {why}, so file transfer does not stage there"
+                ))
+            };
+            let refused: Vec<_> = refused
+                .into_iter()
+                .zip([
+                    why("belongs to another account"),
+                    why("is open to other accounts"),
+                    why("is not a folder"),
+                ])
+                .map(|(got, want)| got.zip(want).is_some_and(|(got, want)| got.contains(&want)))
+                .collect();
+            let _ = std::fs::remove_file(&roomler);
+            let _ = std::fs::remove_dir_all(&roomler);
+            let id = tid("var-lib-made");
+            h.begin_as(FsAs::DaemonAlone, id.clone(), "m.txt".into(), 1, None, None)
+                .await
+                .expect("begin");
+            let made = mode_and_owner(&roomler);
+            h.chunk(b"m").await.expect("chunk");
+            let ended = h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string());
+            forget(&[&id]);
+            assert_eq!(
+                (refused, made, ended),
+                (
+                    vec![true; 3],
+                    (0o755, 0),
+                    Ok(home.downloads().join("m.txt"))
+                ),
+                "refused, saying why, unless root's own; made 0755 root:root when absent"
+            );
+        }
+
+        /// #3688 — a probe's folder left behind in a drop folder (a crash
+        /// between its make and its removal) goes at the startup sweep when it
+        /// is its stager's own and empty. One with something in it, a link
+        /// named so and (as root) another account's are left as they are.
+        #[tokio::test]
+        async fn the_sweep_removes_a_probe_folder_left_behind() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let probe = |n: u8| dl.join(format!(".roomler-probe-{n:016x}"));
+            let (left, full, link, theirs) = (probe(1), probe(2), probe(3), probe(4));
+            std::fs::create_dir(&left).unwrap();
+            std::fs::create_dir(&full).unwrap();
+            std::fs::write(full.join("kept"), b"x").unwrap();
+            std::os::unix::fs::symlink(home.path(), &link).unwrap();
+            if as_root() {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                std::fs::create_dir(&theirs).unwrap();
+                std::os::unix::fs::chown(&theirs, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                staging::sweep_probes(&dl);
+            } else {
+                sweep_orphans().await;
+            }
+            assert_eq!(
+                (
+                    left.exists(),
+                    full.join("kept").exists(),
+                    link.symlink_metadata().is_ok(),
+                    theirs.exists() == as_root()
+                ),
+                (false, true, true, true),
+                "only its stager's own empty probe folder goes"
+            );
+        }
+
+        /// #3688 — an upload staged privately whose copy across fails (its
+        /// folder could not be written at the end) keeps its partial, and a
+        /// resume completes it once the folder can be written again.
+        #[tokio::test]
+        async fn a_copy_across_that_fails_keeps_its_partial() {
+            if euid() == 0 {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let dl = home.downloads();
+            let _fat = stand_in::modes_kept(Some(false));
+            let private = home.path().join(".local/state/roomler/staging");
+            let h = FilesHandler::new();
+            let id = tid("copy-fails");
+            h.begin_as(FsAs::Daemon, id.clone(), "c.txt".into(), 4, None, None)
+                .await
+                .expect("begin");
+            h.chunk(b"copy").await.expect("chunk");
+            chmod(&dl, 0o500);
+            let ended = h.end(&id).await;
+            chmod(&dl, 0o700);
+            let kept = (
+                std::fs::read(private.join(&id).join("data")).ok(),
+                private.join(&id).join("meta.json").is_file(),
+                registered(&id),
+                dl.join("c.txt").exists(),
+            );
+            let resumed = h.resume_incoming_as(FsAs::Daemon, &id, 4).await;
+            let placed = match &resumed {
+                Ok(at) => {
+                    h.chunk(&b"copy"[*at as usize..]).await.expect("chunk");
+                    h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            forget(&[&id]);
+            assert!(ended.is_err(), "the end fails");
+            assert_eq!(
+                (kept, placed),
+                (
+                    (Some(b"copy".to_vec()), true, true, false),
+                    Ok(dl.join("c.txt"))
+                ),
+                "the partial stays, and a resume completes it"
+            );
+        }
+
+        /// #3688 — a private partial resumes at an offset past the 256 KiB
+        /// mark, from that mark, and the file placed is the one sent.
+        #[tokio::test]
+        async fn a_private_partial_resumes_past_256_kib() {
+            if euid() == 0 {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, true);
+            let _fat = stand_in::modes_kept(Some(false));
+            let sent: Vec<u8> = (0..600 * 1024).map(|i| (i % 251) as u8).collect();
+            let h = FilesHandler::new();
+            let id = tid("resume-past");
+            h.begin_as(
+                FsAs::Daemon,
+                id.clone(),
+                "big.bin".into(),
+                sent.len() as u64,
+                None,
+                None,
+            )
+            .await
+            .expect("begin");
+            h.chunk(&sent[..300 * 1024]).await.expect("chunk");
+            h.abort().await;
+            forget(&[&id]);
+            let resumed = h
+                .resume_incoming_as(FsAs::Daemon, &id, 300 * 1024)
+                .await
+                .map_err(|e| e.to_string());
+            let at = resumed.clone();
+            let placed = match resumed {
+                Ok(at) => {
+                    h.chunk(&sent[at as usize..]).await.expect("chunk");
+                    h.end(&id).await.map(|(p, _)| p).map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e),
+            };
+            forget(&[&id]);
+            assert_eq!(at, Ok(256 * 1024), "resumed from the 256 KiB mark");
+            let placed = placed.expect("end");
+            assert_eq!(placed, home.downloads().join("big.bin"));
+            assert!(
+                std::fs::read(&placed).unwrap() == sent,
+                "the file placed is the one sent"
             );
         }
     }

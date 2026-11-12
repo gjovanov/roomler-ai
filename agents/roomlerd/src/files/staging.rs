@@ -316,6 +316,24 @@ pub(super) fn keeps_modes(held: &File) -> bool {
     kept
 }
 
+/// What [`keeps_modes`] found, forgotten: a test whose probe met another
+/// account leaves no answer behind for the tests beside it.
+#[cfg(test)]
+pub(super) fn forget_what_keeps_modes() {
+    KEEPS_MODES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+/// The empty probe folders [`keeps_modes`] left in `folder`, removed: none
+/// yet (#3688, the startup sweep's).
+#[cfg(test)]
+pub(super) fn sweep_probes(folder: &Path) -> usize {
+    let _ = folder;
+    0
+}
+
 /// The type of the file system `held` sits on (`fstatfs`), 0 if unread.
 fn fs_type(held: &File) -> i64 {
     let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
@@ -341,6 +359,10 @@ fn probe(held: &File) -> Option<bool> {
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     mkdir_at(held, &name, 0o700).ok()?;
+    #[cfg(test)]
+    super::stand_in::the_probe_is_made(
+        &Path::new(&format!("/proc/self/fd/{}", held.as_raw_fd())).join(&name),
+    );
     let kept = match open_at(
         held,
         &name,
