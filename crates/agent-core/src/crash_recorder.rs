@@ -729,8 +729,24 @@ fn quarantine(dir: &Path, path: &Path) -> std::io::Result<PathBuf> {
 /// It lives in the uploading process's log folder.
 pub const VERDICTS_FILE: &str = "crash-verdicts.txt";
 
-/// Append `line` to [`VERDICTS_FILE`] in `dir`.
+/// Append `line` to [`VERDICTS_FILE`] in `dir`. FR-145: below the machine's
+/// folder (a SYSTEM worker's `service-logs`), `dir` is reached by handle and
+/// sealed (`Seal::Readable`), and the line goes through
+/// [`crate::machine_tree::HeldPath::append_file`]: a link, or a file with
+/// more than one name, at the ledger's name is deleted as itself, never
+/// written through, and the file made again. A refusal is logged once per
+/// process start, and the line is written nowhere else. Elsewhere by path,
+/// as before.
 pub fn append_verdict(dir: &Path, line: &str) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if in_machine_tree(dir) && held_switch_on() {
+        use crate::machine_tree::{HeldPath, Seal};
+        let held = HeldPath::machine(dir, Seal::Readable).map_err(verdicts_left_alone)?;
+        let mut f = held
+            .append_file(VERDICTS_FILE, Seal::Readable)
+            .map_err(verdicts_left_alone)?;
+        return writeln!(f, "{line}");
+    }
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -739,9 +755,42 @@ pub fn append_verdict(dir: &Path, line: &str) -> std::io::Result<()> {
 }
 
 /// [`VERDICTS_FILE`] in `dir`: empty when it is not there or cannot be read
-/// (the cost is one more send, never a lost crash).
+/// (the cost is one more send, never a lost crash). FR-145: below the
+/// machine's folder, read below `dir`'s handle, never through a link and
+/// never a file with more than one name.
 pub fn read_verdicts(dir: &Path) -> String {
+    #[cfg(windows)]
+    if in_machine_tree(dir) && held_switch_on() {
+        let read =
+            crate::machine_tree::HeldPath::below(&crate::appdirs::machine_program_data(), dir)
+                .and_then(|held| match held {
+                    Some(held) => held.read_file(VERDICTS_FILE, MAX_VERDICTS_BYTES),
+                    None => Ok(None),
+                });
+        return match read {
+            Ok(bytes) => String::from_utf8_lossy(&bytes.unwrap_or_default()).into_owned(),
+            Err(refused) => {
+                let _ = verdicts_left_alone(refused);
+                String::new()
+            }
+        };
+    }
     fs::read_to_string(dir.join(VERDICTS_FILE)).unwrap_or_default()
+}
+
+/// The most of [`VERDICTS_FILE`] that is read: some 25,000 verdicts.
+#[cfg(windows)]
+const MAX_VERDICTS_BYTES: u64 = 1024 * 1024;
+
+/// FR-145 — the ledger left alone below the machine's folder: one WARN per
+/// process start. Not a crash, so not counted with the suppression tally.
+#[cfg(windows)]
+fn verdicts_left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::Error {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("crash_recorder: crash verdicts left alone: {refused}");
+    }
+    refused.into()
 }
 
 // ─── Crash-loop suppression ────────────────────────────────────────────────
