@@ -30,7 +30,7 @@ use crate::fixtures::seed::{SeededTenant, SeededUser};
 use crate::fixtures::test_app::TestApp;
 use crate::tunnel_tests::{connect_agent_ws, enroll_agent, read_until, wait_agent_online};
 
-type Ws =
+pub(crate) type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// One request with a bearer token: the status, and the body as JSON (a body
@@ -83,7 +83,7 @@ fn grant_to(user_id: &str, name: &str) -> Value {
 }
 
 /// The owner writes a policy; returns its id.
-async fn owner_creates(app: &TestApp, seeded: &SeededTenant, body: Value) -> String {
+pub(crate) async fn owner_creates(app: &TestApp, seeded: &SeededTenant, body: Value) -> String {
     let (status, created) = call(
         app,
         "POST",
@@ -473,7 +473,7 @@ async fn enroll_own_tunnel_client(
         .to_string()
 }
 
-async fn connect_tunnel_client(app: &TestApp, token: &str) -> Ws {
+pub(crate) async fn connect_tunnel_client(app: &TestApp, token: &str) -> Ws {
     let url = format!(
         "ws://{}/ws?token={}&role=tunnel-client",
         app.addr,
@@ -486,7 +486,7 @@ async fn connect_tunnel_client(app: &TestApp, token: &str) -> Ws {
     ws
 }
 
-async fn send(ws: &mut Ws, frame: Value) {
+pub(crate) async fn send(ws: &mut Ws, frame: Value) {
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .unwrap();
@@ -494,7 +494,7 @@ async fn send(ws: &mut Ws, frame: Value) {
 
 /// The first frame of type `t` for `flow_id` within 5 s; frames of other types
 /// and flows are skipped.
-async fn frame_for_flow(ws: &mut Ws, t: &str, flow_id: u64) -> Option<Value> {
+pub(crate) async fn frame_for_flow(ws: &mut Ws, t: &str, flow_id: u64) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(250), ws.next()).await {
