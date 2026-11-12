@@ -224,3 +224,10 @@ note, with the diagnostic one-liner: `docs/tunnels.md`.
 ⚠️ It shares the PGP check, NOT `code_signature.rs`: WinTrust stays in `roomlerd`
 (tunnel-core is on `windows-sys` **0.61**, the agent on **0.59**), and no OS needed
 it, because Windows takes the same `.asc` check.
+
+**The Windows machine folder, by handle (FR-145)** — SYSTEM, or an elevated process,
+acts below the machine's `%ProgramData%\roomler` only through `machine_tree::HeldPath`:
+each folder opened below the handle above it, never through a link, its final path
+checked; what it makes sealed when made; a write is a fresh file renamed in by handle;
+a removal deletes what the same walk opened. ⚠️ Never check a path, then act on it.
+The walk, the seals and the leaf policy: `docs/security-baseline.md`.

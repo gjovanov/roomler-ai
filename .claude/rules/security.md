@@ -140,6 +140,7 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   (FR-145): each folder opened below the handle above it, never through a link, its
   final path checked; what it makes sealed when made; a write is a fresh file renamed in
   by handle; a removal deletes what the same walk opened. Never check a path, then act on it.
+  The agent's copy of this line is in `networking.md`, which loads with agent code.
 - **Push endpoints are SSRF-validated at subscribe time** — the server POSTs to a
   browser-supplied URL from inside the cluster on every fan-out.
 - **Uploads are sniffed, never trusted** (`crate::media_type::resolve`); the
