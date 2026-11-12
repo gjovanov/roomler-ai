@@ -1603,10 +1603,18 @@ jobs:
   #
   # What this CAN prove on a hosted runner: the pkg builds, installs, puts both
   # binaries where the plists and the docs say they are, loads the LaunchAgent,
-  # and the CLI shim resolves the daemon inside the bundle. What it CANNOT: TCC
-  # grants, since there is no way to accept a privacy prompt headlessly — so it
-  # asserts the honest REFUSAL path instead, which is exactly what runtime
-  # permission reporting made assertable.
+  # and the CLI shim resolves the daemon inside the bundle. TCC is the image's
+  # to decide, not the job's: the hosted macos-15 image grants the process the
+  # job's shell starts both Screen Recording and Accessibility, so the
+  # permissions step checks that `roomlerd caps` reports the grants it holds
+  # consistently, and asserts the refusal path only where it is reachable.
+  #
+  # #3774: every step tests the build this job made. Before the first install
+  # the job opts out of the live update channel with the product's own marker,
+  # because the update helper the package loads would otherwise install the
+  # newest PUBLISHED release over this build whenever the ref is behind it; and
+  # every step that runs the bundle's `roomlerd` first checks its `--version`
+  # against the build. The marker comes off only for the job's last install.
   macos-pkg-install:
     name: macOS pkg install smoke
     # Pinned to the image release-agent.yml builds the shipped .pkg on (GitHub
@@ -1649,16 +1657,58 @@ jobs:
       # Feature set is a subset of release-agent.yml's build-macos: `full`
       # would drag in the whole media stack for no extra signal, and the
       # payload shape plus the launchd wiring are what this job is about.
+      # `enigo-input` is in it as in the shipped build: without it
+      # `has_input_permission` is false whatever the OS granted, and the
+      # permissions step would read a constant (#3774).
       - name: Build the agent + the CLI shim
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           set -euo pipefail
           cargo build -p roomlerd --release \
-            --features "media,vp9-444,vp9-444-bindgen,overlay-l3" \
+            --features "media,vp9-444,vp9-444-bindgen,overlay-l3,enigo-input" \
             --target aarch64-apple-darwin
           cargo build -p roomler-cli-shim --release --target aarch64-apple-darwin
           cargo build -p roomler-desktop --release --target aarch64-apple-darwin
+
+      # #3774: the version every later step holds the installed bundle to, read
+      # from the binary this job built before anything is installed, and the
+      # check those steps run first. A bundle that answers anything else was
+      # put there by something other than this job's package.
+      - name: Record the build under test, and the check each step runs first
+        run: |
+          set -euo pipefail
+          built="$(target/aarch64-apple-darwin/release/roomlerd --version)"
+          [ -n "$built" ] || { echo "::error::the built roomlerd printed no version"; exit 1; }
+          echo "this job built: $built"
+          echo "SMOKE_BUILT_VERSION=$built" >> "$GITHUB_ENV"
+          check="$RUNNER_TEMP/bundle-is-this-build.sh"
+          cat > "$check" <<'EOF'
+          #!/usr/bin/env bash
+          # The installed bundle's roomlerd must be the build this job made (#3774).
+          set -euo pipefail
+          bin="${1:-/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd}"
+          want="${SMOKE_BUILT_VERSION:?the build step did not record the version it built}"
+          got="$("$bin" --version 2>&1)" || { echo "::error::$bin --version failed: $got"; exit 1; }
+          if [ "$got" != "$want" ]; then
+            echo "::error::the bundle's roomlerd reports '$got' but this job built '$want': something other than this job's package replaced the build under test"
+            exit 1
+          fi
+          echo "  the bundle's roomlerd is this job's build ($got)"
+          EOF
+          chmod +x "$check"
+          # The check refuses a binary that answers another version (its
+          # negative control), and accepts the one this job built.
+          fake="$RUNNER_TEMP/roomlerd-of-another-version"
+          printf '#!/bin/sh\necho "roomlerd 0.0.1"\n' > "$fake"
+          chmod +x "$fake"
+          if SMOKE_BUILT_VERSION="$built" "$check" "$fake" > /dev/null; then
+            echo "::error::the check accepted a roomlerd that answers another version"
+            exit 1
+          fi
+          SMOKE_BUILT_VERSION="$built" "$check" target/aarch64-apple-darwin/release/roomlerd
+          echo "  the check refuses another version and accepts this build"
+          echo "BUNDLE_CHECK=$check" >> "$GITHUB_ENV"
 
       - name: Stage + build the pkg
         run: |
@@ -1836,6 +1886,21 @@ jobs:
           ls -l "$home/Library/LaunchAgents/com.roomler.desktop.plist"
           sudo ls -l "$scratch"
 
+      # #3774: the product's own opt-out, before the first install. Without it
+      # the package loads the update helper (RunAtLoad), which fetches the
+      # newest PUBLISHED release and installs it over this job's build whenever
+      # the ref is behind that release, and every later step then tests the
+      # release instead. With it, every install skips the helper (`postinstall`,
+      # the `disable-auto-update` test). Pointing the update URL at a dead
+      # address would not do: the updater falls back to GitHub. The marker
+      # comes off at the job's last install, which asserts the default.
+      - name: Opt out of the live update channel (before the first install)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/roomler
+          sudo touch /etc/roomler/disable-auto-update
+          ls -l /etc/roomler/disable-auto-update
+
       - name: Install it
         run: sudo installer -verbose -pkg dist/smoke.pkg -target /
 
@@ -1922,7 +1987,7 @@ jobs:
           test -x /usr/local/bin/roomlerd || { echo "::error::missing /usr/local/bin/roomlerd"; exit 1; }
           [ "$(readlink /usr/local/bin/roomlerd)" = "$BIN" ] \
             || { echo "::error::roomlerd does not point at the bundle binary"; exit 1; }
-          "$BIN" --version
+          "$BUNDLE_CHECK"
           /usr/local/bin/roomlerd --version >/dev/null \
             || { echo "::error::roomlerd on PATH does not run"; exit 1; }
           echo "  payload OK"
@@ -1939,6 +2004,7 @@ jobs:
       - name: The pre-rename bundle is swept by an upgrade
         run: |
           set -euo pipefail
+          "$BUNDLE_CHECK"
           sudo mkdir -p /Library/Roomler/roomler-agent.app/Contents/MacOS
           sudo cp /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd \
             /Library/Roomler/roomler-agent.app/Contents/MacOS/roomler-agent
@@ -1990,22 +2056,42 @@ jobs:
           fi
           echo "  privileged half correctly absent"
 
-      - name: Assert the update helper is installed BY DEFAULT
+      # #3774: the marker went down before the first install, so every install
+      # so far skipped the update helper, and none loaded a job that could put
+      # the newest published release over this build. The helper is then run
+      # once by hand, as root as launchd runs it, and must exit on the marker.
+      # That the helper is installed BY DEFAULT is asserted by the job's last
+      # install, after every step that reads the bundle.
+      - name: The live update channel stays shut (the helper exits on the opt-out marker)
         run: |
           set -euo pipefail
-          # The update half is the OPPOSITE polarity of the overlay daemon:
-          # default ON, marker opts OUT. A default install must carry it, or
-          # the DEFAULT macOS flavour (per-user only) can never self-update —
-          # which is the exact state that left a Mac permanently stale.
-          test -f /Library/LaunchDaemons/com.roomler.update.plist \
-            || { echo "::error::com.roomler.update.plist missing — default install has no updater"; exit 1; }
-          # Loaded, not merely placed: RunAtLoad/StartInterval/WatchPaths all
-          # hang off the loaded job. (Its RunAtLoad fires the helper once here;
-          # the smoke binary's version >= the latest published release, so the
-          # helper reports up-to-date/skipped and exits — no install happens.)
-          launchctl print system/com.roomler.update >/dev/null 2>&1 \
-            || { echo "::error::com.roomler.update installed but not loaded"; exit 1; }
-          echo "  update helper installed + loaded (default ON)"
+          "$BUNDLE_CHECK"
+          test -f /etc/roomler/disable-auto-update \
+            || { echo "::error::the opt-out marker is gone"; exit 1; }
+          if [ -f /Library/LaunchDaemons/com.roomler.update.plist ]; then
+            echo "::error::an install placed the update helper although the opt-out marker is set"
+            exit 1
+          fi
+          if launchctl print system/com.roomler.update >/dev/null 2>&1; then
+            echo "::error::com.roomler.update is loaded although the opt-out marker is set"
+            exit 1
+          fi
+          echo "--- the package's lines for the helper, from /var/log/install.log ---"
+          pkg_lines="$(sudo grep -F 'auto-update opted out' /var/log/install.log || true)"
+          printf '%s\n' "$pkg_lines" | sed 's/^.*postinstall: /    /' | tail -3
+          [ -n "$pkg_lines" ] \
+            || { echo "::error::no install said it skipped the helper for the opt-out marker"; exit 1; }
+          # The helper spaces its runs 60 s apart (launchd's ThrottleInterval
+          # twin) and a first run has no stamp yet, so this waits about 60 s.
+          echo "--- the update helper, run once by hand ---"
+          rc=0
+          out="$(sudo env RUST_LOG=info NO_COLOR=1 \
+            /Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd update-helper 2>&1)" || rc=$?
+          printf '%s\n' "$out" | sed 's/^/    /'
+          [ "$rc" -eq 0 ] || { echo "::error::the update helper ended rc=$rc"; exit 1; }
+          printf '%s\n' "$out" | grep -qF 'auto-update opted out — exiting' \
+            || { echo "::error::the update helper did not exit on the opt-out marker"; exit 1; }
+          echo "  the update helper exits on the marker: nothing replaces this job's build"
 
       - name: Assert the menu-bar companion shipped and registered
         run: |
@@ -2032,6 +2118,8 @@ jobs:
       - name: Assert the CLI shim resolves the daemon inside the bundle
         run: |
           set -euo pipefail
+          # The shim execs the bundle's roomlerd.
+          "$BUNDLE_CHECK"
           # macOS is the one platform where the shim's sibling-`roomlerd` probe
           # cannot work, so this covers the bundle fallback. Nothing is enrolled
           # here, so the command itself will fail — what must NOT happen is the
@@ -2046,21 +2134,68 @@ jobs:
           esac
           echo "  shim resolves the daemon"
 
-      - name: Assert permissions are reported HONESTLY when denied
+      # `has_input_permission` used to be a compile-time constant, so a Mac with
+      # Accessibility denied still advertised working input. It is now
+      # feature && GUI session && the OS grant, and `permissions` lists what
+      # the OS granted (`input`, `screen-capture`) or `no-gui-session`
+      # (encode/caps.rs). With `enigo-input` built in, the two must agree.
+      #
+      # What the hosted image grants (#3774): on macos-15 the process this
+      # step's shell starts holds BOTH Screen Recording and Accessibility; runs
+      # on 2026-11-12 printed `permissions: ["screen-capture", "input"]`. So on
+      # this image the step reads the granted path, and the refused path is
+      # asserted only when this process's own `permissions` lacks `input`.
+      - name: Assert permissions are reported as the OS granted them (the hosted image grants both)
         run: |
           set -euo pipefail
-          # A hosted runner grants neither Screen Recording nor Accessibility,
-          # so this is the denied path — the one that used to advertise itself
-          # as working because `has_input_permission` was a compile-time
-          # constant. Being able to assert this at all is the point of moving
-          # it to a runtime probe.
+          "$BUNDLE_CHECK"
+          # judge HAS_INPUT PERMISSIONS_LINE: rc 0 when the two agree.
+          judge() {
+            local has="$1" perms="$2" input=0 nogui=0
+            case "$perms" in *'"input"'*) input=1 ;; esac
+            case "$perms" in *'"no-gui-session"'*) nogui=1 ;; esac
+            case "$has" in
+              true)
+                [ "$input" -eq 1 ] && [ "$nogui" -eq 0 ] && return 0
+                echo "::error::has_input_permission is true while permissions is $perms"
+                return 1 ;;
+              false)
+                if [ "$input" -eq 1 ] && [ "$nogui" -eq 0 ]; then
+                  echo "::error::has_input_permission is false while permissions is $perms (is enigo-input built in?)"
+                  return 1
+                fi
+                return 0 ;;
+              *)
+                echo "::error::has_input_permission is '$has', not true or false"
+                return 1 ;;
+            esac
+          }
+          # The check refuses what it exists to refuse (its negative controls).
+          for bad in 'true|["screen-capture"]' 'true|[]' 'true|["no-gui-session"]' \
+                     'true|["no-gui-session", "input"]' 'false|["screen-capture", "input"]' '|["input"]'; do
+            if judge "${bad%%|*}" "${bad#*|}" >/dev/null; then
+              echo "::error::the check accepted a contradictory report: $bad"
+              exit 1
+            fi
+          done
+          for good in 'true|["screen-capture", "input"]' 'true|["input"]' 'false|[]' \
+                      'false|["screen-capture"]' 'false|["no-gui-session"]'; do
+            judge "${good%%|*}" "${good#*|}" \
+              || { echo "::error::the check refused a consistent report: $good"; exit 1; }
+          done
+          echo "  the check refuses 6 contradictory reports and accepts 5 consistent ones"
+
           caps="$(/Library/Roomler/roomlerd.app/Contents/MacOS/roomlerd caps 2>&1 || true)"
-          echo "$caps"
-          if echo "$caps" | grep -qi 'has_input_permission: true'; then
-            echo "::error::input advertised as granted on a runner that granted nothing"
-            exit 1
-          fi
-          echo "  permissions reported honestly"
+          has="$(printf '%s\n' "$caps" | sed -n 's/^has_input_permission: //p' | head -1)"
+          perms="$(printf '%s\n' "$caps" | sed -n 's/^permissions: //p' | head -1)"
+          echo "  has_input_permission: ${has:-<missing>}    permissions: ${perms:-<missing>}"
+          [ -n "$has" ] && [ -n "$perms" ] \
+            || { printf '%s\n' "$caps"; echo "::error::roomlerd caps printed no has_input_permission or no permissions line"; exit 1; }
+          judge "$has" "$perms" || { printf '%s\n' "$caps"; exit 1; }
+          case "$perms" in
+            *'"input"'*) echo "  this image granted this process Accessibility; the refused path is not reachable here" ;;
+            *) echo "  Accessibility not granted to this process, and input is reported refused" ;;
+          esac
 
       - name: An enabled daemon must SURVIVE the next install (self-update)
         run: |
@@ -2114,8 +2249,16 @@ jobs:
           # happy path. A marker the migration failed to carry would fall through
           # to the else branch and BOOT OUT the daemon, which is the failure this
           # whole phase is shaped around.
+          # The migration runs only while /etc/roomler is ABSENT, and the job's
+          # opt-out marker (#3774) made it exist: the whole directory is renamed
+          # to the legacy name, marker and all, so the migration still runs, and
+          # it must carry the opt-out across too. Both readers of the marker
+          # dual-read, so the live channel stays shut throughout.
           # RETIRED-NAME-ANCHOR(2): the migration SOURCE, seeded on purpose.
-          sudo mkdir -p /etc/roomler-agent
+          "$BUNDLE_CHECK"
+          test ! -e /etc/roomler-agent \
+            || { echo "::error::/etc/roomler-agent exists before the migration is seeded"; exit 1; }
+          sudo mv /etc/roomler /etc/roomler-agent
           sudo touch /etc/roomler-agent/enable-daemon
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
@@ -2129,7 +2272,9 @@ jobs:
             || { echo "::error::the marker was not migrated to /etc/roomler"; exit 1; }
           test ! -d /etc/roomler-agent \
             || { echo "::error::the legacy /etc/roomler-agent survived the migration"; exit 1; }
-          echo "  config dir migrated off the retired name"
+          test -f /etc/roomler/disable-auto-update \
+            || { echo "::error::the migration did not carry the opt-out marker to /etc/roomler"; exit 1; }
+          echo "  config dir migrated off the retired name, the opt-out marker with it"
 
           echo "=== install 2: plain, i.e. what a self-update runs ==="
           sudo installer -verbose -pkg dist/smoke.pkg -target /
@@ -2153,35 +2298,71 @@ jobs:
           fi
           echo "  opt-out still honoured"
 
-      - name: The update helper's opt-out round-trip (disable -> gone, enable -> back)
+      # The opt-out half of the update helper's round trip; the opt-in half is
+      # the job's last install. #3774: the marker has been set since before the
+      # first install, so the helper the removal branch removes is loaded here
+      # by hand, from the bundle's own plist, while the marker is set: a job
+      # loaded before the marker was set lingers like that until an install or
+      # a reboot, and it must exit on the marker too.
+      - name: The update helper's opt-out removes a loaded helper (and a loaded one exits on the marker)
         run: |
           set -euo pipefail
+          "$BUNDLE_CHECK"
           since=$(date -u "+%Y-%m-%d %H:%M:%S")
           dump_log() {
             echo "--- postinstall output from /var/log/install.log ---"
             sudo awk -v s="$since" '$0 ~ /roomler|update helper|disable-auto-update/ {print "    " $0}' \
               /var/log/install.log 2>/dev/null | tail -25 || true
           }
+          plist=/Library/LaunchDaemons/com.roomler.update.plist
 
-          # The three installs above all ran WITHOUT the disable marker, so the
-          # helper must still be present at this point (regression guard for
-          # "an unrelated re-install dropped the updater").
-          test -f /Library/LaunchDaemons/com.roomler.update.plist \
-            || { echo "::error::update plist vanished across plain re-installs"; exit 1; }
+          # Every install above ran WITH the marker, so the helper must still be
+          # absent: each of them honoured it.
+          if [ -f "$plist" ]; then
+            echo "::error::an install placed the update helper although the opt-out marker is set"
+            exit 1
+          fi
 
-          echo "=== opt out: marker set -> the helper must GO ==="
-          # FR-46 P5a — by this point install 1 has already migrated the directory,
-          # so `/etc/roomler` EXISTS and the migration (dest-absent only) will not
-          # run again. That makes this block exercise the DUAL-READ fallback arm:
-          # an opt-out marker sitting at the legacy path must still be honoured,
-          # because reading only the current path would auto-update a Mac whose
-          # operator opted out. Deliberate coverage, not an accident of ordering.
+          echo "=== a helper loaded while the marker is set: it runs once and exits on the marker ==="
+          sudo cp /Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist "$plist"
+          sudo chown root:wheel "$plist"
+          sudo chmod 644 "$plist"
+          sudo launchctl bootstrap system "$plist"
+          # RunAtLoad starts it at once; it may first wait out its 60 s run
+          # spacing. The removal below waits only 10 s for an idle job, so wait
+          # here until it has run and is idle.
+          idle=0
+          for _ in $(seq 1 60); do
+            state=$(sudo launchctl print system/com.roomler.update 2>/dev/null || true)
+            if printf '%s\n' "$state" | grep -qE 'runs = [1-9]' \
+               && ! printf '%s\n' "$state" | grep -q 'state = running'; then
+              idle=1
+              break
+            fi
+            sleep 3
+          done
+          [ "$idle" -eq 1 ] \
+            || { echo "::error::the loaded helper did not run and go idle within 180 s"; exit 1; }
+          echo "--- /var/log/roomler/update.log ---"
+          sudo tail -n 5 /var/log/roomler/update.log | sed 's/^/    /' || true
+          sudo grep -qF 'auto-update opted out — exiting' /var/log/roomler/update.log \
+            || { echo "::error::the helper launchd ran did not exit on the opt-out marker"; exit 1; }
+          echo "  the helper launchd ran exits on the marker"
+          "$BUNDLE_CHECK"
+
+          echo "=== opt out: the marker at the legacy path -> the loaded helper must GO ==="
+          # FR-46 P5a — install 1 above migrated the directory, so `/etc/roomler`
+          # EXISTS and the migration (dest-absent only) will not run again. That
+          # makes this block exercise the DUAL-READ fallback arm: an opt-out
+          # marker sitting at the legacy path must still be honoured, because
+          # reading only the current path would auto-update a Mac whose operator
+          # opted out. Deliberate coverage, not an accident of ordering.
           # RETIRED-NAME-ANCHOR(2): the legacy opt-out path, seeded on purpose.
           sudo mkdir -p /etc/roomler-agent
-          sudo touch /etc/roomler-agent/disable-auto-update
+          sudo mv /etc/roomler/disable-auto-update /etc/roomler-agent/disable-auto-update
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
-          if [ -f /Library/LaunchDaemons/com.roomler.update.plist ]; then
+          if [ -f "$plist" ]; then
             echo "::error::disable-auto-update did not remove the helper plist"
             exit 1
           fi
@@ -2192,16 +2373,9 @@ jobs:
             exit 1
           fi
           echo "  opt-out removes the helper"
-
-          echo "=== opt back in: marker removed -> the helper must RETURN ==="
-          sudo rm -f /etc/roomler-agent/disable-auto-update
-          sudo installer -verbose -pkg dist/smoke.pkg -target /
-          dump_log
-          test -f /Library/LaunchDaemons/com.roomler.update.plist \
-            || { echo "::error::helper plist not restored after removing the opt-out"; exit 1; }
-          launchctl print system/com.roomler.update >/dev/null 2>&1 \
-            || { echo "::error::helper not re-loaded after removing the opt-out"; exit 1; }
-          echo "  opt-in restores the helper"
+          # Back at the current path for the steps that follow.
+          sudo mv /etc/roomler-agent/disable-auto-update /etc/roomler/disable-auto-update
+          sudo rmdir /etc/roomler-agent
 
       # A rewrite that fails over a login item of the person's: the script keeps
       # the item that is there, still loads it, and says so in a WARNING
@@ -2215,6 +2389,8 @@ jobs:
             echo "::warning::no GUI session on this runner, so there is no login item to read"
             exit 0
           fi
+          # The login item it loads runs the bundle's roomlerd.
+          "$BUNDLE_CHECK"
           uid=$(id -u "$console_user")
           home=$(dscl . -read /Users/"$console_user" NFSHomeDirectory | awk '{print $2}')
           item="$home/Library/LaunchAgents/com.roomler.agent.plist"
@@ -2254,6 +2430,31 @@ jobs:
             fail=1
           fi
           exit "$fail"
+
+      # The opt-in half of the round trip, and the job's LAST install. The
+      # update half is the OPPOSITE polarity of the overlay daemon: default ON,
+      # marker opts OUT. A default install must carry it, or the DEFAULT macOS
+      # flavour (per-user only) can never self-update — which is the exact state
+      # that left a Mac permanently stale.
+      #
+      # #3774: taking the marker away opens the live update channel. The helper
+      # this install loads may fetch the newest published release and install it
+      # over this build, so it comes after every step that reads the bundle or
+      # the install log, and no step after it does. Every earlier step's
+      # isolation came from the marker, not from this build's version.
+      - name: Assert the update helper is installed BY DEFAULT (the job's last install)
+        run: |
+          set -euo pipefail
+          "$BUNDLE_CHECK"
+          sudo rm -f /etc/roomler/disable-auto-update /etc/roomler-agent/disable-auto-update
+          sudo installer -verbose -pkg dist/smoke.pkg -target /
+          test -f /Library/LaunchDaemons/com.roomler.update.plist \
+            || { echo "::error::com.roomler.update.plist missing — default install has no updater"; exit 1; }
+          # Loaded, not merely placed: RunAtLoad/StartInterval/WatchPaths all
+          # hang off the loaded job.
+          launchctl print system/com.roomler.update >/dev/null 2>&1 \
+            || { echo "::error::com.roomler.update installed but not loaded"; exit 1; }
+          echo "  update helper installed + loaded (default ON)"
 
       # The package's script keeps launchctl's error text in a variable, so no
       # command in it names a path in /tmp.
