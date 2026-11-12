@@ -75,6 +75,9 @@ pub mod sas;
 #[cfg(feature = "enigo-input")]
 pub mod enigo_backend;
 
+// #3787 — the level an X11 open with no display to open is said at.
+pub mod no_display;
+
 // rc.122 — Windows real-virtual-key text injection so typed letters land in the
 // legacy console (Windows PowerShell 5.1 / cmd), which drops enigo.text()'s
 // KEYEVENTF_UNICODE. Used by the shared `dispatch` KeyText arm.
