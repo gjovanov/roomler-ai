@@ -66,6 +66,9 @@ pub struct Stream {
     pub(crate) state: Arc<AtomicU8>,             // clone from association
     pub(crate) awake_write_loop_ch: Arc<mpsc::Sender<()>>,
     pub(crate) pending_queue: Arc<PendingQueue>,
+    // roomler (#3716): a write's, from its shutdown check until its chunks
+    // are queued (`write_sctp`, `send_reset_request`).
+    pub(crate) write_turn: Arc<Mutex<()>>,
 
     pub(crate) stream_identifier: u16,
     pub(crate) default_payload_type: AtomicU32, //PayloadProtocolIdentifier,
@@ -122,6 +125,7 @@ impl Stream {
             state,
             awake_write_loop_ch,
             pending_queue,
+            write_turn: Arc::new(Mutex::new(())),
 
             stream_identifier,
             default_payload_type: AtomicU32::new(0), //PayloadProtocolIdentifier::Unknown,
@@ -269,6 +273,14 @@ impl Stream {
     ///
     /// Returns an error if the write half of this stream is shutdown or `p` is too large.
     pub async fn write_sctp(&self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
+        // roomler (#3716): a write holds its turn from its shutdown check until
+        // its chunks are queued or it is let go, so the stream's reset never
+        // goes ahead of a write the check let through (`send_reset_request`).
+        // A write after the shutdown still fails at once.
+        if self.write_shutdown.load(Ordering::SeqCst) {
+            return Err(Error::ErrStreamClosed);
+        }
+        let _turn = self.write_turn.lock().await;
         let chunks = self.prepare_write(p, ppi)?;
         self.send_payload_data(chunks).await?;
 
@@ -488,7 +500,11 @@ impl Stream {
         }
 
         // NOTE: append is used here instead of push in order to prevent chunks interlacing.
-        self.pending_queue.append(chunks).await;
+        // roomler (#3716): false = the association closed while this write
+        // waited in flow control; it is let go with an error, not kept forever.
+        if !self.pending_queue.append(chunks).await {
+            return Err(Error::ErrPayloadDataStateNotExist);
+        }
 
         self.awake_write_loop();
         Ok(())
@@ -510,9 +526,36 @@ impl Stream {
             ..Default::default()
         };
 
-        self.pending_queue.push(c).await;
-
-        self.awake_write_loop();
+        // roomler (#3716): the reset needs no flow-control permits, but `push`
+        // queues behind a writer parked in flow control, and on a dead path the
+        // peer never acks that writer free. A data channel's close waited here
+        // forever, and with it the peer connection's close, the one thing that
+        // would have let the writer go (the association's close, after the
+        // channels'). Queue it now if nothing is parked; otherwise right after
+        // the parked writer, on a task, so the close goes on. A writer the
+        // association's close lets go takes the reset with it. A write of this
+        // stream that passed its shutdown check holds `write_turn` until its
+        // chunks are queued: the reset waits for that turn on the task too,
+        // so it never goes ahead of that write's data.
+        let c = match self.write_turn.try_lock() {
+            Ok(_turn) => match self.pending_queue.try_push(c) {
+                Ok(()) => {
+                    self.awake_write_loop();
+                    return Ok(());
+                }
+                Err(c) => c,
+            },
+            Err(_) => c,
+        };
+        let pending_queue = Arc::clone(&self.pending_queue);
+        let awake_write_loop_ch = Arc::clone(&self.awake_write_loop_ch);
+        let write_turn = Arc::clone(&self.write_turn);
+        tokio::spawn(async move {
+            drop(write_turn.lock().await);
+            if pending_queue.push(c).await {
+                let _ = awake_write_loop_ch.try_send(());
+            }
+        });
         Ok(())
     }
 }

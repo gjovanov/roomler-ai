@@ -537,8 +537,12 @@ impl Association {
                         // absent; ENOBUFS; an interface going away under a
                         // roam) killed a whole remote-desktop session. SCTP
                         // retransmits what was dropped, the way libwebrtc does.
-                        // A transport that is really gone is still caught: its
-                        // `recv` fails, and the read loop closes the association.
+                        // roomler (#3716): nothing below ever fails `recv` on a
+                        // dead path (the ICE agent's conn only ends when the
+                        // agent is closed), so it is the peer connection's close
+                        // that ends this association, and that close must not
+                        // wait behind a write the dead path never acks
+                        // (`PendingQueue::close`, `Stream::send_reset_request`).
                         match net_conn.send(raw.as_ref()).await {
                             Ok(_) => {
                                 bytes_sent.fetch_add(raw.len(), Ordering::SeqCst);

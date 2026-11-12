@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use portable_atomic::AtomicU32;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -225,6 +226,71 @@ async fn test_poll_stream() -> std::result::Result<(), io::Error> {
     // misc.
     let clone = poll_stream.clone();
     assert_eq!(clone.stream_identifier(), poll_stream.stream_identifier());
+
+    Ok(())
+}
+
+/// roomler (#3716): a write that passed its shutdown check holds its stream's
+/// `write_turn` until its chunks are queued. The stream's reset waits for that
+/// turn on a task of its own: the shutdown returns at once and queues nothing
+/// yet, and the reset goes in right behind the write's data, never ahead of
+/// it. One thread, so the reset's task runs only where the test yields: the
+/// order is the code's, not a race's.
+#[tokio::test(flavor = "current_thread")]
+async fn test_stream_reset_waits_for_a_write_turn() -> Result<()> {
+    let (awake_write_loop_ch_tx, _awake_write_loop_ch_rx) = mpsc::channel(1);
+    let s = Stream::new(
+        "test_stream_reset_waits_for_a_write_turn".to_owned(),
+        0,
+        4096,
+        Arc::new(AtomicU32::new(4096)),
+        Arc::new(AtomicU8::new(AssociationState::Established as u8)),
+        Arc::new(awake_write_loop_ch_tx),
+        Arc::new(PendingQueue::new()),
+    );
+
+    // A write passed its shutdown check and holds its turn; its chunks are
+    // not queued yet.
+    let turn = s.write_turn.lock().await;
+
+    // The channel closes, and its shutdown does not wait for that write.
+    let mut shutdown = Box::pin(s.shutdown(Shutdown::Both));
+    let polled = std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx))).await;
+    assert!(
+        matches!(polled, Poll::Ready(Ok(()))),
+        "the shutdown waited for a write's turn: {polled:?}"
+    );
+    assert!(
+        s.pending_queue.is_empty(),
+        "the reset was queued while a write that passed its shutdown check held its turn"
+    );
+
+    // Everything else on the runtime runs, the reset's task with it, while the
+    // write packetizes and queues its message. Then it gives up its turn.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let data = Bytes::from_static(b"the last frame");
+    assert!(
+        s.pending_queue
+            .append(s.packetize(&data, PayloadProtocolIdentifier::Binary))
+            .await
+    );
+    drop(turn);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while s.pending_queue.len() < 2 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let mut queued = Vec::new();
+    while let Some(c) = s.pending_queue.pop(true, false) {
+        queued.push(c.user_data);
+    }
+    assert_eq!(
+        queued,
+        [data, Bytes::new()],
+        "the queue must end as [the write's data, the zero-length reset]"
+    );
 
     Ok(())
 }

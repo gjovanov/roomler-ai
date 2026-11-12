@@ -85,6 +85,8 @@ pub struct RTCDataChannel {
 
     pub(crate) sctp_transport: Mutex<Option<Weak<RTCSctpTransport>>>,
     pub(crate) data_channel: Mutex<Option<Arc<data::data_channel::DataChannel>>>,
+    // roomler patch (#3716): this channel's writes take turns on it (`send`).
+    pub(crate) send_lock: Mutex<()>,
 
     pub(crate) notify_tx: Arc<Notify>,
 
@@ -376,8 +378,17 @@ impl RTCDataChannel {
     pub async fn send(&self, data: &Bytes) -> Result<usize> {
         self.ensure_open()?;
 
-        let data_channel = self.data_channel.lock().await;
-        if let Some(dc) = &*data_channel {
+        // roomler patch (#3716): the channel is taken out of its slot, and the
+        // slot's lock is not held across the write. A write parked in SCTP flow
+        // control on a dead path held it forever, and `close()` takes the same
+        // lock, so the channel's close (and the peer connection's after it)
+        // waited behind a write that only that close could let go. The writes
+        // still take turns, on `send_lock`, which nothing but `send` and
+        // `send_text` takes: the slot lock was all that ordered them, and two
+        // at once shared a stream sequence number or split a message.
+        let _turn = self.send_lock.lock().await;
+        let data_channel = self.data_channel.lock().await.clone();
+        if let Some(dc) = data_channel {
             Ok(dc.write_data_channel(data, false).await?)
         } else {
             Err(Error::ErrClosedPipe)
@@ -388,8 +399,10 @@ impl RTCDataChannel {
     pub async fn send_text(&self, s: impl Into<String>) -> Result<usize> {
         self.ensure_open()?;
 
-        let data_channel = self.data_channel.lock().await;
-        if let Some(dc) = &*data_channel {
+        // roomler patch (#3716): as in `send`.
+        let _turn = self.send_lock.lock().await;
+        let data_channel = self.data_channel.lock().await.clone();
+        if let Some(dc) = data_channel {
             Ok(dc.write_data_channel(&Bytes::from(s.into()), true).await?)
         } else {
             Err(Error::ErrClosedPipe)

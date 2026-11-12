@@ -1948,8 +1948,8 @@ impl AgentPeer {
     }
 
     pub async fn close(&self) {
-        self.stop_serving();
-        if let Err(e) = self.pc.close().await {
+        self.stop_serving(); // #3716: the close runs on, past a caller's budget
+        if let Err(e) = crate::peer_close::close(Arc::clone(&self.pc), self.session_id).await {
             warn!(session = %self.session_id, %e, "PC close failed");
         }
     }

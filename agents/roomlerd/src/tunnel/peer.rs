@@ -345,7 +345,9 @@ impl AgentTunnelPeer {
         // lives in one place. A peer that is KEPT (never closed) keeps its
         // flows: the cancel is tied to `close`, not to any loop exit.
         self.flow_canceller.cancel();
-        if let Err(e) = self.peer.peer_connection().close().await {
+        // #3716 — on a task of its own, as `AgentPeer::close`.
+        if let Err(e) = crate::peer_close::close(self.peer.peer_connection(), self.session_id).await
+        {
             debug!(session_id = %self.session_id, %e, "TunnelPeer close errored");
         }
         self.flow_demuxes.lock().await.clear();
