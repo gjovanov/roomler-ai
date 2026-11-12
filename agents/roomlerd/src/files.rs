@@ -179,6 +179,10 @@ pub(crate) static FILES_DIR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mut
 ///   per-user identity to resolve, its default ladder already lands in its
 ///   own folders, and the LocalAPI socket is owner-only (0600) — the pipe's
 ///   non-admin caller does not exist on Unix, so the rule is belt and braces.
+///   On Linux that home is the one root's account names (`account_home`),
+///   never the `HOME` its environment names (`sudo -E` keeps the caller's;
+///   a drop-in may set one), so another account's home there never becomes
+///   where a configured or a chosen folder may sit (#3688).
 /// * Everyone else — unprivileged: this process can only write where its own
 ///   user can, so the folder rules apply and the profile rule does not.
 pub fn writer_context() -> files_dir::Writer {
@@ -195,9 +199,13 @@ pub fn writer_context() -> files_dir::Writer {
     {
         // SAFETY: `geteuid` takes no arguments and cannot fail.
         if unsafe { libc::geteuid() } == 0 {
+            #[cfg(target_os = "linux")]
+            let active_home = account_home().map(|home| home.to_string_lossy().into_owned());
+            #[cfg(not(target_os = "linux"))]
+            let active_home = process_home();
             return files_dir::Writer {
                 privileged: true,
-                active_home: process_home(),
+                active_home,
             };
         }
     }
@@ -4488,7 +4496,8 @@ fn drop_folder_with(writer: &files_dir::Writer) -> Result<(PathBuf, bool)> {
 /// opened following links, and the folder it leads to must be the writer's
 /// own; for root, one no other account may write; for a per-user daemon,
 /// one not every account may (Ubuntu's private-group umask makes
-/// `~/Downloads` 0775), unless its file system keeps no modes
+/// `~/Downloads` 0775), unless its file system keeps no owners or modes,
+/// where it need only be one the daemon can write into
 /// (`staging::may_receive`). Root's home is its account's, and must pass
 /// root's rule too ([`own_home_and_downloads`]). It was the temp dir: on a
 /// server, root's was `/tmp`.
@@ -4648,7 +4657,9 @@ fn private_staging_root(stager: &FsAs) -> Option<PathBuf> {
 
 /// #3688, R4 — the home this process's account names in the account
 /// database (`getpwuid_r` of its effective uid), never the `HOME` its
-/// environment names. A test stands it in (`stand_in::own_home`).
+/// environment names: root's default folder sits in it, and FR-84 D4's
+/// placement rule takes it as root's active home ([`writer_context`]). A
+/// test stands it in (`stand_in::own_home`).
 #[cfg(target_os = "linux")]
 fn account_home() -> Option<PathBuf> {
     #[cfg(test)]
@@ -11116,7 +11127,7 @@ CAN_GRAPHICAL=0
             assert_eq!(placed, Ok(dl.join("e.txt")));
         }
 
-        /// R5 — a per-user daemon whose Downloads sits on a file system that
+        /// #3688 — a per-user daemon whose Downloads sits on a file system that
         /// keeps no Unix owners either: a VirtualBox shared folder reads
         /// `root:vboxsf`, an sshfs without `idmap=user` the server's numbers.
         /// A folder's owner says nothing there, so the daemon's default folder
@@ -11210,7 +11221,7 @@ CAN_GRAPHICAL=0
             assert!(!partial_dir.exists(), "its staging goes");
         }
 
-        /// R5 — a daemon that is root (root at the screen, or the switch off)
+        /// #3688 — a daemon that is root (root at the screen, or the switch off)
         /// judges a configured folder, or one a controller chose, by FR-84
         /// D4's rule against the home its account names (`getpwuid`), never
         /// the `HOME` its environment names (`sudo -E` keeps the caller's, a

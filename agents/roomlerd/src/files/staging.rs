@@ -189,12 +189,16 @@ pub(super) fn open_folder(path: &Path) -> io::Result<File> {
 }
 
 /// #3688 rule 1 — whether the folder `held` may receive the daemon's own
-/// files: a folder, never the temp dir, `uid`'s, and, for root (`strict`),
-/// one no other account may write; for a per-user daemon, one not every
-/// account may write (Ubuntu's private-group umask makes `~/Downloads`
-/// 0775), unless its file system keeps no modes, where every folder reads
-/// so ([`keeps_modes`]): such an upload stages privately and is placed
-/// without following a link. `Err` says why not, in the viewer's words.
+/// files: a folder, never the temp dir; for root (`strict`), `uid`'s and
+/// one no other account may write; for a per-user daemon, `uid`'s and one
+/// not every account may write (Ubuntu's private-group umask makes
+/// `~/Downloads` 0775). A file system that keeps no Unix owners or modes
+/// ([`keeps_modes`]) shows every folder as some fixed owner and mode (a FAT
+/// disk 0777, a VirtualBox shared folder `root:vboxsf`, an sshfs without
+/// `idmap=user` the server's numbers), which say nothing: there a per-user
+/// daemon's folder needs only to be one it can write into ([`writable`]),
+/// since such an upload stages privately and is placed without following a
+/// link. Root stays strict. `Err` says why not, in the viewer's words.
 pub(super) fn may_receive(held: &File, uid: u32, strict: bool) -> Result<(), String> {
     let md = held
         .metadata()
@@ -205,16 +209,58 @@ pub(super) fn may_receive(held: &File, uid: u32, strict: bool) -> Result<(), Str
     if is_the_temp_dir(&md) {
         return Err("it is the temp folder".into());
     }
-    if md.uid() != uid {
-        return Err("it belongs to another account".into());
+    let theirs = md.uid() == uid;
+    if strict {
+        if !theirs {
+            return Err("it belongs to another account".into());
+        }
+        if md.mode() & 0o022 != 0 {
+            return Err("another account can write to it".into());
+        }
+        return Ok(());
     }
-    if strict && md.mode() & 0o022 != 0 {
-        return Err("another account can write to it".into());
+    if theirs && md.mode() & 0o002 == 0 {
+        return Ok(());
     }
-    if md.mode() & 0o002 != 0 && keeps_modes(held) {
-        return Err("every account can write to it".into());
+    if keeps_modes(held) {
+        return Err(if theirs {
+            "every account can write to it"
+        } else {
+            "it belongs to another account"
+        }
+        .into());
+    }
+    if !writable(held) {
+        return Err("file transfer cannot write into it".into());
     }
     Ok(())
+}
+
+/// #3688 — whether the stager may make an entry in the folder `held`, as the
+/// kernel answers for the thread's own fsuid, fsgid and groups
+/// (`faccessat2` with `AT_EACCESS`), with nothing made. Where that call is
+/// missing (a kernel before 5.8) or refused outright (a seccomp profile
+/// older than it answers `EPERM`), an empty folder made there and removed
+/// at once answers instead ([`probe`]).
+fn writable(held: &File) -> bool {
+    // SAFETY: a handle we hold, an empty NUL-terminated path and plain
+    // flags; the call writes nothing back.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_faccessat2,
+            held.as_raw_fd(),
+            c"".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS | libc::AT_EMPTY_PATH,
+        )
+    };
+    if rc == 0 {
+        return true;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ENOSYS | libc::EPERM | libc::EINVAL) => probe(held).is_some(),
+        _ => false,
+    }
 }
 
 /// Whether `md` is the temp dir's (`std::env::temp_dir()`), which no rule
