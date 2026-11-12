@@ -231,7 +231,7 @@ shows in `roomler status` (`… DNS steered` / `DNS NOT steered`).
 `process::exit` bypasses Rust's `Drop`, so the paths that hard-exit (watchdog
 stall, a fatal goodbye, a duplicate-instance loser, `roomlerd self-update` run
 by hand) never run RAII teardown. An auto-update is not one of them: it shuts
-the daemon down gracefully (`agents/roomlerd/src/updater.rs:3001`). Three sync,
+the daemon down gracefully (`agents/roomlerd/src/updater.rs:3011`). Three sync,
 context-free purges — `overlay::tun::purge_split_default()`,
 `overlay::tun::purge_stale_peer_routes()` and `overlay::dns::purge_exit_dns()`
 — are folded, with the host ledger's ([below](#exit-client-pins-fr-97-p0e)),
