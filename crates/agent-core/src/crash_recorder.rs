@@ -1945,6 +1945,80 @@ mod tests {
             println!("{CHECKED}");
         }
 
+        /// R145 — the reads and acts below a held `crashes`: a record that
+        /// does not parse is moved by handle into a sealed `malformed`, and a
+        /// junction where `malformed` goes is moved aside with nothing put
+        /// where it led; a record whose name became a symbolic link after it
+        /// was read is not deleted through the link. Control: a record read
+        /// is deleted through the folder it was read from.
+        #[test]
+        fn records_are_moved_and_deleted_by_handle_never_through_a_link() {
+            use super::super::{MALFORMED_DIR, scan_dir};
+            let Some(root) = child() else {
+                return run(
+                    "records_are_moved_and_deleted_by_handle_never_through_a_link",
+                    "crash records moved and deleted by handle",
+                );
+            };
+            let elsewhere = root.join("elsewhere");
+            let crashes = crate::appdirs::machine_global_dir().join("crashes");
+            let first = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            )
+            .expect("the recorder makes a sealed crashes and writes a record");
+            super::write_valid_sidecar(&crashes, 2, 2);
+            std::fs::write(crashes.join("1-1.json"), b"not json").unwrap();
+            junction(&crashes.join(MALFORMED_DIR), &elsewhere);
+
+            let pending = scan_dir(&crashes);
+            let malformed = crashes.join(MALFORMED_DIR);
+            assert!(
+                records_in(&elsewhere).is_empty(),
+                "nothing is moved where the junction led: {:?}",
+                records_in(&elsewhere)
+            );
+            assert!(
+                !is_link(&malformed) && malformed.join("1-1.json").is_file(),
+                "the record that does not parse is in a real malformed"
+            );
+            assert!(!crashes.join("1-1.json").exists());
+            let shape = sddl(&malformed);
+            assert!(protected(&shape), "malformed is sealed: {shape}");
+            let names: Vec<String> = pending
+                .iter()
+                .map(|(s, _)| s.path().file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            let first_name = first.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                names.len() == 2
+                    && names.contains(&first_name)
+                    && names.contains(&"2-2.json".into()),
+                "{names:?}"
+            );
+
+            // The second record's name becomes a symbolic link after the read.
+            let target = elsewhere.join("t.json");
+            std::fs::write(&target, b"keep").unwrap();
+            let second = crashes.join("2-2.json");
+            std::fs::remove_file(&second).unwrap();
+            std::os::windows::fs::symlink_file(&target, &second).unwrap();
+            let by_name = |n: &str| pending.iter().find(|(s, _)| s.path().ends_with(n)).unwrap();
+            let refused = by_name("2-2.json").0.remove();
+            assert!(refused.is_err(), "a link is not deleted: {refused:?}");
+            assert!(
+                is_link(&second) && target.is_file(),
+                "the link and its file stay"
+            );
+
+            // Control: the recorder's record is deleted through its folder.
+            by_name(&first_name).0.remove().expect("deleted by handle");
+            assert!(!first.exists());
+            println!("{CHECKED}");
+        }
+
         /// R145: a read walk that is refused (a junction above `crashes`)
         /// is not a suppressed crash: the tally the next record carries
         /// stays as it was. Control: a refused write is one.
