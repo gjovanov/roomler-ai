@@ -66,6 +66,12 @@ pub fn active_user_profile_root() -> Option<PathBuf> {
     Some(PathBuf::from(format!("C:\\Users\\{username}")))
 }
 
+/// The user name of the account signed in to this process's session.
+/// `None` when nobody is signed in, or any of the discovery steps fail.
+pub fn session_user_name() -> Option<String> {
+    user_name_for_session(current_session_id()?)
+}
+
 /// `ProcessIdToSessionId(GetCurrentProcessId())`. Returns the session
 /// id this worker is attached to. The SystemContext spawn pipeline
 /// puts the worker in the active interactive session so this is the

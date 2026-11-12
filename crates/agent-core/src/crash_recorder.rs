@@ -211,7 +211,18 @@ fn record_inner(
     log_tail_override: Option<String>,
 ) -> std::io::Result<PathBuf> {
     let dir = crashes_dir_for(ctx)?;
-    fs::create_dir_all(&dir)?;
+    record_inner_at(&dir, reason, summary, log_tail_override)
+}
+
+/// [`record_inner`] into the crashes folder `dir`, which the caller names: a
+/// test names a folder of its own.
+fn record_inner_at(
+    dir: &Path,
+    reason: CrashReason,
+    summary: &str,
+    log_tail_override: Option<String>,
+) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -226,11 +237,11 @@ fn record_inner(
     // uploader). See `should_suppress` for the rate-limit + cap
     // contract; `log_suppression_throttled` keeps the warn from
     // spamming.
-    if let Some(reason) = should_suppress(&dir, now_unix) {
+    if let Some(reason) = should_suppress(dir, now_unix) {
         // rc.51: tally the suppressed write so the next sidecar that
         // DOES land carries the count — loop intensity stays visible.
         SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
-        log_suppression_throttled(&dir, reason, now_unix);
+        log_suppression_throttled(dir, reason, now_unix);
         return Err(std::io::Error::other(reason.as_str()));
     }
 
@@ -1402,5 +1413,159 @@ mod tests {
 
         assert!(scan_dir(&dir).is_empty());
         assert!(torn.exists(), "the sidecar was not lost");
+    }
+
+    /// FR-145 — the supervisor's crash records in the machine folder, each
+    /// case in a child process of this test binary: a case names its own
+    /// stand-in for the machine's `%ProgramData%` (#3702's `program_data_is`),
+    /// which is process-wide. Making a sealed folder and writing into it
+    /// takes SYSTEM's or an elevated administrator's token, so a case says so
+    /// and stops unelevated, and fails in CI's elevated lane.
+    #[cfg(windows)]
+    mod in_the_machine_folder {
+        use std::path::{Path, PathBuf};
+
+        use super::super::record_inner_at;
+        use crate::machine_tree::test_support::{
+            aces, elevated_or_skip, junction, program_data, protected, sddl,
+        };
+        use roomler_ai_remote_control::models::CrashReason;
+
+        const ROOT: &str = "ROOMLER_NODE_TEST_CRASH_ROOT";
+        const CHECKED: &str = "crash-record case: checked";
+
+        /// The parent's half: a stand-in `%ProgramData%` with an open machine
+        /// folder below it (an attended host's), and a folder beside it that
+        /// nothing names; then the case `name` in a child, which must say it ran.
+        fn run(name: &str, case: &str) {
+            if !elevated_or_skip(case) {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let pd = program_data(root.path());
+            std::fs::create_dir_all(pd.join("roomler").join("roomler")).unwrap();
+            std::fs::create_dir_all(root.path().join("elsewhere")).unwrap();
+            let module = module_path!();
+            let test = format!(
+                "{}::{name}",
+                module.split_once("::").map_or(module, |(_, rest)| rest)
+            );
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+                .env(ROOT, root.path())
+                .output()
+                .unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{said}");
+            assert!(said.contains(CHECKED), "the child ran the case: {said}");
+        }
+
+        /// The child's half: the stand-in, before anything names the machine
+        /// tree. `None` in the parent.
+        fn child() -> Option<PathBuf> {
+            let root = PathBuf::from(std::env::var_os(ROOT)?);
+            crate::appdirs::test_fixture::program_data_is(root.join("ProgramData"));
+            Some(root)
+        }
+
+        /// The names in `dir` a record write leaves: `*.json`, `*.json.tmp`.
+        fn records_in(dir: &Path) -> Vec<String> {
+            std::fs::read_dir(dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|n| n.ends_with(".json") || n.ends_with(".json.tmp"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// A junction or a symbolic link, read without following it.
+        fn is_link(path: &Path) -> bool {
+            std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+        }
+
+        /// T11 — `crashes` is a junction: the record lands in a new, sealed
+        /// `crashes`, with no `.json` or `.json.tmp` where the junction led,
+        /// and the junction is kept beside it as `crashes.moved-<unix>`. A
+        /// junction above it: refused, nothing written anywhere.
+        #[test]
+        fn a_crash_record_lands_in_a_sealed_crashes_never_through_a_junction() {
+            let Some(root) = child() else {
+                return run(
+                    "a_crash_record_lands_in_a_sealed_crashes_never_through_a_junction",
+                    "T11: a crash record and a junction",
+                );
+            };
+            let elsewhere = root.join("elsewhere");
+            let machine = crate::appdirs::machine_global_dir();
+            let crashes = machine.join("crashes");
+            junction(&crashes, &elsewhere);
+            let written = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            );
+            assert!(
+                records_in(&elsewhere).is_empty(),
+                "nothing is written where the junction leads: {:?} ({written:?})",
+                records_in(&elsewhere)
+            );
+            assert!(!is_link(&crashes), "crashes is a real folder ({written:?})");
+            assert_eq!(
+                records_in(&crashes).len(),
+                1,
+                "the record is in the new crashes: {:?} ({written:?})",
+                records_in(&crashes)
+            );
+            let shape = sddl(&crashes);
+            let mut got = aces(&shape);
+            got.sort();
+            assert!(
+                protected(&shape)
+                    && got == ["A;OICI;0x1200a9;;;BU", "A;OICI;FA;;;BA", "A;OICI;FA;;;SY"],
+                "crashes is sealed, Users read: {shape}"
+            );
+            let moved: Vec<PathBuf> = std::fs::read_dir(&machine)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("crashes.moved-"))
+                })
+                .map(|e| e.path())
+                .collect();
+            assert!(
+                moved.len() == 1 && is_link(&moved[0]),
+                "the junction is kept beside it: {moved:?}"
+            );
+
+            // A junction above it: the machine folder's parent is one, to a
+            // tree that holds the same names.
+            let parent = machine.parent().unwrap().to_path_buf();
+            let above = root.join("above");
+            std::fs::create_dir_all(above.join("roomler").join("crashes")).unwrap();
+            std::fs::rename(&parent, root.join("roomler-parent-aside")).unwrap();
+            junction(&parent, &above);
+            let written = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            );
+            assert!(
+                records_in(&above.join("roomler").join("crashes")).is_empty(),
+                "nothing is written through a junction above crashes ({written:?})"
+            );
+            let refused = written.expect_err("a junction above crashes is refused");
+            assert!(refused.to_string().contains("link"), "{refused}");
+            println!("{CHECKED}");
+        }
     }
 }

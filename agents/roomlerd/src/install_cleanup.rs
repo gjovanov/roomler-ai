@@ -368,13 +368,18 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
         }
     }
 
-    // 2. The data dirs below the profile `active_user_profile_root()` names,
-    //    as `plan_per_user_removal` decides (#3702).
+    // 2. The data dirs below the profile of the session's user, as
+    //    `plan_per_user_removal` decides (#3702).
     #[cfg(feature = "system-context")]
     {
         let plan = plan_per_user_removal(
             crate::win_token::own_user_sid().as_deref(),
-            crate::system_context::user_profile::active_user_profile_root,
+            || match crate::system_context::user_profile::session_user_name() {
+                Some(name) => SessionAccount::User { name, sid: None },
+                None => SessionAccount::Nobody,
+            },
+            |_| None,
+            Path::new(r"C:\Users"),
         );
         remove_per_user_trees(plan, report, dry_run);
     }
@@ -399,6 +404,18 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
 struct PerUserPlan {
     remove: Vec<std::path::PathBuf>,
     left: Vec<String>,
+}
+
+/// The account signed in to this process's session, as the per-user clean-up
+/// reads it.
+#[cfg(all(target_os = "windows", feature = "system-context"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionAccount {
+    /// Nobody is signed in to the session, or its user cannot be read.
+    Nobody,
+    /// The session's user: its name, and its account's SID when it could be
+    /// told.
+    User { name: String, sid: Option<String> },
 }
 
 /// The data trees below `profile_root`: BOTH the legacy `roomler-agent` app
@@ -434,8 +451,21 @@ fn per_user_trees(profile_root: &Path) -> [std::path::PathBuf; 4] {
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 fn plan_per_user_removal(
     own_sid: Option<&str>,
-    profile_root: impl FnOnce() -> Option<std::path::PathBuf>,
+    session: impl FnOnce() -> SessionAccount,
+    profile_of: impl FnOnce(&str) -> Option<std::path::PathBuf>,
+    users_root: &Path,
 ) -> PerUserPlan {
+    // The profile lookup is passed in, so a test names its own. The profile
+    // is the session user's name below `users_root`; `profile_of` (the
+    // profile the system records for a SID) is not read yet.
+    let _ = profile_of;
+    let profile_root = || match session() {
+        SessionAccount::Nobody => None,
+        SessionAccount::User { name, sid } => {
+            let _ = sid;
+            Some(users_root.join(name))
+        }
+    };
     let mut plan = PerUserPlan::default();
     let Some(own_sid) = own_sid else {
         plan.left.push(
@@ -567,15 +597,25 @@ fn cleanup_per_machine_artifacts(report: &mut CleanupReport, dry_run: bool) {
     }
 
     // 2. Service log dir at %PROGRAMDATA%\roomler\<segment>\service-logs\.
-    //    ACL'd to SYSTEM at create time; the perUser MSI's user-token CA
-    //    may not be able to delete it. Scrub BOTH the legacy
-    //    `roomler-agent` segment AND the new `roomler` segment (binary
-    //    rename, `appdirs.rs`) so a cross-flavour switch doesn't leave the
-    //    other segment's tree behind. Not routed through `machine_global_dir`
-    //    (which resolves to only ONE segment per host); rooted at the
-    //    machine's folder as the system names it.
+    cleanup_per_machine_service_logs(&crate::appdirs::machine_program_data(), report, dry_run);
+}
+
+/// The per-Machine arm's service log folders, below `program_data`, the
+/// machine's `ProgramData` (a test names a folder of its own).
+///
+/// ACL'd to SYSTEM at create time; the perUser MSI's user-token CA may not be
+/// able to delete it. Scrub BOTH the legacy `roomler-agent` segment AND the new
+/// `roomler` segment (binary rename, `appdirs.rs`) so a cross-flavour switch
+/// doesn't leave the other segment's tree behind. Not routed through
+/// `machine_global_dir` (which resolves to only ONE segment per host); rooted
+/// at the machine's folder as the system names it.
+#[cfg(target_os = "windows")]
+fn cleanup_per_machine_service_logs(
+    program_data: &Path,
+    report: &mut CleanupReport,
+    dry_run: bool,
+) {
     {
-        let program_data = crate::appdirs::machine_program_data();
         for segment in ["roomler-agent", "roomler"] {
             let path = program_data
                 .join("roomler")
@@ -835,7 +875,7 @@ mod tests {
         std::fs::create_dir_all(&roaming).unwrap();
         junction(&roaming.join("roomler"), &elsewhere);
 
-        let plan = plan_per_user_removal(Some(A_PERSON), || Some(profile.clone()));
+        let plan = plan_for(Some(A_PERSON), &profile);
         assert_eq!(plan.remove, vec![local.join("roomler")], "{plan:?}");
         for tree in [
             local.join("roomler-agent"),
@@ -865,7 +905,7 @@ mod tests {
         // present, and nothing is removed.
         let empty = root.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
-        let plan = plan_per_user_removal(Some(A_PERSON), || Some(empty.clone()));
+        let plan = plan_for(Some(A_PERSON), &empty);
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(
             plan.left
@@ -883,9 +923,12 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "system-context"))]
     #[test]
     fn on_the_service_account_the_per_user_clean_up_names_no_profile_and_removes_nothing() {
-        let plan = plan_per_user_removal(Some(roomler_node_core::machine_tree::SYSTEM), || {
-            panic!("a profile was looked up on the service account")
-        });
+        let plan = plan_per_user_removal(
+            Some(roomler_node_core::machine_tree::SYSTEM),
+            || panic!("a profile was looked up on the service account"),
+            |_| panic!("a profile was looked up on the service account"),
+            Path::new(r"C:\Users"),
+        );
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(plan.left.len(), 1, "{plan:?}");
         for words in [
@@ -902,6 +945,231 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "system-context"))]
     const A_PERSON: &str = "S-1-5-21-1-2-3-1001";
 
+    /// The plan when `profile` is the profile of the session's account: its
+    /// user is named after the folder, and the system records the folder for
+    /// [`A_PERSON`].
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    fn plan_for(own_sid: Option<&str>, profile: &Path) -> PerUserPlan {
+        plan_with(
+            own_sid,
+            SessionAccount::User {
+                name: profile.file_name().unwrap().to_string_lossy().into_owned(),
+                sid: Some(A_PERSON.into()),
+            },
+            |sid| (sid == A_PERSON).then(|| profile.to_path_buf()),
+            profile.parent().unwrap(),
+        )
+    }
+
+    /// The plan with the profile lookup a test names: `session` is the
+    /// session's account, `profile_of` the profile the system records for a
+    /// SID, and `users_root` the folder that holds the profiles by name.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    fn plan_with(
+        own_sid: Option<&str>,
+        session: SessionAccount,
+        profile_of: impl FnOnce(&str) -> Option<std::path::PathBuf>,
+        users_root: &Path,
+    ) -> PerUserPlan {
+        plan_per_user_removal(own_sid, || session, profile_of, users_root)
+    }
+
+    /// The four data trees of `profile`, each holding `keep.txt`.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    fn make_trees(profile: &Path) {
+        for tree in per_user_trees(profile) {
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join("keep.txt"), "x").unwrap();
+        }
+    }
+
+    /// FR-145 T12 — the per-Machine arm removes no `service-logs` through a
+    /// link: a junction as the `roomler` folder, then as the segment folder.
+    /// What each leads to stays, and the report names the link.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_machine_clean_up_removes_no_service_logs_through_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        // `roomler` is a junction, to a folder that holds both segments.
+        let program_data = root.path().join("ProgramData");
+        std::fs::create_dir_all(&program_data).unwrap();
+        let other = root.path().join("other");
+        for segment in ["roomler-agent", "roomler"] {
+            let logs = other.join(segment).join("service-logs");
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(logs.join("a.log"), "x").unwrap();
+        }
+        junction(&program_data.join("roomler"), &other);
+        let mut report = CleanupReport::default();
+        cleanup_per_machine_service_logs(&program_data, &mut report, false);
+        for segment in ["roomler-agent", "roomler"] {
+            assert!(
+                other
+                    .join(segment)
+                    .join("service-logs")
+                    .join("a.log")
+                    .is_file(),
+                "{report:?}"
+            );
+        }
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(
+            report.skipped.iter().any(|s| s.contains("link")),
+            "{report:?}"
+        );
+
+        // The segment folder is a junction.
+        let program_data = root.path().join("ProgramData2");
+        std::fs::create_dir_all(program_data.join("roomler")).unwrap();
+        let other = root.path().join("other2");
+        std::fs::create_dir_all(other.join("service-logs")).unwrap();
+        std::fs::write(other.join("service-logs").join("a.log"), "x").unwrap();
+        junction(&program_data.join("roomler").join("roomler"), &other);
+        let mut report = CleanupReport::default();
+        cleanup_per_machine_service_logs(&program_data, &mut report, false);
+        assert!(
+            other.join("service-logs").join("a.log").is_file(),
+            "{report:?}"
+        );
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(
+            report.skipped.iter().any(|s| s.contains("link")),
+            "{report:?}"
+        );
+    }
+
+    /// FR-145 T13 — with no link on the way, both segments' `service-logs`
+    /// are removed, one report line each.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_per_machine_clean_up_still_removes_both_segments_service_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let program_data = root.path().join("ProgramData");
+        for segment in ["roomler-agent", "roomler"] {
+            let logs = program_data
+                .join("roomler")
+                .join(segment)
+                .join("service-logs");
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(logs.join("a.log"), "x").unwrap();
+        }
+        let mut report = CleanupReport::default();
+        cleanup_per_machine_service_logs(&program_data, &mut report, false);
+        for segment in ["roomler-agent", "roomler"] {
+            let logs = program_data
+                .join("roomler")
+                .join(segment)
+                .join("service-logs");
+            assert!(!logs.exists(), "{report:?}");
+            assert!(program_data.join("roomler").join(segment).is_dir());
+        }
+        assert_eq!(
+            report
+                .removed
+                .iter()
+                .filter(|line| line.contains("service log dir"))
+                .count(),
+            2,
+            "{report:?}"
+        );
+        assert!(report.errors.is_empty(), "{report:?}");
+    }
+
+    /// FR-145 T14 — the per-user removal acts on the tree it checked: a folder
+    /// on the way that becomes a junction after the plan is never followed.
+    /// What it leads to stays, and the report names the link.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    #[test]
+    fn the_per_user_removal_acts_on_the_tree_it_checked() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        make_trees(&profile);
+        let elsewhere = root.path().join("elsewhere");
+        for segment in ["roomler-agent", "roomler"] {
+            std::fs::create_dir_all(elsewhere.join(segment)).unwrap();
+            std::fs::write(elsewhere.join(segment).join("keep.txt"), "x").unwrap();
+        }
+        let plan = plan_for(Some(A_PERSON), &profile);
+        // After the plan: `AppData\Local\roomler` moved aside, a junction in
+        // its name.
+        let local = profile.join("AppData").join("Local").join("roomler");
+        std::fs::rename(&local, local.with_file_name("roomler.aside")).unwrap();
+        junction(&local, &elsewhere);
+        let mut report = CleanupReport::default();
+        remove_per_user_trees(plan, &mut report, false);
+        for segment in ["roomler-agent", "roomler"] {
+            assert!(
+                elsewhere.join(segment).join("keep.txt").is_file(),
+                "nothing the junction leads to is removed: {report:?}"
+            );
+        }
+        let named = local.display().to_string();
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|line| line.contains(&named) && line.contains("link")),
+            "a line names the link: {report:?}"
+        );
+        let roaming = profile.join("AppData").join("Roaming").join("roomler");
+        for segment in ["roomler-agent", "roomler"] {
+            assert!(!roaming.join(segment).exists(), "{report:?}");
+        }
+    }
+
+    /// FR-145 T15 — the per-user clean-up reads the profile the system records
+    /// for the session's account: that profile's trees are removed, and a
+    /// folder named after the session's user is untouched. With no profile
+    /// recorded, nothing is removed and the report says why.
+    #[cfg(all(target_os = "windows", feature = "system-context"))]
+    #[test]
+    fn the_per_user_clean_up_reads_the_profile_the_system_records() {
+        let root = tempfile::tempdir().unwrap();
+        let recorded = root.path().join("p.000");
+        let by_name = root.path().join("p");
+        make_trees(&recorded);
+        make_trees(&by_name);
+        let account = SessionAccount::User {
+            name: "p".into(),
+            sid: Some(A_PERSON.into()),
+        };
+        let plan = plan_with(
+            Some(A_PERSON),
+            account.clone(),
+            |sid| (sid == A_PERSON).then(|| recorded.clone()),
+            root.path(),
+        );
+        let mut report = CleanupReport::default();
+        remove_per_user_trees(plan, &mut report, false);
+        for tree in per_user_trees(&by_name) {
+            assert!(
+                tree.join("keep.txt").is_file(),
+                "a folder named after the user is untouched: {report:?}"
+            );
+        }
+        for tree in per_user_trees(&recorded) {
+            assert!(!tree.exists(), "the recorded profile's trees: {report:?}");
+        }
+
+        make_trees(&recorded);
+        let plan = plan_with(Some(A_PERSON), account, |_| None, root.path());
+        let mut report = CleanupReport::default();
+        remove_per_user_trees(plan, &mut report, false);
+        assert!(report.removed.is_empty(), "{report:?}");
+        for profile in [&recorded, &by_name] {
+            for tree in per_user_trees(profile) {
+                assert!(tree.join("keep.txt").is_file(), "{report:?}");
+            }
+        }
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|line| line.contains("records no profile")),
+            "the report says why: {report:?}"
+        );
+    }
+
     /// #3702 — when the step cannot tell which account it runs as, the
     /// per-user clean-up looks up no profile and removes no data tree, and
     /// its one line says why, together with the Scheduled Task clean-up that
@@ -909,9 +1177,12 @@ mod tests {
     #[cfg(all(target_os = "windows", feature = "system-context"))]
     #[test]
     fn with_no_account_named_the_per_user_clean_up_names_no_profile_and_removes_nothing() {
-        let plan = plan_per_user_removal(None, || {
-            panic!("a profile was looked up for an account the step cannot name")
-        });
+        let plan = plan_per_user_removal(
+            None,
+            || panic!("a profile was looked up for an account the step cannot name"),
+            |_| panic!("a profile was looked up for an account the step cannot name"),
+            Path::new(r"C:\Users"),
+        );
         assert!(plan.remove.is_empty(), "{plan:?}");
         assert_eq!(plan.left.len(), 1, "{plan:?}");
         for words in [
