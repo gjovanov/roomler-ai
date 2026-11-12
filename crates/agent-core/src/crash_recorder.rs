@@ -402,14 +402,19 @@ impl<'a> Place<'a> {
             use crate::machine_tree::{HeldPath, Seal};
             let held = HeldPath::machine(dir, Seal::Readable).map_err(left_alone)?;
             if held.resealed() {
-                // An earlier build's open folder: a record name that is not a
-                // plain file of SYSTEM's or Administrators' goes.
-                let gone = held.keep_only_plain(|n| n.ends_with(".json") || n.ends_with(".tmp"));
+                // An earlier build's open folder, sealed in place with nothing
+                // handed down: each record name is sealed by its own handle
+                // when it is a plain file of SYSTEM's or Administrators', and
+                // goes when it is not. Other names are left as they are.
+                let gone = held.keep_only_plain(
+                    |n| n.ends_with(".json") || n.ends_with(".tmp"),
+                    Seal::Readable,
+                );
                 if !gone.is_empty() {
                     let gone: Vec<String> = gone.iter().map(ToString::to_string).collect();
                     tracing::warn!(
                         ?gone,
-                        "crash_recorder: crashes sealed; removed what was not a record"
+                        "crash_recorder: crashes sealed; what was not a record removed, or left"
                     );
                 }
             }
@@ -742,6 +747,15 @@ pub fn append_verdict(dir: &Path, line: &str) -> std::io::Result<()> {
     if in_machine_tree(dir) && held_switch_on() {
         use crate::machine_tree::{HeldPath, Seal};
         let held = HeldPath::machine(dir, Seal::Readable).map_err(verdicts_left_alone)?;
+        if held.resealed() {
+            // Sealed in place with nothing handed down: the ledger, when it
+            // is there, is sealed by its own handle; nothing else is touched.
+            let gone = held.keep_only_plain(|n| n == VERDICTS_FILE, Seal::Readable);
+            if !gone.is_empty() {
+                let gone: Vec<String> = gone.iter().map(ToString::to_string).collect();
+                tracing::warn!(?gone, "crash_recorder: the verdicts' folder sealed");
+            }
+        }
         let mut f = held
             .append_file(VERDICTS_FILE, Seal::Readable)
             .map_err(verdicts_left_alone)?;

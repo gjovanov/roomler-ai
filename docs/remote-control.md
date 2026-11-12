@@ -5748,7 +5748,7 @@ is silent while it waits.
   a power loss could persist a NUL-filled file that no parser reads; one
   was seen, skipped at every start for two weeks. A sidecar that does
   not parse is now moved once into `crashes/malformed/`
-  (`crash_recorder.rs:714`), so it is kept but not re-warned.
+  (`crash_recorder.rs:719`), so it is kept but not re-warned.
 
 **What the first named stall found** (#2551). The first stall to name
 its stage came on 2026-10-22, under 0.4.151, and read

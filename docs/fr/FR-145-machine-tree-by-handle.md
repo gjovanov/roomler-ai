@@ -452,7 +452,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   than one).
 - **D10. Who may read `crashes`.** Options: SYSTEM and Administrators alone (`Seal::Private`); Users read and list
   as well (`Seal::Readable`). **Default: Users read and list.** A worker that runs as the signed-in person
-  drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:556`); without read
+  drains the supervisor's records from that folder (`app.rs:2290-2300`, `crash_recorder.rs:561`); without read
   those records would stay on the device. Only the write side closes.
 
 ## Out of scope

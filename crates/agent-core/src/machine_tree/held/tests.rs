@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use super::{HeldPath, Seal, Why};
 use crate::machine_tree::test_support::{
-    between_check_and_use, elevated_or_skip, icacls, junction, local_guest, owner, sddl, sealed,
+    between_check_and_use, elevated_or_skip, icacls, junction, local_guest, owner, protected, sddl,
+    sealed,
 };
 
 const CHECKED: &str = "held-path case: checked";
@@ -446,6 +447,85 @@ fn a_leaf_another_account_owns_is_moved_aside() {
     assert!(sealed(&shape, true) && owner(&shape) == "BA", "{shape}");
     assert!(names_in(&crashes).is_empty());
     println!("{CHECKED}: T9");
+}
+
+/// The folder seal's shape for a file: protected; SYSTEM and Administrators
+/// full control, Users read when `readable`.
+fn file_sealed(sddl: &str, readable: bool) -> bool {
+    let mut want = vec!["A;;FA;;;BA".to_string(), "A;;FA;;;SY".to_string()];
+    if readable {
+        want.insert(0, "A;;0x1200a9;;;BU".into());
+    }
+    let mut got = crate::machine_tree::test_support::aces(sddl);
+    got.sort();
+    crate::machine_tree::test_support::protected(sddl) && got == want
+}
+
+/// T16 (R145) — an open folder Administrators own is sealed in place without
+/// handing the seal down: the scrub deletes, as names, a hard link and a
+/// junction at names the site uses, and a hard link at a name it does not use
+/// is left alone; no file outside changes its DACL or its bytes. Control: the
+/// site's own plain record stays, sealed through its own handle.
+#[test]
+fn a_reseal_in_place_hands_nothing_down_through_a_hard_link() {
+    if !elevated_or_skip("T16: hard links in a folder sealed in place") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    // As under `ProgramData`: what is made below inherits automatically (`AI`).
+    assert!(icacls(
+        root.path(),
+        &["/grant", "*S-1-5-32-545:(OI)(CI)(RX)"]
+    ));
+    let outside = root.path().join("outside");
+    std::fs::create_dir_all(outside.join("dir")).unwrap();
+    std::fs::write(outside.join("dir").join("kept.txt"), b"kept").unwrap();
+    let (t, u) = (outside.join("t.txt"), outside.join("u.txt"));
+    std::fs::write(&t, b"t").unwrap();
+    std::fs::write(&u, b"u").unwrap();
+    let crashes = root.path().join("crashes");
+    std::fs::create_dir(&crashes).unwrap();
+    std::fs::hard_link(&t, crashes.join("x.dat")).unwrap();
+    std::fs::hard_link(&u, crashes.join("a.json")).unwrap();
+    junction(&crashes.join("b.json"), &outside.join("dir"));
+    std::fs::write(crashes.join("1-1.json"), b"{}").unwrap();
+    // A record SYSTEM wrote: the elevated test token makes files its user owns.
+    assert!(icacls(
+        &crashes.join("1-1.json"),
+        &["/setowner", "*S-1-5-32-544"]
+    ));
+    assert!(icacls(&crashes, &["/setowner", "*S-1-5-32-544"]));
+    let (t_before, u_before) = (sddl(&t), sddl(&u));
+
+    let held = base_of(root.path())
+        .sealed_dir("crashes", Seal::Readable)
+        .expect("sealed in place");
+    assert!(held.resealed());
+    let gone = held.keep_only_plain(|n| n.ends_with(".json"), Seal::Readable);
+
+    let (t_after, u_after) = (sddl(&t), sddl(&u));
+    assert!(
+        t_after == t_before && u_after == u_before,
+        "no file outside changes its DACL: t {t_before} -> {t_after}; u {u_before} -> {u_after}"
+    );
+    assert_eq!(std::fs::read(&t).unwrap(), b"t");
+    assert_eq!(std::fs::read(&u).unwrap(), b"u");
+    assert_eq!(names_in(&outside.join("dir")), ["kept.txt"]);
+    assert_eq!(names_in(&crashes), ["1-1.json", "x.dat"], "{gone:?}");
+    let mut deleted: Vec<String> = gone
+        .iter()
+        .filter_map(|r| r.at.file_name()?.to_str().map(str::to_owned))
+        .collect();
+    deleted.sort();
+    assert_eq!(deleted, ["a.json", "b.json"], "{gone:?}");
+    let record = sddl(&crashes.join("1-1.json"));
+    assert!(
+        file_sealed(&record, true),
+        "the record is sealed by its own handle: {record}"
+    );
+    let shape = sddl(&crashes);
+    assert!(protected(&shape) && owner(&shape) == "BA", "{shape}");
+    println!("{CHECKED}: T16");
 }
 
 /// T10 — a tree holding a junction: what it leads to is kept, `left` names

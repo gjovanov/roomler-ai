@@ -31,7 +31,7 @@
 //! | Found | What happens |
 //! |---|---|
 //! | nothing | made sealed |
-//! | a folder SYSTEM or Administrators own | sealed in place, by handle ([`HeldPath::resealed`] says so) |
+//! | a folder SYSTEM or Administrators own | sealed in place, by handle, on the folder alone: nothing is handed down to what it holds ([`HeldPath::resealed`] says so, and the site seals the names it uses with [`HeldPath::keep_only_plain`]) |
 //! | a folder another account owns | moved aside whole, by handle, as `<name>.moved-<unix>`, and a sealed one made |
 //! | a link, or anything that is not a folder | the entry itself moved aside by handle, never followed, and a sealed folder made |
 //!
@@ -58,6 +58,10 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError, UNICODE_STRING};
+use windows_sys::Win32::Security::{
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    SetKernelObjectSecurity,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
@@ -626,40 +630,62 @@ impl HeldPath {
             .map_err(|code| into.refuse_at(to, why_of(code, Kind::File)))
     }
 
-    /// Delete, by handle, the entries this folder holds whose names `uses`
-    /// matches and that are not plain files of one link owned by SYSTEM or
-    /// Administrators: what an earlier build's open folder may hold under a
-    /// name the service writes or reads. A link is deleted as itself, never
-    /// followed. Names `uses` does not match are never opened. What was
-    /// deleted, or could not be, for one WARN.
-    pub fn keep_only_plain(&self, uses: impl Fn(&str) -> bool) -> Vec<Refusal> {
+    /// After a reseal in place ([`HeldPath::resealed`]), the entries whose
+    /// names `uses` matches, each through its own handle: a plain file of one
+    /// link owned by SYSTEM or Administrators is kept and sealed with `seal`
+    /// (on that file alone); anything else is deleted, a link as itself,
+    /// never followed. The reseal hands nothing down, so names `uses` does
+    /// not match are never opened and keep what they had: a hard link among
+    /// them never carries a seal to a file outside (R145). What was deleted,
+    /// or could not be opened, sealed or deleted, for one WARN.
+    pub fn keep_only_plain(&self, uses: impl Fn(&str) -> bool, seal: Seal) -> Vec<Refusal> {
         let mut out = Vec::new();
         let entries = match self.entries() {
             Ok(entries) => entries,
             Err(r) => return vec![r],
         };
-        for entry in entries.into_iter().filter(|e| uses(&e.name)) {
-            let Ok((file, _)) = open_below(
+        let open = |name: &str, access: u32| {
+            open_below(
                 self.handle(),
-                &entry.name,
-                MOVE,
+                name,
+                access,
                 FILE_OPEN,
                 FILE_SYNCHRONOUS_IO_NONALERT,
                 None,
-            ) else {
-                continue;
-            };
-            let Err(why) = plain_and_ours(&file) else {
-                continue;
-            };
+            )
+        };
+        for entry in entries.into_iter().filter(|e| uses(&e.name)) {
             let at = self.path().join(&entry.name);
-            match dispose(&file) {
-                Ok(()) => out.push(Refusal { at, why }),
-                Err(e) => out.push(Refusal {
-                    at,
-                    why: Why::Io(e),
-                }),
-            }
+            // WRITE_DAC to seal what is kept: an owner's own right, so it is
+            // missing only on an entry that is not kept anyway.
+            let file = match open(&entry.name, MOVE | WRITE_DAC).or_else(|code| {
+                if code == STATUS_ACCESS_DENIED {
+                    open(&entry.name, MOVE)
+                } else {
+                    Err(code)
+                }
+            }) {
+                Ok((file, _)) => file,
+                Err(code) if is_absent(code) => continue,
+                Err(code) => {
+                    out.push(Refusal {
+                        at,
+                        why: why_of(code, Kind::File),
+                    });
+                    continue;
+                }
+            };
+            let why = match plain_and_ours(&file) {
+                Ok(()) => match set_own_sd(&file, &seal.sddl(false, false), false) {
+                    Ok(()) => continue,
+                    Err(e) => Why::Io(e),
+                },
+                Err(why) => match dispose(&file) {
+                    Ok(()) => why,
+                    Err(e) => Why::Io(e),
+                },
+            };
+            out.push(Refusal { at, why });
         }
         out
     }
@@ -818,7 +844,11 @@ impl HeldPath {
         let aces = seal.aces(OBJECT_INHERIT | CONTAINER_INHERIT);
         let resealed = !(sd.owner == ADMINISTRATORS && super::is_exactly(&sd, &aces));
         if resealed {
-            win::write_sd(&found, true, Some((&aces, true)))
+            // On the folder alone: nothing is handed down to what it holds
+            // (R145), so a hard link left in it never carries the seal to a
+            // file outside. The site seals the entries it uses by name
+            // (`keep_only_plain`).
+            set_own_sd(&found, &seal.sddl(true, true), true)
                 .map_err(|e| self.refuse_at(name, Why::Io(e)))?;
         }
         self.hold(found, name, false, resealed)
@@ -1053,6 +1083,25 @@ fn plain_and_ours(file: &File) -> Result<(), Why> {
     let sd: Sd = win::read_sd(file).map_err(Why::Io)?;
     if !super::trusted(&sd.owner) {
         return Err(Why::Foreign { owner: sd.owner });
+    }
+    Ok(())
+}
+
+/// Set the protected DACL of `sddl` (and its owner, when `owner`) on the
+/// entry behind `file`, through its handle and on that entry alone
+/// (`SetKernelObjectSecurity`): unlike `SetSecurityInfo` and
+/// `SetNamedSecurityInfo`, the system's own set never hands a folder's new
+/// inheritable entries down to what it holds, on any build (R145).
+fn set_own_sd(file: &File, sddl: &str, owner: bool) -> std::io::Result<()> {
+    let sd = win::Descriptor::from_sddl(sddl)?;
+    let mut info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    if owner {
+        info |= OWNER_SECURITY_INFORMATION;
+    }
+    // SAFETY: a live handle opened with WRITE_DAC (and WRITE_OWNER when
+    // `owner`); `sd` is a valid descriptor, alive across the call.
+    if unsafe { SetKernelObjectSecurity(file.as_raw_handle() as HANDLE, info, sd.0) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
