@@ -32,8 +32,8 @@ Anchors are master `84a93e740` (2026-11-12). Everything below is code, read in t
 | A crash record the service's supervisor writes | `create_dir_all` of `machine_global_dir()\crashes`; `<ts>-<pid>.json.tmp` created, written and flushed by path; `fs::rename` by path | `crates/agent-core/src/crash_recorder.rs:213-214`, `:275-293`, `:314-317` |
 | A record that does not parse | `create_dir_all(crashes\malformed)`, `fs::rename` by path | `crash_recorder.rs:424-433` |
 | The uploader, after a verdict | `std::fs::remove_file` of the sidecar's path | `agents/roomlerd/src/crash_uploader.rs:123`, `:135`, `:354-355` |
-| The service logs | `create_dir_all(service-logs)`; `tracing_appender`'s daily appender opens `<basename>.<date>` by path at start, and again at every rotation | `crates/agent-core/src/logging.rs:227-238`, `:1044-1048` |
-| The prune, the panic file, the stderr file | `read_dir` and `remove_file(entry.path())`; `fs::write(panic-<pid>-<ts>.log)`; an `OpenOptions` create-and-append | `logging.rs:1082-1104`, `:1124-1127`, `:795-801` |
+| The service logs | `create_dir_all(service-logs)`; `tracing_appender`'s daily appender opens `<basename>.<date>` by path at start, and again at every rotation | `crates/agent-core/src/logging.rs:228-239`, `:1044-1048` |
+| The prune, the panic file, the stderr file | `read_dir` and `remove_file(entry.path())`; `fs::write(panic-<pid>-<ts>.log)`; an `OpenOptions` create-and-append | `logging.rs:1085-1107`, `:1124-1127`, `:795-801` |
 | The clean-up's per-Machine arm | for both segments, `path.exists()`, then `remove_dir_all` of `<ProgramData>\roomler\<segment>\service-logs` | `agents/roomlerd/src/install_cleanup.rs:577-605` |
 | The clean-up's per-user arm | each of the four trees checked by path (`appdirs::link_below`, `link_inside`), then removed by path in a second step | `install_cleanup.rs:462-471`, `:514-532` |
 | The vacated install folder's sweep | `link_component` by path, then `remove_file` per product file and `remove_dir` by path | `install_cleanup.rs:267-320` |
@@ -79,7 +79,7 @@ Sealing closes the write side only. Every reader below keeps working.
 > folder it makes is sealed when it is made. A file it writes is made fresh and published by a rename relative to
 > the held folder. A removal deletes, by handle, what the same walk opened.
 
-The bases in use: `appdirs::machine_program_data()` (`crates/agent-core/src/appdirs.rs:201-207`),
+The bases in use: `appdirs::machine_program_data()` (`crates/agent-core/src/appdirs.rs:230-236`),
 `appdirs::machine_program_files()` (`:212-214`) and `appdirs::profile_of_account(sid)` (`:222-234`).
 
 The writer's walk (`walk_sealed`); the clean-up's `walk` makes nothing and ends in `remove_tree`:
@@ -109,7 +109,7 @@ re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It r
 | `HeldPath::base(base)` | opens the base itself (a reparse point refused); `GetFinalPathNameByHandleW` must equal `GetLongPathNameW(base)`, both without `\\?\` and compared case-insensitively; a `\\?\UNC\` path is refused |
 | `open_dir(name)`, `walk(names)` | each name opened below the previous handle (`NtCreateFile` with `RootDirectory`, `FILE_OPEN`, `FILE_DIRECTORY_FILE` and `FILE_OPEN_REPARSE_POINT`), a reparse point refused, its final path checked. `Ok(None)` when a name is not there. Makes nothing |
 | `sealed_dir(name, seal)`, `walk_sealed(names, seal)` | as `walk`, and a folder that is not there is made with the seal's security descriptor in `OBJECT_ATTRIBUTES` (`FILE_OPEN_IF`): sealed from its creation, with no moment in between. The last name gets the leaf policy below |
-| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:394-420`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:515-523`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
+| `HeldPath::machine(target, seal)` | `base(machine_program_data())`, then `walk_sealed` down the names below it (`appdirs::names_below`, `appdirs.rs:423-449`), so every site names its folder as it does today and the segment rule (`resolve_machine_global`, `appdirs.rs:546-554`) stays in one place. The machine folder and its parent, whether passed through or the `target` itself, are only opened (made sealed when they are not there): the leaf policy never moves or re-seals an existing one of those two, which hold the machine config and are FR-94's to repair, and the seal then goes on the files written in them |
 | `write_file(name, bytes, seal)` | a fresh temp below the held folder (`FILE_CREATE`, so an entry already there is never written into), written and flushed (#2955), then renamed onto `name` with `FileRenameInformation` whose `RootDirectory` is the held folder. A folder at `name` fails the rename, and the temp is deleted by handle |
 | `write_file_new(name, bytes, seal)` | `FILE_CREATE` straight into `name`: the first writer wins (`Ok(false)` when it was there) |
 | `append_file(name, seal)` | for logs: `FILE_OPEN_IF` and append. A file already there must be a plain file with one link, owned by SYSTEM or Administrators; otherwise it is deleted by handle and made again |
@@ -152,7 +152,7 @@ Notes on the calls:
 | a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle (`win::set_sd`, as `adopt_machine_folder` does, `machine_tree.rs:832`). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators; any other such entry is deleted by handle. Names the service does not use are left alone and never opened | nothing; the files in it stay |
 | a folder another account owns | moved aside by handle (`FileRenameInformation`, `RootDirectory` = the parent's handle) as `<name>.moved-<unix>`, and a sealed one made. Nothing in it is deleted or changes owner. One WARN names it | a `<name>.moved-<unix>` entry beside the new folder, its content still that account's |
 | a link (a junction or a symbolic link) | the link entry itself moved aside by handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; whatever the link led to is untouched |
-| above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:223-238`, `fallback_log_dir` `:326-332`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
+| above the leaf: a link, or a folder that cannot be opened or whose final path is elsewhere | refused (`Why::Link`, `Why::Elsewhere`), with one throttled WARN, and the site does without: a crash record is not written; the logs take the fallback they take today when `service-logs` cannot be used (`logging.rs:224-239`, `fallback_log_dir` `:326-332`). The machine folder itself is FR-94's to repair, not a log writer's | the WARN line, which names the path |
 
 ### P1: crash records
 
@@ -192,7 +192,7 @@ meets a link or is refused, naming the path. `remove_tree` takes `dry_run`: its 
    domain-qualified name names exactly one account. It needs no privilege beyond the elevated operator's, so it
    works where this arm runs, a command run by hand; the session's token (`WTSQueryUserToken`, then
    `token_user_sid`, `agents/roomlerd/src/win_identity.rs:334`) would need SYSTEM's.
-2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:222-234`): `ProfileList\<sid>\ProfileImagePath`,
+2. The profile is `appdirs::profile_of_account(&sid)` (`appdirs.rs:251-263`): `ProfileList\<sid>\ProfileImagePath`,
    with only `%SystemRoot%` and `%SystemDrive%` filled in, from the kernel's answers.
 3. No profile recorded: nothing is removed, and the report says why, in words that tell the cases apart: "the
    system records no profile for the session's account", or "cannot tell the session's account". Today's "no
@@ -211,7 +211,7 @@ is by handle too. #3743's elevated tests already cover both.
 
 ### P2: service logs
 
-`open_log_appender` (`logging.rs:345`) gets, for a process with a `ServiceLogRole` on Windows (`logging.rs:89-110`:
+`open_log_appender` (`logging.rs:346`) gets, for a process with a `ServiceLogRole` on Windows (`logging.rs:90-111`:
 the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a `HeldRollingWriter` in place of
 `tracing_appender`'s `RollingFileAppender` (D3):
 
@@ -220,14 +220,14 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
   reuse;
 - `impl std::io::Write`: when the UTC date has changed since the last write, it opens `<basename>.<YYYY-MM-DD>`
   with `append_file(.., Seal::Readable)`. Those are `tracing_appender`'s daily names, so `rolling_basenames`, the
-  prune and the log tail read them unchanged (`logging.rs:1057-1059`);
-- wrapped in `tracing_appender::non_blocking`, as today (`logging.rs:246`);
+  prune and the log tail read them unchanged (`logging.rs:1060-1062`);
+- wrapped in `tracing_appender::non_blocking`, as today (`logging.rs:247`);
 - a refusal takes today's fallback for an unusable `service-logs`, the reason logged first (#3073,
-  `logging.rs:223-238`).
+  `logging.rs:224-239`).
 
 | Site | Today | After |
 |---|---|---|
-| the prune (`logging.rs:1082-1104`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
+| the prune (`logging.rs:1085-1107`) | `read_dir`, `remove_file(entry.path())` | `entries()`, the same name and age rule, `remove_file(name)` |
 | the panic file (`:1106-1127`) | `fs::write` | the hook keeps the `Arc<HeldPath>`: `write_file("panic-<pid>-<ts>.log", ..)` |
 | the stderr file (`:795-801`) | `OpenOptions`, create and append | `append_file(name, Seal::Readable)` |
 | the encoder caps cache (`agents/roomlerd/src/encode/caps_cache.rs:316-328`, its path `:183-187`) | `create_dir_all`, `fs::write(tmp)`, `fs::rename` | `write_file(FILE_NAME, ..)`; its readers read with `read_file` |
@@ -247,9 +247,9 @@ above).
 | the machine attention file (`crates/agent-core/src/notify.rs:113-138`, `:166-177`, `:210-214`, `:234-244`) | `create_dir_all`, `fs::write`, `remove_file` | `write_file` and `remove_file`, `Seal::Readable`; a person's own attention file in their profile is unchanged |
 | the companion's launch marker (`agents/roomlerd/src/companion/launch_once.rs:144-173`, `:177-196`, `:469`) | `create_dir_all`, `create_new`, `remove_file` | `write_file_new` (the first one wins, as `create_new` does today), `remove_file`, `Seal::Private` |
 | the peer-presence lock (`agents/roomlerd/src/system_context/peer_presence.rs:83-89`, `:115-132`, `:137-144`) | `create_dir_all`, `fs::write`, `remove_file` | `HeldPath::base(machine_program_data())` and `sealed_dir(<its folder>, Seal::Readable)`, then `write_file` and `remove_file`; its reader (`app.rs:7461`) reads through the same `HeldPath` (D4) |
-| the machine config's saves (`crates/agent-core/src/config.rs:3774`, `:4454`, `:4640`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
+| the machine config's saves (`crates/agent-core/src/config.rs:3781`, `:4461`, `:4647`) | `create_fresh` and `fs::rename`, after `repair(writing = true)` sealed the folder | `write_file` below the held machine folder |
 | the repair's and the adoption's opens (`machine_tree.rs:592-594`, `:832-834`) | `win::open` of the whole path | `HeldPath::walk` |
-| the one-time segment move (`appdirs.rs:591`, `:808`, `:819`, `:917`, `:1032`) | renames and removes by path | per D7 |
+| the one-time segment move (`appdirs.rs:673`, `:808`, `:819`, `:917`, `:1032`) | renames and removes by path | per D7 |
 | the gate (D8) | none | a test in `crates/agent-core` that fails on a new `std::fs` create, write, rename or remove of a path built from `machine_global_dir()` or `machine_program_data()` outside `machine_tree::held` |
 
 ### The kill switch
@@ -317,7 +317,7 @@ Each cell shows that what worked still works on the candidate. Nothing in them m
 |---|---|---|---|
 | L1 a crash record lands | per-Machine, SystemContext, enrolled | as an administrator, end the worker (`taskkill /F`), which the supervisor records | a new `<ts>-<pid>.json` in `%ProgramData%\roomler\roomler\crashes`; `icacls` shows that folder sealed (`Seal::Readable`, D10); the crash is on the device's server-side crash list after the worker's next start |
 | L2 an upgrade keeps the folders | per-Machine, on the previous release, with `crashes` and `service-logs` there | upgrade to the candidate | the same folders, no `.moved-*`, now sealed; the old log files still there; the tray of an account that is not an administrator lists and opens them ("Open Logs Folder") |
-| L3 the logs write and age | L2's host | leave it across a UTC midnight (or move the guest's clock); as an administrator, add a `roomlerd-service.log.<date>` 15 days old | a new daily file per role (`roomlerd-service.log`, `roomlerd.log`, `roomlerd-netd.log`); the 15-day-old file pruned at the next start (`KEEP_DAYS` is 14, `logging.rs:77`); the tray's diagnostics bundle holds the service logs |
+| L3 the logs write and age | L2's host | leave it across a UTC midnight (or move the guest's clock); as an administrator, add a `roomlerd-service.log.<date>` 15 days old | a new daily file per role (`roomlerd-service.log`, `roomlerd.log`, `roomlerd-netd.log`); the 15-day-old file pruned at the next start (`KEEP_DAYS` is 14, `logging.rs:78`); the tray's diagnostics bundle holds the service logs |
 | L4 a machine folder a per-User install made first | a per-User install first (its daemon makes the machine folder), then the per-Machine one | a file transfer as the person; restart the service | service logs and a crash record (L1's step) land; the person's file transfer still completes |
 | L5 the per-Machine arm cleans | a per-Machine host | as an elevated operator, `roomlerd cleanup-legacy-install --target-flavour perUser` from the per-Machine exe | both segments' `service-logs` removed, with the report's lines as before |
 | L6 the per-user arm cleans the recorded profile | a per-User install by an account whose profile folder is not `C:\Users\<name>` (a renamed account, or `<name>.000`) | elevated, `roomlerd cleanup-legacy-install --target-flavour perMachine` by hand | the four trees under the profile `ProfileList` records are removed, and nothing else under `C:\Users` changes; with nobody signed in, the report says no profile was looked up |
@@ -398,7 +398,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
   what it held inside SYSTEM's folder.
 - **D3. The daily log.** Options: a writer of our own below the held folder; or `tracing_appender` kept, after a
   check at start. **Default: our own writer, `HeldRollingWriter`, in P2.** `tracing_appender` opens each day's file
-  by path at rotation (`logging.rs:233-237`), which a check at start does not cover.
+  by path at rotation (`logging.rs:234-238`), which a check at start does not cover.
 - **D4. The presence lock's folder**, which sits directly below `%ProgramData%`, outside the machine folder
   (`peer_presence.rs:83-89`). Options: keep its path, behind `HeldPath`; or move it below the machine folder.
   **Default: keep the path, behind `HeldPath`, in P3.** The leaf policy covers it, and moving it changes what its
@@ -409,7 +409,7 @@ Each takes its default (2026-11-12); the operator may overturn any of them.
 - **D6. #3743's readers onto `HeldPath`** (`PrivateFolder::open`, `machine_tree.rs:1342-1353`; the earlier anchor
   files' deletes, `exec_service.rs:1277-1292`). Options: the helper's PR; the next one. **Default: the helper's
   PR.** A few lines, and #3743's elevated tests already cover both.
-- **D7. The one-time segment move** (`appdirs.rs:591`, `:808`, `:819`, `:917`, `:1032`). Options: onto a rename by
+- **D7. The one-time segment move** (`appdirs.rs:673`, `:808`, `:819`, `:917`, `:1032`). Options: onto a rename by
   handle in P3; retire it. **Default: read first** how many Windows devices still keep only the older segment;
   retire the move if none does, else P3 moves it onto a rename by handle.
 - **D8. A gate against a new path-based SYSTEM write.** Options: none; a grep test; clippy's

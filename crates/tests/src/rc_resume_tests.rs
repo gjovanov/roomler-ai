@@ -13,7 +13,9 @@
 //!   hello that claims sessions and advertises `rc-resume` registers as before
 //!   and is announced no window, with the scope at `all`; a request that names
 //!   what it replaces is answered as before, without `resume_secs`; a rejoin
-//!   is dropped unanswered; and a stats sample stamps the row's `stats_at`.
+//!   is dropped unanswered; and a stats sample stamps the row's `stats_at`;
+//! * the device's switch is the device's: a desired-config push naming it is
+//!   refused 403 by its whole name, as `rc_media_canary` is.
 
 use bson::{Document, doc, oid::ObjectId};
 use futures::{SinkExt, StreamExt};
@@ -500,5 +502,81 @@ async fn at_window_zero_the_new_wire_changes_nothing() {
     assert!(row.get_datetime("stats_at").is_ok(), "no stats_at: {row}");
     for key in ["attach_seq", "detached_at", "resume_by", "end_source"] {
         assert!(!row.contains_key(key), "{key} on the row: {row}");
+    }
+}
+
+/// `rc_sessions_survive_reattach` is the device's switch, so a desired-config
+/// push naming it is refused 403 by its whole name, as `rc_media_canary` is:
+/// dropped unread, it answered 200 as if a push had taken that no device reads.
+/// The refusal names the key, is on the record under the canary's code
+/// `device_owned_switch`, and stores nothing, the push's other keys included.
+/// A key that only starts like the switch, or that the switch starts like, is
+/// not it, and is dropped unread as before.
+#[tokio::test]
+async fn a_push_naming_the_resume_switch_is_refused_by_its_whole_name() {
+    let app = TestApp::spawn().await;
+    let seeded = app.seed_tenant("fr138push").await;
+    let (aid, _) = crate::rc_resume_claim_tests::enroll(&app, &seeded, "mach-fr138-push").await;
+    let path = format!(
+        "/api/tenant/{}/agent/{}/desired-config",
+        seeded.tenant_id,
+        aid.to_hex()
+    );
+    let owner = &seeded.admin.access_token;
+    let put = |body: Value| app.auth_put(&path, owner).json(&body).send();
+
+    for value in [json!(true), json!(false), json!("on")] {
+        let resp = put(json!({ "fps_deny": "none", "rc_sessions_survive_reattach": value }))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "{value}");
+        let body: Value = resp.json().await.unwrap();
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("rc_sessions_survive_reattach")
+                && !message.contains("rc_media_canary"),
+            "the refusal names its own key: {body}"
+        );
+    }
+    // The canary's refusal keeps its own words.
+    let resp = put(json!({ "rc_media_canary": "media_plan" }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    let body: Value = resp.json().await.unwrap();
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("rc_media_canary") && !message.contains("rc_sessions_survive_reattach"),
+        "{body}"
+    );
+
+    let refused = app
+        .db
+        .collection::<Document>("config_audit")
+        .count_documents(doc! { "agent_id": aid, "denied": "device_owned_switch" })
+        .await
+        .unwrap();
+    assert_eq!(refused, 4, "every refusal is on the record, under one code");
+    let row = app
+        .db
+        .collection::<Document>("agents")
+        .find_one(doc! { "_id": aid })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.get_document("desired_config")
+            .map_or(true, |d| d.get_i64("revision").unwrap_or(0) == 0
+                && d.get_i32("revision").unwrap_or(0) == 0),
+        "a refused push stores nothing: {row:?}"
+    );
+
+    // Equality, never a prefix: the same push without the switch is the push
+    // it always was.
+    for near in ["rc_sessions_survive_reattach_v2", "rc_sessions_survive"] {
+        let resp = put(json!({ "fps_deny": "none", near: true }))
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{near} is not the switch");
     }
 }

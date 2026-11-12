@@ -42,6 +42,9 @@ use crate::signaling::close_within_budget;
 
 const AGENT_IP: &str = "1.2.3.4";
 const VIEWER_IP: &str = "1.2.3.5";
+/// A third host on the wire, which only sends markers to itself: how far the
+/// router has counted ([`Wire::sent_by_agent`]).
+const PROBE_IP: &str = "1.2.3.6";
 
 /// A dead path's close has nothing to wait for. The bound is far above the
 /// milliseconds it takes and far below the 5 s budget it overran.
@@ -51,6 +54,27 @@ const DEAD_PATH_CLOSE: Duration = Duration::from_secs(2);
 /// local and already signalled, so this is slack, not a timing assumption:
 /// they settle within milliseconds, and a real leak never settles at all.
 const SETTLE: Duration = Duration::from_secs(20);
+
+/// How long the dead-path test's router holds each packet before it counts
+/// and forwards it. The router does both on a task of its own, after the
+/// send that queued the packet has returned, and a loaded runner starts that
+/// task late: 0.6-13.6 ms after the send in a 2-CPU stress run (#3716). This
+/// makes the lag certain on every run instead of one run in three, so the
+/// test reads the wire through [`Wire::sent_by_agent`] on every run.
+const ROUTER_LAG: Duration = Duration::from_millis(20);
+
+/// What a closed peer may still send: a send that was under way when its
+/// close returned. From there on the ICE agent's conn refuses every write
+/// (`AgentConn::send` checks the `done` flag the agent's close sets last), so
+/// DTLS, SCTP and RTP cannot reach the wire. The one writer left is the ICE
+/// agent's connectivity loop: it sees the close only between two passes (the
+/// `select!` in `AgentInternal::connectivity_checks`), and a pass under way
+/// still sends its STUN checks, each straight onto the router's queue, with
+/// no wait on the network. Those land within a millisecond of the close (in
+/// 3 runs of 120 that closed while the keepalive checks were running, #3716),
+/// and the loop ends after them. A packet sent after this comes from
+/// something the close did not stop.
+const IN_FLIGHT: Duration = Duration::from_millis(250);
 
 /// A runtime of the test's own. The agent and the stand-in viewer get one
 /// each, so the agent's counts the agent's tasks alone, and the virtual
@@ -100,29 +124,68 @@ async fn settle_to(baseline: usize) -> usize {
 struct Wire {
     cut: AtomicBool,
     from_agent: AtomicU64,
+    /// Markers from the probe ([`PROBE_IP`]) the router has counted.
+    markers: AtomicU64,
 }
 
-async fn wan(wire: &Arc<Wire>) -> (Arc<Net>, Arc<Net>) {
+impl Wire {
+    /// How many packets the agent has put on the wire so far. The router
+    /// counts a packet on a task of its own, after the send that queued it
+    /// has returned, so `from_agent` read alone can miss one the agent has
+    /// already sent: on a loaded runner, the DTLS close_notify of a close that
+    /// has just returned (#3716). The router's queue is first in, first out:
+    /// once a marker sent now is counted, so is everything sent before it.
+    async fn sent_by_agent(&self, probe: &Net) -> u64 {
+        let counted = self.markers.load(Ordering::SeqCst);
+        let socket = probe
+            .bind(format!("{PROBE_IP}:0").parse().expect("addr"))
+            .await
+            .expect("the probe's socket");
+        socket
+            .send_to(b"marker", format!("{PROBE_IP}:9").parse().expect("addr"))
+            .await
+            .expect("the marker");
+        let _ = socket.close().await;
+        let deadline = Instant::now() + SETTLE;
+        while self.markers.load(Ordering::SeqCst) == counted {
+            assert!(
+                Instant::now() < deadline,
+                "the router never counted the probe's marker"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        self.from_agent.load(Ordering::SeqCst)
+    }
+}
+
+/// The agent's and the viewer's networks, joined by a router that holds each
+/// packet `lag` before it counts and forwards it, and the probe's network.
+async fn wan(wire: &Arc<Wire>, lag: Duration) -> (Arc<Net>, Arc<Net>, Arc<Net>) {
     let wan = Arc::new(Mutex::new(
         Router::new(RouterConfig {
             cidr: "1.2.3.0/24".to_owned(),
+            min_delay: lag,
             ..Default::default()
         })
         .expect("router"),
     ));
     let tap = Arc::clone(wire);
     let agent: std::net::IpAddr = AGENT_IP.parse().expect("ip");
+    let probe: std::net::IpAddr = PROBE_IP.parse().expect("ip");
     wan.lock()
         .await
         .add_chunk_filter(Box::new(move |c: &(dyn Chunk + Send + Sync)| {
-            if c.get_source_ip() == agent {
+            let from = c.get_source_ip();
+            if from == agent {
                 tap.from_agent.fetch_add(1, Ordering::SeqCst);
+            } else if from == probe {
+                tap.markers.fetch_add(1, Ordering::SeqCst);
             }
             !tap.cut.load(Ordering::SeqCst)
         }))
         .await;
     let mut nets = Vec::new();
-    for ip in [AGENT_IP, VIEWER_IP] {
+    for ip in [AGENT_IP, VIEWER_IP, PROBE_IP] {
         let net = Arc::new(Net::new(Some(NetConfig {
             static_ips: vec![ip.to_owned()],
             ..Default::default()
@@ -141,9 +204,10 @@ async fn wan(wire: &Arc<Wire>) -> (Arc<Net>, Arc<Net>) {
         nets.push(net);
     }
     wan.lock().await.start().await.expect("start");
+    let probe = nets.pop().expect("probe net");
     let viewer = nets.pop().expect("viewer net");
     let agent = nets.pop().expect("agent net");
-    (agent, viewer)
+    (agent, viewer, probe)
 }
 
 /// A peer with the interceptors a session has (NACK, reports, TWCC), so their
@@ -290,7 +354,7 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
     let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
-        let (agent_net, viewer_net) = wan(&wire).await;
+        let (agent_net, viewer_net, probe) = wan(&wire, ROUTER_LAG).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
@@ -313,7 +377,8 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
 
         let started = Instant::now();
         close_like_the_agent(&agent).await;
-        let took = started.elapsed();
+        let closed = Instant::now();
+        let took = closed - started;
         assert!(
             took < DEAD_PATH_CLOSE,
             "the close of a peer whose path died under a data-channel writer took {took:?}: \
@@ -327,21 +392,27 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
             "the writer parked in SCTP flow control was never let go"
         );
 
-        let before = wire.from_agent.load(Ordering::SeqCst);
+        // What the closed peer, still held by its session, sends for 2 s.
+        tokio::time::sleep_until((closed + IN_FLIGHT).into()).await;
+        let before = wire.sent_by_agent(&probe).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let after = wire.from_agent.load(Ordering::SeqCst) - before;
-        assert_eq!(
-            after, 0,
-            "the closed peer still put {after} packets on the wire in 2 s"
-        );
+        let after = wire.sent_by_agent(&probe).await - before;
 
         // The session drops its peer after the close, as `AgentPeer` does.
         drop((dc, agent));
         let left = settle_to(baseline).await;
+        // The tasks first: when packets went out, they tell a close that left
+        // something running from a last send that landed late.
         assert!(
             left <= baseline,
             "{left} tasks alive after both closes, {baseline} before the peers: \
-             what the close did not reach stayed alive"
+             what the close did not reach stayed alive, and put {after} packets \
+             on the wire in 2 s"
+        );
+        assert_eq!(
+            after, 0,
+            "the closed peer still put {after} packets on the wire in 2 s, though \
+             none of its tasks outlived it"
         );
     });
 }
@@ -351,7 +422,7 @@ fn a_healthy_close_still_takes_milliseconds() {
     let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
-        let (agent_net, viewer_net) = wan(&wire).await;
+        let (agent_net, viewer_net, _) = wan(&wire, Duration::ZERO).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
@@ -392,7 +463,7 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
     let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
-        let (agent_net, viewer_net) = wan(&wire).await;
+        let (agent_net, viewer_net, _) = wan(&wire, Duration::ZERO).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
@@ -512,7 +583,7 @@ fn many_writers_share_one_ordered_channel() {
         .expect("runtime")
         .block_on(async {
             let wire = Arc::new(Wire::default());
-            let (agent_net, viewer_net) = wan(&wire).await;
+            let (agent_net, viewer_net, _) = wan(&wire, Duration::ZERO).await;
             let viewer = peer(viewer_net).await;
             let agent = peer(agent_net).await;
 

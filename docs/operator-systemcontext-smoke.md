@@ -122,7 +122,7 @@ refuses to silently fall back to `%APPDATA%`.
 
 From an elevated prompt it first takes the machine folder and its parent,
 `C:\ProgramData\roomler`, for Administrators (#3609,
-`crates/agent-core/src/config.rs:4590`): the folder's owner and nothing else,
+`crates/agent-core/src/config.rs:4597`): the folder's owner and nothing else,
 and for the parent its owner and what it inherits derived again for that
 owner (`crates/agent-core/src/machine_tree.rs:868`). A person's daemon may have
 made both to stage received files before the service ever ran, and the
@@ -299,7 +299,7 @@ can open nothing that was sealed.
 
 | What you see | Why |
 |---|---|
-| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:345`) |
+| The service and worker logs stop at the restart, and `roomler logs` answers `no log file for source "daemon"` | the daemon cannot create its log in `service-logs`. A daemon with the fix logs instead into SYSTEM's own profile, and its first line names the reason (`crates/agent-core/src/logging.rs:346`) |
 | `icacls C:\ProgramData\roomler\roomler` lists **no** entries | the DACL is protected and empty (`icacls … /save` shows `D:PAI`) |
 | a leftover `config.toml.tmp.<pid>` in that directory | the config save whose hardening sealed it could not rename its file into place |
 | the directory lists SYSTEM and Administrators, but a child such as `crashes`, `service-logs` or `config.toml.prev` lists **no** entries; the log says `crash_recorder: read_dir failed … Access is denied`, or the daemon logs into SYSTEM's own profile because `service-logs` refused it | 0.4.185 hardened the directory for the first time, and dropped inheritance before it granted. Each child the user owned was left with an empty DACL. The same repair below heals it |

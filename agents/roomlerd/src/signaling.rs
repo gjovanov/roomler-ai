@@ -5024,11 +5024,12 @@ async fn handle_server_msg(
             );
 
             // FR-27 follow-up — the session is now established (peer built,
-            // answer ready): raise the "Being viewed by …" banner and publish
-            // to the LocalAPI session registry. Deferred to here from request
-            // time so it never shows while consent is still pending — "Being
-            // viewed by X" is only true once pixels actually flow. Harmless
-            // no-op on non-Windows / when the indicator feature is disabled.
+            // answer ready): raise the "Being viewed by …" notice. On Windows
+            // that is the overlay's border and badge; on every platform the
+            // session enters the LocalAPI session registry, whose banner and
+            // Disconnect the desktop companion shows. Deferred to here from
+            // request time so it never shows while consent is still pending —
+            // "Being viewed by X" is only true once pixels actually flow.
             // FR-99 P3b — the device's lock ask first: `show_session_full`
             // takes the lock decision, and the ask is part of it.
             crate::lock_on_end::set_session_ask(session_id, lock_ask);

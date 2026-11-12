@@ -23,7 +23,8 @@
 //! upgraded host stay readable — [`active_log_path`] and [`prune_old_logs_at`]
 //! (and `logs_fetch`) accept BOTH prefixes.
 //!
-//! The log DIR is resolved by `appdirs` (new-then-old segment). On a fresh
+//! The log DIR is resolved by `appdirs` (the tree that holds the config
+//! folder; with none, the local data folders decide). On a fresh
 //! Windows install that's `%LOCALAPPDATA%\roomler\roomler\data\logs\`; a
 //! pre-rename host keeps `...\roomler\roomler-agent\data\logs\`. Linux:
 //! `~/.local/share/roomler/logs/` (or `.../roomler-agent/logs/` on an upgraded
@@ -696,9 +697,11 @@ pub fn finish() {
 /// the write end a broken pipe when it goes (#2934).
 ///
 /// Call it after [`init`], which resolves the directory. The launcher must not
-/// do this: `appdirs::use_old_segment` is new-if-present, so creating the log
-/// folder from outside the daemon would switch a legacy host to the empty new tree
-/// and orphan its enrolled config.
+/// do this: on a host with no config folder in either tree, a new local data
+/// folder decides the tree (`appdirs::use_old_segment`), so creating the log
+/// folder from outside the daemon would switch a legacy host's logs, markers
+/// and stores to the empty new tree. A host whose config folder is in the old
+/// tree stays on it.
 #[cfg(windows)]
 pub fn send_stderr_to_the_log() {
     if let Some(dir) = log_dir() {

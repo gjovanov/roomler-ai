@@ -171,7 +171,7 @@ On the frozen end's pair to a lab node that kept running, which rode `/derp` in 
   reconnecting anyway (FR-55 P4)` (`:339`) means the timer did. On Windows the hold's timer runs on `Instant`, which
   counts the sleep, so after any sleep over 60 s both are ready at the wake and either can win (*reasoned*): only
   `awake again` proves the callback. Both lines reach `agent_logs`, because the upload layer takes every line the
-  filter passes (`crates/agent-core/src/logging.rs:212-219`). P0 reads them.
+  filter passes (`crates/agent-core/src/logging.rs:213-220`). P0 reads them.
 - **[R] The notice says that a sleep happened, not how long it lasted.** `woke()` (`sleep_notice.rs:446`) is also
   what a cancelled or failed sleep calls: macOS's `kIOMessageSystemWillNotSleep` (`:898`), and logind's
   `PrepareForSleep(false)` (`:676`), which logind also sends when a suspend fails. Windows may deliver both

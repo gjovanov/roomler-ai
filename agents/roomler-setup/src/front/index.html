@@ -179,14 +179,17 @@
         <p id="adv-existing-note" class="muted" hidden>This machine already has an
         enrollment: the daemon keeps its current settings, and only the options you
         change here are written over them.</p>
-        <label class="field checkline">
-          <input id="adv-local-subnets" type="checkbox" checked>
-          <span>Advertise directly-connected subnets (admin approval required before use)</span>
-        </label>
+        <!-- #3714: auto_grant_session is this device's own floor under the
+             organization's consent policy, not a blanket approval. -->
         <label class="field checkline">
           <input id="adv-auto-grant" type="checkbox" checked>
-          <span>Auto-approve incoming remote-control sessions on this device</span>
+          <span>Trust the organization's consent policy (no extra prompt on this machine)</span>
         </label>
+        <p class="muted">Sessions the policy lets in without asking start without asking
+        here: the owner's own (whoever approves this device), an administrator's Force
+        control, and every session once this device is set to Auto-grant. Everyone else
+        is asked at this screen. Whoever is here sees a notice with Disconnect while
+        someone is viewing.</p>
         <label class="field">
           <span>Overlay subnet routes</span>
           <input id="adv-overlay-routes" type="text" spellcheck="false"
@@ -194,6 +197,15 @@
           <small class="muted">Comma-separated CIDRs this node offers to route
           for overlay peers. Leave empty unless this is a subnet router.</small>
         </label>
+        <!-- #3714: advertise_local_subnets only suggests routes to the tunnel
+             mesh, so it sits beside the tunnel field it adds to. -->
+        <label class="field checkline">
+          <input id="adv-local-subnets" type="checkbox" checked>
+          <span>Suggest this machine's local networks as tunnel routes</span>
+        </label>
+        <p class="muted">An administrator sees them under the device's Tunnel mesh
+        routes. Nothing on those networks can be reached through this machine until an
+        administrator approves a route.</p>
         <label class="field">
           <span>Tunnel subnet routes</span>
           <input id="adv-tunnel-routes" type="text" spellcheck="false"
