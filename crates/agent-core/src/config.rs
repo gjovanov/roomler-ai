@@ -106,17 +106,26 @@ pub struct AgentConfig {
     #[serde(default)]
     pub files_dir: Option<String>,
 
-    /// Whether incoming `rc:session.request` messages are
-    /// auto-granted without operator interaction. Default `true` to
-    /// match historical self-host behaviour (`docs/remote-control.md`
-    /// §11.2 + signaling.rs's pre-Plan-3 auto-grant). Org-controlled
-    /// fleets set this to `false` so every session start waits for
-    /// an explicit operator decision via the `roomlerd consent
-    /// --session <hex> --approve|--deny` CLI fallback (or, in a
-    /// future version, a tray prompt). 30 s timeout → auto-deny.
-    /// Has NO effect on the file-DC path — uploads/downloads/dir
-    /// browsing remain gated by `enable_remote_browse` + the
-    /// agent's denylist.
+    /// This device's own floor under the consent decision for a
+    /// remote-control session and for `exec`: the stricter of the
+    /// server's directive and this setting wins (FR-27,
+    /// `consent::strictest_of`). Read at start.
+    ///
+    /// - `true` (the default) adds nothing, so the directive decides. An
+    ///   `Auto` directive (the device owner, unless the device asks the
+    ///   owner too; an ADMINISTRATOR's break-glass; a device whose consent
+    ///   policy is `auto`) starts without a prompt, and every other
+    ///   directive asks the person at this machine.
+    /// - `false` turns an `Auto` directive into that prompt too, so every
+    ///   session and every `exec` asks someone here, the owner's included.
+    ///
+    /// A prompt nobody answers within the server's window is refused; with
+    /// no surface to show it on, the refusal is `NoPromptSurface`. With no
+    /// directive (an older server) this setting is the whole answer. A
+    /// session from outside the organization is floored the same way against
+    /// `external_consent_mode`. SSH asks under its own policy and does not
+    /// read this, and nothing inside a granted session (its file channel
+    /// included) is prompted by it.
     #[serde(default = "default_auto_grant_session")]
     pub auto_grant_session: bool,
 
@@ -2810,11 +2819,9 @@ fn default_enable_remote_browse() -> bool {
     true
 }
 
-/// Default for `auto_grant_session` — `true` for back-compat with
-/// every pre-0.3.x agent which auto-granted unconditionally
-/// (signaling.rs:365 TODO). Org-controlled fleets opt out via
-/// `config.toml`. See [`AgentConfig::auto_grant_session`] for the
-/// security model.
+/// Default for `auto_grant_session`: `true`, so the server's consent
+/// directive alone decides. See [`AgentConfig::auto_grant_session`] for
+/// what `false` adds.
 fn default_auto_grant_session() -> bool {
     true
 }
