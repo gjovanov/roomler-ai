@@ -21,6 +21,12 @@
 //! through its end: a folder moved aside mid-upload and another put in its
 //! place changes nothing, because the end renames from the held `<id>` into
 //! the held target ([`place`]).
+//!
+//! A folder on a file system that keeps no Unix owners or modes (a FAT
+//! disk, a share mounted with fixed modes: [`keeps_modes`]) cannot hold a
+//! staging folder of the stager's own. An upload into it stages in the
+//! stager's own private folder instead, on a file system that does keep
+//! them ([`stage_privately`]), and its end copies the file across.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::{CString, OsStr};
@@ -30,6 +36,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use super::PartialMeta;
 
@@ -41,29 +49,40 @@ const MAX_NOTES: u64 = 64 * 1024;
 
 /// A staged upload's folders, held from its begin (or resume) to its end.
 pub(crate) struct Held {
-    /// The folder `.roomler-partial` sits in.
-    base: File,
-    /// `<base>/.roomler-partial`, the stager's own.
+    /// The folder `.roomler-partial` sits in, when the upload stages beside
+    /// the folder it lands in; `None` when it stages in the stager's private
+    /// folder ([`stage_privately`]), whose file the end copies across.
+    beside: Option<File>,
+    /// `<base>/.roomler-partial`, or the private folder: the stager's own.
     staging: File,
-    /// `<base>/.roomler-partial/<id>`, the stager's own.
+    /// `<id>` in `staging`, the stager's own.
     dir: File,
     /// `<id>`: the name `dir` has in `staging`.
     id: String,
-    /// The folder the file is placed in: `base`, unless a resume placed it
-    /// where its notes say ([`Held::place_in`]).
-    target: File,
+    /// `dir`'s path, as the registry and the log name it.
+    dir_path: PathBuf,
+    /// The folder the file is placed in: the one it stages beside, or the
+    /// one it staged privately for, unless a resume placed it where its
+    /// notes say ([`Held::place_in`]). `None` only for a private partial
+    /// walked again, until its resume names its folder.
+    target: Option<File>,
 }
 
 impl Held {
     /// The folder the file is placed in.
-    pub(super) fn target(&self) -> &File {
-        &self.target
+    pub(super) fn target(&self) -> Option<&File> {
+        self.target.as_ref()
     }
 
-    /// Place the file in `folder` instead of beside its staging: a resume
-    /// of the person's, or a per-user daemon's, partial (FR-97 P3d).
+    /// Place the file in `folder`: a resume of the person's, or a per-user
+    /// daemon's, partial (FR-97 P3d), or of a private partial.
     pub(super) fn place_in(&mut self, folder: File) {
-        self.target = folder;
+        self.target = Some(folder);
+    }
+
+    /// The partial's own folder (`<id>`), by path.
+    pub(super) fn dir_path(&self) -> &Path {
+        &self.dir_path
     }
 }
 
@@ -170,10 +189,12 @@ pub(super) fn open_folder(path: &Path) -> io::Result<File> {
 }
 
 /// #3688 rule 1 — whether the folder `held` may receive the daemon's own
-/// files: a folder, `uid`'s, and, for root (`strict`), one no other account
-/// may write; for a per-user daemon, one not every account may write
-/// (Ubuntu's private-group umask makes `~/Downloads` 0775). `Err` says why
-/// not, in the viewer's words.
+/// files: a folder, never the temp dir, `uid`'s, and, for root (`strict`),
+/// one no other account may write; for a per-user daemon, one not every
+/// account may write (Ubuntu's private-group umask makes `~/Downloads`
+/// 0775), unless its file system keeps no modes, where every folder reads
+/// so ([`keeps_modes`]): such an upload stages privately and is placed
+/// without following a link. `Err` says why not, in the viewer's words.
 pub(super) fn may_receive(held: &File, uid: u32, strict: bool) -> Result<(), String> {
     let md = held
         .metadata()
@@ -181,16 +202,116 @@ pub(super) fn may_receive(held: &File, uid: u32, strict: bool) -> Result<(), Str
     if !md.is_dir() {
         return Err("it is not a folder".into());
     }
+    if is_the_temp_dir(&md) {
+        return Err("it is the temp folder".into());
+    }
     if md.uid() != uid {
         return Err("it belongs to another account".into());
     }
     if strict && md.mode() & 0o022 != 0 {
         return Err("another account can write to it".into());
     }
-    if md.mode() & 0o002 != 0 {
+    if md.mode() & 0o002 != 0 && keeps_modes(held) {
         return Err("every account can write to it".into());
     }
     Ok(())
+}
+
+/// Whether `md` is the temp dir's (`std::env::temp_dir()`), which no rule
+/// gives as a folder to receive into.
+fn is_the_temp_dir(md: &std::fs::Metadata) -> bool {
+    std::fs::metadata(std::env::temp_dir())
+        .is_ok_and(|temp| temp.dev() == md.dev() && temp.ino() == md.ino())
+}
+
+/// What [`keeps_modes`] found, by file system (its device and type) and
+/// stager.
+type Kept = ((u64, i64, u32), bool);
+
+static KEEPS_MODES: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+
+/// R4 — whether the file system the folder `held` sits on keeps Unix owners
+/// and modes for the stager: a folder made there 0700 reads back the
+/// stager's own, with no write bit for anyone else (after one `fchmod`,
+/// which some file systems need). A FAT or exFAT disk, NTFS without
+/// permissions, WSL's drive mounts without metadata, a share mounted with
+/// fixed modes or an sshfs that does not map owners keep neither: a
+/// staging folder beside the target could not be the stager's own, so an
+/// upload into it stages in the stager's private folder
+/// ([`stage_privately`]). Asked once per file system and stager, by making
+/// an empty folder in `held` and removing it at once. A folder the stager
+/// may not make one in answers yes: the staging beside it fails as before.
+pub(super) fn keeps_modes(held: &File) -> bool {
+    #[cfg(test)]
+    if let Some(kept) = super::stand_in::modes_kept_now() {
+        return kept;
+    }
+    let Ok(md) = held.metadata() else {
+        return true;
+    };
+    let key = (md.dev(), fs_type(held), stager());
+    let known = |found: &[Kept]| found.iter().find(|(k, _)| *k == key).map(|(_, kept)| *kept);
+    if let Some(kept) = known(&KEEPS_MODES.lock().unwrap_or_else(PoisonError::into_inner)) {
+        return kept;
+    }
+    let Some(kept) = probe(held) else {
+        return true;
+    };
+    if !kept {
+        tracing::info!(
+            "files: a folder's file system keeps no Unix owners or modes — uploads into it stage \
+             in the writer's own private folder"
+        );
+    }
+    let mut found = KEEPS_MODES.lock().unwrap_or_else(PoisonError::into_inner);
+    if known(&found).is_none() {
+        found.push((key, kept));
+    }
+    kept
+}
+
+/// The type of the file system `held` sits on (`fstatfs`), 0 if unread.
+fn fs_type(held: &File) -> i64 {
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: a handle we hold and room for the answer, read only when the
+    // call succeeded.
+    if unsafe { libc::fstatfs(held.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    // SAFETY: filled in by the successful call above.
+    #[allow(clippy::unnecessary_cast)]
+    let kind = unsafe { st.assume_init() }.f_type as i64;
+    kind
+}
+
+/// [`keeps_modes`]'s question, asked: an empty folder made 0700 in `held`
+/// under a name of this process's own, read back (after one `fchmod`), and
+/// removed. `None` when it could not be made.
+fn probe(held: &File) -> Option<bool> {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let name = format!(
+        ".roomler-probe-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    );
+    mkdir_at(held, &name, 0o700).ok()?;
+    let kept = match open_at(
+        held,
+        &name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(made) => {
+            own(&made, true).is_ok() || {
+                // SAFETY: a folder handle we hold.
+                unsafe { libc::fchmod(made.as_raw_fd(), 0o700) };
+                own(&made, true).is_ok()
+            }
+        }
+        Err(_) => false,
+    };
+    let _ = unlink_at(held, &name, libc::AT_REMOVEDIR);
+    Some(kept)
 }
 
 /// Rules 2 and 3 — whether `held` is a folder (`dir`) or a plain file that
@@ -218,14 +339,23 @@ fn own(held: &File, dir: bool) -> Result<(), &'static str> {
 /// 0700 through its handle (R1: one a per-user daemon made under umask 0002
 /// before this rule).
 fn open_staging(base: &File, base_path: &Path, create: bool) -> Result<File> {
-    let shown = base_path.join(STAGING);
+    open_own(base, base_path, OsStr::new(STAGING), create)
+}
+
+/// Rule 2 — folder `name` in `base` (held, at `base_path`): `.roomler-partial`,
+/// or a private staging folder. Made 0700 when `create` and it is not there,
+/// opened without following a link and checked: the stager's own, or refused
+/// with a reason and left as it is; the stager's own but open to others, made
+/// 0700 through its handle, and refused if that does not hold.
+fn open_own(base: &File, base_path: &Path, name: &OsStr, create: bool) -> Result<File> {
+    let shown = base_path.join(name);
     // Twice at most when making it: another upload's end removes an empty
     // `.roomler-partial`, and may do so between the make and the open.
     let mut tries = if create { 2 } else { 1 };
     let staging = loop {
         tries -= 1;
         if create {
-            match mkdir_at(base, STAGING, 0o700) {
+            match mkdir_at(base, name, 0o700) {
                 Ok(()) => {}
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
                 Err(e) => {
@@ -237,7 +367,7 @@ fn open_staging(base: &File, base_path: &Path, create: bool) -> Result<File> {
         }
         match open_at(
             base,
-            STAGING,
+            name,
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
             0,
         ) {
@@ -270,6 +400,12 @@ fn open_staging(base: &File, base_path: &Path, create: bool) -> Result<File> {
         // SAFETY: a folder handle we hold.
         cvt(unsafe { libc::fchmod(staging.as_raw_fd(), 0o700) })
             .with_context(|| format!("making {} its own again", shown.display()))?;
+        if own(&staging, true).is_err() {
+            return Err(anyhow!(
+                "{} stays open to other accounts, so file transfer does not stage there",
+                shown.display()
+            ));
+        }
         tracing::info!(
             folder = %shown.display(),
             was = format!("{:o}", md.mode() & 0o7777),
@@ -277,6 +413,64 @@ fn open_staging(base: &File, base_path: &Path, create: bool) -> Result<File> {
         );
     }
     Ok(staging)
+}
+
+/// R4 — the stager's private staging folder `root` (on a file system that
+/// keeps modes): its missing parents made 0700 when `create`, then `root`
+/// itself made, opened and checked as [`open_own`] does `.roomler-partial`.
+fn open_private_root(root: &Path, create: bool) -> Result<File> {
+    let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+        return Err(anyhow!("{} is not a folder to stage in", root.display()));
+    };
+    if create {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let held = open_folder(parent).with_context(|| format!("opening {}", parent.display()))?;
+    open_own(&held, parent, name, create)
+}
+
+/// `<id>`'s make in `staging` (at `shown`) failed with `e`: an id that
+/// already has a partial is never adopted (B1, the browser sends
+/// `files:resume` instead); anything else says where.
+fn id_not_made(e: io::Error, shown: &Path, id: &str) -> anyhow::Error {
+    if e.raw_os_error() == Some(libc::EEXIST) {
+        return anyhow!("id {id} already has partial state; send files:resume");
+    }
+    anyhow::Error::from(e).context(format!("creating {}", shown.join(id).display()))
+}
+
+/// Rule 2 — the new `<id>` in `staging` (at `shown`) opened without
+/// following a link and checked the stager's own, its notes (`meta`) written
+/// 0600 and its `data` made `data_mode`, each new. Returns `<id>`, and `data`
+/// open for writing.
+fn fill(
+    staging: &File,
+    shown: &Path,
+    id: &str,
+    meta: &[u8],
+    data_mode: u32,
+) -> Result<(File, File)> {
+    let shown = shown.join(id);
+    let dir = open_at(
+        staging,
+        id,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )
+    .with_context(|| format!("opening {}", shown.display()))?;
+    own(&dir, true).map_err(|why| anyhow!("{}: {why}", shown.display()))?;
+    let new = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
+    open_at(&dir, "meta.json", new, 0o600)
+        .and_then(|mut notes| notes.write_all(meta))
+        .with_context(|| format!("writing {}", shown.join("meta.json").display()))?;
+    let data = open_at(&dir, "data", new, data_mode)
+        .with_context(|| format!("creating {}", shown.join("data").display()))?;
+    Ok((dir, data))
 }
 
 /// Rule 2 — stage upload `id` beside `base` (held, at `base_path`): its
@@ -290,57 +484,105 @@ pub(super) fn stage(
     meta: &[u8],
     data_mode: u32,
 ) -> Result<(Held, File)> {
-    let staging = open_staging(&base, base_path, true)?;
-    #[cfg(test)]
-    super::stand_in::before_the_id_is_made(base_path);
-    let shown = base_path.join(STAGING).join(id);
-    match mkdir_at(&staging, id, 0o700) {
-        Ok(()) => {}
-        // B1 — never adopted: the browser sends `files:resume` instead.
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-            return Err(anyhow!(
-                "id {id} already has partial state; send files:resume"
-            ));
-        }
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context(format!("creating {}", shown.display())));
+    let shown = base_path.join(STAGING);
+    // Twice at most: another upload's end removes an empty `.roomler-partial`,
+    // and may do so between its open here and the make of `<id>` in it. Then
+    // it is made and opened again.
+    let mut tries = 2;
+    let staging = loop {
+        tries -= 1;
+        let staging = open_staging(&base, base_path, true)?;
+        #[cfg(test)]
+        super::stand_in::before_the_id_is_made(base_path);
+        match mkdir_at(&staging, id, 0o700) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && tries > 0 => continue,
+            made => break made.map(|()| staging),
         }
     }
-    let dir = open_at(
-        &staging,
-        id,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    )
-    .with_context(|| format!("opening {}", shown.display()))?;
-    own(&dir, true).map_err(|why| anyhow!("{}: {why}", shown.display()))?;
-    let new = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
-    open_at(&dir, "meta.json", new, 0o600)
-        .and_then(|mut notes| notes.write_all(meta))
-        .with_context(|| format!("writing {}", shown.join("meta.json").display()))?;
-    let data = open_at(&dir, "data", new, data_mode)
-        .with_context(|| format!("creating {}", shown.join("data").display()))?;
+    .map_err(|e| id_not_made(e, &shown, id))?;
+    let (dir, data) = fill(&staging, &shown, id, meta, data_mode)?;
     let target = base.try_clone().context("holding the target folder")?;
     let held = Held {
-        base,
+        beside: Some(base),
         staging,
         dir,
         id: id.to_string(),
-        target,
+        dir_path: shown.join(id),
+        target: Some(target),
     };
     Ok((held, data))
 }
 
-/// Rule 3 — a partial walked again from its notes' path
-/// (`<base>/.roomler-partial/<id>/meta.json`): `<base>` (links followed: its
-/// own rule), `.roomler-partial` (rule 2's check), and `<id>` without
-/// following a link, the stager's own. `Err` = not a partial this stager may
-/// trust, and why, for the log. Returns the handles and `<base>`'s path.
-pub(super) fn reopen(meta_path: &Path, id: &str) -> Result<(Held, PathBuf)> {
+/// R4 — stage upload `id` for the folder held as `target` in the stager's
+/// private staging folder `root`, not beside it: the folder it lands in
+/// keeps no modes ([`keeps_modes`]), so a staging folder there could not be
+/// the stager's own. `root` (and any missing parent) is made 0700 and
+/// checked as rule 2 checks `.roomler-partial`; `<id>` and its files are
+/// made as [`stage`] makes them. The end copies the file across into
+/// `target` ([`place`]).
+pub(super) fn stage_privately(
+    target: File,
+    root: &Path,
+    id: &str,
+    meta: &[u8],
+    data_mode: u32,
+) -> Result<(Held, File)> {
+    let staging = open_private_root(root, true)?;
+    mkdir_at(&staging, id, 0o700).map_err(|e| id_not_made(e, root, id))?;
+    let (dir, data) = fill(&staging, root, id, meta, data_mode)?;
+    let held = Held {
+        beside: None,
+        staging,
+        dir,
+        id: id.to_string(),
+        dir_path: root.join(id),
+        target: Some(target),
+    };
+    Ok((held, data))
+}
+
+/// Rule 3 — a partial walked again from its notes' path: in the stager's
+/// private folder (`<private_root>/<id>/meta.json`, that folder checked as
+/// rule 2 checks it), or beside a folder
+/// (`<base>/.roomler-partial/<id>/meta.json`: `<base>`, links followed, its
+/// own rule; `.roomler-partial`, rule 2's check); then `<id>` without
+/// following a link, the stager's own. `Err` = not a partial this stager
+/// may trust, and why, for the log. Returns the handles and, for one staged
+/// beside a folder, that folder's path; a private one holds no folder to
+/// place in until its resume names it ([`Held::place_in`]).
+pub(super) fn reopen(
+    meta_path: &Path,
+    id: &str,
+    private_root: Option<&Path>,
+) -> Result<(Held, Option<PathBuf>)> {
     let dir_path = meta_path
         .parent()
         .filter(|dir| dir.file_name() == Some(OsStr::new(id)))
         .ok_or_else(|| anyhow!("{} is not a partial's notes", meta_path.display()))?;
+    let open_id = |staging: &File| -> Result<File> {
+        let dir = open_at(
+            staging,
+            id,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )
+        .with_context(|| format!("opening {}", dir_path.display()))?;
+        own(&dir, true).map_err(|why| anyhow!("{}: {why}", dir_path.display()))?;
+        Ok(dir)
+    };
+    if let Some(root) = private_root.filter(|root| dir_path.parent() == Some(*root)) {
+        let staging = open_private_root(root, false)?;
+        let dir = open_id(&staging)?;
+        let held = Held {
+            beside: None,
+            staging,
+            dir,
+            id: id.to_string(),
+            dir_path: dir_path.to_path_buf(),
+            target: None,
+        };
+        return Ok((held, None));
+    }
     let base_path = dir_path
         .parent()
         .filter(|staging| staging.file_name() == Some(OsStr::new(STAGING)))
@@ -349,23 +591,17 @@ pub(super) fn reopen(meta_path: &Path, id: &str) -> Result<(Held, PathBuf)> {
     let base =
         open_folder(base_path).with_context(|| format!("opening {}", base_path.display()))?;
     let staging = open_staging(&base, base_path, false)?;
-    let dir = open_at(
-        &staging,
-        id,
-        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-        0,
-    )
-    .with_context(|| format!("opening {}", dir_path.display()))?;
-    own(&dir, true).map_err(|why| anyhow!("{}: {why}", dir_path.display()))?;
+    let dir = open_id(&staging)?;
     let target = base.try_clone().context("holding the target folder")?;
     let held = Held {
-        base,
+        beside: Some(base),
         staging,
         dir,
         id: id.to_string(),
-        target,
+        dir_path: dir_path.to_path_buf(),
+        target: Some(target),
     };
-    Ok((held, base_path.to_path_buf()))
+    Ok((held, Some(base_path.to_path_buf())))
 }
 
 /// Rule 3 — a partial's notes, through a handle opened without following a
@@ -428,9 +664,10 @@ fn unique_name_at(dir: &File, name: &str) -> String {
 /// Rule 6 — place the received file: `data` renamed from the held `<id>`
 /// into the held target, or into a folder upload's subfolders, each made and
 /// opened from the one before it (`no_links`: a link among them refuses),
-/// under a name nothing there has yet; then the staging goes. `shown` is the
-/// target's path, for the path the viewer is told. On a failure the staging
-/// stays, for a resume.
+/// under a name nothing there has yet; then the staging goes. A private
+/// partial's file is copied across instead (R4). `shown` is the target's
+/// path, for the path the viewer is told. On a failure the staging stays,
+/// for a resume.
 pub(super) fn place(
     held: Held,
     shown: &Path,
@@ -438,10 +675,14 @@ pub(super) fn place(
     name: &str,
     no_links: bool,
 ) -> Result<PathBuf> {
+    let target = held
+        .target
+        .as_ref()
+        .ok_or_else(|| anyhow!("no folder is held to place {name} in"))?;
     let mut leaf_path = shown.to_path_buf();
     let mut leaf: Option<File> = None;
     for folder in folders {
-        let parent = leaf.as_ref().unwrap_or(&held.target);
+        let parent = leaf.as_ref().unwrap_or(target);
         leaf_path.push(folder);
         match mkdir_at(parent, folder, 0o777) {
             Ok(()) => {}
@@ -472,18 +713,25 @@ pub(super) fn place(
         };
         leaf = Some(next);
     }
-    let leaf = leaf.as_ref().unwrap_or(&held.target);
+    let leaf = leaf.as_ref().unwrap_or(target);
     let name = unique_name_at(leaf, name);
     let placed = leaf_path.join(&name);
-    match rename_at(&held.dir, "data", leaf, &name) {
-        Ok(()) => {}
-        // A subfolder on another file system: copied across, through handles.
-        Err(e) if super::is_cross_volume_error(&e) => copy_across(&held, leaf, &name, &placed)?,
-        Err(e) => {
-            return Err(anyhow::Error::from(e).context(format!(
-                "renaming the received file to {}",
-                placed.display()
-            )));
+    if held.beside.is_none() {
+        // R4 — staged privately, for a folder whose file system keeps no
+        // modes: always copied across, through handles.
+        copy_across(&held, leaf, &name, &placed)?;
+    } else {
+        match rename_at(&held.dir, "data", leaf, &name) {
+            Ok(()) => {}
+            // A subfolder on another file system: copied across, through
+            // handles.
+            Err(e) if super::is_cross_volume_error(&e) => copy_across(&held, leaf, &name, &placed)?,
+            Err(e) => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "renaming the received file to {}",
+                    placed.display()
+                )));
+            }
         }
     }
     discard(held);
@@ -520,13 +768,34 @@ fn copy_across(held: &Held, leaf: &File, name: &str, placed: &Path) -> Result<()
 }
 
 /// The staging of a transfer that is over or cancelled: its `data` (if
-/// still there), its notes, `<id>`, and `.roomler-partial` once empty.
-/// Best-effort, through the held handles, nothing followed.
+/// still there), its notes, `<id>`, and a `.roomler-partial` once empty (a
+/// private folder stays). Best-effort, through the held handles, nothing
+/// followed.
 pub(super) fn discard(held: Held) {
     let _ = unlink_at(&held.dir, "data", 0);
     let _ = unlink_at(&held.dir, "meta.json", 0);
     let _ = unlink_at(&held.staging, &held.id, libc::AT_REMOVEDIR);
-    let _ = unlink_at(&held.base, STAGING, libc::AT_REMOVEDIR);
+    if let Some(base) = &held.beside {
+        let _ = unlink_at(base, STAGING, libc::AT_REMOVEDIR);
+    }
+}
+
+/// R4 — `name` in `dir` (held; a link at its last step not followed, nor a
+/// FIFO waited on), read whole when it is the stager's own plain file that
+/// nobody else may write and is no bigger than notes ever are. `None`
+/// otherwise.
+pub(super) fn read_own_file(dir: &File, name: &str) -> Option<String> {
+    let file = open_at(
+        dir,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        0,
+    )
+    .ok()?;
+    own(&file, false).ok()?;
+    let mut text = String::new();
+    file.take(MAX_NOTES).read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// What the sweep finds in a `<id>` that is its stager's own.

@@ -1446,7 +1446,7 @@ pub async fn sweep_orphans() -> (usize, usize) {
     // Linux system install, the person at seat0, in their own folder.
     let who = FsAs::now();
     let w = who.clone();
-    let roots = who
+    let (roots, private) = who
         .run(move || {
             let mut roots: Vec<PathBuf> = Vec::new();
             if let Ok(d) = default_download_dir_as(&w, false) {
@@ -1460,20 +1460,30 @@ pub async fn sweep_orphans() -> (usize, usize) {
             {
                 roots.push(c);
             }
-            Ok(roots)
+            // R4 — and the writer's own private staging folder, whose
+            // children are partials.
+            #[cfg(target_os = "linux")]
+            let private = private_staging_root(&w);
+            #[cfg(not(target_os = "linux"))]
+            let private: Option<PathBuf> = None;
+            Ok((roots, private))
         })
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(%e, "sweep_orphans: could not resolve the drop folders as their writer");
-            Vec::new()
+            (Vec::new(), None)
         });
-    if roots.is_empty() {
+    if roots.is_empty() && private.is_none() {
         tracing::debug!("sweep_orphans: Downloads dir not resolvable; skipping");
         return (0, 0);
     }
     let (mut kept, mut swept) = (0, 0);
-    for root in &roots {
-        let (k, s) = sweep_orphans_dir_as(&who, root.join(".roomler-partial")).await;
+    let walked = roots
+        .iter()
+        .map(|root| root.join(".roomler-partial"))
+        .chain(private);
+    for dir in walked {
+        let (k, s) = sweep_orphans_dir_as(&who, dir).await;
         kept += k;
         swept += s;
     }
@@ -2030,20 +2040,24 @@ impl FilesHandler {
         // drop the operator's data. #3688 — a default folder that cannot
         // receive files says why in its own words, which the viewer shows
         // (it shows an error's outermost line only).
-        let target_dir = match dest_path.filter(|p| !p.is_empty()) {
+        // #3688 — and whether it is the daemon's own default folder, whose
+        // rule its staging then holds the handle it opens to.
+        let (target_dir, the_default) = match dest_path.filter(|p| !p.is_empty()) {
             Some(dp) => match resolve_dest_path_as(&who, dp).await {
-                Ok(d) => d,
+                Ok(d) => (d, false),
                 Err(e) => {
                     tracing::warn!(
                         dest_path = dp,
                         %e,
                         "files: dest_path rejected; falling back to Downloads"
                     );
-                    download_dir_for(&who).await?
+                    drop_folder_for(&who).await?
                 }
             },
-            None => download_dir_for(&who).await?,
+            None => drop_folder_for(&who).await?,
         };
+        #[cfg(not(target_os = "linux"))]
+        let _ = the_default;
         let filename = sanitize_filename(&name);
 
         // rc.19: stage at <dest_dir>/.roomler-partial/<id>/data so a
@@ -2081,7 +2095,7 @@ impl FilesHandler {
         };
 
         // The staging half, as the stager.
-        let (meta_path, file, held) = {
+        let (partial_dir, file, held) = {
             let (target_dir, partial_dir, filename, id, reserved_final) = (
                 target_dir.clone(),
                 partial_dir.clone(),
@@ -2097,7 +2111,7 @@ impl FilesHandler {
             // #3688 — on Linux, staged and held by handles (`staging`);
             // the tests' own staging-root mode keeps the steps below.
             #[cfg(target_os = "linux")]
-            let (by_handles, daemons_own) = (!self.stages_in_a_root(), who.is_the_daemon());
+            let (by_handles, as_stager) = (!self.stages_in_a_root(), stager.clone());
             stager
                 .run(move || {
                     #[cfg(target_os = "linux")]
@@ -2114,9 +2128,15 @@ impl FilesHandler {
                         };
                         let meta_bytes = serde_json::to_vec_pretty(&meta)
                             .context("serialising partial meta.json")?;
-                        let (held, file) =
-                            stage_held(&target_dir, &id, &meta_bytes, private, daemons_own)?;
-                        return Ok((partial_dir.join("meta.json"), file, Some(held)));
+                        let (held, file) = stage_held(
+                            &as_stager,
+                            &target_dir,
+                            &id,
+                            &meta_bytes,
+                            private,
+                            the_default,
+                        )?;
+                        return Ok((held.dir_path().to_path_buf(), file, Some(held)));
                     }
                     // B1 fix — reject if an existing partial dir is on disk for
                     // this id. The browser MUST send `files:resume` instead, or
@@ -2173,10 +2193,11 @@ impl FilesHandler {
                     let file = new_file(private)
                         .open(&data_path)
                         .with_context(|| format!("creating {}", data_path.display()))?;
-                    Ok((meta_path, file, HeldStaging::default()))
+                    Ok((partial_dir, file, HeldStaging::default()))
                 })
                 .await?
         };
+        let meta_path = partial_dir.join("meta.json");
         // The open file carries the identity's rights from here on; the
         // writes through it need no identity of their own.
         let file = File::from_std(file);
@@ -2338,7 +2359,10 @@ impl FilesHandler {
                 .run(move || {
                     let root_writer = who.writes_as_root();
                     if root_writer {
-                        root_may_place_in(&who, &dest_dir, held.target()).map_err(|why| {
+                        let target = held
+                            .target()
+                            .ok_or_else(|| anyhow!("no folder is held to place the file in"))?;
+                        root_may_place_in(&who, &dest_dir, target).map_err(|why| {
                             anyhow!(
                                 "{} is not a folder this computer receives files into now \
                                  ({why}), so the file is not placed there",
@@ -2625,10 +2649,10 @@ impl FilesHandler {
             // anything else stays for the sweep.
             #[cfg(target_os = "linux")]
             if !self.stages_in_a_root() {
-                let (notes, id_s) = (dir.join("meta.json"), id.to_string());
+                let (notes, id_s, w) = (dir.join("meta.json"), id.to_string(), who.clone());
                 let _ = who
                     .run(move || {
-                        match staging::reopen(&notes, &id_s) {
+                        match staging::reopen(&notes, &id_s, private_staging_root(&w).as_deref()) {
                             Ok((held, _)) => staging::discard(held),
                             Err(e) => tracing::warn!(
                                 id = %id_s,
@@ -2724,20 +2748,40 @@ impl FilesHandler {
                     self.partial_dir(std::path::Path::new(""), id)?
                         .join("meta.json")
                 } else {
-                    // #3688 — on Linux the lookup creates nothing: the drop
-                    // folder as it would resolve now, unmade.
+                    // R4 — on Linux, first in the stager's own private folder,
+                    // where an upload into a folder that keeps no modes stages.
                     #[cfg(target_os = "linux")]
-                    let downloads = {
-                        let w = now.clone();
-                        now.run(move || drop_folder_without_creating(&w))
-                            .await
-                            .context("resolving Downloads for on-demand resume probe")?
+                    let private = {
+                        let (w, id_s) = (stager.clone(), id.to_string());
+                        stager
+                            .run(move || {
+                                Ok(private_staging_root(&w)
+                                    .map(|root| root.join(&id_s).join("meta.json"))
+                                    .filter(|notes| std::fs::symlink_metadata(notes).is_ok()))
+                            })
+                            .await?
                     };
                     #[cfg(not(target_os = "linux"))]
-                    let downloads = download_dir_for(&now)
-                        .await
-                        .context("resolving Downloads for on-demand resume probe")?;
-                    self.partial_dir(&downloads, id)?.join("meta.json")
+                    let private: Option<PathBuf> = None;
+                    match private {
+                        Some(notes) => notes,
+                        None => {
+                            // #3688 — on Linux the lookup creates nothing: the
+                            // drop folder as it would resolve now, unmade.
+                            #[cfg(target_os = "linux")]
+                            let downloads = {
+                                let w = now.clone();
+                                now.run(move || drop_folder_without_creating(&w))
+                                    .await
+                                    .context("resolving Downloads for on-demand resume probe")?
+                            };
+                            #[cfg(not(target_os = "linux"))]
+                            let downloads = download_dir_for(&now)
+                                .await
+                                .context("resolving Downloads for on-demand resume probe")?;
+                            self.partial_dir(&downloads, id)?.join("meta.json")
+                        }
+                    }
                 };
                 let probe = canonical.clone();
                 if !stager
@@ -2881,9 +2925,10 @@ impl FilesHandler {
         who: FsAs,
     ) -> Result<u64> {
         let placer = who.person_sid().map(str::to_string);
-        let (id_s, w, partial_dir) = (
+        let (id_s, w, st, partial_dir) = (
             id.to_string(),
             who.clone(),
+            stager.clone(),
             meta_path.parent().map(std::path::Path::to_path_buf),
         );
         let (meta, held, accepted, file) = stager
@@ -2896,8 +2941,10 @@ impl FilesHandler {
                     );
                     anyhow!("no partial state for id {id_s}")
                 };
-                let (mut held, base) =
-                    staging::reopen(&meta_path, &id_s).map_err(|e| refuse(format!("{e:#}")))?;
+                let private_root = private_staging_root(&st);
+                let (mut held, beside) =
+                    staging::reopen(&meta_path, &id_s, private_root.as_deref())
+                        .map_err(|e| refuse(format!("{e:#}")))?;
                 let notes = staging::read_notes(&held).map_err(|e| refuse(format!("{e:#}")))?;
                 let meta: PartialMeta = serde_json::from_slice(&notes)
                     .with_context(|| format!("parsing {}", meta_path.display()))?;
@@ -2909,24 +2956,48 @@ impl FilesHandler {
                 {
                     return Err(anyhow!(NOT_THE_PERSON));
                 }
-                if w.writes_as_root() {
-                    if meta.dest_dir != base {
-                        return Err(refuse(format!(
-                            "its notes record {}, but it sits beside {}",
-                            meta.dest_dir.display(),
-                            base.display()
-                        )));
+                match (w.writes_as_root(), beside) {
+                    (true, Some(base)) => {
+                        if meta.dest_dir != base {
+                            return Err(refuse(format!(
+                                "its notes record {}, but it sits beside {}",
+                                meta.dest_dir.display(),
+                                base.display()
+                            )));
+                        }
+                        if sanitize_filename(&meta.filename) != meta.filename {
+                            return Err(refuse(
+                                "its notes record a name that is not a bare one".into(),
+                            ));
+                        }
+                        let target = held
+                            .target()
+                            .ok_or_else(|| refuse("no folder is held beside it".into()))?;
+                        root_may_place_in(&w, &base, target).map_err(refuse)?;
                     }
-                    if sanitize_filename(&meta.filename) != meta.filename {
-                        return Err(refuse(
-                            "its notes record a name that is not a bare one".into(),
-                        ));
+                    // R4 — staged in root's private folder, for a folder
+                    // that keeps no modes: that folder must be one the rule
+                    // gives now, under a bare name, and one no other
+                    // account may write.
+                    (true, None) => {
+                        if sanitize_filename(&meta.filename) != meta.filename {
+                            return Err(refuse(
+                                "its notes record a name that is not a bare one".into(),
+                            ));
+                        }
+                        let folder = staging::open_folder(&meta.dest_dir).map_err(|e| {
+                            refuse(format!("opening {}: {e}", meta.dest_dir.display()))
+                        })?;
+                        root_may_place_in(&w, &meta.dest_dir, &folder).map_err(refuse)?;
+                        staging::may_receive(&folder, own_euid(), true)
+                            .map_err(|why| refuse(format!("{}: {why}", meta.dest_dir.display())))?;
+                        held.place_in(folder);
                     }
-                    root_may_place_in(&w, &base, held.target()).map_err(refuse)?;
-                } else {
-                    let folder = staging::open_folder(&meta.dest_dir)
-                        .with_context(|| format!("opening {}", meta.dest_dir.display()))?;
-                    held.place_in(folder);
+                    (false, _) => {
+                        let folder = staging::open_folder(&meta.dest_dir)
+                            .with_context(|| format!("opening {}", meta.dest_dir.display()))?;
+                        held.place_in(folder);
+                    }
                 }
                 let (data, disk_size) =
                     staging::reopen_data(&held).map_err(|e| refuse(format!("{e:#}")))?;
@@ -4275,28 +4346,44 @@ fn split_stem_ext(name: &str) -> (&str, &str) {
 /// refusal is logged and falls back rather than failing the drop.
 /// FR-97 P3d — the drop folder for `who`, resolved as them (the configured
 /// folder's gate creates it and probes a write).
+#[cfg(any(test, not(target_os = "linux")))]
 async fn download_dir_for(who: &FsAs) -> Result<PathBuf> {
-    let w = who.clone();
-    who.run(move || download_dir_as(&w)).await
+    drop_folder_for(who).await.map(|(folder, _)| folder)
 }
 
-/// [`download_dir`] for `who`, on a thread under their identity. For the
-/// person at seat0: the configured folder when it passes for them (inside
-/// THEIR home, FR-84 D4's rule), else their own Downloads.
+/// [`download_dir_for`], and whether the folder is the daemon's own default
+/// one ([`default_download_dir`]), which a begin then holds to its rule on
+/// the handle its staging opens (#3688).
+async fn drop_folder_for(who: &FsAs) -> Result<(PathBuf, bool)> {
+    let w = who.clone();
+    who.run(move || drop_folder_as(&w)).await
+}
+
+/// The drop folder for `who` ([`drop_folder_as`]), on a thread under their
+/// identity.
+#[cfg(all(test, target_os = "windows"))]
 fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
+    drop_folder_as(who).map(|(folder, _)| folder)
+}
+
+/// [`download_dir_as`], and whether the folder is the daemon's own default
+/// one. For the person at seat0: the configured folder when it passes for
+/// them (inside THEIR home, FR-84 D4's rule), else their own Downloads,
+/// neither the daemon's.
+fn drop_folder_as(who: &FsAs) -> Result<(PathBuf, bool)> {
     match who {
-        FsAs::Daemon => download_dir(),
+        FsAs::Daemon => drop_folder_with(&writer_context()),
         // #3688 — nobody at seat0: the configured folder is checked with no
         // active home ([`FsAs::writer`]), so it never resolves in the
         // daemon's own home, and the drop lands in the default folder.
         #[cfg(target_os = "linux")]
-        FsAs::DaemonAlone => download_dir_with(&who.writer()),
+        FsAs::DaemonAlone => drop_folder_with(&who.writer()),
         #[cfg(target_os = "linux")]
         FsAs::Person { home, .. } => {
             if let Some(raw) = configured_files_dir() {
                 let writer = who.writer();
                 match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
-                    Ok(dir) => return Ok(dir),
+                    Ok(dir) => return Ok((dir, false)),
                     Err(e) => tracing::warn!(
                         files_dir = %raw,
                         active_home = ?writer.active_home,
@@ -4306,7 +4393,7 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
                     ),
                 }
             }
-            Ok(person_downloads(home))
+            Ok((person_downloads(home), false))
         }
         // #3048 — the same for the person signed in to a Windows worker's
         // session: their `files_dir` when it passes for them (inside THEIR
@@ -4318,7 +4405,7 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
             if let Some(raw) = configured_files_dir() {
                 let writer = who.writer();
                 match files_dir::validate(&raw, &writer, &files_dir::Rules::from_env()) {
-                    Ok(dir) => return Ok(dir),
+                    Ok(dir) => return Ok((dir, false)),
                     Err(e) => tracing::warn!(
                         files_dir = %raw,
                         active_home = ?writer.active_home,
@@ -4328,10 +4415,9 @@ fn download_dir_as(who: &FsAs) -> Result<PathBuf> {
                     ),
                 }
             }
-            Ok(person_downloads_windows(
-                downloads.as_deref(),
-                profile,
-                true,
+            Ok((
+                person_downloads_windows(downloads.as_deref(), profile, true),
+                false,
             ))
         }
         #[cfg(target_os = "windows")]
@@ -4365,16 +4451,18 @@ fn default_download_dir_as(who: &FsAs, log: bool) -> Result<PathBuf> {
     }
 }
 
+/// Where the daemon's own drop lands: [`drop_folder_with`] for this process.
+#[cfg(test)]
 fn download_dir() -> Result<PathBuf> {
-    download_dir_with(&writer_context())
+    drop_folder_with(&writer_context()).map(|(folder, _)| folder)
 }
 
-/// [`download_dir`] for `writer`: the configured folder when it passes for
-/// it, else the default ladder.
-fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
+/// The drop folder for `writer`: the configured folder when it passes for
+/// it, else the default ladder, and whether it is that default folder.
+fn drop_folder_with(writer: &files_dir::Writer) -> Result<(PathBuf, bool)> {
     if let Some(raw) = configured_files_dir() {
         match files_dir::validate(&raw, writer, &files_dir::Rules::from_env()) {
-            Ok(dir) => return Ok(dir),
+            Ok(dir) => return Ok((dir, false)),
             Err(e) => tracing::warn!(
                 files_dir = %raw,
                 privileged = writer.privileged,
@@ -4384,7 +4472,7 @@ fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
             ),
         }
     }
-    default_download_dir(true)
+    Ok((default_download_dir(true)?, true))
 }
 
 /// The default ladder — what `files_dir` unset has always meant. `log` =
@@ -4398,8 +4486,10 @@ fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
 /// opened following links, and the folder it leads to must be the writer's
 /// own; for root, one no other account may write; for a per-user daemon,
 /// one not every account may (Ubuntu's private-group umask makes
-/// `~/Downloads` 0775). It was the temp dir: on a server, root's was
-/// `/tmp`.
+/// `~/Downloads` 0775), unless its file system keeps no modes
+/// (`staging::may_receive`). Root's home is its account's, and must pass
+/// root's rule too ([`own_home_and_downloads`]). It was the temp dir: on a
+/// server, root's was `/tmp`.
 #[cfg(target_os = "linux")]
 fn default_download_dir(log: bool) -> Result<PathBuf> {
     let uid = own_euid();
@@ -4428,11 +4518,7 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
             Err(_) => {}
         }
     }
-    let Some(home) = home else {
-        return Err(anyhow!(
-            "file transfer has no folder to receive files into: this account has no home folder"
-        ));
-    };
+    let home = home.map_err(|why| anyhow!("{why}"))?;
     let downloads = home.join("Downloads");
     let held = match staging::open_folder(&downloads) {
         Ok(held) => held,
@@ -4479,35 +4565,125 @@ fn drop_folder_without_creating(who: &FsAs) -> Result<PathBuf> {
 }
 
 /// #3688 — begin's staging on Linux, on the stager's thread: the target
-/// folder opened (its links followed) and held; when it is the daemon's own
-/// default folder, that very handle checked by its rule
-/// ([`default_download_dir`]); then the partial made beside it and held
-/// (`staging::stage`): `data` 0600 for the daemon alone (#3697), 0644
-/// otherwise.
+/// folder opened (its links followed) and held; when begin resolved it as
+/// the daemon's own default folder (`the_default`), that very handle
+/// checked by its rule ([`default_download_dir`]); then the partial made
+/// beside it and held (`staging::stage`): `data` 0600 for the daemon alone
+/// (#3697), 0644 otherwise. R4 — a folder whose file system keeps no modes
+/// (`staging::keeps_modes`) stages in the stager's private folder instead
+/// ([`private_staging_root`], `staging::stage_privately`), and a root
+/// writer stays strict there: never into a folder another account can
+/// write.
 #[cfg(target_os = "linux")]
 fn stage_held(
+    stager: &FsAs,
     target_dir: &std::path::Path,
     id: &str,
     meta: &[u8],
     private: bool,
-    daemons_own: bool,
+    the_default: bool,
 ) -> Result<(staging::Held, std::fs::File)> {
     #[cfg(test)]
     stand_in::before_a_folder_opens(target_dir);
     let base = staging::open_folder(target_dir)
         .with_context(|| format!("opening {}", target_dir.display()))?;
-    if daemons_own && default_download_dir(false).is_ok_and(|default| default == target_dir) {
-        let uid = own_euid();
-        staging::may_receive(&base, uid, uid == 0)
-            .map_err(|why| anyhow!("{} cannot receive files: {why}", target_dir.display()))?;
+    let cannot = |why: String| anyhow!("{} cannot receive files: {why}", target_dir.display());
+    let uid = own_euid();
+    if the_default {
+        staging::may_receive(&base, uid, uid == 0).map_err(cannot)?;
     }
-    staging::stage(
-        base,
-        target_dir,
-        id,
-        meta,
-        if private { 0o600 } else { 0o644 },
-    )
+    let data_mode = if private { 0o600 } else { 0o644 };
+    if staging::keeps_modes(&base) {
+        return staging::stage(base, target_dir, id, meta, data_mode);
+    }
+    if stager.writes_as_root() {
+        staging::may_receive(&base, uid, true).map_err(cannot)?;
+    }
+    let root = private_staging_root(stager).ok_or_else(|| {
+        anyhow!(
+            "{} keeps no file modes, and file transfer has no folder of its own to stage in",
+            target_dir.display()
+        )
+    })?;
+    staging::stage_privately(base, &root, id, meta, data_mode)
+}
+
+/// R4 — the stager's own private staging folder, on a file system that
+/// keeps modes, for an upload into a folder whose file system keeps none
+/// (`staging::keeps_modes`): the person's `~/.local/state/roomler/staging`
+/// (their own `XDG_STATE_HOME` is not the daemon's to know), a per-user
+/// daemon's `$XDG_STATE_HOME/roomler/staging` (else under
+/// `~/.local/state`), root's `/var/lib/roomler/staging`. A test's stood-in
+/// home holds the daemon's.
+#[cfg(target_os = "linux")]
+fn private_staging_root(stager: &FsAs) -> Option<PathBuf> {
+    const OWN: &str = "roomler/staging";
+    let state = |home: &std::path::Path| home.join(".local/state");
+    match stager {
+        FsAs::Person { home, .. } => Some(state(home).join(OWN)),
+        FsAs::Daemon | FsAs::DaemonAlone => {
+            #[cfg(test)]
+            if let Some(home) = stand_in::own_home_now() {
+                let home = home?;
+                return Some(if own_euid() == 0 {
+                    home.join("var/lib").join(OWN)
+                } else {
+                    state(&home).join(OWN)
+                });
+            }
+            if own_euid() == 0 {
+                return Some(PathBuf::from("/var/lib").join(OWN));
+            }
+            std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .or_else(|| directories::BaseDirs::new().map(|d| state(d.home_dir())))
+                .map(|base| base.join(OWN))
+        }
+        FsAs::Nobody | FsAs::CannotTell => None,
+    }
+}
+
+/// #3688, R4 — the home this process's account names in the account
+/// database (`getpwuid_r` of its effective uid), never the `HOME` its
+/// environment names. A test stands it in (`stand_in::own_home`).
+#[cfg(target_os = "linux")]
+fn account_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = stand_in::own_home_now() {
+        return home;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0 as libc::c_char; 1024];
+    // SAFETY: an all-zero `passwd` is a valid value (its pointers null),
+    // read only after a successful call filled it.
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    loop {
+        // SAFETY: every pointer is to memory this frame owns, sized as
+        // passed; the answer points into `buf`, read before it moves.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                own_euid(),
+                &mut pwd,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE && buf.len() < 64 * 1024 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        break;
+    }
+    // SAFETY: a NUL-terminated string in `buf`, which the call filled.
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let dir = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    dir.is_absolute().then_some(dir)
 }
 
 /// #3688 rule 4 — whether `folder`, held as `held`, is one a root writer
@@ -4606,12 +4782,35 @@ fn default_download_dir(log: bool) -> Result<PathBuf> {
     }
 }
 
-/// #3688 — the daemon's own home, and the Downloads folder its
-/// `user-dirs.dirs` names (`XDG_DOWNLOAD_DIR`, as `directories` reads it).
-/// A test stands a home in for its thread (`stand_in::own_home`), whose
-/// `user-dirs.dirs` is read the way a person's is.
+/// #3688 — the daemon's own home (`Err`: why there is none to take), and
+/// the Downloads folder its `user-dirs.dirs` names (`XDG_DOWNLOAD_DIR`). A
+/// per-user daemon's: `$HOME`, and the folder as `directories` reads it.
+/// R4 — root's: the home its account names ([`account_home`]), never the
+/// `HOME` its environment names, and only when that home passes root's own
+/// rule (`staging::may_receive`); its `user-dirs.dirs` read only when it is
+/// root's own plain file nobody else may write, and taken only for a folder
+/// inside that home ([`xdg_download_dir`]). A test stands homes in for its
+/// thread (`stand_in::own_home`, `stand_in::env_home`).
 #[cfg(target_os = "linux")]
-fn own_home_and_downloads() -> (Option<PathBuf>, Option<PathBuf>) {
+fn own_home_and_downloads() -> (Result<PathBuf, String>, Option<PathBuf>) {
+    const NO_HOME: &str =
+        "file transfer has no folder to receive files into: this account has no home folder";
+    if own_euid() == 0 {
+        let Some(home) = account_home() else {
+            return (Err(NO_HOME.into()), None);
+        };
+        let cannot = |why: &str| Err(format!("{} cannot receive files: {why}", home.display()));
+        let held = match staging::open_folder(&home) {
+            Ok(held) => held,
+            Err(e) => return (cannot(&format!("it does not open ({e})")), None),
+        };
+        if let Err(why) = staging::may_receive(&held, own_euid(), true) {
+            return (cannot(&why), None);
+        }
+        let xdg = staging::read_own_file(&held, ".config/user-dirs.dirs")
+            .and_then(|text| xdg_download_dir(&text, &home));
+        return (Ok(home), xdg);
+    }
     // The environment's home as `BaseDirs` reads it, and its
     // `user-dirs.dirs` as `UserDirs` does.
     #[cfg(test)]
@@ -4621,10 +4820,12 @@ fn own_home_and_downloads() -> (Option<PathBuf>, Option<PathBuf>) {
                 .ok()
                 .and_then(|text| stand_in::xdg_as_directories_reads_it(&text, home))
         });
-        return (home, xdg);
+        return (home.ok_or_else(|| NO_HOME.into()), xdg);
     }
     (
-        directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
+        directories::BaseDirs::new()
+            .map(|d| d.home_dir().to_path_buf())
+            .ok_or_else(|| NO_HOME.into()),
         directories::UserDirs::new()
             .and_then(|d| d.download_dir().map(std::path::Path::to_path_buf)),
     )
@@ -9570,6 +9771,9 @@ CAN_GRAPHICAL=0
         impl OwnHome {
             pub(super) fn new(downloads: bool, xdg: bool) -> Self {
                 let dir = tempfile::tempdir().unwrap();
+                // Its owner's own, as a home is, whatever the umask (root's
+                // must pass root's rule).
+                chmod(dir.path(), 0o700);
                 if downloads {
                     std::fs::create_dir(dir.path().join("Downloads")).unwrap();
                     chmod(&dir.path().join("Downloads"), 0o700);
