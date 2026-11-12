@@ -37,6 +37,7 @@ use webrtc::util::vnet::chunk::Chunk;
 use webrtc::util::vnet::net::{Net, NetConfig};
 use webrtc::util::vnet::router::{Router, RouterConfig};
 
+use crate::peer_close::close as close_peer_connection;
 use crate::signaling::close_within_budget;
 
 const AGENT_IP: &str = "1.2.3.4";
@@ -47,8 +48,10 @@ const VIEWER_IP: &str = "1.2.3.5";
 const DEAD_PATH_CLOSE: Duration = Duration::from_secs(2);
 
 /// How long a closed peer's tasks get to finish. Everything they wait on is
-/// local and already signalled, so this is slack, not a timing assumption.
-const SETTLE: Duration = Duration::from_secs(5);
+/// local and already signalled, so this is slack, not a timing assumption:
+/// alone they settle within milliseconds, but under the whole lib suite in
+/// parallel 5 s was once too short, and a real leak never settles at all.
+const SETTLE: Duration = Duration::from_secs(20);
 
 /// A runtime of the test's own: its task count is the two peers' alone.
 fn runtime() -> tokio::runtime::Runtime {
@@ -231,8 +234,10 @@ fn states(agent: &RTCPeerConnection, dc: &RTCDataChannel) -> String {
     )
 }
 
-/// The agent's close of a session's peer: `RTCPeerConnection::close` under
-/// the agent's budget, whose overrun drops it (`AgentPeer::close`).
+/// `RTCPeerConnection::close` inline under the agent's budget, which drops it
+/// on an overrun: the close as the agent ran it before #3716, without the
+/// background safety net (`peer_close::close`), so these two tests hold
+/// the root cause itself.
 async fn close_like_the_agent(agent: &RTCPeerConnection) {
     let session = bson::oid::ObjectId::new();
     close_within_budget(
@@ -336,6 +341,43 @@ fn a_healthy_close_still_takes_milliseconds() {
         assert!(
             left <= baseline,
             "{left} tasks alive after both closes, {baseline} before the peers"
+        );
+    });
+}
+
+/// The safety net under every stall a root-cause fix has not met yet: a close
+/// whose caller stops waiting (the agent's budget) goes on to the end on a
+/// task of its own. Here the caller polls the close once and drops it, which
+/// cuts an inline `RTCPeerConnection::close` at its first wait (the
+/// interceptors' loops ending): checked against that, this test fails.
+#[test]
+fn a_close_its_caller_stopped_waiting_for_still_finishes() {
+    runtime().block_on(async {
+        let wire = Arc::new(Wire::default());
+        let (agent_net, viewer_net) = wan(&wire).await;
+        let baseline = alive();
+        let viewer = peer(viewer_net).await;
+        let agent = peer(agent_net).await;
+        let dc = connect(&viewer, &agent).await;
+
+        let session = bson::oid::ObjectId::new();
+        let mut close = Box::pin(close_peer_connection(Arc::clone(&agent), session));
+        let finished =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(close.as_mut().poll(cx).is_ready()))
+                .await;
+        assert!(
+            !finished,
+            "the close must still be running when its caller stops waiting, or this proves nothing"
+        );
+        drop(close);
+
+        viewer.close().await.expect("viewer close");
+        drop((dc, agent, viewer));
+        let left = settle_to(baseline).await;
+        assert!(
+            left <= baseline,
+            "{left} tasks alive after both closes, {baseline} before the peers: \
+             a close its caller stopped waiting for was cut short"
         );
     });
 }

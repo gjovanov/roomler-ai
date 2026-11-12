@@ -62,15 +62,50 @@ impl PendingQueue {
         }
     }
 
-    /// Appends a chunk to the back of the pending queue.
-    pub(crate) async fn push(&self, c: ChunkPayloadData) {
+    /// roomler (#3716): lets go every writer parked in flow control. Their
+    /// permits come back only when the peer acknowledges, so on a dead path a
+    /// writer waited forever, holding `semaphore_lock` (which a stream's reset
+    /// queues behind) and whatever the caller held across the write. The
+    /// association calls this as it closes; a writer it lets go queues nothing.
+    pub(crate) fn close(&self) {
+        self.semaphore.close();
+    }
+
+    /// roomler (#3716): queues `c` only if no writer is parked in flow control
+    /// and its permits are free now; otherwise hands it back. For a stream's
+    /// reset, which must never wait behind a writer the peer may never ack.
+    pub(crate) fn try_push(&self, c: ChunkPayloadData) -> std::result::Result<(), ChunkPayloadData> {
+        let Ok(_sem_lock) = self.semaphore_lock.try_lock() else {
+            return Err(c);
+        };
+        let user_data_len = c.user_data.len();
+        let Ok(permits) = self.semaphore.try_acquire_many(user_data_len as u32) else {
+            return Err(c);
+        };
+        permits.forget();
+        if c.unordered {
+            self.unordered_queue.write().push_back(c);
+        } else {
+            self.ordered_queue.write().push_back(c);
+        }
+        self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
+        self.queue_len.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Appends a chunk to the back of the pending queue. False when the queue
+    /// was closed (#3716) before the chunk got its permits; nothing is queued.
+    pub(crate) async fn push(&self, c: ChunkPayloadData) -> bool {
         let user_data_len = c.user_data.len();
 
         {
             let _sem_lock = self.semaphore_lock.lock().await;
             let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
+            // roomler (#3716): closed by the association's close; was an unwrap.
+            let Ok(permits) = permits else {
+                return false;
+            };
+            permits.forget();
 
             if c.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
@@ -83,16 +118,18 @@ impl PendingQueue {
 
         self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
         self.queue_len.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
-    /// Appends chunks to the back of the pending queue.
+    /// Appends chunks to the back of the pending queue. False when the queue
+    /// was closed (#3716) before they got their permits.
     ///
     /// # Panics
     ///
     /// If it's a mix of unordered and ordered chunks.
-    pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) {
+    pub(crate) async fn append(&self, chunks: Vec<ChunkPayloadData>) -> bool {
         if chunks.is_empty() {
-            return;
+            return true;
         }
 
         let total_user_data_len = chunks.iter().fold(0, |acc, c| acc + c.user_data.len());
@@ -105,22 +142,30 @@ impl PendingQueue {
                 .semaphore
                 .acquire_many(total_user_data_len as u32)
                 .await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
+            // roomler (#3716): closed by the association's close; was an unwrap.
+            let Ok(permits) = permits else {
+                return false;
+            };
+            permits.forget();
             self.append_unlimited(chunks, total_user_data_len);
+            true
         }
     }
 
     // If this is a very large message we append chunks one by one to allow progress while we are appending
-    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) {
+    async fn append_large(&self, chunks: Vec<ChunkPayloadData>) -> bool {
         // lock this for the whole duration
         let _sem_lock = self.semaphore_lock.lock().await;
 
         for chunk in chunks.into_iter() {
             let user_data_len = chunk.user_data.len();
             let permits = self.semaphore.acquire_many(user_data_len as u32).await;
-            // unwrap ok because we never close the semaphore unless we have dropped self
-            permits.unwrap().forget();
+            // roomler (#3716): closed by the association's close; was an unwrap.
+            // The chunks queued so far are the association's to drop.
+            let Ok(permits) = permits else {
+                return false;
+            };
+            permits.forget();
 
             if chunk.unordered {
                 let mut unordered_queue = self.unordered_queue.write();
@@ -132,6 +177,7 @@ impl PendingQueue {
             self.n_bytes.fetch_add(user_data_len, Ordering::SeqCst);
             self.queue_len.fetch_add(1, Ordering::SeqCst);
         }
+        true
     }
 
     /// Assumes that A) enough permits have been acquired and forget from the semaphore and that the semaphore_lock is held

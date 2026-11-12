@@ -376,8 +376,13 @@ impl RTCDataChannel {
     pub async fn send(&self, data: &Bytes) -> Result<usize> {
         self.ensure_open()?;
 
-        let data_channel = self.data_channel.lock().await;
-        if let Some(dc) = &*data_channel {
+        // roomler patch (#3716): the channel is taken out of its slot, and the
+        // slot's lock is not held across the write. A write parked in SCTP flow
+        // control on a dead path held it forever, and `close()` takes the same
+        // lock, so the channel's close (and the peer connection's after it)
+        // waited behind a write that only that close could let go.
+        let data_channel = self.data_channel.lock().await.clone();
+        if let Some(dc) = data_channel {
             Ok(dc.write_data_channel(data, false).await?)
         } else {
             Err(Error::ErrClosedPipe)
@@ -388,8 +393,9 @@ impl RTCDataChannel {
     pub async fn send_text(&self, s: impl Into<String>) -> Result<usize> {
         self.ensure_open()?;
 
-        let data_channel = self.data_channel.lock().await;
-        if let Some(dc) = &*data_channel {
+        // roomler patch (#3716): as in `send`.
+        let data_channel = self.data_channel.lock().await.clone();
+        if let Some(dc) = data_channel {
             Ok(dc.write_data_channel(&Bytes::from(s.into()), true).await?)
         } else {
             Err(Error::ErrClosedPipe)

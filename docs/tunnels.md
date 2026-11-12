@@ -306,6 +306,97 @@ The same investigation found the control channel owning itself: its `on_message`
 closure held a strong clone of the channel it is stored in, so a session's control
 channel, and everything its handler captures, was never freed. It now holds a `Weak`.
 
+### ⚠️ The same trap, a fourth time: a close that never reaches the ICE agent (#3716)
+
+Fixed in the vendored `webrtc`, `webrtc-sctp` and `webrtc-ice`, with a net in the agent
+([#3716](https://github.com/gjovanov/roomler-ai/issues/3716)). Here the peer **was**
+`close()`d, but the close stopped partway and was then dropped. Everything it had not
+reached yet stayed alive until the daemon exited.
+
+The agent waits for a peer's close at most `PEER_CLOSE_BUDGET` (5 s,
+`agents/roomlerd/src/signaling.rs:207`), through `close_within_budget`
+(`signaling.rs:314`, #1738). `RTCPeerConnection::close` marks the peer closed at its first
+step, so a later close returns at once. Before #3716 a close that overran was dropped
+where it stood: the ICE agent, every socket and the SCTP association it had not reached
+lived on.
+
+**Field:** 17 UDP sockets per ended session on a Linux system install after a 15 s network
+drop, on every build back to 0.4.213. On Windows, a UDP socket and four TCP sockets (one per
+TURNS relay) after the viewer's tab closed on a `tcp-turn` session. In both cases the
+association went on retransmitting into the dead link once a minute
+(`failed to write packets on net_conn … SCTP retransmits (N in this run)`).
+
+**The stall:** a session's video rides a data channel, written by a send task of its own. When
+the path dies, no SACK comes back, SCTP's 128 KiB send queue fills, and the send task parks in
+flow control. The peer's close then waited behind it, before the SCTP stop
+(`crates/vendored/webrtc/src/peer_connection/mod.rs:1969-1977`), and never got any further.
+
+```mermaid
+sequenceDiagram
+    participant W as video send task
+    participant D as RTCDataChannel
+    participant Q as SCTP pending queue
+    participant C as RTCPeerConnection::close
+
+    Note over W,Q: the path dies: no SACK, the 128 KiB queue fills
+    W->>D: send(): took the slot lock for the whole write
+    D->>Q: append(): holds semaphore_lock, waits for permits forever
+    C->>D: step 3, close(): waits for the slot lock (this channel)
+    C->>Q: or Stream::shutdown → push(EOS): waits for semaphore_lock (any channel)
+    Note over C: never reaches step 4 (SCTP stop), so nothing lets the writer go
+    Note over C: budget: dropped. ICE agent, sockets, association: alive for good
+```
+
+Three links had to break, one in each place that owned it:
+
+| Where | Change | Anchor |
+|---|---|---|
+| `webrtc` | `send`/`send_text` take the channel out of its slot instead of holding the slot's lock across the write | `crates/vendored/webrtc/src/data_channel/mod.rs:376` |
+| `webrtc-sctp` | a stream's reset (the EOS a channel's close queues) is queued at once if no writer is parked in flow control, otherwise right after it, on a task. The close goes on either way | `crates/vendored/webrtc-sctp/src/stream/mod.rs:501`, `queue/pending_queue.rs:77` |
+| `webrtc-sctp` | the association's close closes the pending queue's semaphore, which lets every parked writer go with an error instead of waiting forever | `src/association/association_internal.rs:264`, `queue/pending_queue.rs:70` |
+
+#1856's comment expected a transport that is really gone to fail the association's `recv`.
+Nothing below SCTP ever fails it on a dead path, because the ICE agent's conn ends only when
+the agent is closed. So it is the peer's close that ends the association, and that close
+can no longer stall before it.
+
+**The Mac's stall point** is a different one. A supervised Mac overran about 1 close in 15 to 26
+plain sessions on a healthy network, on every build. Its DTLS stop was reached, and it waited
+in the ICE agent's candidate sweep. That was not reproduced here. Its two suspects are closed
+off in `crates/vendored/webrtc-ice/src/agent/agent_internal.rs`:
+
+- `add_candidate` closed a late or duplicate candidate while holding `local_candidates`, the
+  lock the sweep takes (`:585`).
+- `delete_all_candidates` closed the local candidates one at a time under that lock, so one
+  close that waits on the network (a relay's TURN client) held the agent's close, and every
+  other socket with it (`:709`).
+
+Now no candidate is closed under the lock. Each local candidate closes on a task of its own,
+and one still closing after 5 s is named in a `closing candidate … is taking over 5s` warning.
+
+**The net under the rest:** `AgentPeer::close` and `TunnelPeer::close` run `pc.close()` through
+`agents/roomlerd/src/peer_close.rs:32`, on a task of its own, bounded by
+`PEER_CLOSE_CEILING` (60 s, `:26`). The caller still waits at most the 5 s budget. A close
+past the budget now goes on to its end, and logs `peer close finished in the background, past
+its budget` (or, at the ceiling, `peer close did not finish within its ceiling`). The overrun
+line now reads `peer close overran its budget — it goes on in the background (#3716)`.
+
+**Tests** (`agents/roomlerd/src/peer_close_tests.rs`, two plain webrtc-rs peers on a vnet,
+black-box: close time, the parked writer, packets on the wire, tasks alive on a runtime of the
+test's own):
+
+| Test | Holds | Before the fix |
+|---|---|---|
+| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:254`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, sends nothing more, and leaves no task | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
+| `a_healthy_close_still_takes_milliseconds` (`:314`) | the same close with the path alive | passes, 1 ms here |
+| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:354`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
+
+**Not covered:** a TURNS/TCP leg that is dead but never reset. Its writes block until the OS
+gives the connection up (`crates/tcp-turn-conn/src/lib.rs:257`), with the TURN client's lock
+held across them. Its read side does report a reset or EOF, to the TURN client's read loop
+only: that loop exits, and nothing above it hears. Every field case had the link reset
+(`os error 10054`, `Broken pipe`), so its writes failed fast.
+
 ### ⚠️ Every client path that ends a session must tell the exit agent (#1754)
 
 The leaks above are the *client* failing to free its own sockets. This one is the

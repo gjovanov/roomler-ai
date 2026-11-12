@@ -204,7 +204,7 @@ const SESSION_STATS_BUDGET: Duration = Duration::from_secs(3);
 /// display-match release) runs in `AgentPeer`'s Drop on every path, so an
 /// expired close forfeits only the polite goodbye to a peer that is
 /// unreachable anyway.
-const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
+pub(crate) const PEER_CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
 /// FR-27 P10 — how long the host's Disconnect keeps the peer up AFTER the
 /// server has been told, so the viewer hears the reason over signalling
@@ -306,11 +306,11 @@ async fn device_end(
 
 /// Run a session's peer close (a remote-control or a tunnel peer) within
 /// [`PEER_CLOSE_BUDGET`], and SAY so when the budget runs out (#1738). The
-/// session-scoped teardown still runs in Drop, but a close dropped at its
-/// budget never reaches `RTCPeerConnection::close`'s ICE step, and the
-/// webrtc internals it did not reach (the ICE agent's connectivity checker, a
-/// 200 ms tick) stay alive for the life of the process. Every close site goes
-/// through here so that it never happens without a line.
+/// session-scoped teardown still runs in Drop. #3716: the caller stops waiting
+/// at the budget, the close does not. `AgentPeer::close` and `TunnelPeer::close`
+/// run it on a task of its own ([`crate::peer_close::close`]); dropped half done,
+/// it left its ICE agent, sockets and SCTP association alive for good. Every
+/// close site goes through here so that an overrun never happens without a line.
 pub(crate) async fn close_within_budget(
     close: impl std::future::Future<Output = ()>,
     session: bson::oid::ObjectId,
@@ -324,7 +324,7 @@ pub(crate) async fn close_within_budget(
             session = %session,
             why,
             budget_ms = PEER_CLOSE_BUDGET.as_millis() as u64,
-            "peer close overran its budget — dropping it (webrtc internals it did not reach stay alive)"
+            "peer close overran its budget — it goes on in the background (#3716)"
         );
     }
 }

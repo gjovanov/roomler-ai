@@ -17,9 +17,18 @@
 #     closing the association and every stream on it. Upstream ended the
 #     loop on any send error, so one EHOSTUNREACH from a route that was
 #     absent for 3 ms killed a remote-desktop session outright. A transport
-#     that is really closed is still detected by the read loop.
+#     that is really closed is detected by the read loop once the ICE agent
+#     under it is closed, which the peer connection's close does (#3716).
 #   - src/association/association_test.rs: the regression test (a send
 #     that fails once; the message must arrive by retransmission).
+#   - src/queue/pending_queue.rs, src/stream/mod.rs and
+#     src/association/association_internal.rs (#3716): the association's
+#     close lets go every writer parked in flow control (the semaphore is
+#     closed; a write it lets go fails instead of waiting forever), and a
+#     stream's reset no longer queues behind such a writer. On a dead path
+#     the peer never acks, so a data channel's close waited forever behind
+#     the video writer, and with it the peer connection's close: its ICE
+#     agent, sockets and this association lived until the process exited.
 
 [package]
 edition = "2021"

@@ -488,7 +488,11 @@ impl Stream {
         }
 
         // NOTE: append is used here instead of push in order to prevent chunks interlacing.
-        self.pending_queue.append(chunks).await;
+        // roomler (#3716): false = the association closed while this write
+        // waited in flow control; it is let go with an error, not kept forever.
+        if !self.pending_queue.append(chunks).await {
+            return Err(Error::ErrPayloadDataStateNotExist);
+        }
 
         self.awake_write_loop();
         Ok(())
@@ -510,7 +514,24 @@ impl Stream {
             ..Default::default()
         };
 
-        self.pending_queue.push(c).await;
+        // roomler (#3716): the reset needs no flow-control permits, but `push`
+        // queues behind a writer parked in flow control, and on a dead path the
+        // peer never acks that writer free. A data channel's close waited here
+        // forever, and with it the peer connection's close, the one thing that
+        // would have let the writer go (the association's close, after the
+        // channels'). Queue it now if nothing is parked; otherwise right after
+        // the parked writer, on a task, so the close goes on. A writer the
+        // association's close lets go takes the reset with it.
+        if let Err(c) = self.pending_queue.try_push(c) {
+            let pending_queue = Arc::clone(&self.pending_queue);
+            let awake_write_loop_ch = Arc::clone(&self.awake_write_loop_ch);
+            tokio::spawn(async move {
+                if pending_queue.push(c).await {
+                    let _ = awake_write_loop_ch.try_send(());
+                }
+            });
+            return Ok(());
+        }
 
         self.awake_write_loop();
         Ok(())

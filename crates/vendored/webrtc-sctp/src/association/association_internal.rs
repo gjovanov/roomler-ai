@@ -259,6 +259,10 @@ impl AssociationInternal {
             // awake read/write_loop to exit
             self.close_loop_ch_tx.take();
 
+            // roomler (#3716): and every writer parked in flow control. Nothing
+            // else ever lets one go once the peer stops acknowledging.
+            self.pending_queue.close();
+
             for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
                 self.unregister_stream(si);
             }
