@@ -394,17 +394,33 @@ runtime of its own, what the receiver gets):
 
 | Test | Holds | Before the fix |
 |---|---|---|
-| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:289`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, sends nothing more, and leaves no task | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
-| `a_healthy_close_still_takes_milliseconds` (`:350`) | the same close with the path alive | passes, 1 ms here |
-| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:391`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
-| `many_writers_share_one_ordered_channel` (`:507`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
+| `a_dead_path_under_a_data_channel_writer_does_not_stall_the_close` (`:353`) | the wire is cut under a 16 KiB-message writer, then the agent's close runs inline under the budget: it ends within 2 s, lets the writer go, leaves no task, and from 250 ms after it (`IN_FLIGHT`, `:77`) sends nothing for 2 s | took 5.01 s, `stuck at data channel closing, sctp connected, dtls connected, ice disconnected` |
+| `a_healthy_close_still_takes_milliseconds` (`:421`) | the same close with the path alive | passes, 1 ms here |
+| `a_close_its_caller_stopped_waiting_for_still_finishes` (`:462`) | the caller polls `peer_close::close` once and drops it; nothing is left | an inline close cut the same way leaves 18 tasks alive |
+| `many_writers_share_one_ordered_channel` (`:578`) | eight writers send 60 messages each at once on one ordered channel to a webrtc-rs receiver, every other one big enough to fragment: every message arrives whole, once, and in its writer's order | with the slot lock taken off `send` and nothing in its place, 1 of 480 arrived in 15 s and the other 479 never did |
 
-The stand-in viewer runs on a runtime of its own (`on_viewer`, `:71`), so the agent's runtime
+The stand-in viewer runs on a runtime of its own (`on_viewer`, `:95`), so the agent's runtime
 counts the agent's tasks alone. The viewer's peer, the one that offers, now and then keeps two
 tasks alive after its close: in 6 runs of 60 with the agent closing first, and 3 of 30 with the
 viewer first. On a runtime both peers shared, the healthy-close test read them as the agent's
 and failed (`3 tasks alive after both closes, 1 before the peers`). The agent's runtime never
 kept a task past its baseline in those 90 runs.
+
+**How the dead-path test reads the wire.** The vnet router counts a packet on a task of its own,
+after the send that queued it has returned. On a loaded CI runner that task started late, and
+the close's own DTLS close_notify, sent before `close()` returned, was counted inside the 2 s
+window: `the closed peer still put 1 packets on the wire in 2 s`, about one run in three on
+Linux and Windows alike, with nothing sent after the close. So the test reads the wire through
+a probe:
+
+| Piece | What it does |
+|---|---|
+| `ROUTER_LAG` (`:64`) | the test's router holds every packet 20 ms, so the counting lag is there on every run, not one run in three: without the probe the test fails 12 runs of 12 |
+| `Wire::sent_by_agent` (`:138`) | a third host on the wire (`PROBE_IP`, `:47`) sends a marker; the router's queue is first in, first out, so once the marker is counted, so is everything the agent sent before it |
+| `IN_FLIGHT` (`:77`) | the count starts 250 ms after the close. After `close()` the ICE agent's conn refuses every write, so only the ICE connectivity loop can still send: it sees the close between two passes, and a pass under way still sends its STUN check, within 1 ms of the close (3 runs of 120 that closed while the keepalive checks ran) |
+
+The task count is asserted before the wire. When packets went out, it says whether the close
+left something running (a leak) or a last send landed late.
 
 The reset's order has a unit test of its own, on one thread:
 `test_stream_reset_waits_for_a_write_turn`
@@ -1057,8 +1073,9 @@ still open forwards, the window a `DELETE` has always had.
 The on-host control surface — how `roomler`, `roomler-desktop`, and scripts talk
 to a running `roomlerd` without any token:
 
-- **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins +
-  Interactive Users, no-write-up); Unix socket `/var/run/roomler/roomler.sock`
+- **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins + the
+  daemon's own account in full; Interactive Users read and write data only,
+  never a new instance; no-write-up); Unix socket `/var/run/roomler/roomler.sock`
   for a system daemon, else `$XDG_RUNTIME_DIR/roomler.sock` (the per-user temp
   folder's `roomler/roomler.sock` on macOS), 0600, and only in a directory
   private to the daemon's account.

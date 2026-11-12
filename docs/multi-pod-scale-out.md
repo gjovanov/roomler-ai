@@ -108,7 +108,7 @@ rejected there is NO data plane crossing pods), keyspace notifications
   and retries ONCE. After topology changes the *agent's* WS may sit on an
   old-hash pod: the owning pod closes it — **only when idle** (no active
   sessions, no tunnel sessions targeting it) — so its reconnect re-lands
-  at the current hash. Sessions stay pod-local for life; **cross-pod
+  at the current hash. Sessions stay pod-local (FR-138 rebuilds one on the pod its device's claim reaches, [below](#a-live-rc-session-through-its-pods-death-fr-138)); **cross-pod
   session frame-relay is rejected permanently** (a `LiveSession` pins its
   `controller_tx` on the creating pod; relaying is a durable bidirectional
   proxy with new failure modes, for a signaling-only channel whose media
@@ -179,7 +179,7 @@ bounded passive staleness; (4) pod-alive → advisory only.
 
 | Entity | Owner-pod death | Blast radius |
 |---|---|---|
-| Agent WS | socket breaks ⇒ agent redials; LWW re-register | that pod's rc sessions end (P2P media freezes → controller reconnect); listing stale ≤90 s |
+| Agent WS | socket breaks ⇒ agent redials; LWW re-register | that pod's rc sessions end (P2P media freezes → controller reconnect), except those FR-138 keeps: a live session on `direct` or `turn` whose device is in the resume scope with its switch on goes on peer to peer and is claimed back on the pod the redial reaches, about 3 s later in the field ([below](#a-live-rc-session-through-its-pods-death-fr-138)); listing stale ≤90 s |
 | Tunnel session | **data plane survives outright** (P2P); new opens rehome | bookkeeping blip only |
 | DERP peer | reconnect loop; the tenant pin answers 502 until the replacement listens, with no failover to the survivor. `ws_flat_redial` (default OFF) redials that 502 flat instead of climbing the ladder (FR-28) | ~7.6 s of WG loss (p50 over 14 rolls, FR-28); corp pairs re-handshake |
 | Media room | claim gone (graceful: zero window; crash: ≤30 s TTL) ⇒ rejoin claims a live pod | one conference, ≤30 s gap on crash |
@@ -189,6 +189,28 @@ bounded passive staleness; (4) pod-alive → advisory only.
 suppressed, media falls back to the S6 belt (logged
 `media_belt_fallback_total`). On recovery, heartbeats re-assert every
 record within one beat and the fold rule resolves any belt-era splits.
+
+### A live RC session through its pod's death (FR-138)
+
+The rc hub is still pod-local, and nothing in a dying pod's memory survives it. What survives is
+the session's `remote_sessions` row, so the fourth principle holds: no live-state handoff. The pod
+that the device's next hello reaches folds the session back in through two join paths, the
+device's claim and the viewer's rejoin
+([remote-control.md §11.18](remote-control.md#1118-a-session-outlives-its-control-socket-the-servers-half-fr-138-p1b)):
+
+| What | Where it lives through the gap | What brings it back |
+|---|---|---|
+| The peer: pixels, input, its channels | the device and the page, peer to peer. No pod ever carried it | nothing has to: it never stopped |
+| The session's state | its row, still live, with `detached_at`, `resume_by` and the fencing number `attach_seq` when the dying pod got to write them | the device's claim, on whichever pod it reaches: it commits at the `attach_seq` it read, bumps it, and rebuilds the hub entry (`claim`, `crates/modules/remote/src/resume.rs:137`) |
+| The viewer's binding | nothing: the page holds the session and asks | the viewer's rejoin binds its new socket on the pod that holds the session, through the relay when that is another pod (`rejoin`, `crates/modules/remote/src/rejoin.rs:216`) |
+| An end issued during the gap | the row, written there because no hub holds the session | read by the claim and by the rejoin |
+| A row nobody claims | the row, past its `resume_by` | the sweep, one pod at a time (`run_sweep`, `crates/modules/remote/src/sweep.rs:94`) |
+
+The fencing number keeps a pod that no longer holds the session from undoing a resume: its late
+detach or end carries the number it held, and lands nowhere. A session on `derp` still redials,
+because `/derp` is pod-local and its path goes down with the pod. The switches, and what an operator
+reads before and after a roll, are in
+[deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138).
 
 ## Stages
 
