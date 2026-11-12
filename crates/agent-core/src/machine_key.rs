@@ -86,17 +86,105 @@ pub fn trusted(sid: &str) -> bool {
     crate::machine_tree::trusted(sid) || sid == crate::machine_tree::TRUSTED_INSTALLER
 }
 
-/// The key's own check, over its owner and DACL as read. RED seam (#3737):
-/// takes every key.
+/// `S-1-3-0`. An ACE for it hands what it grants to whoever makes a key below
+/// the one that carries it.
+const CREATOR_OWNER: &str = "S-1-3-0";
+
+/// The key's own check, over its owner and DACL as read: `Ok` only when it is
+/// owned by SYSTEM, Administrators or TrustedInstaller, has a DACL, and no
+/// allow-ACE that applies to the key gives another account a right in
+/// `counts` ([`KEY_SECRET`] for a key whose values are a secret), generic
+/// rights mapped first. An inherit-only ACE does not apply to the key. A deny
+/// is never credited: an allow counts whatever a deny beside it says, so a
+/// wrong answer only ever stops a device. An ACE of any other kind is a
+/// refusal, because this check fails closed. `what` names the key in the
+/// reason.
 pub fn verdict(sd: &Sd, counts: u32, what: &str) -> Result<(), String> {
-    let _ = (sd, counts, what, ACE_ALLOW, ACE_DENY, INHERIT_ONLY);
+    owned(sd, what)?;
+    let Some(aces) = &sd.dacl else {
+        return Err(format!(
+            "{what} has no DACL, so every account may change it"
+        ));
+    };
+    for ace in aces {
+        if ace.flags & INHERIT_ONLY != 0 {
+            continue;
+        }
+        match ace.kind {
+            ACE_DENY => {}
+            ACE_ALLOW => {
+                let granted = map_generic_key(ace.mask) & counts;
+                if granted != 0 && !trusted(&ace.sid) {
+                    let may = if granted & KEY_WRITE_LIKE != 0 {
+                        "change it"
+                    } else {
+                        "read what it holds"
+                    };
+                    return Err(format!(
+                        "{what} lets an account other than SYSTEM or Administrators {may}"
+                    ));
+                }
+            }
+            other => return Err(unread(what, other)),
+        }
+    }
     Ok(())
 }
 
-/// The parent's check. RED seam (#3737): takes every parent.
+/// The parent's check: `Ok` only when it is owned by SYSTEM, Administrators or
+/// TrustedInstaller, has a DACL, and no allow-ACE gives another account a
+/// right in [`KEY_WRITE_LIKE`], inherit-only ACEs included: what the parent
+/// hands down reaches a key made below it later, and only an account that may
+/// write a key below the parent can rename that key to the name the reader
+/// opens. Reading the parent is fine: `HKLM\SOFTWARE` lets Users, app packages
+/// and capability SIDs read, and so does the key Windows makes below it.
+/// CREATOR OWNER is spared: it hands its rights only to whoever makes a key
+/// below the parent, and making one takes a right this check already counts.
+/// A deny is never credited; an ACE of another kind is a refusal.
 pub fn parent_verdict(sd: &Sd, what: &str) -> Result<(), String> {
-    let _ = (sd, what);
+    owned(sd, what)?;
+    let Some(aces) = &sd.dacl else {
+        return Err(format!(
+            "{what} has no DACL, so every account may change it"
+        ));
+    };
+    for ace in aces {
+        match ace.kind {
+            ACE_DENY => {}
+            ACE_ALLOW => {
+                if map_generic_key(ace.mask) & KEY_WRITE_LIKE != 0
+                    && !trusted(&ace.sid)
+                    && ace.sid != CREATOR_OWNER
+                {
+                    let whom = if ace.flags & INHERIT_ONLY != 0 {
+                        "a key made below it"
+                    } else {
+                        "it"
+                    };
+                    return Err(format!(
+                        "{what} lets an account other than SYSTEM or Administrators change {whom}"
+                    ));
+                }
+            }
+            other => return Err(unread(what, other)),
+        }
+    }
     Ok(())
+}
+
+/// The owner decides the DACL, so it must be one the checks trust.
+fn owned(sd: &Sd, what: &str) -> Result<(), String> {
+    if trusted(&sd.owner) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{what} is owned by an account other than SYSTEM or Administrators"
+        ))
+    }
+}
+
+fn unread(what: &str, kind: u8) -> String {
+    format!("{what} carries an access rule of a kind this check does not read (type {kind})")
 }
 
 #[cfg(windows)]
