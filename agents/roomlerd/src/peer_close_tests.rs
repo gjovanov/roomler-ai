@@ -58,9 +58,9 @@ const SETTLE: Duration = Duration::from_secs(20);
 /// How long the dead-path test's router holds each packet before it counts
 /// and forwards it. The router does both on a task of its own, after the
 /// send that queued the packet has returned, and a loaded runner starts that
-/// task late: 0.3-13 ms late in a 2-CPU stress run (#3716). This makes the
-/// lag certain on every run instead of one run in three, so the test reads
-/// the wire through [`Wire::sent_by_agent`] on every run.
+/// task late: 0.6-13.6 ms after the send in a 2-CPU stress run (#3716). This
+/// makes the lag certain on every run instead of one run in three, so the
+/// test reads the wire through [`Wire::sent_by_agent`] on every run.
 const ROUTER_LAG: Duration = Duration::from_millis(20);
 
 /// What a closed peer may still send: a send that was under way when its
