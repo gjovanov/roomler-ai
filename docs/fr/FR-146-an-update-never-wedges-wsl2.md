@@ -49,7 +49,7 @@ sequenceDiagram
     W->>H: new service, adapters re-created (12:58:39.97Z, 53–58Z)
     H->>K: HCS Add x2 (12:58:56.64Z, 12:59:13.63Z)
     G->>K: caps probe child opens hevc_nvenc: a sysfs PCI config read (from 12:58:45.7Z)
-    K-->>K: a vCPU sits in hv_pcifront_read_config; soft lockups 12:59:10Z to 13:04:40Z
+    K-->>K: a vCPU sits in hv_pcifront_read_config, soft lockups 12:59:10Z to 13:04:40Z
     X->>K: new session: SessionLeader accept4 times out (110) from 13:02:16Z
     Note over X,K: E_UNEXPECTED until wsl --shutdown (13:46:40Z)
 ```
