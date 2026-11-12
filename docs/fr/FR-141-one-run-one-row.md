@@ -1,6 +1,6 @@
 # FR-141: The Setup wizard installs remote desktop and the private network in one run, on one device row, as a choice the person sees (macOS and Linux)
 
-**Issue:** [#3679](https://github.com/gjovanov/roomler-ai/issues/3679) · **Status:** claimed 2026-11-11. Nothing built. P0 (the field read that records RED) comes first
+**Issue:** [#3679](https://github.com/gjovanov/roomler-ai/issues/3679) · **Status:** claimed 2026-11-11. P0 done the same day: the field read, on Linux and on macOS, is recorded in the [field log](#field-log). D1 to D3 decided the same day. P1 onwards not started, and nothing is built
 **Builds on:** FR-129 ([#3022](https://github.com/gjovanov/roomler-ai/issues/3022), B2: the wizard's macOS root half), FR-43 ([#971](https://github.com/gjovanov/roomler-ai/issues/971), P3: one macOS row behind `macos_one_row`)
 **Related:** [FR-142](FR-142-linux-system-install-full-desktop.md) (the Linux system install's full desktop, which this FR does not wait on), #3247, #3240, #2892, #3660, #3535
 
@@ -100,8 +100,11 @@ row starts with defaults (inferred). P0 shows which case the lab hit.
 - Each option says what it installs on this OS and card: on a Mac one row, or two rows and two plan slots while
   P2's switch is off (today's hint, `app.js:525-527`); on Linux the TUN for the system card, the SOCKS front for the
   per-user card (`app.js:522-524`).
-- The system card's text says what it does not give yet (clipboard, layout, display match, desktops other than
-  GNOME and KDE) and that FR-142 adds it: open decision D3.
+- The system card's text says what it does not give yet: the clipboard, the keyboard layout, display match,
+  and desktops other than GNOME and KDE. FR-142's first phase, under a key that is off by default, adds the
+  clipboard on GNOME and KDE (Wayland and X11) and the layout and display match on X11 only; the other X11
+  desktops wait for a way to see their lock, and Wayland's layout and display match are not planned. Decided
+  as D3.
 - Done names every row it made (`app.js:1862-1865`, `:1907-1913` already carry a root half).
 
 ### 2. One row from the wizard, on a Mac (P2)
@@ -143,7 +146,7 @@ person's half on it and says why.
 
 | phase | what | kill switch | status |
 |---|---|---|---|
-| P0 | Field read on production's released wizard and script, recorded RED: a Mac by pairing, by paste with two tokens, "Screen only", a re-install over a two-row Mac (row ids, SSH policy, names), the wizard over a one-row Mac (`install.sh --one-row` first); Linux on the system card on GNOME Wayland, GNOME on Xorg and KDE; `install.sh --system` | read only | not started |
+| P0 | Field read on production's released wizard and script, recorded RED: a Mac by pairing, by paste with two tokens, "Screen only", a re-install over a two-row Mac (row ids, SSH policy, names), the wizard over a one-row Mac (`install.sh --one-row` first); Linux on the system card on GNOME Wayland, GNOME on Xorg and KDE; `install.sh --system` | read only | done 2026-11-11: Linux and macOS (cells M1 to M5), in the [field log](#field-log) |
 | P1 | The question on the first page (design 1), with `front_tests` | server key `wizard_mesh_choice` in `/api/setup/features`, default on: off restores today's layout | not started |
 | P2 | One row from the wizard on a Mac (design 2) | server key `wizard_macos_one_row`, default off: off = today's two rows | not started |
 | P3 | A re-install lands on the same row(s); a one-row or supervised Mac gets no person's half (design 3) | server key `wizard_reinstall_guard`, default on: off = today's enroll | not started |
@@ -163,9 +166,18 @@ on the Devices page.
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
   once the device's `ssh_enabled` is on (`docs/installation.md:2156-2157`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
+  P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
+  paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.
 - [ ] **AC3**: macOS, **"Screen only"**: one row, no LaunchDaemon, no marker, no overlay address.
+  P0 read, cell M3 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)):
+  today's "Screen only", the Advanced box unticked, already leaves one row and no system daemon, but it still asks
+  for the administrator password, and the daemon card still says the Mac joins as two devices.
 - [ ] **AC4**: macOS, **a re-install** over a Mac this wizard made (one row, and, with the switch off, two rows):
   the same row id(s), names and SSH policy as before, and no new row. Shown RED or already green by P0 first.
+  P0 read, cell M5 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6804483259)): a
+  wizard run over a Mac that the script installed as one row does not recognise it and leaves three rows, because
+  the wizard and the script derive the machine's identity differently, so AC4 and AC5 are not held for a one-row
+  Mac; that is P3's subject.
 - [ ] **AC5**: macOS, **a Mac that already has two rows**: the wizard does what D1 decides, says so before it acts,
   and leaves no third row.
 - [ ] **AC6**: macOS with the one-row switch **off**: today's two rows, `<name>` and `<name>-daemon`, both online,
@@ -183,18 +195,23 @@ on the Devices page.
 
 ## Open decisions
 
-- **D1. Macs that already have two rows: stay, or move to one row, and how?** Recommendation: they stay two rows
-  until a person runs `sudo roomlerd one-row` (FR-43 P3c, field-verified on 0.4.200), and the wizard over such a
-  Mac re-installs onto the same two rows and names that command on Done. Cost: those Macs keep two rows and two
-  plan slots until someone acts. The other way, the wizard offering the migration when it finds two rows, costs a
-  daemon restart inside the wizard that ends live sessions, and the retired row still needs a person's delete.
-- **D2. Does `macos_one_row`'s default flip for script installs too (#971), or only the wizard's?**
-  Recommendation: the wizard's first (P2's switch), and the script's after the same field read, as #971's own
-  decision. Cost: for a while the wizard and the one-liner give a Mac different row counts, and the dialog has to
-  say which.
-- **D3. What the Linux system card says until FR-142 ships.** Recommendation: name the three missing features and
-  the two desktops, and point at the per-user card for them, with its outbound-only mesh named. Cost: a longer
-  card. The other way, saying nothing, keeps today's surprise.
+None is open. The operator decided all three on 2026-11-11, each as recommended.
+
+- **D1. Macs that already have two rows: stay, or move to one row, and how? Decided 2026-11-11, as recommended:**
+  they stay two rows until a person runs `sudo roomlerd one-row` (FR-43 P3c, field-verified on 0.4.200), and the
+  wizard over such a Mac re-installs onto the same two rows and names that command on Done. Cost: those Macs keep
+  two rows and two plan slots until someone acts. The other way, the wizard offering the migration when it finds
+  two rows, costs a daemon restart inside the wizard that ends live sessions, and the retired row still needs a
+  person's delete.
+- **D2. Does `macos_one_row`'s default flip for script installs too (#971), or only the wizard's? Decided
+  2026-11-11, as recommended:** the wizard's first (P2's switch), and the script's after the same field read, as
+  #971's own decision. Cost: for a while the wizard and the one-liner give a Mac different row counts, and the
+  dialog has to say which.
+- **D3. What the Linux system card says until FR-142 ships. Decided 2026-11-11, as recommended:** name the three
+  missing features and the two desktops, point at the per-user card for them, with its outbound-only mesh named,
+  and promise nothing on Wayland beyond the clipboard: a per-user install does not read or switch the layout or
+  match the display under Wayland either. Cost: a longer card. The other way, saying nothing, keeps today's
+  surprise.
 
 ## Out of scope
 
@@ -210,3 +227,15 @@ on the Devices page.
 
 | date | what | result |
 |---|---|---|
+| 2026-11-11 | P0 RED, AC9: the released wizard (setup-v0.4.210) on an Ubuntu 24.04 GNOME Wayland lab guest ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6796598555)) | Welcome: three cards, the system card preselected; no question between screen with private network and screen only. The choice is the box "Join the overlay network (private mesh between your devices)" under the collapsed "Advanced options (optional)" on the Server page, ticked by default. Done names one Device ID and does not mention the private network. Not held, as the spec says for today. |
+| 2026-11-11 | P0, AC7 today: the default system card, paired, on the same guest (agent 0.4.210) ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6796598555)) | One administrator prompt; one row, online, `wizard/system`. The Devices page row shows its overlay IPv4, a ULA, a MagicDNS name and Connect (read on the page's screenshot and the Devices API). The viewer's frame matched the real screen (RMSE 0.0035, 0.0002 after input); a click and a typed line landed (DRM scanout). `roomler0` up; 5/5 pings each way with the lab's anchor peer. `roomler ssh` gives the organization's default refusal, "roomler SSH is disabled for this organization (an admin must enable it)"; the setting was not turned on. |
+| 2026-11-11 | P0 RED, AC10: the served `install.sh` (sha256 `e6ee3d13…`) on a fresh Ubuntu 24.04 GNOME Wayland lab guest ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6796598555)) | `--system --overlay`: "unknown flag: --overlay", then the usage, exit 1 (RED). `--role daemon --system --token …`: exit 0; one row `script-sh/system`, no overlay address or MagicDNS (Devices API), no `roomler0`, `overlay_enabled = false`; a session shows the screen. |
+| 2026-11-11 | P0, AC8 today, GNOME on Xorg: the released wizard's preselected system card, paired, on an Ubuntu 24.04 lab guest switched to GNOME on Xorg before the install (agent 0.4.210) ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6797644030)) | One administrator prompt. Done names one Device ID ("System service (root)", 0.4.210) and says nothing about the private network. One row, online, `wizard/system`, reporting `desktop {session: user, type: x11, capture_arm: drm, input_reach: full}`. `roomler0` up (100.65.x.x/22 and a ULA /96); 5/5 pings to the anchor peer (1-2 ms) and 5/5 back (1.9-2.3 ms). The viewer's frame matched the real screen (RMSE 0.0040; "DRM scanout · asks nobody", VP9 4:4:4 SW). A click and a typed line landed in a second session (0.0002 after input); the first session's click missed through a harness fault. `roomler ssh`: the organization's default refusal. Held on GNOME on Xorg, except "its overlay address shown": the Devices page row was not read on this cell. |
+| 2026-11-11 | P0, AC8 today, KDE Plasma on X11: the released wizard (setup-v0.4.210) on an Ubuntu 24.04 lab guest switched to Plasma 5.27's X11 session (SDDM) before the install. The wizard's install step got agent 0.4.211: `agent-v0.4.211` was published at 13:41:40Z, seconds before it resolved the latest release (the GNOME on Xorg guest at 13:22 got 0.4.210) ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6797644030)) | The wizard starts on Plasma: the same three cards, the system card preselected and taken; one administrator prompt (KDE's polkit dialog); Done names one Device ID ("System service (root)", 0.4.211) and says nothing about the private network. One row, online, `wizard/system`, reporting `desktop {session: user, type: x11, desktop: KDE, capture_arm: drm, input_reach: full}`. The Devices page row shows its overlay IPv4, a ULA, a MagicDNS name and Connect. The viewer's frame matched the real screen (RMSE 0.040: a transient "Being viewed by …" notice; 0.0031 after input); a click and a typed line landed (DRM scanout). `roomler0` up; 5/5 pings each way with the anchor peer; `roomler ssh`: the organization's default refusal. Held on KDE Plasma X11 (agent 0.4.211); Plasma on Wayland not read. |
+| 2026-11-11 | P0 RED, AC9 on GNOME on Xorg and KDE Plasma X11: the same two guests ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6797644030)) | As on GNOME Wayland: the system card preselected, no question on the first page, the private network is the Advanced box "Join the overlay network …", ticked by default under the collapsed "Advanced options (optional)". Not held, as the spec says for today. |
+| 2026-11-11 | P0 RED, AC10 again with agent 0.4.211 served: the served `install.sh` (sha256 `e6ee3d13…`, unchanged since 12:29) on an Ubuntu 24.04 lab guest ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6798060335)) | `--system --overlay`: "unknown flag: --overlay", exit 1 (RED). `--role daemon --system`: exit 0; one row `script-sh/system`, 0.4.211; no `roomler0`, `overlay_enabled = false`. After a reboot into XFCE on X11, the same row reports `desktop {session: none, …}` and a session is refused (`x11_not_enabled`). |
+| 2026-11-11 | P0 M1, macOS 27.2 lab guest, setup 0.4.211, pairing, defaults, read 15:11 to 15:34Z ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6800327603)) | Two rows (`<name>` wizard/per-user, `<name>-daemon` wizard/system), both online; the question is not on the first page (the overlay box under Advanced, ticked); Done names both rows; mesh both ways on the daemon row; the screen row has no overlay address. AC1 RED, AC9 RED (Done half held), AC6 held. Install's end: two TCC alerts and System Settings cover Done. |
+| 2026-11-11 | P0 M4, the same guest, the wizard again, read 15:37 to 15:44Z ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6800327603)) | Same two row ids, no new row, the renamed name and the daemon row's SSH policy kept; the wizard's words before acting are a first install's (nothing about reuse), it pre-fills the host name, Done still says "One manual step remains". AC4 held today (two-row case); AC5 waits on D1. |
+| 2026-11-11 | P0 M2, macOS 27.2 lab guest, setup 0.4.211, two pasted tokens, defaults, read 18:04 to 18:16Z ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)) | The paste section asks for two tokens ("Token" + "Second token, for the private network"); one administrator prompt; two rows (`<name>` wizard/per-user, `<name>-daemon` wizard/system) online; LaunchDaemon + marker; mesh both ways on the daemon row; Done names both rows. AC2 RED, AC6 held, AC9 Done held. |
+| 2026-11-11 | P0 M3, a fresh lab guest, setup 0.4.211, pairing, "Join the overlay network" unticked, read 18:16 to 18:25Z ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)) | Pairing asks `halves: 1`; still one administrator prompt (the package); one row `<name>` wizard/per-user online; no LaunchDaemon, no `enable-daemon` marker, no root config, no overlay address; Done names the one row. AC3 held. |
+| 2026-11-11 | P0 M5, a fresh macOS 27.2 lab guest: served `install.sh --one-row` under sudo (one token), then the released wizard (setup 0.4.211), pairing, defaults, read 18:31 to 18:48Z ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6804483259)) | The script gives one row `<name>` (`script-sh/system`, online, one-row switches on, no LaunchAgent). The wizard's Welcome says "enrolled both per-user and as a system daemon … two daemons"; pairing asks `halves: 2`; nothing says the Mac is one row; one administrator prompt. After: three rows — a new `<name>-daemon` (`wizard/system`, online; the root half took the hardware fingerprint, the script had used a derived one), the old one row offline, a new person's row (`wizard/per-user`) offline; one LaunchDaemon in one-row mode, no LaunchAgent; mesh both ways. RED for AC4/AC5 (new rows, the old row left offline, nothing said before acting). |

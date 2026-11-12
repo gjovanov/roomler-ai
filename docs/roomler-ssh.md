@@ -805,8 +805,8 @@ roomlerd anchor ssh off|console_user|system   # an anchor that exists
 roomlerd anchor status                        # "ssh: ON, …" and the service's host-key fingerprint
 ```
 
-The ceiling belongs to the anchor (`%ProgramData%\roomler\roomler\exec-service\anchor.json`,
-SYSTEM and Administrators only) and defaults to **off**, so every FR-94 anchor
+The ceiling belongs to the anchor (`HKLM\SOFTWARE\Roomler\ExecService`, SYSTEM and
+Administrators only, with the service's host key beside it since #3737: [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)) and defaults to **off**, so every FR-94 anchor
 reads as off and no device gains SYSTEM SSH by updating. `system` permits
 `daemon` and `console_user` grants; `console_user` permits only that one. A
 grant outside the ceiling takes the worker path, exactly as before: that is a

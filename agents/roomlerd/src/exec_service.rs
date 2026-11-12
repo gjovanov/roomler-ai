@@ -8,13 +8,17 @@
 //! token, the server origin, `exec_enabled`) sits in that user's writable
 //! `%APPDATA%`. So the SYSTEM service in session 0 trusts none of it:
 //!
-//! - **The anchor** (`%ProgramData%\roomler\roomler\exec-service\anchor.json`)
-//!   is the service's ONLY source of the server origin, the device, and its
-//!   own credential. An elevated administrator writes it
-//!   (`roomlerd anchor create`), and the service reads it only from a file
-//!   and a directory owned by SYSTEM or Administrators that grant nobody
-//!   else write: a folder a standard user made there first is never
-//!   trusted ([`load_anchor`]).
+//! - **The anchor** (`HKLM\SOFTWARE\Roomler\ExecService`, #3737) is the
+//!   service's ONLY source of the server origin, the device, and its own
+//!   credential. An elevated administrator writes it (`roomlerd anchor
+//!   create`), and the service reads it only from that key, when SYSTEM or
+//!   Administrators own it, its DACL lets no other account change it or read
+//!   its values, and its parent lets no other account change it
+//!   ([`load_anchor`], `roomler_node_core::machine_key`). Builds before #3737
+//!   kept it in `%ProgramData%\roomler\roomler\exec-service\anchor.json`: the
+//!   service's first start on this build copies one from there once, in the
+//!   exact shape `roomlerd anchor create` wrote, and nothing reads that file
+//!   after ([`store`]).
 //! - **The doorbell** (`\\.\pipe\roomler-exec-service`) carries a request id
 //!   and nothing else. The service claims the command from the server with
 //!   its own credential, runs it, and posts the result to the server itself,
@@ -25,8 +29,8 @@
 //!
 //! ⚠️ Nothing the signed-in user can write may decide what SYSTEM runs
 //! (FR-94 §4). A forged ring claims nothing the server did not queue for this
-//! device; a squatted pipe is refused by its owner, and a planted anchor by
-//! its owner and its DACL.
+//! device; a squatted pipe is refused by its owner, and an anchor key by its
+//! owner, its DACL and its parent's.
 //!
 //! Gate 4 has two halves on this path, and both must say yes: the person's
 //! `exec_enabled`, checked by the worker before it rings, exactly as for a
@@ -42,6 +46,14 @@ pub const PIPE_NAME: &str = r"\\.\pipe\roomler-exec-service";
 /// `exec-system` from every connection, so the server routes nothing to the
 /// service. The FR's P3 kill switch.
 pub const KILL_SWITCH_ENV: &str = "ROOMLERD_EXEC_VIA_SERVICE";
+
+/// #3737 — `ROOMLERD_EXEC_ANCHOR_COPY=0` (or `false`/`off`/`no`), in the
+/// SYSTEM service's own environment, stops the one-time copy of an anchor
+/// from where builds before the registry key kept it: the first start
+/// records `refused`, "switched off", and copies nothing. An administrator
+/// anchors the device again to recover. It never makes a file be read as an
+/// anchor.
+pub const COPY_SWITCH_ENV: &str = "ROOMLERD_EXEC_ANCHOR_COPY";
 
 /// The anchor file's schema version.
 const ANCHOR_VERSION: u32 = 1;
@@ -589,28 +601,15 @@ pub async fn cancel(request_id: &str) -> bool {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// The anchor file
+// Where the anchor lives
 // ────────────────────────────────────────────────────────────────────────────
 
-/// `%ProgramData%\roomler\roomler\exec-service`. Windows only: no other
-/// platform anchors a device.
-#[cfg(windows)]
-pub fn anchor_dir() -> std::path::PathBuf {
-    roomler_node_core::appdirs::machine_global_dir().join("exec-service")
-}
-
-/// `…\exec-service\anchor.json`.
-#[cfg(windows)]
-pub fn anchor_path() -> std::path::PathBuf {
-    anchor_dir().join("anchor.json")
-}
-
 /// The anchor, if there is one this process may trust. `Ok(None)` = none.
-/// `Err` = a file is there, but its owner, its DACL, its directory or its
-/// content says nobody should act on it.
+/// `Err` = one is there, but where it is or what it holds says nobody should
+/// act on it.
 #[cfg(windows)]
 pub fn load_anchor() -> Result<Option<Anchor>, String> {
-    win::load_anchor(&anchor_dir(), &anchor_path())
+    store::load_anchor()
 }
 
 #[cfg(not(windows))]
@@ -618,44 +617,862 @@ pub fn load_anchor() -> Result<Option<Anchor>, String> {
     Ok(None)
 }
 
-/// FR-105 — `…\exec-service\ssh_host_ed25519_key`: the SYSTEM service's own
-/// SSH host key, beside the anchor and as private.
-#[cfg(windows)]
-pub fn host_key_path() -> std::path::PathBuf {
-    anchor_dir().join(HOST_KEY_FILE)
-}
-
-#[cfg(windows)]
-const HOST_KEY_FILE: &str = "ssh_host_ed25519_key";
-
 /// FR-105 — the SSH pipe is made with the doorbell's DACL and opened with its
 /// owner check.
 #[cfg(all(windows, feature = "ssh-server"))]
 pub(crate) use win::{open_system_pipe, pipe_instance};
 
 /// FR-105 — the service's host key (OpenSSH PEM), if there is one this process
-/// may trust: the same owner and DACL rules as the anchor.
+/// may trust: kept as the anchor is, under the same rules.
 #[cfg(windows)]
 pub fn load_host_key() -> Result<Option<String>, String> {
-    win::read_private(
-        &anchor_dir(),
-        &host_key_path(),
-        "the SSH host key",
-        16 * 1024,
-    )
+    store::load_host_key()
 }
 
-/// FR-105 — the host key, made now if there is none. Only an anchored device's
-/// directory ever holds one: the caller has the anchor already.
+/// FR-105 — the host key, made now if there is none. Only an anchored device
+/// ever holds one: the caller has the anchor already.
 #[cfg(all(windows, feature = "ssh-server"))]
 pub fn ensure_host_key() -> Result<String, String> {
-    if let Some(pem) = load_host_key()? {
-        return Ok(pem);
+    store::ensure_host_key()
+}
+
+/// #3737 — V2 of the one-time copy: the folder and the file are exactly as
+/// `roomlerd anchor create` left them in every build that kept the anchor in
+/// a file: Administrators own both, and each has a protected DACL of SYSTEM
+/// and Administrators with full control and nothing else, handed down on the
+/// folder (`OI`, `CI`) and not on the file. That writer never wrote any other
+/// shape, so the copy takes no other.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn legacy_shape_ok(
+    folder: &roomler_node_core::machine_tree::Sd,
+    file: &roomler_node_core::machine_tree::Sd,
+) -> bool {
+    legacy_folder_ok(folder) && legacy_file_ok(file)
+}
+
+/// The folder half of [`legacy_shape_ok`]: what `anchor create` left on
+/// `exec-service` itself. Only a folder in this shape ever loses a file to
+/// `anchor create` or `anchor remove`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn legacy_folder_ok(folder: &roomler_node_core::machine_tree::Sd) -> bool {
+    use roomler_node_core::machine_tree::{CONTAINER_INHERIT, OBJECT_INHERIT};
+    exactly_system_and_administrators(folder, OBJECT_INHERIT | CONTAINER_INHERIT)
+}
+
+/// The file half of [`legacy_shape_ok`].
+#[cfg_attr(not(windows), allow(dead_code))]
+fn legacy_file_ok(file: &roomler_node_core::machine_tree::Sd) -> bool {
+    exactly_system_and_administrators(file, 0)
+}
+
+/// Administrators own it, and its protected DACL is SYSTEM and
+/// Administrators with full control, each with exactly the inheritance
+/// `flags`, and nothing else.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn exactly_system_and_administrators(sd: &roomler_node_core::machine_tree::Sd, flags: u8) -> bool {
+    use roomler_node_core::machine_tree::{ACE_ALLOW, ADMINISTRATORS, FULL, SYSTEM};
+    sd.owner == ADMINISTRATORS
+        && sd.protected
+        && sd.dacl.as_ref().is_some_and(|aces| {
+            let mut sids: Vec<&str> = aces
+                .iter()
+                .filter(|a| a.kind == ACE_ALLOW && a.flags == flags && a.mask == FULL)
+                .map(|a| a.sid.as_str())
+                .collect();
+            sids.sort_unstable();
+            aces.len() == 2 && sids == [SYSTEM, ADMINISTRATORS]
+        })
+}
+
+/// #3737 — V1 and V3 of the one-time copy: the anchor passes FR-94's whole
+/// check of what it holds ([`Anchor::validate`]), its origin is https, and it
+/// is not on this machine. An origin on this machine (which `origin_ok`
+/// allows over plain http when it is a loopback one) is a lab's and never a
+/// field anchor's, so the copy takes none, over https either.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copyable(anchor: &Anchor) -> Result<(), String> {
+    anchor.validate()?;
+    let url = reqwest::Url::parse(anchor.server.trim()).map_err(|e| e.to_string())?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "the anchor names {}, which is not an https origin",
+            anchor.server
+        ));
     }
-    let pem = crate::ssh::generate_host_key().map_err(|e| format!("making a host key: {e}"))?;
-    win::write_private(HOST_KEY_FILE, pem.as_bytes())?;
-    tracing::info!("ssh-service: made the SYSTEM service's SSH host key");
-    Ok(pem)
+    if on_this_machine(&url) {
+        return Err(format!(
+            "the anchor names {}, an origin on this machine, which a lab's anchor has and a \
+             field anchor never does",
+            anchor.server
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `url`'s host is this machine: `localhost` or a name below
+/// `.localhost`, a loopback address (an IPv4 one written as IPv6 included),
+/// or an unspecified address. The URL parser has already written an IPv4
+/// address out whole (`127.1` is `127.0.0.1`) and a name in lower case.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn on_this_machine(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    let host = url.host_str().unwrap_or_default();
+    match host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Ok(IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    }
+}
+
+/// #3737 — where the anchor and the host key are kept: the registry key
+/// `HKLM\SOFTWARE\Roomler\ExecService`, and the one-time copy from where
+/// builds before it kept them.
+///
+/// Four invariants, each load-bearing:
+///
+/// - **[`load_anchor`] never names a path under `%ProgramData%`.** The key
+///   is the only place an anchor is read from; the files of the anchor's
+///   first home are read by the one-time copy alone ([`super::legacy`]).
+/// - **No switch makes it.** No setting, variable or config makes the service
+///   read a file as an anchor again: such a switch would undo, on the device
+///   that set it, what the key is for. `ROOMLERD_EXEC_ANCHOR_COPY=0` only
+///   stops the copy.
+/// - **The key is written only by an elevated administrator** (`roomlerd
+///   anchor`, Setup's elevated anchor step) **or SYSTEM** (the renewal, the
+///   host key, the one-time copy). Its DACL names nobody else, and only they
+///   may create a key below `HKLM\SOFTWARE`. A key that fails the check is
+///   deleted and made again by a writer, never sealed where it stands, and a
+///   registry link at the key or its parent is refused.
+/// - **Nothing is ever copied without the copy's marker, and the copy runs
+///   until it has recorded an outcome.** Its marker, `LegacyCopy`, is written
+///   before anything is read; a start that finds it copies nothing, and a
+///   start that cannot write it copies nothing and leaves the copy to the
+///   next start.
+#[cfg(windows)]
+pub(crate) mod store {
+    use roomler_node_core::machine_key::{self, Key, KeyPath, Takeover};
+    use serde::{Deserialize, Serialize};
+
+    use super::{Anchor, legacy};
+
+    /// The anchor, the JSON `anchor.json` held: 64 Ki characters at most.
+    const ANCHOR: &str = "Anchor";
+    const MAX_ANCHOR: u32 = 128 * 1024;
+    /// FR-105's host key, OpenSSH PEM: 16 Ki characters at most.
+    const HOST_KEY: &str = "SshHostKey";
+    const MAX_HOST_KEY: u32 = 32 * 1024;
+    /// What the one-time copy did ([`LegacyCopy`]): no secret.
+    const LEGACY_COPY: &str = "LegacyCopy";
+    const MAX_LEGACY_COPY: u32 = 8 * 1024;
+
+    /// `HKLM\SOFTWARE\Roomler\ExecService`. A test build takes its stand-in
+    /// from [`super::test_fixture`], and stops when there is none.
+    pub(crate) fn key() -> KeyPath {
+        #[cfg(test)]
+        {
+            super::test_fixture::key()
+        }
+        #[cfg(not(test))]
+        {
+            KeyPath {
+                hive: machine_key::Hive::LocalMachine,
+                parent: r"SOFTWARE\Roomler".to_string(),
+                name: "ExecService".to_string(),
+            }
+        }
+    }
+
+    /// The key as every writer but the one-time copy opens it: made sealed
+    /// when it is not there, and, when it fails the check, deleted and made
+    /// again with its `LegacyCopy` kept, so the copy stays shut.
+    fn sealed_for_writing() -> Result<Key, String> {
+        machine_key::create_sealed(
+            &key(),
+            Takeover::Remake {
+                keep: &[LEGACY_COPY],
+            },
+        )
+    }
+
+    /// The anchor, from the key alone, when the key passes the check
+    /// (`machine_key::open_checked`). `Ok(None)`: no key, or no anchor in it.
+    pub fn load_anchor() -> Result<Option<Anchor>, String> {
+        let path = key();
+        let Some(key) = machine_key::open_checked(&path)? else {
+            return Ok(None);
+        };
+        let Some(text) = key.read(ANCHOR, MAX_ANCHOR)? else {
+            return Ok(None);
+        };
+        let anchor: Anchor = serde_json::from_str(&text)
+            .map_err(|e| format!("the anchor in {}: {e}", path.shown()))?;
+        anchor.validate()?;
+        Ok(Some(anchor))
+    }
+
+    /// FR-105's host key, from the same key under the same check.
+    pub fn load_host_key() -> Result<Option<String>, String> {
+        match machine_key::open_checked(&key())? {
+            Some(key) => key.read(HOST_KEY, MAX_HOST_KEY),
+            None => Ok(None),
+        }
+    }
+
+    /// The host key, made now if there is none. A key that fails the check
+    /// holds nothing worth keeping: the writer makes it again, so an
+    /// administrator's `anchor create --ssh …` recovers it.
+    #[cfg(feature = "ssh-server")]
+    pub fn ensure_host_key() -> Result<String, String> {
+        if let Ok(Some(pem)) = load_host_key() {
+            return Ok(pem);
+        }
+        let pem = crate::ssh::generate_host_key().map_err(|e| format!("making a host key: {e}"))?;
+        sealed_for_writing()?.write(HOST_KEY, &pem)?;
+        tracing::info!("ssh-service: made the SYSTEM service's SSH host key");
+        Ok(pem)
+    }
+
+    /// Write the anchor into the sealed key (made again when it fails the
+    /// check), then read it back through the service's own check: an anchor
+    /// the service would not use is an error here, not a device that quietly
+    /// stays unanchored.
+    pub fn store_anchor(anchor: &Anchor) -> Result<(), String> {
+        anchor.validate()?;
+        let text = serde_json::to_string_pretty(anchor).map_err(|e| e.to_string())?;
+        let path = key();
+        sealed_for_writing()?.write(ANCHOR, &text)?;
+        match load_anchor()? {
+            Some(back) if &back == anchor => Ok(()),
+            _ => Err(format!(
+                "{} does not read back the anchor just written",
+                path.shown()
+            )),
+        }
+    }
+
+    /// `anchor create`'s half on this machine, once the server has anchored
+    /// it. First a parent its caller's own account owns is given to
+    /// Administrators, when that is all that stands in the way
+    /// (`machine_key::adopt_parent`). Then the copy's marker when there is
+    /// none, so a later first start never copies an older file over this
+    /// anchor; the host key when the anchor's SSH ceiling is above off; the
+    /// anchor; and last the files an earlier build kept are deleted
+    /// ([`legacy::remove_files`]), so a rollback finds no anchor the server
+    /// no longer accepts.
+    pub fn anchor_created(anchor: &Anchor) -> Result<(), String> {
+        let path = key();
+        if let Some(caller) = crate::win_token::own_user_sid()
+            && let Err(e) = machine_key::adopt_parent(&path, &caller)
+        {
+            tracing::warn!(%e, "exec-service: the anchor key's parent was left as it is");
+        }
+        {
+            let key = sealed_for_writing()?;
+            if !key.has(LEGACY_COPY)? {
+                key.write(
+                    LEGACY_COPY,
+                    &LegacyCopy::now(CopyOutcome::Nothing, Some("anchored with this build")).json(),
+                )?;
+            }
+        }
+        // The key before the ceiling: a service that reads the new ceiling
+        // must find a key to publish with it.
+        #[cfg(feature = "ssh-server")]
+        if anchor.ssh != roomler_ai_remote_control::models::SshServiceCeiling::Off {
+            ensure_host_key()?;
+        }
+        store_anchor(anchor)?;
+        legacy::remove_files();
+        Ok(())
+    }
+
+    /// `anchor remove`'s half on this machine: the anchor and the host key
+    /// out of the key; the marker kept, so nothing is copied again, and
+    /// retired ([`retire_marker`]); and the files an earlier build kept
+    /// deleted. Whether there was an anchor in either place.
+    pub fn remove() -> Result<bool, String> {
+        let mut anchored = false;
+        // Judged by nothing: taking a value away never makes anything trusted.
+        if let Some(key) = machine_key::open_for_change(&key())? {
+            anchored = key.delete(ANCHOR)?;
+            key.delete(HOST_KEY)?;
+            retire_marker(&key)?;
+        }
+        let had_file = legacy::remove_files();
+        Ok(anchored || had_file)
+    }
+
+    /// After `anchor remove`: the marker says `removed`, and when, and keeps
+    /// what it said before in `earlier`, so a copy refused or left unfinished
+    /// long ago no longer asks for the anchor to be made again. The marker
+    /// stays, so nothing is ever copied. One that cannot be read is left as
+    /// it is: being there is what shuts the copy.
+    fn retire_marker(key: &Key) -> Result<(), String> {
+        let Ok(Some(text)) = key.read(LEGACY_COPY, MAX_LEGACY_COPY) else {
+            return Ok(());
+        };
+        let Ok(mut copy) = serde_json::from_str::<LegacyCopy>(&text) else {
+            return Ok(());
+        };
+        if copy.outcome == CopyOutcome::Removed {
+            return Ok(());
+        }
+        copy.earlier.push(Earlier {
+            at: copy.at.clone(),
+            outcome: copy.outcome,
+            why: copy.why.take(),
+        });
+        let over = copy.earlier.len().saturating_sub(MAX_EARLIER);
+        copy.earlier.drain(..over);
+        copy.at = chrono::Utc::now().to_rfc3339();
+        copy.outcome = CopyOutcome::Removed;
+        copy.why =
+            Some("the anchor was removed from this machine (`roomlerd anchor remove`)".into());
+        key.write(LEGACY_COPY, &copy.json())
+    }
+
+    /// The most earlier outcomes a marker keeps.
+    const MAX_EARLIER: usize = 8;
+
+    /// What the one-time copy did, kept in `LegacyCopy`, and what became of
+    /// it since. No secret: an administrator can read it.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct LegacyCopy {
+        /// RFC 3339.
+        pub at: String,
+        pub outcome: CopyOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub why: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub anchored_at: Option<String>,
+        /// What the marker said before a later step changed its outcome,
+        /// oldest first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub earlier: Vec<Earlier>,
+    }
+
+    /// An outcome the marker had before.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Earlier {
+        /// RFC 3339.
+        pub at: String,
+        pub outcome: CopyOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub why: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CopyOutcome {
+        /// Written before anything is read; still there only when the start
+        /// that wrote it ended before it could say more.
+        Pending,
+        Copied,
+        /// There was nothing to copy.
+        #[serde(rename = "none")]
+        Nothing,
+        Refused,
+        /// `anchor remove` ran since: whatever the copy did, there is no
+        /// anchor to make again.
+        Removed,
+        /// A word a newer build wrote.
+        #[serde(other)]
+        Unknown,
+    }
+
+    impl std::fmt::Display for CopyOutcome {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                CopyOutcome::Pending => "pending",
+                CopyOutcome::Copied => "copied",
+                CopyOutcome::Nothing => "none",
+                CopyOutcome::Refused => "refused",
+                CopyOutcome::Removed => "removed",
+                CopyOutcome::Unknown => "unknown",
+            })
+        }
+    }
+
+    impl LegacyCopy {
+        fn now(outcome: CopyOutcome, why: Option<&str>) -> Self {
+            Self {
+                at: chrono::Utc::now().to_rfc3339(),
+                outcome,
+                why: why.map(str::to_string),
+                agent_id: None,
+                anchored_at: None,
+                earlier: Vec::new(),
+            }
+        }
+
+        fn json(&self) -> String {
+            serde_json::to_string(self).unwrap_or_default()
+        }
+    }
+
+    /// What the service's health and `anchor status` say about the one-time
+    /// copy while the key holds no anchor, with the way back: the copy
+    /// refused the anchor this machine had (and why), or it did not finish.
+    /// `None`: nothing to say.
+    pub fn copy_problem() -> Option<String> {
+        let key = machine_key::open_checked(&key()).ok()??;
+        if key.has(ANCHOR).ok()? {
+            return None;
+        }
+        let text = key.read(LEGACY_COPY, MAX_LEGACY_COPY).ok()??;
+        let copy: LegacyCopy = serde_json::from_str(&text).ok()?;
+        match copy.outcome {
+            CopyOutcome::Refused => Some(super::copy_refused_problem(
+                copy.why.as_deref().unwrap_or("no reason was recorded"),
+            )),
+            CopyOutcome::Pending => Some(super::copy_unfinished_problem()),
+            _ => None,
+        }
+    }
+
+    /// The SYSTEM service's first start on this build: copy the anchor
+    /// builds before it kept in the machine folder into the key, once, and
+    /// only one exactly as `roomlerd anchor create` wrote it. Only the SCM
+    /// host calls it, before the doorbell, the renewal and the SSH publisher
+    /// start; the command line and the worker never do. It logs what it did,
+    /// once.
+    pub fn copy_legacy_once() {
+        match copy_once(&key()) {
+            Ok(Some(done)) => tracing::info!(
+                outcome = %done.outcome,
+                why = done.why.as_deref().unwrap_or(""),
+                agent_id = done.agent_id.as_deref().unwrap_or(""),
+                "exec-service: one-time anchor copy"
+            ),
+            Ok(None) => tracing::debug!("exec-service: the one-time anchor copy ran before"),
+            Err(e) => tracing::error!(
+                %e,
+                "exec-service: the one-time anchor copy did not run; nothing was copied"
+            ),
+        }
+    }
+
+    /// `Ok(None)`: the marker was there, so nothing ran. `Err`: the marker
+    /// could not be written or read, so nothing was copied.
+    fn copy_once(path: &KeyPath) -> Result<Option<LegacyCopy>, String> {
+        // The writer without a takeover: a key that fails the check is not
+        // this start's to make again, and an anchor copied into it would not
+        // be read anyway.
+        let key = machine_key::create_sealed(path, Takeover::Never)?;
+        if key.has(LEGACY_COPY)? {
+            return Ok(None);
+        }
+        // The marker first: from here on no start copies anything again,
+        // whatever happens below.
+        key.write(
+            LEGACY_COPY,
+            &LegacyCopy::now(CopyOutcome::Pending, None).json(),
+        )?;
+        let done = if super::disabled_by(std::env::var(super::COPY_SWITCH_ENV).ok().as_deref()) {
+            LegacyCopy::now(
+                CopyOutcome::Refused,
+                Some(&format!("switched off ({}=0)", super::COPY_SWITCH_ENV)),
+            )
+        } else {
+            copy_from_file(&key)
+                .unwrap_or_else(|why| LegacyCopy::now(CopyOutcome::Refused, Some(&why)))
+        };
+        key.write(LEGACY_COPY, &done.json())?;
+        Ok(Some(done))
+    }
+
+    /// The copy itself, after the marker: `Err` is a refusal, and says why.
+    fn copy_from_file(key: &Key) -> Result<LegacyCopy, String> {
+        let nothing = |why: &str| LegacyCopy::now(CopyOutcome::Nothing, Some(why));
+        if key.has(ANCHOR)? {
+            return Ok(nothing("the key held an anchor already"));
+        }
+        // FR-94's reader, by handle: no link on the way, the folder owned by
+        // SYSTEM or Administrators with no write for anyone else, held open,
+        // and each file opened below that handle under the same rule (V4).
+        let Some(home) = legacy::open()? else {
+            return Ok(nothing("no anchor file"));
+        };
+        let Some(file) = home.read(legacy::ANCHOR_FILE, "the anchor file", 64 * 1024)? else {
+            return Ok(nothing("no anchor file"));
+        };
+        let anchor: Anchor =
+            serde_json::from_str(&file.text).map_err(|e| format!("the anchor file: {e}"))?;
+        // V2: exactly what `anchor create` left.
+        if !super::legacy_shape_ok(home.sd(), &file.sd) {
+            return Err(
+                "the anchor file's folder or file does not have the exact owner and \
+                        DACL `roomlerd anchor create` gives them"
+                    .to_string(),
+            );
+        }
+        // V1, V3: an https origin not on this machine, and a valid anchor.
+        super::copyable(&anchor)?;
+        let host_key = legacy_host_key(&home);
+        // A known window, accepted: an elevated `anchor create` that lands
+        // between this check and the writes below has its fresh anchor
+        // replaced by this copy's, whose credential that re-anchor revoked,
+        // so commands are refused (401) until the device is anchored again.
+        // It is a few registry calls long, at the service's first start on
+        // this build, while `anchor create` waits on a server round trip.
+        if key.has(ANCHOR)? {
+            return Ok(nothing("the key held an anchor already"));
+        }
+        // The host key before the anchor, as every writer orders them: a
+        // service that reads an SSH ceiling must find a key to publish.
+        if let Some(pem) = &host_key {
+            key.write(HOST_KEY, pem)?;
+        }
+        let text = serde_json::to_string_pretty(&anchor).map_err(|e| e.to_string())?;
+        key.write(ANCHOR, &text)?;
+        Ok(LegacyCopy {
+            agent_id: Some(anchor.agent_id),
+            anchored_at: Some(anchor.anchored_at),
+            ..LegacyCopy::now(CopyOutcome::Copied, None)
+        })
+    }
+
+    /// The host key beside the copied anchor, read below the same folder
+    /// handle under the same rules (V2 and V4). One the copy does not take is
+    /// left, and a new one is made when SSH through the service is used.
+    fn legacy_host_key(home: &roomler_node_core::machine_tree::PrivateFolder) -> Option<String> {
+        match home.read(legacy::HOST_KEY_FILE, "the SSH host key", 16 * 1024) {
+            Ok(Some(file)) if super::legacy_shape_ok(home.sd(), &file.sd) => Some(file.text),
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    "exec-service: the one-time copy left the SSH host key file: its folder or \
+                     file does not have the exact owner and DACL `roomlerd anchor create` gives \
+                     them"
+                );
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(%e, "exec-service: the one-time copy left the SSH host key file");
+                None
+            }
+        }
+    }
+}
+
+/// #3737 — the anchor's first home, `%ProgramData%\roomler\roomler\exec-service`,
+/// where builds before the registry key kept the anchor (`anchor.json`) and
+/// FR-105's host key beside it. Only the SYSTEM service's one-time copy reads
+/// it ([`store::copy_legacy_once`]), and `anchor create` and `anchor remove`
+/// delete its files. Nothing else names it.
+#[cfg(windows)]
+pub(crate) mod legacy {
+    use std::path::{Path, PathBuf};
+
+    use roomler_node_core::machine_tree::{HeldFolder, OpenFor, PrivateFolder};
+
+    /// The anchor's file name.
+    pub(crate) const ANCHOR_FILE: &str = "anchor.json";
+    /// The host key's file name beside the anchor.
+    pub(crate) const HOST_KEY_FILE: &str = "ssh_host_ed25519_key";
+
+    /// `<ProgramData>\roomler\roomler\exec-service`: the current segment only
+    /// (FR-94 came after the rename, so no build kept an anchor below the
+    /// pre-rename one), rooted at the machine's `ProgramData` as the system
+    /// names it, never at a variable (#3702).
+    pub fn dir() -> PathBuf {
+        let dir = roomler_node_core::appdirs::machine_program_data()
+            .join("roomler")
+            .join("roomler")
+            .join("exec-service");
+        #[cfg(test)]
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "a test named this computer's own machine folder: {}",
+            dir.display()
+        );
+        dir
+    }
+
+    /// `…\exec-service\anchor.json`.
+    #[cfg(test)]
+    pub fn anchor_path() -> PathBuf {
+        dir().join(ANCHOR_FILE)
+    }
+
+    /// `…\exec-service\ssh_host_ed25519_key`.
+    #[cfg(test)]
+    pub fn host_key_path() -> PathBuf {
+        dir().join(HOST_KEY_FILE)
+    }
+
+    /// This folder through FR-94's reader, held open by its handle: no link on
+    /// the way, and SYSTEM or Administrators own it with no write for any
+    /// other account. Its files are read below that handle, so the folder
+    /// judged is the folder read, with the owner and DACL of each, for the
+    /// copy's exact-shape check. `Ok(None)`: there is no such folder.
+    pub fn open() -> Result<Option<PrivateFolder>, String> {
+        PrivateFolder::open(&dir())
+    }
+
+    /// Delete the anchor's file and the host key's, best effort and each
+    /// logged, by handle and only where an earlier build left them:
+    /// `exec-service` is opened itself (a junction or a symbolic link there is
+    /// refused, never followed, and so is one on the way to it) and must have
+    /// exactly the owner and DACL `anchor create` gave it, which no account
+    /// but SYSTEM or an administrator can give a folder. Each file is then
+    /// opened below that folder's handle, never through a link, and deleted
+    /// through its own handle only when it is a plain file with exactly the
+    /// owner and DACL `anchor create` gave it. Anything else is left as it is,
+    /// and logged. Whether the anchor's file was deleted.
+    pub fn remove_files() -> bool {
+        let dir = dir();
+        let folder = match held_in_its_shape(&dir) {
+            Ok(Some(folder)) => folder,
+            Ok(None) => return false,
+            Err(e) => {
+                tracing::warn!(
+                    %e,
+                    path = %dir.display(),
+                    "exec-service: left the anchor's first home as it is"
+                );
+                return false;
+            }
+        };
+        let mut had_anchor = false;
+        for (name, is_anchor) in [(ANCHOR_FILE, true), (HOST_KEY_FILE, false)] {
+            let path = dir.join(name);
+            match remove_in_its_shape(&folder, name) {
+                Ok(true) => {
+                    tracing::info!(
+                        path = %path.display(),
+                        "exec-service: deleted a file of the anchor's first home"
+                    );
+                    had_anchor |= is_anchor;
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    %e,
+                    path = %path.display(),
+                    "exec-service: left a file of the anchor's first home"
+                ),
+            }
+        }
+        had_anchor
+    }
+
+    /// `dir` held open by its own handle, when no link is on the way to it
+    /// and it is a folder with exactly the owner and DACL `anchor create`
+    /// gave it. `Ok(None)`: it is not there.
+    fn held_in_its_shape(dir: &Path) -> Result<Option<HeldFolder>, String> {
+        if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
+            return Err(format!("{} is a link", link.display()));
+        }
+        let Some(folder) = HeldFolder::open(dir)? else {
+            return Ok(None);
+        };
+        if !super::legacy_folder_ok(&folder.security()?) {
+            return Err(
+                "the folder does not have the exact owner and DACL `roomlerd anchor create` \
+                 gives it"
+                    .into(),
+            );
+        }
+        Ok(Some(folder))
+    }
+
+    /// Delete the file `name` of `folder`, opened below the folder's handle,
+    /// through its own handle, when it is a plain file with exactly the owner
+    /// and DACL `anchor create` gave it. `Ok(false)`: it is not there.
+    fn remove_in_its_shape(folder: &HeldFolder, name: &str) -> Result<bool, String> {
+        let Some(file) = folder.file(name, OpenFor::Delete)? else {
+            return Ok(false);
+        };
+        if !super::legacy_file_ok(&file.security()?) {
+            return Err(
+                "the file does not have the exact owner and DACL `roomlerd anchor create` gives \
+                 it"
+                .into(),
+            );
+        }
+        file.delete()?;
+        Ok(true)
+    }
+
+    /// Tests only: the anchor file `name` in the folder `dir`, through FR-94's
+    /// reader, parsed and validated as builds before the registry key loaded
+    /// it.
+    #[cfg(test)]
+    pub fn read_at(dir: &Path, name: &str) -> Result<Option<super::Anchor>, String> {
+        let Some(text) =
+            roomler_node_core::machine_tree::read_private(dir, name, "the anchor file", 64 * 1024)?
+        else {
+            return Ok(None);
+        };
+        let anchor: super::Anchor =
+            serde_json::from_str(&text).map_err(|e| format!("the anchor file: {e}"))?;
+        anchor.validate()?;
+        Ok(Some(anchor))
+    }
+
+    /// Tests only: write `bytes` as `name` in this folder exactly as every
+    /// build before the registry key did, which is what an upgrade finds.
+    #[cfg(test)]
+    pub fn write(name: &str, bytes: &[u8]) -> Result<(), String> {
+        writer::write(&dir(), name, bytes)
+    }
+
+    /// Tests only: [`write`], into the folder `dir` instead.
+    #[cfg(test)]
+    pub fn write_in(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+        writer::write(dir, name, bytes)
+    }
+
+    /// FR-94's writer, as it shipped until #3737 (`dda326009` and after).
+    #[cfg(test)]
+    mod writer {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::path::Path;
+
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateDirectoryW, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        use super::super::win::{Sddl, wide};
+
+        /// The anchor's directory: Administrators own it, SYSTEM and
+        /// Administrators alone may touch it, inheritance off.
+        const DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+        /// The anchor file itself: the same, explicitly.
+        const FILE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+        /// Make the anchor's directory private, or take over the plain
+        /// directory already there.
+        fn private_dir(dir: &Path) -> Result<(), String> {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
+                return Err(format!("{} is a link", link.display()));
+            }
+            let mut sd = Sddl::new(DIR_SDDL).map_err(|e| e.to_string())?;
+            let name = wide(dir);
+            match std::fs::symlink_metadata(dir) {
+                Ok(m) => {
+                    if !m.is_dir() || m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                        return Err(format!("{} is not a plain directory", dir.display()));
+                    }
+                    // SAFETY: a NUL-terminated path; the descriptor lives in `sd`.
+                    let ok = unsafe {
+                        SetFileSecurityW(
+                            name.as_ptr(),
+                            OWNER_SECURITY_INFORMATION
+                                | DACL_SECURITY_INFORMATION
+                                | PROTECTED_DACL_SECURITY_INFORMATION,
+                            sd.psd,
+                        )
+                    };
+                    if ok == 0 {
+                        return Err(format!(
+                            "{}: {}",
+                            dir.display(),
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // SAFETY: a NUL-terminated path; the attributes live in `sd`.
+                    if unsafe { CreateDirectoryW(name.as_ptr(), sd.attributes()) } == 0 {
+                        return Err(format!(
+                            "{}: {}",
+                            dir.display(),
+                            std::io::Error::last_os_error()
+                        ));
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("{}: {e}", dir.display())),
+            }
+        }
+
+        /// Write `bytes` as `name` in `dir`, made private first, through a
+        /// temporary file given the file's own DACL before it takes the name.
+        pub(super) fn write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+            private_dir(dir)?;
+            let path = dir.join(name);
+            let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+            std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+            let sd = Sddl::new(FILE_SDDL).map_err(|e| e.to_string())?;
+            let wide_tmp = wide(&tmp);
+            // SAFETY: a NUL-terminated path; the descriptor lives in `sd`.
+            let ok = unsafe {
+                SetFileSecurityW(
+                    wide_tmp.as_ptr(),
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    sd.psd,
+                )
+            };
+            if ok == 0 {
+                let e = std::io::Error::last_os_error();
+                let _ = std::fs::remove_file(&tmp);
+                return Err(format!("{}: {e}", tmp.display()));
+            }
+            std::fs::rename(&tmp, &path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("{}: {e}", path.display())
+            })
+        }
+    }
+}
+
+/// Tests only: the anchor key under a stand-in the test names itself, below
+/// the person's own hive. A release build has no such switch.
+#[cfg(all(windows, test))]
+pub(crate) mod test_fixture {
+    use std::sync::OnceLock;
+
+    use roomler_node_core::machine_key::{Hive, KeyPath};
+
+    static KEY: OnceLock<KeyPath> = OnceLock::new();
+
+    /// The anchor key is `<parent>\ExecService` below `hive` for the rest of
+    /// this test process. One stand-in per process.
+    pub fn anchor_key_is(hive: Hive, parent: &str) {
+        let key = KeyPath {
+            hive,
+            parent: parent.to_string(),
+            name: "ExecService".to_string(),
+        };
+        if let Err(key) = KEY.set(key) {
+            assert_eq!(KEY.get(), Some(&key), "one stand-in per process");
+        }
+    }
+
+    /// The stand-in. A test that names the anchor key without one stops here,
+    /// so no test run ever touches this computer's own key.
+    pub fn key() -> KeyPath {
+        KEY.get()
+            .cloned()
+            .expect("a test named the machine's anchor key without a stand-in")
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -755,6 +1572,8 @@ mod svc {
     const RENEW_CHECK_EVERY: Duration = Duration::from_secs(12 * 60 * 60);
 
     pub async fn run() {
+        // #3737 — before the doorbell, the renewal and the SSH publisher.
+        super::store::copy_legacy_once();
         tokio::spawn(renew_loop());
         // FR-105 — the SSH pipe and the endpoint publisher, beside the
         // doorbell. They serve nothing until an administrator turns the
@@ -803,11 +1622,14 @@ mod svc {
                 version,
                 ssh: crate::ssh_service::served_ceiling(&a),
             },
+            // #3737 — no anchor in the key: when the one-time copy refused
+            // the anchor this device had, or did not finish, the worker logs
+            // why and how back.
             Ok(None) => DoorbellReply::Health {
                 anchored: false,
                 agent_id: None,
                 exec_enabled: false,
-                problem: None,
+                problem: super::store::copy_problem(),
                 version,
                 ssh: None,
             },
@@ -1122,7 +1944,7 @@ mod svc {
             return Ok(());
         }
         current.service_token = renewed.service_token;
-        super::win::store_anchor(&current)?;
+        super::store::store_anchor(&current)?;
         info!("exec-service: credential renewed");
         Ok(())
     }
@@ -1174,8 +1996,36 @@ pub fn parse_ssh_ceiling(
     }
 }
 
+/// #3737 — what the service's health and `anchor status` say when the
+/// one-time copy refused the anchor this device had (`why`), with the way
+/// back.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copy_refused_problem(why: &str) -> String {
+    format!(
+        "the anchor this device had before its upgrade was not copied into the registry key \
+         ({why}); anchor it again from an elevated prompt: {REANCHOR}"
+    )
+}
+
+/// #3737 — what the service's health and `anchor status` say when the
+/// one-time copy started and did not finish (its marker still `pending`):
+/// it never runs again, so the way back is the same.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn copy_unfinished_problem() -> String {
+    format!(
+        "the one-time copy of the anchor this device had before its upgrade did not finish, so \
+         the registry key holds none; anchor it again from an elevated prompt: {REANCHOR}"
+    )
+}
+
+/// The way back for a device whose anchor the service does not use.
+#[cfg_attr(not(windows), allow(dead_code))]
+const REANCHOR: &str =
+    "roomlerd anchor create --server <origin> --token <token> --device <device id> --force";
+
 /// `roomlerd anchor …`. Every action but `status` needs an elevated prompt;
-/// `status` does too, in practice, because the file is Administrators-only.
+/// `status` does too, in practice, because the key is SYSTEM and
+/// Administrators only.
 pub async fn anchor_cli(action: AnchorAction) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
@@ -1193,10 +2043,9 @@ pub async fn anchor_cli(action: AnchorAction) -> anyhow::Result<()> {
 
 #[cfg(windows)]
 mod win {
-    //! Windows: the anchor's DACL rules, the doorbell pipe, elevation.
+    //! Windows: the doorbell pipe, elevation, and the `roomlerd anchor` verbs.
 
     use std::os::windows::ffi::OsStrExt as _;
-    use std::os::windows::fs::MetadataExt as _;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -1210,22 +2059,16 @@ mod win {
         SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-        SetFileSecurityW, WinLocalSystemSid,
+        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
-        FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_WRITE_DATA, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
     };
 
     use super::{Anchor, AnchorAction, DoorbellReply, DoorbellRequest, RingLimiter};
 
-    /// The anchor's directory: Administrators own it, SYSTEM and
-    /// Administrators alone may touch it, inheritance off.
-    const DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-    /// The anchor file itself: the same, explicitly.
-    const FILE_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
     /// The doorbell. SYSTEM owns it (the worker checks), and makes every
     /// instance. Administrators and interactive users may read it and write
     /// data to it (`0x12008b`), and nothing more: not
@@ -1237,9 +2080,9 @@ mod win {
 
     /// A security descriptor from SDDL, and the `SECURITY_ATTRIBUTES` that
     /// hand it to a directory or a pipe instance. Freed on drop.
-    struct Sddl {
+    pub(super) struct Sddl {
         sa: SECURITY_ATTRIBUTES,
-        psd: PSECURITY_DESCRIPTOR,
+        pub(super) psd: PSECURITY_DESCRIPTOR,
     }
 
     // SAFETY: a LocalAlloc'd buffer with no thread affinity; the accept loop
@@ -1247,7 +2090,7 @@ mod win {
     unsafe impl Send for Sddl {}
 
     impl Sddl {
-        fn new(sddl: &str) -> std::io::Result<Self> {
+        pub(super) fn new(sddl: &str) -> std::io::Result<Self> {
             let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
             let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: a NUL-terminated string; `psd` receives a LocalAlloc'd
@@ -1273,7 +2116,7 @@ mod win {
             })
         }
 
-        fn attributes(&mut self) -> *mut SECURITY_ATTRIBUTES {
+        pub(super) fn attributes(&mut self) -> *mut SECURITY_ATTRIBUTES {
             &raw mut self.sa
         }
     }
@@ -1285,7 +2128,7 @@ mod win {
         }
     }
 
-    fn wide(path: &Path) -> Vec<u16> {
+    pub(super) fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1295,124 +2138,6 @@ mod win {
     fn is_well_known(sid: PSID, kind: i32) -> bool {
         // SAFETY: `sid` points into a descriptor that outlives the call.
         !sid.is_null() && unsafe { IsWellKnownSid(sid, kind) } != 0
-    }
-
-    pub fn load_anchor(dir: &Path, path: &Path) -> Result<Option<Anchor>, String> {
-        let Some(text) = read_private(dir, path, "the anchor file", 64 * 1024)? else {
-            return Ok(None);
-        };
-        let anchor: Anchor =
-            serde_json::from_str(&text).map_err(|e| format!("the anchor file: {e}"))?;
-        anchor.validate()?;
-        Ok(Some(anchor))
-    }
-
-    /// Read `path`, a file in the anchor's directory `dir`, if both are
-    /// private: owned by SYSTEM or Administrators and writable by nobody
-    /// else. `Ok(None)` = not there. `what` names it in errors. #3609 — the
-    /// reader moved to `roomler_node_core::machine_tree`, where the machine
-    /// config's check is the same rule (`machine_tree::verdict`).
-    pub(crate) fn read_private(
-        dir: &Path,
-        path: &Path,
-        what: &str,
-        max_len: u64,
-    ) -> Result<Option<String>, String> {
-        roomler_node_core::machine_tree::read_private(dir, path, what, max_len)
-    }
-
-    /// Make the anchor's directory private, or take over the plain directory
-    /// already there: as its maker, a standard user who made it first would
-    /// keep WRITE_DAC whatever its DACL said.
-    fn private_dir(dir: &Path) -> Result<(), String> {
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
-            return Err(format!("{} is a link", link.display()));
-        }
-        let mut sd = Sddl::new(DIR_SDDL).map_err(|e| e.to_string())?;
-        let name = wide(dir);
-        match std::fs::symlink_metadata(dir) {
-            Ok(m) => {
-                if !m.is_dir() || m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(format!("{} is not a plain directory", dir.display()));
-                }
-                // SAFETY: a NUL-terminated path; the descriptor lives in `sd`.
-                let ok = unsafe {
-                    SetFileSecurityW(
-                        name.as_ptr(),
-                        OWNER_SECURITY_INFORMATION
-                            | DACL_SECURITY_INFORMATION
-                            | PROTECTED_DACL_SECURITY_INFORMATION,
-                        sd.psd,
-                    )
-                };
-                if ok == 0 {
-                    return Err(format!(
-                        "{}: {} (if another account made this directory, delete it and \
-                         anchor again)",
-                        dir.display(),
-                        std::io::Error::last_os_error()
-                    ));
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // SAFETY: a NUL-terminated path; the attributes live in `sd`.
-                if unsafe { CreateDirectoryW(name.as_ptr(), sd.attributes()) } == 0 {
-                    return Err(format!(
-                        "{}: {}",
-                        dir.display(),
-                        std::io::Error::last_os_error()
-                    ));
-                }
-                Ok(())
-            }
-            Err(e) => Err(format!("{}: {e}", dir.display())),
-        }
-    }
-
-    /// Write the anchor: into a private directory, through a temporary file
-    /// given the file's own DACL before it takes the name.
-    pub fn store_anchor(anchor: &Anchor) -> Result<(), String> {
-        anchor.validate()?;
-        let text = serde_json::to_string_pretty(anchor).map_err(|e| e.to_string())?;
-        write_private("anchor.json", text.as_bytes())
-    }
-
-    /// Write `bytes` as `name` in the anchor's directory, made private first,
-    /// through a temporary file given the file's own DACL before it takes the
-    /// name. The directory's inherited DACL already admits only SYSTEM and
-    /// Administrators, so not even the temporary file is ever readable by
-    /// anyone else (FR-105's host key is a private key).
-    pub(crate) fn write_private(name: &str, bytes: &[u8]) -> Result<(), String> {
-        let dir = super::anchor_dir();
-        private_dir(&dir)?;
-        let path = dir.join(name);
-        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        let sd = Sddl::new(FILE_SDDL).map_err(|e| e.to_string())?;
-        let name = wide(&tmp);
-        // SAFETY: a NUL-terminated path; the descriptor lives in `sd`.
-        let ok = unsafe {
-            SetFileSecurityW(
-                name.as_ptr(),
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION,
-                sd.psd,
-            )
-        };
-        if ok == 0 {
-            let e = std::io::Error::last_os_error();
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("{}: {e}", tmp.display()));
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{}: {e}", path.display())
-        })
     }
 
     /// Is this process elevated (or SYSTEM)? Only such a process may write
@@ -1619,7 +2344,7 @@ mod win {
             AnchorAction::Status => status(),
             AnchorAction::Ssh { ceiling } => {
                 require_elevated()?;
-                let mut anchor = load_anchor(&super::anchor_dir(), &super::anchor_path())
+                let mut anchor = super::load_anchor()
                     .map_err(anyhow::Error::msg)?
                     .ok_or_else(|| anyhow::anyhow!("this device is not anchored"))?;
                 anchor.ssh = ceiling;
@@ -1629,7 +2354,7 @@ mod win {
                 if ceiling != roomler_ai_remote_control::models::SshServiceCeiling::Off {
                     super::ensure_host_key().map_err(anyhow::Error::msg)?;
                 }
-                store_anchor(&anchor).map_err(anyhow::Error::msg)?;
+                super::store::store_anchor(&anchor).map_err(anyhow::Error::msg)?;
                 println!(
                     "SSH through the SYSTEM service is now {} on this device.\n\
                      The service publishes it to the server within a minute; nothing needs \
@@ -1642,11 +2367,11 @@ mod win {
             }
             AnchorAction::Exec { on } => {
                 require_elevated()?;
-                let mut anchor = load_anchor(&super::anchor_dir(), &super::anchor_path())
+                let mut anchor = super::load_anchor()
                     .map_err(anyhow::Error::msg)?
                     .ok_or_else(|| anyhow::anyhow!("this device is not anchored"))?;
                 anchor.exec_enabled = on;
-                store_anchor(&anchor).map_err(anyhow::Error::msg)?;
+                super::store::store_anchor(&anchor).map_err(anyhow::Error::msg)?;
                 println!(
                     "Remote execution through the SYSTEM service is now {} on this device.",
                     if on { "ON" } else { "OFF" }
@@ -1655,13 +2380,9 @@ mod win {
             }
             AnchorAction::Remove => {
                 require_elevated()?;
-                match std::fs::remove_file(super::anchor_path()) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        println!("This device was not anchored.");
-                        return Ok(());
-                    }
-                    Err(e) => return Err(e.into()),
+                if !super::store::remove().map_err(anyhow::Error::msg)? {
+                    println!("This device was not anchored.");
+                    return Ok(());
                 }
                 println!(
                     "The anchor is gone from this machine: commands go to the worker again \
@@ -1720,9 +2441,7 @@ mod win {
         if anchored.agent_id != device {
             anyhow::bail!("the server anchored a different device than asked; nothing written");
         }
-        let replaced = load_anchor(&super::anchor_dir(), &super::anchor_path())
-            .ok()
-            .flatten();
+        let replaced = super::load_anchor().ok().flatten();
         // FR-105 — an administrator re-anchoring the SAME device (a fresh
         // credential, a re-run wizard) keeps the SSH ceiling an administrator
         // chose for it; any other device starts off.
@@ -1733,10 +2452,8 @@ mod win {
                 .map(|old| old.ssh)
                 .unwrap_or_default()
         });
-        #[cfg(feature = "ssh-server")]
-        if ssh != roomler_ai_remote_control::models::SshServiceCeiling::Off {
-            super::ensure_host_key().map_err(anyhow::Error::msg)?;
-        }
+        // The host key, when `ssh` is above off, is made by `anchor_created`
+        // below, after the copy's marker and before the anchor.
         let anchor = Anchor {
             version: super::ANCHOR_VERSION,
             server: server.clone(),
@@ -1749,7 +2466,7 @@ mod win {
             ssh,
             extra: Default::default(),
         };
-        store_anchor(&anchor).map_err(anyhow::Error::msg)?;
+        super::store::anchor_created(&anchor).map_err(anyhow::Error::msg)?;
         if let Some(old) = replaced {
             println!(
                 "Replaced the anchor for device {} ({}).",
@@ -1772,7 +2489,7 @@ mod win {
     }
 
     fn status() -> anyhow::Result<()> {
-        match load_anchor(&super::anchor_dir(), &super::anchor_path()) {
+        match super::load_anchor() {
             Ok(Some(a)) => {
                 let expires = super::token_expiry(&a.service_token)
                     .and_then(|exp| chrono::DateTime::from_timestamp(exp, 0))
@@ -1801,11 +2518,16 @@ mod win {
             }
             Ok(None) => {
                 println!("This device is not anchored for SYSTEM exec.");
+                // #3737 — and why, when the upgrade's copy refused one or did
+                // not finish.
+                if let Some(problem) = super::store::copy_problem() {
+                    println!("Note: {problem}");
+                }
                 Ok(())
             }
             Err(e) if !process_is_elevated() => anyhow::bail!(
-                "could not read the anchor ({e}); it is Administrators-only, so run this \
-                 elevated"
+                "could not read the anchor ({e}); it is SYSTEM and Administrators only, so run \
+                 this elevated"
             ),
             Err(e) => anyhow::bail!("the anchor here cannot be trusted: {e}"),
         }
@@ -2047,26 +2769,1151 @@ mod tests {
         panic!("{why}")
     }
 
-    /// `%ProgramData%` lets a standard user create folders, so an anchor
-    /// is trusted only from a directory and a file owned by SYSTEM or
-    /// Administrators that grant nobody else write. A folder an ordinary
-    /// account made, holding a well-formed anchor, is refused: by its owner
-    /// when this runs unelevated, by its inherited user-writable DACL when it
+    /// The one-time copy reads the anchor's first home through FR-94's
+    /// reader, which takes a file only from a folder and a file owned by
+    /// SYSTEM or Administrators that give no other account write. A folder an
+    /// ordinary account made, holding a well-formed anchor, is refused: by its
+    /// owner when this runs unelevated, by its inherited writable DACL when it
     /// runs elevated (Administrators then own it). Either way, never read.
     #[cfg(windows)]
     #[test]
-    fn an_anchor_in_a_folder_a_user_made_is_never_trusted() {
+    fn a_legacy_anchor_in_a_folder_a_user_made_is_never_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("anchor.json");
         std::fs::write(&path, serde_json::to_string(&anchor()).unwrap()).unwrap();
-        let err = win::load_anchor(dir.path(), &path).unwrap_err();
+        let err = legacy::read_at(dir.path(), "anchor.json").unwrap_err();
         assert!(err.contains("SYSTEM or Administrators"), "{err}");
-        // And no file is not an error: nothing to trust.
+        // And no folder or no file is not an error: nothing to trust.
         let empty = tempfile::tempdir().unwrap();
-        let missing = empty.path().join("anchor.json");
         assert!(matches!(
-            win::load_anchor(&empty.path().join("nope"), &missing),
+            legacy::read_at(&empty.path().join("nope"), "anchor.json"),
             Ok(None)
         ));
+    }
+
+    /// R3 — the one-time copy takes only the folder and the file exactly as
+    /// `roomlerd anchor create` left them (every build wrote `O:BA` and a
+    /// protected DACL of SYSTEM and Administrators alone), and only an anchor
+    /// at an https origin: a loopback origin is a lab's.
+    #[test]
+    fn only_the_shape_anchor_create_leaves_is_copied() {
+        use roomler_node_core::machine_tree::{
+            ACE_ALLOW, ADMINISTRATORS, Ace, CONTAINER_INHERIT, FULL, INHERITED, OBJECT_INHERIT,
+            READ_EXECUTE, SYSTEM, Sd,
+        };
+        const USERS: &str = "S-1-5-32-545";
+        let ace = |flags: u8, mask: u32, sid: &str| Ace {
+            kind: ACE_ALLOW,
+            flags,
+            mask,
+            sid: sid.into(),
+        };
+        let oici = OBJECT_INHERIT | CONTAINER_INHERIT;
+        let folder = Sd {
+            owner: ADMINISTRATORS.into(),
+            protected: true,
+            dacl: Some(vec![
+                ace(oici, FULL, SYSTEM),
+                ace(oici, FULL, ADMINISTRATORS),
+            ]),
+        };
+        let file = Sd {
+            owner: ADMINISTRATORS.into(),
+            protected: true,
+            dacl: Some(vec![ace(0, FULL, SYSTEM), ace(0, FULL, ADMINISTRATORS)]),
+        };
+        let with = |sd: &Sd, change: &dyn Fn(&mut Sd)| {
+            let mut sd = sd.clone();
+            change(&mut sd);
+            sd
+        };
+        assert!(legacy_shape_ok(&folder, &file), "what anchor create leaves");
+        assert!(
+            legacy_shape_ok(
+                &with(&folder, &|s| s.dacl.as_mut().unwrap().reverse()),
+                &file
+            ),
+            "the same two entries in the other order"
+        );
+        let refused: [(&str, Sd, Sd); 11] = [
+            (
+                "a folder SYSTEM owns",
+                with(&folder, &|s| s.owner = SYSTEM.into()),
+                file.clone(),
+            ),
+            (
+                "a file SYSTEM owns",
+                folder.clone(),
+                with(&file, &|s| s.owner = SYSTEM.into()),
+            ),
+            (
+                "a third entry on the folder",
+                with(&folder, &|s| {
+                    s.dacl
+                        .as_mut()
+                        .unwrap()
+                        .push(ace(oici, READ_EXECUTE, USERS))
+                }),
+                file.clone(),
+            ),
+            (
+                "a third entry on the file",
+                folder.clone(),
+                with(&file, &|s| {
+                    s.dacl.as_mut().unwrap().push(ace(0, READ_EXECUTE, USERS))
+                }),
+            ),
+            (
+                "a folder that inherits",
+                with(&folder, &|s| s.protected = false),
+                file.clone(),
+            ),
+            (
+                "a file that inherits",
+                folder.clone(),
+                with(&file, &|s| s.protected = false),
+            ),
+            (
+                "the file with the folder's inheritance flags",
+                folder.clone(),
+                with(&file, &|s| {
+                    s.dacl = Some(vec![
+                        ace(oici, FULL, SYSTEM),
+                        ace(oici, FULL, ADMINISTRATORS),
+                    ])
+                }),
+            ),
+            (
+                "a folder that hands nothing down",
+                with(&folder, &|s| {
+                    s.dacl = Some(vec![ace(0, FULL, SYSTEM), ace(0, FULL, ADMINISTRATORS)])
+                }),
+                file.clone(),
+            ),
+            (
+                "inherited entries",
+                folder.clone(),
+                with(&file, &|s| {
+                    s.dacl = Some(vec![
+                        ace(INHERITED, FULL, SYSTEM),
+                        ace(INHERITED, FULL, ADMINISTRATORS),
+                    ])
+                }),
+            ),
+            (
+                "Administrators with less than full control",
+                folder.clone(),
+                with(&file, &|s| s.dacl.as_mut().unwrap()[1].mask = READ_EXECUTE),
+            ),
+            (
+                "a NULL DACL",
+                folder.clone(),
+                with(&file, &|s| s.dacl = None),
+            ),
+        ];
+        for (case, folder, file) in &refused {
+            assert!(!legacy_shape_ok(folder, file), "{case}");
+        }
+        assert_eq!(copyable(&anchor()), Ok(()));
+        for origin in [
+            "http://127.0.0.1:5001",
+            "http://localhost:3000",
+            "http://[::1]:3000",
+        ] {
+            let mut a = anchor();
+            a.server = origin.into();
+            assert!(copyable(&a).is_err(), "{origin}");
+        }
+        let mut a = anchor();
+        a.agent_id = "nope".into();
+        assert!(copyable(&a).is_err(), "a malformed anchor");
+    }
+
+    /// No origin on this machine is copied, over https or not: a loopback
+    /// name or address, a name below `.localhost`, an IPv4 loopback address
+    /// written as IPv6, or an unspecified address.
+    #[test]
+    fn no_origin_on_this_machine_is_copyable() {
+        for origin in [
+            "https://localhost",
+            "https://localhost:8443",
+            "https://LOCALHOST.",
+            "https://app.localhost",
+            "https://127.0.0.1:5001",
+            "https://127.1",
+            "https://[::1]:3000",
+            "https://[::ffff:127.0.0.1]",
+            "https://0.0.0.0",
+            "https://[::]",
+        ] {
+            let mut a = anchor();
+            a.server = origin.into();
+            assert!(copyable(&a).is_err(), "{origin}");
+        }
+        assert_eq!(copyable(&anchor()), Ok(()));
+    }
+
+    /// R4-R9 — where the anchor lives on a machine, each case in a child
+    /// process of this test binary. A case names its own stand-ins for the
+    /// machine's `%ProgramData%` (#3702's `program_data_is`) and for
+    /// `HKLM\SOFTWARE` (an HKCU key the parent makes before and removes
+    /// after, with `Roomler` below it), which are process-wide. Only an
+    /// elevated token sets Administrators as an owner, so a case says so and
+    /// stops unelevated, and fails in CI's elevated lane.
+    #[cfg(windows)]
+    mod on_the_machine {
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use roomler_node_core::machine_key::test_support as keys;
+        use roomler_node_core::machine_key::{Hive, KeyPath};
+        use roomler_node_core::machine_tree::ADMINISTRATORS;
+        use roomler_node_core::machine_tree::test_support::{
+            aces, between_check_and_use, elevated_or_skip, junction, me, owner, program_data,
+            protected, set_dacl,
+        };
+
+        use super::super::{Anchor, legacy, load_anchor, load_host_key, store};
+        use super::anchor;
+
+        const ROOT: &str = "ROOMLERD_TEST_EXEC_ANCHOR_ROOT";
+        const KEY: &str = "ROOMLERD_TEST_EXEC_ANCHOR_KEY";
+        const CHECKED: &str = "exec-anchor case: checked";
+        /// What the writer makes.
+        const SEALED: &str = "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)";
+        /// The sealed key with Users' full control added, as an administrator
+        /// troubleshooting it might leave it.
+        const LOOSE: &str = "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KA;;;BU)";
+        /// `HKLM\SOFTWARE`'s own entries, protected here: what a parent made
+        /// below its stand-in inherits.
+        const SOFTWARE: &str = "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)(A;CIIO;KA;;;CO)";
+        /// Where every case's stand-in keys live, below the person's own hive.
+        const SCRATCH: &str = r"Software\RoomlerTest";
+        const HOST_KEY: &str = "test-only host key, not a key";
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+        /// Removes the case's stand-in keys whatever the child did, and the
+        /// scratch key above them when no other case still uses it.
+        struct Cleanup(String);
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                keys::remove_tree(Hive::CurrentUser, &self.0);
+                keys::remove_if_empty(Hive::CurrentUser, SCRATCH);
+            }
+        }
+
+        /// The parent's half: an elevated token, a stand-in `%ProgramData%`
+        /// whose machine folder inherits what `%ProgramData%` hands Users (an
+        /// attended host's), and a stand-in for `HKLM\SOFTWARE\Roomler` as a
+        /// machine has it; then the case `name` in a child, which must say it
+        /// ran.
+        fn run(name: &str, case: &str) {
+            run_case(name, case, Some(keys::PARENT_SDDL), None);
+        }
+
+        /// [`run`], with the parent stand-in made with `parent_sddl` (`None`:
+        /// not made, so the writer makes it below the stand-in for
+        /// `HKLM\SOFTWARE`), and the copy's switch set to `switch` in the
+        /// child (`None`: not set).
+        fn run_case(name: &str, case: &str, parent_sddl: Option<&str>, switch: Option<&str>) {
+            if !elevated_or_skip(case) {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let program_data = program_data(root.path());
+            std::fs::create_dir_all(program_data.join("roomler").join("roomler")).unwrap();
+            keys::ensure(Hive::CurrentUser, SCRATCH);
+            let sub = format!(
+                r"{SCRATCH}\exec-anchor-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::SeqCst)
+            );
+            keys::make(Hive::CurrentUser, &sub, SOFTWARE);
+            let _cleanup = Cleanup(sub.clone());
+            if let Some(sddl) = parent_sddl {
+                keys::make(Hive::CurrentUser, &format!(r"{sub}\Roomler"), sddl);
+            }
+            let module = module_path!();
+            let test = format!(
+                "{}::{name}",
+                module.split_once("::").map_or(module, |(_, rest)| rest)
+            );
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+                .env(ROOT, root.path())
+                .env(KEY, &sub)
+                .env_remove(super::super::COPY_SWITCH_ENV);
+            if let Some(value) = switch {
+                child.env(super::super::COPY_SWITCH_ENV, value);
+            }
+            let out = child.output().unwrap();
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{said}");
+            assert!(said.contains(CHECKED), "the child ran the case: {said}");
+        }
+
+        /// The child's half: both stand-ins, before anything names the machine
+        /// tree or the key. `None` in the parent.
+        fn child() -> Option<KeyPath> {
+            let root = PathBuf::from(std::env::var_os(ROOT)?);
+            roomler_node_core::appdirs::test_fixture::program_data_is(root.join("ProgramData"));
+            crate::exec_service::test_fixture::anchor_key_is(
+                Hive::CurrentUser,
+                &format!(r"{}\Roomler", software()),
+            );
+            Some(crate::exec_service::test_fixture::key())
+        }
+
+        /// In a case: the stand-in for `HKLM\SOFTWARE`, which holds the parent
+        /// stand-in and whatever else the case makes.
+        fn software() -> String {
+            std::env::var(KEY).expect("the stand-in key")
+        }
+
+        /// In a case: a folder beside the stand-in `%ProgramData%`, which
+        /// nothing roomlerd names.
+        fn elsewhere() -> PathBuf {
+            PathBuf::from(std::env::var_os(ROOT).expect("in a case")).join("elsewhere")
+        }
+
+        fn sub(key: &KeyPath) -> String {
+            format!("{}\\{}", key.parent, key.name)
+        }
+
+        /// From here on what this process makes is owned by its own account,
+        /// as with the "Default owner for objects created by members of the
+        /// Administrators group: Object creator" policy, not by
+        /// Administrators.
+        fn objects_owned_by_this_account() {
+            use windows_sys::Win32::Security::{
+                SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+                TokenOwner, TokenUser,
+            };
+            let token = crate::win_token::own_token(TOKEN_QUERY | TOKEN_ADJUST_DEFAULT)
+                .expect("this process's token");
+            let user = crate::win_token::token_info(token.raw(), TokenUser).expect("its user");
+            // SAFETY: a TOKEN_USER whose SID lives in `user`, alive across the
+            // call below.
+            let owner = TOKEN_OWNER {
+                Owner: unsafe { (*(user.as_ptr() as *const TOKEN_USER)).User.Sid },
+            };
+            // SAFETY: `owner` and the SID it names outlive the call.
+            let ok = unsafe {
+                SetTokenInformation(
+                    token.raw(),
+                    TokenOwner,
+                    (&raw const owner).cast(),
+                    std::mem::size_of::<TOKEN_OWNER>() as u32,
+                )
+            };
+            assert_ne!(
+                ok, 0,
+                "this account as the owner of what this process makes"
+            );
+        }
+
+        /// The key is the one the writer makes: Administrators', SYSTEM and
+        /// Administrators alone, not inheriting.
+        fn sealed_here(key: &KeyPath) -> Result<(), String> {
+            let sddl = keys::sddl(Hive::CurrentUser, &sub(key));
+            let mut got = aces(&sddl);
+            got.sort();
+            if owner(&sddl) == "BA" && protected(&sddl) && got == ["A;CI;KA;;;BA", "A;CI;KA;;;SY"] {
+                Ok(())
+            } else {
+                Err(sddl)
+            }
+        }
+
+        /// An anchor where every build before this one kept it, as they wrote
+        /// it: a sealed `exec-service` folder and file in the machine folder.
+        fn write_legacy(anchor: &Anchor) {
+            let text = serde_json::to_string_pretty(anchor).unwrap();
+            legacy::write("anchor.json", text.as_bytes()).expect("the legacy writer");
+        }
+
+        /// R4 — once the first start of this build has run, a well-formed,
+        /// sealed anchor file in an open machine folder is not read: the
+        /// anchor comes from the key alone, and the key holds none.
+        #[test]
+        fn an_anchor_in_the_machine_folder_is_not_read_after_the_copy_ran() {
+            let Some(key) = child() else {
+                return run(
+                    "an_anchor_in_the_machine_folder_is_not_read_after_the_copy_ran",
+                    "R4: an anchor file after the first start",
+                );
+            };
+            write_legacy(&anchor());
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            keys::put(
+                &key,
+                "LegacyCopy",
+                r#"{"at":"2026-11-12T00:00:00Z","outcome":"none"}"#,
+            );
+            assert_eq!(load_anchor(), Ok(None), "the file is not read");
+            println!("{CHECKED}");
+        }
+
+        /// R5 — the first start leaves its marker, and nothing that appears in
+        /// the machine folder after it is copied at a later start.
+        #[test]
+        fn nothing_put_in_the_machine_folder_after_the_first_start_is_ever_copied() {
+            let Some(key) = child() else {
+                return run(
+                    "nothing_put_in_the_machine_folder_after_the_first_start_is_ever_copied",
+                    "R5: an anchor file that appears after the first start",
+                );
+            };
+            store::copy_legacy_once();
+            let marker = keys::get(&key, "LegacyCopy").expect("the first start leaves its marker");
+            assert!(marker.contains(r#""outcome":"none""#), "{marker}");
+            write_legacy(&anchor());
+            store::copy_legacy_once();
+            assert!(
+                !keys::names(&key).iter().any(|n| n == "Anchor"),
+                "nothing is copied at a later start: {:?}",
+                keys::names(&key)
+            );
+            assert_eq!(load_anchor(), Ok(None));
+            println!("{CHECKED}");
+        }
+
+        /// R6 (control) — `anchor create` writes the anchor to the sealed key,
+        /// which the service reads it from, leaves the copy's marker, and
+        /// deletes what an earlier build kept in the machine folder.
+        #[test]
+        fn a_created_anchor_loads_from_the_key_and_leaves_no_file() {
+            let Some(key) = child() else {
+                return run(
+                    "a_created_anchor_loads_from_the_key_and_leaves_no_file",
+                    "R6: a created anchor",
+                );
+            };
+            let mut earlier = anchor();
+            earlier.device_name = "EARLIER".into();
+            write_legacy(&earlier);
+            legacy::write(legacy::HOST_KEY_FILE, HOST_KEY.as_bytes()).unwrap();
+            let a = anchor();
+            store::anchor_created(&a).unwrap();
+            assert_eq!(load_anchor(), Ok(Some(a)), "it loads");
+            assert!(
+                !legacy::anchor_path().exists(),
+                "no anchor file is left in the machine folder"
+            );
+            assert!(
+                !legacy::host_key_path().exists(),
+                "no host key file is left in the machine folder"
+            );
+            assert_eq!(sealed_here(&key), Ok(()));
+            let marker = keys::get(&key, "LegacyCopy").expect("the copy's marker");
+            assert!(marker.contains(r#""outcome":"none""#), "{marker}");
+            println!("{CHECKED}");
+        }
+
+        /// R7 (control) — an upgrade copies an anchor in the exact shape every
+        /// build wrote, whole, with its host key, once, and leaves the file
+        /// for a rollback.
+        #[test]
+        fn an_upgrade_copies_a_real_anchor_once_and_keeps_the_file() {
+            let Some(key) = child() else {
+                return run(
+                    "an_upgrade_copies_a_real_anchor_once_and_keeps_the_file",
+                    "R7: an upgrade with an anchor",
+                );
+            };
+            let mut a = anchor();
+            a.extra.insert(
+                "written_by_a_newer_build".into(),
+                serde_json::json!({ "kept": true }),
+            );
+            write_legacy(&a);
+            legacy::write(legacy::HOST_KEY_FILE, HOST_KEY.as_bytes()).unwrap();
+            store::copy_legacy_once();
+            let copied: Anchor =
+                serde_json::from_str(&keys::get(&key, "Anchor").expect("the anchor was copied"))
+                    .unwrap();
+            assert_eq!(copied, a, "the whole anchor, a newer build's keys included");
+            assert_eq!(
+                keys::get(&key, "SshHostKey").as_deref(),
+                Some(HOST_KEY),
+                "the host key with it"
+            );
+            let marker: serde_json::Value =
+                serde_json::from_str(&keys::get(&key, "LegacyCopy").expect("the marker")).unwrap();
+            assert_eq!(marker["outcome"], "copied", "{marker}");
+            assert_eq!(marker["agent_id"], a.agent_id.as_str(), "{marker}");
+            assert_eq!(marker["anchored_at"], a.anchored_at.as_str(), "{marker}");
+            assert!(
+                legacy::anchor_path().exists(),
+                "the file stays, for a rollback"
+            );
+            assert_eq!(load_anchor(), Ok(Some(a.clone())));
+            assert_eq!(sealed_here(&key), Ok(()));
+            let mut later = a.clone();
+            later.device_name = "LATER".into();
+            write_legacy(&later);
+            store::copy_legacy_once();
+            assert_eq!(
+                load_anchor(),
+                Ok(Some(a)),
+                "a later start copies nothing, whatever the file says now"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// R8 — a key that fails the check (one more entry, for Users' read)
+        /// is made again before an administrator's write: the sealed owner
+        /// and DACL, and nothing it held before.
+        #[test]
+        fn a_key_that_fails_the_verdict_is_taken_over_and_emptied() {
+            let Some(key) = child() else {
+                return run(
+                    "a_key_that_fails_the_verdict_is_taken_over_and_emptied",
+                    "R8: a key that fails the check",
+                );
+            };
+            keys::make(
+                Hive::CurrentUser,
+                &sub(&key),
+                "O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;0x1;;;BU)",
+            );
+            keys::put(&key, "SshHostKey", "a value roomlerd never wrote");
+            let refused = load_anchor().expect_err("the reader refuses a key Users may read");
+            assert!(refused.contains("read what it holds"), "{refused}");
+            let a = anchor();
+            store::store_anchor(&a).unwrap();
+            assert_eq!(sealed_here(&key), Ok(()));
+            assert_eq!(
+                keys::names(&key),
+                ["Anchor"],
+                "nothing the key held before is kept"
+            );
+            assert_eq!(load_anchor(), Ok(Some(a)));
+            println!("{CHECKED}");
+        }
+
+        /// R9 — `anchor remove` takes the anchor and the host key out of the
+        /// key and deletes the files an earlier build kept, and keeps the
+        /// copy's marker, so nothing is ever copied again.
+        #[test]
+        fn anchor_remove_takes_the_key_values_and_the_legacy_file() {
+            let Some(key) = child() else {
+                return run(
+                    "anchor_remove_takes_the_key_values_and_the_legacy_file",
+                    "R9: anchor remove",
+                );
+            };
+            let a = anchor();
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            keys::put(&key, "SshHostKey", HOST_KEY);
+            keys::put(&key, "Anchor", &serde_json::to_string(&a).unwrap());
+            keys::put(
+                &key,
+                "LegacyCopy",
+                r#"{"at":"2026-11-12T00:00:00Z","outcome":"copied"}"#,
+            );
+            write_legacy(&a);
+            legacy::write(legacy::HOST_KEY_FILE, HOST_KEY.as_bytes()).unwrap();
+            assert_eq!(store::remove(), Ok(true));
+            assert_eq!(
+                keys::names(&key),
+                ["LegacyCopy"],
+                "the marker stays, so nothing is copied again"
+            );
+            assert!(!legacy::anchor_path().exists(), "no anchor file is left");
+            assert!(
+                !legacy::host_key_path().exists(),
+                "no host key file is left"
+            );
+            assert_eq!(load_anchor(), Ok(None));
+            assert_eq!(store::remove(), Ok(false), "a second remove finds nothing");
+            println!("{CHECKED}");
+        }
+
+        /// The copy refuses an anchor file whose DACL is not the exact one
+        /// `anchor create` gave it (one more entry here, Users' read, which
+        /// FR-94's reader alone would take), records why, and the service's
+        /// health and `anchor status` say so with the way back.
+        #[test]
+        fn a_legacy_anchor_in_another_shape_is_refused_and_says_why() {
+            let Some(key) = child() else {
+                return run(
+                    "a_legacy_anchor_in_another_shape_is_refused_and_says_why",
+                    "the copy's exact-shape refusal",
+                );
+            };
+            write_legacy(&anchor());
+            set_dacl(
+                &legacy::anchor_path(),
+                "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)",
+            );
+            assert!(
+                legacy::read_at(&legacy::dir(), legacy::ANCHOR_FILE).is_ok_and(|a| a.is_some()),
+                "FR-94's reader alone takes it"
+            );
+            store::copy_legacy_once();
+            assert!(
+                !keys::names(&key).iter().any(|n| n == "Anchor"),
+                "nothing is copied"
+            );
+            let marker: serde_json::Value =
+                serde_json::from_str(&keys::get(&key, "LegacyCopy").expect("the marker")).unwrap();
+            assert_eq!(marker["outcome"], "refused", "{marker}");
+            let problem = store::copy_problem().expect("the refusal is reported");
+            assert!(problem.contains("exact owner and DACL"), "{problem}");
+            assert!(problem.contains("roomlerd anchor create"), "{problem}");
+            assert_eq!(load_anchor(), Ok(None));
+            assert!(legacy::anchor_path().exists(), "the file stays");
+            println!("{CHECKED}");
+        }
+
+        /// `ROOMLERD_EXEC_ANCHOR_COPY=0` in the service's environment: the
+        /// first start copies nothing, and records why.
+        #[test]
+        fn the_copy_switch_copies_nothing() {
+            let Some(key) = child() else {
+                return run_case(
+                    "the_copy_switch_copies_nothing",
+                    "the copy's switch",
+                    Some(keys::PARENT_SDDL),
+                    Some("0"),
+                );
+            };
+            write_legacy(&anchor());
+            store::copy_legacy_once();
+            assert!(
+                !keys::names(&key).iter().any(|n| n == "Anchor"),
+                "nothing is copied"
+            );
+            let marker: serde_json::Value =
+                serde_json::from_str(&keys::get(&key, "LegacyCopy").expect("the marker")).unwrap();
+            assert_eq!(marker["outcome"], "refused", "{marker}");
+            assert!(
+                marker["why"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("switched off")),
+                "{marker}"
+            );
+            assert_eq!(load_anchor(), Ok(None));
+            println!("{CHECKED}");
+        }
+
+        /// A parent that hands Users a right to change a key made below it
+        /// fails closed: the reader refuses the key below it, and a writer
+        /// writes nothing there.
+        #[test]
+        fn a_key_below_a_parent_another_account_may_change_is_refused() {
+            let Some(key) = child() else {
+                return run_case(
+                    "a_key_below_a_parent_another_account_may_change_is_refused",
+                    "a parent another account may change",
+                    Some(&format!("{}(A;CIIO;KW;;;BU)", keys::PARENT_SDDL)),
+                    None,
+                );
+            };
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            keys::put(&key, "Anchor", &serde_json::to_string(&anchor()).unwrap());
+            let refused = load_anchor().expect_err("the reader refuses the key");
+            assert!(refused.contains("a key made below it"), "{refused}");
+            assert!(
+                store::store_anchor(&anchor()).is_err(),
+                "the writer writes nothing there"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// Between the folder's check and the first file opened in it, move
+        /// `exec-service` aside and make a junction to `to` in its name. Where
+        /// the folder went.
+        fn swap_for_a_junction_after_the_check(to: &std::path::Path) -> PathBuf {
+            let dir = legacy::dir();
+            let aside = dir.with_file_name("exec-service-aside");
+            let (moved, to) = (aside.clone(), to.to_path_buf());
+            between_check_and_use(move || {
+                std::fs::rename(&dir, &moved).expect("the folder moves aside");
+                junction(&dir, &to);
+            });
+            aside
+        }
+
+        /// `anchor remove` deletes only through the folder it checked:
+        /// when `exec-service` is moved aside and a junction takes its name
+        /// between the check and the delete, nothing the junction leads to is
+        /// deleted, and the file of the folder that was checked is.
+        #[test]
+        fn a_folder_swapped_for_a_junction_after_its_check_loses_nothing_elsewhere() {
+            let Some(_key) = child() else {
+                return run(
+                    "a_folder_swapped_for_a_junction_after_its_check_loses_nothing_elsewhere",
+                    "a folder swapped for a junction after its check",
+                );
+            };
+            write_legacy(&anchor());
+            std::fs::create_dir_all(elsewhere()).unwrap();
+            let bystander = elsewhere().join("anchor.json");
+            std::fs::write(&bystander, b"a file an administrator may delete").unwrap();
+            let aside = swap_for_a_junction_after_the_check(&elsewhere());
+            let _ = store::remove();
+            assert!(
+                bystander.exists(),
+                "nothing the junction leads to is deleted"
+            );
+            assert!(
+                !aside.join("anchor.json").exists(),
+                "the file of the folder that was checked is deleted"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// Only a folder and a file each in exactly the shape `anchor
+        /// create` gave them lose a file: a folder made another way, or a
+        /// file with another DACL in the exact folder, is left, whatever its
+        /// name.
+        #[test]
+        fn only_a_folder_and_a_file_in_the_exact_shape_lose_a_file() {
+            let Some(_key) = child() else {
+                return run(
+                    "only_a_folder_and_a_file_in_the_exact_shape_lose_a_file",
+                    "a folder or a file in another shape",
+                );
+            };
+            // A folder made here: it inherits the open machine folder's entries.
+            std::fs::create_dir(legacy::dir()).unwrap();
+            std::fs::write(legacy::anchor_path(), b"no anchor create wrote this").unwrap();
+            std::fs::write(legacy::host_key_path(), HOST_KEY).unwrap();
+            store::anchor_created(&anchor()).unwrap();
+            let _ = store::remove();
+            assert!(
+                legacy::anchor_path().exists(),
+                "a folder in another shape keeps its anchor file"
+            );
+            assert!(
+                legacy::host_key_path().exists(),
+                "a folder in another shape keeps its host key file"
+            );
+            std::fs::remove_file(legacy::anchor_path()).unwrap();
+            std::fs::remove_file(legacy::host_key_path()).unwrap();
+            std::fs::remove_dir(legacy::dir()).unwrap();
+            // The exact folder, holding files in another shape.
+            write_legacy(&anchor());
+            set_dacl(
+                &legacy::anchor_path(),
+                "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)",
+            );
+            std::fs::write(legacy::host_key_path(), HOST_KEY).unwrap();
+            store::anchor_created(&anchor()).unwrap();
+            let _ = store::remove();
+            assert!(
+                legacy::anchor_path().exists(),
+                "a file with one more entry is left"
+            );
+            assert!(
+                legacy::host_key_path().exists(),
+                "a file that inherits its entries is left"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// A junction at `exec-service` is never followed: `anchor
+        /// create` and `anchor remove` delete nothing it leads to, even files
+        /// in the exact shape.
+        #[test]
+        fn a_junction_at_exec_service_deletes_nothing() {
+            let Some(_key) = child() else {
+                return run(
+                    "a_junction_at_exec_service_deletes_nothing",
+                    "a junction at exec-service",
+                );
+            };
+            let text = serde_json::to_string_pretty(&anchor()).unwrap();
+            legacy::write_in(&elsewhere(), "anchor.json", text.as_bytes()).unwrap();
+            legacy::write_in(&elsewhere(), legacy::HOST_KEY_FILE, HOST_KEY.as_bytes()).unwrap();
+            junction(&legacy::dir(), &elsewhere());
+            store::anchor_created(&anchor()).unwrap();
+            let _ = store::remove();
+            assert!(
+                elsewhere().join("anchor.json").exists(),
+                "the anchor file the junction leads to stays"
+            );
+            assert!(
+                elsewhere().join(legacy::HOST_KEY_FILE).exists(),
+                "the host key file the junction leads to stays"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// The one-time copy reads the anchor file of the folder it
+        /// checked, below that folder's handle: a junction that takes the
+        /// folder's name after the check brings no other anchor in.
+        #[test]
+        fn the_copy_reads_the_file_of_the_folder_it_checked() {
+            let Some(key) = child() else {
+                return run(
+                    "the_copy_reads_the_file_of_the_folder_it_checked",
+                    "the copy reads below the folder it checked",
+                );
+            };
+            let here = anchor();
+            write_legacy(&here);
+            let mut other = anchor();
+            other.device_name = "ELSEWHERE".into();
+            let text = serde_json::to_string_pretty(&other).unwrap();
+            legacy::write_in(&elsewhere(), "anchor.json", text.as_bytes()).unwrap();
+            swap_for_a_junction_after_the_check(&elsewhere());
+            store::copy_legacy_once();
+            let copied = keys::get(&key, "Anchor")
+                .map(|text| serde_json::from_str::<Anchor>(&text).expect("an anchor"));
+            assert_ne!(
+                copied.as_ref(),
+                Some(&other),
+                "the anchor the junction leads to is never copied"
+            );
+            assert_eq!(copied, Some(here), "the checked folder's anchor is");
+            println!("{CHECKED}");
+        }
+
+        /// A registry link at the anchor key, or at its parent, is
+        /// refused by the reader and by every writer, and nothing changes
+        /// where it leads.
+        #[test]
+        fn a_registry_link_at_the_anchor_key_or_its_parent_is_refused() {
+            let Some(key) = child() else {
+                return run(
+                    "a_registry_link_at_the_anchor_key_or_its_parent_is_refused",
+                    "a registry link",
+                );
+            };
+            let a = anchor();
+            let mut b = anchor();
+            b.device_name = "THROUGH-A-LINK".into();
+            let held = |path: &KeyPath| {
+                (
+                    keys::names(path),
+                    keys::sddl(Hive::CurrentUser, &sub(path)),
+                    keys::get(path, "Anchor"),
+                )
+            };
+            let refused_everywhere = |what: &str| {
+                assert!(load_anchor().is_err(), "the reader refuses {what}");
+                assert!(store::store_anchor(&b).is_err(), "a writer refuses {what}");
+                assert!(
+                    store::anchor_created(&b).is_err(),
+                    "anchor create refuses {what}"
+                );
+                assert!(store::remove().is_err(), "anchor remove refuses {what}");
+                store::copy_legacy_once();
+            };
+
+            // The key a link to a sealed key that holds an anchor.
+            let target = KeyPath {
+                hive: Hive::CurrentUser,
+                parent: software(),
+                name: "Target".into(),
+            };
+            keys::make(Hive::CurrentUser, &sub(&target), SEALED);
+            keys::put(&target, "Anchor", &serde_json::to_string(&a).unwrap());
+            keys::link(
+                Hive::CurrentUser,
+                &sub(&key),
+                &keys::kernel_name(Hive::CurrentUser, &sub(&target)),
+            );
+            let before = held(&target);
+            refused_everywhere("a key that is a link");
+            assert_eq!(held(&target), before, "nothing changes where it leads");
+
+            // The parent a link to one that holds a sealed key with an anchor.
+            keys::remove_tree(Hive::CurrentUser, &key.parent);
+            let real = KeyPath {
+                hive: Hive::CurrentUser,
+                parent: format!(r"{}\RealParent", software()),
+                name: "ExecService".into(),
+            };
+            keys::make(Hive::CurrentUser, &real.parent, keys::PARENT_SDDL);
+            keys::make(Hive::CurrentUser, &sub(&real), SEALED);
+            keys::put(&real, "Anchor", &serde_json::to_string(&a).unwrap());
+            keys::link(
+                Hive::CurrentUser,
+                &key.parent,
+                &keys::kernel_name(Hive::CurrentUser, &real.parent),
+            );
+            let before = held(&real);
+            refused_everywhere("a parent that is a link");
+            assert_eq!(held(&real), before, "nothing changes where it leads");
+            println!("{CHECKED}");
+        }
+
+        /// A key that fails the check is deleted and made again, sealed,
+        /// before an administrator's write: a handle opened while it was loose
+        /// writes nothing the service reads, nothing the key held is kept (a
+        /// value whose name holds a NUL included), and its `LegacyCopy` is.
+        #[test]
+        fn a_loosened_key_is_made_again_keeping_only_its_marker() {
+            let Some(key) = child() else {
+                return run(
+                    "a_loosened_key_is_made_again_keeping_only_its_marker",
+                    "a loosened key taken over",
+                );
+            };
+            keys::make(Hive::CurrentUser, &sub(&key), LOOSE);
+            let marker = r#"{"at":"2026-11-12T00:00:00Z","outcome":"copied","agent_id":"6ace07367d06cf41e19e54b0","anchored_at":"2026-10-13T12:00:00Z"}"#;
+            keys::put(&key, "LegacyCopy", marker);
+            keys::put(&key, "SshHostKey", "a value roomlerd never wrote");
+            let nul_name: Vec<u16> = "Stray\u{0}Name".encode_utf16().collect();
+            keys::put_raw(&key, &nul_name, "a value whose name holds a NUL");
+            let held = keys::opened(&key).expect("a handle opened while the key is loose");
+            let a = anchor();
+            store::store_anchor(&a).unwrap();
+            let mut theirs = anchor();
+            theirs.server = "https://elsewhere.example".into();
+            let wrote = held.write("Anchor", &serde_json::to_string(&theirs).unwrap());
+            assert!(
+                wrote.is_err(),
+                "a handle opened while the key was loose writes nothing: {wrote:?}"
+            );
+            assert_eq!(load_anchor(), Ok(Some(a)));
+            assert_eq!(sealed_here(&key), Ok(()));
+            assert_eq!(
+                keys::names(&key),
+                ["Anchor", "LegacyCopy"],
+                "nothing else the key held is kept"
+            );
+            assert_eq!(
+                keys::value_count(&key),
+                2,
+                "no value of the loose key is kept, whatever its name"
+            );
+            assert_eq!(
+                keys::get(&key, "LegacyCopy").as_deref(),
+                Some(marker),
+                "the copy's marker is kept"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// A takeover stopped after any of its steps leaves the key
+        /// refused, gone or empty: never sealed around a value the loose key
+        /// held.
+        #[test]
+        fn a_takeover_stopped_midway_leaves_nothing_trusted() {
+            let Some(key) = child() else {
+                return run(
+                    "a_takeover_stopped_midway_leaves_nothing_trusted",
+                    "a takeover stopped midway",
+                );
+            };
+            let a = anchor();
+            let mut theirs = anchor();
+            theirs.server = "https://elsewhere.example".into();
+            for step in 1..=3 {
+                keys::remove_tree(Hive::CurrentUser, &sub(&key));
+                keys::make(Hive::CurrentUser, &sub(&key), LOOSE);
+                keys::put(&key, "Anchor", &serde_json::to_string(&theirs).unwrap());
+                keys::put(&key, "SshHostKey", "a value roomlerd never wrote");
+                keys::stop_takeover_after(step);
+                let wrote = store::store_anchor(&a);
+                keys::stop_takeover_after(0);
+                let read = load_anchor();
+                assert!(
+                    !matches!(&read, Ok(Some(got)) if *got != a),
+                    "stopped after step {step} ({wrote:?}), the service reads {read:?}"
+                );
+                assert!(
+                    !matches!(load_host_key(), Ok(Some(_))),
+                    "stopped after step {step}, the service reads the loose key's host key"
+                );
+            }
+            println!("{CHECKED}");
+        }
+
+        /// The parent the writer makes is owned by Administrators, also
+        /// for a caller whose new objects its own account owns (the "Object
+        /// creator" default-owner policy), and inherits what the key above it
+        /// hands down.
+        #[test]
+        fn a_parent_the_writer_makes_is_owned_by_administrators() {
+            let Some(key) = child() else {
+                return run_case(
+                    "a_parent_the_writer_makes_is_owned_by_administrators",
+                    "the parent the writer makes",
+                    None,
+                    None,
+                );
+            };
+            objects_owned_by_this_account();
+            let a = anchor();
+            store::anchor_created(&a).unwrap();
+            assert_eq!(
+                keys::owner_sid(Hive::CurrentUser, &key.parent),
+                ADMINISTRATORS
+            );
+            let parent = keys::sddl(Hive::CurrentUser, &key.parent);
+            assert!(!protected(&parent), "it inherits: {parent}");
+            assert_eq!(load_anchor(), Ok(Some(a)));
+            println!("{CHECKED}");
+        }
+
+        /// `anchor create` gives a parent its caller's own account owns to
+        /// Administrators when nothing else stands in the way. No other writer
+        /// changes an owner, and a parent that also fails for another reason
+        /// is left as it is.
+        #[test]
+        fn anchor_create_gives_a_parent_its_caller_owns_to_administrators() {
+            let Some(key) = child() else {
+                return run_case(
+                    "anchor_create_gives_a_parent_its_caller_owns_to_administrators",
+                    "a parent its caller owns",
+                    Some(&format!(
+                        "O:{}D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KR;;;BU)(A;CIIO;KA;;;CO)",
+                        me()
+                    )),
+                    None,
+                );
+            };
+            let a = anchor();
+            assert!(
+                store::store_anchor(&a).is_err(),
+                "a writer other than anchor create changes no owner"
+            );
+            assert_eq!(keys::owner_sid(Hive::CurrentUser, &key.parent), me());
+            store::anchor_created(&a).unwrap();
+            assert_eq!(
+                keys::owner_sid(Hive::CurrentUser, &key.parent),
+                ADMINISTRATORS
+            );
+            assert_eq!(load_anchor(), Ok(Some(a.clone())));
+            keys::remove_tree(Hive::CurrentUser, &key.parent);
+            keys::make(
+                Hive::CurrentUser,
+                &key.parent,
+                &format!("O:{}D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CI;KW;;;BU)", me()),
+            );
+            assert!(
+                store::anchor_created(&a).is_err(),
+                "a parent Users may change too is refused"
+            );
+            assert_eq!(
+                keys::owner_sid(Hive::CurrentUser, &key.parent),
+                me(),
+                "and keeps its owner"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// A copy that did not finish (its marker still `pending`) is
+        /// reported with the way back, as a refused one is; with an anchor in
+        /// the key there is nothing to report.
+        #[test]
+        fn a_copy_that_did_not_finish_is_reported() {
+            let Some(key) = child() else {
+                return run(
+                    "a_copy_that_did_not_finish_is_reported",
+                    "a copy that did not finish",
+                );
+            };
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            keys::put(
+                &key,
+                "LegacyCopy",
+                r#"{"at":"2026-11-12T00:00:00Z","outcome":"pending"}"#,
+            );
+            let problem = store::copy_problem().expect("a copy that did not finish is reported");
+            assert!(problem.contains("did not finish"), "{problem}");
+            assert!(problem.contains("roomlerd anchor create"), "{problem}");
+            keys::put(&key, "Anchor", &serde_json::to_string(&anchor()).unwrap());
+            assert_eq!(
+                store::copy_problem(),
+                None,
+                "an anchored device has nothing to report"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// After `anchor remove`, a copy refused long ago no longer asks
+        /// for a re-anchor: the marker says `removed`, and when, and keeps
+        /// what it said before.
+        #[test]
+        fn anchor_remove_retires_a_refused_copys_report_and_keeps_its_record() {
+            let Some(key) = child() else {
+                return run(
+                    "anchor_remove_retires_a_refused_copys_report_and_keeps_its_record",
+                    "anchor remove after a refused copy",
+                );
+            };
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            keys::put(
+                &key,
+                "LegacyCopy",
+                r#"{"at":"2026-11-12T00:00:00Z","outcome":"refused","why":"the anchor file's folder or file does not have the exact owner and DACL"}"#,
+            );
+            assert!(store::copy_problem().is_some(), "the refusal is reported");
+            store::remove().unwrap();
+            assert_eq!(
+                store::copy_problem(),
+                None,
+                "a removed anchor asks for nothing"
+            );
+            let marker: serde_json::Value =
+                serde_json::from_str(&keys::get(&key, "LegacyCopy").expect("the marker stays"))
+                    .unwrap();
+            assert_eq!(marker["outcome"], "removed", "{marker}");
+            assert_ne!(marker["at"], "2026-11-12T00:00:00Z", "{marker}");
+            assert_eq!(marker["earlier"][0]["outcome"], "refused", "{marker}");
+            assert_eq!(
+                marker["earlier"][0]["at"], "2026-11-12T00:00:00Z",
+                "{marker}"
+            );
+            assert!(
+                marker["earlier"][0]["why"]
+                    .as_str()
+                    .is_some_and(|why| why.contains("exact owner")),
+                "{marker}"
+            );
+            println!("{CHECKED}");
+        }
+
+        /// A value name is compared as the registry compares it, without
+        /// regard to case: a marker or an anchor written as `legacycopy` or
+        /// `anchor` counts as there.
+        #[test]
+        fn a_value_named_in_another_case_counts_as_there() {
+            let Some(key) = child() else {
+                return run(
+                    "a_value_named_in_another_case_counts_as_there",
+                    "a value named in another case",
+                );
+            };
+            let mut legacy_anchor = anchor();
+            legacy_anchor.device_name = "LEGACY".into();
+            write_legacy(&legacy_anchor);
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            keys::put(
+                &key,
+                "legacycopy",
+                r#"{"at":"2026-11-12T00:00:00Z","outcome":"none"}"#,
+            );
+            store::copy_legacy_once();
+            assert_eq!(
+                load_anchor(),
+                Ok(None),
+                "a marker named in another case shuts the copy"
+            );
+            keys::remove_tree(Hive::CurrentUser, &sub(&key));
+            keys::make(Hive::CurrentUser, &sub(&key), SEALED);
+            let a = anchor();
+            keys::put(&key, "anchor", &serde_json::to_string(&a).unwrap());
+            store::copy_legacy_once();
+            assert_eq!(
+                load_anchor(),
+                Ok(Some(a)),
+                "an anchor named in another case is not copied over"
+            );
+            println!("{CHECKED}");
+        }
     }
 }

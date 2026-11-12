@@ -836,8 +836,9 @@ pub fn role_anchors(role: Role) -> bool {
 
 /// FR-104 on an install whose enrollment was ADDED beside the machine's
 /// primary one (another org): the step does not run. The anchor is one per
-/// machine (`exec_service.rs`: one `anchor.json`, and only the anchored
-/// device's connection advertises `exec-system`), so anchoring this org's row
+/// machine (`exec_service.rs`: one anchor, in `HKLM\SOFTWARE\Roomler\ExecService`
+/// since #3737, and only the anchored device's connection advertises
+/// `exec-system`), so anchoring this org's row
 /// would take SYSTEM exec away from the primary organization on another
 /// organization's token, the rule peer relays keep too (primary-org only).
 /// `Some(reason)` when the token asked for an anchor, so the person is told;
