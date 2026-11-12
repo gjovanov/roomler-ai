@@ -514,7 +514,8 @@ The Overview's **Incoming files** card shows where a file a controller drops ont
 screen will land **right now**, with **Open folder**, **Change…** (the native folder picker,
 which can create a folder) and **Use default**. The setting is `files_dir`; unset, the ladder
 is the active user's Downloads, then the service's own fallback (a Windows background service
-with nobody signed in refuses the file instead, §9.2). It is **live**: every
+with nobody signed in refuses the file instead, §9.2; on Linux the service's own folder is never
+one another account can write, §9.5). It is **live**: every
 transfer reads the current value, so a change needs no restart.
 
 ⚠️ `files_dir` is a security control, because the daemon writing the file can be SYSTEM or
@@ -560,9 +561,9 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who writes | `FsAs` (`:249-705`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:1139-1142`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
+| Who writes | `FsAs` (`:261-739`), chosen once in `begin` and carried by the transfer and by `PARTIAL_REGISTRY`'s `PartialEntry` (`:1173-1176`) | the end-time rename, a resume and a cancel act as whoever staged the partial, even after a user switch |
 | How | `FsAs::run` → `crate::fs_identity::FsIdentity` (FR-85's guard, moved out of `recording`) | Linux checks every open, create and unlink against the thread's fsuid, fsgid and groups; root's bypass capabilities leave with the fsuid |
-| Their folder | `person_downloads` / `xdg_download_dir` (`:893-926`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
+| Their folder | `person_downloads` / `xdg_download_dir` (`:927-960`) | `user-dirs.dirs` is the person's to write, so only a folder inside their home is taken |
 | The staging | `create_dir` and `create_new`, never reuse (`begin_as`) | a folder or a link planted where the staging goes refuses the begin |
 
 ⚠️ **Never as root followed by a `chown`.** In a folder the person owns, a link they planted
@@ -573,8 +574,9 @@ and whose `dest_dir` the final rename trusts, is theirs to edit. Under their ide
 shows the begin refused, with a control proving root's own rights go straight through it.
 
 ⚠️ "The person" is seat0's (`companion::seat0_user`, FR-97 P5a), never whoever asked: an xrdp
-session sits on no seat. With nobody at seat0, the daemon's own ladder applies, as before, but
-never a folder a controller chose, nor the configured one (#3688). Since #3688 downloads and browsing (the host → viewer
+session sits on no seat. With nobody at seat0, the daemon's own ladder applies, but never a folder
+a controller chose, nor the configured one, and that ladder ends in root's own Downloads (#3688,
+§9.5). Since #3688 downloads and browsing (the host → viewer
 direction) take the same person (§9.4).
 
 ### 9.2 A Windows background-service install writes the file as the person at the screen (#3048)
@@ -600,7 +602,7 @@ flowchart TD
 
 | What | Where | Why |
 |---|---|---|
-| Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:249-296`), chosen by `fs_as_for` (`:379`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
+| Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:261-308`), chosen by `fs_as_for` (`:391`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
 | How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:381`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
 | Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:713`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:6732`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:8389`): never the machine-global folder |
 | The staging | `stager_for` (`:1899`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
@@ -638,10 +640,10 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who reads | `FsAs::for_read` (`:422`), one function with `FsAs::now` (`session_or_daemon`, `:457`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`) |
-| A download | `begin_outgoing_as` (`:2716`), `open_to_send` (`:2834`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
-| A folder | `begin_outgoing_zip_as` (`:3425`), `walk_and_zip` (`:3506`), `zip_folder_entries` (`:3700`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
-| A listing | `list_dir_as` (`:3199`), `list_canonical` (`:3217`) | resolved and opened as them inside the 3 s timeout, then the entries read through that handle |
+| Who reads | `FsAs::for_read` (`:434`), one function with `FsAs::now` (`session_or_daemon`, `:469`) | a read and a write cannot take different people. The person is fixed when the request arrives, and every step asks for the session user's token again and checks its SID (`win_identity::as_person`) |
+| A download | `begin_outgoing_as` (`:2992`), `open_to_send` (`:3110`) | one step resolves the path, refuses the agent's own secrets, states, caps and opens the file. Windows checks access when a handle is opened, and a handle on a share keeps the logon it was opened with, so the pump reads through it and needs no identity |
+| A folder | `begin_outgoing_zip_as` (`:3701`), `walk_and_zip` (`:3782`), `zip_folder_entries` (`:3976`) | the root is resolved and opened for listing as them, so a folder they may not list is refused at the start, never sent as an empty zip. Each folder is listed, and each file opened, in its own step as them; what they may not open is left out, as an unreadable file always was. A step whose identity fails (they signed out) ends the walk with an error, never a short zip that looks complete |
+| A listing | `list_dir_as` (`:3475`), `list_canonical` (`:3493`) | resolved and opened as them inside the 3 s timeout, then the entries read through that handle |
 
 - **Nobody signed in**: a download or a folder download is refused with "Nobody is signed in to
   this computer to send the file"; the drawer, its drive list included, with "Nobody is signed in
@@ -668,7 +670,7 @@ flowchart TD
 - `ROOMLERD_FILES_AS_SEAT_USER=0` keeps the service's own identity for reads too: one switch, both
   directions.
 - **A worker that cannot read its own token** is taken for LocalSystem (`fs_as_for`,
-  `agents/roomlerd/src/files.rs:379`; the token is read once, `win_identity::own_token_is_local_system`,
+  `agents/roomlerd/src/files.rs:391`; the token is read once, `win_identity::own_token_is_local_system`,
   `agents/roomlerd/src/win_identity.rs:62`): reads and writes then take the person, or nobody, never
   the worker itself.
 - **The entry points are tested with the person**, not only their steps: a test stands the
@@ -714,14 +716,14 @@ flowchart TD
 | How | `FsIdentity::begin_reading` (`agents/roomlerd/src/fs_identity.rs:233`), from `run_here` (`files.rs:635`) | §9.1's fsuid, fsgid and groups, and the thread's effective capabilities emptied for the step. An fsuid that is not 0 takes away only the file-system capabilities, and the rest would still answer for root wherever a check asks for one. The drop gives the capabilities back first (the groups' restore needs `CAP_SETGID`), then the identity, then the capabilities again, and checks all of it: a thread it cannot restore aborts the daemon |
 | The handles | `held_to_the_person` (`:3770`), `folder_held_to_the_person` (`:3782`), `folder_listing` (`:3662`), `KERNEL_FILE_SYSTEMS` (`:3744`) | inside the step, before a handle leaves it or anything is listed through it: never on one of the kernel's own file systems (procfs, sysfs, debugfs, tracefs, securityfs, efivarfs, bpf, pstore, configfs, cgroup, …: `fstatfs` on the handle, a file's or a folder's), and the kernel's own path for the handle must be the path asked for. A folder is opened first, checked so, and listed through that handle (`/proc/self/fd/N`), never through its path again. Some kernel files answer by who reads at `read()`, which the pump does as root, so the person's rights to them say nothing; and a link swapped in after the path was resolved is followed by the open, through a `/proc/<pid>/fd` link even onto a file or folder the daemon holds open |
 | A folder download, the person leaves | `FsAs::still_at_the_screen` (`:593`), `seat0_active_uid` (`:795`), `walk_and_zip` (`:3506`) | before each folder is listed and before each file is opened, seat0's active uid (`ACTIVE_UID=` in `/run/systemd/seats/seat0`, logind's own record of the seat, as `sd-login` reads it) must still be the person's. Once it is not, or it does not read, the walk ends with `files:error`, never `files:eof` (§9.3's rule) |
-| A received file, nobody at seat0 | `FsAs::DaemonAlone` (`:263`), `resolve_dest_path_as` (`:2956`), `FsAs::writer` (`:666`), `new_file` (`:1316`) | written as the daemon, as before, but neither a folder the controller chose nor the configured one (`files_dir`) is taken: the first is refused before it is touched, and the second is checked with no active home, so its `~` never resolves in root's. The upload lands in the default folder: FR-84 D4's rule for a privileged writer with nobody signed in (§9). Its partial and the partial's notes are created 0600 from the first byte, so the file is root's only (`root:root`, 0600) wherever it lands, a server's shared `/tmp` included. Nothing changes the mode after |
+| A received file, nobody at seat0 | `FsAs::DaemonAlone` (`:263`), `resolve_dest_path_as` (`:2956`), `FsAs::writer` (`:666`), `new_file` (`:1316`) | written as the daemon, as before, but neither a folder the controller chose nor the configured one (`files_dir`) is taken: the first is refused before it is touched, and the second is checked with no active home, so its `~` never resolves in root's. The upload lands in the default folder: FR-84 D4's rule for a privileged writer with nobody signed in (§9). Its partial and the partial's notes are created 0600 from the first byte, so the file is root's only (`root:root`, 0600), in root's own Downloads (§9.5). Nothing changes the mode after |
 
 - **Nobody at seat0** (an empty seat, the login screen, a server or a cluster node with no session
   at all): a download or a folder download is refused with "Nobody is signed in at this computer's
   screen to send the file"; the drawer, its roots view included, with "Nobody is signed in at this
-  computer's screen to browse its files". The viewer shows either. Uploads still work, into the
-  default folder, as files only root may read. The rule is the screen, not a sign-in: someone
-  signed in over SSH is not at it.
+  computer's screen to browse its files". The viewer shows either. Uploads still work, into
+  root's own `/root/Downloads` (§9.5), as files only root may read. The rule is the screen, not a
+  sign-in: someone signed in over SSH is not at it.
 - **A host with no logind at all** (no `loginctl`, or a host systemd did not boot: a container, WSL
   without systemd, a minimal VM) has no seat0, so nobody is at its screen: its reads get the texts
   above, never "Try again", and the switch below gives them back.
@@ -807,6 +809,79 @@ sudo systemctl restart roomlerd.service   # ends the sessions under way
 - **To undo it**: remove the file, `sudo systemctl daemon-reload`, and restart the service.
 - **A host systemd did not boot** (a container, WSL without systemd) has no service to drop it
   into: the same variable goes into the daemon's environment wherever root starts it.
+
+### 9.5 A received file stays off folders another account can write (#3688)
+
+On Linux, a received file is staged beside the folder it lands in, as
+`<folder>/.roomler-partial/<id>/{meta.json,data}`, and renamed into place at its end. Where the
+daemon's own files land (§9.4: nobody at seat0, root at it, the switch off, a per-user daemon) and
+everything in that staging is now its writer's own, made so and checked so, and a transfer holds
+its folders from its begin to its end:
+
+```mermaid
+flowchart TD
+    B["files:begin, as the daemon itself"] --> X{"its XDG Downloads<br/>exists and passes?"}
+    X -- "yes" --> T["that folder"]
+    X -- "no" --> D{"~/Downloads"}
+    D -- "missing" --> M["made 0700"] --> T
+    D -- "passes" --> T
+    D -- "fails, or no home" --> R["refused, saying why:<br/>&lt;folder&gt; cannot receive files: …"]
+    T --> H["the folder opened (links followed)<br/>and checked on that handle, then held"]
+    H --> S[".roomler-partial: made 0700, or the writer's own<br/>(made 0700 again when others could write it);<br/>a link or another account's: refused"]
+    S --> P["&lt;id&gt; 0700, meta.json 0600, data 0600 or 0644,<br/>each new, none through a link"]
+    P --> E["files:end: renamed from the held &lt;id&gt;<br/>into the held folder"]
+```
+
+| What | Where (`agents/roomlerd/src/files.rs`, `agents/roomlerd/src/files/staging.rs`) | Why |
+|---|---|---|
+| The daemon's own default folder | `default_download_dir` (`files.rs:4397`), `own_home_and_downloads` (`:4600`), `may_receive` (`staging.rs:177`) | the XDG Downloads folder when it exists and passes, else `~/Downloads`, made 0700 when a file arrives (looking, for the status card, the sweep or a resume, makes nothing), else a refusal the viewer shows. Each is opened following its links, and the folder it leads to must be the writer's own; for root, one no other account may write; for a per-user daemon, one not every account may (Ubuntu's private-group umask makes `~/Downloads` 0775). It was the temp dir, which for root on a server is `/tmp`. The person at seat0 keeps their own folder (§9.1) |
+| The folder held | `stage_held` (`files.rs:4481`), called from `begin_as` (`:2111`) | begin opens the target folder once and holds it; when it is the daemon's default folder, that very handle is checked again by the rule above |
+| The staging, made | `open_staging` (`staging.rs:220`), `stage` (`:274`) | every folder and file with an explicit mode, whatever the umask: a per-user daemon on Ubuntu runs under 0002, and its staging still passes its own checks. A `.roomler-partial` that is a link, or another account's, is refused with a reason and left as it is; the writer's own, open to others, is made 0700 again through its handle. `data` is 0600 for the daemon alone (§9.4), 0644 otherwise, and is the received file itself after the rename |
+| The staging, trusted | `reopen` (`staging.rs:325`), `read_notes` (`:359`), `reopen_data` (`:379`), `FilesHandler::resume_held` (`files.rs:2868`) | a resume walks the partial again from its notes' path, each step without following a link (and without waiting on a FIFO), and trusts it only when its folder, `meta.json` and `data` are its stager's own and nobody else may write them. Anything else is "no partial state for id …", and the viewer starts that upload over. `data` is opened once and truncated on that handle |
+| A root writer's resume and end | `root_may_place_in` (`files.rs:4511`), `FsAs::writes_as_root` (`:594`), from `resume_held` (`:2918`) and `end` (`:2334`) | the folder a partial's notes record must be the one it sits beside, under a bare name, and must be one the rule gives it now: the default folder, its handle passing the rule; for root at the screen or the switch off, also the configured folder or a folder a controller may choose now. The person's partial, and a per-user daemon's, are placed where their notes say, as them (§9.1) |
+| The end | `place` (`staging.rs:420`), `discard` (`:511`), from `end` (`files.rs:2347`) | renamed from the held `<id>` into the held folder, under a name nothing there has yet, a link counted; a folder upload's subfolders are made and opened one by one from it, and for a root writer a link among them refuses. Across file systems, copied through handles. A folder moved aside mid-upload, with another put in its place, changes nothing |
+| Cancel and the sweep | `cancel_incoming` (`files.rs:2563`), `sweep` (`staging.rs:591`), `sweep_orphans_dir_here` (`files.rs:1538`) | a cancel removes through the handles the transfer holds, or walks again with the same checks and removes only what passes. The startup sweep registers only a partial that passes in full; removes one whose notes are missing or corrupt, and, once over a day old, the stager's own that fails the checks; and leaves a link, or anything another account owns, as it is |
+| A resume's lookup | `drop_folder_without_creating` (`files.rs:4467`), from `resume_incoming_as` (`:2725`) | with nothing registered, a resume looks beside the folder a file would land in now, and makes nothing while it looks |
+
+What a user notices:
+
+- **With nobody at the screen, uploads land in `/root/Downloads`** (made 0700, root's), where they
+  used to land in `/tmp`; each file is 0600, root's only (§9.4).
+- **A default folder that cannot receive files says so**: "`<folder>` cannot receive files: another
+  account can write to it" (or "it belongs to another account", "every account can write to it",
+  "it is not a folder", "it could not be made (…)"). The sandboxed per-user unit
+  (`ProtectHome=read-only`) can make no `~/Downloads` and says so; it could not write `/tmp` either.
+- **A per-user daemon's partials from before this change** (made under umask 0002, so its group
+  could write them) are refused once on resume, and that upload starts over; the sweep removes them
+  after a day. Its `.roomler-partial` is made 0700 again.
+- **A received file on a per-user daemon is 0644** where umask 0002 made it 0664.
+- **A host whose XDG Downloads folder is configured but missing** receives into `~/Downloads`;
+  before, the first upload made the XDG folder.
+- **A root writer's folder upload into a subfolder that is a link is refused**: "`<path>` is not a
+  folder, so file transfer does not place the file there". The person's, and a per-user daemon's,
+  still follow their own links with their own rights.
+- macOS and Windows are unchanged: macOS's default is always `~/Downloads`, and a Windows service
+  stages in the machine's own folder (§9.2).
+
+**Tested**: `files::seat_user_tests::own_staging`, on every Linux run and again as root in the
+`rust-recorder` job's sudo step (`ROOMLERD_TEST_REQUIRE_ROOT=1`). Each stands in the daemon's own
+home (`stand_in::own_home`, carried by `FsAs::run` to the step's thread), so none touches a real
+home, `/root/Downloads` or `/tmp`: the temp dir is never the folder
+(`the_temp_dir_is_never_a_writers_folder`), the fallback is made 0700 and its writer's
+(`the_fallback_folder_is_made_0700_and_owned_by_its_writer`), each writer's check on its folder
+and through a link (`a_downloads_folder_is_checked_by_its_writer`), the modes under any umask
+(`a_partial_is_made_its_stagers_own_whatever_the_umask`), the writer's own open staging folder made
+0700 (`the_writers_own_open_staging_folder_is_tightened_not_refused`), a staging folder that is a
+link or another account's refused at begin and by the sweep
+(`a_staging_folder_that_is_a_link_is_refused_at_begin_and_by_the_sweep`,
+`a_staging_folder_another_account_owns_is_refused_at_begin_and_by_the_sweep`, root), a link at
+`data` or `meta.json` and a partial others may write refused on resume
+(`a_link_at_data_or_meta_json_is_refused_on_resume`,
+`a_resume_of_a_partial_another_account_can_write_is_refused`), the sweep's choices
+(`the_sweep_trusts_only_partials_that_are_their_stagers_own`), a root writer's resume held to the
+rule's folder (`a_resume_whose_recorded_folder_is_not_the_rules_folder_is_refused`), a staging
+folder moved aside mid-upload (`a_staging_folder_swapped_mid_upload_is_not_followed`) and a root
+writer's folder upload through a link (`a_folder_upload_follows_no_link_for_root`).
 
 ## 10. Starting after install, and the Welcome flow
 

@@ -566,9 +566,10 @@ file systems before it leaves the step; a folder is then listed through its
 handle, never through its path again. A folder download ends with an error
 once the person has left seat0. With nobody at seat0, a read is refused with a
 reason the viewer shows, and a received file is the daemon's, 0600 and root's
-only, but never in a folder a controller chose. A host with no logind at all
-has no seat0, so nobody is there. Any other lookup of seat0 that fails or runs
-out of time refuses the read too, saying it could not tell who is there.
+only, in root's own Downloads, but never in a folder a controller chose. A host
+with no logind at all has no seat0, so nobody is there. Any other lookup of
+seat0 that fails or runs out of time refuses the read too, saying it could not
+tell who is there.
 root itself at seat0, a user install and `ROOMLERD_FILES_AS_SEAT_USER=0`
 are the daemon, both ways. Only root sets that switch, in the service's own
 environment (a systemd drop-in); remote config cannot reach it
@@ -579,7 +580,7 @@ environment (a systemd drop-in); remote config cannot reach it
 The viewer chooses an upload's `id`, and the daemon names the upload's staging
 folder after it. So the id is one plain name: letters, digits, `.`, `_` and
 `-`, not starting with `.`, at most 128 bytes (`transfer_id`,
-`agents/roomlerd/src/files.rs:1281`). Every entry that takes an id from the
+`agents/roomlerd/src/files.rs:1315`). Every entry that takes an id from the
 files channel checks it first, on every OS and before anything on disk is
 touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
 other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
@@ -594,6 +595,34 @@ and a folder download's walk) logs what a viewer sends (an id, a name, a path,
 a request id), and any error that may quote it, with Debug escaping (`?`), so a
 line break in it stays inside its own log line. Only an upload's id that passed
 `transfer_id` is logged as it is. Pinned by `peer::files_log_tests`.
+
+### A received file's folders are its writer's own (#3688)
+
+On Linux, where the daemon writes a received file as itself (a system install
+with nobody at seat0, root at it, or the switch off; a per-user daemon), no
+folder on its way is one another account can write
+([`desktop-companion.md`](desktop-companion.md) §9.5):
+
+- **Its default folder** is its XDG Downloads when that exists and passes, else
+  `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:4397`). The folder each
+  is opened to must be the writer's own: for root, one no other account may
+  write; for a per-user daemon, one not every account may. Never the temp dir.
+- **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
+  explicit modes whatever the umask, and is used, resumed or registered by the
+  startup sweep only when each piece is its stager's own and nobody else may
+  write it, every step opened without following a link
+  (`agents/roomlerd/src/files/staging.rs`).
+- **A root writer's resume and end** place only in the folder the partial sits
+  beside, and only when that is a folder the rule gives it now
+  (`root_may_place_in`, `files.rs:4511`): never where its notes alone say.
+- **A transfer holds** its folders from its begin, or its resume, to its end, and
+  renames from those handles.
+
+A new step on a received file's staging goes through `files/staging.rs`, on
+the stager's own thread (`FsAs::run`), so the thread's fsuid is the owner every
+check asks for. Pinned by `files::seat_user_tests::own_staging`, which CI runs
+again as root.
 
 ### An enrollment token is spent once, through one owner (#3328)
 

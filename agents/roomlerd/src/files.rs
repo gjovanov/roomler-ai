@@ -31,9 +31,9 @@
 //!   multiplexing binary chunks by id, which SCTP on a DC doesn't do
 //!   for us — browsers would need to open one DC per transfer. Ship
 //!   the simple path first; queue client-side.
-//! - Destination: `~/Downloads` (or platform equivalent per
-//!   `directories::UserDirs::download_dir()`). Falls back to the OS
-//!   temp dir if the user has no Downloads (rare — headless CI).
+//! - Destination: the Downloads of whoever the file is written as. Never
+//!   the temp dir on Linux (#3688: the daemon's own `~/Downloads`, made
+//!   0700, else a refusal); Windows falls back to the machine's folder.
 //! - Filename safety: the browser-provided `name` is stripped to its
 //!   basename and any character outside `[A-Za-z0-9._-]` is replaced
 //!   with `_` so the agent never writes outside Downloads. Collisions
@@ -4391,8 +4391,8 @@ fn download_dir_with(writer: &files_dir::Writer) -> Result<PathBuf> {
 /// opened following links, and the folder it leads to must be the writer's
 /// own; for root, one no other account may write; for a per-user daemon,
 /// one not every account may (Ubuntu's private-group umask makes
-/// `~/Downloads` 0775). It was the temp dir: on a server, root's was the
-/// shared `/tmp`.
+/// `~/Downloads` 0775). It was the temp dir: on a server, root's was
+/// `/tmp`.
 #[cfg(target_os = "linux")]
 fn default_download_dir(log: bool) -> Result<PathBuf> {
     let uid = own_euid();
@@ -7843,7 +7843,7 @@ mod seat_user_tests {
         }
 
         /// #3688 — with nobody at seat0 a received file is the daemon's, in
-        /// the default folder, which on a server is the shared `/tmp`: it is
+        /// the default folder, root's own `~/Downloads` (a stand-in here): it is
         /// born root's and 0600, its partial and the partial's notes
         /// included, so no other account reads any of it at any point.
         #[tokio::test]
@@ -9488,7 +9488,7 @@ CAN_GRAPHICAL=0
         /// With no `~/Downloads`, a received file lands there (made when one
         /// arrives); with no home, or a `~/Downloads` every account can
         /// write, it is refused, saying why. Before, both fell back to the
-        /// temp dir: on a server, root's was the shared `/tmp`.
+        /// temp dir: on a server, root's was `/tmp`.
         #[tokio::test]
         async fn the_temp_dir_is_never_a_writers_folder() {
             let _lock = FILES_DIR_TEST_LOCK.lock().await;
