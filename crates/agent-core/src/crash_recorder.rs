@@ -1804,7 +1804,7 @@ mod tests {
 
         use super::super::record_inner_at;
         use crate::machine_tree::test_support::{
-            aces, elevated_or_skip, junction, program_data, protected, sddl,
+            aces, elevated_or_skip, icacls, junction, owner, program_data, protected, sddl,
         };
         use roomler_ai_remote_control::models::CrashReason;
 
@@ -1864,6 +1864,24 @@ mod tests {
         /// A junction or a symbolic link, read without following it.
         fn is_link(path: &Path) -> bool {
             std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+        }
+
+        /// How many names the file at `path` has, read through a handle of
+        /// the test's own, opened by name.
+        fn links(path: &Path) -> u32 {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let file = std::fs::File::open(path).unwrap();
+            let handle = file.as_raw_handle() as HANDLE;
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a live handle; `info` is the struct the call fills in.
+            let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+            let error = std::io::Error::last_os_error();
+            assert!(ok != 0, "{}: {error}", path.display());
+            info.nNumberOfLinks
         }
 
         /// T11 — `crashes` is a junction: the record lands in a new, sealed
@@ -2062,10 +2080,16 @@ mod tests {
         }
 
         /// FR-145 T19 — the uploader's ledger in a SYSTEM worker's `service-logs`:
-        /// (a) its name is a hard link to a file outside: the verdict goes to
-        /// a new file of one name, and the file outside is unchanged; (b)
+        /// (a) a first verdict makes `service-logs` sealed, Administrators its
+        /// owner, as it does for the service. Then the ledger's name is made a
+        /// hard link to a file outside that Administrators own, so a second
+        /// name is the one thing wrong with it. The folder is sealed already,
+        /// so the next walk seals and deletes nothing before the append: the
+        /// line reaches `append_file`'s own check and goes to a new file of one
+        /// name, the file outside unchanged and nothing moved aside. (b)
         /// `service-logs` is a junction: nothing is written where it leads.
-        /// Control: the verdict is there to read in both.
+        /// Control: the first verdict, and the verdict is there to read in
+        /// both.
         #[test]
         fn a_verdict_is_never_written_through_a_hard_link_or_a_junction() {
             use super::super::{VERDICTS_FILE, append_verdict, read_verdicts};
@@ -2076,21 +2100,48 @@ mod tests {
                 );
             };
             let elsewhere = root.join("elsewhere");
-            let logs = crate::appdirs::machine_global_dir().join("service-logs");
-            std::fs::create_dir_all(&logs).unwrap();
+            let machine = crate::appdirs::machine_global_dir();
+            let logs = machine.join("service-logs");
+            let ledger = logs.join(VERDICTS_FILE);
 
-            // (a) the ledger's name is a hard link to a file outside.
+            // (a) The first verdict makes `service-logs`, sealed.
+            let first = append_verdict(&logs, "12:34 1-2.json");
+            assert!(first.is_ok(), "the first verdict: {first:?}");
+            let shape = sddl(&logs);
+            let mut got = aces(&shape);
+            got.sort();
+            assert!(
+                protected(&shape)
+                    && owner(&shape) == "BA"
+                    && got == ["A;OICI;0x1200a9;;;BU", "A;OICI;FA;;;BA", "A;OICI;FA;;;SY"],
+                "service-logs is made sealed, Users read, Administrators its owner: {shape}"
+            );
+            // Then the ledger's name is a hard link to a file outside, owned
+            // by Administrators as a file the service wrote would be.
             let outside = elsewhere.join("outside.txt");
             std::fs::write(&outside, b"outside\n").unwrap();
-            std::fs::hard_link(&outside, logs.join(VERDICTS_FILE)).unwrap();
-            let linked = append_verdict(&logs, "12:34 1-2.json");
+            assert!(
+                icacls(&outside, &["/setowner", "*S-1-5-32-544"]) && owner(&sddl(&outside)) == "BA",
+                "the file outside is Administrators'"
+            );
+            std::fs::remove_file(&ledger).unwrap();
+            std::fs::hard_link(&outside, &ledger).unwrap();
+            assert_eq!(links(&ledger), 2, "the ledger's name is a second name");
+            let linked = append_verdict(&logs, "23:45 3-4.json");
             let outside_now = std::fs::read(&outside).unwrap();
+            let names = (links(&ledger), links(&outside));
+            let moved: Vec<String> = std::fs::read_dir(&machine)
+                .unwrap()
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("service-logs.moved-"))
+                .collect();
             let read_a = read_verdicts(&logs);
 
             // (b) `service-logs` is a junction to a folder outside.
             std::fs::rename(&logs, root.join("service-logs-aside")).unwrap();
             junction(&logs, &elsewhere);
-            let through = append_verdict(&logs, "56:78 3-4.json");
+            let through = append_verdict(&logs, "56:78 5-6.json");
             let led_to = std::fs::read_to_string(elsewhere.join(VERDICTS_FILE)).ok();
             let read_b = read_verdicts(&logs);
 
@@ -2102,8 +2153,17 @@ mod tests {
                 String::from_utf8_lossy(&outside_now)
             );
             assert!(linked.is_ok() && through.is_ok(), "{linked:?} {through:?}");
-            assert_eq!(read_a, "12:34 1-2.json\n", "(a) the new ledger");
-            assert_eq!(read_b, "56:78 3-4.json\n", "(b) the new ledger");
+            assert_eq!(
+                names,
+                (1, 1),
+                "(a) a new ledger of one name, and the file outside keeps only its own"
+            );
+            assert!(
+                moved.is_empty(),
+                "(a) the sealed service-logs is kept, not moved aside: {moved:?}"
+            );
+            assert_eq!(read_a, "23:45 3-4.json\n", "(a) the new ledger");
+            assert_eq!(read_b, "56:78 5-6.json\n", "(b) the new ledger");
             assert!(!is_link(&logs), "service-logs is a real folder again");
             println!("{CHECKED}");
         }
