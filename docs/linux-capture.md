@@ -529,7 +529,7 @@ the portal every minute would start it on every host that does not run it.
 ⚠️ **logind never runs on the signalling path.** `loginctl` is a subprocess, and
 a wedged logind must not stall the hello. A `desktop-brief` thread
 (`desktop_brief.rs:98`) reads it every 60 s into a cache. The hello and the
-heartbeat only read that cache (`signaling.rs:7148`). A changed brief (a login, a
+heartbeat only read that cache (`signaling.rs:7149`). A changed brief (a login, a
 logout, the greeter) re-announces the caps on the next heartbeat (`:2620`).
 Until the first read lands, which is milliseconds after start, the hello
 carries none.
@@ -2199,7 +2199,7 @@ tables: [FR-45](fr/FR-45-portal-capture.md#field-verification-log),
 
 Every key below is `restart required`; env wins over the config file. The
 keys are `crates/agent-core/src/config_surface.rs:1160-1183`, and they reach
-the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2956`).
+the daemon through the env bridge (`env_bridge_bools`, `crates/agent-core/src/config.rs:2963`).
 
 | Key | Env | Default | What it does |
 |---|---|---|---|
