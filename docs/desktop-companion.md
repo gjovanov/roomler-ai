@@ -40,7 +40,7 @@ flowchart LR
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
 and the daemon's own account** in full and **Interactive Users** reading and writing data
-only, at medium integrity (`crates/localapi/src/lib.rs:3955-3956`): any person logged in at
+only, at medium integrity (`crates/localapi/src/lib.rs:3985-3986`): any person logged in at
 the machine can call it, but only the first three add an instance of the pipe, and a
 sandboxed low-integrity process cannot call it. Everything
 below that lets the companion *change* something is therefore something any interactive user
@@ -112,7 +112,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4055`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4085`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:4150`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -185,7 +185,7 @@ compile.
   (#2871, the operator, 2026-10-25):** the root half's person socket now serves the
   configuration — the listing, with every key it will not set marked
   `read_only = "root_only"`, and `ConfigSet` of exactly the keys that are the console
-  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3165`;
+  person's own call (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`;
   the device-owned gates are not among them) — and the page shows the Mac as one device:
   each row comes from, and a change goes to, the half that READS the key. The split is the
   key's group (`config_surface::Owner`, `crates/agent-core/src/config_surface.rs:212`):
@@ -382,7 +382,7 @@ sequenceDiagram
   (§5), so the person always knows which daemon answered; the per-user half's own
   `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
   the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:5039`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:5069`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
@@ -393,7 +393,7 @@ sequenceDiagram
 Most settings are read once at startup, so saving one is not the same as applying it. The
 Settings page collects the saved restart-required keys in a bar with an **Apply now** button;
 `roomler restart` is the same thing from a terminal. Both send `Request::RestartDaemon`
-(`crates/localapi/src/lib.rs:1698`), and **the daemon decides**.
+(`crates/localapi/src/lib.rs:1728`), and **the daemon decides**.
 
 It restarts only when it can prove that something will start it again — exiting an
 unsupervised `roomlerd run` would take the device offline for good:
@@ -718,8 +718,8 @@ flowchart TD
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
-| Who reads | `FsAs::for_read` (`:460`) → `linux_fs_as` (`:925`), the function `FsAs::now` (`:438`) asks for a write | a read and a write cannot take different people. The person is seat0's (`seat_now`, `:832`, through `companion::seat0_account`, `agents/roomlerd/src/companion.rs:1240`, FR-97 P5a's rule), fixed when the request arrives. A name that resolves to another uid than the one logind recorded for the session is nobody (`seat_of`, `files.rs:848`): that account's rights are not the person's |
-| The lookup | `seat_within` (`:1009`), `SEAT_LOOKUP_WAIT` (`:1000`), `FsAs::CannotTell` (`:328`), `linux_fs_as_within` (`:977`) | logind and the account database are other processes: the lookup runs on a blocking thread, never a stalled async worker, and waits 1.5 s. A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:1361`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:1276`), or systemd did not boot the host (`loginctl_failed`, `:1292`). Any other lookup that fails cannot tell who is there (`Seat::CannotTell`), and one that runs out of time does not know yet (`Seat::OutOfTime`, `files.rs:826`): the read is refused with its own text either way, logged |
+| Who reads | `FsAs::for_read` (`:460`) → `linux_fs_as` (`:925`), the function `FsAs::now` (`:438`) asks for a write | a read and a write cannot take different people. The person is seat0's (`seat_now`, `:832`, through `companion::seat0_account`, `agents/roomlerd/src/companion.rs:1483`, FR-97 P5a's rule), fixed when the request arrives. A name that resolves to another uid than the one logind recorded for the session is nobody (`seat_of`, `files.rs:848`): that account's rights are not the person's |
+| The lookup | `seat_within` (`:1009`), `SEAT_LOOKUP_WAIT` (`:1000`), `FsAs::CannotTell` (`:328`), `linux_fs_as_within` (`:977`) | logind and the account database are other processes: the lookup runs on a blocking thread, never a stalled async worker, and waits 1.5 s. A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:1604`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:1519`), or systemd did not boot the host (`loginctl_failed`, `:1535`). Any other lookup that fails cannot tell who is there (`Seat::CannotTell`), and one that runs out of time does not know yet (`Seat::OutOfTime`, `files.rs:826`): the read is refused with its own text either way, logged |
 | A received file's lookup (#3711) | `FsAs::for_write` (`:481`), from `FilesHandler::begin` (`:2114`), `FilesHandler::resume_incoming` (`:2838`) and `sweep_orphans` (`:1530`) | the same path as a read's, with the same wait. These three asked inline on the async worker, with no time limit, so a slow account database (SSSD or LDAP refreshing a large group list) stalled that worker for as long as the lookup took, and the startup sweep, which signalling waits for, held the daemon's start as long. What a received file takes with each answer is in the list below |
 | How | `FsIdentity::begin_reading` (`agents/roomlerd/src/fs_identity.rs:233`), from `run_here` (`files.rs:716`) | §9.1's fsuid, fsgid and groups, and the thread's effective capabilities emptied for the step. An fsuid that is not 0 takes away only the file-system capabilities, and the rest would still answer for root wherever a check asks for one. The drop gives the capabilities back first (the groups' restore needs `CAP_SETGID`), then the identity, then the capabilities again, and checks all of it: a thread it cannot restore aborts the daemon |
 | The handles | `held_to_the_person` (`:4251`), `folder_held_to_the_person` (`:4263`), `folder_listing` (`:4143`), `KERNEL_FILE_SYSTEMS` (`:4225`) | inside the step, before a handle leaves it or anything is listed through it: never on one of the kernel's own file systems (procfs, sysfs, debugfs, tracefs, securityfs, efivarfs, bpf, pstore, configfs, cgroup, …: `fstatfs` on the handle, a file's or a folder's), and the kernel's own path for the handle must be the path asked for. A folder is opened first, checked so, and listed through that handle (`/proc/self/fd/N`), never through its path again. Some kernel files answer by who reads at `read()`, which the pump does as root, so the person's rights to them say nothing; and a link swapped in after the path was resolved is followed by the open, through a `/proc/<pid>/fd` link even onto a file or folder the daemon holds open |
@@ -1189,7 +1189,7 @@ dialog the person had to answer. Measured on Plasma 6.6, its **Disconnect** sat 
 dialog's **Approve**. Now the capture open's wait hook marks its session `asking` while that
 dialog is the wait (`agents/roomlerd/src/peer.rs:5879`, `AskingMark`
 `agents/roomlerd/src/rc_sessions.rs:43`). The LocalAPI row carries the mark (`asking`,
-`crates/localapi/src/lib.rs:1333`), and the banner comes up only for a session that sees the
+`crates/localapi/src/lib.rs:1363`), and the banner comes up only for a session that sees the
 screen (`wants_banner`, `agents/roomler-desktop/src/main.rs:325`). The mark goes
 when the open does, whether the dialog was approved, denied or timed out, so a dialog nobody
 answers still ends with the banner. The kill switch is `ROOMLERD_BANNER_WAITS_FOR_DIALOG=0`.
@@ -1318,7 +1318,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1432`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1675`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:82`), within minutes while the tray is too old to connect (§13.2) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
@@ -1350,7 +1350,7 @@ flowchart TD
   a password. That is a system install's root daemon, or a per-user install's root update
   helper (FR-96). A per-user daemon that sees the skew wakes its helper. Mechanics:
   [linux-self-update.md](linux-self-update.md#the-desktop-companion-follows-the-daemon-fr-117).
-- **What it reads:** `installed_package` (`companion.rs:414`) asks dpkg, then rpm. ⚠️ dpkg's
+- **What it reads:** `installed_package` (`companion.rs:657`) asks dpkg, then rpm. ⚠️ dpkg's
   answer counts only for an INSTALLED package (`dpkg_installed_version`,
   `companion/package_sync.rs:56`). `dpkg-query -W` also answers, with a version, for one that was
   removed with its config kept, and a companion a person removed must stay removed.
@@ -1366,9 +1366,9 @@ flowchart TD
   graphical session where one was stopped, through FR-27's `systemd_run_command`, as the Windows
   swap does (#1686). A companion that was not running stays stopped.
 - **The grid catches up at once:** the sync drops `installed_version`'s 10-minute cache
-  (`forget_installed_version`, `companion.rs:369`).
+  (`forget_installed_version`, `companion.rs:612`).
 - **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns off FR-117's two additions, the Linux sync and
-  the Windows retry. Windows' refresh at start is older and stays.
+  the Windows retry (§13.2's faster one with it). Windows' refresh at start is older and stays.
 
 ### 13.1 Checking for updates: one click from the tray (#2936)
 
@@ -1403,6 +1403,59 @@ sequenceDiagram
 
 ⚠️ **Installing stays a separate click.** The menu item says "Check for Updates", and on macOS
 **Install update** queues the root update helper (FR-27).
+
+### 13.2 A tray too old for its daemon (Windows, #3781)
+
+From `agent-v0.4.217` the LocalAPI pipe gives an interactive user only the open a tray makes from
+`agent-v0.4.216` on: reading and writing data, and nothing that adds an instance of the pipe
+(#3742, #3760; the DACL is §1's trust-boundary note). A tray from before 0.4.216 opens the pipe
+with `GENERIC_WRITE`. Every connect it makes is refused, and none of its pages reach the daemon.
+That holds where the daemon runs elevated or as SYSTEM: a machine-wide install, unless its worker
+runs as a person without administrator rights. A daemon that runs as the person owns its pipe (a
+per-user install, or such a worker), so that person's old tray still connects, through the
+owner's entry.
+
+The refresh (§13's table) normally replaces the tray within seconds of the daemon's update. On
+2026-11-12 every online Windows device had its tray refreshed within seconds of its 0.4.216 update.
+This section is for a device whose refresh keeps failing, such as a corporate laptop whose
+endpoint protection blocks the swap. Before #3760 that device kept a stale tray that still worked;
+now it keeps one that cannot connect. So while the tray is that old, the daemon retries the
+refresh within minutes, and `roomler status` says what is wrong.
+
+```mermaid
+flowchart TD
+    W([the retry loop:<br/>one plan per wait]) --> K{ROOMLERD_COMPANION_SYNC=0?}
+    K -->|yes| N[4 h, no refresh, no line]
+    K -->|no| M{roomler-desktop.exe.version}
+    M -->|0.4.216 or later| R[4 h]
+    M -->|older, missing, unreadable,<br/>or no version in it| F[2, 5, 10, 15, 15, 15 min,<br/>then 4 h]
+    F --> L[one warn line before the wait:<br/>installed, needs, next_try_in_min]
+```
+
+| Piece | Where | What |
+|---|---|---|
+| the floor | `MIN_COMPANION_VERSION`, `agents/roomlerd/src/companion.rs:130`; `predates_min_companion`, `:136` | `0.4.216`, the first release whose tray opens the pipe exactly (`agent-v0.4.215` was cut before #3742). It moves only with the pipe's DACL or the client's open. A marker that is missing, unreadable or names no version counts as older: nothing vouches for the open such a tray makes |
+| the schedule | `next_refresh_wait`, `companion.rs:201`; `FAST_REFRESH_WAITS`, `:110`; `RefreshSchedule::next`, `:181` | keyed on the version marker. While it reads too old the waits are 2, 5, 10 and 15 minutes, then 15 to the end of the first hour, so the tries land 2, 7, 17, 32, 47 and 62 minutes after the loop starts; after that the updater's 4 h. A marker that reads current starts them over |
+| the loop | `retry_refresh`, `companion.rs:217` | one plan per wait, so one line per wait while the tray is too old: `desktop companion is too old to connect to this daemon; its refresh is retried`, with `installed`, `needs` and `next_try_in_min`. It runs in the one refresher per install (#1686): on a machine-wide install the service host, whose log is `roomler logs --source service` |
+| what status is told | `too_old_to_connect`, `companion.rs:270`; `too_old_here`, `:291` | `NodeStatus.companion_too_old` (`crates/localapi/src/lib.rs:496`), read fresh on every answer, because the service host, another process, may have just refreshed the tray. Absent means fine or not applicable, never unknown: a marker that names no version is reported without one, and a token or a file the daemon cannot read counts as reportable |
+| what status says | `tray_lines`, `agents/roomler-cli/src/localclient.rs:2498` | the lines below |
+
+`roomler status` on a machine-wide install whose tray is 0.4.212:
+
+```
+  tray        OUT OF DATE: 0.4.212 cannot connect to this daemon, which needs 0.4.216 or later
+              Roomler replaces it by itself, retrying every few minutes for an hour after a start, then every 4 h
+              To retry now: Restart-Service Roomler (as an administrator)
+              Why it failed: roomler logs --source service --grep "desktop companion"
+```
+
+- A tray whose marker is missing, or names no version, reads `version UNKNOWN (no version
+  marker): one older than 0.4.216 cannot connect to this daemon`.
+- A daemon that refreshes the tray itself, not the service (an elevated `roomlerd run`), names
+  `restart roomlerd` and its own log instead.
+- The field is additive: an older daemon sends none, an older CLI ignores it, and
+  `status --json` carries it as `companion_too_old`.
+- **Kill switch:** `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster one with it.
 
 ## 14. Opening links: View screen and Open Roomler (#2713)
 
@@ -1446,7 +1499,7 @@ The lookup above reads the desktop's own defaults, which depends on the companio
 A companion the desktop starts (its autostart entry) has all of these. One the **daemon** starts
 did not: FR-27's consent launch, FR-117's restart after an update
 (`restart_replaced`, `agents/roomlerd/src/companion/package_sync.rs:412`) and the post-install
-first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:866`). For a
+first run all go through `systemd_run_command` (`agents/roomlerd/src/companion.rs:1109`). For a
 root daemon that is a transient **system** unit, which inherits nothing of the desktop; its
 environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DISPLAY`,
 `WAYLAND_DISPLAY`) and nothing else.
@@ -1454,8 +1507,8 @@ environment was logind's four variables (`XDG_RUNTIME_DIR`, the session bus, `DI
 Since #2713 a root daemon reads the session user's systemd manager environment, the store the
 desktop fills at login, by running `systemctl --user show-environment` **as that user** (the one
 privilege-drop path, `exec::drop_to_std`), bounded at 5 s (`user_manager_environment`,
-`companion.rs:946`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:894`;
-parsing in `session_env_pairs`, `companion.rs:920`):
+`companion.rs:1189`). It passes on an **allowlist** of it (`SESSION_ENV_KEYS`, `companion.rs:1137`;
+parsing in `session_env_pairs`, `companion.rs:1163`):
 
 - ⚠️ **An allowlist, not the whole environment.** The values are the user's own, and the companion
   runs as that user, so no privilege crosses. But loader plumbing (`LD_*`, `GTK_MODULES`) has no
@@ -1548,7 +1601,7 @@ kills everything left in its cgroup. Quitting the companion, a crash, and FR-117
 crashed with them (the field check below).
 
 Since #2729 the daemon starts the companion with `--property=KillMode=process`
-(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:1031`), in a root daemon's system
+(`systemd_run_command_with`, `agents/roomlerd/src/companion.rs:1274`), in a root daemon's system
 unit and a per-user daemon's `--user` unit alike: stopping the unit signals the companion only.
 Its own helpers end with it regardless, since WebKit's web and network processes exit when their
 UI process's connection closes.

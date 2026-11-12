@@ -75,19 +75,262 @@ pub(crate) fn sync_enabled() -> bool {
 /// a laptop that is never restarted is never, and nothing said why (a corp
 /// laptop sat a version behind on 2026-10-20). One file read when the version
 /// marker matches.
+///
+/// #3781 — sooner while the companion is too old to connect to this daemon
+/// ([`RefreshSchedule`]), and one log line per wait while it is.
 #[cfg(target_os = "windows")]
 pub async fn refresh_periodically(respawn: RespawnContext) {
-    loop {
-        tokio::time::sleep(REFRESH_RETRY).await;
-        if sync_enabled() {
-            refresh_if_stale(respawn).await;
+    retry_refresh(
+        sync_enabled,
+        sibling_marker,
+        || refresh_if_stale(respawn),
+        |next| {
+            tracing::warn!(
+                installed = next.installed.as_deref().unwrap_or("<none>"),
+                needs = MIN_COMPANION_VERSION,
+                next_try_in_min = next.wait.as_secs() / 60,
+                "desktop companion is too old to connect to this daemon; its refresh is retried"
+            )
+        },
+    )
+    .await
+}
+
+/// FR-117 P2 — the retry's period: the updater's own default interval.
+const REFRESH_RETRY: std::time::Duration = crate::updater::CHECK_INTERVAL;
+
+/// #3781 — the waits before each refresh while the companion is too old to
+/// connect: 2, 5, 10 and 15 minutes, then 15 to the end of the first hour, so
+/// the tries land 2, 7, 17, 32, 47 and 62 minutes in; after them the
+/// updater's [`REFRESH_RETRY`]. A tray that cannot connect leaves the person
+/// with no status, tunnels or settings, and what stops its refresh (a
+/// download a middlebox dropped, an EXE endpoint protection holds) often
+/// clears within minutes. A block that outlasts the hour gets the old period,
+/// not a tight loop.
+const FAST_REFRESH_WAITS: [std::time::Duration; 6] = [
+    minutes(2),
+    minutes(5),
+    minutes(10),
+    minutes(15),
+    minutes(15),
+    minutes(15),
+];
+
+const fn minutes(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n * 60)
+}
+
+/// #3736 — the oldest companion (tray) this daemon's LocalAPI pipe accepts
+/// from a person's session: `agent-v0.4.216`, the first release whose
+/// companion opens the pipe with exactly `localapi::PIPE_CLIENT_ACCESS`
+/// (#3742; `agent-v0.4.215` was cut before it). Since #3760 the pipe gives
+/// Interactive Users only that access, so an older companion, which opens it
+/// with `GENERIC_WRITE`, is refused on every connect by a daemon that runs
+/// elevated or as SYSTEM. Moves only with that DACL or the client's open.
+pub(crate) const MIN_COMPANION_VERSION: &str = "0.4.216";
+
+/// #3781 — is the companion whose version marker reads `marker` too old to
+/// connect to this daemon? No marker, an unreadable one and one that names no
+/// version all count as too old: nothing vouches for the open such a tray
+/// makes.
+pub(crate) fn predates_min_companion(marker: Option<&str>) -> bool {
+    let parse = crate::updater::parse_version;
+    let installed = marker_version(marker);
+    match (
+        installed.as_deref().and_then(parse),
+        parse(MIN_COMPANION_VERSION),
+    ) {
+        (Some(installed), Some(minimum)) => installed < minimum,
+        _ => true,
+    }
+}
+
+/// #3781 — the version a marker names, bounded for a log line and the wire
+/// ([`sanitize_version`]); `None` when it names none.
+fn marker_version(marker: Option<&str>) -> Option<String> {
+    marker
+        .and_then(sanitize_version)
+        .filter(|v| crate::updater::parse_version(v).is_some())
+}
+
+/// #3781 — the retry loop's memory: how many refreshes it has made in a row
+/// while the companion read too old to connect.
+#[derive(Debug, Default)]
+pub(crate) struct RefreshSchedule {
+    tries: u32,
+}
+
+/// #3781 — one wait of the retry loop, as [`RefreshSchedule::next`] plans it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))] // the log line reads it on Windows
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NextRefresh {
+    /// How long the loop sleeps before its next refresh.
+    pub(crate) wait: std::time::Duration,
+    /// The companion is too old to connect: the loop logs one line for this
+    /// wait.
+    pub(crate) too_old: bool,
+    /// The version its marker names; `None` when no marker reads as one.
+    pub(crate) installed: Option<String>,
+}
+
+impl RefreshSchedule {
+    /// The next wait, from the version marker as it reads now. Called once
+    /// per wait, so the loop logs at most one line per wait. A marker that
+    /// reads current starts the fast waits over for the next time one reads
+    /// too old.
+    pub(crate) fn next(&mut self, marker: Option<&str>) -> NextRefresh {
+        let too_old = predates_min_companion(marker);
+        let wait = next_refresh_wait(marker, self.tries);
+        self.tries = if too_old {
+            self.tries.saturating_add(1)
+        } else {
+            0
+        };
+        NextRefresh {
+            wait,
+            too_old,
+            installed: marker_version(marker),
         }
     }
 }
 
-/// FR-117 P2 — the retry's period: the updater's own default interval.
+/// #3781 — how long the retry loop waits before its next refresh, keyed on
+/// the companion's version marker: [`FAST_REFRESH_WAITS`] while it is too old
+/// to connect (`tries` = the refreshes the loop has already made while it
+/// read too old), else, and after them, [`REFRESH_RETRY`].
+pub(crate) fn next_refresh_wait(marker: Option<&str>, tries: u32) -> std::time::Duration {
+    if !predates_min_companion(marker) {
+        return REFRESH_RETRY;
+    }
+    FAST_REFRESH_WAITS
+        .get(tries as usize)
+        .copied()
+        .unwrap_or(REFRESH_RETRY)
+}
+
+/// #3781 — the retry loop, over what it does to the world: read the version
+/// marker, refresh, log. Generic so its rhythm is tested on every OS, on
+/// tokio's paused clock. One [`RefreshSchedule::next`] per wait, so one line
+/// per wait while the companion is too old to connect, and never one per
+/// tick: there is none.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) async fn retry_refresh<E, M, R, F, L>(
+    mut enabled: E,
+    mut marker: M,
+    mut refresh: R,
+    mut log: L,
+) where
+    E: FnMut() -> bool,
+    M: FnMut() -> Option<String>,
+    R: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+    L: FnMut(&NextRefresh),
+{
+    let mut schedule = RefreshSchedule::default();
+    loop {
+        // `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster
+        // one with it: the old period, no refresh, and no line saying one is
+        // coming.
+        let next = if enabled() {
+            schedule.next(marker().as_deref())
+        } else {
+            schedule = RefreshSchedule::default();
+            NextRefresh {
+                wait: REFRESH_RETRY,
+                too_old: false,
+                installed: None,
+            }
+        };
+        if next.too_old {
+            log(&next);
+        }
+        tokio::time::sleep(next.wait).await;
+        if enabled() {
+            refresh().await;
+        }
+    }
+}
+
+/// #3781 — what `roomler status` says about the companion beside this daemon
+/// (`localapi::NodeStatus::companion_too_old`): `Some` when the person's
+/// tray cannot connect to it, `None` when it connects or this does not apply.
+///
+/// - `exe_present`: a companion sits beside the daemon. With none there is no
+///   tray to refuse.
+/// - `refuses_old`: this daemon runs elevated or as SYSTEM. Its pipe's owner
+///   is then the Administrators group or SYSTEM, so the person's tray, started
+///   in their own session, reaches the pipe through the Interactive Users
+///   entry alone (#3760). A daemon that runs as the person owns its pipe, and
+///   their tray connects through the owner's entry, whatever its age.
+/// - `marker`: the version marker as read. One that names no version, or none
+///   at all, is reported without `installed`, never left out.
+/// - `by_service`: the machine-wide service refreshes the tray, not this
+///   process.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn too_old_to_connect(
+    exe_present: bool,
+    refuses_old: bool,
+    marker: Option<&str>,
+    by_service: bool,
+) -> Option<tunnel_core::localapi::CompanionTooOld> {
+    (exe_present && refuses_old && predates_min_companion(marker)).then(|| {
+        tunnel_core::localapi::CompanionTooOld {
+            installed: marker_version(marker),
+            minimum: MIN_COMPANION_VERSION.to_string(),
+            by_service,
+        }
+    })
+}
+
+/// #3781 — [`too_old_to_connect`] for the companion beside this process, read
+/// fresh on every status answer: on a machine-wide install the service host,
+/// another process, may have just refreshed it. What this process cannot read
+/// counts as reportable, so the field's absence never stands for "could not
+/// tell".
 #[cfg(target_os = "windows")]
-const REFRESH_RETRY: std::time::Duration = crate::updater::CHECK_INTERVAL;
+pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
+    if !pipe_refuses_old_companions() {
+        return None;
+    }
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    let (exe_present, marker) = match &dir {
+        Some(dir) => (
+            dir.join(DESKTOP_EXE).try_exists().unwrap_or(true),
+            std::fs::read_to_string(dir.join(VERSION_MARKER)).ok(),
+        ),
+        // No folder of its own to look in: a tray of unknown version.
+        None => (true, None),
+    };
+    too_old_to_connect(
+        exe_present,
+        true,
+        marker.as_deref(),
+        crate::supervision::current() == Some(crate::supervision::Supervision::WindowsScm),
+    )
+}
+
+/// #3781 — does this daemon's pipe refuse a companion older than
+/// [`MIN_COMPANION_VERSION`]? Yes when it runs as LocalSystem or elevated:
+/// its pipe's owner is then SYSTEM or the Administrators group, not the
+/// person. A token this process cannot read counts as refusing. Read once: a
+/// process's token never changes.
+#[cfg(target_os = "windows")]
+fn pipe_refuses_old_companions() -> bool {
+    static REFUSES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REFUSES.get_or_init(|| match crate::win_identity::own_token_is_local_system() {
+        Some(false) => crate::win_identity::process_is_elevated(),
+        Some(true) | None => true,
+    })
+}
+
+/// The version marker beside this daemon, as read; `None` when it cannot be.
+#[cfg(target_os = "windows")]
+fn sibling_marker() -> Option<String> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    std::fs::read_to_string(dir.join(VERSION_MARKER)).ok()
+}
 
 /// FR-84 D6 — open the companion ONCE after a fresh install, from whichever
 /// process owns that on this host: the SCM host on a perMachine Windows
@@ -2411,5 +2654,234 @@ mod nobody_at_the_screen_tests {
             !is_nobody_at_the_screen(&would_not_start),
             "loginctl would not start: {would_not_start:#}"
         );
+    }
+}
+
+/// #3781 — the retry schedule, keyed on the companion's version marker, the
+/// loop's rhythm on tokio's paused clock, and what `roomler status` is told:
+/// pure, on every OS.
+#[cfg(test)]
+mod too_old_tests {
+    use super::{
+        MIN_COMPANION_VERSION, NextRefresh, REFRESH_RETRY, RefreshSchedule, next_refresh_wait,
+        retry_refresh, too_old_to_connect,
+    };
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tunnel_core::localapi::CompanionTooOld;
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    /// The first eight waits the loop would take for `marker`, in minutes.
+    fn waits(marker: Option<&str>) -> Vec<u64> {
+        (0..8)
+            .map(|tries| next_refresh_wait(marker, tries).as_secs() / 60)
+            .collect()
+    }
+
+    /// A tray older than the minimum is refreshed again after 2, 5, 10 and 15
+    /// minutes, then every 15 to the end of the first hour, then every 4 h.
+    #[test]
+    fn a_tray_too_old_to_connect_is_retried_within_minutes_for_its_first_hour() {
+        assert!(crate::updater::parse_version(MIN_COMPANION_VERSION).is_some());
+        assert_eq!(REFRESH_RETRY, crate::updater::CHECK_INTERVAL);
+        assert_eq!(waits(Some("0.4.212")), [2, 5, 10, 15, 15, 15, 240, 240]);
+        assert_eq!(waits(Some("0.4.215\r\n")), [2, 5, 10, 15, 15, 15, 240, 240]);
+        let first_hour: u64 = waits(Some("0.4.212"))[..6].iter().sum();
+        assert_eq!(
+            first_hour, 62,
+            "the sixth try lands at the end of the first hour"
+        );
+    }
+
+    /// Nothing vouches for the open a tray with no readable version makes.
+    #[test]
+    fn no_marker_or_one_that_names_no_version_counts_as_too_old() {
+        for marker in [None, Some(""), Some("  \r\n"), Some("garbage"), Some("v")] {
+            assert_eq!(waits(marker)[..2], [2, 5], "{marker:?}");
+        }
+    }
+
+    /// From the minimum on the tray connects, and the period stays the
+    /// updater's. A pre-release of the minimum predates its final.
+    #[test]
+    fn a_tray_from_the_minimum_on_keeps_the_normal_period() {
+        for marker in [
+            Some(MIN_COMPANION_VERSION),
+            Some("0.4.216\n"),
+            Some("0.4.217"),
+            Some("0.5.0"),
+            Some("1.0.0"),
+        ] {
+            assert_eq!(waits(marker), [240; 8], "{marker:?}");
+        }
+        assert_eq!(waits(Some("0.4.216-rc.1"))[0], 2);
+    }
+
+    /// The fast waits count refreshes made in a row while the tray read too
+    /// old: one that reads current starts them over.
+    #[test]
+    fn the_schedule_starts_over_when_the_tray_reads_current_again() {
+        let mut s = RefreshSchedule::default();
+        let minutes = |n: &NextRefresh| n.wait.as_secs() / 60;
+        let first = s.next(Some("0.4.212"));
+        assert_eq!(
+            (minutes(&first), first.too_old, first.installed.as_deref()),
+            (2, true, Some("0.4.212"))
+        );
+        assert_eq!(minutes(&s.next(Some("0.4.212"))), 5);
+        let current = s.next(Some("0.4.218"));
+        assert_eq!((minutes(&current), current.too_old), (240, false));
+        let again = s.next(None);
+        assert_eq!(
+            (minutes(&again), again.too_old, again.installed),
+            (2, true, None)
+        );
+    }
+
+    /// The pin for the log: ONE line per wait while the tray is too old, each
+    /// before its wait and naming the version and the wait; never one per
+    /// tick, and none once the tray reads current.
+    #[tokio::test(start_paused = true)]
+    async fn the_too_old_line_is_logged_once_per_wait() {
+        let marker = Arc::new(Mutex::new(Some("0.4.212".to_string())));
+        let refreshes = Arc::new(AtomicU32::new(0));
+        let lines: Arc<Mutex<Vec<NextRefresh>>> = Arc::default();
+        let task = tokio::spawn(retry_refresh(
+            || true,
+            {
+                let marker = marker.clone();
+                move || marker.lock().unwrap().clone()
+            },
+            {
+                let refreshes = refreshes.clone();
+                move || {
+                    refreshes.fetch_add(1, SeqCst);
+                    std::future::ready(())
+                }
+            },
+            {
+                let lines = lines.clone();
+                move |next: &NextRefresh| lines.lock().unwrap().push(next.clone())
+            },
+        ));
+        let seen = || (lines.lock().unwrap().len(), refreshes.load(SeqCst));
+        let last = || {
+            let lines = lines.lock().unwrap();
+            lines
+                .last()
+                .map(|n| (n.wait.as_secs() / 60, n.installed.clone()))
+        };
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(seen(), (1, 0), "the first wait's line, before it");
+        tokio::time::sleep(MINUTE).await;
+        assert_eq!(seen(), (1, 0), "a minute into a wait logs nothing more");
+        tokio::time::sleep(MINUTE).await;
+        assert_eq!(seen(), (2, 1), "a refresh, then the next wait's line");
+        tokio::time::sleep(60 * MINUTE).await;
+        assert_eq!(seen(), (7, 6), "62 minutes: six tries, seven waits");
+        let logged: Vec<u64> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| n.wait.as_secs() / 60)
+            .collect();
+        assert_eq!(logged, [2, 5, 10, 15, 15, 15, 240]);
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|n| n.too_old && n.installed.as_deref() == Some("0.4.212"))
+        );
+        tokio::time::sleep(120 * MINUTE).await;
+        assert_eq!(seen(), (7, 6), "two hours into the 4-h wait: nothing");
+
+        // The refresh lands: the tray reads current, and the lines stop.
+        *marker.lock().unwrap() = Some("0.4.218".into());
+        tokio::time::sleep(120 * MINUTE).await;
+        assert_eq!(seen(), (7, 7));
+        // A tray that reads too old again starts the fast waits over.
+        *marker.lock().unwrap() = None;
+        tokio::time::sleep(240 * MINUTE).await;
+        assert_eq!(seen(), (8, 8));
+        assert_eq!(last(), Some((2, None)));
+        task.abort();
+    }
+
+    /// `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster one
+    /// with it: no refresh, and no line saying one is coming.
+    #[tokio::test(start_paused = true)]
+    async fn with_the_switch_off_nothing_is_refreshed_or_logged() {
+        let refreshes = Arc::new(AtomicU32::new(0));
+        let lines = Arc::new(AtomicU32::new(0));
+        let task = tokio::spawn(retry_refresh(
+            || false,
+            || Some("0.4.212".to_string()),
+            {
+                let refreshes = refreshes.clone();
+                move || {
+                    refreshes.fetch_add(1, SeqCst);
+                    std::future::ready(())
+                }
+            },
+            {
+                let lines = lines.clone();
+                move |_: &NextRefresh| {
+                    lines.fetch_add(1, SeqCst);
+                }
+            },
+        ));
+        tokio::time::sleep(9 * 60 * MINUTE).await;
+        assert_eq!((refreshes.load(SeqCst), lines.load(SeqCst)), (0, 0));
+        task.abort();
+    }
+
+    /// A tray older than the minimum, where this daemon's pipe refuses it, is
+    /// reported with its version, the minimum, and who refreshes it.
+    #[test]
+    fn a_tray_too_old_to_connect_is_reported_where_the_pipe_refuses_it() {
+        assert_eq!(
+            too_old_to_connect(true, true, Some("0.4.212\r\n"), true),
+            Some(CompanionTooOld {
+                installed: Some("0.4.212".into()),
+                minimum: "0.4.216".into(),
+                by_service: true,
+            })
+        );
+        let own = too_old_to_connect(true, true, Some("0.4.215"), false).expect("reported");
+        assert!(!own.by_service);
+    }
+
+    /// Nothing for a tray that connects, for no tray, and for a daemon that
+    /// runs as the person: it owns its pipe, and their old tray still
+    /// connects through the owner's entry.
+    #[test]
+    fn nothing_is_reported_for_a_tray_that_connects_or_is_not_there() {
+        assert_eq!(too_old_to_connect(true, true, Some("0.4.216"), true), None);
+        assert_eq!(
+            too_old_to_connect(true, true, Some("0.4.220\n"), true),
+            None
+        );
+        assert_eq!(too_old_to_connect(false, true, Some("0.4.212"), true), None);
+        assert_eq!(too_old_to_connect(false, true, None, true), None);
+        assert_eq!(
+            too_old_to_connect(true, false, Some("0.4.212"), false),
+            None
+        );
+        assert_eq!(too_old_to_connect(true, false, None, false), None);
+    }
+
+    /// A tray whose version nobody can vouch for is reported, never hidden,
+    /// and never with what a marker says when it names no version.
+    #[test]
+    fn a_tray_of_unknown_version_is_reported_without_one() {
+        for marker in [None, Some(""), Some("garbage"), Some("<script>")] {
+            let reported = too_old_to_connect(true, true, marker, true).expect("reported");
+            assert_eq!(reported.installed, None, "{marker:?}");
+            assert_eq!(reported.minimum, MIN_COMPANION_VERSION);
+        }
     }
 }

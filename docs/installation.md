@@ -1919,7 +1919,7 @@ Disconnect and its consent prompt. As that user:
   changes exactly the keys that are the person at the device's own call — where
   incoming files land, whether a controller may record, what a remote session may use,
   privacy mode, lock on end, display match, the browser check, external access
-  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3165`). The
+  (`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`). The
   device-owned switches — `exec_enabled`, `ssh_enabled`, `remote_config_enabled` — the
   overlay, SSH, the updater and the recordings folder are refused by name: `sudo
   roomler config set <key> <value>`. The companion's Device configuration page shows
@@ -2455,13 +2455,13 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:5039`).
+(`crates/localapi/src/lib.rs:5069`).
 
 The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
 socket it serves the console user admits, besides the safety surface, exactly
 the configuration keys that are the person's own call
-(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3165`) — never
+(`localapi::CONSOLE_PERSON_KEYS`, `crates/localapi/src/lib.rs:3195`) — never
 `exec_enabled`, `ssh_enabled` or `remote_config_enabled`, which it serves
 read-only and refuses to set by name (`localapi::person_may`, `:3341`). Whether
 the console user should flip those from the app is the decision left open on
@@ -2715,8 +2715,41 @@ when one is needed (FR-27).
 |---|---|
 | `roomlerd` (daemon hosts) | Self-updater polls `/api/agent/latest-release` (4 h timer + startup cooldown; a check that fails on the NETWORK — DNS, connect, timeout — rechecks after 5, 15, then 60 min instead of the full interval, #1755, while a verdict such as a 403 rate limit keeps the interval), verifies SHA-256, hands off to MSI / `dpkg` / `installer` and restarts. A per-user Linux daemon cannot write `/usr`: there a root update helper (`roomler-update.service`) installs, and the daemon restarts onto the new binary once nothing it serves would be cut (FR-96). Admins can force it fleet-wide or per device (`POST …/agent/update`); ⚠️ `delivered: true` means only that the push reached the device's live socket — a device with `auto_update = false` ignores it and logs `update trigger dropped — auto-update is off on this device` (#1689). Crash-looping updates roll back to the last known-good version. On a Windows service install the post-install watcher's last act is to **settle** the `Roomler` service: it waits out a stop still in flight, starts the service when it reads STOPPED, and trusts RUNNING only after 15 s unbroken. Windows Installer's Restart Manager can stop the freshly installed service *after* the install has finished, and a single `sc start` answers 1056 ("already running") for a service that is still stopping (#2711). `last-install.json` records what it saw (`service Roomler: running (1 start; seen StopPending→Stopped→Running)`). The watcher writes its verdict without `println!` (#2934, #2935): an update driven by `roomler exec … self-update` leaves it the exec's stdout, whose reader is gone by then, and the panic that followed was filed as an agent crash |
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin): since FR-97 P6b the release's `.asc` is checked against the pinned key on every OS, and Linux and macOS install too, the tarball or (where dpkg owns the binary) the `.deb` ([`tunnel-install.md` §10](tunnel-install.md)). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
-| `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686) |
+| `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686). A refresh that fails is retried every 4 h, and within minutes while the tray is too old to connect ([below](#a-tray-older-than-its-daemon-windows-3781)) |
 | wizard | Fetch-latest by nature; `setup-v<V>` is cut with every `agent-v<V>` (the lockstep job in `release-agent.yml`) |
+
+### A tray older than its daemon (Windows, #3781)
+
+From `agent-v0.4.217` the LocalAPI pipe gives a person's session only the exact open a tray makes
+from `agent-v0.4.216` on (#3742, #3760). A tray from before 0.4.216 asks for more, so a daemon that
+runs elevated or as SYSTEM refuses every connect it makes, and none of its pages reach the daemon
+until the daemon replaces it. That is a machine-wide install, unless its worker runs as a person
+without administrator rights. A daemon that runs as the person owns its pipe, and that person's
+old tray still connects there.
+
+The daemon's refresh replaces the tray within seconds of an update. When it cannot, for example
+because endpoint protection blocks the swap, it retries soon. The retry is keyed on the tray's
+version marker (`roomler-desktop.exe.version`, beside the daemon). While the marker is older than
+0.4.216, missing, or names no version, the waits are 2, 5, 10 and 15 minutes, then 15 to the end
+of the first hour after the service (or the per-user daemon) starts, then every 4 hours. Each wait
+logs one line: `desktop companion is too old to connect to this daemon; its refresh is retried`,
+with `installed`, `needs` and `next_try_in_min`.
+
+`roomler status` says so, under `version` and `last update`:
+
+```
+  tray        OUT OF DATE: 0.4.212 cannot connect to this daemon, which needs 0.4.216 or later
+              Roomler replaces it by itself, retrying every few minutes for an hour after a start, then every 4 h
+              To retry now: Restart-Service Roomler (as an administrator)
+              Why it failed: roomler logs --source service --grep "desktop companion"
+```
+
+A tray with no marker reads `version UNKNOWN (no version marker)` instead. Restarting the service
+retries at once. When the log shows the swap refused (`desktop companion refresh skipped`, with
+access denied or a file in use), allowing Roomler to replace `roomler-desktop.exe` in its install
+folder ends it. `ROOMLERD_COMPANION_SYNC=0` turns the retry off, the faster one with it. The
+mechanics:
+[`desktop-companion.md` §13.2](desktop-companion.md#132-a-tray-too-old-for-its-daemon-windows-3781).
 
 ## Verifying what you install
 

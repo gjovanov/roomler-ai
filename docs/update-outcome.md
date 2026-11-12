@@ -101,7 +101,7 @@ sequenceDiagram
 ## 4. The eight words
 
 The daemon reports the record as `NodeStatus.last_install`
-(`crates/localapi/src/lib.rs:476`), a `LastInstallStatus` (`:536`) whose
+(`crates/localapi/src/lib.rs:476`), a `LastInstallStatus` (`:566`) whose
 `status` is one of eight words — the six a record can hold, spelled exactly
 as the file and the watcher's `post-install verdict:` log line spell them so
 one grep finds all three surfaces (locked by
@@ -120,7 +120,7 @@ say:
 | `WatcherStopped` | nothing wrote a verdict in the watcher's whole life, and the daemon that settled the record is not the version it was for (#3302) | `WATCHER STOPPED — agent-v0.4.172 started 3d ago: <note>` | WARN |
 | `Unreadable` | a file is there and does not parse; `note` carries the error chain | `record UNREADABLE — <error> (<path>)` | WARN |
 
-The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:575`): the
+The 25 min line is `LastInstallStatus::STALE_AFTER_SECS` (`lib.rs:605`): the
 watcher's whole life is bounded — 10 min on the installer, 10 more on a
 Windows wedge retry, 2 min settling the service — so nothing is still writing
 a record older than that (`never_reported`, `:557`).
@@ -200,7 +200,7 @@ $ roomler status
   status` (fleet RPC, `docs/fleet-rpc.md`), or `roomler status --json` and read
   `.last_install`. The line sits right under `version` — the record and the
   binary it produced, together — and is printed only when the daemon reports
-  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2509`;
+  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2548`;
   the sentence per word, `last_install_line`, `:2887`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
