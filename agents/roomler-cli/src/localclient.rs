@@ -2172,11 +2172,23 @@ fn print_password_next_steps(state: &localapi::ExternalPasswordState) {
 /// ENOENT must never surface, and `main` prints just this one line). Everything
 /// else keeps its context. Both branches are returned BEFORE any stdout write,
 /// so `--json | jq` on a dead daemon fails cleanly with empty stdout.
+///
+/// #3736 — when this account had no per-user socket to try at all (no private
+/// runtime directory: cron, `su`, a shell without a login session), the line
+/// says so, since a per-user daemon could not be reached from here either.
 pub(crate) fn daemon_err(e: io::Error) -> anyhow::Error {
     if e.kind() == io::ErrorKind::NotFound {
-        anyhow!("roomler daemon not running (is the service started?)")
+        not_running(localapi::no_per_user_socket_note())
     } else {
         anyhow!("talking to the roomler daemon: {e}")
+    }
+}
+
+/// The "not running" line, with why there was no per-user socket to try.
+fn not_running(note: Option<String>) -> anyhow::Error {
+    match note {
+        Some(note) => anyhow!("roomler daemon not running (is the service started?); {note}"),
+        None => anyhow!("roomler daemon not running (is the service started?)"),
     }
 }
 
@@ -3600,6 +3612,21 @@ fn route_state_word(s: &RouteState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3736 — "not running" says why there was no per-user socket to try,
+    /// when there was none, and is the one plain line otherwise.
+    #[test]
+    fn not_running_says_why_there_was_no_per_user_socket() {
+        assert_eq!(
+            not_running(None).to_string(),
+            "roomler daemon not running (is the service started?)"
+        );
+        let with = not_running(Some("XDG_RUNTIME_DIR is not set".into())).to_string();
+        assert_eq!(
+            with,
+            "roomler daemon not running (is the service started?); XDG_RUNTIME_DIR is not set"
+        );
+    }
 
     fn tier_row(tier: &str, eligible: bool, available: Option<bool>) -> TierWhy {
         TierWhy {

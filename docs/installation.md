@@ -162,7 +162,7 @@ step's words (`steps.rs:305`); the download's ticks and a script's lines have
 panels of their own. The daemon's and the companion's downloads are separate
 rows. No row names an MSI flavour: `AssetResolving` is drawn nowhere, and the
 preflight says what is installed here already and what the install does to it,
-in a person's words (`label_existing`, `orchestrator_agent.rs:1880`,
+in a person's words (`label_existing`, `orchestrator_agent.rs:1881`,
 `orchestrator_unix.rs:1227`; `orchestrator_tunnel.rs:410`), for example
 "Roomler is installed for the whole computer (version 0.4.207): this install
 replaces it". A switch to the other kind is the switch's warning row to say.
@@ -273,13 +273,13 @@ new name. Two changes close it:
 | Where | What it does |
 |---|---|
 | the daemon's start (`agents/roomlerd/src/app.rs:3942`, `crates/agent-core/src/config.rs:4303`) | The saves a daemon makes while it starts (a migration, a minted key, the crash bookkeeping) write the copy it loaded. Each one now checks first that the file is still the one it loaded or last wrote itself. A config another process wrote in the meantime is not written over; the daemon runs it from its next start. Every later writer already reloads under the daemon's write lock. |
-| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:993`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
+| the wizard (`agents/roomler-setup/src/orchestrator_agent.rs:660`, `:994`) | On a perMachine reinstall it reads the config to fold into only once the daemon the MSI restarted answers on its LocalAPI (up to 90 s), which a daemon serves only after its startup saves, so an older daemon's save cannot land after the wizard's write either. After the write it asks that daemon to restart through its own LocalAPI (`RestartDaemon`, the companion's Apply now), as `install.sh` restarts the Linux unit. That is the internal arm: the restart is not counted as a crash, and an ephemeral device does not take it for the OS stop that unenrolls it. When the daemon declines or does not answer, the Done page says why: the enrollment is written and takes effect at its next start. |
 
 **A reinstall of the pre-logon service needs Roomler Setup run as
 administrator.** Once that config is there, the daemon keeps its folder to
 SYSTEM and Administrators (#3073, #3609), and a wizard that is not elevated
 cannot open it. The wizard says so on its first page, before a token is pasted
-or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1294`), and the
+or paired (`agents/roomler-setup/src/orchestrator_agent.rs:1295`), and the
 install refuses it before anything is downloaded (`:295`). Before the enroll it
 also stops on a config it may not read (`agents/roomler-setup/src/machine_write.rs:157`,
 never reported as a damaged config) or a folder it may not write (`:160`). The
@@ -1454,7 +1454,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1953`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1652`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1672`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7845`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7878`)
 pin the role per command and the end line of a failure.
@@ -1915,6 +1915,17 @@ person's uid, and `localapi: person-at-the-device socket down`. Turn it off with
 `ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service` drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
 [security baseline](security-baseline.md) §4.
 
+**Which socket a `roomler` command reaches (#3736).** Its own account's per-user socket
+first, only when it has a runtime dir private to it (`$XDG_RUNTIME_DIR`, which a login
+session sets), then the system socket. Each is kept only when its own account or root
+serves it. So `sudo roomler …`, a cron job and a system service, which have no runtime
+dir, go straight to `/var/run/roomler/roomler.sock`. On a **per-user** install the
+daemon's socket is that runtime dir's, and a command run without one (cron, `su`)
+answers `roomler daemon not running` with a note naming `XDG_RUNTIME_DIR`: run it with
+`XDG_RUNTIME_DIR=/run/user/$(id -u)`. A per-user daemon started without a private
+runtime dir serves no LocalAPI at all and logs `localapi: not served: …` with the
+reason.
+
 ### The companion's Device configuration on a system install (#2891, #2871)
 
 The companion reaches the root daemon over that same person socket. Before #2871's
@@ -2307,7 +2318,9 @@ Same three commands as Windows and Linux.
 
 `roomler peers` / `status` reach the **per-user** half; `sudo roomler …` reaches
 the **root** half, because the two listen on different LocalAPI sockets
-(`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`). If a
+(`$TMPDIR/roomler/roomler.sock`, in the person's own `/var/folders/…/T`, vs
+`/var/run/roomler/roomler.sock`). A command keeps a socket only when its own account
+or root serves it, and root never looks in a per-user temp folder (#3736). If a
 command reports "daemon not running", you are probably asking the wrong half.
 
 `roomler status` as the signed-in user carries the **root** half's overlay
@@ -2343,7 +2356,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:4829`).
+(`crates/localapi/src/lib.rs:5029`).
 
 The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person
@@ -2636,7 +2649,11 @@ precisely so corporate networks can allow-list `roomler.ai` instead of
   (`roomler-desktop.exe` with its `.old` and `.version`). A run that is not
   elevated removes this account's install only, and names what it left with
   the way on (`scripts/install.ps1:519-531`, #3247). Either way the settings in
-  `C:\ProgramData\roomler` stay.
+  `C:\ProgramData\roomler` stay, and so does an anchored device's SYSTEM
+  service anchor, the registry key `HKLM\SOFTWARE\Roomler\ExecService` (#3737):
+  no installer touches `HKLM\SOFTWARE\Roomler`, so an upgrade keeps it too.
+  `roomlerd anchor remove` (elevated) before the uninstall takes the anchor out
+  ([`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)).
 - **Linux and macOS** (FR-97 P6d): one command, whatever put Roomler there —
   this script, the `.deb`, the companion's `.rpm`, the tarball, the `.pkg`, the
   tunnel CLI. Every step acts only on what is present, so it also works on a
