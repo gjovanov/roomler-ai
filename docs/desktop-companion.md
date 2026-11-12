@@ -39,8 +39,10 @@ flowchart LR
 ```
 
 ⚠️ The LocalAPI is the trust boundary. On Windows its SDDL grants **SYSTEM, Administrators
-and Interactive Users** at medium integrity (`crates/localapi/src/lib.rs:3946`): any person
-logged in at the machine can call it, a sandboxed low-integrity process cannot. Everything
+and the daemon's own account** in full and **Interactive Users** reading and writing data
+only, at medium integrity (`crates/localapi/src/lib.rs:3955-3956`): any person logged in at
+the machine can call it, but only the first three add an instance of the pipe, and a
+sandboxed low-integrity process cannot call it. Everything
 below that lets the companion *change* something is therefore something any interactive user
 can do — which is why the device-side rules (the `files_dir` SYSTEM rule, the visibility rule
 on the Devices page) are enforced in the daemon and on the server, never in the page.
