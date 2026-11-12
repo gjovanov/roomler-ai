@@ -1230,15 +1230,39 @@ pub fn read_private(
     what: &str,
     max_len: u64,
 ) -> Result<Option<String>, String> {
+    read_private_judged(dir, path, what, max_len).map(|read| read.map(|r| r.text))
+}
+
+/// What [`read_private_judged`] read: the text, and the owner and DACL of the
+/// folder and of the file, as judged on the handles the text came through.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateRead {
+    pub text: String,
+    pub folder: Sd,
+    pub file: Sd,
+}
+
+/// [`read_private`], and the security it judged. #3737 — the SYSTEM service's
+/// one-time copy of an anchor from its first home takes only the exact
+/// owner and DACL `roomlerd anchor create` gave the folder and the file, so it
+/// needs both, read through the same handles as the text.
+#[cfg(windows)]
+pub fn read_private_judged(
+    dir: &Path,
+    path: &Path,
+    what: &str,
+    max_len: u64,
+) -> Result<Option<PrivateRead>, String> {
     if let Some(link) = crate::recording_dir::link_component(path) {
         return Err(format!("{} is a link", link.display()));
     }
     let Some(dir_entry) = win::open(dir, win::Kind::Dir, false, false)? else {
         return Ok(None);
     };
-    let sd = win::read_sd(&dir_entry.file)
+    let folder = win::read_sd(&dir_entry.file)
         .map_err(|e| format!("the anchor's directory: reading its security: {e}"))?;
-    verdict(&sd, WRITE_LIKE, "the anchor's directory")?;
+    verdict(&folder, WRITE_LIKE, "the anchor's directory")?;
     let Some(file) = win::open(path, win::Kind::File, true, false)? else {
         return Ok(None);
     };
@@ -1250,12 +1274,27 @@ pub fn read_private(
     if len > max_len {
         return Err(format!("{what} is too large to be one"));
     }
-    let sd = win::read_sd(&file.file).map_err(|e| format!("{what}: reading its security: {e}"))?;
-    verdict(&sd, WRITE_LIKE, what)?;
+    let file_sd =
+        win::read_sd(&file.file).map_err(|e| format!("{what}: reading its security: {e}"))?;
+    verdict(&file_sd, WRITE_LIKE, what)?;
     let bytes = win::read_to_end(&file.file, path, max_len)?;
-    String::from_utf8(bytes)
-        .map_err(|e| format!("reading {what}: {e}"))
-        .map(Some)
+    let text = String::from_utf8(bytes).map_err(|e| format!("reading {what}: {e}"))?;
+    Ok(Some(PrivateRead {
+        text,
+        folder,
+        file: file_sd,
+    }))
+}
+
+/// #3737 — the owner and DACL of the object behind `handle` (`object`: its
+/// kind, such as `SE_REGISTRY_KEY`), read through it, for
+/// [`crate::machine_key`]. The handle must carry `READ_CONTROL`.
+#[cfg(windows)]
+pub(crate) fn security_of(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    object: windows_sys::Win32::Security::Authorization::SE_OBJECT_TYPE,
+) -> std::io::Result<Sd> {
+    win::read_sd_of(handle, object)
 }
 
 /// The handle-level Windows calls: open an entry itself, read and write its
@@ -1276,7 +1315,8 @@ mod win {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+        ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SE_OBJECT_TYPE,
+        SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
         ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DACL_SECURITY_INFORMATION,
@@ -1398,6 +1438,13 @@ mod win {
 
     /// The owner and DACL of the entry behind `file`, read through its handle.
     pub(super) fn read_sd(file: &std::fs::File) -> std::io::Result<Sd> {
+        read_sd_of(file.as_raw_handle() as HANDLE, SE_FILE_OBJECT)
+    }
+
+    /// The owner and DACL of the object behind `handle`, read through it:
+    /// `object` names its kind (a file's, or #3737's registry key's,
+    /// `SE_REGISTRY_KEY`). The handle must carry `READ_CONTROL`.
+    pub(super) fn read_sd_of(handle: HANDLE, object: SE_OBJECT_TYPE) -> std::io::Result<Sd> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -1405,8 +1452,8 @@ mod win {
         // point into `sd`, a LocalAlloc'd descriptor freed below.
         let rc = unsafe {
             GetSecurityInfo(
-                file.as_raw_handle() as HANDLE,
-                SE_FILE_OBJECT,
+                handle,
+                object,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut owner,
                 std::ptr::null_mut(),
