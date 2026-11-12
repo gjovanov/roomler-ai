@@ -273,6 +273,9 @@ fn process_home() -> Option<String> {
 /// the configured one ([`FsAs::DaemonAlone`]).
 /// `ROOMLERD_FILES_AS_SEAT_USER=0` gives back the daemon's identity both
 /// ways.
+///
+/// #3711 — a received file asks who is at seat0 as a read does, off the
+/// async worker and [`SEAT_LOOKUP_WAIT`] at most ([`FsAs::for_write`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
     /// This process: every user install, a Mac's GUI worker (its system
@@ -315,10 +318,12 @@ pub(crate) enum FsAs {
     /// a read) nobody at seat0 (#3688): every read is refused, saying so.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     Nobody,
-    /// (Linux root, a read) who is at seat0 could not be told (#3688): the
-    /// lookup failed or ran out of its time. Every read is refused with
-    /// [`CANNOT_TELL`], never as if nobody were there. Only a read takes it;
-    /// a received file then takes [`Self::DaemonAlone`], as with nobody.
+    /// (Linux root) who is at seat0 could not be told (#3688): the lookup
+    /// failed or ran out of its time. Every read is refused with
+    /// [`CANNOT_TELL`], never as if nobody were there. #3711 — so is a
+    /// received file whose lookup ran out of its time ([`Seat::OutOfTime`]);
+    /// one whose lookup failed outright takes [`Self::DaemonAlone`], as with
+    /// nobody.
     #[cfg(target_os = "linux")]
     CannotTell,
 }
@@ -347,6 +352,8 @@ const NOBODY_AT_THE_SCREEN: &str = "Nobody is signed in at this computer's scree
 /// #3688 — why a read is refused on a Linux system install when who is at
 /// seat0 could not be told: the seat0 lookup failed, or did not answer in
 /// time ([`SEAT_LOOKUP_WAIT`]). Not nobody: a retry may well find them.
+/// #3711 — and why a received file is refused when the lookup did not
+/// answer in time.
 #[cfg(target_os = "linux")]
 const CANNOT_TELL: &str = "Could not tell who is signed in at this computer's screen. Try again.";
 
@@ -424,7 +431,10 @@ fn fs_as_for(
 }
 
 impl FsAs {
-    /// Who a transfer starting now writes as.
+    /// Who a transfer starting now writes as, asked on a blocking thread:
+    /// `ConfigSet`'s check of `files_dir` and the status refresh's own
+    /// thread. On a Linux system install it asks seat0 inline, with no time
+    /// limit. #3711 — an async task asks [`Self::for_write`] instead.
     pub(crate) fn now() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -461,7 +471,13 @@ impl FsAs {
     }
 
     /// #3711 — who a transfer starting now writes as, asked from an async
-    /// task (`files:begin`, `files:resume`, the startup sweep).
+    /// task (`files:begin`, `files:resume`, the startup sweep). On a Linux
+    /// system install the seat0 lookup runs as a read's does, on a blocking
+    /// thread and [`SEAT_LOOKUP_WAIT`] at most. One that gives no answer in
+    /// that time refuses the write as a read is refused
+    /// ([`Self::CannotTell`]); one that failed outright leaves the file the
+    /// daemon's alone, as with nobody at seat0 ([`linux_fs_as`]). Windows
+    /// and macOS answer as [`Self::now`] does.
     pub(crate) async fn for_write() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -802,11 +818,11 @@ enum Seat {
     /// that resolves to another uid than logind's, a host with no logind.
     Nobody(String),
     /// Not known, and why: logind did not answer, the account database
-    /// did not answer, or the lookup failed or ran out of its time.
+    /// did not answer, or the lookup failed outright.
     CannotTell(String),
-    /// #3711 — not known yet: the lookup gave no answer within its wait,
-    /// and goes on, on its own thread.
-    #[allow(dead_code)] // RED (#3711): `seat_within` answers it in the fix.
+    /// #3711 — not known yet: the lookup gave no answer within its wait
+    /// ([`seat_within`]) and goes on, on its own thread, so the account
+    /// database's own caches usually hold its answer for the next one.
     OutOfTime(std::time::Duration),
 }
 
@@ -884,6 +900,24 @@ fn linux_process() -> (bool, bool) {
     (root, tunnel_core::env::flag("FILES_AS_SEAT_USER", true))
 }
 
+/// #3711 — whether file transfer here moves files only as the person signed
+/// in at the screen: a Linux system install (root) with
+/// `ROOMLERD_FILES_AS_SEAT_USER` on, its default ([`FsAs`]). With nobody
+/// signed in there it browses and sends nothing, and a received file is
+/// root's alone. A hint that says what still works with no picture says so
+/// (`capture::CaptureUnavailableCode::hint`, `apps::Unavailable::reason`).
+pub(crate) fn follows_the_screen() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let (root, switch_on) = linux_process();
+        root && switch_on
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// #3688 — who a step starting now acts as on Linux, from whether this
 /// process is root, the switch, and who is at seat0, which is asked only
 /// when it is needed. Pure, so the decision is a test.
@@ -905,6 +939,17 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             tracing::debug!(%why, "files: nobody at seat0 — a read is refused");
             FsAs::Nobody
         }
+        // #3711 — no answer in time: refused both ways, and a retry asks
+        // again. The lookup goes on and usually finds the person, so a
+        // received file is not written for anyone else meanwhile.
+        Seat::OutOfTime(wait) => {
+            tracing::debug!(
+                ?wait,
+                reading,
+                "files: who is at seat0 is not known yet — refused"
+            );
+            FsAs::CannotTell
+        }
         Seat::CannotTell(why) if reading => {
             tracing::debug!(%why, "files: who is at seat0 is not known — a read is refused");
             FsAs::CannotTell
@@ -913,31 +958,21 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             tracing::debug!(%why, "files: nobody at seat0 — a write is the daemon's");
             FsAs::DaemonAlone
         }
+        // A lookup that failed outright: a write has a safe answer, the
+        // daemon alone (root's own default folder, 0600, never a folder a
+        // controller chose), so a host whose lookup always fails keeps its
+        // uploads. A read has none: as root it would read what root may.
         Seat::CannotTell(why) => {
             tracing::debug!(%why, "files: who is at seat0 is not known — a write is the daemon's");
-            FsAs::DaemonAlone
-        }
-        // RED (#3711): master's answer for a lookup past its time, which it
-        // gave as `CannotTell`.
-        Seat::OutOfTime(wait) if reading => {
-            tracing::debug!(
-                ?wait,
-                "files: who is at seat0 is not known — a read is refused"
-            );
-            FsAs::CannotTell
-        }
-        Seat::OutOfTime(wait) => {
-            tracing::debug!(
-                ?wait,
-                "files: who is at seat0 is not known — a write is the daemon's"
-            );
             FsAs::DaemonAlone
         }
     }
 }
 
 /// #3688, #3711 — [`linux_fs_as`] from an async task, a read's or a write's:
-/// `lookup` is asked only when it is needed (a root daemon, the switch on).
+/// `lookup` is asked only when it is needed (a root daemon, the switch on),
+/// on a blocking thread and `wait` at most ([`seat_within`]). logind and the
+/// account database are other processes, and either may hang.
 #[cfg(target_os = "linux")]
 async fn linux_fs_as_within(
     root: bool,
@@ -949,11 +984,6 @@ async fn linux_fs_as_within(
     if !(root && switch_on) {
         return FsAs::Daemon;
     }
-    if !reading {
-        // RED (#3711): master's write path — asked inline, on this async
-        // worker, with no time limit.
-        return linux_fs_as(root, switch_on, reading, lookup);
-    }
     let seat = seat_within(wait, lookup).await;
     linux_fs_as(root, switch_on, reading, move || seat)
 }
@@ -963,14 +993,18 @@ async fn linux_fs_as_within(
 /// viewer's drawer gives up on `files:dir` after 5 s, so the two together
 /// must leave room inside that. `files:get` and `files:get-folder` have no
 /// timer of their own in the viewer: their wait only delays the offer.
+/// #3711 — a received file's lookup waits as long, at `files:begin`,
+/// `files:resume` (which the viewer gives 10 s) and the startup sweep (which
+/// signalling waits for).
 #[cfg(target_os = "linux")]
 const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// #3688 — `lookup` on a blocking thread, given `wait` at most: a wedged
-/// logind or account lookup cannot tell who is at the screen, and never
-/// stalls an async worker. A lookup past its time finishes on its own
+/// logind or account lookup never stalls an async worker. One that fails
+/// cannot tell who is at the screen ([`Seat::CannotTell`]); #3711 — one past
+/// its time does not know yet ([`Seat::OutOfTime`]), and finishes on its own
 /// thread, so the account database's own caches (SSSD's, nscd's) hold its
-/// answer for the next read's lookup.
+/// answer for the next lookup.
 #[cfg(target_os = "linux")]
 async fn seat_within(
     wait: std::time::Duration,
@@ -979,15 +1013,15 @@ async fn seat_within(
     match tokio::time::timeout(wait, tokio::task::spawn_blocking(lookup)).await {
         Ok(Ok(seat)) => seat,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "files: the seat0 lookup failed — a read is refused");
+            tracing::warn!(error = %e, "files: the seat0 lookup failed — who is at seat0 is not known");
             Seat::CannotTell(format!("the seat0 lookup failed: {e}"))
         }
         Err(_) => {
             tracing::warn!(
                 ?wait,
-                "files: the seat0 lookup did not answer in time — a read is refused"
+                "files: the seat0 lookup did not answer in time — who is at seat0 is not known yet"
             );
-            Seat::CannotTell(format!("the seat0 lookup did not answer within {wait:?}"))
+            Seat::OutOfTime(wait)
         }
     }
 }
@@ -1509,7 +1543,10 @@ pub async fn sweep_orphans() -> (usize, usize) {
     // walk the default folder AND the configured one (when set, usable and
     // different), so a `files_dir` change strands no resumable upload.
     // FR-97 P3d — for, and as, whoever a drop would be written as now: on a
-    // Linux system install, the person at seat0, in their own folder.
+    // Linux system install, the person at seat0, in their own folder. #3711 —
+    // signalling waits for this sweep, so that is asked off the async worker
+    // and waited for 1.5 s at most; with no answer in time, nothing is swept
+    // this start.
     let who = FsAs::for_write().await;
     let w = who.clone();
     let (roots, private) = who
