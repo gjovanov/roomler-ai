@@ -129,6 +129,169 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # #3754 — every installer run of this job goes through Invoke-Installer,
+      # never through `Start-Process -Wait`, which waits for every process in
+      # the child's job object and has no deadline. It waits for the one process
+      # it started, for at most its deadline. Past the deadline it saves the
+      # evidence (every process with its image path, and the service's and the
+      # per-User daemon's logs), ends that process's tree and fails the step.
+      # Any exit but 0 fails too, and 3010 or 1641 says that a restart was
+      # needed. Every failure prints the MSI log's RESTART MANAGER and held-in-use
+      # lines. Five jobs sat in an msiexec run until the job's limit and left no
+      # log at all (#3754). 300 s is twice the slowest passing per-Machine step
+      # (nine runs), and more than every bounded wait of the custom actions summed.
+      - name: "The installer runner: a deadline on every installer run, and its evidence (#3754)"
+        shell: pwsh
+        run: |
+          $runner = Join-Path $env:RUNNER_TEMP 'installer-run.ps1'
+          @'
+          $InstallerEvidence = Join-Path $env:RUNNER_TEMP 'msi-logs'
+          New-Item -ItemType Directory -Path $InstallerEvidence -Force | Out-Null
+          # What a Windows Installer log says about a restart.
+          $RestartMarks = 'RESTART MANAGER', 'held in use', 'ReplacedInUseFiles', 'requires a system restart', 'MainEngineThread is returning'
+
+          # Every process with its image path and command line, and the logs of
+          # the service and of the per-User daemon, as they are now.
+          function Save-InstallerEvidence([string]$Label, [string]$Dir = $InstallerEvidence) {
+            $to = Join-Path $Dir ('evidence-' + ($Label -replace '[^A-Za-z0-9._-]+', '-'))
+            New-Item -ItemType Directory -Path $to -Force | Out-Null
+            $procs = @(Get-CimInstance Win32_Process | Sort-Object ProcessId)
+            $procs | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine, CreationDate |
+              Export-Csv -NoTypeInformation -Encoding utf8 -Path (Join-Path $to 'processes.csv')
+            $procs | Where-Object { $_.Name -match '^(msiexec|roomler)' } |
+              Format-Table -AutoSize ProcessId, ParentProcessId, Name, ExecutablePath | Out-String -Width 400 | Write-Host
+            $logs = @{ 'service-logs' = "$env:ProgramData\roomler\roomler\service-logs"; 'per-user-logs' = "$env:LOCALAPPDATA\roomler\roomler\data\logs" }
+            foreach ($name in $logs.Keys) {
+              if (Test-Path -LiteralPath $logs[$name]) { Copy-Item -LiteralPath $logs[$name] -Destination (Join-Path $to $name) -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            Write-Host "evidence saved: $to ($($procs.Count) processes)"
+          }
+
+          function Get-RestartLines([string]$Log) {
+            if (-not $Log -or -not (Test-Path -LiteralPath $Log)) { return @() }
+            @(Select-String -LiteralPath $Log -SimpleMatch -Pattern $RestartMarks | ForEach-Object { "{0,6}: {1}" -f $_.LineNumber, $_.Line.Trim() })
+          }
+
+          # Runs one installer process and waits for that process alone, for at
+          # most $DeadlineSeconds. -Output sends a console program's stdout and
+          # stderr to <Output>.out.log and <Output>.err.log. -RestartNote is added
+          # to the failure when the exit says a restart was needed.
+          function Invoke-Installer {
+            param(
+              [Parameter(Mandatory)][string]$Label,
+              [Parameter(Mandatory)][string]$FilePath,
+              [Parameter(Mandatory)][string]$Arguments,
+              [string]$Log,
+              [int]$DeadlineSeconds = 300,
+              [string]$Output,
+              [string]$RestartNote,
+              [string]$EvidenceDir = $InstallerEvidence,
+              [int]$Tail = 120,
+              [switch]$NoAnnotation
+            )
+            $start = @{ FilePath = $FilePath; ArgumentList = $Arguments; PassThru = $true }
+            if ($Output) { $start += @{ NoNewWindow = $true; RedirectStandardOutput = "$Output.out.log"; RedirectStandardError = "$Output.err.log" } }
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process @start
+            $null = $p.Handle   # held from here, so the exit code outlives the process
+            $why = $null
+            if (-not $p.WaitForExit($DeadlineSeconds * 1000)) {
+              Save-InstallerEvidence $Label $EvidenceDir   # before anything is ended
+              try { $p.Kill($true) } catch { Write-Host "ending pid $($p.Id): $($_.Exception.Message)" }
+              $null = $p.WaitForExit(30000)
+              $why = "still running at its deadline of $DeadlineSeconds s, so its process tree was ended"
+            } elseif ($p.ExitCode -eq 3010 -or $p.ExitCode -eq 1641) {
+              $why = "exited $($p.ExitCode): Windows Installer needed a restart ($(if ($p.ExitCode -eq 1641) { 'and started one' } else { 'held back by REBOOT=ReallySuppress' }))"
+              if ($RestartNote) { $why += ". $RestartNote" }
+            } elseif ($p.ExitCode -ne 0) {
+              $why = "exited $($p.ExitCode)"
+            }
+            $secs = [int]$clock.Elapsed.TotalSeconds
+            if (-not $why) { Write-Host "${Label}: exit 0 in $secs s"; return }
+            if ($why -notlike 'still running*') { Save-InstallerEvidence $Label $EvidenceDir }
+            $lines = @(Get-RestartLines $Log)
+            if ($Log) {
+              Write-Host "--- $(Split-Path $Log -Leaf): $($lines.Count) line(s) on RESTART MANAGER, files held in use and the engine's end ---"
+              $lines | ForEach-Object { Write-Host $_ }
+              if (Test-Path -LiteralPath $Log) { Write-Host "--- the last $Tail lines of $(Split-Path $Log -Leaf) ---"; Get-Content -LiteralPath $Log -Tail $Tail | Write-Host }
+            }
+            $msg = "${Label}: $why (after $secs s)"
+            if (-not $NoAnnotation) { Write-Host "::error title=installer run failed::$msg" }
+            $ex = [System.Exception]::new($msg)
+            $ex.Data['RestartLines'] = $lines
+            throw $ex
+          }
+
+          # msiexec with the workflow's usual switches; /norestart is
+          # REBOOT=ReallySuppress for /i and /x.
+          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
+            Invoke-Installer -Label "msiexec $verb $(Split-Path $msi -Leaf) [$props]" -FilePath 'msiexec.exe' `
+              -Arguments "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props" -Log $log
+          }
+          '@ | Set-Content -LiteralPath $runner -Encoding utf8
+          'INSTALLER_RUN=' + $runner | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "installer runner: $runner"
+
+      # #3754 — the negative control of the deadline above: an endless process
+      # with an endless child of its own is ended and reported within its limit,
+      # or every deadline in this job is a claim, not a check. And an exit of
+      # 3010 fails with the log's Restart Manager lines. Only then does it pass.
+      - name: "The installer runner ends an endless process at its deadline and reports it (#3754, negative control)"
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          $dir = Join-Path $env:RUNNER_TEMP 'deadline-control'
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $endless = Join-Path $dir 'endless.ps1'
+          @'
+          param([string]$Marker, [switch]$Leaf)
+          if (-not $Leaf) {
+            Start-Process -FilePath (Get-Process -Id $PID).Path -WindowStyle Hidden `
+              -ArgumentList '-NoProfile', '-File', "`"$PSCommandPath`"", '-Marker', $Marker, '-Leaf'
+          }
+          while ($true) { Start-Sleep -Seconds 1 }
+          '@ | Set-Content -LiteralPath $endless -Encoding utf8
+          $marker = 'endless-' + [guid]::NewGuid().ToString('N')
+          $limit = 20
+          $clock = [System.Diagnostics.Stopwatch]::StartNew()
+          $failed = $null
+          try {
+            Invoke-Installer -Label 'deadline control' -FilePath (Get-Process -Id $PID).Path `
+              -Arguments "-NoProfile -File `"$endless`" -Marker $marker" -DeadlineSeconds $limit -EvidenceDir $dir -NoAnnotation
+          } catch { $failed = $_.Exception.Message }
+          $took = $clock.Elapsed.TotalSeconds
+          Write-Host ("the runner said, after {0:n1} s: {1}" -f $took, $failed)
+          if (-not $failed) { throw 'NEGATIVE CONTROL FAILED: an endless process came back as a success' }
+          if ($failed -notlike '*deadline*') { throw "NEGATIVE CONTROL FAILED: the runner failed, but not on its deadline: $failed" }
+          if ($took -lt $limit -or $took -gt $limit + 60) { throw "NEGATIVE CONTROL FAILED: the deadline was $limit s and the runner gave up after $took s" }
+          # Reported: the process list it saved before ending anything holds both.
+          $saved = @(Import-Csv (Join-Path $dir 'evidence-deadline-control\processes.csv') | Where-Object { $_.CommandLine -like "*$marker*" })
+          if ($saved.Count -ne 2) { throw "NEGATIVE CONTROL FAILED: the saved process list holds $($saved.Count) of the 2 endless processes" }
+          # Ended: neither outlives the deadline.
+          Start-Sleep -Seconds 2
+          $left = @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*$marker*" })
+          if ($left.Count) {
+            $left | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            throw "NEGATIVE CONTROL FAILED: $($left.Count) endless process(es) outlived the deadline"
+          }
+          Write-Host "OK: the endless process and its child were saved in the evidence, then ended, $([int]$took) s after a $limit s deadline"
+
+          # An exit of 3010 fails, and prints the log's restart lines.
+          $planted = Join-Path $dir 'planted.log'
+          @(
+            'MSI (s) (00:00) [00:00:00:000]: RESTART MANAGER: Did detect that a critical application holds file[s] in use, so a reboot will be necessary.',
+            'Info 1603. The file C:\Program Files\Roomler\roomlerd.exe is being held in use by the following process: Name: roomlerd, Id: 1.'
+          ) | Set-Content -LiteralPath $planted -Encoding utf8
+          $failed = $null
+          try {
+            Invoke-Installer -Label 'exit 3010 control' -FilePath "$env:SystemRoot\System32\cmd.exe" -Arguments '/d /c exit 3010' `
+              -Log $planted -EvidenceDir $dir -RestartNote 'planted' -NoAnnotation
+          } catch { $failed = $_ }
+          if (-not $failed -or $failed.Exception.Message -notlike '*exited 3010*') { throw "NEGATIVE CONTROL FAILED: an exit of 3010 came back as: $failed" }
+          $printed = @($failed.Exception.Data['RestartLines'])
+          if ($printed.Count -ne 2) { throw "NEGATIVE CONTROL FAILED: the runner printed $($printed.Count) of the log's 2 restart lines" }
+          Write-Host 'OK: an exit of 3010 failed, with the log''s RESTART MANAGER and held-in-use lines'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.95.0
 
@@ -355,17 +518,14 @@ jobs:
           # /quiet runs without UI; /norestart prevents implicit reboot
           # if the MSI calls for one; /l*v emits a verbose log so the
           # workflow's artifact upload below captures it on failure.
+          # #3754: under the installer runner's deadline.
+          . $env:INSTALLER_RUN
           $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           New-Item -ItemType Directory -Path $logDir -Force | Out-Null
           $log = Join-Path $logDir 'install.log'
-          $proc = Start-Process -FilePath 'msiexec.exe' `
-            -ArgumentList "/i `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" `
-            -Wait -PassThru
           'INSTALL_LOG=' + $log | Out-File -FilePath $env:GITHUB_ENV -Append
-          if ($proc.ExitCode -ne 0) {
-            Get-Content $log -Tail 200
-            throw "msiexec /i failed with exit $($proc.ExitCode)"
-          }
+          Invoke-Installer -Label 'msiexec /i (per-User)' -FilePath 'msiexec.exe' `
+            -Arguments "/i `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" -Log $log -Tail 200
           Write-Host "Install succeeded (exit 0)"
 
       - name: Assert registry UpgradeCode present (rc.27 install_detect lock)
@@ -650,16 +810,13 @@ jobs:
       - name: Uninstall the MSI (quiet)
         shell: pwsh
         run: |
+          # #3754: under the installer runner's deadline.
+          . $env:INSTALLER_RUN
           $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           $log = Join-Path $logDir 'uninstall.log'
-          $proc = Start-Process -FilePath 'msiexec.exe' `
-            -ArgumentList "/x `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" `
-            -Wait -PassThru
           'UNINSTALL_LOG=' + $log | Out-File -FilePath $env:GITHUB_ENV -Append
-          if ($proc.ExitCode -ne 0) {
-            Get-Content $log -Tail 200
-            throw "msiexec /x failed with exit $($proc.ExitCode)"
-          }
+          Invoke-Installer -Label 'msiexec /x (per-User)' -FilePath 'msiexec.exe' `
+            -Arguments "/x `"$env:MSI_PATH`" /quiet /norestart /l*v `"$log`"" -Log $log -Tail 200
           Write-Host 'Uninstall succeeded (exit 0)'
 
       - name: "Assert the uninstall stopped the daemon (#3292)"
@@ -904,8 +1061,9 @@ jobs:
         # product deletes the service, and the MSI's two custom actions carry
         # the entries across it. Asserted after every step. Then each action
         # is made to fail on purpose (ROOMLER_TEST_CA_FAIL), and the upgrade
-        # must still complete, with only the entries lost. Then a repair (/fa)
-        # and the uninstall. No MSI log may hold a carried value.
+        # must still complete, with only the entries lost. The repair and the
+        # uninstall are the next two steps (#3754). No MSI log may hold a
+        # carried value.
         # Negative control: on master the v2 cell fails (the entries are gone).
         shell: pwsh
         run: |
@@ -929,14 +1087,14 @@ jobs:
             Move-Item "$wixDir\main.wxs.bak" "$wixDir\main.wxs" -Force
           }
 
-          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
-            $a = "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props"
-            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
-            if ($p.ExitCode -ne 0) {
-              Get-Content $log -Tail 120
-              throw "msiexec $verb $(Split-Path $msi -Leaf) [$props] exited $($p.ExitCode)"
-            }
-          }
+          # #3754 — Invoke-Msi is the installer runner's. The cells' helpers go in
+          # a file that the repair and the uninstall steps below load too.
+          . $env:INSTALLER_RUN
+          $pmCells = Join-Path $env:RUNNER_TEMP 'pm-cells.ps1'
+          'PM_CELLS=' + $pmCells | Out-File -FilePath $env:GITHUB_ENV -Append
+          @'
+          $out = Join-Path $env:RUNNER_TEMP 'pm-msi'
+          $logDir = Join-Path $env:RUNNER_TEMP 'msi-logs'
           function Get-Swap {
             $block = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Roomler' -Name Environment -ErrorAction SilentlyContinue).Environment
             [bool](@($block) -contains 'ROOMLERD_ENABLE_SYSTEM_SWAP=1')
@@ -985,6 +1143,8 @@ jobs:
           function Assert-Logged([string]$log, [string]$line) {
             if (-not (Select-String -Path (Join-Path $logDir $log) -SimpleMatch "roomler_msi_ca: $line")) { throw "${log}: no '$line' from the custom actions" }
           }
+          '@ | Set-Content -LiteralPath $pmCells -Encoding utf8
+          . $pmCells
 
           # #3115 — a stop slower than the 5 s RegisterService used to wait,
           # made from OUTSIDE the product (no hook in it): the service host's
@@ -1146,15 +1306,54 @@ jobs:
             Invoke-Msi '/i' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-6.log') ''
             Assert-Mode 'v6, hand-run upgrade with no property' $false '0.0.6.1'
             Assert-Carried 'v6, after the two failures' $true
-            # A repair reconfigures the entry in place (#3115): nothing to carry.
-            Invoke-Msi '/fa' (Join-Path $out 'pm-6.msi') (Join-Path $logDir 'pm-6-repair.log') ''
-            Assert-Mode 'v6, repaired' $false '0.0.6.1'
-            Assert-Carried 'v6, repaired' $true
           } finally {
             Copy-Item "$env:ProgramData\roomler\roomler\service-logs" (Join-Path $logDir 'service-logs') -Recurse -Force -ErrorAction SilentlyContinue
             Copy-Item "$env:ProgramData\roomler\last-system-context-attempt.json" $logDir -Force -ErrorAction SilentlyContinue
           }
 
+      # #3754 — the repair over the running service, in a step of its own so that
+      # a failure names its cell. `/fa` takes no property, so `/norestart` never
+      # reached it, and a repair whose files Restart Manager could not free
+      # restarted Windows: the runner went with it, five times, with no log
+      # (#3455 measured the same on a lab machine). As `/i REINSTALL=ALL
+      # REINSTALLMODE=a` it takes REBOOT=ReallySuppress, and the server's own
+      # Command Line in the log has to show it. A repair that still needs a
+      # restart then ends 3010 with its log: that is #3455, the product's half.
+      - name: "A repair over the running per-Machine service never restarts Windows, and keeps the mode and the entries (#3754, #3455)"
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          . $env:PM_CELLS
+          $msi = Join-Path $out 'pm-6.msi'
+          $log = Join-Path $logDir 'pm-6-repair.log'
+          $is3455 = '#3455: the package does not free its own files before InstallFiles on a repair over the running service, so Windows Installer can only replace them at a restart. It is the product''s open bug, not this workflow''s'
+          $cmd = @()
+          try {
+            # A repair reconfigures the entry in place (#3115): nothing to carry.
+            Invoke-Installer -Label 'msiexec repair of pm-6.msi over the running service' -FilePath 'msiexec.exe' `
+              -Arguments "/i `"$msi`" REINSTALL=ALL REINSTALLMODE=a REBOOT=ReallySuppress /qn /l*v `"$log`"" -Log $log -RestartNote $is3455
+          } finally {
+            $cmd = @(Select-String -LiteralPath $log -Pattern 'MSI \(s\) \([^)]*\) \[[^\]]*\]: Command Line: ' -ErrorAction SilentlyContinue | ForEach-Object { $_.Line.Trim() })
+            $cmd | ForEach-Object { Write-Host "the server's $_" }
+            Copy-Item "$env:ProgramData\roomler\roomler\service-logs" (Join-Path $logDir 'service-logs') -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          if ($cmd.Count -eq 0) { throw 'pm-6-repair.log holds no server Command Line line' }
+          $bare = @($cmd | Where-Object { $_ -notmatch '\bREBOOT=ReallySuppress\b' })
+          if ($bare.Count) { throw "the repair's server Command Line does not carry REBOOT=ReallySuppress: $($bare[0])" }
+          Write-Host 'OK: the server ran the repair with REBOOT=ReallySuppress'
+          $replaced = @(Select-String -LiteralPath $log -Pattern "ReplacedInUseFiles(?: property\. Its value is '|\s*=\s*)1")
+          if ($replaced.Count) {
+            Get-RestartLines $log | ForEach-Object { Write-Host $_ }
+            throw "the repair exited 0, and its log says ReplacedInUseFiles = 1 (line $($replaced[0].LineNumber)). $is3455"
+          }
+          Assert-Mode 'v6, repaired' $false '0.0.6.1'
+          Assert-Carried 'v6, repaired' $true
+
+      - name: "The per-Machine uninstall removes the service and its Environment, and no MSI log holds a carried value (#3375)"
+        shell: pwsh
+        run: |
+          . $env:INSTALLER_RUN
+          . $env:PM_CELLS
           # The custom actions log names; no MSI log may hold a carried value.
           $leak = Select-String -Path (Join-Path $logDir '*.log') -SimpleMatch $token | Select-Object -First 3
           if ($leak) {
@@ -1225,14 +1424,9 @@ jobs:
             Write-Host "released $flavour MSI: $($a[0].name) (sha256 verified)"
             $dst
           }
-          function Invoke-Msi([string]$verb, [string]$msi, [string]$log, [string]$props) {
-            $a = "$verb `"$msi`" /qn /norestart /l*v `"$log`" $props"
-            $p = Start-Process msiexec.exe -ArgumentList $a -Wait -PassThru
-            if ($p.ExitCode -ne 0) {
-              Get-Content $log -Tail 120
-              throw "msiexec $verb $(Split-Path $msi -Leaf) [$props] exited $($p.ExitCode)"
-            }
-          }
+          # #3754 — Invoke-Msi, and the deadline on install.ps1 below, are the
+          # installer runner's.
+          . $env:INSTALLER_RUN
           # Every product Apps & Features would show under a Roomler name, one row
           # per ProductCode (a per-User record can sit in more than one hive).
           function Get-Entries {
@@ -1276,12 +1470,17 @@ jobs:
             throw "${label}: the Roomler service is $($svc.Status), want Running"
           }
           # The served script, in the shell the field runs it in.
+          # It runs msiexec /x itself, so it gets the same deadline (#3754).
           function Invoke-UninstallScript([string]$label) {
-            $o = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall 2>&1
-            $rc = $LASTEXITCODE
-            $o | Out-File -FilePath (Join-Path $logDir "install-ps1-uninstall-$label.log") -Encoding utf8
-            $o | ForEach-Object { Write-Host "  install.ps1 | $_" }
-            if ($rc -ne 0) { throw "${label}: install.ps1 -Uninstall exited $rc" }
+            $base = Join-Path $logDir "install-ps1-uninstall-$label"
+            try {
+              Invoke-Installer -Label "${label}: install.ps1 -Uninstall" -FilePath 'powershell.exe' `
+                -Arguments '-NoProfile -ExecutionPolicy Bypass -File scripts\install.ps1 -Uninstall' -Output $base
+            } finally {
+              foreach ($f in "$base.out.log", "$base.err.log") {
+                if (Test-Path -LiteralPath $f) { Get-Content -LiteralPath $f | ForEach-Object { Write-Host "  install.ps1 | $_" } }
+              }
+            }
           }
 
           # This branch's MSIs, one patch version above the newest release.
@@ -1362,8 +1561,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # #3754 — what a failure leaves for its reader, taken before the runner
+      # cleans up: every process with its image path, and the service's and the
+      # per-User daemon's logs. A failed installer run has saved its own already.
+      # On a cancel too: a job that hit its limit is a failure for its reader.
+      - name: Save the evidence of a failure (#3754)
+        if: failure() || cancelled()
+        shell: pwsh
+        run: |
+          if (-not $env:INSTALLER_RUN -or -not (Test-Path -LiteralPath $env:INSTALLER_RUN)) { Write-Host 'no installer runner: nothing ran'; exit 0 }
+          . $env:INSTALLER_RUN
+          Save-InstallerEvidence 'job-end'
+
       - name: Upload MSI logs on failure
-        if: failure()
+        if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
           name: msi-logs
