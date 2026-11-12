@@ -432,9 +432,10 @@ fn fs_as_for(
 
 impl FsAs {
     /// Who a transfer starting now writes as, asked on a blocking thread:
-    /// `ConfigSet`'s check of `files_dir` and the status refresh's own
-    /// thread. On a Linux system install it asks seat0 inline, with no time
-    /// limit. #3711 — an async task asks [`Self::for_write`] instead.
+    /// the status refresh's own thread, and a `ConfigSet` of `files_dir` off
+    /// Linux. On a Linux system install it asks seat0 inline, with no time
+    /// limit. #3711 — an async task asks [`Self::for_write`] instead, and
+    /// #3769 — so does that `ConfigSet` there ([`FilesDirSet::check`]).
     pub(crate) fn now() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -1175,18 +1176,49 @@ pub fn refresh_effective_files_dir() -> Option<String> {
 fn refresh_effective_files_dir_as(who: &FsAs) -> Option<String> {
     let (raw, generation) = configured_files_dir_and_gen();
     let value = compute_effective_files_dir(who, raw.as_deref());
+    publish_effective(generation, value.clone(), true);
+    value
+}
+
+/// Cache `value` as the status answer for the configured value of
+/// `generation`. An answer for an OLDER value never replaces one for a newer
+/// value, and #3769 — nor is one published once its value is no longer the
+/// configured one: a slow answer for an earlier set never shows after a
+/// later set saved, even before the later set's own answer lands. `fresh`
+/// false: not an answer yet, so the next status read starts a refresh.
+fn publish_effective(generation: u64, value: Option<String>, fresh: bool) {
     let mut c = EFFECTIVE_FILES_DIR
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // An answer for an OLDER value never replaces one for a newer value.
-    if generation >= c.generation {
+    if generation == FILES_DIR_GEN.load(Ordering::Acquire) && generation >= c.generation {
         *c = EffectiveFilesDir {
             generation,
-            computed_at: Some(std::time::Instant::now()),
-            value: value.clone(),
+            computed_at: fresh.then(std::time::Instant::now),
+            value,
         };
     }
-    value
+}
+
+/// #3769 — while this lives no background refresh starts, one already
+/// running waited out first, so a test sees only the answers it publishes.
+#[cfg(test)]
+struct NoBackgroundRefresh;
+
+#[cfg(test)]
+impl NoBackgroundRefresh {
+    fn hold() -> Self {
+        while EFFECTIVE_REFRESHING.swap(true, Ordering::AcqRel) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for NoBackgroundRefresh {
+    fn drop(&mut self) {
+        EFFECTIVE_REFRESHING.store(false, Ordering::Release);
+    }
 }
 
 /// One background refresh at a time; a read that finds one running simply
@@ -1239,50 +1271,84 @@ fn compute_effective_files_dir_as(who: &FsAs, raw: Option<&str>) -> Option<Strin
 }
 
 /// #3769 — one `ConfigSet` of `files_dir` (`localapi_state::config_set`):
-/// whoever a drop would be written as now (FR-97 P3d), asked once, and the
-/// two checks that need them, FR-84 D4's set-time gate ([`Self::check`]) and
-/// the status answer after the save ([`Self::refresh_status`]).
+/// whoever a drop would be written as now (FR-97 P3d), asked ONCE and before
+/// the config write lock, and the two checks that need them, FR-84 D4's
+/// set-time gate ([`Self::check`]) and the status answer after the save
+/// ([`Self::refresh_status`]). Neither reads the config file, so neither runs
+/// under its lock: a slow logind or account database, or a home on a slow
+/// disk, holds this set alone, never another config read or write.
 pub(crate) struct FilesDirSet {
     who: FsAs,
+    /// What this set saved and the generation `set_files_dir` gave it, read
+    /// under the config write lock ([`Self::saved`]).
+    saved: Option<(Option<String>, u64)>,
 }
 
 impl FilesDirSet {
     /// Who the folder is checked for, then, when `value` names a folder, the
-    /// set-time gate for and as them. `Err` is the refusal, verbatim.
+    /// set-time gate for and as them. `Err` is the refusal, verbatim. A Linux
+    /// system install asks who is at seat0 as a received file does
+    /// ([`FsAs::for_write`]: on a blocking thread, [`SEAT_LOOKUP_WAIT`] at
+    /// most). Windows asks this process's token and the person signed in to
+    /// its session on a blocking thread, as before; macOS asks nothing.
     pub(crate) async fn check(value: Option<&str>) -> Result<Self, String> {
-        // Asked here, on the thread a test stood the lookup in on, and run
-        // on a blocking thread with no time limit.
-        #[cfg(all(test, target_os = "linux"))]
-        let stood_in = stand_in::lookup_now();
-        let who = tokio::task::spawn_blocking(move || {
-            #[cfg(all(test, target_os = "linux"))]
-            if let Some(lookup) = stood_in {
-                let (root, switch_on) = linux_process();
-                return linux_fs_as(root, switch_on, false, lookup);
-            }
-            FsAs::now()
-        })
-        .await
-        .map_err(|e| format!("config set task join: {e}"))?;
+        #[cfg(target_os = "linux")]
+        let who = FsAs::for_write().await;
+        #[cfg(not(target_os = "linux"))]
+        let who = tokio::task::spawn_blocking(FsAs::now)
+            .await
+            .map_err(|e| format!("config set task join: {e}"))?;
         Self::check_as(who, value).await
     }
 
-    /// [`Self::check`] for `who`.
+    /// [`Self::check`] for `who`. A folder that cannot be checked for anyone
+    /// is refused before anything is touched, in the words its gate would
+    /// use: on Linux a seat0 lookup with no answer in time ([`CANNOT_TELL`]:
+    /// a retry asks again), on a Windows service nobody signed in. A clear
+    /// needs no one and goes through.
     async fn check_as(who: FsAs, value: Option<&str>) -> Result<Self, String> {
         if let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            if let Some(why) = who.refusal() {
+                return Err(why.to_string());
+            }
             let (gate, raw) = (who.clone(), raw.to_string());
             on_a_blocking_thread(move || validate_files_dir_setting_as(&gate, &raw))
                 .await
                 .map_err(|e| format!("config set task join: {e}"))??;
         }
-        Ok(Self { who })
+        Ok(Self { who, saved: None })
     }
 
-    /// After the save: the status answer for the same person, so the read
-    /// right after the set shows it.
+    /// Under the config write lock, right after the save re-seeded the live
+    /// folder (`set_files_dir`): note what this set saved, and its generation.
+    pub(crate) fn saved(&mut self) {
+        self.saved = Some(configured_files_dir_and_gen());
+    }
+
+    /// After the lock: the status answer for what this set saved, for the
+    /// same person, so the read right after the set shows it. It is published
+    /// only while that is still the configured value ([`publish_effective`]).
+    /// With no answer in time for who that is, none is computed: the status
+    /// names no folder yet (the companion shows the default as pending, never
+    /// a folder just cleared), and the next status read asks again.
     pub(crate) async fn refresh_status(self) {
+        let Some((raw, generation)) = self.saved else {
+            return;
+        };
         let who = self.who;
-        let _ = on_a_blocking_thread(move || refresh_effective_files_dir_as(&who)).await;
+        let _ = on_a_blocking_thread(move || {
+            #[cfg(target_os = "linux")]
+            if matches!(who, FsAs::CannotTell) {
+                publish_effective(generation, None, false);
+                return;
+            }
+            publish_effective(
+                generation,
+                compute_effective_files_dir(&who, raw.as_deref()),
+                true,
+            );
+        })
+        .await;
     }
 }
 
@@ -5909,6 +5975,48 @@ mod tests {
         set_files_dir(None);
     }
 
+    /// #3769 — a `ConfigSet` of the files folder publishes its status answer
+    /// after the config write lock, so an earlier set's answer can land after
+    /// a later set saved. It is never published then: the status names the
+    /// earlier folder neither before the later answer lands nor after, and
+    /// ends where the config does.
+    #[tokio::test]
+    async fn an_earlier_files_folder_sets_late_answer_is_never_published() {
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        let _quiet = NoBackgroundRefresh::hold();
+        set_files_dir(None);
+        let (x, y) = (scratch_drop_dir("late-x"), scratch_drop_dir("late-y"));
+        let (xs, ys) = (
+            x.to_string_lossy().into_owned(),
+            y.to_string_lossy().into_owned(),
+        );
+        // X is checked and saved first, Y after it, as two clients' sets
+        // take the lock one after the other.
+        let mut earlier = FilesDirSet::check_as(FsAs::Daemon, Some(&xs))
+            .await
+            .expect("X passes its gate");
+        set_files_dir(Some(xs.clone()));
+        earlier.saved();
+        let mut later = FilesDirSet::check_as(FsAs::Daemon, Some(&ys))
+            .await
+            .expect("Y passes its gate");
+        set_files_dir(Some(ys.clone()));
+        later.saved();
+        // X's answer lands first, after Y saved: it is not published.
+        earlier.refresh_status().await;
+        assert_ne!(
+            effective_files_dir().as_deref(),
+            Some(xs.as_str()),
+            "the status names X while the config says Y"
+        );
+        later.refresh_status().await;
+        assert_eq!(effective_files_dir().as_deref(), Some(ys.as_str()));
+        assert_eq!(configured_files_dir().as_deref(), Some(ys.as_str()));
+        set_files_dir(None);
+        let _ = std::fs::remove_dir_all(&x);
+        let _ = std::fs::remove_dir_all(&y);
+    }
+
     #[test]
     fn writer_context_describes_this_process() {
         let w = writer_context();
@@ -9369,6 +9477,57 @@ mod seat_user_tests {
         })
         .await;
         assert_eq!(failed, FsAs::DaemonAlone, "a failed lookup, a write");
+    }
+
+    /// #3769 — a `ConfigSet` of the files folder whose seat0 lookup gave no
+    /// answer in time (`FsAs::CannotTell`): a set that names a folder is
+    /// refused in the read's words before anything is touched, and a clear,
+    /// which needs no one, goes through. Its status answer is not computed for
+    /// no one: the status names no folder yet, never the folder just cleared
+    /// (the companion shows the default as pending), and the next status read
+    /// asks again.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_files_folder_set_with_no_one_known_is_refused_and_a_clear_shows_pending() {
+        const CANNOT_TELL: &str =
+            "Could not tell who is signed in at this computer's screen. Try again.";
+        let _lock = FILES_DIR_TEST_LOCK.lock().await;
+        let _quiet = NoBackgroundRefresh::hold();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("drops");
+        let spelled = folder.to_string_lossy().into_owned();
+        let Err(refused) = FilesDirSet::check_as(FsAs::CannotTell, Some(&spelled)).await else {
+            panic!("a folder was checked for no one");
+        };
+        assert_eq!(refused, CANNOT_TELL);
+        assert!(!folder.exists(), "nothing made");
+
+        // The card named the folder that is about to be cleared.
+        set_files_dir(Some(spelled.clone()));
+        publish_effective(
+            FILES_DIR_GEN.load(Ordering::Acquire),
+            Some(spelled.clone()),
+            true,
+        );
+        let mut cleared = FilesDirSet::check_as(FsAs::CannotTell, None)
+            .await
+            .expect("a clear needs no one");
+        set_files_dir(None);
+        cleared.saved();
+        cleared.refresh_status().await;
+        let (generation, computed_at, value) = {
+            let c = EFFECTIVE_FILES_DIR
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            (c.generation, c.computed_at, c.value.clone())
+        };
+        assert_eq!(value, None, "the cleared folder is not shown");
+        assert_eq!(generation, FILES_DIR_GEN.load(Ordering::Acquire));
+        assert!(
+            computed_at.is_none(),
+            "pending: the next status read asks again"
+        );
+        assert_eq!(configured_files_dir(), None);
     }
 
     /// #3688 — seat0's active uid is read from logind's own record of the

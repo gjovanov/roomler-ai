@@ -1360,7 +1360,7 @@ impl LocalApiState for DaemonState {
 
     /// S2 — set/clear one editable key. Same write discipline as
     /// [`set_device_name`](Self::set_device_name): daemon-wide write lock
-    /// across load→validate→save so a concurrent config writer can't have
+    /// across load→apply→save so a concurrent config writer can't have
     /// its field dropped by our full-struct save. Validation is
     /// per-key in [`crate::config_surface::apply`]; a validation error
     /// leaves the file untouched.
@@ -1370,7 +1370,6 @@ impl LocalApiState for DaemonState {
                 message: "config editing is not available on this daemon".into(),
             };
         };
-        let _guard = lock.lock().await;
         // FR-84 D4 — `files_dir` names a folder this daemon will WRITE
         // remote-supplied files into, as the identity it runs under. The
         // surface's `apply` checks the shape; placement (a SYSTEM/root
@@ -1379,7 +1378,12 @@ impl LocalApiState for DaemonState {
         // process's identity and its disk, so they run here, before
         // anything is persisted: a refused value is never saved to be
         // silently ignored at use time, and the reason goes back verbatim.
-        let files = if key == "files_dir" {
+        // #3769 — who that is (on a Linux system install, the person at
+        // seat0: logind, then the account database) is asked once, and the
+        // check runs, BEFORE the write lock: neither needs the file, and a
+        // slow lookup held under the lock held every other config read and
+        // write behind it.
+        let mut files = if key == "files_dir" {
             match crate::files::FilesDirSet::check(value).await {
                 Ok(files) => Some(files),
                 Err(message) => return Response::Error { message },
@@ -1387,6 +1391,7 @@ impl LocalApiState for DaemonState {
         } else {
             None
         };
+        let _guard = lock.lock().await;
         let path = path.clone();
         let key = key.to_string();
         let value = value.map(str::to_string);
@@ -1416,10 +1421,11 @@ impl LocalApiState for DaemonState {
         .unwrap_or_else(|e| Err(format!("config set task join: {e}")));
         match saved {
             Ok((entry, cfg)) => {
-                // The status answer is recomputed before the answer, so the
-                // read right after the set shows it.
-                if let Some(files) = files {
-                    files.refresh_status().await;
+                // #3769 — what `files_dir` was saved as, and its generation,
+                // read under the lock: the status answer is published for it
+                // only while it is still the configured value.
+                if let Some(files) = files.as_mut() {
+                    files.saved();
                 }
                 // Re-seed the LIVE gate-4 flags from what was just written,
                 // still under the write lock. Everything else on this surface
@@ -1454,6 +1460,13 @@ impl LocalApiState for DaemonState {
                 // FR-101 P2b — and the session-policy floor: the next session
                 // is masked by it, and the hub hears it on the next heartbeat.
                 crate::session_policy::set_device_policy(crate::session_policy::from_config(&cfg));
+                drop(_guard);
+                // #3769 — the status answer is recomputed for the same person
+                // after the lock, before the answer, so the read right after
+                // the set shows it.
+                if let Some(files) = files {
+                    files.refresh_status().await;
+                }
                 // The surface says per key whether that re-seed made the
                 // change live (FR-84 D2) — log the same truth the client
                 // shows, never a blanket "on restart".
