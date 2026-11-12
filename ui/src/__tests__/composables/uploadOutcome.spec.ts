@@ -10,6 +10,9 @@
 // #3048 — a success says where the file landed too. On a machine-wide
 // Windows install that is the signed-in person's Downloads, which Folder
 // Redirection may have moved to a share.
+//
+// #3726 — a Cancel the person chose read "Upload failed: cancelled by
+// operator". It is said as a cancel now; a failure keeps its wording.
 import { describe, it, expect } from 'vitest'
 import { uploadLandedIn, uploadOutcomeMessage, type UploadOutcome } from '@/composables/useRemoteControl'
 
@@ -171,5 +174,37 @@ describe('uploadOutcomeMessage says where a file landed (#3048)', () => {
 
   it('a completion that carried no path says only what was uploaded', () => {
     expect(said([done('f.txt', '')]).text).toBe('Uploaded f.txt')
+  })
+})
+
+describe('uploadOutcomeMessage says a Cancel the person chose as a cancel (#3726)', () => {
+  const cancel = (name: string): UploadOutcome => ({ ok: false, name, error: 'cancelled', cancelled: true })
+
+  it('on its own it is information, never "Upload failed"', () => {
+    expect(uploadOutcomeMessage([cancel('big.bin')], 1)).toEqual({ level: 'info', text: 'Upload cancelled: big.bin' })
+    expect(uploadOutcomeMessage([cancel('a'), cancel('b')], 2)).toEqual({ level: 'info', text: '2 uploads cancelled' })
+  })
+
+  it('beside uploads that landed it is counted, and the success still says where', () => {
+    const results = [done('l2fold/a.bin', '/home/u/Downloads/l2fold/a.bin'), cancel('l2fold/b.bin')]
+    expect(uploadOutcomeMessage(results, 2)).toEqual({
+      level: 'success',
+      text: 'Uploaded l2fold/a.bin to /home/u/Downloads; 1 cancelled',
+    })
+    expect(uploadOutcomeMessage([done('f.txt', '/home/u/Downloads/f.txt'), cancel('g.txt')], 2, '/tmp/x')).toEqual({
+      level: 'warning',
+      text: 'Uploaded f.txt to /home/u/Downloads instead: the host refused /tmp/x; 1 cancelled',
+    })
+  })
+
+  it('beside a failure the failure leads, and keeps its wording', () => {
+    expect(uploadOutcomeMessage([fail('a', 'disk full'), cancel('b')], 2)).toEqual({
+      level: 'error',
+      text: 'Upload failed: disk full; 1 cancelled',
+    })
+    expect(uploadOutcomeMessage([done('a', '/tmp/x/a'), fail('b', 'bang'), cancel('c')], 3, '/tmp/x')).toEqual({
+      level: 'error',
+      text: 'Uploaded 1/3 — 1 failed (e.g. b: bang); 1 cancelled',
+    })
   })
 })

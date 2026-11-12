@@ -2605,6 +2605,7 @@ import {
   awaitingConsentLabel,
   drawerPasteFiles,
   uploadOutcomeMessage,
+  isTransferCancelled,
   thisDevicesFromPick,
 } from '@/composables/useRemoteControl'
 import { offersBreakGlass } from '@/composables/breakGlass'
@@ -3441,7 +3442,9 @@ async function downloadEntry(entry: { name: string; is_dir: boolean }) {
       showSuccess(`Downloaded ${r.name} (${formatFileSize(r.bytes)})`)
     }
   } catch (e) {
-    showError(`Download failed: ${(e as Error).message}`)
+    // #3726 — the Transfers row's Cancel, which the person chose.
+    if (isTransferCancelled(e)) showSnackbar(`Download cancelled: ${entry.is_dir ? `${entry.name}.zip` : entry.name}`, 'info', 4000)
+    else showError(`Download failed: ${(e as Error).message}`)
   }
 }
 
@@ -3649,6 +3652,8 @@ async function uploadMany(
     const said = uploadOutcomeMessage(results, items.length, destPath)
     if (said.level === 'success') showSuccess(said.text)
     else if (said.level === 'warning') showSnackbar(said.text, 'warning', 10000)
+    // #3726 — a Cancel the person chose, said as one.
+    else if (said.level === 'info') showSnackbar(said.text, 'info', 4000)
     else showError(said.text)
   } finally {
     uploadsInFlight.value--
