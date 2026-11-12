@@ -58,6 +58,27 @@ pub(crate) async fn close(
             }
         }
     });
-    // A JoinError is the runtime going down, which takes the rest with it.
-    close.await.unwrap_or(Ok(()))
+    match close.await {
+        Ok(result) => result,
+        // The close panicked: what it had not reached yet stays alive, and the
+        // panic itself went only to stderr, which a service has nowhere.
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            let panic = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            warn!(
+                session = %session,
+                %panic,
+                "peer close panicked — what it did not reach stays alive (#3716)"
+            );
+            Err(webrtc::Error::new(format!(
+                "the peer's close panicked: {panic}"
+            )))
+        }
+        // The runtime going down, which takes the rest with it.
+        Err(_) => Ok(()),
+    }
 }
