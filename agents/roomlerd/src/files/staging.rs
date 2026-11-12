@@ -36,7 +36,6 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use super::PartialMeta;
@@ -270,33 +269,40 @@ fn is_the_temp_dir(md: &std::fs::Metadata) -> bool {
         .is_ok_and(|temp| temp.dev() == md.dev() && temp.ino() == md.ino())
 }
 
-/// What [`keeps_modes`] found, by file system (its device and type) and
-/// stager.
-type Kept = ((u64, i64, u32), bool);
+/// What [`keeps_modes`] found, by mount ([`mount_id`]), file system type
+/// and stager.
+type Kept = (((u64, bool), i64, u32), bool);
 
 static KEEPS_MODES: Mutex<Vec<Kept>> = Mutex::new(Vec::new());
+
+/// The name a probe folder starts with ([`probe`], [`sweep_probes`]).
+const PROBE: &str = ".roomler-probe-";
 
 /// R4 — whether the file system the folder `held` sits on keeps Unix owners
 /// and modes for the stager: a folder made there 0700 reads back the
 /// stager's own, with no write bit for anyone else (after one `fchmod`,
 /// which some file systems need). A FAT or exFAT disk, NTFS without
 /// permissions, WSL's drive mounts without metadata, a share mounted with
-/// fixed modes or an sshfs that does not map owners keep neither: a
-/// staging folder beside the target could not be the stager's own, so an
-/// upload into it stages in the stager's private folder
-/// ([`stage_privately`]). Asked once per file system and stager, by making
-/// an empty folder in `held` and removing it at once. A folder the stager
-/// may not make one in answers yes: the staging beside it fails as before.
+/// fixed modes keep neither: they show every folder with one owner and
+/// mode, so a staging folder beside the target could not be the stager's
+/// own, and an upload into it stages in the stager's private folder
+/// ([`stage_privately`]). Asked by making an empty folder in `held` under a
+/// random name and removing it at once ([`probe`]; nothing it makes stays,
+/// and one a crash left is swept: [`sweep_probes`]). Only a definite answer
+/// is remembered, per mount, file system type and stager; anything else
+/// (the folder could not be made, did not open as made, or reads neither
+/// way) answers yes, so the folder's owner and modes still count, and is
+/// asked again next time.
 pub(super) fn keeps_modes(held: &File) -> bool {
     #[cfg(test)]
     if let Some(kept) = super::stand_in::modes_kept_now() {
         return kept;
     }
-    let Ok(md) = held.metadata() else {
-        return true;
+    let key = mount_id(held).map(|mount| (mount, fs_type(held), stager()));
+    let known = |found: &[Kept]| {
+        let key = key?;
+        found.iter().find(|(k, _)| *k == key).map(|(_, kept)| *kept)
     };
-    let key = (md.dev(), fs_type(held), stager());
-    let known = |found: &[Kept]| found.iter().find(|(k, _)| *k == key).map(|(_, kept)| *kept);
     if let Some(kept) = known(&KEEPS_MODES.lock().unwrap_or_else(PoisonError::into_inner)) {
         return kept;
     }
@@ -310,7 +316,9 @@ pub(super) fn keeps_modes(held: &File) -> bool {
         );
     }
     let mut found = KEEPS_MODES.lock().unwrap_or_else(PoisonError::into_inner);
-    if known(&found).is_none() {
+    if let Some(key) = key
+        && known(&found).is_none()
+    {
         found.push((key, kept));
     }
     kept
@@ -326,12 +334,85 @@ pub(super) fn forget_what_keeps_modes() {
         .clear();
 }
 
-/// The empty probe folders [`keeps_modes`] left in `folder`, removed: none
-/// yet (#3688, the startup sweep's).
-#[cfg(test)]
+/// The mount `held` sits on: its unique ID where the kernel keeps one
+/// (`STATX_MNT_ID_UNIQUE`, Linux 6.8; never reused), else its mount ID
+/// (`STATX_MNT_ID`, Linux 5.8, else `mnt_id:` in `/proc/self/fdinfo`), which
+/// a mount made after this one is gone may reuse. Asked through the system
+/// call itself, so no newer C library is needed. `None` when none can be
+/// read: then nothing is remembered.
+fn mount_id(held: &File) -> Option<(u64, bool)> {
+    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+    let mut stx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: a handle we hold, an empty NUL-terminated path, and room for
+    // the answer, read only when the call succeeded.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            held.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_MNT_ID | STATX_MNT_ID_UNIQUE,
+            stx.as_mut_ptr(),
+        )
+    };
+    if rc == 0 {
+        // SAFETY: filled in by the successful call above (zeroed before).
+        let stx = unsafe { stx.assume_init() };
+        if stx.stx_mask & STATX_MNT_ID_UNIQUE != 0 {
+            return Some((stx.stx_mnt_id, true));
+        }
+        if stx.stx_mask & libc::STATX_MNT_ID != 0 {
+            return Some((stx.stx_mnt_id, false));
+        }
+    }
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", held.as_raw_fd())).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+        .map(|id| (id, false))
+}
+
+/// R5 — the empty probe folders [`keeps_modes`] left in `folder` (a crash
+/// between a probe's make and its removal), removed through a handle on
+/// `folder` (its links followed: the drop folder's own rule), each looked
+/// at without following a link. One goes when it is a folder that is the
+/// stager's own, or reads exactly like `folder` as a probe does where no
+/// modes are kept, and is empty (the removal refuses one that is not); a
+/// link, anything with something in it, and another account's stay.
+/// Returns how many went.
 pub(super) fn sweep_probes(folder: &Path) -> usize {
-    let _ = folder;
-    0
+    let Ok(base) = open_path(folder, libc::O_RDONLY | libc::O_DIRECTORY) else {
+        return 0;
+    };
+    let (Ok(md), Ok(entries)) = (
+        base.metadata(),
+        std::fs::read_dir(format!("/proc/self/fd/{}", base.as_raw_fd())),
+    ) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.starts_with(PROBE) {
+            continue;
+        }
+        let Ok(Some(st)) = stat_at(&base, &name) else {
+            continue;
+        };
+        let its_own = st.st_uid == stager()
+            || (st.st_uid == md.uid() && st.st_mode & 0o7777 == md.mode() & 0o7777);
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && its_own
+            && unlink_at(&base, &name, libc::AT_REMOVEDIR).is_ok()
+        {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        tracing::info!(folder = %folder.display(), swept, "sweep_orphans: removed empty probe folders left behind");
+    }
+    swept
 }
 
 /// The type of the file system `held` sits on (`fstatfs`), 0 if unread.
@@ -348,38 +429,74 @@ fn fs_type(held: &File) -> i64 {
     kind
 }
 
-/// [`keeps_modes`]'s question, asked: an empty folder made 0700 in `held`
-/// under a name of this process's own, read back (after one `fchmod`), and
-/// removed. `None` when it could not be made.
+/// A probe folder's name: [`PROBE`] and 16 random hex digits (`getrandom`,
+/// through the system call), so nobody can make it first. `None` when no
+/// random bytes come.
+fn probe_name() -> Option<String> {
+    let mut bytes = [0u8; 8];
+    // SAFETY: room for the bytes asked for, which the call fills.
+    let got = unsafe { libc::syscall(libc::SYS_getrandom, bytes.as_mut_ptr(), bytes.len(), 0) };
+    (got == bytes.len() as libc::c_long)
+        .then(|| format!("{PROBE}{:016x}", u64::from_ne_bytes(bytes)))
+}
+
+/// [`keeps_modes`]'s question, asked (R5): an empty folder made 0700 in
+/// `held` under a random name ([`probe_name`]; another one when it is
+/// taken), opened without following a link, read back ([`read_back`]), and
+/// removed. `None`, no answer: it could not be made, or did not open as
+/// made (another account may have moved it, or put a folder of its own in
+/// its place), or reads neither way.
 fn probe(held: &File) -> Option<bool> {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let name = format!(
-        ".roomler-probe-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-    mkdir_at(held, &name, 0o700).ok()?;
+    let target = held.metadata().ok()?;
+    let mut made = None;
+    for _ in 0..4 {
+        let name = probe_name()?;
+        match mkdir_at(held, &name, 0o700) {
+            Ok(()) => {
+                made = Some(name);
+                break;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(_) => return None,
+        }
+    }
+    let name = made?;
     #[cfg(test)]
     super::stand_in::the_probe_is_made(
         &Path::new(&format!("/proc/self/fd/{}", held.as_raw_fd())).join(&name),
     );
-    let kept = match open_at(
+    let kept = open_at(
         held,
         &name,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
         0,
-    ) {
-        Ok(made) => {
-            own(&made, true).is_ok() || {
-                // SAFETY: a folder handle we hold.
-                unsafe { libc::fchmod(made.as_raw_fd(), 0o700) };
-                own(&made, true).is_ok()
-            }
-        }
-        Err(_) => false,
-    };
+    )
+    .ok()
+    .and_then(|folder| read_back(&folder, &target));
     let _ = unlink_at(held, &name, libc::AT_REMOVEDIR);
-    Some(kept)
+    kept
+}
+
+/// What the folder [`probe`] made says, opened (`made`), against the folder
+/// it was made in (`target`): `Some(true)` when it reads as the stager's own
+/// and nobody else may write it, after one `fchmod` (which some file systems
+/// need) made only when it reads as the stager's; `Some(false)` when it
+/// reads exactly like `target`, the same owner and permission bits, as a
+/// file system that keeps no modes shows every folder; else `None`.
+fn read_back(made: &File, target: &std::fs::Metadata) -> Option<bool> {
+    if own(made, true).is_ok() {
+        return Some(true);
+    }
+    if made.metadata().ok()?.uid() == stager() {
+        // SAFETY: a folder handle we hold.
+        unsafe { libc::fchmod(made.as_raw_fd(), 0o700) };
+        if own(made, true).is_ok() {
+            return Some(true);
+        }
+    }
+    let md = made.metadata().ok()?;
+    (md.is_dir() && md.uid() == target.uid() && md.mode() & 0o7777 == target.mode() & 0o7777)
+        .then_some(false)
 }
 
 /// Rules 2 and 3 — whether `held` is a folder (`dir`) or a plain file that
@@ -484,22 +601,88 @@ fn open_own(base: &File, base_path: &Path, name: &OsStr, create: bool) -> Result
 }
 
 /// R4 — the stager's private staging folder `root` (on a file system that
-/// keeps modes): its missing parents made 0700 when `create`, then `root`
-/// itself made, opened and checked as [`open_own`] does `.roomler-partial`.
+/// keeps modes): its missing parents made 0700 when `create` (for root, its
+/// own `/var/lib/roomler` instead: [`open_roots_own`]), then `root` itself
+/// made, opened and checked as [`open_own`] does `.roomler-partial`.
 fn open_private_root(root: &Path, create: bool) -> Result<File> {
     let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
         return Err(anyhow!("{} is not a folder to stage in", root.display()));
+    };
+    let held = if stager() == 0 {
+        open_roots_own(parent, create)?
+    } else {
+        if create {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        open_folder(parent).with_context(|| format!("opening {}", parent.display()))?
+    };
+    open_own(&held, parent, name, create)
+}
+
+/// R5 — root's `/var/lib/roomler` (`folder`), which root's private staging
+/// folder sits in: opened from a handle on its parent without following a
+/// link, and used only when it is root's and no other account may write it,
+/// as the overlay host ledger takes it; made 0755 when absent. Anything else
+/// refuses the staging, saying why.
+fn open_roots_own(folder: &Path, create: bool) -> Result<File> {
+    let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) else {
+        return Err(anyhow!("{} is not a folder to stage in", folder.display()));
     };
     if create {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(0o755)
             .create(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let held = open_folder(parent).with_context(|| format!("opening {}", parent.display()))?;
-    open_own(&held, parent, name, create)
+    let lib = open_folder(parent).with_context(|| format!("opening {}", parent.display()))?;
+    let made = create
+        && match mkdir_at(&lib, name, 0o755) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => false,
+            Err(e) => {
+                return Err(
+                    anyhow::Error::from(e).context(format!("creating {}", folder.display()))
+                );
+            }
+        };
+    let not_here = |why: &str| {
+        anyhow!(
+            "{} {why}, so file transfer does not stage there",
+            folder.display()
+        )
+    };
+    let held = match open_at(
+        &lib,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(held) => held,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            return Err(not_here("is not a folder"));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e).context(format!("opening {}", folder.display())));
+        }
+    };
+    if held.metadata().map(|md| md.uid()).ok() != Some(0) {
+        return Err(not_here("belongs to another account"));
+    }
+    if made {
+        // SAFETY: a folder handle we hold, just made.
+        unsafe { libc::fchmod(held.as_raw_fd(), 0o755) };
+    }
+    if held.metadata().map(|md| md.mode() & 0o022).ok() != Some(0) {
+        return Err(not_here("is open to other accounts"));
+    }
+    Ok(held)
 }
 
 /// `<id>`'s make in `staging` (at `shown`) failed with `e`: an id that

@@ -1497,6 +1497,23 @@ pub async fn sweep_orphans() -> (usize, usize) {
         kept += k;
         swept += s;
     }
+    // #3688 — and the empty folders `staging::keeps_modes`'s probe left in a
+    // drop folder (a crash between their make and their removal): nothing a
+    // probe makes stays.
+    #[cfg(target_os = "linux")]
+    {
+        let probes = who
+            .run(move || {
+                Ok(roots
+                    .iter()
+                    .map(|root| staging::sweep_probes(root))
+                    .sum::<usize>())
+            })
+            .await;
+        if let Err(e) = probes {
+            tracing::debug!(%e, "sweep_orphans: probe folders not swept");
+        }
+    }
     (kept, swept)
 }
 
