@@ -23,9 +23,13 @@
 //!   to whatever window is underneath, and activation focus isn't
 //!   stolen from e.g. the game or terminal the user was working in.
 //!
-//! Non-Windows builds stub the whole module to a no-op so the call
-//! sites in signalling don't need `#[cfg]`. A future PR can add an
-//! X11 / Wayland / Cocoa implementation.
+//! Outside Windows there is no border or badge. The module still keeps
+//! the LocalAPI session registry that the desktop companion draws its
+//! "being viewed" banner and Disconnect from, asks consent questions on a
+//! native panel where the build has one (`x11` on Linux, `mac` on macOS),
+//! and on Linux falls back to the desktop's notifications (`notify`),
+//! which also say "This screen is being viewed", with Disconnect, where
+//! the companion cannot. The call sites in signalling carry no `#[cfg]`.
 
 use anyhow::Result;
 
