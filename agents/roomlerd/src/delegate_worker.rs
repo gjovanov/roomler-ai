@@ -701,6 +701,33 @@ mod tests {
         assert_eq!(seen[total].msg.len(), WORKER_LOG_MSG_MAX);
     }
 
+    /// #3695 — a full frame of the longest lines a worker can log, each a
+    /// message that doubles when escaped plus a large field, still encodes
+    /// under the daemon's read limit, so the daemon never refuses a worker's
+    /// own frame.
+    #[tokio::test]
+    async fn a_full_log_frame_fits_under_the_daemons_read_limit() {
+        use crate::delegate::{DELEGATE_LINE_MAX, DelegateFrame, WORKER_LOG_LINE_MAX};
+        let n = WORKER_LOG_LINES_PER_FRAME;
+        let (tx, rx) = tokio::sync::mpsc::channel(n + 1);
+        for _ in 0..n + 1 {
+            let mut l = line("\"".repeat(WORKER_LOG_MSG_MAX));
+            l.fields.insert("big", "y".repeat(100 * 1024));
+            tx.try_send(l).unwrap();
+        }
+        drop(tx);
+        let mut logs = Some(rx);
+        let first = next_log_line(&mut logs).await.unwrap();
+        let lines = log_batch(first, &mut logs);
+        assert_eq!(lines.len(), n);
+        for l in &lines {
+            assert!(serde_json::to_vec(l).unwrap().len() <= WORKER_LOG_LINE_MAX);
+            assert!(!l.msg.is_empty(), "the message is cut, not dropped");
+        }
+        let frame = serde_json::to_vec(&DelegateFrame::WorkerLogs { lines }).unwrap();
+        assert!(frame.len() <= DELEGATE_LINE_MAX, "{} bytes", frame.len());
+    }
+
     /// FR-43 P3b — a worker that hands no floor over never wakes for one; one
     /// that does wakes when the person's `rc_*` floor is set (a `config set`),
     /// and says their `auto_grant_session` as it was given.

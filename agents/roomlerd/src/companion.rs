@@ -490,8 +490,8 @@ mod version_tests {
 #[cfg(test)]
 mod console_tests {
     use super::{
-        console_owner_person, seat0_active_session, seat0_person_uid, session_person,
-        session_person_uid, show_field,
+        console_owner_person, seat0_active_session, seat0_person_uid, session_account,
+        session_person, session_person_uid, show_field,
     };
 
     /// `key=value` lines, the whole key and nothing but it: `NameX=` is not
@@ -535,6 +535,41 @@ mod console_tests {
         let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
         let e = session_person("3", unnamed).unwrap_err().to_string();
         assert!(e.contains("names no account"), "{e}");
+    }
+
+    /// #3688 — a GNOME or KDE lock keeps the person's own session showing on
+    /// seat0, marked `LockedHint=yes`: it is still their person, for a
+    /// viewer's reads as for a received file. LightDM's light-locker switches
+    /// seat0 to a greeter session instead, which is nobody, as the login
+    /// screen is. The uid logind recorded comes with the name, so root
+    /// signed in at the screen is told from a person.
+    #[test]
+    fn a_locked_screen_keeps_its_person() {
+        let seat = "Id=seat0\nActiveSession=2\nCanGraphical=yes\nSessions=2\n";
+        assert_eq!(seat0_active_session(seat).unwrap(), "2");
+        let locked = "Id=2\nName=ana\nUser=1000\nSeat=seat0\nType=wayland\nClass=user\n\
+                      Active=yes\nState=active\nLockedHint=yes\nRemote=no\n";
+        assert_eq!(session_person("2", locked).unwrap(), "ana");
+        assert_eq!(
+            session_account("2", locked).unwrap(),
+            ("ana".to_string(), Some(1000))
+        );
+
+        let light_locker = "Id=c2\nName=lightdm\nUser=111\nSeat=seat0\nType=x11\nClass=greeter\n\
+                            Active=yes\nRemote=no\n";
+        let e = session_account("c2", light_locker).unwrap_err().to_string();
+        assert!(e.contains("the login screen is showing"), "{e}");
+
+        let root = "Id=4\nName=root\nUser=0\nSeat=seat0\nType=tty\nClass=user\nRemote=no\n";
+        assert_eq!(
+            session_account("4", root).unwrap(),
+            ("root".to_string(), Some(0))
+        );
+        let no_uid = "Id=6\nName=ops\nSeat=seat0\nType=tty\nClass=user\n";
+        assert_eq!(
+            session_account("6", no_uid).unwrap(),
+            ("ops".to_string(), None)
+        );
     }
 
     /// #2871 (review) — whom a root daemon's person socket is made for:
@@ -1195,8 +1230,16 @@ fn show_field(text: &str, key: &str) -> Option<String> {
 /// screen.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn seat0_user() -> Result<String> {
+    seat0_account().map(|(name, _)| name)
+}
+
+/// #3688 — [`seat0_user`], with the uid logind recorded for that session: a
+/// root daemon's file steps tell root itself at the screen, whose files are
+/// the daemon's own, from a person and from nobody.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn seat0_account() -> Result<(String, Option<u32>)> {
     let id = seat0_active_session(&loginctl_show(&["show-seat", "seat0"])?)?;
-    session_person(&id, &loginctl_show(&["show-session", &id])?)
+    session_account(&id, &loginctl_show(&["show-session", &id])?)
 }
 
 /// #2871 (review) — the uid of the person signed in at seat0, by
@@ -1218,15 +1261,42 @@ fn loginctl_show(args: &[&str]) -> Result<String> {
         .args(args)
         .arg("--no-pager")
         .output()
-        .context("spawning loginctl (is systemd-logind running?)")?;
+        .map_err(loginctl_did_not_start)?;
     if !out.status.success() {
-        anyhow::bail!(
-            "loginctl {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(loginctl_failed(args, &String::from_utf8_lossy(&out.stderr)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The pure half of [`loginctl_show`] when `loginctl` did not start. #3688 —
+/// not installed at all, it is a host with no logind, so no seat: nobody is at
+/// its screen ([`NobodyAtTheScreen`]). Any other failure to start it cannot
+/// tell who is there.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) fn loginctl_did_not_start(e: std::io::Error) -> anyhow::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return nobody_at_the_screen(format!(
+            "nobody is signed in at this machine's screen (it has no seat: loginctl is not \
+             installed, {e})"
+        ));
+    }
+    anyhow::Error::new(e).context("spawning loginctl (is systemd-logind running?)")
+}
+
+/// The pure half of [`loginctl_show`] when `loginctl <args>` failed, from
+/// what it wrote to stderr. #3688 — a host systemd did not boot (a container,
+/// WSL without systemd) has no logind, so no seat: nobody is at its screen
+/// ([`NobodyAtTheScreen`]). Any other failure (the bus or logind not
+/// answering, a timeout) cannot tell who is there.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) fn loginctl_failed(args: &[&str], stderr: &str) -> anyhow::Error {
+    let failed = format!("loginctl {} failed: {}", args.join(" "), stderr.trim());
+    if stderr.contains("System has not been booted with systemd") {
+        return nobody_at_the_screen(format!(
+            "nobody is signed in at this machine's screen (it has no seat: {failed})"
+        ));
+    }
+    anyhow::anyhow!(failed)
 }
 
 /// The pure half of [`seat0_uid`]: seat0's active session out of `show-seat
@@ -1259,13 +1329,46 @@ fn session_person_uid(id: &str, session: &str) -> Result<u32> {
         .ok_or_else(|| anyhow::anyhow!("seat0's session {id} names no uid"))
 }
 
+/// #3688 — seat0's own answer that nobody is at this machine's screen: an
+/// empty seat, the login screen, a session that is not a person's; or a host
+/// with no logind at all, so no seat ([`loginctl_did_not_start`],
+/// [`loginctl_failed`]). Any other lookup that failed (logind did not answer,
+/// a session that names no account) is not one: who is there is then not
+/// known, and a viewer's read says so, rather than that nobody is.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[derive(Debug)]
+struct NobodyAtTheScreen(String);
+
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+impl std::fmt::Display for NobodyAtTheScreen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+impl std::error::Error for NobodyAtTheScreen {}
+
+/// `why`, as seat0's own answer that nobody is at the screen.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) fn nobody_at_the_screen(why: String) -> anyhow::Error {
+    anyhow::Error::new(NobodyAtTheScreen(why))
+}
+
+/// #3688 — whether `e` is seat0's own answer that nobody is at the screen
+/// ([`NobodyAtTheScreen`]), anywhere in its chain.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) fn is_nobody_at_the_screen(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<NobodyAtTheScreen>())
+}
+
 /// The pure half of [`seat0_user`]: the active session out of `loginctl
 /// show-seat seat0`.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn seat0_active_session(seat: &str) -> Result<String> {
     show_field(seat, "ActiveSession").ok_or_else(|| {
-        anyhow::anyhow!(
-            "nobody is signed in at this machine's screen (seat0 has no active session)"
+        nobody_at_the_screen(
+            "nobody is signed in at this machine's screen (seat0 has no active session)".into(),
         )
     })
 }
@@ -1277,18 +1380,33 @@ fn seat0_active_session(seat: &str) -> Result<String> {
 fn session_person(id: &str, session: &str) -> Result<String> {
     match show_field(session, "Class").as_deref() {
         Some("user") => {}
-        Some("greeter") => anyhow::bail!(
-            "nobody is signed in at this machine's screen (the login screen is showing, \
-             session {id})"
-        ),
-        other => anyhow::bail!(
-            "nobody is signed in at this machine's screen (seat0's session {id} is of class \
-             {}, not a person's)",
-            other.unwrap_or("unknown")
-        ),
+        Some("greeter") => {
+            return Err(nobody_at_the_screen(format!(
+                "nobody is signed in at this machine's screen (the login screen is showing, \
+                 session {id})"
+            )));
+        }
+        other => {
+            return Err(nobody_at_the_screen(format!(
+                "nobody is signed in at this machine's screen (seat0's session {id} is of class \
+                 {}, not a person's)",
+                other.unwrap_or("unknown")
+            )));
+        }
     }
     show_field(session, "Name")
         .ok_or_else(|| anyhow::anyhow!("seat0's session {id} names no account"))
+}
+
+/// The pure half of [`seat0_account`]: [`session_person`]'s person, with the
+/// uid logind recorded for the session when it names one.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn session_account(id: &str, session: &str) -> Result<(String, Option<u32>)> {
+    let name = session_person(id, session)?;
+    Ok((
+        name,
+        show_field(session, "User").and_then(|u| u.parse().ok()),
+    ))
 }
 
 /// Is a process with this exact name running? An exact-name match (`pgrep -x`)
@@ -2217,5 +2335,81 @@ XMODIFIERS=@im=ibus
     #[test]
     fn non_numeric_greeter_ids_are_kept() {
         assert_eq!(session_ids("c1 42 gdm seat0 - active no -\n"), ["c1"]);
+    }
+}
+
+/// #3688 — seat0's own "nobody" told from a lookup that failed, on every OS,
+/// as `console_tests` are. At the end of the file, so no line above moves.
+#[cfg(test)]
+mod nobody_at_the_screen_tests {
+    use super::{is_nobody_at_the_screen, seat0_active_session, session_account};
+
+    /// The states that really are nobody at the screen say so by their type:
+    /// an empty seat, the login screen, a session that is not a person's. A
+    /// session that names no account, and a lookup that failed, are not
+    /// nobody: who is there is not known, and a viewer is told that.
+    #[test]
+    fn nobody_at_the_screen_is_told_from_a_lookup_that_failed() {
+        let empty = "Id=seat0\nActiveSession=\nCanGraphical=no\nSessions=\n";
+        let greeter = "Id=c1\nName=gdm\nUser=120\nSeat=seat0\nType=wayland\nClass=greeter\n";
+        let lock = "Id=9\nName=x\nUser=1000\nType=x11\nClass=lock-screen\n";
+        let unnamed = "Id=3\nUser=1000\nType=x11\nClass=user\n";
+        assert!(
+            is_nobody_at_the_screen(&seat0_active_session(empty).unwrap_err()),
+            "an empty seat"
+        );
+        assert!(
+            is_nobody_at_the_screen(&session_account("c1", greeter).unwrap_err()),
+            "the login screen"
+        );
+        assert!(
+            is_nobody_at_the_screen(&session_account("9", lock).unwrap_err()),
+            "a session that is not a person's"
+        );
+        assert!(
+            !is_nobody_at_the_screen(&session_account("3", unnamed).unwrap_err()),
+            "a session that names no account"
+        );
+        let failed = anyhow::anyhow!("loginctl show-seat seat0 failed: Failed to connect to bus");
+        assert!(!is_nobody_at_the_screen(&failed), "a lookup that failed");
+    }
+
+    /// A host with no logind at all has no seat, so nobody is at its screen,
+    /// and its lookup says so by its type: `loginctl` is not installed, or
+    /// systemd is not what booted the host (a container, WSL without systemd,
+    /// a minimal VM). Every other failure of the lookup is not nobody: a bus
+    /// or a logind that does not answer, a `loginctl` that would not start for
+    /// another reason. Who is there is then not known.
+    #[test]
+    fn a_host_with_no_logind_has_nobody_at_the_screen() {
+        use super::{loginctl_did_not_start, loginctl_failed};
+        let seat = ["show-seat", "seat0"];
+        let not_installed = loginctl_did_not_start(std::io::ErrorKind::NotFound.into());
+        assert!(
+            is_nobody_at_the_screen(&not_installed),
+            "loginctl is not installed: {not_installed:#}"
+        );
+        let not_booted = loginctl_failed(
+            &seat,
+            "System has not been booted with systemd as init system (PID 1). Can't operate.\n\
+             Failed to connect to bus: Host is down\n",
+        );
+        assert!(
+            is_nobody_at_the_screen(&not_booted),
+            "systemd did not boot this host: {not_booted:#}"
+        );
+        for stderr in [
+            "Failed to connect to bus: Connection refused",
+            "Failed to get properties: Connection timed out",
+            "",
+        ] {
+            let failed = loginctl_failed(&seat, stderr);
+            assert!(!is_nobody_at_the_screen(&failed), "{stderr:?}: {failed:#}");
+        }
+        let would_not_start = loginctl_did_not_start(std::io::ErrorKind::PermissionDenied.into());
+        assert!(
+            !is_nobody_at_the_screen(&would_not_start),
+            "loginctl would not start: {would_not_start:#}"
+        );
     }
 }

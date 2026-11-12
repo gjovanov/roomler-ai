@@ -50,6 +50,9 @@ pub struct PortalCapture {
     /// When the last frame arrived: proof the compositor draws this session,
     /// newer than the watch's read on the way back (see [`away_now`]).
     last_frame: Option<std::time::Instant>,
+    /// #3695 — the frame the reader refused, when one ended the stream: the
+    /// reason [`ScreenCapture::next_frame`] gives for the end.
+    refused: std::sync::Arc<std::sync::Mutex<Option<anyhow::Error>>>,
 }
 
 /// What one portal session is opened with. [`PortalOpen::from_env`] is the
@@ -134,8 +137,19 @@ impl PortalCapture {
                  will show a picker, so somebody has to be at the screen"
             );
         }
-        let mut child =
+        let child =
             super::helper::spawn_streaming(target_fps, want_input, use_mutter, window_capture)?;
+        Self::from_helper(child, use_mutter, want_input)
+    }
+
+    /// The capture over a helper already started: its handshake, then its
+    /// frames. Split from [`Self::open_with`] so a test can hand it a
+    /// stand-in helper.
+    fn from_helper(child: std::process::Child, use_mutter: bool, want_input: bool) -> Result<Self> {
+        // #3695 — held by `Starting` until the capture owns it: every return
+        // below that does not hand it over ends it and waits for it.
+        let mut helper = Starting(Some(child));
+        let child = helper.child();
         let stdout = child
             .stdout
             .take()
@@ -150,6 +164,8 @@ impl PortalCapture {
         //    open instead, and the capture cascade falls through with a reason.
         let (hs_tx, hs_rx) = std::sync::mpsc::channel::<Result<super::helper::StreamStarted>>();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let refused = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let refused_by_reader = refused.clone();
         std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stdout);
             let handshake = super::helper::read_stream_handshake(&mut reader);
@@ -169,6 +185,12 @@ impl PortalCapture {
                     Ok(None) => break, // clean EOF — the helper exited
                     Err(e) => {
                         tracing::warn!(error = %e, "portal capture: frame stream ended");
+                        // #3695 — a refused frame is why the capture ends.
+                        // Kept before `tx` drops with this thread, so the
+                        // pump that sees the channel close finds it.
+                        if e.is::<Refused>() {
+                            *refused_by_reader.lock().expect("refused mutex") = Some(e);
+                        }
                         break;
                     }
                 }
@@ -179,8 +201,6 @@ impl PortalCapture {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(anyhow!(
                     "the portal helper did not start a stream within {}s — a consent dialog \
                      left unanswered, most likely (the portal is attended)",
@@ -246,7 +266,7 @@ impl PortalCapture {
         let watch = watch_session();
 
         Ok(Self {
-            child,
+            child: helper.hand_over(),
             rx,
             width,
             height,
@@ -255,6 +275,7 @@ impl PortalCapture {
             mutter: use_mutter,
             watch,
             last_frame: None,
+            refused,
         })
     }
 
@@ -263,6 +284,33 @@ impl PortalCapture {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+}
+
+/// #3695 — the helper from its start until a capture owns it. Every return
+/// from [`PortalCapture::from_helper`] that does not hand it over drops this,
+/// and the drop ends the helper and waits for it.
+struct Starting(Option<std::process::Child>);
+
+impl Starting {
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("the helper is held until it is handed over")
+    }
+
+    /// The capture takes the helper, and nothing is ended.
+    fn hand_over(mut self) -> std::process::Child {
+        self.0.take().expect("the helper is handed over once")
+    }
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -507,7 +555,28 @@ mod session_away_tests {
     }
 }
 
+/// #3695 — a frame the reader refused from its header: the reason the
+/// capture ends, as distinct from the stream itself ending.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the portal helper sent a frame that was refused: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// Read one framed frame. `Ok(None)` is a clean end of stream.
+///
+/// #3695 — the header is checked whole before anything is allocated: its
+/// size rules ([`FrameHeader::decode`]) and its pixel format. A frame that
+/// fails either check is a [`Refused`] error.
 fn read_frame(r: &mut impl std::io::Read) -> Result<Option<Frame>> {
     let mut head = [0u8; HEADER_LEN];
     match r.read_exact(&mut head) {
@@ -515,7 +584,9 @@ fn read_frame(r: &mut impl std::io::Read) -> Result<Option<Frame>> {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    let h = FrameHeader::decode(&head).map_err(|e| anyhow!("{e}"))?;
+    let h = FrameHeader::decode(&head).map_err(|e| anyhow::Error::new(Refused(e)))?;
+    let pixel_format =
+        pixel_format_of(h.video_format).map_err(|e| anyhow::Error::new(Refused(e.to_string())))?;
     let mut data = vec![0u8; h.len as usize];
     r.read_exact(&mut data)?;
 
@@ -523,7 +594,7 @@ fn read_frame(r: &mut impl std::io::Read) -> Result<Option<Frame>> {
         width: h.width,
         height: h.height,
         stride: h.stride,
-        pixel_format: pixel_format_of(h.video_format)?,
+        pixel_format,
         data: data.into(),
         monotonic_us: now_us(),
         monitor: 0,
@@ -573,12 +644,16 @@ impl ScreenCapture for PortalCapture {
             // "nothing this tick".
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
             // FR-93 P6c — why the helper ended is in its exit status, which
-            // follows its stdout closing within moments.
+            // follows its stdout closing within moments. #3695 — unless the
+            // reader refused a frame: then that is why.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let refused = self.refused.lock().expect("refused mutex").take();
                 let child = &mut self.child;
-                let code = tokio::task::block_in_place(|| reap(child, HELPER_EXIT_WAIT))
-                    .and_then(|s| s.code());
-                Err(helper_ended(code, screen_stop_enabled()))
+                let code = || {
+                    tokio::task::block_in_place(|| reap(child, HELPER_EXIT_WAIT))
+                        .and_then(|s| s.code())
+                };
+                Err(stream_end(refused, code, screen_stop_enabled()))
             }
         }
     }
@@ -666,6 +741,20 @@ fn helper_ended(code: Option<i32>, honour_stop: bool) -> anyhow::Error {
         }
         Some(c) => anyhow!("the portal helper stopped producing frames (exit status {c})"),
         None => anyhow!("the portal helper stopped producing frames"),
+    }
+}
+
+/// #3695 — why a capture's frames ended: the frame the reader refused when
+/// there is one, which the helper's exit status knows nothing of and which is
+/// not waited for; else the exit status, as [`helper_ended`] reads it.
+fn stream_end(
+    refused: Option<anyhow::Error>,
+    code: impl FnOnce() -> Option<i32>,
+    honour_stop: bool,
+) -> anyhow::Error {
+    match refused {
+        Some(e) => e,
+        None => helper_ended(code(), honour_stop),
     }
 }
 
@@ -761,6 +850,39 @@ mod tests {
         assert!(e.contains("exit status 3"), "{e}");
     }
 
+    /// #3695 — a frame whose payload is not its header's rows is refused from
+    /// the header, as a [`Refused`] error, and that refusal is the reason the
+    /// capture ends: the exit status is not waited for. A stream that simply
+    /// ended keeps the exit status's reading, the person's Stop included.
+    #[test]
+    fn a_refused_frame_is_the_reason_the_capture_ends() {
+        let mut short = hdr(32);
+        short.len = 31;
+        let mut cur = std::io::Cursor::new(framed(short, 1));
+        let e = read_frame(&mut cur).err().expect("refused");
+        assert!(e.is::<Refused>(), "{e}");
+        assert!(e.to_string().contains("rows of 16 bytes"), "{e}");
+        assert_eq!(cur.position(), HEADER_LEN as u64, "no payload read");
+
+        let mut truncated = framed(hdr(32), 1);
+        truncated.truncate(HEADER_LEN + 10);
+        let e = read_frame(&mut std::io::Cursor::new(truncated))
+            .err()
+            .expect("ended");
+        assert!(!e.is::<Refused>(), "a stream that ended is not a refusal");
+
+        let refused = anyhow::Error::new(Refused("why".into()));
+        let not_waited = || -> Option<i32> { panic!("the exit status was waited for") };
+        let e = stream_end(Some(refused), not_waited, true).to_string();
+        assert!(e.contains("why"), "{e}");
+
+        let stop = super::super::helper::EXIT_STOPPED_AT_SCREEN;
+        let e = stream_end(None, || Some(stop), true);
+        assert!(crate::capture::stopped_at_screen(&e), "{e}");
+        let e = stream_end(None, || Some(3), true).to_string();
+        assert!(e.contains("exit status 3"), "{e}");
+    }
+
     /// P6c — a real child's status is read once it has exited, and a child
     /// still running is not waited on past the bound.
     #[test]
@@ -781,5 +903,26 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_secs(5));
         let _ = running.kill();
         let _ = running.wait();
+    }
+
+    /// #3695 — a handshake that fails ends the helper and waits for it. The
+    /// stand-in closes its stdout without announcing a stream and stays up;
+    /// once the open has returned, it is no longer in the process table.
+    #[test]
+    fn a_failed_handshake_ends_the_helper_and_waits_for_it() {
+        let helper = std::process::Command::new("sh")
+            .args(["-c", "exec >&-; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = helper.id();
+        let e = PortalCapture::from_helper(helper, false, false)
+            .err()
+            .expect("the handshake failed");
+        assert!(e.to_string().contains("before announcing a stream"), "{e}");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the helper is still in the process table"
+        );
     }
 }

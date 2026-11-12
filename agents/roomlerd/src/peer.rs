@@ -13089,7 +13089,7 @@ async fn handle_files_control(
     let parsed = match parsed {
         Ok(p) => p,
         Err(e) => {
-            debug!(%session_id, %e, "files: unparseable control JSON");
+            debug!(%session_id, e = ?e.to_string(), "files: unparseable control JSON");
             return;
         }
     };
@@ -13102,7 +13102,7 @@ async fn handle_files_control(
             rel_path,
             dest_path,
         } => {
-            info!(%session_id, %id, %name, size, ?mime, ?rel_path, ?dest_path, "files: begin");
+            info!(%session_id, ?id, ?name, size, ?mime, ?rel_path, ?dest_path, "files: begin");
             match handler
                 .begin(
                     id.clone(),
@@ -13125,7 +13125,7 @@ async fn handle_files_control(
                     .await;
                 }
                 Err(e) => {
-                    warn!(%session_id, %id, %e, "files: begin failed");
+                    warn!(%session_id, ?id, e = ?e.to_string(), "files: begin failed");
                     let msg = format!("{e}");
                     send_files_json(
                         &dc,
@@ -13140,7 +13140,7 @@ async fn handle_files_control(
         }
         crate::files::FilesIncoming::End { id } => match handler.end(&id).await {
             Ok((path, bytes)) => {
-                info!(%session_id, %id, bytes, path = %path.display(), "files: complete");
+                info!(%session_id, %id, bytes, path = ?path, "files: complete");
                 // FR-101 P3 — the audit gets the name's hash, never the name.
                 crate::session_telemetry::counters(session_id).note_file(
                     TransferDirection::ToHost,
@@ -13162,7 +13162,7 @@ async fn handle_files_control(
                 .await;
             }
             Err(e) => {
-                warn!(%session_id, %id, %e, "files: end failed");
+                warn!(%session_id, ?id, e = ?e.to_string(), "files: end failed");
                 let msg = format!("{e}");
                 send_files_json(
                     &dc,
@@ -13175,7 +13175,7 @@ async fn handle_files_control(
             }
         },
         crate::files::FilesIncoming::Get { id, path } => {
-            info!(%session_id, %id, path = %path, "files: get (download requested)");
+            info!(%session_id, ?id, path = ?path, "files: get (download requested)");
             spawn_outgoing_pump(dc.clone(), handler, session_id, id, path);
         }
         crate::files::FilesIncoming::GetFolder { id, path, format } => {
@@ -13183,7 +13183,7 @@ async fn handle_files_control(
             if let Some(f) = format.as_deref()
                 && f != "zip"
             {
-                warn!(%session_id, %id, format = %f, "files: get-folder unsupported format");
+                warn!(%session_id, ?id, format = ?f, "files: get-folder unsupported format");
                 send_files_json(
                     &dc,
                     &crate::files::FilesOutgoing::Error {
@@ -13194,7 +13194,7 @@ async fn handle_files_control(
                 .await;
                 return;
             }
-            info!(%session_id, %id, path = %path, "files: get-folder (zip) requested");
+            info!(%session_id, ?id, path = ?path, "files: get-folder (zip) requested");
             spawn_outgoing_zip_pump(dc.clone(), handler, session_id, id, path);
         }
         crate::files::FilesIncoming::Cancel { id } => {
@@ -13203,18 +13203,35 @@ async fn handle_files_control(
             // cancel_incoming clears upload state + removes the
             // .roomler-partial/<id>/ staging dir + registry entry so
             // the partial doesn't sit until the 24h orphan sweep.
-            // Browsers send files:cancel on terminal upload failure
-            // (6 reconnect attempts exhausted).
+            // The viewer sends files:cancel to stop a download; for an
+            // upload only when its resume loop gives up, which since
+            // rc.23's endless retry it never does.
             let out_cancelled = handler.cancel_outgoing(&id).await;
-            let in_cancelled = handler.cancel_incoming(&id).await;
-            info!(
-                %session_id, %id, out_cancelled, in_cancelled,
-                "files: cancel requested"
-            );
+            // #3688 — an upload's id is one plain name
+            // (`files::transfer_id`): any other is refused, and the viewer
+            // told, as at files:begin and files:resume.
+            match handler.cancel_incoming(&id).await {
+                Ok(in_cancelled) => info!(
+                    %session_id, %id, out_cancelled, in_cancelled,
+                    "files: cancel requested"
+                ),
+                Err(e) => {
+                    warn!(%session_id, ?id, out_cancelled, e = ?e.to_string(), "files: cancel refused");
+                    let msg = format!("{e}");
+                    send_files_json(
+                        &dc,
+                        &crate::files::FilesOutgoing::Error {
+                            id: &id,
+                            message: &msg,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
         crate::files::FilesIncoming::Dir { req_id, path } => {
             if !crate::files::is_remote_browse_enabled() {
-                info!(%session_id, %req_id, path = %path, "files: dir refused — remote browse disabled");
+                info!(%session_id, ?req_id, path = ?path, "files: dir refused — remote browse disabled");
                 send_files_json(
                     &dc,
                     &crate::files::FilesOutgoing::DirError {
@@ -13228,8 +13245,8 @@ async fn handle_files_control(
             match crate::files::list_dir(&path).await {
                 Ok(listing) => {
                     info!(
-                        %session_id, %req_id,
-                        path = %listing.path,
+                        %session_id, ?req_id,
+                        path = ?listing.path,
                         entries = listing.entries.len(),
                         "files: dir listed"
                     );
@@ -13246,7 +13263,7 @@ async fn handle_files_control(
                     .await;
                 }
                 Err(e) => {
-                    warn!(%session_id, %req_id, path = %path, %e, "files: dir failed");
+                    warn!(%session_id, ?req_id, path = ?path, e = ?e.to_string(), "files: dir failed");
                     let msg = format!("{e}");
                     send_files_json(
                         &dc,
@@ -13286,7 +13303,7 @@ async fn handle_files_control(
                     .await;
                 }
                 Err(e) => {
-                    warn!(%session_id, %id, %offset, %e, "files: resume rejected");
+                    warn!(%session_id, ?id, %offset, e = ?e.to_string(), "files: resume rejected");
                     let msg = format!("{e}");
                     send_files_json(
                         &dc,
@@ -13322,7 +13339,7 @@ fn spawn_outgoing_pump(
         let offer = match handler.begin_outgoing(id.clone(), &requested_path).await {
             Ok(o) => o,
             Err(e) => {
-                warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing failed");
+                warn!(%session_id, ?id, path = ?requested_path, e = ?e.to_string(), "files: begin_outgoing failed");
                 let msg = format!("{e}");
                 send_files_json(
                     &dc,
@@ -13363,10 +13380,10 @@ fn spawn_outgoing_pump(
             Err(e) => {
                 handler.finish_outgoing(&offer.id).await;
                 if offer.cancel.is_cancelled() {
-                    info!(%session_id, id = %offer.id, "files: download stopped (cancelled, or the session ended)");
+                    info!(%session_id, id = ?offer.id, "files: download stopped (cancelled, or the session ended)");
                     return;
                 }
-                warn!(%session_id, id = %offer.id, %e, "files: pump_outgoing failed");
+                warn!(%session_id, id = ?offer.id, e = ?e.to_string(), "files: pump_outgoing failed");
                 let msg = format!("{e}");
                 let _ = or_stopped(
                     &offer.cancel,
@@ -13386,7 +13403,7 @@ fn spawn_outgoing_pump(
         // Successful end-of-stream: clear state, then send Eof so the
         // browser closes the writable cleanly.
         info!(
-            %session_id, id = %offer.id, bytes_sent, path = %offer.path.display(),
+            %session_id, id = ?offer.id, bytes_sent, path = ?offer.path,
             "files: outgoing complete"
         );
         crate::session_telemetry::counters(session_id).note_file(
@@ -13443,7 +13460,7 @@ async fn outgoing_zip<S: DownloadSink + Clone + 'static>(
     {
         Ok(o) => o,
         Err(e) => {
-            warn!(%session_id, %id, path = %requested_path, %e, "files: begin_outgoing_zip failed");
+            warn!(%session_id, ?id, path = ?requested_path, e = ?e.to_string(), "files: begin_outgoing_zip failed");
             let msg = format!("{e}");
             dc.send_json(&crate::files::FilesOutgoing::Error {
                 id: &id,
@@ -13504,10 +13521,10 @@ async fn outgoing_zip<S: DownloadSink + Clone + 'static>(
         (Ok(Err(e)), _) | (_, Ok(Err(e))) => {
             handler.finish_outgoing(&offer.id).await;
             if offer.cancel.is_cancelled() {
-                info!(%session_id, id = %offer.id, "files: zip download stopped (cancelled, or the session ended)");
+                info!(%session_id, id = ?offer.id, "files: zip download stopped (cancelled, or the session ended)");
                 return;
             }
-            warn!(%session_id, id = %offer.id, %e, "files: zip pump failed");
+            warn!(%session_id, id = ?offer.id, e = ?e.to_string(), "files: zip pump failed");
             let msg = format!("{e}");
             let _ = or_stopped(
                 &offer.cancel,
@@ -13521,7 +13538,7 @@ async fn outgoing_zip<S: DownloadSink + Clone + 'static>(
         }
         (Err(je), _) | (_, Err(je)) => {
             handler.finish_outgoing(&offer.id).await;
-            warn!(%session_id, id = %offer.id, %je, "files: zip pump task panicked");
+            warn!(%session_id, id = ?offer.id, %je, "files: zip pump task panicked");
             let _ = or_stopped(
                 &offer.cancel,
                 dc.send_json(&crate::files::FilesOutgoing::Error {
@@ -13535,8 +13552,8 @@ async fn outgoing_zip<S: DownloadSink + Clone + 'static>(
     };
 
     info!(
-        %session_id, id = %offer.id, total_bytes,
-        path = %offer.path.display(),
+        %session_id, id = ?offer.id, total_bytes,
+        path = ?offer.path,
         "files: outgoing zip complete"
     );
     crate::session_telemetry::counters(session_id).note_file(
@@ -13693,7 +13710,7 @@ async fn handle_files_chunk(
             // Below the progress-report threshold; nothing to send.
         }
         Err(e) => {
-            warn!(%session_id, id = %active_id, %e, "files: chunk failed");
+            warn!(%session_id, id = %active_id, e = ?e.to_string(), "files: chunk failed");
             let msg = format!("{e}");
             send_files_json(
                 &dc,
@@ -16474,15 +16491,18 @@ mod download_stop_tests {
 /// message through the task a `files:get-folder` runs ([`outgoing_zip`]),
 /// walks as the reader it began for: the person its offer carries to the
 /// walk. The person is the low-integrity stand-in (`files::stand_in`).
-#[cfg(all(test, target_os = "windows"))]
-mod folder_download_as_the_person_tests {
+/// #3688 — a Linux system install's twin drives [`download`] from
+/// `files::seat_user_tests::as_root`, which CI runs as root.
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+pub(crate) mod folder_download_as_the_person_tests {
     use super::*;
+    #[cfg(target_os = "windows")]
     use crate::files::stand_in;
 
     /// A channel that keeps what it was sent: the bytes, and each message
     /// as its JSON.
     #[derive(Clone, Default)]
-    struct Recorded {
+    pub(crate) struct Recorded {
         bytes: Arc<std::sync::Mutex<Vec<u8>>>,
         said: Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -16504,18 +16524,18 @@ mod folder_download_as_the_person_tests {
     }
 
     impl Recorded {
-        fn has(&self, needle: &[u8]) -> bool {
+        pub(crate) fn has(&self, needle: &[u8]) -> bool {
             let bytes = self.bytes.lock().unwrap();
             bytes.windows(needle.len()).any(|w| w == needle)
         }
-        fn said(&self) -> Vec<String> {
+        pub(crate) fn said(&self) -> Vec<String> {
             self.said.lock().unwrap().clone()
         }
     }
 
     /// `root` downloaded as a folder, read as whoever `FsAs::for_read()`
     /// answers now.
-    async fn download(root: &std::path::Path) -> Recorded {
+    pub(crate) async fn download(root: &std::path::Path) -> Recorded {
         let sink = Recorded::default();
         outgoing_zip(
             sink.clone(),
@@ -16531,6 +16551,7 @@ mod folder_download_as_the_person_tests {
     /// Their file is in the zip; a file only the daemon may read, and one
     /// inside a folder only the daemon may list, are left out; the zip
     /// completes. Without a stand-in the daemon zips all three (the control).
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn a_folder_download_walks_as_the_person_its_offer_carries() {
         let temp = tempfile::tempdir().unwrap();
@@ -16576,6 +16597,7 @@ mod folder_download_as_the_person_tests {
     /// taken for the whole folder. The steps: the download's start (1), the
     /// root resolved (2) and listed (3), the first file opened (4); by the
     /// second file they have gone.
+    #[cfg(target_os = "windows")]
     #[tokio::test]
     async fn a_person_who_signs_out_mid_folder_ends_it_with_an_error_not_eof() {
         let temp = tempfile::tempdir().unwrap();
@@ -16773,5 +16795,109 @@ mod stopped_at_screen_tests {
                 assert_eq!(killed.recv().await, Some(owner), "then the owner");
             } => {}
         }
+    }
+}
+
+/// #3688 — text the viewer sends on the files channel (an id, a path, a
+/// name), and an error that may quote it, is logged escaped: a line break in
+/// it never starts a log line of its own. At the end of the file, so no line
+/// above moves.
+#[cfg(test)]
+pub(crate) mod files_log_tests {
+    use super::*;
+
+    /// What is logged on this thread while it lives, as the daemon's log
+    /// file writes it: no colour, one event a line. A `#[tokio::test]` polls
+    /// its body, and the tasks it spawns, on its own thread.
+    pub(crate) struct Logged {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+        _default: tracing::subscriber::DefaultGuard,
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread (`derp`'s `logged`).
+        _second: tracing::Dispatch,
+    }
+
+    impl Logged {
+        pub(crate) fn start(level: tracing::Level) -> Self {
+            #[derive(Clone)]
+            struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Buf(buf.clone());
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_max_level(level)
+                .with_writer(move || writer.clone())
+                .finish();
+            Self {
+                buf,
+                _default: tracing::subscriber::set_default(subscriber),
+                _second: second,
+            }
+        }
+
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A channel that takes everything and keeps nothing.
+    #[derive(Clone)]
+    struct Quiet;
+    impl DownloadSink for Quiet {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A folder download asked with a line break in its id and in its path:
+    /// the line saying it failed holds both, each escaped. Off Windows the
+    /// path names a file, so the error quotes it too ("not a directory").
+    #[tokio::test]
+    async fn a_viewers_id_or_path_never_starts_a_log_line_of_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let asked = temp.path().join("a\nSECOND LINE from a path");
+        #[cfg(unix)]
+        std::fs::write(&asked, b"a file, not a folder").unwrap();
+        let log = Logged::start(tracing::Level::INFO);
+        outgoing_zip(
+            Quiet,
+            crate::files::FilesHandler::new(),
+            bson::oid::ObjectId::new(),
+            "z1\nSECOND LINE from an id".into(),
+            asked.to_string_lossy().into_owned(),
+        )
+        .await;
+        let text = log.text();
+        assert!(
+            text.contains("files: begin_outgoing_zip failed"),
+            "the failure is logged: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("SECOND LINE")),
+            "a line break from the viewer started a log line: {text}"
+        );
+        assert!(
+            text.contains(r"z1\nSECOND LINE from an id"),
+            "the id, escaped: {text}"
+        );
     }
 }

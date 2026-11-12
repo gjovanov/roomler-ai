@@ -249,8 +249,8 @@ The overlay reaches a session's ICE three ways. The interface-name rule RC alway
 
 > ⚠️ **A supervised Mac's GUI worker runs no overlay** (FR-43: a GUI-session process cannot create a `utun`), yet it builds the peer for two kinds of session, and each needs the overlay's blocks by a different route:
 >
-> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3859`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:342`).
-> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1328`, `delegate.rs:1370`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4844`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
+> - **A session delegated from the daemon:** the daemon resolves the decision *with* its blocks (`signaling.rs:3859`) and sends both in `SessionParams.rc_overlay` (`delegate.rs:458`).
+> - **The worker's OWN enrollment's sessions** (the per-user row) never cross the daemon, so the worker resolves them against its own footprint registry. The daemon fills it with `DelegateFrame::OverlayFootprint`: right after `Attached`, and again after a `Pong` whenever the set has grown (`delegate.rs:1466`, `delegate.rs:1510`; the worker side is `delegate_worker.rs:432`, wired at `app.rs:4844`). Measured on 0.4.122, before this frame existed: the user row's session logged `overlay_blocks=0` and still offered the `utunN` v4 address, while a daemon-row session logged `overlay_blocks=1` and offered no overlay candidate at all.
 >
 > A frame from an older daemon carries none and reads **off**, with an empty footprint: the derived-v6 ULA is still caught, the v4 utun address is not.
 
@@ -770,7 +770,7 @@ sequenceDiagram
     V-->>V: a snackbar once, and the reason<br/>on the audio control's title
 ```
 
-The pump ([`peer.rs:14075`](../agents/roomlerd/src/peer.rs#L14075)) sends it
+The pump ([`peer.rs:14092`](../agents/roomlerd/src/peer.rs#L14092)) sends it
 from every exit: a capture that does not open, an encoder that does not start,
 and a capture or encode that stops mid-session. The payload is built by
 [`peer.rs:5788`](../agents/roomlerd/src/peer.rs#L5788); the viewer parses it
@@ -2938,8 +2938,8 @@ sequenceDiagram
 
 | | |
 |---|---|
-| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14330`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14308`). An offer with no `m=video` is answered without the track |
-| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4642`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14339`) |
+| Decided by | the **agent**, the one party holding both halves: the codec its RTP track sends and the offer (`rtp_track_unanswerable`, `agents/roomlerd/src/peer.rs:14347`). A DataChannel transport is never refused: its track is a placeholder and takes VP8 instead (#2231, `rtp_track_codec`, `:14325`). An offer with no `m=video` is answered without the track |
+| Refused at | `rc:sdp.offer`, before the peer is built (`agents/roomlerd/src/signaling.rs:4642`). The warning names what the browser offered (`offered_video_codecs`, `peer.rs:14356`) |
 | Wire | the existing `error` plus `limit: "no_common_codec"` (`LIMIT_NO_COMMON_CODEC`, `crates/remote_control/src/signaling.rs:110`). No new `EndReason`: an older server drops a frame that carries one it does not know (the FR-27 P10 lesson) |
 | Hub | names it only from the agent and only with `error` (`device_end_limit`, `crates/modules/fleet/src/hub.rs:691`), on both ends' `rc:terminate` and in the `session_ended` audit row |
 | Viewer | never retries it (`isRetryableTerminateReason`, `ui/src/composables/useRemoteControl.ts:350`) and says: *"This browser can't decode the video this device sends. Try Chrome, Edge or Safari, or turn on the OpenH264 plugin in Firefox's add-ons."* (`friendlyEndReason`, `:941`). An `rc:error` that arrives later for the same, already-ended session, from candidates still in flight, is ignored, so it cannot replace that sentence (`isFalloutOfEndedSession`, `:480`, #2326) |
@@ -3671,7 +3671,7 @@ whose peer is dead, `Failed` or `Closed`, at the exit: it cannot come back (P2a-
 | ⚠️ The consent prompt keeps the connection's own sender: `await_prompt_or_socket_end` reads its close to withdraw a prompt (#2416) | `agents/roomlerd/src/signaling.rs:413` |
 | The person at the device ends a kept session at once: it stops serving, says `rc:ended {reason}` on its control channel, closes after the grace, and its `rc:terminate` goes out on the current connection, or on the next one, after its hello. A pump with no encoder asks through the same channel, and a kept one's end is `no_video` too, never the person's `host_disconnect` (P2a-2, L10) | `end_kept_by_device`, `agents/roomlerd/src/session_table.rs:975`; `end_in_gap`, `agents/roomlerd/src/signaling.rs:7127`; `no_video`, `agents/roomlerd/src/session_table.rs:670` |
 | The server's end of a session the table holds, attached or kept (a kick, the maximum length, a refused claim): control stops at once, `rc:ended {reason, limit}` goes on its control channel, and the peer closes after the grace, on a task of its own. Its viewer may not have rejoined since a resume, and to a viewer a bare close reads as a drop, which it redials: on an owner's or an auto-consent device that undid the kick. The viewer reads `rc:ended` as it reads `rc:terminate`, and the first of the two wins (§11.17). Off, the end closes the peer at once and says nothing, as before (P2a-2, C1) | `close_terminated`, `agents/roomlerd/src/session_table.rs:690`; its call in the `Terminate` arm, `agents/roomlerd/src/signaling.rs:4995` |
-| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:831`; `resume`, `:778`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:13868` |
+| A dead peer, `Failed` or `Closed`, is never kept and never resumed. Its state handler says `Terminate` once, on `Failed`, and the watchdog stops watching there, so one that died while its socket was dying told only that socket. A transient exit closes it and says its end, `error`, on the next connection; a claim answered after it died is refused the same way (P2a-2, M1) | `end_connection`, `agents/roomlerd/src/session_table.rs:831`; `resume`, `:778`; `AgentPeer::is_dead`, `agents/roomlerd/src/peer.rs:13885` |
 | A connection that ends before its server announced a window (the window comes after the hello) closes what it built, as before. What the last connection kept keeps its own deadline, and the next hello claims it (P2a-2, M3) | `end_connection`, `agents/roomlerd/src/session_table.rs:831` |
 | What the server must hear is never lost to a full queue: an end at the device, a kept session's own end and reports, the answer to a claim the device can no longer honour, a request refused as busy. It waits, in order, for room on this connection's queue, and the loop's table arm sends it the moment there is room; with no connection, the next one's hello is followed by it. Nothing waits on it (P2a-2, L7) | `queue_end`, `agents/roomlerd/src/session_table.rs:1013`; `next_event`, `:1057` |
 | Kept sessions count against `rc_max_sessions`: a request that would put one beside a kept peer past it is refused as busy (`rc:terminate agent_hangup`), and the table never keeps more than the capacity | `full_beside_kept`, `agents/roomlerd/src/session_table.rs:751` |
@@ -5033,7 +5033,13 @@ to-activate, so the browser never sees a bait-and-switch.
   64 KiB ArrayBuffer chunks with `bufferedAmount` back-pressure →
   `files:end` → agent writes into the controlled host's Downloads
   folder. Filename sanitization + collision-safe rename + 2 GiB
-  per-transfer cap. Since FR-84 D4 the folder is **`files_dir`** (live; `~`
+  per-transfer cap. An upload's `id` names its staging folder, so it is one
+  plain name: letters, digits, `.`, `_` and `-`, not starting with `.`, at
+  most 128 bytes (`transfer_id`, `agents/roomlerd/src/files.rs:1332`).
+  `files:begin`, `files:resume`, `files:cancel` and `files:end` check it
+  first, on every OS, and answer any other id with a `files:error`; the
+  viewer's ids (`up-<base36>-<base36>`) are such names (#3688).
+  Since FR-84 D4 the folder is **`files_dir`** (live; `~`
   per the active user; a SYSTEM/root writer is confined to the active user's
   profile), shown and changed from the companion's Overview —
   [desktop-companion.md](desktop-companion.md) §9 has the rules. Since FR-97
@@ -5044,7 +5050,13 @@ to-activate, so the browser never sees a bait-and-switch.
   with a reason the viewer shows (§9.2 there). Since #3669 that install
   reads as the same person: a download, a folder download and the drawer's
   listing open what they touch as them, and with nobody signed in they are
-  refused with a reason the viewer shows (§9.3 there).
+  refused with a reason the viewer shows (§9.3 there). Since #3688 a Linux
+  system install reads as the person at seat0 too, each step with no
+  capability and every handle, a file's or a folder's, held to what was
+  asked, off the kernel's own file systems; a folder download ends with an
+  error once they leave seat0. With nobody there reads are refused with a
+  reason the viewer shows, and an upload lands in the default folder, never
+  in one the controller chose, as a file only root may read (§9.4 there).
   Gated by `AgentCaps.files` — `upload · download ·
   download-folder · resume` always, `browse` only while
   `enable_remote_browse` is on. ⚠️ The list is assigned by the daemon in

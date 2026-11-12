@@ -23,7 +23,7 @@ sequenceDiagram
     participant A as SourceForge Release API
     participant L as The listing (best_release.json)
     W->>G: publish 16 assets
-    W-->>P: workflow_run completed, head_branch = setup-v
+    W->>P: workflow_dispatch, tag = setup-v (its last job)
     P->>G: download the release, read each asset's digest
     P->>P: verify: file = GitHub digest = its .sha256 sidecar
     P->>F: rsync the 16 files into the setup-v folder
@@ -34,29 +34,83 @@ sequenceDiagram
 ```
 
 The agent release tags `setup-v<V>` and dispatches the wizard lane
-([build-caches.md](build-caches.md#2-one-release-five-runs)). When that run finishes,
-`.github/workflows/sourceforge-publish.yml` starts by itself. A run stops at the first step that
-fails.
+([build-caches.md](build-caches.md#2-one-release-five-runs)). Once the wizard is published, that
+run's last job (`sourceforge` in `.github/workflows/release-setup.yml`) dispatches
+`.github/workflows/sourceforge-publish.yml` for the tag. A run stops at the first step that fails.
 
 | # | Step | What makes it safe |
 |---|---|---|
-| 1 | Resolve the tag | Only `setup-v<major>.<minor>.<patch>` with a published, final GitHub release goes on. Anything else is skipped with a notice |
+| 1 | Resolve the tag | Only `setup-v<major>.<minor>.<patch>` with a published, final GitHub release goes on. A dispatch that names anything else fails |
 | 2 | Download and verify | Every file must hash to GitHub's asset digest, and every installer to the value in its own `.sha256` sidecar. The directory and the asset list must name the same files |
 | 3 | Upload | rsync over ssh to a host whose three keys are pinned in `scripts/sourceforge-known-hosts`, comparing by checksum: a file already there with the right bytes is not touched, not even its time. Then the same transfer again, dry, must find nothing left to send |
 | 4 | Set the defaults | Only for the **newest** setup release. One `PUT` per platform to SourceForge's Release API; the API's answer has to list the platform |
 | 5 | Wait for the listing | `best_release.json` must name the three new files within 15 minutes |
 | 6 | Retention | Only after step 5. Removes `setup-v*` folders older than the newest 10 |
 
-> ⚠️ **An event made with `GITHUB_TOKEN` starts no workflow.** The wizard lane publishes with that
-> token, so `on: release` would never fire. That is why the trigger is `workflow_run`.
+> ⚠️ **A run that `GITHUB_TOKEN` started starts no workflow, not even by finishing.** The agent
+> release dispatches the wizard lane with that token, so the wizard run's actor is
+> `github-actions[bot]`. GitHub then starts nothing for the release it publishes (`on: release`)
+> and nothing for its completion (`workflow_run`). `workflow_dispatch` is the documented exception,
+> which is why the wizard lane dispatches the publish itself.
 
-> ⚠️ **`workflow_run.head_branch` is text the triggering run chose.** It reaches the shell only
-> through an environment variable, is never printed, and is used only after `valid-tag` has matched
-> it.
+That second half was measured on 2026-11-11, the day the workflow reached master with a
+`workflow_run` trigger. A job that skips itself was re-run on two finished wizard runs, 38 seconds
+apart.
 
-The triggering run's conclusion is not read. A wizard run that published and then failed its cache
-refresh still has a release the listing should carry; a run that never published has none, and
-step 1 sees that.
+| The wizard run | Its actor | A `workflow_run` listener started |
+|---|---|---|
+| dispatched from a person's account, on a branch | that account | yes, 2 seconds after it completed |
+| dispatched by the release lane, a re-seed on `master` | `github-actions[bot]` | no |
+| another re-seed of that kind, which happened to finish 59 seconds after the listener reached master | `github-actions[bot]` | no |
+
+Every real release is of the second kind, so that trigger would never have published one, and no
+run would have failed to say so.
+
+### The reconcile
+
+A dispatch can be lost: the job that sends it ends in a warning and never fails a release. A
+wizard run on a tag cut before that job existed sends none. So a second job, `reconcile`, runs on
+a schedule four times a day, and by a dispatch with no tag.
+
+**It publishes nothing.** It finds the newest final setup release on GitHub, reads what
+SourceForge has, and when that release is missing, or an alert is still open, it sends the
+dispatch the release should have sent. The `publish` job then does the work, in its own queue,
+with its own alert. A scheduled run leaves a release younger than 45 minutes to its own dispatch.
+
+| SourceForge's file store (sftp) | `best_release.json` | What the reconcile does |
+|---|---|---|
+| no folder for the release | anything | sends the dispatch |
+| the folder is there | read, and a button does not serve the release | sends the dispatch |
+| the folder is there | read, and all three buttons serve it | nothing |
+| the folder is there | not readable | nothing |
+| not readable | read: as the two rows above | |
+| not readable | not readable | sends the dispatch |
+| any row above that says "nothing", while an alert issue is open | | sends the dispatch |
+| a setup folder, or a button, **newer** than GitHub's newest release | anything | the run fails and sends nothing: a release was pulled back on GitHub, and §5 has what to do |
+
+**An open alert sends the dispatch again**, whatever the listing looks like. Only a green publish
+closes an alert, so while one is open the reconcile publishes the newest release again, four times
+a day. A run that passes closes the issue, and one that fails comments "failed again" on it. The
+reconcile never closes an alert itself: a publish can fail after the buttons have moved (the 15
+minute wait, a retention that fails), and the buttons cannot tell whether that fault is gone.
+
+**A fault of the reconcile itself files the same alert.** No `publish` job stands behind it, so
+its last step opens the issue or comments on the open one. Three things can do that: SourceForge
+is ahead of GitHub, GitHub refused the dispatch three times, or the run failed before it could
+decide.
+
+The file store decides because it is the channel a publish needs anyway, and it is another host
+than the web tier, whose bot protection may one day stop answering a runner. `best_release.json`
+adds only what it can prove. When neither can be read the dispatch is sent all the same: the
+publish is idempotent and it is the job with the alert, and a reconcile that kept quiet whenever
+it could not read would be quiet for good on the day SourceForge blocks runners.
+
+A read GitHub does not answer ends the run with a notice. The next run reads again.
+
+> ⚠️ **GitHub keeps one run waiting in a concurrency group, and a newer arrival replaces it
+> without a trace.** Only a real publish, a dispatch that names a tag and is not a dry run, joins
+> the `live` group. A reconcile run and a dry run each get a group of their own, so neither a cron
+> tick nor a rehearsal can push a release's waiting publish out of the queue.
 
 ## 2. What SourceForge holds
 
@@ -160,6 +214,12 @@ gh workflow run sourceforge-publish.yml -f tag=setup-v0.4.211 -f dry_run=true
 # Publish (or re-publish) a release by hand. The newest one also takes the defaults.
 gh workflow run sourceforge-publish.yml -f tag=setup-v0.4.211
 
+# Run the reconcile once: it sends the newest release's dispatch if SourceForge lacks it.
+gh workflow run sourceforge-publish.yml
+
+# Rehearse the reconcile: it decides, says so, and dispatches a publish that is itself a dry run.
+gh workflow run sourceforge-publish.yml -f dry_run=true
+
 # What the listing serves right now.
 curl -s https://sourceforge.net/projects/roomler-ai/best_release.json \
   | jq '{generic: .release.filename} + (.platform_releases | map_values(.filename))'
@@ -167,7 +227,11 @@ curl -s https://sourceforge.net/projects/roomler-ai/best_release.json \
 
 | Situation | What happens | What to do |
 |---|---|---|
-| A publish fails | One issue opens, "SourceForge publish failed". A repeat comments on it | Fix the cause, re-run the command in the issue. The next green publish closes it |
+| A publish fails | One issue opens, "SourceForge publish failed". A repeat comments on it. While it is open the reconcile sends the newest release again, four times a day | Fix the cause. The next green publish closes it, by itself or from the command in the issue |
+| A release's dispatch never arrives | Nothing fails. Within about seven hours a reconcile run finds no folder for the release on SourceForge, sends the dispatch and says so in a warning | Nothing. To do it at once: `gh workflow run sourceforge-publish.yml` |
+| A publish failed after the buttons had moved (the 15 minute wait ran out, or retention failed) | The alert is open although the listing is current. The next reconcile run sends the release again | Nothing, if that publish passes: it closes the alert. If it fails it comments on the issue, and the fault is still there: fix it |
+| A reconcile run cannot send its dispatch | The run fails and the alert opens, with the command in it | Run that command. The next green publish closes the alert |
+| A release is pulled back on GitHub (deleted, or back to draft) after SourceForge took it | Every reconcile run fails with "SourceForge is ahead of GitHub", sends nothing, and opens the alert or comments on it. The buttons stay on the pulled release | 1. `gh workflow run sourceforge-publish.yml -f tag=<the release before it>` moves the three buttons back. 2. Remove the pulled release's folder in SourceForge's Files (its trash icon). The reconcile is green again once the folder is gone. Putting the release back on GitHub ends it too |
 | A dispatch names an older tag | Its files are uploaded. The defaults and every other folder are left alone | Nothing: that is a backfill |
 | The secrets are missing | A warning on the run, and it skips | §4 |
 | `best_release.json` cannot be read from the runner | A warning, not a failure: the API's own answer is the record that the defaults moved | Read the JSON by hand once |
@@ -209,6 +273,7 @@ two. So the webhook went, and the publish became ours.
 
 | File | What to look for |
 |---|---|
-| `.github/workflows/sourceforge-publish.yml` | the `gate` step (which runs go on, and `is_newest`), `Upload`, the `defaults` step, the `served` step, the retention step, the `alert` and `recovered` jobs |
-| `scripts/sourceforge-publish.sh` | `valid_tag`, `sorted_tags`, `newest`, `default_for`, `defaults_plan`, `verify`, `prune_plan`, `selftest` |
+| `.github/workflows/sourceforge-publish.yml` | the `publish` job: the `gate` step (which runs go on, and `is_newest`), `Upload`, the `defaults` step, the `served` step, the retention step. The `reconcile` job: its `decide` step, its `send` step, and its last step, which files the alert for a fault of its own. The `alert` and `recovered` jobs |
+| `.github/workflows/release-setup.yml` | the `sourceforge` job, which dispatches the publish |
+| `scripts/sourceforge-publish.sh` | `valid_tag`, `sorted_tags`, `newest`, `default_file`, `default_for`, `defaults_plan`, `verify`, `prune_plan`, `listing_state`, `reconcile_plan`, `selftest` |
 | `scripts/sourceforge-known-hosts` | the three pinned keys, with their fingerprints in the header |
