@@ -207,14 +207,14 @@ What a roll does to a live session now:
 | The session | All three switches on | Any one off |
 |---|---|---|
 | on `direct` or `turn` | kept: the same row, no redial, no prompt; on a supervised Mac, from agent 0.4.215. Eight sessions over seven field rolls read a pause in the picture of 13 to 262 ms | ends `agent_disconnect`, and the page redials into a new session |
-| on `derp` | redials, since `/derp` is pod-local; the new request ends the old row | the same |
+| on `derp` | kept, as on `direct`, when its DERP path is back before ICE gives up on the pair, as a Windows session's was on 2026-11-12, about 4 s after the cut. Otherwise it redials, since `/derp` is pod-local, and the new request ends the old row. Either way there is no `agent_busy`. `gap_ms` under-reads its stall ([remote-control.md §11.17](remote-control.md#1117-a-session-outlives-its-control-socket-the-viewers-half-fr-138-p1c)) | ends as on `direct` |
 | external (FR-52), not yet live, or begun before its device entered the scope | ends as before | the same |
 
 **Before a roll**, read:
 
 | What | Why | Where |
 |---|---|---|
-| The open sessions | A roll ends every session it does not keep: one on `derp`, an external one, and any on a device outside the scope or without the switch. Each is a person whose session drops | the `remote_sessions` rows in phase `active`, with their `carrier` and `external`, read bounded through `scripts/prod-mongo-read.sh`, never from a client inside the database pod ([production-mongo-reads.md](production-mongo-reads.md)) |
+| The open sessions | A roll ends every session it does not keep: an external one, any on a device outside the scope or without the switch, and one on `derp` whose DERP path is not back in time. Each is a person whose session drops | the `remote_sessions` rows in phase `active`, with their `carrier` and `external`, read bounded through `scripts/prod-mongo-read.sh`, never from a client inside the database pod ([production-mongo-reads.md](production-mongo-reads.md)) |
 | The window and the scope | which devices are told a window | `GET /api/admin/rc-resume-scope` |
 | Each such device's switch | a device says `rc-resume` only with its switch on | `capabilities.rpc` on its `agents` row, as its last hello reported it |
 

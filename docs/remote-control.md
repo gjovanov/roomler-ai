@@ -3832,7 +3832,7 @@ socket handed in, so every row below is a unit test. The composable wires it (`u
 | `rc:terminate` | The hold ends `ended` with its reason, and the rest is today's: a retryable reason starts the ladder, a final one closes and says why. An admin's end now has a sentence (§2.5 of the spec) | `useRemoteControl.ts:9508`; `friendlyEndReason`, `:946` |
 | `rc:ended {reason, limit}` on the control channel | Read as an `rc:terminate` for the session: a retryable reason starts the ladder, a final one closes with no ladder and drops the replay arguments, so a reload resumes nothing either. The first of `rc:terminate` and `rc:ended` for a session wins, and the second does nothing. One from a peer the page has since replaced ends nothing | `onDeviceEnded`, `useRemoteControl.ts:5706`; `claimEnd`, `:5691` |
 | An `rc:error` | The server refused the rejoin: the hold ends `ended` with the code, and the page redials. A held session sends nothing but its rejoins, ICE included, so the error is never about a stray candidate | `useRemoteControl.ts:9598`; `:10442` |
-| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. For a session the server called detached it sends no `rc:terminate controller_hangup` first (D5 = A): its device is away, so the session ended on the device's side, and the request's `replaces` ends the row as that (§11.18). A `derp` session lands here at a roll (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9770`; the skipped hangup, `:9758` |
+| A transport signal: the peer `failed`, `disconnected` past 4 s, the control channel closing, the media watchdog | Today's meaning: the peer failed, so the page redials. For a session the server called detached it sends no `rc:terminate controller_hangup` first (D5 = A): its device is away, so the session ended on the device's side, and the request's `replaces` ends the row as that (§11.18). A `derp` session lands here at a roll when its DERP path is not back before ICE gives up on the pair (§4.5 of the spec) | `scheduleReconnect`, `useRemoteControl.ts:9770`; the skipped hangup, `:9758` |
 | The deadline passes with no answer | The hold ends `expired`, the peer is closed and today's ladder starts, with no hangup first for a session the server called detached, as above | `onExpired`, `useRemoteControl.ts:5604` |
 
 ⚠️ **`resume_by` is on the server's clock, never this browser's** (#3511). It is read once, at receipt, against
@@ -3864,7 +3864,7 @@ It is AC2's instrument.
 | `v` | 1 |
 | `outcome` | `resumed`, `ended` or `expired` |
 | `reason` | An `ended` hold's reason: the server's or the device's token, `transport`, `controller_hangup`, `error`, or an `rc:error` code |
-| `gap_ms` | From the last frame painted before the cut to the first painted after it, on the paint path's own clock |
+| `gap_ms` | From the last frame painted before the cut to the first painted after it, on the paint path's own clock. Only that first frame counts, so a stall that starts after it never shows (below) |
 | `gap_open` | No frame was painted after the cut by the time of the record, so `gap_ms` is a lower bound |
 | `ws_down_ms` | How long the page's own socket was down inside the hold |
 | `held_ms` | From the cut to the outcome |
@@ -3878,6 +3878,14 @@ frame callback reports each frame (`ui/src/views/remote/RemoteControl.vue:5593`)
 page marks a cut. ⚠️ On a still screen the RTP track carries no frames, so `gap_ms` reads the stillness there
 (`gap_open`). The data-channel pumps re-send the last frame every 60 ms, so a session on the data channel always
 paints. FR-138's §6 read runs a moving picture.
+
+⚠️ **`gap_ms` reads the cut, not what comes after it.** The page keeps the first frame painted after the cut and
+ignores the rest ("Only the first one counts", `createHoldPaintGap`, `ui/src/composables/rcSessionHold.ts:333`).
+`direct` and `turn` media never crosses the server, so the cut stops nothing there and `gap_ms` is a fair reading:
+the 2026-11-12 macOS `turn` cell's pump sent 20 frames every 2 s straight through its detach. A `derp` pair rides
+`/derp`, which goes down with the pod. The frames already in flight land first and the stall comes after them, so
+`gap_ms` under-reads a `derp` session's stall: the 2026-11-12 `derp` cell read 128 ms while the device's data
+channel buffered about 3 s of video, and only the device's log showed it.
 
 What stays as it was:
 
@@ -4297,7 +4305,7 @@ What a roll does to each kind of session, as the field read it (the spec's §10)
 | The session | All three halves on | Any half off, as before FR-138 |
 |---|---|---|
 | on `direct` or `turn` | Keeps its row: no end, no new row, no redial, no consent prompt. The device logs `rc session detached`, then `rc session resumed` with `kept_ms` 3114 to 3723. Eight sessions over seven rolls read `rc.resume`'s `gap_ms` from 13 to 262 ms, on Linux, Windows and macOS, against AC2's bound of 500 ms | Ends `agent_disconnect` when its device's pod goes. The page redials (`rc.connect` with `after_drop=true`), the new row comes 4.0 to 8.4 s after the old end, and the picture is gone for 4.7 to 9.0 s. A device that asks raises a new prompt |
-| on `derp` | Redials as before: its pair rides `/derp`, which is pod-local (the spec's §4.5). The request names the old session in `replaces`, which frees its slot at once; when the roll also cut the device's socket, the old row ends `agent_disconnect`, marked `end_source: redial` (D5 = A). Not yet read in the field | as on the left |
+| on `derp` | Kept when its DERP path is back before ICE gives up on the pair, and redials otherwise. Its pair rides `/derp`, which is pod-local, so the roll takes the path down until the mesh rebuilds its DERP carrier (the spec's §4.5). On 2026-11-12 a Windows session's carrier was back about 4 s after the cut: the device's peer never left `Connected`, the device logged `rc session resumed` with `kept_ms` 3120, the page did not redial, the row stayed (`attach_seq` 1), and there was no `agent_busy`. Its `gap_ms`, 128 ms, under-reads the stall (§11.17). A redial names the old session in `replaces`, which frees its slot at once; when the roll also cut the device's socket, the old row ends `agent_disconnect`, marked `end_source: redial` (D5 = A) | ends as on `direct` |
 | delegated, on a supervised Mac | Kept by the GUI worker on the daemon's orders (§11.16.1), from agent 0.4.215 | ends as on `direct` |
 | not yet live: a consent prompt or an offer in flight | Ends as before (#2416) | the same |
 | external (FR-52) | Ends as before (D3): its viewer's login was proven on one pod, and proving it again on another is a design of its own | the same |
@@ -4368,7 +4376,7 @@ session not yet live, and an external one, end as before FR-138.
 | `rc:goodbye`, a key rotation | the `Goodbye` and `KeyRotated` arms close every peer | `arm_goodbye_closes_every_peer` (`agents/roomlerd/src/session_table.rs:2345`); `arm_key_rotated_closes_every_peer` (`:2346`) |
 | a token refused at the next dial | every peer closes, kept ones included | `a_refused_token_closes_every_peer_kept_ones_included` (`agents/roomlerd/src/session_table.rs:2849`); `a_device_removed_during_the_gap_is_refused_at_its_redial_and_its_session_ends` (`crates/tests/src/rc_resume_claim_tests.rs:1155`) |
 | each row above | each arm is the loop's one call into the table, and nothing else closes the connection's peers | `every_arm_of_the_connection_ends_through_the_table` (`agents/roomlerd/src/session_table.rs:2387`) |
-| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:8151`) |
+| a session not yet live: a consent prompt or an offer in flight | ends at the socket loss, as before (#2416): the server ends it, and the device withdraws its prompt | `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_prompt_whose_socket_closes_is_withdrawn` (`agents/roomlerd/src/signaling.rs:8152`) |
 | an external session (FR-52, D3) | built with no link, so it closes at every exit. The server ends it at the drop and refuses a claim of it | `an_external_session_is_built_without_a_link` (`agents/roomlerd/src/session_table.rs:3300`); `a_delegated_or_external_session_closes_at_a_transient_exit` (`:2462`); `an_announced_drop_detaches_the_live_session_and_ends_the_rest` (`crates/modules/fleet/src/hub/resume.rs:974`); `a_claim_of_an_external_session_is_refused` (`crates/tests/src/rc_resume_pd_tests.rs:379`) |
 
 ⚠️ **The rollback floor.** Production has written `session_detached` and `session_resumed` since P3 turned the window
