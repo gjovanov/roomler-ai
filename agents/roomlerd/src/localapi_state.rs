@@ -998,6 +998,12 @@ impl LocalApiState for DaemonState {
                 .keep_busy_worker
                 .as_ref()
                 .map(crate::delegate::DelegateHost::worker_status),
+            // #3781 — a Windows tray too old to connect to this daemon, read
+            // fresh: the service host may have just refreshed it.
+            #[cfg(target_os = "windows")]
+            companion_too_old: crate::companion::too_old_here(),
+            #[cfg(not(target_os = "windows"))]
+            companion_too_old: None,
         }
     }
 
