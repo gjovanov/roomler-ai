@@ -182,7 +182,7 @@ to a local pipe. What each attempt to get around that meets:
 |---|---|
 | Ring the doorbell with a made-up or stale request id | the claim: the server has nothing pending under it for this device (404, audited `claim_refused`) |
 | Point the user's config at another server | the service never reads it: its origin is in the anchor |
-| Plant an anchor before an admin makes one (`%ProgramData%` lets users create folders) | the service trusts the file only if it and its directory are owned by SYSTEM or Administrators and grant nobody else write (`machine_tree.rs` `read_private`, the reader the machine config's check shares since #3609) |
+| An anchor that no administrator wrote through `roomlerd anchor` | the service reads the anchor only from `HKLM\SOFTWARE\Roomler\ExecService`, a key that SYSTEM or Administrators own and no other account may change, read or create (`machine_key.rs`, #3737); no file is read as one ([Where the anchor lives](#where-the-anchor-lives-3737)) |
 | Squat the doorbell's pipe name | the worker refuses a pipe SYSTEM does not own; the service's `first_pipe_instance` refuses to share the name |
 | Read SYSTEM's output | it is posted from the service to the server over HTTPS |
 | An http origin, to rewrite the claim on the path | the anchor accepts https only (loopback excepted, for tests) |
@@ -214,10 +214,105 @@ roomlerd anchor remove            # this machine stops offering SYSTEM exec
   (the org is not archived, the admin who minted the token may still enroll
   devices there, live device, same org, Windows, host name matches the device
   unless `--force`).
-- The anchor lives in `%ProgramData%\roomler\roomler\exec-service\anchor.json`
-  (Administrators-only). The worker learns from the service, every 30 s,
-  which device it is anchored for, and offers the `exec-system` capability on
-  that connection only. No restart is needed either way.
+- The anchor lives in the registry key `HKLM\SOFTWARE\Roomler\ExecService`
+  (SYSTEM and Administrators only, #3737; [below](#where-the-anchor-lives-3737)).
+  The worker learns from the service, every 30 s, which device it is anchored
+  for, and offers the `exec-system` capability on that connection only. No
+  restart is needed either way.
+
+#### Where the anchor lives (#3737)
+
+The anchor is a registry key, `HKLM\SOFTWARE\Roomler\ExecService` (the 64-bit
+view), and nothing else. The service reads it through `exec_service::store`
+(`agents/roomlerd/src/exec_service.rs`) and judges it with
+`crates/agent-core/src/machine_key.rs`.
+
+| Value | Holds | Written by |
+|---|---|---|
+| `Anchor` | the anchor: server origin, org, device, the service's credential, `exec_enabled`, the SSH ceiling (JSON, as `anchor.json` held it) | `roomlerd anchor create`, `exec` and `ssh`, elevated, and Setup's elevated anchor step (FR-104); the SYSTEM service when it renews its credential, and once at an upgrade (the copy below) |
+| `SshHostKey` | the service's SSH host key (FR-105, OpenSSH PEM) | `anchor create` and `anchor ssh` when the ceiling is above off; the SYSTEM service when SSH is on and there is none |
+| `LegacyCopy` | what the one-time copy did: `at`, `outcome` (`copied`, `none` or `refused`), `why`, `agent_id`, `anchored_at`. No secret | the SYSTEM service at its first start on a build with #3737; `anchor create` when it is not there |
+
+- **What the service takes.** It reads the key only when SYSTEM or
+  Administrators own it (TrustedInstaller counts), no rule in its DACL lets
+  another account change it or read its values, and its parent,
+  `HKLM\SOFTWARE\Roomler`, lets no other account change it, counting what the
+  parent hands down to a key made below it later. Only SYSTEM and
+  Administrators may create a key below `HKLM\SOFTWARE`, and a key never moves
+  from one parent to another.
+- **What the writer makes.** The key is created with exactly
+  `O:BAD:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)`. An administrator's writer that finds a
+  key failing the check takes it over (that owner and DACL, by handle) and
+  deletes every value in it before it writes; the SYSTEM service's copy never
+  takes a key over. Every write is read back through the service's own check,
+  so an anchor the service would not use is an error at `anchor create`, not a
+  device that quietly stays unanchored.
+- **No file is read as an anchor**, and no switch makes one be. Builds before
+  #3737 kept the anchor in `%ProgramData%\roomler\roomler\exec-service\anchor.json`
+  and the host key beside it. Only the one-time copy reads them, once.
+
+**The one-time copy.** The SYSTEM service's first start on a build with #3737
+runs it before the doorbell opens (`store::copy_legacy_once`). The command line
+and the worker never do.
+
+```mermaid
+flowchart TD
+  S[service start] --> M{LegacyCopy value?}
+  M -- yes --> D[doorbell up; the anchor comes from the key only]
+  M -- no --> W[write LegacyCopy = pending]
+  W -- fails --> F[logged; nothing copied] --> D
+  W --> K{"ROOMLERD_EXEC_ANCHOR_COPY=0?"}
+  K -- yes --> R
+  K -- no --> A{Anchor value there already?}
+  A -- yes --> N[LegacyCopy = none] --> D
+  A -- no --> L{anchor.json in exec-service?}
+  L -- no --> N
+  L -- yes --> V{"the FR-94 reader, no link on the way, the exact owner and DACL anchor create wrote, https, valid"}
+  V -- pass --> C[SshHostKey, then Anchor; LegacyCopy = copied] --> D
+  V -- fail --> R[LegacyCopy = refused, and why] --> D
+```
+
+- The marker is written before anything is read, so the copy runs at most once
+  per machine, and nothing that appears in the machine folder later is copied.
+- It takes the folder and the file only with the owner and DACL every build
+  gave them (`O:BA`, a protected DACL of SYSTEM and Administrators alone), the
+  host key under the same rule, and an anchor at an https origin: a loopback
+  origin is a lab's.
+- It writes the anchor as this build's writer would, the keys a newer build
+  added kept, and leaves the files where they are.
+- The service log says what it did, once: `exec-service: one-time anchor copy`,
+  with `outcome=`.
+
+**What a refused anchor shows.** An anchor the copy refused, or a key that fails
+the check, leaves the device unanchored as far as the service is concerned:
+
+- the service's health answers `anchored: false` with a `problem` that says why
+  (for a refused copy, the reason and the command to anchor again), and the
+  worker logs `exec-service: the SYSTEM service's anchor is not used` with it;
+- the worker stops offering `exec-system` at its next heartbeat, so commands
+  take the worker path (`ran_as=worker`), or are refused with `SystemRequired`
+  where the org requires SYSTEM;
+- `roomlerd anchor status` (elevated) prints the reason;
+- the device page still reads *Anchored*: that is the server's record.
+
+The way back is `roomlerd anchor create … --force` from an elevated prompt, or
+Setup with an anchor-capable token.
+
+**Rollback.** A build before #3737 reads only the file, which the copy left in
+place, and its credential is still live: a renewal never revokes the earlier
+credential of the same anchor. `anchor create` and `anchor remove` on a build
+with #3737 delete the file and the host key beside it (never through a link),
+so a rollback after either finds no anchor and takes the worker path, rather
+than offering an anchor the server no longer accepts. The `exec-service` folder
+itself stays.
+
+**Kill switch.** `ROOMLERD_EXEC_ANCHOR_COPY=0` in the service's own
+`Environment`: the first start copies nothing and records `refused`, "switched
+off". Anchor the device again to recover. `ROOMLERD_EXEC_VIA_SERVICE=0` and
+`rc.exec_via_service = false` stop the service path as before.
+
+An uninstall leaves the key, as it leaves `%ProgramData%\roomler`
+([`installation.md`](installation.md#uninstall-every-platform)).
 
 #### The wizard anchors, with the token it installs with (FR-104)
 
@@ -260,7 +355,7 @@ sequenceDiagram
   W->>E: second administrator prompt, then anchor create --token --device
   E->>S: POST /api/agent/anchor (claims "jti:anchor", this device only)
   S-->>E: the service's credential
-  E->>E: write anchor.json (SYSTEM + Administrators)
+  E->>E: write the anchor key (SYSTEM + Administrators)
 ```
 
 ⚠️ **Whoever holds an anchor-capable token can anchor the device it enrolls,**
@@ -293,7 +388,7 @@ stateDiagram-v2
 | renewal | minted again under the same `anchor_id` | unchanged |
 | `roomlerd anchor create` again | every earlier `anchor_id`'s credential refused (401) | the service holding the new anchor |
 | `DELETE …/exec-anchor` | refused (401) | the worker, or refused where the org requires SYSTEM |
-| `roomlerd anchor remove` on the device | the file is gone; the server's record stays | the worker once the device stops advertising `exec-system`, or refused where the org requires SYSTEM |
+| `roomlerd anchor remove` on the device | gone from the key (and any file an earlier build kept); the server's record stays | the worker once the device stops advertising `exec-system`, or refused where the org requires SYSTEM |
 | the device is removed | ended: the removal clears the anchor (401, "deleted", meanwhile) | nowhere: the device is gone |
 | the same machine re-enrolls | **still refused** (401): the revived row has no anchor | the worker, until an administrator anchors it again |
 

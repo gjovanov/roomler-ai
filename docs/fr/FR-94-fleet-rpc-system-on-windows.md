@@ -125,6 +125,16 @@ stateDiagram-v2
 
 ### 5c. The pieces
 
+> **Amended 2026-11-12 (#3737): where P1's anchor lives.** The anchor and the service's SSH host key
+> (FR-105) are the values `Anchor` and `SshHostKey` of the registry key `HKLM\SOFTWARE\Roomler\ExecService`,
+> made with a protected DACL of SYSTEM and Administrators alone, no longer files under `%PROGRAMDATA%`. The
+> service reads them only from that key, when SYSTEM or Administrators own it, its DACL lets no other account
+> change it or read its values, and its parent lets no other account change it (`crates/agent-core/src/machine_key.rs`).
+> The first start of a build with #3737 copies an `exec-service\anchor.json` an earlier build wrote, once, in
+> the exact shape `roomlerd anchor create` gave it, and records what it did in `LegacyCopy`; nothing reads that
+> file after. Kill switch: `ROOMLERD_EXEC_ANCHOR_COPY=0`. The text below, and §10's rows, are the design as it
+> shipped first, kept as history: [`fleet-rpc.md`](../fleet-rpc.md#where-the-anchor-lives-3737) has the current one.
+
 - **P1 — the machine trust anchor.** `%PROGRAMDATA%\roomler\…\service.toml` holds:
   - the server origin, this device's id, and a **service credential**: a new `TokenType::AgentService`
     audience (`crates/services/src/auth/mod.rs` L37), verified like the agent token with the same
