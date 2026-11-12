@@ -1057,8 +1057,9 @@ still open forwards, the window a `DELETE` has always had.
 The on-host control surface — how `roomler`, `roomler-desktop`, and scripts talk
 to a running `roomlerd` without any token:
 
-- **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins +
-  Interactive Users, no-write-up); Unix socket `/var/run/roomler/roomler.sock`
+- **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins + the
+  daemon's own account in full; Interactive Users read and write data only,
+  never a new instance; no-write-up); Unix socket `/var/run/roomler/roomler.sock`
   for a system daemon, else `$XDG_RUNTIME_DIR/roomler.sock` (the per-user temp
   folder's `roomler/roomler.sock` on macOS), 0600, and only in a directory
   private to the daemon's account.

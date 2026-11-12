@@ -3929,11 +3929,20 @@ pub fn effective_pipe_pool(configured: Option<u32>) -> u32 {
 const LOCALAPI_PIPE_NAME: &str = r"\\.\pipe\roomler";
 
 /// SDDL for the pipe. DACL: allow (`A`) generic-all (`GA`) to Local `SY`stem,
-/// `B`uiltin `A`dministrators, and `I`nteractive `U`sers — and, by omission,
-/// deny everyone else. IU covers the desktop app / CLI running in the operator's
-/// interactive session (including a non-elevated admin, whose Administrators SID
-/// is deny-only but who still matches IU). No OWNER is set — a user-mode daemon
+/// `B`uiltin `A`dministrators and the pipe's owner (`OW`, OWNER RIGHTS: the
+/// daemon's own account, which a worker running as the person is); allow
+/// `I`nteractive `U`sers `0x12008b` only — and, by omission, deny everyone
+/// else. IU covers the desktop app / CLI running in the operator's interactive
+/// session (including a non-elevated admin, whose Administrators SID is
+/// deny-only but who still matches IU). No OWNER is set — a user-mode daemon
 /// can't assign one it doesn't hold, and the creator is a valid owner anyway.
+///
+/// #3736 — `0x12008b` is reading and writing data plus reading the owner
+/// (`FILE_GENERIC_READ | FILE_WRITE_DATA`), exactly what a client opens with
+/// (`PIPE_CLIENT_ACCESS`). Never `GENERIC_WRITE`, whose `FILE_APPEND_DATA` is
+/// `FILE_CREATE_PIPE_INSTANCE`: only SYSTEM, the Administrators and the
+/// daemon's own account add an instance of this pipe, and every instance
+/// carries the first one's owner, which is what a client checks.
 ///
 /// SACL `S:(ML;;NW;;;ME)` — a mandatory-integrity label at **Medium** with
 /// No-Write-Up: a process **below** medium integrity (an AppContainer / sandboxed
@@ -3943,7 +3952,8 @@ const LOCALAPI_PIPE_NAME: &str = r"\\.\pipe\roomler";
 /// medium IL and SYSTEM above it, so both are unaffected. Setting a label at or
 /// below the creator's own IL needs no privilege.
 #[cfg(windows)]
-const LOCALAPI_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)";
+const LOCALAPI_SDDL: &str =
+    "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;0x12008b;;;IU)S:(ML;;NW;;;ME)";
 
 /// `SDDL_REVISION_1` — the only defined SDDL revision.
 #[cfg(windows)]
@@ -10596,6 +10606,80 @@ mod tests {
             .await
             .expect("its own account's pipe");
         assert_eq!(client.status().await.unwrap().name, "devbox");
+    }
+
+    /// #3736 — who may add an instance of the LocalAPI pipe: SYSTEM, the
+    /// Administrators group and the pipe's owner (OWNER RIGHTS, the daemon's
+    /// own account), never an interactive user, who reads and writes data and
+    /// reads the owner: exactly what a client opens with.
+    #[cfg(windows)]
+    #[test]
+    fn interactive_users_read_and_write_the_pipe_and_never_add_an_instance() {
+        use windows_sys::Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, GENERIC_MAPPING, GetAce, GetSecurityDescriptorDacl,
+            IsWellKnownSid, MapGenericMask, PSID, WinBuiltinAdministratorsSid,
+            WinCreatorOwnerRightsSid, WinInteractiveSid, WinLocalSystemSid,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ALL_ACCESS, FILE_APPEND_DATA, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+            FILE_GENERIC_WRITE,
+        };
+        // FILE_APPEND_DATA is FILE_CREATE_PIPE_INSTANCE on a pipe.
+        const CREATE_INSTANCE: u32 = FILE_APPEND_DATA;
+        let sec = PipeSecurity::new(LOCALAPI_SDDL).expect("the SDDL parses");
+        let (mut present, mut defaulted) = (0, 0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: the descriptor PipeSecurity owns, alive for this test; valid
+        // out-params.
+        let ok =
+            unsafe { GetSecurityDescriptorDacl(sec.psd, &mut present, &mut dacl, &mut defaulted) };
+        assert!(ok != 0 && present != 0 && !dacl.is_null(), "a DACL");
+        let mapping = GENERIC_MAPPING {
+            GenericRead: FILE_GENERIC_READ,
+            GenericWrite: FILE_GENERIC_WRITE,
+            GenericExecute: FILE_GENERIC_EXECUTE,
+            GenericAll: FILE_ALL_ACCESS,
+        };
+        let mut masks = std::collections::HashMap::new();
+        // SAFETY: `dacl` is valid while `sec` lives.
+        let count = u32::from(unsafe { (*dacl).AceCount });
+        for i in 0..count {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: an index below the ACL's own count.
+            assert_ne!(unsafe { GetAce(dacl, i, &mut ace) }, 0);
+            let ace = ace as *const ACCESS_ALLOWED_ACE;
+            // SAFETY: the SDDL holds only allow (`A`) entries, so each ACE is an
+            // ACCESS_ALLOWED_ACE whose SID starts at `SidStart`.
+            let (sid, mut mask) = unsafe { ((&raw const (*ace).SidStart) as PSID, (*ace).Mask) };
+            // SAFETY: a valid mask and mapping.
+            unsafe { MapGenericMask(&mut mask, &mapping) };
+            for (kind, name) in [
+                (WinLocalSystemSid, "SY"),
+                (WinBuiltinAdministratorsSid, "BA"),
+                (WinCreatorOwnerRightsSid, "OW"),
+                (WinInteractiveSid, "IU"),
+            ] {
+                // SAFETY: `sid` points into the ACE, alive with `sec`.
+                if unsafe { IsWellKnownSid(sid, kind) } != 0 {
+                    masks.insert(name, mask);
+                }
+            }
+        }
+        let iu = masks["IU"];
+        assert_eq!(
+            iu & CREATE_INSTANCE,
+            0,
+            "an interactive user never adds an instance: {iu:#x}"
+        );
+        assert_eq!(
+            iu,
+            (PIPE_CLIENT_ACCESS & !windows_sys::Win32::Foundation::GENERIC_READ)
+                | FILE_GENERIC_READ,
+            "an interactive user gets exactly what a client opens with: {iu:#x}"
+        );
+        for name in ["SY", "BA", "OW"] {
+            assert_ne!(masks[name] & CREATE_INSTANCE, 0, "{name} adds instances");
+        }
     }
 
     /// The pipe client asks for reading and writing data, nothing that
