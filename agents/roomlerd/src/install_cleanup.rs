@@ -1176,7 +1176,7 @@ mod tests {
     /// `AppData\Local\roomler`, after every check a walk or a re-check by
     /// path could make, that folder is renamed aside and a junction put at
     /// its name (`between_check_and_use`). The tree removed is the held
-    /// folder's, now `roomler.aside\roomler-agent`; nothing the junction
+    /// folder's, below what is now `roomler.aside`; nothing the junction
     /// leads to is removed, and the next walk through the junction is
     /// refused with a line. A removal by path after the walk fails this
     /// case either way: through the junction it deletes what it leads to,
@@ -1235,7 +1235,7 @@ mod tests {
             );
         }
         assert!(
-            !aside.join("roomler-agent").exists(),
+            !aside.join(PER_USER_TREES[0].1).exists(),
             "the held folder's tree is the one removed: {report:?}"
         );
         assert!(
