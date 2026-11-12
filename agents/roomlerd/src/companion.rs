@@ -99,6 +99,27 @@ pub async fn refresh_periodically(respawn: RespawnContext) {
 /// FR-117 P2 — the retry's period: the updater's own default interval.
 const REFRESH_RETRY: std::time::Duration = crate::updater::CHECK_INTERVAL;
 
+/// #3781 — the waits before each refresh while the companion is too old to
+/// connect: 2, 5, 10 and 15 minutes, then 15 to the end of the first hour, so
+/// the tries land 2, 7, 17, 32, 47 and 62 minutes in; after them the
+/// updater's [`REFRESH_RETRY`]. A tray that cannot connect leaves the person
+/// with no status, tunnels or settings, and what stops its refresh (a
+/// download a middlebox dropped, an EXE endpoint protection holds) often
+/// clears within minutes. A block that outlasts the hour gets the old period,
+/// not a tight loop.
+const FAST_REFRESH_WAITS: [std::time::Duration; 6] = [
+    minutes(2),
+    minutes(5),
+    minutes(10),
+    minutes(15),
+    minutes(15),
+    minutes(15),
+];
+
+const fn minutes(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n * 60)
+}
+
 /// #3736 — the oldest companion (tray) this daemon's LocalAPI pipe accepts
 /// from a person's session: `agent-v0.4.216`, the first release whose
 /// companion opens the pipe with exactly `localapi::PIPE_CLIENT_ACCESS`
@@ -106,8 +127,31 @@ const REFRESH_RETRY: std::time::Duration = crate::updater::CHECK_INTERVAL;
 /// Interactive Users only that access, so an older companion, which opens it
 /// with `GENERIC_WRITE`, is refused on every connect by a daemon that runs
 /// elevated or as SYSTEM. Moves only with that DACL or the client's open.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) const MIN_COMPANION_VERSION: &str = "0.4.216";
+
+/// #3781 — is the companion whose version marker reads `marker` too old to
+/// connect to this daemon? No marker, an unreadable one and one that names no
+/// version all count as too old: nothing vouches for the open such a tray
+/// makes.
+pub(crate) fn predates_min_companion(marker: Option<&str>) -> bool {
+    let parse = crate::updater::parse_version;
+    let installed = marker_version(marker);
+    match (
+        installed.as_deref().and_then(parse),
+        parse(MIN_COMPANION_VERSION),
+    ) {
+        (Some(installed), Some(minimum)) => installed < minimum,
+        _ => true,
+    }
+}
+
+/// #3781 — the version a marker names, bounded for a log line and the wire
+/// ([`sanitize_version`]); `None` when it names none.
+fn marker_version(marker: Option<&str>) -> Option<String> {
+    marker
+        .and_then(sanitize_version)
+        .filter(|v| crate::updater::parse_version(v).is_some())
+}
 
 /// #3781 — the retry loop's memory: how many refreshes it has made in a row
 /// while the companion read too old to connect.
@@ -131,27 +175,44 @@ pub(crate) struct NextRefresh {
 
 impl RefreshSchedule {
     /// The next wait, from the version marker as it reads now. Called once
-    /// per wait.
+    /// per wait, so the loop logs at most one line per wait. A marker that
+    /// reads current starts the fast waits over for the next time one reads
+    /// too old.
     pub(crate) fn next(&mut self, marker: Option<&str>) -> NextRefresh {
+        let too_old = predates_min_companion(marker);
+        let wait = next_refresh_wait(marker, self.tries);
+        self.tries = if too_old {
+            self.tries.saturating_add(1)
+        } else {
+            0
+        };
         NextRefresh {
-            wait: next_refresh_wait(marker, self.tries),
-            too_old: false,
-            installed: None,
+            wait,
+            too_old,
+            installed: marker_version(marker),
         }
     }
 }
 
 /// #3781 — how long the retry loop waits before its next refresh, keyed on
-/// the companion's version marker; `tries` = the refreshes the loop has
-/// already made while it read too old.
+/// the companion's version marker: [`FAST_REFRESH_WAITS`] while it is too old
+/// to connect (`tries` = the refreshes the loop has already made while it
+/// read too old), else, and after them, [`REFRESH_RETRY`].
 pub(crate) fn next_refresh_wait(marker: Option<&str>, tries: u32) -> std::time::Duration {
-    let _ = (marker, tries);
-    REFRESH_RETRY
+    if !predates_min_companion(marker) {
+        return REFRESH_RETRY;
+    }
+    FAST_REFRESH_WAITS
+        .get(tries as usize)
+        .copied()
+        .unwrap_or(REFRESH_RETRY)
 }
 
 /// #3781 — the retry loop, over what it does to the world: read the version
 /// marker, refresh, log. Generic so its rhythm is tested on every OS, on
-/// tokio's paused clock.
+/// tokio's paused clock. One [`RefreshSchedule::next`] per wait, so one line
+/// per wait while the companion is too old to connect, and never one per
+/// tick: there is none.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) async fn retry_refresh<E, M, R, F, L>(
     mut enabled: E,
@@ -167,7 +228,19 @@ pub(crate) async fn retry_refresh<E, M, R, F, L>(
 {
     let mut schedule = RefreshSchedule::default();
     loop {
-        let next = schedule.next(marker().as_deref());
+        // `ROOMLERD_COMPANION_SYNC=0` turns the whole retry off, the faster
+        // one with it: the old period, no refresh, and no line saying one is
+        // coming.
+        let next = if enabled() {
+            schedule.next(marker().as_deref())
+        } else {
+            schedule = RefreshSchedule::default();
+            NextRefresh {
+                wait: REFRESH_RETRY,
+                too_old: false,
+                installed: None,
+            }
+        };
         if next.too_old {
             log(&next);
         }
@@ -181,6 +254,18 @@ pub(crate) async fn retry_refresh<E, M, R, F, L>(
 /// #3781 — what `roomler status` says about the companion beside this daemon
 /// (`localapi::NodeStatus::companion_too_old`): `Some` when the person's
 /// tray cannot connect to it, `None` when it connects or this does not apply.
+///
+/// - `exe_present`: a companion sits beside the daemon. With none there is no
+///   tray to refuse.
+/// - `refuses_old`: this daemon runs elevated or as SYSTEM. Its pipe's owner
+///   is then the Administrators group or SYSTEM, so the person's tray, started
+///   in their own session, reaches the pipe through the Interactive Users
+///   entry alone (#3760). A daemon that runs as the person owns its pipe, and
+///   their tray connects through the owner's entry, whatever its age.
+/// - `marker`: the version marker as read. One that names no version, or none
+///   at all, is reported without `installed`, never left out.
+/// - `by_service`: the machine-wide service refreshes the tray, not this
+///   process.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn too_old_to_connect(
     exe_present: bool,
@@ -188,21 +273,56 @@ pub(crate) fn too_old_to_connect(
     marker: Option<&str>,
     by_service: bool,
 ) -> Option<tunnel_core::localapi::CompanionTooOld> {
-    let _ = (exe_present, refuses_old, marker, by_service);
-    None
+    (exe_present && refuses_old && predates_min_companion(marker)).then(|| {
+        tunnel_core::localapi::CompanionTooOld {
+            installed: marker_version(marker),
+            minimum: MIN_COMPANION_VERSION.to_string(),
+            by_service,
+        }
+    })
 }
 
-/// #3781 — [`too_old_to_connect`] for the companion beside this process.
+/// #3781 — [`too_old_to_connect`] for the companion beside this process, read
+/// fresh on every status answer: on a machine-wide install the service host,
+/// another process, may have just refreshed it. What this process cannot read
+/// counts as reportable, so the field's absence never stands for "could not
+/// tell".
 #[cfg(target_os = "windows")]
 pub(crate) fn too_old_here() -> Option<tunnel_core::localapi::CompanionTooOld> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let marker = std::fs::read_to_string(dir.join(VERSION_MARKER)).ok();
+    if !pipe_refuses_old_companions() {
+        return None;
+    }
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    let (exe_present, marker) = match &dir {
+        Some(dir) => (
+            dir.join(DESKTOP_EXE).try_exists().unwrap_or(true),
+            std::fs::read_to_string(dir.join(VERSION_MARKER)).ok(),
+        ),
+        // No folder of its own to look in: a tray of unknown version.
+        None => (true, None),
+    };
     too_old_to_connect(
-        dir.join(DESKTOP_EXE).exists(),
+        exe_present,
         true,
         marker.as_deref(),
-        false,
+        crate::supervision::current() == Some(crate::supervision::Supervision::WindowsScm),
     )
+}
+
+/// #3781 — does this daemon's pipe refuse a companion older than
+/// [`MIN_COMPANION_VERSION`]? Yes when it runs as LocalSystem or elevated:
+/// its pipe's owner is then SYSTEM or the Administrators group, not the
+/// person. A token this process cannot read counts as refusing. Read once: a
+/// process's token never changes.
+#[cfg(target_os = "windows")]
+fn pipe_refuses_old_companions() -> bool {
+    static REFUSES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REFUSES.get_or_init(|| match crate::win_identity::own_token_is_local_system() {
+        Some(false) => crate::win_identity::process_is_elevated(),
+        Some(true) | None => true,
+    })
 }
 
 /// The version marker beside this daemon, as read; `None` when it cannot be.

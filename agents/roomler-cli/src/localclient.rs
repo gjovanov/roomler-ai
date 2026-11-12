@@ -2490,10 +2490,42 @@ pub(crate) fn power_line(p: &localapi::PowerStatus, macos: bool) -> String {
 }
 
 /// #3781 — `roomler status`'s `tray` lines for
-/// [`NodeStatus::companion_too_old`].
+/// [`NodeStatus::companion_too_old`]: the tray beside this Windows daemon is
+/// too old to connect to it, Roomler replaces it by itself and when, the one
+/// command that retries now and the one that says why it failed. Those are
+/// the service's when the machine-wide service refreshes the tray, and this
+/// daemon's own when it does that itself.
 fn tray_lines(c: &localapi::CompanionTooOld) -> Vec<String> {
-    let _ = c;
-    Vec::new()
+    let first = match &c.installed {
+        Some(v) => format!(
+            "OUT OF DATE: {v} cannot connect to this daemon, which needs {} or later",
+            c.minimum
+        ),
+        None => format!(
+            "version UNKNOWN (no version marker): one older than {} cannot connect to this \
+             daemon",
+            c.minimum
+        ),
+    };
+    let (retry, why) = if c.by_service {
+        (
+            "Restart-Service Roomler (as an administrator)",
+            "roomler logs --source service --grep \"desktop companion\"",
+        )
+    } else {
+        (
+            "restart roomlerd",
+            "roomler logs --grep \"desktop companion\"",
+        )
+    };
+    vec![
+        first,
+        "Roomler replaces it by itself, retrying every few minutes for an hour after a start, \
+         then every 4 h"
+            .to_string(),
+        format!("To retry now: {retry}"),
+        format!("Why it failed: {why}"),
+    ]
 }
 
 /// #3387 — `roomler status`'s line for [`NodeStatus::waiting_for_machine_enrollment`].
