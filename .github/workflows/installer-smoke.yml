@@ -806,6 +806,19 @@ jobs:
             throw 'the daemon did not stay up on a config with no server, so this lane proves nothing'
           }
           Write-Host "Daemon up under the launcher: pid $($up.Id)"
+          # #3774: this daemon must not reach the live update channel, or it
+          # could put the newest published release over the build under test.
+          # ROOMLERD_AUTO_UPDATE=0 shuts it, and its own log says so.
+          $logFile = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'roomler\roomler\data\logs') -Filter 'roomlerd.log*' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1
+          if (-not $logFile) { throw 'the daemon wrote no log, so nothing shows whether it armed its updater' }
+          $lines = Get-Content -LiteralPath $logFile.FullName
+          $armed = $lines | Select-String -SimpleMatch 'auto-updater armed'
+          if ($armed) { $armed | ForEach-Object { Write-Host "  $_" }; throw 'the started daemon armed its auto-updater: it can reach the live update channel' }
+          $shut = $lines | Select-String -SimpleMatch -Pattern 'auto-update disabled', 'auto-update opted out'
+          if (-not $shut) { throw 'the daemon log has no line saying its auto-update is disabled' }
+          $shut | Select-Object -First 1 | ForEach-Object { Write-Host "  $_" }
+          Write-Host 'the started daemon does not reach the live update channel'
 
       - name: Uninstall the MSI (quiet)
         shell: pwsh
@@ -1372,9 +1385,11 @@ jobs:
         # FR-133 P1 renamed what Apps & Features lists: "Roomler" and
         # "Roomler (per-Machine)". An upgrade is matched by the UpgradeCode,
         # never by that name, and this step proves it on real released bytes:
-        # install the NEWEST published release of each flavour, then this
-        # branch's MSI over it, built one patch version above so it is a real
-        # major upgrade, and count what a person would see: exactly one entry,
+        # install the newest published release of each flavour AT OR BELOW this
+        # build's version (#3774: on a ref behind the newest release, the
+        # newest of all is newer than this build), then this branch's MSI over
+        # it, built one patch version above so it is a real major upgrade, and
+        # count what a person would see: exactly one entry,
         # under the new name. The per-Machine cell also keeps the SystemContext
         # switch (#1727) and ends with the service Running.
         #
@@ -1483,15 +1498,30 @@ jobs:
             }
           }
 
-          # This branch's MSIs, one patch version above the newest release.
-          $newest = (Get-ReleaseJson 'releases?per_page=100') |
+          # This branch's MSIs, one patch version above the release they upgrade.
+          # #3774: that release is the newest published one AT OR BELOW this
+          # build's version. On a ref behind the newest release, upgrading from
+          # the newest would put this older build over newer bytes, which ended
+          # 1603; at or ahead of the newest release the two are the same.
+          $builtText = (& .\target\release\roomlerd.exe --version | Out-String).Trim()
+          $built = $null
+          if (-not [version]::TryParse((($builtText -split '\s+')[-1] -replace '[-+].*$', ''), [ref]$built)) {
+            throw "could not read this build's version from '$builtText'"
+          }
+          $published = @((Get-ReleaseJson 'releases?per_page=100') |
             Where-Object { $_.tag_name -like 'agent-v*' -and -not $_.draft -and -not $_.prerelease } |
-            Sort-Object { [datetime]$_.published_at } -Descending | Select-Object -First 1
-          if (-not $newest) { throw 'no published agent-v* release to upgrade from' }
+            Sort-Object { [datetime]$_.published_at } -Descending)
+          if (-not $published) { throw 'no published agent-v* release to upgrade from' }
+          $newest = $published | Where-Object {
+              $v = $null
+              [version]::TryParse(($_.tag_name -replace '^agent-v', ''), [ref]$v) -and $v -le $built
+            } | Select-Object -First 1
+          if (-not $newest) { throw "no published agent-v* release at or below this build's $built to upgrade from" }
           $base = [version]($newest.tag_name -replace '^agent-v', '')
           $next = '{0}.{1}.{2}' -f $base.Major, $base.Minor, ($base.Build + 1)
           $nextMsi = "$next.1"
-          Write-Host "newest release $($newest.tag_name); this branch's MSIs are built at $next-smoke.1 (MSI $nextMsi)"
+          Write-Host "this build is $built; the newest release is $($published[0].tag_name); upgrading from $($newest.tag_name), the newest at or below this build"
+          Write-Host "this branch's MSIs are built at $next-smoke.1 (MSI $nextMsi)"
           $pu = Join-Path $out "branch-$nextMsi-peruser.msi"
           $pm = Join-Path $out "branch-$nextMsi-permachine.msi"
           Remove-Item target\wix\*.msi -Force -ErrorAction SilentlyContinue
@@ -1516,7 +1546,7 @@ jobs:
           Invoke-UninstallScript 'pre-p1-peruser'
           $null = Assert-Entries "$($pre.tag_name) per-User after install.ps1 -Uninstall" @() ''
 
-          # 2. per-User: the newest release, then this branch over it.
+          # 2. per-User: the release chosen above, then this branch over it.
           Invoke-Msi '/i' (Save-Msi $newest 'pu') (Join-Path $logDir 'fr133-newest-peruser.log') ''
           $was = Assert-Entries "$($newest.tag_name) per-User installed" @($old.pu, $new.pu) ''
           if ($was -cne $new.pu) { Write-Host "the newest release registers the pre-P1 name: this cell is the rename upgrade" }
