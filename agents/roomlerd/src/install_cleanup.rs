@@ -24,20 +24,22 @@
 //!   admin; perUser MSI's CA runs Impersonated and inherits the user
 //!   token, so this is best-effort. A non-admin user can't have a
 //!   live perMachine install anyway, so failure here is benign.
-//! - Service log dir `%PROGRAMDATA%\roomler\roomler-agent\service-logs\`
-//!   (best-effort; may be ACL-locked).
+//! - Service log dirs `%PROGRAMDATA%\roomler\roomler-agent\service-logs\`
+//!   and the `roomler` segment's, removed by handle (FR-145, below).
 //!
 //! When installing **perMachine**, the helper cleans **perUser**
 //! leftovers:
 //! - Scheduled Task `RoomlerAgent` (`schtasks /Delete /TN RoomlerAgent
 //!   /F`). Runs as SYSTEM, can see + delete the user-scope task.
-//! - Active-session user's data dirs at `%LOCALAPPDATA%\roomler\
-//!   roomler-agent\` and `%APPDATA%\roomler\roomler-agent\` (and the
-//!   `roomler` segment), below the profile
-//!   `system_context::user_profile::active_user_profile_root()` names. A
-//!   tree that is a link, holds one or is reached through one is left in
-//!   place, and on the service account no tree is removed (#3702).
-//! - `needs-attention.txt` sentinel in the user's config dir.
+//! - The session user's data dirs at `AppData\Local\roomler\
+//!   roomler-agent\` and `AppData\Roaming\roomler\roomler-agent\` (and the
+//!   `roomler` segment; `needs-attention.txt` goes with the Roaming one),
+//!   below the profile the system records for that account's SID
+//!   (`user_profile::session_account_sid`, `appdirs::profile_of_account`),
+//!   never a folder named after the user; none on the service account (#3702).
+//! - FR-145: each tree is removed by handle, through the walk that checked
+//!   it (`HeldPath::remove_tree`); a tree with a link on the way or in it is
+//!   left in place, with a line that names the link.
 //!
 //! ## Vacated-dir sweep (P4b)
 //!
@@ -228,15 +230,15 @@ const INSTALL_DIR_PRODUCT_FILES: &[&str] = &[
 /// TARGET flavour's scope (perUser →
 /// `%LOCALAPPDATA%\Programs\roomler-agent`, perMachine →
 /// `%ProgramFiles%\roomler-agent`). #3702 — both folders as the system
-/// names them (`updater::install_dir_with_name`: the account's own local
-/// application data folder, the machine's program files folder), never
-/// from the environment; the sweep deletes nothing through a link.
+/// names them (FR-145: below the profile the system records for this
+/// account's SID, or the machine's program files folder), never from the
+/// environment; the sweep deletes nothing through a link.
 ///
 /// Policy: conservative. Skip outright when the candidate IS the
 /// directory this process runs from (paranoia guard — impossible
 /// with the renamed wxs, but cheap insurance against a rebuilt
 /// old-name MSI invoking a new exe). Delete only
-/// [`INSTALL_DIR_PRODUCT_FILES`], then `remove_dir` NON-recursively:
+/// [`INSTALL_DIR_PRODUCT_FILES`], then the folder NON-recursively:
 /// foreign content survives and is reported; locked files fail soft
 /// (the CA runs `Return='ignore'`; PendingFileRenameOperations
 /// clears them on the next reboot, after which a later invocation

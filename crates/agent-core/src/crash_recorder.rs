@@ -24,9 +24,33 @@
 //!   `%PROGRAMDATA%\roomler\roomler-agent\crashes\` because
 //!   `directories::ProjectDirs::data_local_dir()` under LocalSystem
 //!   resolves to `C:\Windows\System32\config\systemprofile\…` which
-//!   the user-context worker can't read. PROGRAMDATA is world-
-//!   readable (ACL set on dir creation) so the same uploader scans
-//!   both dirs and merges results.
+//!   the user-context worker can't read. The same uploader scans both
+//!   dirs and merges results; the supervisor's dir is the machine's,
+//!   reached by handle (below).
+//!
+//! ## The machine folder, by handle (FR-145)
+//!
+//! A crashes dir below the machine's `ProgramData` (the supervisor's, and a
+//! SYSTEM worker's `service-logs\crashes`) is reached by handle, never by
+//! path (`machine_tree::HeldPath::machine`): each folder on the way opened
+//! below the one above it, never through a link, its final path checked.
+//!
+//! - `crashes` is made sealed (`Seal::Readable`, D10): SYSTEM and
+//!   Administrators write, Users read and list, so a worker running as the
+//!   signed-in person drains the supervisor's records. One an earlier build
+//!   made is sealed in place, and a record name in it that is not a plain
+//!   file of SYSTEM's or Administrators' is deleted by handle. A link, a
+//!   file or another account's folder at `crashes` is moved aside whole, as
+//!   `crashes.moved-<unix>`.
+//! - A record is a fresh temp file, flushed, then renamed into place by
+//!   handle. The scan lists and reads below the folder's handle, a record
+//!   that does not parse is renamed into `malformed` by handle, and the
+//!   uploader deletes through the folder it read from ([`Sidecar::remove`]).
+//! - A link on the way leaves the crash unrecorded, with one WARN per
+//!   process start (`crash records left alone: …`), counted with the
+//!   suppression tally. It is never written anywhere else.
+//! - `ROOMLERD_MACHINE_TREE_HELD=0`: written and read by path as before,
+//!   with one WARN naming the switch.
 //!
 //! On non-Windows the Supervisor context resolves to the writing
 //! process's own Worker dir. The one supervisor there is macOS's (FR-43,

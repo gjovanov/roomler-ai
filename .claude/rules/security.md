@@ -136,6 +136,10 @@ the managed-role reconcile: `docs/permissions.md`. The rules that bind new code:
   (`wg_key_taken_by_other`, fail-CLOSED). Nothing proves possession of the private
   half, and the key is an *addressing* key — DERP authorizes registration against
   it, WireGuard keys peers by it.
+- **SYSTEM acts below the machine's folders only through `machine_tree::HeldPath`**
+  (FR-145): each folder opened below the handle above it, never through a link, its
+  final path checked; what it makes sealed when made; a write is a fresh file renamed in
+  by handle; a removal deletes what the same walk opened. Never check a path, then act on it.
 - **Push endpoints are SSRF-validated at subscribe time** — the server POSTs to a
   browser-supplied URL from inside the cluster on every fan-out.
 - **Uploads are sniffed, never trusted** (`crate::media_type::resolve`); the

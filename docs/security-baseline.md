@@ -540,6 +540,83 @@ because an answer that needed a domain controller would flap SYSTEM mode.
 
 The SYSTEM service's FR-94 anchor is no file: it is read only from `HKLM\SOFTWARE\Roomler\ExecService`, a key that SYSTEM or Administrators own and no other account may change, read or create, below a parent no other account may change, neither of them a registry link (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)). A writer makes a key that fails that check again rather than sealing it where it stands, so a handle opened while it was loose reaches nothing.
 
+### SYSTEM acts below the machine's folders by handle (FR-145)
+
+A process running as SYSTEM, or elevated, acts on a path below a known base only through
+handles. The base is opened as itself, and its final path must be the base's own name.
+Every folder below it is opened relative to the handle above it (`NtCreateFile` with
+`RootDirectory` and `FILE_OPEN_REPARSE_POINT`), never through a link, and its final path
+must be its parent's plus its own name. A folder it makes is sealed when it is made, its
+security descriptor in the create call itself, so it never inherits anything first. A
+file it writes is made fresh and published by a rename relative to the held folder. A
+removal deletes, by handle, what the same walk opened.
+
+Why: a check made by path and an act made by path are two lookups of the same name, and
+the name can change in between; a walk by handle looks each name up once, and every act
+goes through the handle that was checked. One helper carries the rule,
+`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:336`), so a new
+SYSTEM writer gets it by calling the helper rather than by re-deriving it
+([FR-145](fr/FR-145-machine-tree-by-handle.md)). `OBJ_DONT_REPARSE` goes on every
+relative open as a second lock where the build honours it, and nothing relies on it
+alone.
+
+The writer's walk (`walk_sealed`, `HeldPath::machine`); the clean-up's `walk` makes
+nothing, refuses a link at any name, and ends in `remove_tree`:
+
+```mermaid
+flowchart TD
+    B["HeldPath::base: the base opened as itself"] --> F{"its final path is its own name?"}
+    F -- no --> R1["refused: Elsewhere, naming the final path"]
+    F -- yes --> C["the next name, opened below the handle above it,<br/>FILE_OPEN_REPARSE_POINT"]
+    C --> M{"the last name?"}
+    M -- no --> L{"a link, or a final path that is not<br/>its parent's plus its name?"}
+    L -- yes --> R2["refused: Link or Elsewhere, one WARN;<br/>the site does without"]
+    L -- no --> C
+    M -- yes --> P["the leaf policy: made sealed, sealed in place,<br/>or moved aside and made sealed"]
+    P --> A["act by handle: write_file, read_file, rename_file,<br/>remove_file, remove_tree"]
+```
+
+| `Seal` | Owner and DACL | Used for |
+|---|---|---|
+| `Private` | owner Administrators; protected; SYSTEM and Administrators full control, handed down to what is made below | what only SYSTEM and Administrators read (P3) |
+| `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`) | `crashes`, which a worker running as the signed-in person drains; `service-logs` (P2) |
+
+What SYSTEM finds where it writes (the leaf policy):
+
+| Found at the leaf | What happens | What a person or an operator sees |
+|---|---|---|
+| nothing | made sealed | nothing |
+| a folder SYSTEM or Administrators own (every folder the service made before FR-145) | sealed in place, by handle. A name in it that the site writes or reads, and that is not a plain file of one link owned by SYSTEM or Administrators, is deleted by handle; other names are never opened | nothing; the files in it stay |
+| a folder another account owns | moved aside whole, by handle, as `<name>.moved-<unix>`, its owner and contents unchanged, and a sealed one made. One WARN | a `<name>.moved-<unix>` entry |
+| a link, or anything else that is not a folder | the entry itself moved aside by its own handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; what a link led to is untouched |
+| above the leaf: a link, or a folder whose final path is elsewhere | refused, one WARN, and the site does without | the WARN line, which names the path |
+
+The machine folder and its parent are only opened (made sealed when they are not there),
+never moved or re-sealed: they hold the machine config, and their repair is FR-94's
+(above). A worker running as the signed-in person reads `crashes` below a machine folder
+it may not list: a name its read walk passes through is then held with
+`FILE_READ_ATTRIBUTES` alone, which NTFS grants through the parent's list right, and is
+still checked for a link and for its final path. Nothing is listed, read or done in such
+a folder, and no write walk does this.
+
+The sites on it since P1:
+
+| Site | By handle | Code |
+|---|---|---|
+| A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:399` |
+| Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:642`, `crates/agent-core/src/crash_recorder.rs:529` |
+| The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:679` |
+| The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:561`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
+| The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:286` |
+| #3737's readers (`PrivateFolder::open`, the earlier anchor files' deletes) | `HeldPath::below(ProgramData, dir)` | `crates/agent-core/src/machine_tree.rs:1435` |
+
+P2 moves the service logs onto the helper, and P3 the remaining SYSTEM writers below the
+machine folder, with a test that fails on a new path-based one; until then those sites
+write by path as before. `ROOMLERD_MACHINE_TREE_HELD=0` in the service's environment
+sends the crash recorder back to its writes by path, with one WARN naming the switch
+(`crates/agent-core/src/machine_tree.rs:377`). The clean-up's removals have no switch: a
+removal that follows a link has no safe old way to return to.
+
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 
 On a Windows background-service install the worker is LocalSystem. What a

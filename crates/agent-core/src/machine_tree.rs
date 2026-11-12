@@ -66,7 +66,9 @@
 //!   its final path checked; what it makes sealed from creation; what it
 //!   writes made fresh and renamed into place by handle; a removal deleting
 //!   what the same walk opened. #3737's readers ([`PrivateFolder`]) walk the
-//!   same way.
+//!   same way. The crash records and the install clean-up act through it
+//!   (FR-145 P1); the service logs and the other SYSTEM writers follow in P2
+//!   and P3.
 //!
 //! Kill switches, read from the process environment only (the service's
 //! `Environment` block), never from the config: `ROOMLERD_MACHINE_TREE_REPAIR=0`
