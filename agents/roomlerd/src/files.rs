@@ -215,9 +215,11 @@ fn process_home() -> Option<String> {
     #[cfg(not(target_os = "windows"))]
     {
         // #3688 — a test's stand-in for the daemon's own home, so the
-        // placement rule's home is never a real one either.
+        // placement rule's home is never a real one either: the `HOME` its
+        // environment names (`stand_in::env_home`), which `BaseDirs` reads,
+        // else its account's own.
         #[cfg(all(test, target_os = "linux"))]
-        if let Some(home) = stand_in::own_home_now() {
+        if let Some(home) = stand_in::env_home_now().or_else(stand_in::own_home_now) {
             return home.map(|home| home.to_string_lossy().into_owned());
         }
         directories::BaseDirs::new().map(|d| d.home_dir().to_string_lossy().into_owned())
@@ -11112,6 +11114,148 @@ CAN_GRAPHICAL=0
                 "and resumes, from 0"
             );
             assert_eq!(placed, Ok(dl.join("e.txt")));
+        }
+
+        /// R5 — a per-user daemon whose Downloads sits on a file system that
+        /// keeps no Unix owners either: a VirtualBox shared folder reads
+        /// `root:vboxsf`, an sshfs without `idmap=user` the server's numbers.
+        /// A folder's owner says nothing there, so the daemon's default folder
+        /// is not refused for reading another account's when the daemon can
+        /// write into it (here a folder root owns that every account may
+        /// write, reached through `~/Downloads`): the upload stages in the
+        /// daemon's own private folder, and the end copies the file across.
+        /// Another account's folder it cannot write into (`XDG_DOWNLOAD_DIR`
+        /// naming `/usr`) is passed over. As root, the daemon is root, which
+        /// stays strict: another account's folder is refused.
+        #[tokio::test]
+        async fn a_per_user_daemons_folder_of_another_owner_keeping_no_modes_receives_by_copy() {
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(false, false);
+            let dl = home.downloads();
+            let _fat = stand_in::modes_kept(Some(false));
+            if as_root() {
+                let nobody =
+                    crate::fs_identity::Account::by_name("nobody").expect("the `nobody` account");
+                std::fs::create_dir(&dl).unwrap();
+                chmod(&dl, 0o700);
+                std::os::unix::fs::chown(&dl, Some(nobody.uid), Some(nobody.gid)).unwrap();
+                for who in [FsAs::Daemon, FsAs::DaemonAlone] {
+                    assert_eq!(
+                        download_dir_for(&who).await.map_err(|e| e.to_string()),
+                        Err(cannot_receive(&dl, "it belongs to another account")),
+                        "{who:?}: root stays strict"
+                    );
+                }
+                return;
+            }
+            // Root's, and every account may write it, as FHS keeps
+            // `/var/tmp` (or `/dev/shm`); never the temp dir.
+            let temp = std::fs::canonicalize(std::env::temp_dir()).ok();
+            let theirs = ["/var/tmp", "/dev/shm"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|p| {
+                    std::fs::metadata(p)
+                        .is_ok_and(|md| md.is_dir() && md.uid() != euid() && md.mode() & 0o002 != 0)
+                        && std::fs::canonicalize(p).ok() != temp
+                })
+                .expect("a folder another account owns that every account may write");
+            std::os::unix::fs::symlink(&theirs, &dl).unwrap();
+            std::fs::create_dir_all(home.path().join(".config")).unwrap();
+            std::fs::write(
+                home.path().join(".config/user-dirs.dirs"),
+                "XDG_DOWNLOAD_DIR=\"/usr\"\n",
+            )
+            .unwrap();
+            assert_eq!(
+                default_download_dir_as(&FsAs::Daemon, false).map_err(|e| e.to_string()),
+                Ok(dl.clone()),
+                "another account's folder it can write into: taken; one it cannot: passed over"
+            );
+            /// What the end places in that shared folder, removed with the test.
+            struct Placed(PathBuf);
+            impl Drop for Placed {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(&self.0);
+                }
+            }
+            let private = home.path().join(".local/state/roomler/staging");
+            let h = FilesHandler::new();
+            let id = tid("fat-theirs");
+            let name = format!("{id}.txt");
+            let landed = Placed(theirs.join(&name));
+            h.begin_as(FsAs::Daemon, id.clone(), name.clone(), 4, None, None)
+                .await
+                .expect("begin");
+            let partial_dir = private.join(&id);
+            let staged = (
+                partial_dir.is_dir().then(|| mode_and_owner(&partial_dir)),
+                theirs.join(".roomler-partial").join(&id).exists(),
+            );
+            h.chunk(b"vbox").await.expect("chunk");
+            let ended = h.end(&id).await;
+            forget(&[&id]);
+            assert_eq!(
+                staged,
+                (Some((0o700, euid())), false),
+                "staged in its own private folder, nothing beside the target"
+            );
+            let (placed, _) = ended.expect("end");
+            assert_eq!(placed, dl.join(&name));
+            assert_eq!(
+                (std::fs::read(&landed.0).ok(), mode_and_owner(&landed.0).1),
+                (Some(b"vbox".to_vec()), euid()),
+                "copied across, the daemon's"
+            );
+            assert!(!partial_dir.exists(), "its staging goes");
+        }
+
+        /// R5 — a daemon that is root (root at the screen, or the switch off)
+        /// judges a configured folder, or one a controller chose, by FR-84
+        /// D4's rule against the home its account names (`getpwuid`), never
+        /// the `HOME` its environment names (`sudo -E` keeps the caller's, a
+        /// drop-in may set one): a folder inside another account's home named
+        /// there is not taken, and the upload lands in the default folder.
+        /// `~` expands against its account's home.
+        #[tokio::test]
+        async fn a_root_daemons_configured_or_chosen_folder_is_judged_against_its_accounts_home() {
+            if !as_root() {
+                return;
+            }
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let home = OwnHome::new(true, false);
+            let (foreign, _person) = super::as_root::nobodys_home();
+            let _env = stand_in::env_home(Some(foreign.path()));
+            let theirs = foreign.path().join("Drops");
+            std::fs::create_dir(&theirs).unwrap();
+            chmod(&theirs, 0o700);
+            let _configured = Configured::set(&theirs);
+            let seen = (
+                writer_context().active_home.map(PathBuf::from),
+                download_dir_for(&FsAs::Daemon)
+                    .await
+                    .map_err(|e| e.to_string()),
+                resolve_dest_path_as(&FsAs::Daemon, &theirs.to_string_lossy())
+                    .await
+                    .is_ok(),
+            );
+            assert_eq!(
+                seen,
+                (Some(home.path().to_path_buf()), Ok(home.downloads()), false),
+                "the environment's home decides nothing: neither the configured folder nor a \
+                 chosen one inside it is taken"
+            );
+            let ours = home.path().join("Drops");
+            std::fs::create_dir(&ours).unwrap();
+            chmod(&ours, 0o700);
+            set_files_dir(Some("~/Drops".into()));
+            assert_eq!(
+                download_dir_for(&FsAs::Daemon)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Ok(ours),
+                "`~` expands against its account's home"
+            );
         }
     }
 }
