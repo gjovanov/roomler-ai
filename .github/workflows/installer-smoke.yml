@@ -2357,6 +2357,7 @@ jobs:
           sudo cp /Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist "$plist"
           sudo chown root:wheel "$plist"
           sudo chmod 644 "$plist"
+          sudo mkdir -p /var/log/roomler
           sudo launchctl bootstrap system "$plist"
           # RunAtLoad starts it at once; it may first wait out its 60 s run
           # spacing. The removal below waits only 10 s for an idle job, so wait
