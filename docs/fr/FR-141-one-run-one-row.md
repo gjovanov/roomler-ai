@@ -52,10 +52,10 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
   person's half enrolls with the overlay keys stripped (`orchestrator_unix.rs:143-185`); `--user-steps` starts the
   LaunchAgent (`install.sh:938-947`). Two rows.
 - **One row exists, but only in the terminal.** FR-43 P3a to P3d are built and field-verified on released 0.4.200
-  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2017-2053`). `install.sh --one-row` is
+  and 0.4.201 behind `macos_one_row`, default off (`docs/installation.md:2016-2053`). `install.sh --one-row` is
   the one-token path (`install.sh:991-1087`); it is refused with the halves the wizard runs: "have no one-row
   form yet" (`install.sh:296-299`). The docs say the wizard has no one-row control
-  (`docs/installation.md:2147-2150`).
+  (`docs/installation.md:2146-2150`).
 - **The wizard cannot see a Mac's root daemon before it enrolls.** `root_identity::query` answers on Linux only
   (`agents/roomler-setup/src/root_identity.rs:67-79`), so on a Mac that is already one row or supervised the
   wizard would enroll a new person's half and start a LaunchAgent that the package's guard removes
@@ -164,7 +164,7 @@ on the Devices page.
 - [ ] **AC1**: macOS 15 or later, the released wizard, **pairing**, the default choice, one-row switch on: **one**
   row, online. From that row on the Devices page: its overlay address(es) shown, a remote-desktop session that
   streams and takes input; `sudo roomler peers` lists the mesh; a ping over the overlay both ways; `roomler ssh`
-  once the device's `ssh_enabled` is on (`docs/installation.md:2157-2157`).
+  once the device's `ssh_enabled` is on (`docs/installation.md:2156-2157`).
 - [ ] **AC2**: the same with a **pasted** token: one field, one token, one row.
   P0 read, cell M2 ([the read](https://github.com/gjovanov/roomler-ai/issues/3679#issuecomment-6803951312)): the
   paste path with the default choice still asks for two tokens and leaves two rows, so AC2 is not held yet.
