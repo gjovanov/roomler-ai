@@ -2357,16 +2357,19 @@ every self-update through the update helper. Root writes only in system
 folders: `/Applications`, `/Library`, `/etc` and `/var/log`. What belongs to the person at the console, the two
 login items in `~/Library/LaunchAgents`, is made, written and removed by that
 person's own account, so the system applies that account's rights and nothing
-more.
+more. With nobody signed in at the console, the three rows that act for the
+console user are skipped and every root row runs as on any install
+(`agents/roomlerd/packaging/macos/postinstall:524-535`, #3783; see
+[an update with nobody signed in](#macos-an-update-with-nobody-signed-in-3783)).
 
 | Step | Writes as | Where | Anchor |
 |---|---|---|---|
-| Sweep the bundles of earlier layouts | root | `/Applications`, `/Library/Roomler` | `agents/roomlerd/packaging/macos/postinstall:33-36`, `:51-61` |
-| Move or copy the system config and log folders | root | `/etc`, `/var/log` | `agents/roomlerd/packaging/macos/postinstall:79-108` |
+| Sweep the bundles of earlier layouts | root | `/Applications`, `/Library/Roomler` | `agents/roomlerd/packaging/macos/postinstall:38-41`, `:56-66` |
+| Move or copy the system config and log folders | root | `/etc`, `/var/log` | `agents/roomlerd/packaging/macos/postinstall:84-113` |
 | Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u '#<uid>'`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:229-345`, `:381`, `:471` |
 | Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:358` |
-| Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:161` |
-| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:539-542`, `:547`, `:614-617`, `:633`, `:641`, `:568`, `:652` |
+| Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:149` |
+| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:575-578`, `:583`, `:666-669`, `:685`, `:693`, `:604`, `:704` |
 
 - **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
   groups; `launchctl asuser` changes only the bootstrap context. `-n` because
@@ -2717,6 +2720,61 @@ when one is needed (FR-27).
 | `roomler` CLI (tunnel-only hosts) | `roomler self-update` (same proxy origin): since FR-97 P6b the release's `.asc` is checked against the pinned key on every OS, and Linux and macOS install too, the tarball or (where dpkg owns the binary) the `.deb` ([`tunnel-install.md` §10](tunnel-install.md)). On daemon hosts the MSI/.deb owns the binaries — the shim's `self-update` refuses by design |
 | `roomler-desktop` | Not in either MSI: the daemon refreshes it itself at start when the companion's recorded version differs from its own — downloads the signed asset, stages it beside the old EXE, stops the running companion **by PID** (found by the path it was started from, never by image name), promotes the new file and starts it again in the same session (`agents/roomlerd/src/companion.rs`, `swap`). ⚠️ **One refresher per install**: on a Windows service install that is the service host — the worker it spawns skips, because two refreshers raced and left the old companion running, holding the single-instance lock (#1686). A refresh that fails is retried every 4 h, and within minutes while the tray is too old to connect ([below](#a-tray-older-than-its-daemon-windows-3781)) |
 | wizard | Fetch-latest by nature; `setup-v<V>` is cut with every `agent-v<V>` (the lockstep job in `release-agent.yml`) |
+
+### macOS: an update with nobody signed in (#3783)
+
+The update helper (`com.roomler.update`, a root LaunchDaemon) runs
+`installer -pkg … -target /` at load and on its timer, so it often installs
+while the Mac sits at the login window: a server, a lab Mac, a laptop after a
+restart. The package's post-install script then takes one of two roads, chosen
+once by the owner of `/dev/console`
+(`agents/roomlerd/packaging/macos/postinstall:524-535`). Only the person's half
+differs. The root daemon and the update helper go through the same lines on both
+roads. Until #3783 the road with nobody signed in ended the script at that
+point, so each such update put the new version on disk while the root daemon
+kept running the old one until a reboot.
+
+```mermaid
+flowchart TD
+    H["update helper (root)<br/>installer -pkg … -target /"] --> P["postinstall"]
+    P --> C{"a person at the console?"}
+    C -- yes --> S["the person's half<br/>login items written as that person,<br/>loaded in gui/&lt;uid&gt;, menu-bar app restarted"]
+    C -- "no: login window, root or nobody" --> N["skipped, and said in install.log:<br/>NO GUI session is logged in"]
+    S --> D["root daemon, where enable-daemon is set:<br/>bootout, then bootstrap on the new plist"]
+    N --> D
+    D --> U{"the update helper's state"}
+    U -- "not loaded" --> B["bootstrap"]
+    U -- "loaded, idle" --> R["bootout, then bootstrap:<br/>update helper re-cycled"]
+    U -- "running: this very install" --> L["left alone; its plist applies at its next load"]
+```
+
+| | A person signed in | Nobody signed in |
+|---|---|---|
+| The person's login items and menu-bar app | written as that person and reloaded (`postinstall:215-500`) | not touched. The items an earlier install placed in `~/Library/LaunchAgents` load at the next sign-in (`RunAtLoad`: `com.roomler.agent.plist:31-32`, `com.roomler.desktop.plist:32-33`) and start the bundle on disk, this version, with the plists that earlier install wrote |
+| The root daemon (opt-in, `/etc/roomler/enable-daemon`) | reloaded: a new pid on the new version (`postinstall:571-614`) | the same lines |
+| The update helper (default on; `/etc/roomler/disable-auto-update` opts out) | re-armed by its state (`postinstall:662-701`), or removed when opted out and idle (`postinstall:702-739`) | the same lines |
+| `install.log` says | `roomlerd installed and started for <person>` | `NO GUI session is logged in`, what was not touched, and what waits for a sign-in |
+
+The helper's state comes from `update_helper_running`
+(`postinstall:650-656`): launchctl's whole answer is read first, then matched
+on `state = running`. A running helper is the install's own ancestor, and a
+bootout ends its process group, `installer` included. Until #3783 that answer
+was piped into `grep -q` under `pipefail`. A launchctl still writing when
+`grep -q` exits dies of SIGPIPE, and the failed pipe read as "idle".
+`scripts/macos-postinstall-check.sh` runs the real script on both roads in a
+container: a case for each of the helper's states, and one where launchctl
+writes its answer in pieces. CI runs it as "macOS post-install roads".
+
+Two things #3783 did not change:
+
+- **A person in a background session (fast user switching)** keeps the per-user
+  agent they had, the old version, until their next sign-in, while the root
+  daemon moves on. The script cannot see that session: the console reads root.
+- **A daemon bootstrap that fails five times** leaves the daemon unloaded until
+  the next boot, on both roads. `install.log` says
+  `WARNING: daemon bootstrap failed after retries` with the command that starts
+  it by hand (`postinstall:584-585`). At boot launchd loads the plist again
+  (`RunAtLoad`, `com.roomler.daemon.plist:42-43`).
 
 ### A tray older than its daemon (Windows, #3781)
 
