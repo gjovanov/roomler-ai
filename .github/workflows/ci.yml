@@ -576,6 +576,19 @@ jobs:
           -p roomler-ai-mod-remote
           -p roomler-ai-mod-conference
 
+      # #3736 — the LocalAPI client keeps a socket only when its own account or
+      # root serves it. The step above proves the rule and the candidate loop
+      # as the runner; this one proves the kernel's credentials across real
+      # uids, which needs root: a socket another uid serves is refused, and
+      # root's socket is still reached after it. Built as the runner, run under
+      # sudo; ROOMLERD_TEST_REQUIRE_ROOT turns the test's skip into a failure.
+      - name: "LocalAPI, as root — a socket another uid serves is refused (#3736)"
+        run: |
+          cargo test -p roomler-localapi --lib --no-run --message-format=json > /tmp/lapi.json
+          BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/lapi.json | head -1)
+          if [ -z "$BIN" ]; then echo "::error::no roomler-localapi lib test binary in the build output"; exit 1; fi
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" as_root_
+
       # FR-115 P4a-2 — `derp-relay`, the regional PoPs' DERP relay, ran its
       # tests in NO lane: it is a binary crate, so the `--lib` step above
       # cannot name it, and `--workspace` clippy compiles none of its
@@ -1440,6 +1453,13 @@ jobs:
         run: |
           cargo check -p roomlerd --lib --bins
           cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams
+
+      # #3736 — the LocalAPI on a real Mac: the per-user socket lives in the
+      # person's own temp folder and nowhere shared, a client keeps a socket
+      # only when its own account or root serves it (getpeereid), and the
+      # whole crate's Unix tests run against the Mac's arms.
+      - name: cargo test the LocalAPI on a real Mac (#3736)
+        run: cargo test -p roomler-localapi --lib
 
       # FR-85 — the release feature set (`full`, less the vendored FFmpeg
       # and libvpx), which carries `recording` again (P4c, after the

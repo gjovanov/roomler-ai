@@ -1454,7 +1454,7 @@ error chain in the file (`crates/agent-core/src/logging.rs:1953`); run with a co
 step shows what it always showed (`crates/agent-core/src/logging.rs:1983`). A daemon's `init`,
 run in a child with a log file and a console, leaves tracing at the default filter's own level,
 INFO, not TRACE (`crates/agent-core/src/logging.rs:2026`). The Windows lane runs the module
-beside `stderr_capture` (`.github/workflows/ci.yml:1652`). In `roomlerd`,
+beside `stderr_capture` (`.github/workflows/ci.yml:1672`). In `roomlerd`,
 `the_log_role_of_each_command` (`agents/roomlerd/src/app.rs:7845`) and
 `a_failed_step_ends_with_its_whole_chain_and_its_exit_code` (`agents/roomlerd/src/app.rs:7878`)
 pin the role per command and the end line of a failure.
@@ -1915,6 +1915,17 @@ person's uid, and `localapi: person-at-the-device socket down`. Turn it off with
 `ROOMLERD_PERSON_SOCKET=0` in a `roomlerd.service` drop-in. Details: [`desktop-companion.md`](desktop-companion.md) §12 and the
 [security baseline](security-baseline.md) §4.
 
+**Which socket a `roomler` command reaches (#3736).** Its own account's per-user socket
+first, only when it has a runtime dir private to it (`$XDG_RUNTIME_DIR`, which a login
+session sets), then the system socket. Each is kept only when its own account or root
+serves it. So `sudo roomler …`, a cron job and a system service, which have no runtime
+dir, go straight to `/var/run/roomler/roomler.sock`. On a **per-user** install the
+daemon's socket is that runtime dir's, and a command run without one (cron, `su`)
+answers `roomler daemon not running` with a note naming `XDG_RUNTIME_DIR`: run it with
+`XDG_RUNTIME_DIR=/run/user/$(id -u)`. A per-user daemon started without a private
+runtime dir serves no LocalAPI at all and logs `localapi: not served: …` with the
+reason.
+
 ### The companion's Device configuration on a system install (#2891, #2871)
 
 The companion reaches the root daemon over that same person socket. Before #2871's
@@ -2307,7 +2318,9 @@ Same three commands as Windows and Linux.
 
 `roomler peers` / `status` reach the **per-user** half; `sudo roomler …` reaches
 the **root** half, because the two listen on different LocalAPI sockets
-(`$TMPDIR/roomler/roomler.sock` vs `/var/run/roomler/roomler.sock`). If a
+(`$TMPDIR/roomler/roomler.sock`, in the person's own `/var/folders/…/T`, vs
+`/var/run/roomler/roomler.sock`). A command keeps a socket only when its own account
+or root serves it, and root never looks in a per-user temp folder (#3736). If a
 command reports "daemon not running", you are probably asking the wrong half.
 
 `roomler status` as the signed-in user carries the **root** half's overlay
@@ -2343,7 +2356,7 @@ the per-user half, every key of its file, and print the "a second roomler daemon
 is running" note that `status` and `peers` already printed — a note that had
 gone silent for the console user, because the root socket's `0700` directory
 refuses their `stat`; the root half's person socket is the evidence now
-(`crates/localapi/src/lib.rs:4829`).
+(`crates/localapi/src/lib.rs:5029`).
 
 The root half's device-owned switches are **root's to set by design**, not by
 omission: its LocalAPI is `/var/run/roomler` (`0700` / `0600`), and the person

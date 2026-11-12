@@ -907,6 +907,38 @@ Windows it is a named pipe whose security descriptor admits `SYSTEM`,
 `/var/run/roomler/roomler.sock`, 0700 / 0600, root only. Per-verb checks sit on top:
 the recording verbs require the console user (FR-85).
 
+**A LocalAPI client keeps an endpoint only when its own account or the system serves
+it (#3736).** The CLI, the companion, the wizard and the daemon's own workers all go
+through `localapi::connect()` ([`lib.rs:4922`](../crates/localapi/src/lib.rs#L4922)), and
+each check runs on the connected endpoint, before the client sends anything:
+
+| OS | The endpoint is kept when | Otherwise |
+|---|---|---|
+| Linux, macOS | the server's uid, read from the kernel (`SO_PEERCRED`, `getpeereid`), is the caller's own or root's ([`lib.rs:4354`](../crates/localapi/src/lib.rs#L4354) `server_uid_trusted`) | refused with `PermissionDenied`, naming the path and the uid, and the client goes on to the next candidate, the system socket ([`lib.rs:4948`](../crates/localapi/src/lib.rs#L4948) `connect_first_trusted`) |
+| Windows | the pipe's owner, read through the client's own handle, is SYSTEM, the Administrators group or the caller's own account ([`lib.rs:5197`](../crates/localapi/src/lib.rs#L5197) `pipe_owner_trusted`). Not the server process's token: a person may not open a SYSTEM process's token, so that check would refuse the real daemon | refused with `PermissionDenied`, naming the pipe and its owner, and what to run instead ([`lib.rs:5229`](../crates/localapi/src/lib.rs#L5229) `connect_windows_checked`) |
+
+- **Where a per-user endpoint lives.** Only in a directory private to its account: a
+  real directory, not a link, owned by that account and writable by neither its group nor
+  anyone else ([`lib.rs:4328`](../crates/localapi/src/lib.rs#L4328)
+  `per_user_socket_path_for`). Off macOS that is `$XDG_RUNTIME_DIR` and nothing else; on
+  macOS it is the per-user temp folder (`/var/folders/…/T`), and never for root. A caller
+  with no such directory (root under `sudo`, a cron job, a system service) has no
+  per-user candidate and goes straight to the system socket.
+- **What a daemon serves.** A system daemon serves `/var/run/roomler/roomler.sock`
+  alone. A per-user daemon serves its own per-user socket, and with no private directory
+  it serves none and logs why ([`lib.rs:4368`](../crates/localapi/src/lib.rs#L4368)
+  `unix_endpoints`); `roomler`'s "not running" line then says the same
+  ([`localclient.rs:2179`](../agents/roomler-cli/src/localclient.rs#L2179)).
+- **The pipe client's open.** `GENERIC_READ | FILE_WRITE_DATA`, at identification level
+  (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`): read and write data, never the
+  right to create an instance of the pipe, and the server may learn who the client is but
+  never act as it ([`lib.rs:5209`](../crates/localapi/src/lib.rs#L5209)). It works
+  against every daemon version.
+- ⚠️ **An attended Windows install whose person is a standard user.** There the worker,
+  and so the pipe, runs as that person. A CLI run as another account, `SYSTEM` included
+  (`roomler exec` through an anchor, FR-94), is refused with the owner named: run the
+  command as that person.
+
 ⚠️ **One deliberate carve-out: the person socket (FR-27 P11, #1911; FR-97 P2g).** A
 Linux system install's companion runs as the desktop user and could not reach the root
 socket. That left the person at the screen with no "being viewed" banner, no

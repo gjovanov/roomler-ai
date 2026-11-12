@@ -200,7 +200,7 @@ $ roomler status
   status` (fleet RPC, `docs/fleet-rpc.md`), or `roomler status --json` and read
   `.last_install`. The line sits right under `version` — the record and the
   binary it produced, together — and is printed only when the daemon reports
-  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2497`;
+  the field (`print_status`, `agents/roomler-cli/src/localclient.rs:2509`;
   the sentence per word, `last_install_line`, `:2887`).
 - **The startup log**: one line, always prefixed `last install:`, right after
   `agent starting` (`post_install::log_at_startup`, `post_install.rs:1526`,
