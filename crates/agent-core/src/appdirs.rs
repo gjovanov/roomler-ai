@@ -391,7 +391,7 @@ pub fn in_folder(path: &Path, folder: &Path) -> bool {
 /// The names from `folder` down to `path`, when `path` is in `folder`
 /// ([`in_folder`]'s rule, a part on Windows in any case). `None` when it is
 /// not, or when a part below `folder` is anything but a name.
-fn names_below<'a>(path: &'a Path, folder: &Path) -> Option<Vec<&'a std::ffi::OsStr>> {
+pub(crate) fn names_below<'a>(path: &'a Path, folder: &Path) -> Option<Vec<&'a std::ffi::OsStr>> {
     use std::path::Component;
     let same = |a: &std::ffi::OsStr, b: &std::ffi::OsStr| {
         if cfg!(target_os = "windows") {

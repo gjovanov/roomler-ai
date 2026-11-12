@@ -8489,7 +8489,7 @@ mod tests {
             for switches in [
                 Switches {
                     repair: false,
-                    check: true,
+                    ..Switches::ON
                 },
                 Switches::ON,
             ] {
