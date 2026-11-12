@@ -553,9 +553,9 @@ pub(crate) fn resolve_machine_global(base: &Path) -> PathBuf {
 /// [`project_dirs`]`().data_local_dir()` resolves to for the OWNER of
 /// `profile`, computed from the profile path so a SYSTEM worker can reach the
 /// signed-in person's per-user data (its own `project_dirs` is SYSTEM's).
-/// #3747 — the tree is the owner's ([`segment_in_profile`]), never the
-/// calling process's own; the owner's Roaming AppData folder is taken at its
-/// place below `profile`. Windows only, like the workers that need it.
+/// #3747 — the tree is the one the owner's own processes pick
+/// ([`segment_in_profile`]); the owner's Roaming AppData folder is taken at
+/// its place below `profile`. Windows only, like the workers that need it.
 #[cfg(target_os = "windows")]
 pub fn data_local_dir_in_profile(profile: &Path) -> PathBuf {
     let app_data = profile.join("AppData");
@@ -598,9 +598,9 @@ pub fn config_dir_in_profile(
 /// #3747 — the tree the processes of the account whose Roaming and Local
 /// AppData folders are `roaming` and `local` pick for themselves:
 /// [`segment_of`] over that account's folders, laid out as `ProjectDirs` lays
-/// them out on Windows. A path into another account's profile is named
-/// through this, never through the naming process's own choice. `local`
-/// `None` takes that account's local data folders as absent.
+/// them out on Windows. Every path into another account's profile is named
+/// through this. `local` `None` takes that account's local data folders as
+/// absent.
 #[cfg(any(target_os = "windows", test))]
 fn segment_in_profile(
     roaming: &Path,
@@ -1721,17 +1721,18 @@ mod tests {
         );
     }
 
-    // `use_old_segment` / segment resolution touch the real HOME/APPDATA, so we
-    // don't assert on live paths here (that would be environment-dependent).
-    // Instead lock the pure new-then-old PRECEDENCE with an injected predicate,
-    // mirroring the `node_env` fallback-order test in tunnel-core.
-    fn pick<'a>(new: &'a str, old: &'a str, exists: impl Fn(&str) -> bool) -> &'a str {
-        if exists(new) {
-            new
-        } else if exists(old) {
-            old
+    // The order the Linux root config ladder in `config::default_config_path`
+    // takes: the first path if it exists, else the second if it exists, else
+    // the first. The predicate is injected because the real `/etc` depends on
+    // the box and on root. The tree choice has its own tests over
+    // [`segment_of`] above.
+    fn pick<'a>(first: &'a str, second: &'a str, exists: impl Fn(&str) -> bool) -> &'a str {
+        if exists(first) {
+            first
+        } else if exists(second) {
+            second
         } else {
-            new
+            first
         }
     }
 
@@ -1740,8 +1741,8 @@ mod tests {
     /// fixed order, so the packaged unit's `--config` and a bare `roomlerd run`
     /// can never disagree about where this host's identity lives.
     ///
-    /// Same injected-predicate shape as the tree test above — asserting on
-    /// real `/etc` would be environment-dependent and root-dependent.
+    /// The predicate is injected (`pick` above): asserting on the real `/etc`
+    /// would depend on the box and on root.
     #[test]
     fn linux_system_config_precedence_is_etc_then_profile_then_etc() {
         // `/etc` present -> `/etc`, even when the legacy profile copy survives
@@ -1796,16 +1797,6 @@ mod tests {
         folder_link(&linked.join(".config"), &home.join(".config"));
         let note = system_config_home(Some(&linked), &config(&linked)).unwrap_err();
         assert!(note.contains("is a link"), "{note}");
-    }
-
-    #[test]
-    fn new_then_old_then_new_precedence() {
-        // NEW present -> NEW (even if OLD also present).
-        assert_eq!(pick("new", "old", |s| s == "new" || s == "old"), "new");
-        // only OLD present -> OLD (upgraded host keeps its tree).
-        assert_eq!(pick("new", "old", |s| s == "old"), "old");
-        // neither present -> NEW (fresh install).
-        assert_eq!(pick("new", "old", |_| false), "new");
     }
 
     #[test]
