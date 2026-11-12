@@ -581,12 +581,17 @@ flowchart TD
 | `Private` | owner Administrators; protected; SYSTEM and Administrators full control, handed down to what is made below | what only SYSTEM and Administrators read (P3) |
 | `Readable` | `Private`, plus Users read, list and traverse (`0x1200a9`) | `crashes`, which a worker running as the signed-in person drains; `service-logs` (P2) |
 
+What SYSTEM makes is owned by Administrators from its creation. A thread that acts as
+another account (it holds an impersonation token) never makes anything there: where that
+account could not name Administrators as the owner, the make is refused rather than
+left to that account, and the site logs its one line.
+
 What SYSTEM finds where it writes (the leaf policy):
 
 | Found at the leaf | What happens | What a person or an operator sees |
 |---|---|---|
 | nothing | made sealed | nothing |
-| a folder SYSTEM or Administrators own (every folder the service made before FR-145) | sealed in place, by handle. A name in it that the site writes or reads, and that is not a plain file of one link owned by SYSTEM or Administrators, is deleted by handle; other names are never opened | nothing; the files in it stay |
+| a folder SYSTEM or Administrators own (every folder the service made before FR-145) | sealed in place, by handle, on the folder alone (`SetKernelObjectSecurity`): nothing is handed down to what it holds, so a hard link left in it never carries the seal to a file outside. A name in it that the site writes or reads is sealed through its own handle when it is a plain file of one link owned by SYSTEM or Administrators, and deleted by handle when it is not; other names are never opened and keep what they had | nothing; the files in it stay |
 | a folder another account owns | moved aside whole, by handle, as `<name>.moved-<unix>`, its owner and contents unchanged, and a sealed one made. One WARN | a `<name>.moved-<unix>` entry |
 | a link, or anything else that is not a folder | the entry itself moved aside by its own handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; what a link led to is untouched |
 | above the leaf: a link, or a folder whose final path is elsewhere | refused, one WARN, and the site does without | the WARN line, which names the path |
@@ -605,6 +610,7 @@ The sites on it since P1:
 |---|---|---|
 | A crash record SYSTEM writes: the supervisor's `crashes`, a SYSTEM worker's `service-logs\crashes` | `HeldPath::machine(.., Seal::Readable)`, then `write_file`. A link on the way leaves the crash unrecorded, never written anywhere else | `crates/agent-core/src/crash_recorder.rs:399` |
 | Reading the records, setting a malformed one aside, the uploader's delete | `below`, `entries`, `read_file`; `rename_file` into `malformed`; `remove_file` through the folder the record was read from | `crates/agent-core/src/crash_recorder.rs:652`, `crates/agent-core/src/crash_recorder.rs:539` |
+| The uploader's verdicts ledger in a SYSTEM worker's `service-logs` (`crash-verdicts.txt`) | `HeldPath::machine(.., Seal::Readable)`, then `append_file`; read with `read_file`. A link, or a file with more than one name, at its name is deleted as itself and the file made again | `crates/agent-core/src/crash_recorder.rs:750` |
 | The install clean-up's per-Machine arm | `roomler\<segment>` walked below `ProgramData`, then `remove_tree("service-logs")` | `agents/roomlerd/src/install_cleanup.rs:679` |
 | The install clean-up's per-user arm | the profile the system records for the session account's SID (`ProfileList`), never `C:\Users\<name>`, which can be another account's folder or none; then `AppData\<area>\roomler` walked and `remove_tree(<segment>)` | `agents/roomlerd/src/install_cleanup.rs:561`, `agents/roomlerd/src/system_context/user_profile.rs:62` |
 | The sweep of the vacated install folder | the folder above it walked from its base, then `remove_file` per product file and `remove_empty_dir` | `agents/roomlerd/src/install_cleanup.rs:286` |

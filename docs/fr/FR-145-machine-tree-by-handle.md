@@ -120,7 +120,7 @@ re-exported as `machine_tree::{HeldPath, Seal, Refusal, Why, TreeRemoval}`. It r
 | `append_file(name, seal)` | for logs: `FILE_OPEN_IF` and append. A file already there must be a plain file with one link, owned by SYSTEM or Administrators; otherwise it is deleted by handle and made again |
 | `HeldPath::below(base, dir)` | as built in P1: `base(base)`, then `walk` down the names of `dir` below it. The readers' way down (#3743's `PrivateFolder::open`, the crash records' scan) |
 | `read_file(name, max_len)`, `entries()` | read below the held folder, never through a link (the listing through `GetFileInformationByHandleEx` with `FileIdExtdDirectoryInfo`); as built, `read_file` also refuses a folder and a file with more than one name |
-| `resealed()`, `keep_only_plain(uses)` | as built in P1: the leaf was there and was sealed in place by this walk; the site then deletes, by handle, each entry whose name `uses` matches and that is not a plain file of one link owned by SYSTEM or Administrators (the "sealed in place" row below). Other names are never opened |
+| `resealed()`, `keep_only_plain(uses, seal)` | as built in P1: the leaf was there and was sealed in place by this walk, on the folder alone; the site then takes, by handle, each entry whose name `uses` matches: a plain file of one link owned by SYSTEM or Administrators is kept and sealed with `seal` on that file alone (after review, R145), and anything else is deleted (the "sealed in place" row below). Other names are never opened |
 | `remove_file(name)`, `remove_empty_dir(name)` | opened below the held folder with `DELETE` and deleted by handle (#3743's `HeldFile::delete`); a link at `name` is refused, never followed |
 | `rename_file(from, into, to, replace)` | `from` opened below this folder with `DELETE`, renamed with `RootDirectory` set to `into`'s handle |
 | `remove_tree(name, dry_run)` | bottom-up by handle: each entry opened below its folder with `FILE_OPEN_REPARSE_POINT` and deleted with `FileDispositionInfoEx` (POSIX semantics, read-only ignored), falling back to `FileDispositionInfo`. A link met anywhere is never followed and never deleted: it stays, with the folders above it, and `TreeRemoval::left` names it. A first pass leaves the whole tree when it holds a link; the delete pass leaves any link that appeared since |
@@ -168,13 +168,20 @@ Notes on the calls:
 - A token that may not name Administrators as an owner (an unelevated test) gets `STATUS_INVALID_OWNER`; the helper
   then makes the entry with the protected DACL and the caller as its owner, as `seal_new_file`'s doc already
   allows (`machine_tree.rs:1235-1245`). SYSTEM and an elevated administrator always get Administrators.
+  **As built after review (R145), never on a thread that acts as another account:** a thread that holds an
+  impersonation token (read from its effective token; a query that fails counts as one) is refused instead, and
+  the site logs its one line. A crash recorded on such a thread (a panic inside `as_session_user`, a transfer
+  written as the person) goes unrecorded rather than owned by that person. The recorder does not switch tokens
+  inside the panic hook: a failed restore would leave the rest of the unwinding running as SYSTEM. The case runs
+  under a LUA-restricted token; with Administrators made deny-only alone, a token may still name them as an
+  owner, which a UAC-filtered token may not (measured).
 
 ### The leaf policy (D2): what SYSTEM finds where it writes
 
 | Found at the leaf | What happens | What a person or an operator sees |
 |---|---|---|
 | nothing | made sealed | nothing |
-| a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle (`win::set_sd`, as `adopt_machine_folder` does, `machine_tree.rs:859`). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators; any other such entry is deleted by handle. Names the service does not use are left alone and never opened. As built, the site names its own: `keep_only_plain` after `resealed()`, the crash recorder with `*.json` and `*.tmp` | nothing; the files in it stay |
+| a folder SYSTEM or Administrators own, with an inherited DACL: every folder the service made before this FR | sealed in place, by handle, on the folder alone. As built after review (R145): the owner and the protected DACL are set with `SetKernelObjectSecurity` on the held handle, which hands nothing down to what the folder holds on any build, so a hard link left in it never carries the seal to a file outside (measured before the change on Windows 11 26300: the handle-based `SetSecurityInfo` handed nothing down there either, so a record kept in the folder kept its earlier inherited entries). An entry in it that the service writes or reads by name is kept only when it is a plain file with one link, owned by SYSTEM or Administrators, and is then sealed through its own handle; any other such entry is deleted by handle. Names the service does not use are left alone and never opened. As built, the site names its own: `keep_only_plain(uses, seal)` after `resealed()`, the crash recorder with `*.json` and `*.tmp`, the verdicts ledger with its own name | nothing; the files in it stay |
 | a folder another account owns | moved aside by handle (`FileRenameInformation`, `RootDirectory` = the parent's handle) as `<name>.moved-<unix>`, and a sealed one made. Nothing in it is deleted or changes owner. One WARN names it | a `<name>.moved-<unix>` entry beside the new folder, its content still that account's |
 | a link (a junction or a symbolic link) | the link entry itself moved aside by handle, never followed, and a sealed folder made. One WARN | a `<name>.moved-<unix>` entry; whatever the link led to is untouched |
 | anything else that is not a folder: a plain file, a file link, a hard link (as built in P1, accepted 2026-11-12) | the entry moved aside by its own handle (opened with `FILE_OPEN_REPARSE_POINT` and `DELETE`), and a sealed folder made: a file link moves as itself, a hard link moves only that name. One WARN | a `<name>.moved-<unix>` entry, its content unchanged |
@@ -190,13 +197,15 @@ unchanged).
 | Site | Today | After |
 |---|---|---|
 | `record_inner` (`crash_recorder.rs:231-341`) | `create_dir_all`, the temp file and `fs::rename`, by path | `HeldPath::machine(&dir, Seal::Readable)`, then `write_file("<ts>-<pid>.json", ..)` |
-| `scan_dir`, `should_suppress` (`:571-573`, `:768-769`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
-| `quarantine` (`:714-723`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
+| `scan_dir`, `should_suppress` (`:581-583`, `:858-859`) | `read_dir` by path | `entries()` and `read_file(name, MAX_PAYLOAD_BYTES)` |
+| `quarantine` (`:724-733`) | `create_dir_all(malformed)`, `fs::rename` | `sealed_dir("malformed", ..)` and `rename_file(name, &malformed, name, false)` |
 | the uploader's deletes (`crash_uploader.rs:126`, `:141`, `:344-345`) | `remove_file(path)` | `remove_file(name)` on the held folder the sidecar was read from: the uploader carries a name and its folder, not a path |
+| the uploader's verdicts ledger, `crash-verdicts.txt` in the uploading process's log folder (a SYSTEM worker's `service-logs`; before, `crash_uploader.rs:269-293` at `0c5c1dbe6`) | `OpenOptions` create and append, `read_to_string`, by path | as built after review (R145): `crash_recorder::append_verdict` (`crash_recorder.rs:750`): `HeldPath::machine(&log_dir, Seal::Readable)`, then `append_file("crash-verdicts.txt", Seal::Readable)`; `read_verdicts` (`:780`) reads it below the held folder with `read_file`. A refusal is one WARN per process start, not counted |
 
 A refusal is logged once per process start (`crash_recorder: crash records left alone: <at> is a link`, or
-`… ends elsewhere (<final path>)`), counted with the suppression tally, and the crash goes unrecorded. It is never
-written anywhere else.
+`… ends elsewhere (<final path>)`). A refused write is counted with the suppression tally, and the crash goes
+unrecorded; it is never written anywhere else. As built after review (R145), a refused read is not counted: before,
+every drain whose read walk was refused added one, and the next record reported crashes that never happened.
 
 ### P1: the install clean-up
 
@@ -260,6 +269,9 @@ the service host, the SYSTEM worker, `netd`, the per-Machine package's steps), a
 | the install outcome (`agents/roomlerd/src/post_install.rs:173-175`, `:190-196`) | `create_dir_all`, `fs::write` | `write_file("last-install.json", ..)` |
 | the wedged MSI log (`post_install.rs:629-637`) | `fs::rename` to `.prev`, `fs::copy` | `rename_file("msi-wedged.log", held, "msi-wedged.prev.log", true)`, then `write_file` of the copy, read from SYSTEM's own staging |
 | the update-attempt marker (`agents/roomlerd/src/updater.rs:230-232`, `:242-256`) | `create_dir_all`, `fs::write` | `write_file("update-attempt", ..)` |
+
+The uploader's verdicts ledger (`crash-verdicts.txt`) is a `service-logs` writer too, and P1's since the review
+(R145; see P1: crash records).
 
 ### P3: the rest
 
@@ -336,6 +348,13 @@ them.
 | T13 | `the_per_machine_clean_up_still_removes_both_segments_service_logs` | same | no link: both `service-logs` removed, two report lines | no | control |
 | T14 | `the_per_user_removal_acts_on_the_tree_it_checked` | same | after the plan, a folder on the way replaced by a junction: what it leads to stays, and the report names the link | no | yes |
 | T15 | `the_per_user_clean_up_reads_the_profile_the_system_records` | same | the lookup injected: the recorded profile's trees removed, a folder named after the session's user untouched; with no recorded profile, nothing removed and the report says why | no | yes |
+| T14b | `the_per_user_removal_acts_through_the_folder_it_holds` | `install_cleanup.rs` tests | after review (R145): the swap at the act, through `between_check_and_use` once the walk holds `AppData\Local\roomler`: the held folder's tree is removed, nothing the junction leads to, and the next walk is refused with a line. A removal by path after the walk fails it either way; checked with such a change, which T14 passes and T14b does not | no | new after review |
+| T16 | `a_reseal_in_place_hands_nothing_down_through_a_hard_link` | `machine_tree/held.rs` | after review (R145): an open folder Administrators own, holding a hard link at a name the site does not use, a hard link and a junction at names it uses, and its own record: sealed in place; the two at used names deleted as names; no file outside changes its DACL or its bytes; the record sealed through its own handle | yes | new after review; its control failed on the earlier reseal |
+| T17 | `nothing_is_made_for_the_account_a_thread_acts_as` | same | after review (R145): on a thread impersonating a LUA-restricted token (Administrators deny-only), the make is refused and nothing is made. Control: the same make on a thread that is itself, Administrators the owner | yes | new after review; failed with the guard off |
+| T18 | `a_reader_as_the_person_reaches_a_readable_folder_below_a_sealed_one` | same | after review (R145), D10: under that token, `walk` passes a folder sealed to SYSTEM and Administrators with `FILE_READ_ATTRIBUTES` alone and reads the record in the `Readable` `crashes` below it. Control: with that way through turned off for the thread, the walk is refused at the sealed folder | yes | new after review |
+| T19 | `a_verdict_is_never_written_through_a_hard_link_or_a_junction` | `crash_recorder.rs` tests | after review (R145): the uploader's ledger in a SYSTEM worker's `service-logs`, its name a hard link to a file outside, then `service-logs` a junction: the verdict lands in a new file of one name and in a sealed `service-logs`; the file outside, and where the junction leads, are unchanged | yes | yes, at its own test commit |
+| T20 | `a_refused_read_is_not_counted_as_a_suppressed_crash` | same | after review (R145): three refused read walks leave the crash tally as it was. Control: a refused write adds one | yes | failed before its fix |
+| T21 | `records_are_moved_and_deleted_by_handle_never_through_a_link` | same | after review (R145): a record that does not parse goes by handle into a sealed `malformed`, a junction at `malformed` moved aside; a record whose name became a symbolic link after it was read is not deleted through it. Control: a record read is deleted through its folder | yes | new after review |
 
 P2 and P3 add their own with their phase: the log writer's rotation below the held folder (an injected clock;
 failing at its seam, since today's appender opens each day's file by path), the prune by handle, the presence lock,
@@ -393,9 +412,9 @@ The docs:
 
 ## Acceptance criteria
 
-- [ ] **AC1** (P1 tests): T1–T15 and T7b pass on the Windows lanes; T2, T5 (a), T8, T9 and T11 run, not skipped,
-  in the lane that sets `ROOMLERD_TEST_REQUIRE_ELEVATED`; T11, T12, T14 and T15 are shown failing at the seam
-  commit in the same PR's CI history.
+- [ ] **AC1** (P1 tests): T1–T21, T7b and T14b pass on the Windows lanes; T2, T5 (a), T8, T9, T11 and T16–T21
+  run, not skipped, in the lane that sets `ROOMLERD_TEST_REQUIRE_ELEVATED`; T11, T12, T14 and T15 are shown failing
+  at the seam commit in the same PR's CI history.
 - [ ] **AC2** (P1 code): no `std::fs` create, write, rename or remove of the machine folder is left in
   `crash_recorder.rs`, `crash_uploader.rs` or `install_cleanup.rs`; `active_user_profile_root` and
   `user_name_for_session` are deleted, and no code builds `C:\Users\<name>`.
