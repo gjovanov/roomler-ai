@@ -566,8 +566,9 @@ file systems before it leaves the step; a folder is then listed through its
 handle, never through its path again. A folder download ends with an error
 once the person has left seat0. With nobody at seat0, a read is refused with a
 reason the viewer shows, and a received file is the daemon's, 0600 and root's
-only, but never in a folder a controller chose. A lookup of seat0 that fails or
-runs out of time refuses the read too, saying it could not tell who is there.
+only, but never in a folder a controller chose. A host with no logind at all
+has no seat0, so nobody is there. Any other lookup of seat0 that fails or runs
+out of time refuses the read too, saying it could not tell who is there.
 root itself at seat0, a user install and `ROOMLERD_FILES_AS_SEAT_USER=0`
 are the daemon, both ways. Only root sets that switch, in the service's own
 environment (a systemd drop-in); remote config cannot reach it
@@ -587,6 +588,12 @@ check still builds no path from it. The viewer's own ids
 (`up-<base36>-<base36>`) are such names. A download's id (`files:get`,
 `files:get-folder`) names no path and is only echoed back. Pinned by
 `files::transfer_id_tests`, one test per entry.
+
+The files channel's handler (`peer::handle_files_control`, the download pumps
+and a folder download's walk) logs what a viewer sends (an id, a name, a path,
+a request id), and any error that may quote it, with Debug escaping (`?`), so a
+line break in it stays inside its own log line. Only an upload's id that passed
+`transfer_id` is logged as it is. Pinned by `peer::files_log_tests`.
 
 ### An enrollment token is spent once, through one owner (#3328)
 

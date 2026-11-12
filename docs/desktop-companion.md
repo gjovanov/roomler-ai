@@ -602,7 +602,7 @@ flowchart TD
 |---|---|---|
 | Who writes | `FsAs::Person` and `FsAs::Nobody` (`agents/roomlerd/src/files.rs:249-296`), chosen by `fs_as_for` (`:379`) when the process is LocalSystem | the person is read from their token (`win_identity::session_person`, `agents/roomlerd/src/win_identity.rs:308`), never from a name, which can name another account's folder |
 | How | `win_identity::as_person` (`agents/roomlerd/src/win_identity.rs:381`), on a blocking thread | it impersonates the session user's token after checking its SID is the person's; no token, another SID or a refused impersonation is an error, never a step as LocalSystem; a failed revert aborts |
-| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:713`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:6732`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:8254`): never the machine-global folder |
+| Their folder | `person_downloads_windows` (`agents/roomlerd/src/files.rs:713`) | the Downloads known folder for their token, read with `KF_FLAG_DONT_VERIFY`, local or redirected to a share: the write is theirs, made with their logon (the share is a lab read, #3048). None, or not a folder: their profile. The status card takes it as it is and probes nothing. The choice is a unit test on every OS (`person_downloads_windows_is_the_known_folder_else_the_profile`, `:6732`), and the worker's whole decision one in the Windows lane (`a_system_context_worker_takes_the_person_downloads_never_the_machine_folder`, `:8389`): never the machine-global folder |
 | The staging | `stager_for` (`:1899`) | the service's own `%PROGRAMDATA%` staging, as before (rc.22); the person needs no right to it |
 | The end | `place_across` (`:2350`) | no rename crosses from the service's folder into theirs, which would carry the staging file's permissions along: the data is copied into a new file the person creates, with their folder's permissions. A failed copy removes its half file and keeps the staging for a resume |
 | A resume | `resume_incoming_as` (`:2539`), `PartialMeta::person_sid` (`:1184`) | the file is placed only for the person the transfer began for; for anyone else it is refused. A partial from a daemon before #3048 goes to whoever is signed in |
@@ -698,22 +698,22 @@ flowchart TD
     Q -- "no" --> D["FsAs::Daemon, as before"]
     Q -- "yes" --> S{"who is at seat0?<br/>asked off the async worker, 1.5 s at most"}
     S -- "root" --> D
-    S -- "nobody: an empty seat,<br/>the login screen" --> N["FsAs::Nobody: refused<br/>before anything is touched"]
+    S -- "nobody: an empty seat, the login<br/>screen, a host with no logind" --> N["FsAs::Nobody: refused<br/>before anything is touched"]
     S -- "no answer in time,<br/>or the lookup failed" --> C["FsAs::CannotTell: refused,<br/>saying it could not tell"]
     S -- "a person" --> P["FsAs::Person: each step on a blocking thread<br/>with their fsuid, fsgid and groups,<br/>and no capability"]
     P --> H["every handle, a file's or a folder's,<br/>held to what was asked,<br/>off the kernel's own file systems"]
     H --> F["a file: the pump reads that handle"]
-    H --> Z["a folder download: before each folder,<br/>still their uid at seat0? Each folder listed<br/>through its handle, each file opened as them"]
+    H --> Z["a folder download: before each folder and<br/>each file, still their uid at seat0? Each folder<br/>listed through its handle, each file opened as them"]
     H --> G["a listing: resolved as them,<br/>listed through its handle"]
 ```
 
 | What | Where (`agents/roomlerd/src/files.rs`) | Why |
 |---|---|---|
 | Who reads | `FsAs::for_read` (`:422`) → `linux_fs_as` (`:822`), the function `FsAs::now` (`:400`) asks for a write | a read and a write cannot take different people. The person is seat0's (`seat_now`, `:747`, through `companion::seat0_account`, `agents/roomlerd/src/companion.rs:1240`, FR-97 P5a's rule), fixed when the request arrives. A name that resolves to another uid than the one logind recorded for the session is nobody (`seat_of`, `files.rs:763`): that account's rights are not the person's |
-| The lookup | `seat_within` (`:868`), `SEAT_LOOKUP_WAIT` (`:860`), `FsAs::CannotTell` (`:295`) | logind and the account database are other processes: the lookup runs on a blocking thread, never a stalled async worker, and waits 1.5 s. A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. A lookup that fails or runs out of time cannot tell who is there, and the read is refused with its own text, logged. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:1333`) |
+| The lookup | `seat_within` (`:868`), `SEAT_LOOKUP_WAIT` (`:860`), `FsAs::CannotTell` (`:295`) | logind and the account database are other processes: the lookup runs on a blocking thread, never a stalled async worker, and waits 1.5 s. A listing then waits for its own 3 s timeout, and the viewer's drawer gives up on `files:dir` after 5 s, so the two leave room inside it; `files:get` and `files:get-folder` have no timer of their own in the viewer. Only seat0's own answer is nobody (`companion::is_nobody_at_the_screen`, `agents/roomlerd/src/companion.rs:1361`), and so is a host with no logind at all, which has no seat: `loginctl` is not installed (`loginctl_did_not_start`, `companion.rs:1276`), or systemd did not boot the host (`loginctl_failed`, `:1292`). Any other lookup that fails, or one that runs out of time, cannot tell who is there, and the read is refused with its own text, logged |
 | How | `FsIdentity::begin_reading` (`agents/roomlerd/src/fs_identity.rs:233`), from `run_here` (`files.rs:635`) | §9.1's fsuid, fsgid and groups, and the thread's effective capabilities emptied for the step. An fsuid that is not 0 takes away only the file-system capabilities, and the rest would still answer for root wherever a check asks for one. The drop gives the capabilities back first (the groups' restore needs `CAP_SETGID`), then the identity, then the capabilities again, and checks all of it: a thread it cannot restore aborts the daemon |
 | The handles | `held_to_the_person` (`:3770`), `folder_held_to_the_person` (`:3782`), `folder_listing` (`:3662`), `KERNEL_FILE_SYSTEMS` (`:3744`) | inside the step, before a handle leaves it or anything is listed through it: never on one of the kernel's own file systems (procfs, sysfs, debugfs, tracefs, securityfs, efivarfs, bpf, pstore, configfs, cgroup, …: `fstatfs` on the handle, a file's or a folder's), and the kernel's own path for the handle must be the path asked for. A folder is opened first, checked so, and listed through that handle (`/proc/self/fd/N`), never through its path again. Some kernel files answer by who reads at `read()`, which the pump does as root, so the person's rights to them say nothing; and a link swapped in after the path was resolved is followed by the open, through a `/proc/<pid>/fd` link even onto a file or folder the daemon holds open |
-| A folder download, the person leaves | `FsAs::still_at_the_screen` (`:593`), `seat0_active_uid` (`:795`), `walk_and_zip` (`:3506`) | before each folder is listed, seat0's active uid (`ACTIVE_UID=` in `/run/systemd/seats/seat0`, logind's own record of the seat, as `sd-login` reads it) must still be the person's. Once it is not, or it does not read, the walk ends with `files:error`, never `files:eof` (§9.3's rule) |
+| A folder download, the person leaves | `FsAs::still_at_the_screen` (`:593`), `seat0_active_uid` (`:795`), `walk_and_zip` (`:3506`) | before each folder is listed and before each file is opened, seat0's active uid (`ACTIVE_UID=` in `/run/systemd/seats/seat0`, logind's own record of the seat, as `sd-login` reads it) must still be the person's. Once it is not, or it does not read, the walk ends with `files:error`, never `files:eof` (§9.3's rule) |
 | A received file, nobody at seat0 | `FsAs::DaemonAlone` (`:263`), `resolve_dest_path_as` (`:2956`), `FsAs::writer` (`:666`), `new_file` (`:1316`) | written as the daemon, as before, but neither a folder the controller chose nor the configured one (`files_dir`) is taken: the first is refused before it is touched, and the second is checked with no active home, so its `~` never resolves in root's. The upload lands in the default folder: FR-84 D4's rule for a privileged writer with nobody signed in (§9). Its partial and the partial's notes are created 0600 from the first byte, so the file is root's only (`root:root`, 0600) wherever it lands, a server's shared `/tmp` included. Nothing changes the mode after |
 
 - **Nobody at seat0** (an empty seat, the login screen, a server or a cluster node with no session
@@ -722,16 +722,19 @@ flowchart TD
   computer's screen to browse its files". The viewer shows either. Uploads still work, into the
   default folder, as files only root may read. The rule is the screen, not a sign-in: someone
   signed in over SSH is not at it.
-- **Who is at seat0 could not be told** (logind could not be asked, as on a host without it; the
-  account database did not answer; or the lookup took longer than 1.5 s): every read is refused
+- **A host with no logind at all** (no `loginctl`, or a host systemd did not boot: a container, WSL
+  without systemd, a minimal VM) has no seat0, so nobody is at its screen: its reads get the texts
+  above, never "Try again", and the switch below gives them back.
+- **Who is at seat0 could not be told** (logind did not answer, on a host that has it; the account
+  database did not answer; or the lookup took longer than 1.5 s): every read is refused
   with "Could not tell who is signed in at this computer's screen. Try again." A retry asks again.
   A lookup that ran out of time keeps going on its own thread, so the account database's own
   caches (SSSD's, nscd's) usually hold its answer by then. A received file takes the daemon alone,
   as with nobody there.
 - **A person who leaves seat0 during a folder download** (signs out, or the login screen or another
-  person takes seat0) ends it before its next folder with `files:error`, "the person this began for
-  is no longer signed in", never `files:eof`, as on Windows (§9.3). The files of the folder being
-  zipped when they left still go.
+  person takes seat0) ends it before its next file or folder with `files:error`, "the person this
+  began for is no longer signed in", never `files:eof`, as on Windows (§9.3). The file being zipped
+  when they left still goes.
 - **A file or folder Linux refuses to open for the person** (their own rights, or an LSM such as
   AppArmor or SELinux, which answers with the same code) is refused, as a download or a listing,
   with "`<path>`: Linux refused to open it for the person signed in at this computer's screen".
@@ -770,12 +773,14 @@ flowchart TD
   handle or to procfs, at the listing, a folder download's root and a folder of its walk
   (`a_folder_swapped_for_a_link_to_the_daemons_own_handle_is_not_listed`,
   `a_folder_swapped_for_a_link_to_a_kernel_file_system_is_not_listed`). It ends a folder download
-  whose person leaves seat0 with `files:error`
-  (`a_person_who_leaves_the_screen_mid_folder_ends_it_with_an_error_not_eof`), and receives a file
+  whose person leaves seat0 with `files:error`, at the next folder
+  (`a_person_who_leaves_the_screen_mid_folder_ends_it_with_an_error_not_eof`) and at the next file
+  (`a_person_who_leaves_the_screen_between_two_files_ends_it_at_the_next_file`), and receives a file
   with nobody at seat0 as root's, 0600, its partial included
   (`nobody_at_the_screen_receives_a_file_only_root_may_read`). The decision itself
   (`reads_take_whom_writes_take`, `a_seat0_name_that_resolves_to_another_uid_is_nobody`), a lookup
-  that cannot tell (`a_seat_that_cannot_be_told_is_not_nobody`) and its wait
+  that cannot tell (`a_seat_that_cannot_be_told_is_not_nobody`), a host with no logind
+  (`a_host_with_no_logind_has_nobody_at_the_screen`, in `companion` too) and the lookup's wait
   (`a_listing_waits_for_the_seat_inside_the_drawers_timer`), nobody's texts, seat0's own record
   (`seat0s_active_uid_is_logind_s_own_record`), the handle checks, and the default folder with nobody
   at seat0 (`nobody_at_the_screen_takes_no_folder_a_controller_chose`,
@@ -800,6 +805,8 @@ sudo systemctl restart roomlerd.service   # ends the sessions under way
   directions. Every controller allowed file transfer there then browses, downloads and receives
   files as root.
 - **To undo it**: remove the file, `sudo systemctl daemon-reload`, and restart the service.
+- **A host systemd did not boot** (a container, WSL without systemd) has no service to drop it
+  into: the same variable goes into the daemon's environment wherever root starts it.
 
 ## 10. Starting after install, and the Welcome flow
 
@@ -1101,7 +1108,7 @@ step differently:
 
 | OS | How the companion ships | What moves it with the daemon |
 |---|---|---|
-| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1404`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
+| Windows | a standalone EXE beside the daemon, in neither MSI | `refresh_if_stale` (`agents/roomlerd/src/companion.rs:1432`): at the start of the process that owns it (#1686), and from FR-117 P2 again every 4 h (`refresh_periodically`, `companion.rs:79`) |
 | macOS | inside the daemon's `.pkg` (`/Applications/Roomler.app`) | the same `.pkg`: one install moves both |
 | Linux | its own `.deb`, or `.rpm` (§10.1) | FR-117 P1: the root update owner moves the package (`companion/package_sync.rs`) |
 
