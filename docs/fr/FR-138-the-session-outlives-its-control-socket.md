@@ -663,7 +663,7 @@ The same read for every RED and GREEN, so that they compare.
 - [ ] **AC3, nothing leaks.** On each OS class the daemon's UDP socket count returns to its step-2 baseline within
   five minutes of each session's real end; every `detached` line is followed by one `resumed` or one `closed` line
   for the same session; no `peer close overran its budget` line names a kept peer.
-- [ ] **AC4, the server still decides.** In integration tests, and once in the field on a test guest: an admin's end,
+- [x] **AC4, the server still decides.** In integration tests, and once in the field on a test guest: an admin's end,
   the device's removal and the controller's removal from the org, each issued while the agent's socket is down, end
   the session within 5 s of the agent's next registration and never later than the window plus the close budget. A
   session nobody claims ends at the window as `agent_disconnect`. The person's Disconnect during the gap ends it at
