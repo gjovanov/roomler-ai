@@ -5715,6 +5715,27 @@ mod tests {
         );
     }
 
+    /// #3757 — a Mac's root half declines a session's `files` channel when no
+    /// GUI worker serves the session (`files::files_channel`), and its hello
+    /// still offers file transfer: the row is the one its worker serves
+    /// whenever someone is signed in at the screen, and the hub puts FILES in
+    /// a grant, which consent names, from these words at request time. A root
+    /// half's facts (no window-server session) take no file word away.
+    #[test]
+    fn a_macs_root_half_still_offers_file_transfer() {
+        use roomler_ai_remote_control::models::OsKind;
+        let root_half = HostFacts {
+            audio_backend: false,
+            mac_audio_refusal: Some(crate::audio_source::AudioUnavailableCode::NoSession),
+            clipboard_reachable: false,
+            layout_reachable: false,
+            ..p0c_facts(OsKind::Macos)
+        };
+        let caps = assigned_by_the_daemon(compute_caps(false, false), &root_half, &[], None);
+        assert!(caps.supports_file_transfer, "file transfer was taken away");
+        assert_eq!(caps.files, files_caps(), "the file words changed");
+    }
+
     // ─── FR-97 P0c — a word is a promise this host keeps ─────────────────
     // Each test below fails on master, where every one of these words was a
     // compile-time constant (the census before P0c, FR-97 §8).
