@@ -265,6 +265,45 @@ mod front_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// #3714 — each ticked box under Advanced options says what it does.
+    /// Auto-approve only drops this machine's own extra prompt: the
+    /// organization's consent policy still decides, the people it does not let
+    /// in are asked at the screen, and a notice with Disconnect shows while
+    /// someone views. The subnets box only suggests routes to the tunnel mesh,
+    /// which an administrator approves, so it sits with the tunnel's routes.
+    #[test]
+    fn the_advanced_boxes_say_what_they_do() {
+        let html = include_str!("front/index.html");
+        let from = html
+            .find("<details id=\"advanced-wrap\"")
+            .expect("the Advanced section");
+        let to = from + html[from..].find("</details>").expect("its end");
+        let advanced = one_line(&visible_text(&html[from..to]));
+        let mut wrong = Vec::new();
+        for said in [
+            "Trust the organization's consent policy (no extra prompt on this machine)",
+            "Everyone else is asked at this screen",
+            "a notice with Disconnect while someone is viewing",
+            "Suggest this machine's local networks as tunnel routes",
+            "until an administrator approves a route",
+        ] {
+            if !advanced.contains(said) {
+                wrong.push(format!("the Advanced section does not say {said:?}"));
+            }
+        }
+        if advanced.contains("Auto-approve") {
+            wrong.push("the Advanced section still says \"Auto-approve\"".into());
+        }
+        // The subnets box sits beside the tunnel field it adds to, after the
+        // overlay's routes, so it does not read as an overlay setting.
+        let at = |text: &str| advanced.find(text).unwrap_or(usize::MAX);
+        let subnets = at("Suggest this machine's local networks");
+        if !(at("Overlay subnet routes") < subnets && subnets < at("Tunnel subnet routes")) {
+            wrong.push("the subnets box is not beside \"Tunnel subnet routes\"".into());
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// `text` with every run of whitespace, line breaks included, as one space.
     fn one_line(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
