@@ -755,8 +755,7 @@ impl CaptureUnavailableCode {
                      therefore no screen to capture. Connect to this machine's user-session \
                      agent instead. Remote shell works here."
                 } else {
-                    "This host has no display to capture (headless, or no desktop session). \
-                     Remote shell and file transfer still work."
+                    no_display_hint(crate::files::follows_the_screen())
                 }
             }
             Self::NotBuilt => {
@@ -770,6 +769,41 @@ impl CaptureUnavailableCode {
             Self::WaylandNotEnabled => wayland_hint(running_as_root()),
             Self::X11NotEnabled => x11_hint(running_as_root()),
         }
+    }
+}
+
+/// #3711 — what a hint says of file transfer where it works only as the
+/// person signed in at the screen (`files::follows_the_screen`: a Linux
+/// system install, `docs/desktop-companion.md` §9.4): with nobody signed in
+/// there, it browses and sends nothing, and a received file is root's alone.
+/// A macro, so each hint stays one `&'static str`.
+///
+/// ⚠️ On the wire as a JSON literal, unescaped
+/// (`capture_unavailable_payload`): no double quote, no backslash.
+macro_rules! files_follow_the_screen {
+    () => {
+        "Remote shell still works. File transfer works as the person signed in at the \
+         screen: with nobody signed in there, this computer's files cannot be browsed or \
+         downloaded, and a file sent to it is kept where only root can read it."
+    };
+}
+
+/// [`files_follow_the_screen!`], for a sentence composed at run time
+/// (`apps::Unavailable::reason`).
+pub(crate) const FILES_FOLLOW_THE_SCREEN: &str = files_follow_the_screen!();
+
+/// The `no_display` sentence off macOS, which only Linux reaches. #3711 —
+/// with no display there may well be nobody at the screen, so where file
+/// transfer works only as the person signed in there, the hint says that.
+fn no_display_hint(follows_the_screen: bool) -> &'static str {
+    if follows_the_screen {
+        concat!(
+            "This host has no display to capture (headless, or no desktop session). ",
+            files_follow_the_screen!()
+        )
+    } else {
+        "This host has no display to capture (headless, or no desktop session). \
+         Remote shell and file transfer still work."
     }
 }
 
@@ -803,12 +837,33 @@ fn x11_hint(root: bool) -> &'static str {
         root,
         NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed),
         NO_LOCK_REPORT.load(std::sync::atomic::Ordering::Relaxed),
+        crate::files::follows_the_screen(),
     )
 }
 
 /// [`x11_hint`], with the last system plan's refusals passed in: "no
-/// surface", and (FR-113 D4) "the desktop does not report its lock".
-fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static str {
+/// surface", and (FR-113 D4) "the desktop does not report its lock". #3711 —
+/// and whether file transfer works only as the person signed in at the
+/// screen (`files::follows_the_screen`), which the login screen has nobody
+/// for. The first two find a person's desktop on screen, so it still works.
+fn x11_hint_with(
+    root: bool,
+    no_surface: bool,
+    no_lock_report: bool,
+    follows_the_screen: bool,
+) -> &'static str {
+    // The root sentence with nothing found, with either ending below.
+    macro_rules! not_captured {
+        () => {
+            "This computer is showing an X11 desktop that this system install does not capture \
+             by itself right now: nobody is signed in at the screen (the login screen is never \
+             captured by default), or automatic capture is switched off (wayland_auto), or a \
+             capture key is set. On the host an administrator can run sudo roomler config ls, \
+             clear wayland_auto and any capture key it shows as set (drm_capture, \
+             portal_capture, mutter_capture, window_capture) with sudo roomler config clear, \
+             then sudo roomler restart. "
+        };
+    }
     if root && no_lock_report {
         "This computer is showing an X11 desktop whose screen locker does not report a lock to \
          the system (GNOME and KDE do; this desktop does not), so a system install does not \
@@ -824,14 +879,13 @@ fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static
          drm_capture true and sudo roomler config set uinput true, then sudo roomler restart. \
          That capture reads the screen below the desktop, the lock screen included. Remote \
          shell and file transfer still work."
+    } else if root && follows_the_screen {
+        concat!(not_captured!(), files_follow_the_screen!())
     } else if root {
-        "This computer is showing an X11 desktop that this system install does not capture by \
-         itself right now: nobody is signed in at the screen (the login screen is never captured \
-         by default), or automatic capture is switched off (wayland_auto), or a capture key is \
-         set. On the host an administrator can run sudo roomler config ls, clear wayland_auto \
-         and any capture key it shows as set (drm_capture, portal_capture, mutter_capture, \
-         window_capture) with sudo roomler config clear, then sudo roomler restart. Remote shell \
-         and file transfer still work."
+        concat!(
+            not_captured!(),
+            "Remote shell and file transfer still work."
+        )
     } else {
         "This computer is showing an X11 desktop, and this agent was started without access to \
          it (no DISPLAY). Restart it from inside the desktop session, with roomler restart in a \
@@ -849,11 +903,29 @@ fn x11_hint_with(root: bool, no_surface: bool, no_lock_report: bool) -> &'static
 /// ⚠️ A hint goes on the wire as a JSON literal, unescaped
 /// (`capture_unavailable_payload`): no double quote, no backslash.
 fn wayland_hint(root: bool) -> &'static str {
-    wayland_hint_with(root, NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed))
+    wayland_hint_with(
+        root,
+        NO_SURFACE.load(std::sync::atomic::Ordering::Relaxed),
+        crate::files::follows_the_screen(),
+    )
 }
 
 /// [`wayland_hint`], with the last system plan's "no surface" passed in.
-fn wayland_hint_with(root: bool, no_surface: bool) -> &'static str {
+/// #3711 — and whether file transfer works only as the person signed in at
+/// the screen (`files::follows_the_screen`): a Wayland login screen reaches
+/// the keys-only sentence too, with nobody signed in. "No surface" finds a
+/// person's session on screen, so it still works there.
+fn wayland_hint_with(root: bool, no_surface: bool, follows_the_screen: bool) -> &'static str {
+    // The root keys-only sentence, with either ending below.
+    macro_rules! switched_off {
+        () => {
+            "This computer is showing a Wayland desktop, and capturing it is switched off on \
+             this device. On the host an administrator can run sudo roomler config set \
+             drm_capture true and sudo roomler config set uinput true, then sudo roomler \
+             restart. That capture reads the screen below the desktop, the lock screen \
+             included. "
+        };
+    }
     if root && no_surface {
         "This computer is showing a Wayland desktop, and it is not captured by itself because \
          nobody at the screen could be told they are being viewed: the session on screen has no \
@@ -862,12 +934,13 @@ fn wayland_hint_with(root: bool, no_surface: bool) -> &'static str {
          drm_capture true and sudo roomler config set uinput true, then sudo roomler restart. \
          That capture reads the screen below the desktop, the lock screen included. Remote \
          shell and file transfer still work."
+    } else if root && follows_the_screen {
+        concat!(switched_off!(), files_follow_the_screen!())
     } else if root {
-        "This computer is showing a Wayland desktop, and capturing it is switched off on this \
-         device. On the host an administrator can run sudo roomler config set drm_capture true \
-         and sudo roomler config set uinput true, then sudo roomler restart. That capture reads \
-         the screen below the desktop, the lock screen included. Remote shell and file transfer \
-         still work."
+        concat!(
+            switched_off!(),
+            "Remote shell and file transfer still work."
+        )
     } else {
         "This computer is showing a Wayland desktop, and capturing it is switched off on this \
          device. On the host, run roomler config clear wayland_auto, and roomler config clear for \
@@ -3719,9 +3792,9 @@ mod frame_tests {
 mod wayland_reason_tests {
     use super::CaptureUnavailableCode::{self, *};
     use super::{
-        MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code, wayland_hint,
-        wayland_not_enabled_detail, x11_hint, x11_hint_with, x11_not_enabled_detail,
-        xwayland_verdict,
+        FILES_FOLLOW_THE_SCREEN, MAC_PERMISSION_HINT, SeatKind, linux_no_pixels_code,
+        no_display_hint, wayland_hint, wayland_hint_with, wayland_not_enabled_detail, x11_hint,
+        x11_hint_with, x11_not_enabled_detail, xwayland_verdict,
     };
 
     fn seat(answer: Option<SeatKind>) -> impl FnOnce() -> Option<SeatKind> {
@@ -3909,20 +3982,20 @@ mod wayland_reason_tests {
     /// `no_display`.
     #[test]
     fn the_x11_hint_names_what_this_install_can_use() {
-        let no_surface = x11_hint_with(true, true, false);
+        let no_surface = x11_hint_with(true, true, false, true);
         assert!(no_surface.contains("X11 desktop"), "{no_surface}");
         assert!(no_surface.contains("being viewed"), "{no_surface}");
         assert!(no_surface.contains("desktop companion"), "{no_surface}");
-        let off = x11_hint_with(true, false, false);
+        let off = x11_hint_with(true, false, false, true);
         assert!(off.contains("sudo roomler config clear"), "{off}");
         assert!(off.contains("login screen"), "{off}");
         assert!(!off.contains("x11_auto_system"), "{off}");
-        let user = x11_hint_with(false, false, false);
+        let user = x11_hint_with(false, false, false, true);
         assert!(user.contains("DISPLAY"), "{user}");
         assert!(!user.contains("sudo"), "{user}");
         for (no_surface, no_lock_report) in [(true, false), (false, true), (true, true)] {
             assert_eq!(
-                x11_hint_with(false, no_surface, no_lock_report),
+                x11_hint_with(false, no_surface, no_lock_report, true),
                 user,
                 "the system half's refusals are not a per-user daemon's"
             );
@@ -3934,13 +4007,13 @@ mod wayland_reason_tests {
     /// operator's choice.
     #[test]
     fn an_unreported_lock_is_named_with_the_keys_that_read_it_anyway() {
-        let hint = x11_hint_with(true, false, true);
+        let hint = x11_hint_with(true, false, true, true);
         assert!(hint.contains("does not report a lock"), "{hint}");
         assert!(hint.contains("GNOME and KDE do"), "{hint}");
         assert!(hint.contains("drm_capture true"), "{hint}");
         assert!(hint.contains("the lock screen included"), "{hint}");
         assert_eq!(
-            x11_hint_with(true, true, true),
+            x11_hint_with(true, true, true, true),
             hint,
             "it outranks no surface"
         );
@@ -3966,13 +4039,18 @@ mod wayland_reason_tests {
         hints.push(wayland_hint(false));
         hints.push(x11_hint(true));
         hints.push(x11_hint(false));
-        for root in [true, false] {
-            for no_surface in [true, false] {
-                for no_lock_report in [true, false] {
-                    hints.push(x11_hint_with(root, no_surface, no_lock_report));
+        for follows in [true, false] {
+            hints.push(no_display_hint(follows));
+            for root in [true, false] {
+                for no_surface in [true, false] {
+                    hints.push(wayland_hint_with(root, no_surface, follows));
+                    for no_lock_report in [true, false] {
+                        hints.push(x11_hint_with(root, no_surface, no_lock_report, follows));
+                    }
                 }
             }
         }
+        hints.push(FILES_FOLLOW_THE_SCREEN);
         for hint in hints {
             assert!(
                 !hint
@@ -3980,6 +4058,75 @@ mod wayland_reason_tests {
                     .any(|c| c == '"' || c == '\\' || (c as u32) < 0x20),
                 "a hint would break the payload: {hint}"
             );
+        }
+    }
+
+    /// #3711 — a hint says what file transfer does here. Where it works only
+    /// as the person signed in at the screen (a Linux system install), the
+    /// sentences that may find nobody there (no display, the X11 and Wayland
+    /// ones with nothing found, the login screen among them) say so. Where a
+    /// person's desktop is on screen, or the install is a per-user one, or
+    /// the switch gives the daemon's identity back, it still works, in the
+    /// words the hints have always used.
+    #[test]
+    fn a_hint_says_what_file_transfer_does_here() {
+        const STILL: &str = "Remote shell and file transfer still work.";
+        assert!(
+            FILES_FOLLOW_THE_SCREEN.starts_with("Remote shell still works.")
+                && FILES_FOLLOW_THE_SCREEN.contains("cannot be browsed or downloaded")
+                && FILES_FOLLOW_THE_SCREEN.contains("only root can read"),
+            "{FILES_FOLLOW_THE_SCREEN}"
+        );
+        // May find nobody at the screen: the ending follows the install.
+        let maybe_nobody = |follows: bool| {
+            [
+                no_display_hint(follows),
+                x11_hint_with(true, false, false, follows),
+                wayland_hint_with(true, false, follows),
+            ]
+        };
+        for hint in maybe_nobody(true) {
+            assert!(hint.ends_with(FILES_FOLLOW_THE_SCREEN), "{hint}");
+            assert!(!hint.contains("file transfer still work"), "{hint}");
+        }
+        for hint in maybe_nobody(false) {
+            assert!(hint.ends_with(STILL), "{hint}");
+        }
+        // The switch off: each sentence exactly as it was.
+        assert_eq!(
+            no_display_hint(false),
+            "This host has no display to capture (headless, or no desktop session). \
+             Remote shell and file transfer still work."
+        );
+        assert_eq!(
+            x11_hint_with(true, false, false, false),
+            "This computer is showing an X11 desktop that this system install does not capture by \
+             itself right now: nobody is signed in at the screen (the login screen is never captured \
+             by default), or automatic capture is switched off (wayland_auto), or a capture key is \
+             set. On the host an administrator can run sudo roomler config ls, clear wayland_auto \
+             and any capture key it shows as set (drm_capture, portal_capture, mutter_capture, \
+             window_capture) with sudo roomler config clear, then sudo roomler restart. Remote shell \
+             and file transfer still work."
+        );
+        assert_eq!(
+            wayland_hint_with(true, false, false),
+            "This computer is showing a Wayland desktop, and capturing it is switched off on this \
+             device. On the host an administrator can run sudo roomler config set drm_capture true \
+             and sudo roomler config set uinput true, then sudo roomler restart. That capture reads \
+             the screen below the desktop, the lock screen included. Remote shell and file transfer \
+             still work."
+        );
+        // A person's desktop on screen, or a per-user daemon: still works.
+        for follows in [true, false] {
+            for hint in [
+                x11_hint_with(true, true, false, follows),
+                x11_hint_with(true, false, true, follows),
+                wayland_hint_with(true, true, follows),
+                x11_hint_with(false, false, false, follows),
+                wayland_hint_with(false, false, follows),
+            ] {
+                assert!(hint.ends_with(STILL), "{hint}");
+            }
         }
     }
 
@@ -4180,17 +4327,17 @@ mod system_auto_tests {
             system_plan(true, true, BOTH, false, false, alice(), told(false)),
             SystemPlan::NoSurface
         );
-        let hint = wayland_hint_with(true, true);
+        let hint = wayland_hint_with(true, true, true);
         assert!(hint.contains("being viewed"), "{hint}");
         assert!(hint.contains("desktop companion"), "{hint}");
         assert!(hint.contains("drm_capture"), "{hint}");
         assert!(
-            !wayland_hint_with(true, false).contains("being viewed"),
+            !wayland_hint_with(true, false, true).contains("being viewed"),
             "the keys-only hint stays as it was"
         );
         assert_eq!(
-            wayland_hint_with(false, true),
-            wayland_hint_with(false, false),
+            wayland_hint_with(false, true, true),
+            wayland_hint_with(false, false, true),
             "a per-user install's hint is not the system half's"
         );
     }

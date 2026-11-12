@@ -245,11 +245,9 @@ impl Unavailable {
                                (`[virtual_desktop_apps] enabled = false` in its config). \
                                Enable them there and restart the daemon."
                 .to_string(),
-            Self::NoSession { detail } => format!(
-                "No active graphical login session on this host — nobody is at its screen — \
-                 so there is no desktop to list windows on or launch into. Remote shell and \
-                 file transfer still work. ({detail})"
-            ),
+            Self::NoSession { detail } => {
+                no_session_reason(detail, crate::files::follows_the_screen())
+            }
             Self::NoXDisplay { user, tried } => format!(
                 "{user} has a graphical session but no X display on it answered (tried {}): \
                  a Wayland compositor without Xwayland. This backend lists and focuses X11 \
@@ -283,6 +281,21 @@ impl Unavailable {
     pub fn to_json(&self) -> Value {
         json!({ "code": self.code(), "reason": self.reason() })
     }
+}
+
+/// The `no_session` sentence. #3711 — nobody is at the screen, so where file
+/// transfer works only as the person signed in there (a Linux system install,
+/// `files::follows_the_screen`), it says that instead of "still work".
+fn no_session_reason(detail: &str, follows_the_screen: bool) -> String {
+    let files = if follows_the_screen {
+        crate::capture::FILES_FOLLOW_THE_SCREEN
+    } else {
+        "Remote shell and file transfer still work."
+    };
+    format!(
+        "No active graphical login session on this host — nobody is at its screen — so there \
+         is no desktop to list windows on or launch into. {files} ({detail})"
+    )
 }
 
 pub trait WindowManager: Send + Sync {
@@ -1091,6 +1104,29 @@ mod tests {
         assert_eq!(reply["unavailable"]["code"], "no_session");
         let reason = reply["unavailable"]["reason"].as_str().unwrap();
         assert!(reason.contains("no active graphical session"), "{reason}");
+    }
+
+    /// #3711 — with nobody at the screen, a Linux system install's file
+    /// transfer works only as the person signed in there, and the reason says
+    /// so; every other install keeps "still work", word for word.
+    #[test]
+    fn no_session_says_what_file_transfer_does_here() {
+        let system = no_session_reason("no active graphical session", true);
+        assert!(
+            system.contains(crate::capture::FILES_FOLLOW_THE_SCREEN),
+            "{system}"
+        );
+        assert!(!system.contains("file transfer still work"), "{system}");
+        assert!(
+            system.ends_with("(no active graphical session)"),
+            "{system}"
+        );
+        assert_eq!(
+            no_session_reason("no active graphical session", false),
+            "No active graphical login session on this host — nobody is at its screen — so there \
+             is no desktop to list windows on or launch into. Remote shell and file transfer still \
+             work. (no active graphical session)"
+        );
     }
 
     /// FR-56 AC10 — every refusal arm names its reason on every verb, so a

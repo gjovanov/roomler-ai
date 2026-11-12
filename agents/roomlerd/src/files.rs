@@ -273,6 +273,9 @@ fn process_home() -> Option<String> {
 /// the configured one ([`FsAs::DaemonAlone`]).
 /// `ROOMLERD_FILES_AS_SEAT_USER=0` gives back the daemon's identity both
 /// ways.
+///
+/// #3711 — a received file asks who is at seat0 as a read does, off the
+/// async worker and [`SEAT_LOOKUP_WAIT`] at most ([`FsAs::for_write`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FsAs {
     /// This process: every user install, a Mac's GUI worker (its system
@@ -315,10 +318,12 @@ pub(crate) enum FsAs {
     /// a read) nobody at seat0 (#3688): every read is refused, saying so.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     Nobody,
-    /// (Linux root, a read) who is at seat0 could not be told (#3688): the
-    /// lookup failed or ran out of its time. Every read is refused with
-    /// [`CANNOT_TELL`], never as if nobody were there. Only a read takes it;
-    /// a received file then takes [`Self::DaemonAlone`], as with nobody.
+    /// (Linux root) who is at seat0 could not be told (#3688): the lookup
+    /// failed or ran out of its time. Every read is refused with
+    /// [`CANNOT_TELL`], never as if nobody were there. #3711 — so is a
+    /// received file whose lookup ran out of its time ([`Seat::OutOfTime`]);
+    /// one whose lookup failed outright takes [`Self::DaemonAlone`], as with
+    /// nobody.
     #[cfg(target_os = "linux")]
     CannotTell,
 }
@@ -347,6 +352,8 @@ const NOBODY_AT_THE_SCREEN: &str = "Nobody is signed in at this computer's scree
 /// #3688 — why a read is refused on a Linux system install when who is at
 /// seat0 could not be told: the seat0 lookup failed, or did not answer in
 /// time ([`SEAT_LOOKUP_WAIT`]). Not nobody: a retry may well find them.
+/// #3711 — and why a received file is refused when the lookup did not
+/// answer in time.
 #[cfg(target_os = "linux")]
 const CANNOT_TELL: &str = "Could not tell who is signed in at this computer's screen. Try again.";
 
@@ -424,7 +431,10 @@ fn fs_as_for(
 }
 
 impl FsAs {
-    /// Who a transfer starting now writes as.
+    /// Who a transfer starting now writes as, asked on a blocking thread:
+    /// `ConfigSet`'s check of `files_dir` and the status refresh's own
+    /// thread. On a Linux system install it asks seat0 inline, with no time
+    /// limit. #3711 — an async task asks [`Self::for_write`] instead.
     pub(crate) fn now() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -454,27 +464,47 @@ impl FsAs {
         }
         #[cfg(target_os = "linux")]
         {
-            let (root, switch_on) = linux_process();
-            if !(root && switch_on) {
-                return Self::Daemon;
-            }
-            // Asked here, on the thread a test stood it in on.
-            #[cfg(test)]
-            let stood_in = stand_in::seat_now();
-            // Off the async worker, and bounded: logind and the account
-            // database are other processes, and either may hang.
-            let seat = seat_within(SEAT_LOOKUP_WAIT, move || {
-                #[cfg(test)]
-                if let Some(seat) = stood_in {
-                    return seat;
-                }
-                seat_now()
-            })
-            .await;
-            linux_fs_as(root, switch_on, true, move || seat)
+            Self::at_seat0(true).await
         }
         #[cfg(not(target_os = "linux"))]
         Self::session_or_daemon()
+    }
+
+    /// #3711 — who a transfer starting now writes as, asked from an async
+    /// task (`files:begin`, `files:resume`, the startup sweep). On a Linux
+    /// system install the seat0 lookup runs as a read's does, on a blocking
+    /// thread and [`SEAT_LOOKUP_WAIT`] at most. One that gives no answer in
+    /// that time refuses the write as a read is refused
+    /// ([`Self::CannotTell`]); one that failed outright leaves the file the
+    /// daemon's alone, as with nobody at seat0 ([`linux_fs_as`]). Windows
+    /// and macOS answer as [`Self::now`] does.
+    pub(crate) async fn for_write() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::at_seat0(false).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        Self::session_or_daemon()
+    }
+
+    /// #3688, #3711 — who a read, or a write, starting now acts as on Linux,
+    /// from this process and who is at seat0 ([`linux_fs_as_within`]). A
+    /// test stands in the lookup on its thread (`stand_in::seat`,
+    /// `stand_in::seat_asked`).
+    #[cfg(target_os = "linux")]
+    async fn at_seat0(reading: bool) -> Self {
+        let (root, switch_on) = linux_process();
+        // Asked here, on the thread a test stood it in on.
+        #[cfg(test)]
+        let stood_in = stand_in::lookup_now();
+        linux_fs_as_within(root, switch_on, reading, SEAT_LOOKUP_WAIT, move || {
+            #[cfg(test)]
+            if let Some(lookup) = stood_in {
+                return lookup();
+            }
+            seat_now()
+        })
+        .await
     }
 
     /// #3048 — on Windows, the person signed in to this process's session
@@ -788,8 +818,12 @@ enum Seat {
     /// that resolves to another uid than logind's, a host with no logind.
     Nobody(String),
     /// Not known, and why: logind did not answer, the account database
-    /// did not answer, or the lookup failed or ran out of its time.
+    /// did not answer, or the lookup failed outright.
     CannotTell(String),
+    /// #3711 — not known yet: the lookup gave no answer within its wait
+    /// ([`seat_within`]) and goes on, on its own thread, so the account
+    /// database's own caches usually hold its answer for the next one.
+    OutOfTime(std::time::Duration),
 }
 
 /// Who is at seat0 now, by FR-97 P5a's rule (`companion::seat0_account`).
@@ -866,6 +900,24 @@ fn linux_process() -> (bool, bool) {
     (root, tunnel_core::env::flag("FILES_AS_SEAT_USER", true))
 }
 
+/// #3711 — whether file transfer here moves files only as the person signed
+/// in at the screen: a Linux system install (root) with
+/// `ROOMLERD_FILES_AS_SEAT_USER` on, its default ([`FsAs`]). With nobody
+/// signed in there it browses and sends nothing, and a received file is
+/// root's alone. A hint that says what still works with no picture says so
+/// (`capture::CaptureUnavailableCode::hint`, `apps::Unavailable::reason`).
+pub(crate) fn follows_the_screen() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let (root, switch_on) = linux_process();
+        root && switch_on
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// #3688 — who a step starting now acts as on Linux, from whether this
 /// process is root, the switch, and who is at seat0, which is asked only
 /// when it is needed. Pure, so the decision is a test.
@@ -887,6 +939,17 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             tracing::debug!(%why, "files: nobody at seat0 — a read is refused");
             FsAs::Nobody
         }
+        // #3711 — no answer in time: refused both ways, and a retry asks
+        // again. The lookup goes on and usually finds the person, so a
+        // received file is not written for anyone else meanwhile.
+        Seat::OutOfTime(wait) => {
+            tracing::debug!(
+                ?wait,
+                reading,
+                "files: who is at seat0 is not known yet — refused"
+            );
+            FsAs::CannotTell
+        }
         Seat::CannotTell(why) if reading => {
             tracing::debug!(%why, "files: who is at seat0 is not known — a read is refused");
             FsAs::CannotTell
@@ -895,6 +958,10 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
             tracing::debug!(%why, "files: nobody at seat0 — a write is the daemon's");
             FsAs::DaemonAlone
         }
+        // A lookup that failed outright: a write has a safe answer, the
+        // daemon alone (root's own default folder, 0600, never a folder a
+        // controller chose), so a host whose lookup always fails keeps its
+        // uploads. A read has none: as root it would read what root may.
         Seat::CannotTell(why) => {
             tracing::debug!(%why, "files: who is at seat0 is not known — a write is the daemon's");
             FsAs::DaemonAlone
@@ -902,19 +969,42 @@ fn linux_fs_as(root: bool, switch_on: bool, reading: bool, seat: impl FnOnce() -
     }
 }
 
+/// #3688, #3711 — [`linux_fs_as`] from an async task, a read's or a write's:
+/// `lookup` is asked only when it is needed (a root daemon, the switch on),
+/// on a blocking thread and `wait` at most ([`seat_within`]). logind and the
+/// account database are other processes, and either may hang.
+#[cfg(target_os = "linux")]
+async fn linux_fs_as_within(
+    root: bool,
+    switch_on: bool,
+    reading: bool,
+    wait: std::time::Duration,
+    lookup: impl FnOnce() -> Seat + Send + 'static,
+) -> FsAs {
+    if !(root && switch_on) {
+        return FsAs::Daemon;
+    }
+    let seat = seat_within(wait, lookup).await;
+    linux_fs_as(root, switch_on, reading, move || seat)
+}
+
 /// #3688 — how long a read waits for the seat0 lookup. A listing waits for
 /// it and then for its own timeout ([`DIR_LIST_TIMEOUT_SECS`], 3 s), and the
 /// viewer's drawer gives up on `files:dir` after 5 s, so the two together
 /// must leave room inside that. `files:get` and `files:get-folder` have no
 /// timer of their own in the viewer: their wait only delays the offer.
+/// #3711 — a received file's lookup waits as long, at `files:begin`,
+/// `files:resume` (which the viewer gives 10 s) and the startup sweep (which
+/// signalling waits for).
 #[cfg(target_os = "linux")]
 const SEAT_LOOKUP_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// #3688 — `lookup` on a blocking thread, given `wait` at most: a wedged
-/// logind or account lookup cannot tell who is at the screen, and never
-/// stalls an async worker. A lookup past its time finishes on its own
+/// logind or account lookup never stalls an async worker. One that fails
+/// cannot tell who is at the screen ([`Seat::CannotTell`]); #3711 — one past
+/// its time does not know yet ([`Seat::OutOfTime`]), and finishes on its own
 /// thread, so the account database's own caches (SSSD's, nscd's) hold its
-/// answer for the next read's lookup.
+/// answer for the next lookup.
 #[cfg(target_os = "linux")]
 async fn seat_within(
     wait: std::time::Duration,
@@ -923,15 +1013,15 @@ async fn seat_within(
     match tokio::time::timeout(wait, tokio::task::spawn_blocking(lookup)).await {
         Ok(Ok(seat)) => seat,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "files: the seat0 lookup failed — a read is refused");
+            tracing::warn!(error = %e, "files: the seat0 lookup failed — who is at seat0 is not known");
             Seat::CannotTell(format!("the seat0 lookup failed: {e}"))
         }
         Err(_) => {
             tracing::warn!(
                 ?wait,
-                "files: the seat0 lookup did not answer in time — a read is refused"
+                "files: the seat0 lookup did not answer in time — who is at seat0 is not known yet"
             );
-            Seat::CannotTell(format!("the seat0 lookup did not answer within {wait:?}"))
+            Seat::OutOfTime(wait)
         }
     }
 }
@@ -1453,8 +1543,11 @@ pub async fn sweep_orphans() -> (usize, usize) {
     // walk the default folder AND the configured one (when set, usable and
     // different), so a `files_dir` change strands no resumable upload.
     // FR-97 P3d — for, and as, whoever a drop would be written as now: on a
-    // Linux system install, the person at seat0, in their own folder.
-    let who = FsAs::now();
+    // Linux system install, the person at seat0, in their own folder. #3711 —
+    // signalling waits for this sweep, so that is asked off the async worker
+    // and waited for 1.5 s at most; with no answer in time, nothing is swept
+    // this start.
+    let who = FsAs::for_write().await;
     let w = who.clone();
     let (roots, private) = who
         .run(move || {
@@ -2028,8 +2121,15 @@ impl FilesHandler {
     ) -> Result<PathBuf> {
         // FR-97 P3d — who this transfer writes as, for its whole life: on a
         // Linux system install the person at seat0, in their own folder.
-        self.begin_as(FsAs::now(), id, name, expected, rel_path, dest_path)
-            .await
+        self.begin_as(
+            FsAs::for_write().await,
+            id,
+            name,
+            expected,
+            rel_path,
+            dest_path,
+        )
+        .await
     }
 
     /// [`Self::begin`] as an explicit identity: the seam the root-only tests
@@ -2736,7 +2836,7 @@ impl FilesHandler {
     /// when the agent's on-disk size is smaller than what the
     /// browser thinks it acked (B3 fix in the rc.19 plan).
     pub async fn resume_incoming(&self, id: &str, requested_offset: u64) -> Result<u64> {
-        self.resume_incoming_as(FsAs::now(), id, requested_offset)
+        self.resume_incoming_as(FsAs::for_write().await, id, requested_offset)
             .await
     }
 
@@ -4938,13 +5038,21 @@ pub(crate) mod stand_in {
 
     /// #3688 — who is at seat0, stood in on one thread: the seat the
     /// lookup answers, and how many more times a folder download finds them
-    /// still there (`None`: always).
+    /// still there (`None`: always). #3711 — or the lookup itself
+    /// ([`seat_asked`]), run where the real one runs.
     #[cfg(target_os = "linux")]
     struct StoodSeat {
         thread: std::thread::ThreadId,
         seat: Seat,
         stays_for: Option<u32>,
+        asked: Option<Asked>,
     }
+
+    /// #3711 — a seat0 lookup stood in: it runs on whatever thread the real
+    /// one would, so a test sees which thread that is, and how long its
+    /// caller waits for it.
+    #[cfg(target_os = "linux")]
+    type Asked = std::sync::Arc<dyn Fn() -> Seat + Send + Sync>;
 
     #[cfg(target_os = "linux")]
     static SEAT: Mutex<Option<StoodSeat>> = Mutex::new(None);
@@ -4978,6 +5086,23 @@ pub(crate) mod stand_in {
         stand(seat, Some(checks)).await
     }
 
+    /// #3711 — stand `lookup` in for the seat0 lookup itself, on this thread
+    /// only: `FsAs::for_read()` and `FsAs::for_write()` run it where they run
+    /// the real one, and decide from what it answers, if it answers in time.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn seat_asked(
+        lookup: impl Fn() -> Seat + Send + Sync + 'static,
+    ) -> SeatStoodIn {
+        let turn = TURN.lock().await;
+        *SEAT.lock().unwrap_or_else(PoisonError::into_inner) = Some(StoodSeat {
+            thread: std::thread::current().id(),
+            seat: Seat::CannotTell("a stood-in lookup".into()),
+            stays_for: None,
+            asked: Some(std::sync::Arc::new(lookup)),
+        });
+        SeatStoodIn { _turn: turn }
+    }
+
     #[cfg(target_os = "linux")]
     async fn stand(seat: Seat, stays_for: Option<u32>) -> SeatStoodIn {
         let turn = TURN.lock().await;
@@ -4985,17 +5110,29 @@ pub(crate) mod stand_in {
             thread: std::thread::current().id(),
             seat,
             stays_for,
+            asked: None,
         });
         SeatStoodIn { _turn: turn }
     }
 
-    /// The seat stood in for this thread, if there is one.
+    /// The seat0 lookup stood in for this thread, if there is one: a seat
+    /// stood in answers at once; a lookup stood in ([`seat_asked`]) runs.
     #[cfg(target_os = "linux")]
-    pub(super) fn seat_now() -> Option<Seat> {
+    pub(super) fn lookup_now() -> Option<Box<dyn FnOnce() -> Seat + Send>> {
         let held = SEAT.lock().unwrap_or_else(PoisonError::into_inner);
-        held.as_ref()
-            .filter(|stood| stood.thread == std::thread::current().id())
-            .map(|stood| stood.seat.clone())
+        let stood = held
+            .as_ref()
+            .filter(|stood| stood.thread == std::thread::current().id())?;
+        Some(match &stood.asked {
+            Some(asked) => {
+                let asked = asked.clone();
+                Box::new(move || asked())
+            }
+            None => {
+                let seat = stood.seat.clone();
+                Box::new(move || seat)
+            }
+        })
     }
 
     /// #3688 — seat0's active uid as a folder download finds it, stood in
@@ -5016,7 +5153,7 @@ pub(crate) mod stand_in {
         Some(match &stood.seat {
             Seat::Person { account, .. } => Some(account.uid),
             Seat::Root => Some(0),
-            Seat::Nobody(_) | Seat::CannotTell(_) => None,
+            Seat::Nobody(_) | Seat::CannotTell(_) | Seat::OutOfTime(_) => None,
         })
     }
 
@@ -8368,6 +8505,130 @@ mod seat_user_tests {
             assert_eq!(mode, (0o600, 0, 0), "the file");
         }
 
+        /// #3711 — at each entry point that asks who a received file is
+        /// written as (`files:begin`, `files:resume`, the startup sweep), the
+        /// seat0 lookup runs off the async worker and is waited for
+        /// [`SEAT_LOOKUP_WAIT`] at most. One that gives no answer in that time
+        /// refuses the upload and the resume in the read's words, and the
+        /// sweep sweeps nothing: nothing is touched, root's own default folder
+        /// included. A current-thread runtime has one worker, this test's own
+        /// thread.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_lookup_past_its_time_refuses_a_received_file_at_every_entry_point() {
+            const CANNOT_TELL: &str =
+                "Could not tell who is signed in at this computer's screen. Try again.";
+            if !root() {
+                return;
+            }
+            // The drop folder, which is process-wide and which a test beside
+            // this one sets.
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            // Root's own home, stood in: never the real `/root/Downloads`.
+            let home = super::own_staging::OwnHome::new(false, true);
+            let worker = std::thread::current().id();
+            let asked_on = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _asked = stand_in::seat_asked({
+                let asked_on = asked_on.clone();
+                move || {
+                    asked_on.lock().unwrap().push(std::thread::current().id());
+                    std::thread::sleep(SEAT_LOOKUP_WAIT * 2);
+                    Seat::Nobody("seat0 has no active session".into())
+                }
+            })
+            .await;
+            let off_the_worker = |what: &str| {
+                let asked = asked_on.lock().unwrap().clone();
+                assert!(
+                    !asked.is_empty() && asked.iter().all(|on| *on != worker),
+                    "{what}: a lookup ran on the async worker ({asked:?}, worker {worker:?})"
+                );
+            };
+            let bound = SEAT_LOOKUP_WAIT + std::time::Duration::from_secs(1);
+            let h = FilesHandler::new();
+            let pid = std::process::id();
+
+            let began = std::time::Instant::now();
+            let begun = h
+                .begin(format!("late-b-{pid}"), "late.txt".into(), 1, None, None)
+                .await;
+            let waited = began.elapsed();
+            off_the_worker("files:begin");
+            assert!(waited < bound, "files:begin waited {waited:?}");
+            assert_eq!(
+                format!("{}", begun.expect_err("files:begin with no answer in time")),
+                CANNOT_TELL
+            );
+
+            let began = std::time::Instant::now();
+            let resumed = h.resume_incoming(&format!("late-r-{pid}"), 0).await;
+            let waited = began.elapsed();
+            off_the_worker("files:resume");
+            assert!(waited < bound, "files:resume waited {waited:?}");
+            assert_eq!(
+                format!(
+                    "{}",
+                    resumed.expect_err("files:resume with no answer in time")
+                ),
+                CANNOT_TELL
+            );
+
+            let began = std::time::Instant::now();
+            let swept = sweep_orphans().await;
+            let waited = began.elapsed();
+            off_the_worker("the startup sweep");
+            assert!(waited < bound, "the startup sweep waited {waited:?}");
+            assert_eq!(swept, (0, 0), "nothing swept");
+
+            assert_eq!(asked_on.lock().unwrap().len(), 3, "each asked once");
+            assert!(
+                !home.downloads().exists(),
+                "nothing was made in root's own default folder"
+            );
+        }
+
+        /// #3711 — the control: a lookup that answers in time still gives a
+        /// received file to the person at seat0 through `files:begin` itself
+        /// (FR-97 P3d), and it too runs off the async worker.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_lookup_in_time_still_receives_the_file_as_the_person() {
+            if !root() {
+                return;
+            }
+            // No folder chosen: the drop folder, which is process-wide and
+            // which a test beside this one sets.
+            let _lock = FILES_DIR_TEST_LOCK.lock().await;
+            let (home, person) = nobodys_home();
+            let worker = std::thread::current().id();
+            let asked_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let seat = at_the_screen(&person, home.path());
+            let _asked = stand_in::seat_asked({
+                let asked_on = asked_on.clone();
+                move || {
+                    *asked_on.lock().unwrap() = Some(std::thread::current().id());
+                    seat.clone()
+                }
+            })
+            .await;
+            let h = FilesHandler::new();
+            let id = format!("in-time-{}", std::process::id());
+            h.begin(id.clone(), "in-time.txt".into(), 5, None, None)
+                .await
+                .expect("files:begin as the person");
+            h.chunk(b"hello").await.expect("chunk");
+            let (path, bytes) = h.end(&id).await.expect("end");
+            let md = std::fs::metadata(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(bytes, 5);
+            assert!(path.starts_with(home.path()), "in their home: {path:?}");
+            assert_eq!(
+                (md.uid(), md.gid()),
+                (person.uid, person.gid),
+                "born the person's"
+            );
+            let asked_on = asked_on.lock().unwrap().expect("the lookup was asked");
+            assert_ne!(asked_on, worker, "the lookup ran on the async worker");
+        }
+
         /// The file is born the person's, in their folder, and nothing of the
         /// staging is left. 0.4.143 wrote it `root:root` into `/tmp` (FR-97
         /// §8, P3d's red).
@@ -8657,9 +8918,11 @@ mod seat_user_tests {
 
     /// #3688 — a seat0 lookup that fails or runs out of time is not nobody at
     /// the screen: who is there is not known, and a read says so in its own
-    /// words, never that nobody is signed in. A received file takes the
-    /// daemon alone, as with nobody there. The states that are nobody (an
-    /// empty seat, the login screen) keep their texts.
+    /// words, never that nobody is signed in. #3711 — a received file whose
+    /// lookup failed takes the daemon alone, as with nobody there; one whose
+    /// lookup gave no answer in time is refused in the read's words. The
+    /// states that are nobody (an empty seat, the login screen) keep their
+    /// texts.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_seat_that_cannot_be_told_is_not_nobody() {
@@ -8671,10 +8934,7 @@ mod seat_user_tests {
             Seat::Root
         })
         .await;
-        assert!(
-            matches!(slow, Seat::CannotTell(_)),
-            "a lookup past its time: {slow:?}"
-        );
+        assert_eq!(slow, Seat::OutOfTime(wait), "a lookup past its time");
         let broke = seat_within(std::time::Duration::from_secs(5), || -> Seat {
             panic!("a seat0 lookup that fails")
         })
@@ -8714,16 +8974,33 @@ mod seat_user_tests {
             matches!(unresolved, Seat::CannotTell(_)),
             "an account the database did not answer: {unresolved:?}"
         );
-        let unknown = || Seat::CannotTell("the seat0 lookup did not answer".into());
+        let failed = || {
+            Seat::CannotTell(
+                "loginctl show-seat seat0 failed: Unit dbus-org.freedesktop.login1.service is \
+                 masked."
+                    .into(),
+            )
+        };
         assert_eq!(
-            linux_fs_as(true, true, true, unknown),
+            linux_fs_as(true, true, true, failed),
             FsAs::CannotTell,
-            "a read"
+            "a failed lookup: a read is refused"
         );
         assert_eq!(
-            linux_fs_as(true, true, false, unknown),
+            linux_fs_as(true, true, false, failed),
             FsAs::DaemonAlone,
-            "a write"
+            "a failed lookup: a write is the daemon's, alone"
+        );
+        let late = || Seat::OutOfTime(SEAT_LOOKUP_WAIT);
+        assert_eq!(
+            linux_fs_as(true, true, true, late),
+            FsAs::CannotTell,
+            "no answer in time: a read is refused"
+        );
+        assert_eq!(
+            linux_fs_as(true, true, false, late),
+            FsAs::CannotTell,
+            "no answer in time: a write is refused too"
         );
 
         let temp = tempfile::tempdir().unwrap();
@@ -8732,6 +9009,13 @@ mod seat_user_tests {
         let folder = temp.path().to_string_lossy().into_owned();
         let h = FilesHandler::new();
         let who = FsAs::CannotTell;
+        let Err(begun) = h
+            .begin_as(who.clone(), "c3711-1".into(), "x.txt".into(), 1, None, None)
+            .await
+        else {
+            panic!("a received file began with no one known at the screen");
+        };
+        assert_eq!(format!("{begun}"), CANNOT_TELL, "files:begin");
         let Err(get) = h
             .begin_outgoing_as(who.clone(), "c3688-1".into(), &file.to_string_lossy())
             .await
@@ -8756,6 +9040,65 @@ mod seat_user_tests {
             };
             assert_eq!(format!("{dir}"), CANNOT_TELL, "files:dir {path:?}");
         }
+    }
+
+    /// #3711 — a received file's seat0 lookup is asked as a read's is: on a
+    /// blocking thread, never the async worker, and given its wait at most.
+    /// One that gives no answer in that time refuses the write in the read's
+    /// words, before anything is touched. A current-thread runtime has one
+    /// worker, this test's own thread: a lookup run inline would run there,
+    /// and hold the whole runtime for as long as it took.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_seat0_lookup_past_its_time_refuses_a_write_as_it_refuses_a_read() {
+        const CANNOT_TELL: &str =
+            "Could not tell who is signed in at this computer's screen. Try again.";
+        let worker = std::thread::current().id();
+        let wait = std::time::Duration::from_millis(100);
+        let lookup_takes = std::time::Duration::from_secs(3);
+        for reading in [false, true] {
+            let asked_on = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let slow = {
+                let asked_on = asked_on.clone();
+                move || {
+                    *asked_on.lock().unwrap() = Some(std::thread::current().id());
+                    std::thread::sleep(lookup_takes);
+                    Seat::Root
+                }
+            };
+            let began = std::time::Instant::now();
+            let who = linux_fs_as_within(true, true, reading, wait, slow).await;
+            let waited = began.elapsed();
+            // The lookup's thread names itself as it starts.
+            let asked_on = (0..500)
+                .find_map(|_| {
+                    let on = *asked_on.lock().unwrap();
+                    if on.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    on
+                })
+                .expect("the lookup was asked");
+            assert_ne!(
+                asked_on, worker,
+                "reading {reading}: the lookup ran on the async worker"
+            );
+            assert!(
+                waited < wait + std::time::Duration::from_secs(1),
+                "reading {reading}: waited {waited:?} for a lookup given {wait:?}"
+            );
+            assert_eq!(who, FsAs::CannotTell, "reading {reading}");
+            assert_eq!(who.refusal(), Some(CANNOT_TELL), "reading {reading}");
+        }
+        // The controls: inside its wait the lookup's answer stands, and a
+        // lookup that failed outright leaves a write the daemon's, alone.
+        let in_time = linux_fs_as_within(true, true, false, lookup_takes, || Seat::Root).await;
+        assert_eq!(in_time, FsAs::Daemon, "root at the screen, in time");
+        let failed = linux_fs_as_within(true, true, false, lookup_takes, || {
+            Seat::CannotTell("getpwnam_r(ana): the account database did not answer".into())
+        })
+        .await;
+        assert_eq!(failed, FsAs::DaemonAlone, "a failed lookup, a write");
     }
 
     /// #3688 — seat0's active uid is read from logind's own record of the

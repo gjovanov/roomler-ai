@@ -65,7 +65,7 @@ Three properties of the wire are load-bearing:
   handing it to `wmctrl -i -a` so a crafted id cannot become a flag
   (`agents/roomlerd/src/apps/linux.rs:461`).
 - 🔑 **Launch takes a key, never a command.** `resolve_app`
-  (`agents/roomlerd/src/apps/mod.rs:618`) is the security gate: the key must be
+  (`agents/roomlerd/src/apps/mod.rs:631`) is the security gate: the key must be
   in the device's own allowlist and the entry's `command` is run as argv with
   no shell, so a compromised viewer can start only what the device's owner
   wrote into its config, and there is no injection surface to reason about.
@@ -114,7 +114,7 @@ Four rules the session arm enforces, each paid for somewhere:
   session but no X display on it answered"*. On an X11 greeter it read as a
   complete, empty desktop with launch on offer, as `gdm`. All three verbs reach
   a session only through `discover()`, once per request
-  (`agents/roomlerd/src/apps/mod.rs:482`).
+  (`agents/roomlerd/src/apps/mod.rs:495`).
 - ⚠️ **The privilege drop is not politeness, and it is fallible on purpose.**
   `launch` spawns a terminal and a tmux server; doing that as root on
   somebody's own desktop puts a root shell on their screen and root-owned
@@ -265,7 +265,7 @@ not a field set at construction, so the compiler forces every backend to answer
   `pre_exec` hook long after the environment was copied, so the target user's
   login `PATH` never enters into it (`linux.rs:211`). Asking any other way
   answers about an environment the child never gets.
-- **`coverage` rides the error arm too** (`mod.rs:548`). A failed listing is
+- **`coverage` rides the error arm too** (`mod.rs:561`). A failed listing is
   exactly where an empty list is most likely to be read as calm.
 
 ### 4.2 `unavailable` — why there is no listing at all (P6)
@@ -283,7 +283,7 @@ into `starts_with`).
 | `code` | When | What the reason says to do |
 |---|---|---|
 | `disabled` | `[virtual_desktop_apps] enabled = false` on the device | enable it there and restart the daemon — the owner's choice, reported as such |
-| `no_session` | `loginctl` shows no active `x11`/`wayland` session | nobody is at the screen; remote shell and file transfer still work |
+| `no_session` | `loginctl` shows no active `x11`/`wayland` session | nobody is at the screen; remote shell still works, and so does file transfer, except on a Linux system install (`ROOMLERD_FILES_AS_SEAT_USER` on, its default): there it works as the person signed in at the screen, so with nobody there it browses and sends nothing and keeps a file sent to it where only root can read it ([desktop-companion.md §9.4](desktop-companion.md#94-a-linux-system-install-reads-as-the-person-at-the-screen-too-3688)) |
 | `no_x_display` | a session exists, no candidate display answered | a Wayland compositor without Xwayland; this backend manages X11 windows only |
 | `cannot_run_as` | the session's owner was found and the privilege drop failed | the account is unresolvable or the drop was refused; commands are never run as root instead |
 | `tool_missing` | `wmctrl` is not installed (session arm) — the whole feature, launch included, since this backend needs it to find and manage the desktop | `apt install wmctrl` |
@@ -292,7 +292,7 @@ into `starts_with`).
 
 The legacy `error` string on a focus/launch refusal keeps its shape and
 *contains* the reason, so a viewer that reads nothing else still shows it
-(`mod.rs:603`).
+(`mod.rs:616`).
 
 ### 4.3 The hello is a boot-time snapshot; the reply is live
 
@@ -308,14 +308,14 @@ restart changes it. That is why P6 added a fourth value:
 - **`status`** — *this build has a Remote Apps backend and answers
   `rc:apps.list` honestly*: with the list when there is a desktop, with
   `unavailable` when there is not. Advertised whenever the platform has a
-  backend (`apps::has_backend`, `mod.rs:434`), independent of what the host
+  backend (`apps::has_backend`, `mod.rs:447`), independent of what the host
   was doing at boot.
 - The viewer shows the *Remote apps* entry for `list` **or** `status`
   (`ui/src/views/remote/RemoteControl.vue:5306` `agentSupportsApps`), never disables it, and lets
   the **dialog** carry the truth from the live reply: the list, the caveats,
   or the reason (`useRemoteControl.ts:11371`, the `apps_list_reply` arm). A greyed button with no tooltip
   was the one place a reason could not reach.
-- 🔑 **`availability_for()` is the single source for both** (`mod.rs:396`): the
+- 🔑 **`availability_for()` is the single source for both** (`mod.rs:409`): the
   hello's `list` and the reply's `unavailable` come from one function, so they
   can disagree only by *time*, never by logic — **and never by which process
   asked.** ⚠️ The review of #1667 found that claim false on a caps-cache
@@ -355,7 +355,7 @@ server outlives both), it is `ssh`-attachable from a real login
 
 - 🔑 **Our own windows carry a known title**, so a window maps back to its
   session or allowlist key without pid/`xprop` correlation
-  (`classify_title`, `mod.rs:732`). Anything else is an unmanaged window and is
+  (`classify_title`, `mod.rs:745`). Anything else is an unmanaged window and is
   reported with its real title.
 - ⚠️ **A re-attach target is validated as a plain session token**
   (`is_safe_session`, `linux.rs:470`) — defence in depth against a crafted
@@ -398,7 +398,7 @@ rule are [`linux-capture.md`](linux-capture.md) §4.
 
 **Switching it on takes two keys.** `window_capture` only says what to ask the
 portal for. The portal arm itself is `portal_capture`
-(`agents/roomlerd/src/capture/mod.rs:3278`), and DRM is tried before it, so a
+(`agents/roomlerd/src/capture/mod.rs:3351`), and DRM is tried before it, so a
 host with `drm_capture = true` never gets there. Set `portal_capture = true` and
 `window_capture = true`, leave `drm_capture` unset or false, then
 `roomler restart`.
