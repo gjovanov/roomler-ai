@@ -110,7 +110,7 @@ sequenceDiagram
    flow id (`routeRows`, `:48`) so a button never moves under the cursor. Refresh failures
    are also written to the companion's own log (`src/desktop_log.rs`, capped at 2 MiB,
    one rolled generation).
-2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4045`)
+2. **The pipe always has a spare.** `serve_windows_at` (`crates/localapi/src/lib.rs:4055`)
    binds the first instance (retrying while another process holds the name), then runs a
    pool of accept tasks (`accept_pipe`, `:4150`), each owning one listening instance and
    re-creating it before handing a connected one off. Default 4
@@ -380,7 +380,7 @@ sequenceDiagram
   (§5), so the person always knows which daemon answered; the per-user half's own
   `ConfigGet` / `ConfigSet` stay its own file's. The same socket tells the companion, and
   the CLI's `config ls` / `config set` note (`localapi::other_daemon_socket`,
-  `crates/localapi/src/lib.rs:5029`), that a root half exists: `/var/run/roomler` is
+  `crates/localapi/src/lib.rs:5039`), that a root half exists: `/var/run/roomler` is
   `0700`, so the console user's `stat` of the root socket fails and that note had been
   silent for them.
 - The root half's person socket, its directory and the uid check: §12 and the
