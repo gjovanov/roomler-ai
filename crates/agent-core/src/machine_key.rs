@@ -190,6 +190,11 @@ fn unread(what: &str, kind: u8) -> String {
 #[cfg(windows)]
 pub use win::{Hive, Key, KeyPath, create_sealed, open_checked, open_for_change};
 
+/// Tests only: the step of a takeover after which every later takeover in this
+/// process stops with an error, as a crash there would. `0`: none.
+#[cfg(all(windows, any(test, feature = "test-fixtures")))]
+static STOP_TAKEOVER_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The Windows half: open, create, read and write a key by handle.
 #[cfg(windows)]
 mod win {
@@ -655,16 +660,29 @@ mod win {
                 return Err(why);
             }
             key.seal()?;
+            stop_point(1)?;
             let stray = key.names()?;
             for name in &stray {
                 key.delete(name)?;
             }
+            stop_point(2)?;
             tracing::warn!(
                 key = %path.shown(), reason = %why, removed = ?stray,
                 "machine key: took the key over and emptied it"
             );
         }
         Ok(key)
+    }
+
+    /// Tests only: stop a takeover after its step `step` with an error, as a
+    /// crash there would ([`super::test_support::stop_takeover_after`]).
+    fn stop_point(step: usize) -> Result<(), String> {
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if super::STOP_TAKEOVER_AFTER.load(std::sync::atomic::Ordering::SeqCst) == step {
+            return Err(format!("a test stopped the takeover after its step {step}"));
+        }
+        let _ = step;
+        Ok(())
     }
 
     /// The key `path`, opened to delete its values, judged by nothing:
@@ -696,7 +714,10 @@ mod win {
 #[cfg(all(windows, any(test, feature = "test-fixtures")))]
 #[doc(hidden)]
 pub mod test_support {
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Wdk::System::Registry::{NtDeleteKey, NtSetValueKey};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, LocalFree, UNICODE_STRING,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
         SE_REGISTRY_KEY,
@@ -706,8 +727,9 @@ pub mod test_support {
         SECURITY_ATTRIBUTES,
     };
     use windows_sys::Win32::System::Registry::{
-        HKEY, KEY_WOW64_64KEY, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW,
-        RegDeleteTreeW,
+        HKEY, KEY_WOW64_64KEY, REG_LINK, REG_OPTION_CREATE_LINK, REG_OPTION_NON_VOLATILE,
+        REG_OPTION_OPEN_LINK, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteKeyExW, RegEnumKeyExW,
+        RegOpenKeyExW, RegQueryInfoKeyW, RegSetValueExW,
     };
 
     use super::win::{Descriptor, open, wide};
@@ -856,22 +878,207 @@ pub mod test_support {
             .expect("writing a value");
     }
 
-    /// Remove `sub` below `hive`, the key and everything in it; not being
-    /// there is fine.
+    /// Remove `sub` below `hive`, the key and everything in it, each key
+    /// through its own handle and never through a registry link (a link is
+    /// removed itself, and what it leads to is left); not being there is
+    /// fine.
     pub fn remove_tree(hive: Hive, sub: &str) {
+        if let Some(hkey) = open_itself(hive.root(), sub) {
+            delete_with_all_below(hkey, sub);
+        }
+        assert!(open_itself(hive.root(), sub).is_none(), "{sub} is gone");
+    }
+
+    /// Remove `sub` below `hive` when it holds nothing at all: a key another
+    /// test still uses below it stays.
+    pub fn remove_if_empty(hive: Hive, sub: &str) {
         let name = wide(sub);
-        // SAFETY: a NUL-terminated name.
-        let rc = unsafe { RegDeleteTreeW(hive.root(), name.as_ptr()) };
-        assert!(
-            rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND,
-            "removing {sub}: {rc}"
-        );
-        assert!(
-            open(hive.root(), sub, KEY_READ, sub.to_string())
-                .expect("looking for the key")
-                .is_none(),
-            "{sub} is gone"
-        );
+        // SAFETY: a NUL-terminated name. `RegDeleteKeyExW` refuses a key that
+        // has subkeys, which is the point.
+        unsafe { RegDeleteKeyExW(hive.root(), name.as_ptr(), KEY_WOW64_64KEY, 0) };
+    }
+
+    /// `sub` below `root` itself, a registry link included, for everything
+    /// this process may do to it. `None`: it is not there.
+    fn open_itself(root: HKEY, sub: &str) -> Option<HKEY> {
+        let name = wide(sub);
+        let mut hkey: HKEY = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated name; `hkey` is closed by the caller.
+        let rc = unsafe {
+            RegOpenKeyExW(
+                root,
+                name.as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_ALL_ACCESS | KEY_WOW64_64KEY,
+                &mut hkey,
+            )
+        };
+        match rc {
+            ERROR_SUCCESS => Some(hkey),
+            ERROR_FILE_NOT_FOUND => None,
+            rc => panic!("opening {sub}: {rc}"),
+        }
+    }
+
+    /// Delete `hkey` and every key below it, each through its own handle;
+    /// closes `hkey`.
+    fn delete_with_all_below(hkey: HKEY, shown: &str) {
+        loop {
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            // SAFETY: a live key opened with KEY_ENUMERATE_SUB_KEYS; `buf`
+            // holds `len` characters, and 255 is the longest key name.
+            let rc = unsafe {
+                RegEnumKeyExW(
+                    hkey,
+                    0,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            assert_eq!(rc, ERROR_SUCCESS, "listing what {shown} holds");
+            let name = String::from_utf16_lossy(&buf[..len as usize]);
+            let child = open_itself(hkey, &name).expect("a key just listed");
+            delete_with_all_below(child, &format!("{shown}\\{name}"));
+        }
+        // SAFETY: a live key opened with DELETE; closed once, after.
+        let status = unsafe { NtDeleteKey(hkey) };
+        // SAFETY: as above.
+        unsafe { RegCloseKey(hkey) };
+        assert!(status >= 0, "deleting {shown}: {status:#x}");
+    }
+
+    /// The kernel's name of `sub` below `hive`, which a registry link names
+    /// its target by: `\REGISTRY\USER\<this account's SID>\…` for the
+    /// person's own hive.
+    pub fn kernel_name(hive: Hive, sub: &str) -> String {
+        match hive {
+            Hive::LocalMachine => format!(r"\REGISTRY\MACHINE\{sub}"),
+            Hive::CurrentUser => format!(
+                r"\REGISTRY\USER\{}\{sub}",
+                crate::machine_tree::test_support::me()
+            ),
+        }
+    }
+
+    /// Make `sub` below `hive` a registry link to `target`, a kernel name
+    /// ([`kernel_name`]). It must not be there yet.
+    pub fn link(hive: Hive, sub: &str, target: &str) {
+        let name = wide(sub);
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let mut disposition = 0u32;
+        // SAFETY: a NUL-terminated name; the key is closed below.
+        let rc = unsafe {
+            RegCreateKeyExW(
+                hive.root(),
+                name.as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_CREATE_LINK,
+                KEY_ALL_ACCESS | KEY_WOW64_64KEY,
+                std::ptr::null(),
+                &mut hkey,
+                &mut disposition,
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS, "making the link {sub}");
+        let value = wide("SymbolicLinkValue");
+        let to: Vec<u16> = target.encode_utf16().collect();
+        // SAFETY: a key just made with KEY_SET_VALUE; a link's target is
+        // its name without a NUL, sized in bytes.
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                value.as_ptr(),
+                0,
+                REG_LINK,
+                to.as_ptr().cast(),
+                (to.len() * 2) as u32,
+            )
+        };
+        // SAFETY: the key made above, closed once.
+        unsafe { RegCloseKey(hkey) };
+        assert_eq!(disposition, 1, "{sub} was made here, not found");
+        assert_eq!(rc, ERROR_SUCCESS, "pointing the link {sub} at {target}");
+    }
+
+    /// Set the `REG_SZ` value of `path` whose name is exactly `name`, which
+    /// may hold a NUL: a name the Win32 calls cannot spell.
+    pub fn put_raw(path: &KeyPath, name: &[u16], text: &str) {
+        let key = opened(path).expect("the key is there");
+        let mut name = name.to_vec();
+        let bytes = (name.len() * 2) as u16;
+        let counted = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: name.as_mut_ptr(),
+        };
+        let data = wide(text);
+        // SAFETY: a live key opened with KEY_SET_VALUE; `counted` points into
+        // `name`, and `data` is the REG_SZ with its NUL, sized in bytes.
+        let status = unsafe {
+            NtSetValueKey(
+                key.handle(),
+                &counted,
+                0,
+                REG_SZ,
+                data.as_ptr().cast(),
+                (data.len() * 2) as u32,
+            )
+        };
+        assert!(status >= 0, "setting a value: {status:#x}");
+    }
+
+    /// How many values `path` holds, whatever their names; 0 when there is no
+    /// such key.
+    pub fn value_count(path: &KeyPath) -> u32 {
+        let Some(key) = opened(path) else {
+            return 0;
+        };
+        let mut values = 0u32;
+        // SAFETY: a live key opened with KEY_QUERY_VALUE; every out-param
+        // but the value count is optional.
+        let rc = unsafe {
+            RegQueryInfoKeyW(
+                key.handle() as HKEY,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut values,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS, "counting what the key holds");
+        values
+    }
+
+    /// The owner of `sub` below `hive`, as a SID (`S-1-5-32-544`).
+    pub fn owner_sid(hive: Hive, sub: &str) -> String {
+        let key = open(hive.root(), sub, KEY_READ, sub.to_string())
+            .expect("opening the key")
+            .expect("the key is there");
+        crate::machine_tree::security_of(key.handle(), SE_REGISTRY_KEY)
+            .expect("reading its security")
+            .owner
+    }
+
+    /// Stop every later takeover in this process after its step `step`
+    /// (`0`: none) with an error, as a crash there would.
+    pub fn stop_takeover_after(step: usize) {
+        super::STOP_TAKEOVER_AFTER.store(step, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

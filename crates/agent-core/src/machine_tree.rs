@@ -1263,6 +1263,8 @@ pub fn read_private_judged(
     let folder = win::read_sd(&dir_entry.file)
         .map_err(|e| format!("the anchor's directory: reading its security: {e}"))?;
     verdict(&folder, WRITE_LIKE, "the anchor's directory")?;
+    #[cfg(any(test, feature = "test-fixtures"))]
+    test_support::run_between();
     let Some(file) = win::open(path, win::Kind::File, true, false)? else {
         return Ok(None);
     };
@@ -2390,6 +2392,28 @@ pub mod test_support {
         )
         .expect("a key file");
         tree
+    }
+
+    /// #3737 — what runs once, the next time a reader or a deleter of the
+    /// SYSTEM service's former anchor folder has checked the folder and not
+    /// yet opened a file in it.
+    type Between = Box<dyn FnOnce() + Send>;
+    static BETWEEN: std::sync::Mutex<Option<Between>> = std::sync::Mutex::new(None);
+
+    /// #3737 — run `f` once, between a folder's check and the first open of a
+    /// file in it, as something else changing the folder at that moment
+    /// would: a test's stand-in for a swap it cannot time.
+    pub fn between_check_and_use(f: impl FnOnce() + Send + 'static) {
+        *BETWEEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+    }
+
+    /// Run what [`between_check_and_use`] left, once; nothing when it left
+    /// nothing.
+    pub fn run_between() {
+        let f = BETWEEN.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = f {
+            f();
+        }
     }
 
     /// A protected DACL of SYSTEM and Administrators alone, `(OI)(CI)` on a
