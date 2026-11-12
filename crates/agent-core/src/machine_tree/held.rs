@@ -59,8 +59,9 @@ use windows_sys::Wdk::Storage::FileSystem::{
 };
 use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError, UNICODE_STRING};
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    SetKernelObjectSecurity,
+    DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity, TOKEN_TYPE, TokenImpersonation,
+    TokenType,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -778,7 +779,7 @@ impl HeldPath {
                     // held for its name and attributes alone. No synchronous
                     // I/O (that takes SYNCHRONIZE, which the DACL would have
                     // to give), and nothing is ever listed or done in it.
-                    Err(STATUS_ACCESS_DENIED) if through => {
+                    Err(STATUS_ACCESS_DENIED) if through && read_through_on() => {
                         match open_below(
                             self.handle(),
                             name,
@@ -940,6 +941,18 @@ impl HeldPath {
                 .map_err(|e| self.refuse_at(name, Why::Io(e)))?;
             match open_below(self.handle(), name, access, disposition, options, Some(&sd)) {
                 Ok(made) => return Ok(made),
+                // Never on a thread that acts as another account (a panic
+                // inside `as_session_user`, a transfer written as the person):
+                // that account would own what SYSTEM makes (R145).
+                Err(STATUS_INVALID_OWNER) if owner && impersonating() => {
+                    return Err(self.refuse_at(
+                        name,
+                        Why::Io(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "not made: this thread acts as another account, which would own it",
+                        )),
+                    ));
+                }
                 Err(STATUS_INVALID_OWNER) if owner => last = STATUS_INVALID_OWNER,
                 Err(code) => return Err(self.refuse_at(name, why_of(code, kind_of_entry))),
             }
@@ -976,6 +989,45 @@ impl HeldPath {
         )
         .map(|(file, _)| file)
     }
+}
+
+/// This thread acts as another account: it holds an impersonation token.
+/// Read from the thread's effective token (`GetCurrentThreadEffectiveToken`,
+/// the pseudo-handle -6); a query that fails counts as acting as another
+/// account, so the caller-owned fallback is never taken on a doubt.
+fn impersonating() -> bool {
+    const THREAD_EFFECTIVE_TOKEN: HANDLE = -6isize as HANDLE;
+    let mut kind: TOKEN_TYPE = 0;
+    let mut len = 0u32;
+    // SAFETY: a pseudo-handle the system resolves for this thread (Windows 8
+    // and later); `kind` is the 4-byte answer of the `TokenType` class.
+    let ok = unsafe {
+        GetTokenInformation(
+            THREAD_EFFECTIVE_TOKEN,
+            TokenType,
+            (&raw mut kind).cast(),
+            std::mem::size_of::<TOKEN_TYPE>() as u32,
+            &mut len,
+        )
+    };
+    ok == 0 || kind == TokenImpersonation
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: a read walk on this thread may not pass a folder with
+    /// `FILE_READ_ATTRIBUTES` alone (D10's control case).
+    static NO_READ_THROUGH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A read walk may pass a folder it may not list with `FILE_READ_ATTRIBUTES`
+/// alone (D10). Always, outside the tests.
+fn read_through_on() -> bool {
+    #[cfg(test)]
+    if NO_READ_THROUGH.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
 }
 
 /// The names from `base` down to `target`, each a plain name.

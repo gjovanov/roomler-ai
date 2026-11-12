@@ -528,6 +528,153 @@ fn a_reseal_in_place_hands_nothing_down_through_a_hard_link() {
     println!("{CHECKED}: T16");
 }
 
+/// Run `f` on this thread as this process's token with Administrators made
+/// deny-only (`CreateRestrictedToken`, then `ImpersonateLoggedOnUser`): as a
+/// worker that runs as the signed-in person, or a SYSTEM thread acting as
+/// one. The thread is itself again afterwards, a panic included.
+fn as_restricted<T>(f: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE, ImpersonateLoggedOnUser,
+        LUA_TOKEN, RevertToSelf, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE, TOKEN_QUERY,
+        WinBuiltinAdministratorsSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            // SAFETY: ends this thread's impersonation; no arguments.
+            unsafe { RevertToSelf() };
+        }
+    }
+    let mut process: HANDLE = std::ptr::null_mut();
+    // SAFETY: the process pseudo-handle; `process` receives a token handle,
+    // closed below.
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY,
+            &mut process,
+        )
+    };
+    assert!(ok != 0, "{}", std::io::Error::last_os_error());
+    let mut sid = [0u64; 9];
+    let mut size = std::mem::size_of_val(&sid) as u32;
+    // SAFETY: `sid` holds `size` bytes, aligned for a SID.
+    let ok = unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            std::ptr::null_mut(),
+            sid.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    assert!(ok != 0, "{}", std::io::Error::last_os_error());
+    let disable = SID_AND_ATTRIBUTES {
+        Sid: sid.as_mut_ptr().cast(),
+        Attributes: 0,
+    };
+    let mut restricted: HANDLE = std::ptr::null_mut();
+    // SAFETY: a token opened for duplication, one SID to make deny-only;
+    // `restricted` receives a new token handle, closed below.
+    let ok = unsafe {
+        CreateRestrictedToken(
+            process,
+            LUA_TOKEN | DISABLE_MAX_PRIVILEGE,
+            1,
+            &disable,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &mut restricted,
+        )
+    };
+    // SAFETY: the handle OpenProcessToken gave, closed once.
+    unsafe { CloseHandle(process) };
+    assert!(ok != 0, "{}", std::io::Error::last_os_error());
+    // SAFETY: a token this process made from its own; closed once after.
+    let ok = unsafe { ImpersonateLoggedOnUser(restricted) };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: as above.
+    unsafe { CloseHandle(restricted) };
+    assert!(ok != 0, "{err}");
+    let _revert = Revert;
+    f()
+}
+
+/// R145 — a thread that acts as another account never makes an entry that
+/// account owns: the token may not name Administrators as the owner, and the
+/// make is refused instead of falling back to the caller as the owner.
+/// Control: the same make on a thread that is itself is made, Administrators
+/// its owner.
+#[test]
+fn nothing_is_made_for_the_account_a_thread_acts_as() {
+    if !elevated_or_skip("R145: a make while the thread acts as another account") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let made = as_restricted(|| base_of(root.path()).sealed_dir("crashes", Seal::Private));
+    let refused = made.expect_err("refused while the thread acts as another account");
+    assert!(
+        !root.path().join("crashes").exists(),
+        "nothing is made: {refused}"
+    );
+    let held = base_of(root.path())
+        .sealed_dir("crashes", Seal::Private)
+        .expect("made by a thread that is itself");
+    let shape = sddl(&root.path().join("crashes"));
+    assert!(
+        sealed(&shape, true) && owner(&shape) == "BA",
+        "{shape} {held:?}"
+    );
+    println!("{CHECKED}: impersonation");
+}
+
+/// D10 (R145) — a reader that runs as the person reaches the `Readable`
+/// `crashes` below a folder it may not list: a middle folder sealed to SYSTEM
+/// and Administrators, `crashes` below it `Readable` with a record in it.
+/// Under a token with Administrators deny-only, `walk` passes the middle
+/// folder with `FILE_READ_ATTRIBUTES` alone and reads the record. Control:
+/// the same walk with that way through turned off is refused there.
+#[test]
+fn a_reader_as_the_person_reaches_a_readable_folder_below_a_sealed_one() {
+    if !elevated_or_skip("D10: a read walk under a token with Administrators deny-only") {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    {
+        let mid = base_of(root.path())
+            .sealed_dir("mid", Seal::Private)
+            .unwrap();
+        let crashes = mid.sealed_dir("crashes", Seal::Readable).unwrap();
+        crashes
+            .write_file("1-1.json", b"{}", Seal::Readable)
+            .unwrap();
+    }
+    let read = as_restricted(|| {
+        let held = HeldPath::base(root.path())?.walk(&["mid", "crashes"])?;
+        held.expect("crashes is there").read_file("1-1.json", 64)
+    });
+    assert_eq!(
+        read.as_ref().ok().cloned().flatten().as_deref(),
+        Some(&b"{}"[..]),
+        "the record is read through the folder it may not list: {read:?}"
+    );
+    let off = as_restricted(|| {
+        super::NO_READ_THROUGH.with(|off| off.set(true));
+        let walked = HeldPath::base(root.path()).and_then(|base| base.walk(&["mid", "crashes"]));
+        super::NO_READ_THROUGH.with(|off| off.set(false));
+        walked
+    });
+    let refused = off.expect_err("without the way through, the walk is refused");
+    assert!(
+        named(&refused.at, "mid"),
+        "refused at the folder it may not list: {refused}"
+    );
+    println!("{CHECKED}: D10");
+}
+
 /// T10 — a tree holding a junction: what it leads to is kept, `left` names
 /// it, the root stays. Control: a tree with none is removed.
 #[test]

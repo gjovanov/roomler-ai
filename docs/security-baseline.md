@@ -554,7 +554,7 @@ removal deletes, by handle, what the same walk opened.
 Why: a check made by path and an act made by path are two lookups of the same name, and
 the name can change in between; a walk by handle looks each name up once, and every act
 goes through the handle that was checked. One helper carries the rule,
-`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:340`), so a new
+`machine_tree::HeldPath` (`crates/agent-core/src/machine_tree/held.rs:341`), so a new
 SYSTEM writer gets it by calling the helper rather than by re-deriving it
 ([FR-145](fr/FR-145-machine-tree-by-handle.md)). `OBJ_DONT_REPARSE` goes on every
 relative open as a second lock where the build honours it, and nothing relies on it
