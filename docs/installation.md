@@ -2343,10 +2343,10 @@ more.
 |---|---|---|---|
 | Sweep the bundles of earlier layouts | root | `/Applications`, `/Library/Roomler` | `agents/roomlerd/packaging/macos/postinstall:33-36`, `:51-61` |
 | Move or copy the system config and log folders | root | `/etc`, `/var/log` | `agents/roomlerd/packaging/macos/postinstall:79-108` |
-| Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u '#<uid>'`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:229-306`, `:336`, `:426` |
+| Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u '#<uid>'`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:229-306`, `:337`, `:427` |
 | Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:319` |
 | Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:161` |
-| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:494-497`, `:502`, `:569-572`, `:588`, `:596`, `:523`, `:607` |
+| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:495-498`, `:503`, `:570-573`, `:589`, `:597`, `:524`, `:608` |
 
 - **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
   groups; `launchctl asuser` changes only the bootstrap context. `-n` because
@@ -2369,11 +2369,12 @@ more.
   there stays placed and is loaded, a `WARNING` carries the copy's error, and
   the last line does not say "installed and started".
 - **On a Mac whose root daemon runs the GUI worker**, an agent item the person's
-  account cannot remove is a `WARNING` with the same folder line, and with
+  account cannot remove is a `WARNING` with the same folder line, then
+  `sudo rm -f "<item>"`, which removes only that item, and
   `sudo roomlerd one-row`, which moves the item aside as root after it says its
   plan and asks (`agents/roomlerd/src/one_row.rs:704-721`).
 - **No scratch file.** `launchctl bootstrap`'s error text is kept in a shell
-  variable (`BOOTSTRAP_ERR`, `UPDATE_ERR`, `:161`, `:588`, `:596`), so the script
+  variable (`BOOTSTRAP_ERR`, `UPDATE_ERR`, `:161`, `:589`, `:597`), so the script
   writes nothing to `/tmp`.
 
 `installer-smoke`'s macOS job holds this on a real install: the runner's own

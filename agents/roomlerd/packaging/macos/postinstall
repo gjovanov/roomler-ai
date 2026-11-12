@@ -322,6 +322,7 @@ if daemon_supervises_gui_worker; then
     echo "  so launchd loads it at the next login and the per-user agent comes back."
     [ -z "$rm_err" ] || echo "  $rm_err"
     folder_not_the_persons || true
+    echo "  To remove only this item by hand, run: sudo rm -f \"$PLIST_TARGET\""
     echo "  To finish one row by hand (it moves the item aside; it says its plan and"
     echo "  asks first), run:"
     echo "    sudo roomlerd one-row"

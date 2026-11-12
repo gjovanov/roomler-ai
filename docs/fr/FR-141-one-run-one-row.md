@@ -59,7 +59,7 @@ Today the operator's own Mac shows two rows: one for the screen and one named `<
 - **The wizard cannot see a Mac's root daemon before it enrolls.** `root_identity::query` answers on Linux only
   (`agents/roomler-setup/src/root_identity.rs:67-79`), so on a Mac that is already one row or supervised the
   wizard would enroll a new person's half and start a LaunchAgent that the package's guard removes
-  (`agents/roomlerd/packaging/macos/postinstall:188-335`). Inferred, never run.
+  (`agents/roomlerd/packaging/macos/postinstall:188-336`). Inferred, never run.
 
 ### Linux today (code)
 
@@ -116,7 +116,7 @@ What each layer has to do. The daemon needs nothing new: FR-43 P3a, P3b and P3d 
 | Pages (`app.js`, `index.html`) | "both" = two rows; a second token field | "Screen and private network" = one row while `wizard_macos_one_row` is on; one token field; Done names one row |
 | Roles and tokens (`role.rs`, `commands.rs`, `pairing.rs`) | `wants_root_half` → `halves: 2`, a root token and a person's token | a third shape beside "screen only" and "two rows": one token, `halves: 1`, which enrolls the ROOT half |
 | Enrollment (`orchestrator_unix.rs:867-937`) | the root half as `<name>-daemon`, overlay on | the root half under the person's own name, overlay on, with `macos_supervise_gui_worker` and `macos_one_row` set as `enroll --one-row` sets them (`agents/roomlerd/src/app.rs:8778-8784`); no person's enrollment, no `--user-steps` |
-| Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | a one-row form, lifting `install.sh:296-299`: package, the binary's `enroll --help` lists `--one-row` (as `install.sh:1043-1048`), marker, config placed, the package again so that its guard removes the LaunchAgent and starts the root half (`install.sh:1072-1076`, `postinstall:221-239`); on a Mac that is one row already, the package only (`install.sh:1013-1031`) |
+| Privileged half (`install.sh --privileged-steps --config-from`) | marker, package, config placed, daemon started | a one-row form, lifting `install.sh:296-299`: package, the binary's `enroll --help` lists `--one-row` (as `install.sh:1043-1048`), marker, config placed, the package again so that its guard removes the LaunchAgent and starts the root half (`install.sh:1072-1076`, `postinstall:308-336`); on a Mac that is one row already, the package only (`install.sh:1013-1031`) |
 | Server pairing (`crates/modules/fleet/src/pairing.rs:326-334`) | `halves: 2` for a macOS daemon only | no change: `halves: 1` is accepted for every OS. `halves: 2` stays for two-row installs and older wizards. The `/pair` page shows its two-entries note only for `halves === 2` (`ui/src/views/pair/PairView.vue:110-111`) |
 | Server features (`/api/setup/features`) | `wizard_macos_daemon` | a new key, `wizard_macos_one_row`, default off |
 | Devices page (`ui/src/components/admin/AgentsSection.vue`) | the per-user row has no overlay address; the `-daemon` row has one | expected no change: the Overlay column reads the row's own address (`:325-333`) and Connect is the row's (`:898-901`), and a one-row Mac's row holds the node and reports the worker's capabilities (FR-43 P2c). Inferred: the field read confirms it |
