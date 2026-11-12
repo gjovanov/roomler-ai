@@ -1910,12 +1910,10 @@ async fn connect_once(
     // #3280 — read before the answer: one adopted in between is news next beat.
     let mut last_announced_caps_generation = crate::encode::caps::generation();
     // FR-138 — the switch, read once for this connection: with it on, the
-    // hello says `rc-resume` and claims what the last connection kept. P2b
+    // hello says `rc-resume` (P4-0: it asks for a window, and nothing else
+    // changes before one) and claims what the last connection kept. P2b
     // (A11): a loop that holds the delegation host reads it as every loop
-    // does; its delegated sessions are kept as records, and one it cannot
-    // keep it does not claim. P4-0: the verb asks for a window, and nothing
-    // else the switch gates happens before one is announced
-    // (`SessionTable::window_open`).
+    // does; its delegated sessions are kept as records, one it cannot keep unclaimed.
     let survive = crate::session_table::connection_keeps(
         crate::session_table::survive_enabled(),
         delegation.host().is_some(),
@@ -3934,10 +3932,9 @@ async fn handle_server_msg(
     // which is gone, and so never claimed or counted. None off the host.
     let offer_generation = peers.live_generation();
     // FR-138 P2b (A1) — routing first, then delegation: while this loop keeps
-    // (P4-0: a window open on this connection, or a session still kept), a
-    // session this loop's own table holds (attached or kept) is served here,
-    // and its `Terminate` or `Ice` never crosses to a worker that attached
-    // since. Otherwise, the switch on alone included, the gate is today's.
+    // (P4-0: a window open, or a session still kept), a session its own table
+    // holds is served here, and its `Terminate` or `Ice` never crosses to a
+    // worker that attached since. Otherwise the gate is today's.
     if let Some(delegate) = delegate
         && crate::delegate::delegable_inbound(&msg)
         && !crate::delegate::served_by_daemon(
@@ -4368,10 +4365,9 @@ async fn handle_server_msg(
                             // not in the worker that builds the peer.
                             media_legacy: remote_cfg.media_legacy_for_delegate(),
                             // FR-138 P2b (A2) — this session will be claimed through
-                            // this loop's control-socket loss: a window open on
-                            // this connection (P4-0: the switch alone is not
-                            // enough), a worker that said `keep-delegated`, and
-                            // never an external session.
+                            // this loop's control-socket loss: a window open (P4-0,
+                            // not the switch alone), a worker that said
+                            // `keep-delegated`, and never an external session.
                             keepable: crate::delegate::session_keepable(
                                 peers.window_open(),
                                 delegate.worker_keeps(),
@@ -5155,13 +5151,10 @@ async fn handle_server_msg(
                 {
                     debug!(%session_id, %e, "final session stats send failed");
                 }
-                // FR-138 P2a-2 (C1) — with a window open on this connection
-                // (P4-0), the viewer hears the end peer to peer before the
-                // peer goes: it may not have rejoined since a resume, and a
-                // bare close reads to it as a drop, which it redials. With
-                // none, the switch on included, closed here as before; a GUI
-                // worker's delegated table, which holds only what a window let
-                // the daemon offer `keepable`, always says it.
+                // FR-138 P2a-2 (C1) — with a window open (P4-0), or on a GUI
+                // worker's delegated table, the viewer hears the end peer to
+                // peer first: it may not have rejoined since a resume, and a
+                // bare close reads as a drop it redials. Else closed here.
                 peers
                     .close_terminated(
                         peer,

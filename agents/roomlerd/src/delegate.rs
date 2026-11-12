@@ -369,20 +369,16 @@ pub fn worker_lane(frame: DelegateFrame) -> WorkerLane {
 /// FR-138 P2b (A1) — whether a delegable message about a session is served by
 /// the daemon instead of crossing: a session the daemon's own table holds,
 /// attached or kept, is the daemon's, and a worker that attached since must not
-/// be handed its `Terminate` or `Ice`. Only while the daemon's table is
-/// `keeping` (P4-0, `SessionTable::keeping`): a window open on this
-/// connection, or a session still kept. Otherwise, the switch on alone
-/// included, the gate is byte for byte what it was.
+/// be handed its `Terminate` or `Ice`. Only while the table is `keeping`
+/// (P4-0): otherwise, the switch on alone included, the gate is what it was.
 pub(crate) fn served_by_daemon(keeping: bool, daemon_holds: bool) -> bool {
     keeping && daemon_holds
 }
 
 /// FR-138 P2b (A2) — whether a delegated session's params say `keepable`: a
-/// window open on this connection (P4-0, `SessionTable::window_open`, which
-/// takes the device's switch), an attached worker that said
-/// [`KEEP_DELEGATED`], and not an external session, which is never kept
-/// (FR-138 D3). Anything else is served as today: the switch on with no
-/// window is the switch off.
+/// window open on this connection (P4-0: the switch alone is not enough), an
+/// attached worker that said [`KEEP_DELEGATED`], and not an external session,
+/// never kept (FR-138 D3). Anything else is served as today.
 pub(crate) fn session_keepable(window_open: bool, worker_keeps: bool, external: bool) -> bool {
     window_open && worker_keeps && !external
 }
@@ -2893,9 +2889,8 @@ mod tests {
 
     /// FR-138 P2b (R12, A2) — a delegated session is said `keepable` only to a
     /// worker that said `keep-delegated` (by equality: a near miss is not the
-    /// word), only with a window open (P4-0: the switch alone is not enough),
-    /// and never for an external session; and this build's worker says the
-    /// word.
+    /// word), only with a window open (P4-0), and never for an external
+    /// session; and this build's worker says the word.
     #[tokio::test]
     async fn p2b_only_a_worker_that_says_keep_delegated_gets_keepable_sessions() {
         assert_eq!(
@@ -2907,10 +2902,7 @@ mod tests {
             session_keepable(true, true, false),
             "a window open, a P2b worker"
         );
-        assert!(
-            !session_keepable(false, true, false),
-            "no window open: the switch off, or on with none announced"
-        );
+        assert!(!session_keepable(false, true, false), "no window open");
         assert!(
             !session_keepable(true, false, false),
             "an older worker, or none"
@@ -3385,11 +3377,10 @@ mod routing_tests {
         assert!(!k.is_empty() && k != "?", "got {k}");
     }
 
-    /// FR-138 P2b (R2, A1) — while the daemon's table keeps (P4-0: a window
-    /// open, or a session still kept), a delegable message about a session the
-    /// daemon's own table holds is the daemon's, and never crosses to a worker
-    /// that attached since: its `Terminate` or `Ice` would go to a process that
-    /// never held the peer.
+    /// FR-138 P2b (R2, A1) — while the daemon's table keeps (P4-0), a delegable
+    /// message about a session the daemon's own table holds is the daemon's,
+    /// and never crosses to a worker that attached since: its `Terminate` or
+    /// `Ice` would go to a process that never held the peer.
     #[test]
     fn p2b_a_session_the_daemon_holds_is_served_there_with_the_switch_on() {
         assert!(
@@ -3404,9 +3395,7 @@ mod routing_tests {
 
     /// FR-138 P2b (a6's amendment) — with the switch off the gate is today's: a
     /// `Terminate` for a session the daemon holds still crosses, as on master.
-    /// A guard, so it passes before the implementation and after it. P4-0: so
-    /// does the switch on while the table keeps nothing (no window, nothing
-    /// kept), which `SessionTable::keeping` answers.
+    /// A guard, so it passes before the implementation and after it (P4-0 too).
     #[test]
     fn p2b_with_the_switch_off_the_gate_is_todays() {
         assert!(!served_by_daemon(false, true), "off, it still crosses");
