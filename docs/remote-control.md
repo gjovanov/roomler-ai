@@ -892,7 +892,7 @@ sequenceDiagram
 - **The frame goes through the input arbiter like a key**, so it needs the
   input floor and the session's input permission, as typing does. The injector
   then checks again
-  ([`enigo_backend.rs:298`](../agents/roomlerd/src/input/enigo_backend.rs#L298)):
+  ([`enigo_backend.rs:300`](../agents/roomlerd/src/input/enigo_backend.rs#L300)):
   the policy can change between the hello and the click, and a viewer is not
   trusted to have read the hello.
 - **The relay** ([`sas_relay.rs:43`](../agents/roomlerd/src/win_service/sas_relay.rs#L43))
@@ -1658,8 +1658,8 @@ A new session's first event looks at once, from the shortest wait again (`Regran
 
 | Who is at the screen (the desktop brief) | The line |
 |---|---|
-| nobody signed in at a graphical session: a login screen, a tty, no seat | INFO `input: no X display to open: … nobody is signed in …` |
-| a person signed in on X11 or Wayland, or the brief not read yet | ERROR `input: no X display to open: … though a graphical session is signed in …` |
+| known to show nobody at a graphical session: the login screen (`greeter`), no seat (`none`), a text console (`tty`) | INFO `input: no X display to open: … nobody is signed in …` |
+| a person signed in on X11, Wayland or any other session type, or the brief not read yet | ERROR `input: no X display to open: … though a person is signed in …` |
 | the same kind again within the session (warm, a first event, each regrant, each keep-busy op) | DEBUG |
 
 With `DISPLAY` set the open runs as before, and a failed one still prints enigo's ERROR lines and warns. The doubling still bounds the regrant tries: about nine in a session's first minute, then one a minute while events arrive.
@@ -1897,7 +1897,7 @@ logged in fast 4 times out of 4.
 `caps_for_frame` (`:292`) now reads once per run of typing. A read stands for as
 long as frames keep coming within `CAPS_FRESH_FOR`, 2 s of each other, on one
 foreground thread. A CapsLock key frame clears it (`caps_changed`, `:309`, called
-from `agents/roomlerd/src/input/enigo_backend.rs:247`), so the letters after it
+from `agents/roomlerd/src/input/enigo_backend.rs:249`), so the letters after it
 take the new state (read with CapsLock toggled twice inside a run of typing,
 `abcDEFabcDEFabcDEF`). Injecting 1,147 characters went from about 3.7 s to about
 0.9 s, because the attach was costing about 2.5 ms a character.

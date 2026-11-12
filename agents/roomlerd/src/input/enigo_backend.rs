@@ -35,7 +35,9 @@ impl EnigoInjector {
         // I/O (`enigo_settings` names no display, so enigo reads `DISPLAY`),
         // and x11rb is enigo's only backend here: such an open cannot succeed,
         // and enigo logs it at ERROR twice. So it is not tried. The caller says
-        // why, once a session, at the level its kind has.
+        // why, once a session, at the level its kind has. An EMPTY `DISPLAY`
+        // counts as set: x11rb answers it `MalformedValue`, not `DisplayNotSet`,
+        // so that open still runs and its failure stays enigo's ERROR.
         #[cfg(target_os = "linux")]
         {
             let brief = crate::desktop_brief::current();

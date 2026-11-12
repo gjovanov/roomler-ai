@@ -23,11 +23,12 @@ use std::sync::Mutex;
 /// Why there is no X display for this process to open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoDisplay {
-    /// Nobody is signed in at a graphical session on this host's screen: a
-    /// login screen, a tty, or nobody at a seat. No display is expected.
+    /// The seat is known to show nobody at a graphical session: the login
+    /// screen, nobody at a seat, or a text console. No display is expected.
     NobodySignedIn,
-    /// A person is signed in at a graphical session, or the seat is not known
-    /// yet. A display should exist, so its absence is a fault.
+    /// Anything else: a person signed in on X11, on Wayland or in a session of
+    /// any other type, or a seat not known yet. A display should exist, so its
+    /// absence is a fault.
     ShouldExist,
 }
 
@@ -40,9 +41,7 @@ impl NoDisplay {
             return None;
         }
         Some(match seat {
-            Some((session, kind)) if !signed_in_graphically(session, kind) => {
-                NoDisplay::NobodySignedIn
-            }
+            Some((session, kind)) if nobody_graphical(session, kind) => NoDisplay::NobodySignedIn,
             _ => NoDisplay::ShouldExist,
         })
     }
@@ -57,10 +56,12 @@ impl NoDisplay {
     }
 }
 
-/// A graphical session (`x11`, `wayland`) with a person in it: any logind
-/// class but the login screen's (`greeter`) and `none`. Equality only.
-fn signed_in_graphically(session: &str, kind: &str) -> bool {
-    matches!(kind, "x11" | "wayland") && !matches!(session, "greeter" | "none")
+/// A seat known to show nobody at a graphical session: logind's class
+/// `greeter` (the login screen) or `none` (nobody at a seat), or the type
+/// `tty` (a text console). Anything else counts as a person who should have a
+/// display, a session type this does not know included. Equality only.
+fn nobody_graphical(session: &str, kind: &str) -> bool {
+    matches!(session, "greeter" | "none") || kind == "tty"
 }
 
 /// The level to say `kind` at, given the kind last said in this session: a
@@ -89,8 +90,8 @@ impl std::fmt::Display for NoDisplayToOpen {
                  graphical session on this screen"
             }
             NoDisplay::ShouldExist => {
-                "no X display to open: this process has no DISPLAY, though a graphical session is \
-                 signed in at this screen or the seat is not known yet"
+                "no X display to open: this process has no DISPLAY, though a person is signed in \
+                 at this screen or the seat is not known yet"
             }
         })
     }
@@ -161,7 +162,9 @@ mod tests {
     }
 
     /// The control: where a display should exist, its absence is still an
-    /// ERROR, as on master, where enigo's own lines said it.
+    /// ERROR, as on master, where enigo's own lines said it. Only a seat known
+    /// to show nobody graphical is INFO: a session type this does not know
+    /// is a person.
     #[test]
     fn a_display_that_should_exist_still_fails_at_error() {
         for seat in [
@@ -169,6 +172,9 @@ mod tests {
             Some(("user", "wayland")),
             Some(("lock-screen", "x11")),
             Some(("user-incomplete", "wayland")),
+            Some(("user", "unspecified")),
+            Some(("lock-screen", "unspecified")),
+            Some(("user", "mir")),
             None,
         ] {
             let kind = NoDisplay::of(false, seat);
