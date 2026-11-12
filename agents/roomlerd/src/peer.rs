@@ -12984,13 +12984,11 @@ pub(crate) enum FilesChannel {
 /// lands. Every other process serves the channel as before. Pure, so the
 /// rule is a test on every OS.
 pub(crate) fn files_channel(on_macos: bool, root: bool) -> FilesChannel {
-    // RED: master's answer, every process serves the channel.
-    let _ = (
-        on_macos,
-        root,
-        FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION),
-    );
-    FilesChannel::Served
+    if on_macos && root {
+        FilesChannel::Declined(FILES_IN_THE_PERSONS_SESSION)
+    } else {
+        FilesChannel::Served
+    }
 }
 
 /// [`files_channel`] for this process, by its own effective uid.
