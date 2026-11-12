@@ -11174,7 +11174,7 @@ CAN_GRAPHICAL=0
 
         /// #3688 — a per-user daemon whose Downloads sits on a file system that
         /// keeps no Unix owners either: a VirtualBox shared folder reads
-        /// `root:vboxsf`, an sshfs without `idmap=user` the server's numbers.
+        /// `root:vboxsf`, a share mounted with a fixed owner reads that one.
         /// A folder's owner says nothing there, so the daemon's default folder
         /// is not refused for reading another account's when the daemon can
         /// write into it (here a folder root owns that every account may

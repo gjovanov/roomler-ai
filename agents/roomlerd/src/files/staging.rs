@@ -193,8 +193,8 @@ pub(super) fn open_folder(path: &Path) -> io::Result<File> {
 /// not every account may write (Ubuntu's private-group umask makes
 /// `~/Downloads` 0775). A file system that keeps no Unix owners or modes
 /// ([`keeps_modes`]) shows every folder as some fixed owner and mode (a FAT
-/// disk 0777, a VirtualBox shared folder `root:vboxsf`, an sshfs without
-/// `idmap=user` the server's numbers), which say nothing: there a per-user
+/// disk 0777, a VirtualBox shared folder `root:vboxsf`, a share mounted
+/// with fixed modes), which say nothing: there a per-user
 /// daemon's folder needs only to be one it can write into ([`writable`]),
 /// since such an upload stages privately and is placed without following a
 /// link. Root stays strict. `Err` says why not, in the viewer's words.
