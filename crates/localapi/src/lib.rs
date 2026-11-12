@@ -4245,19 +4245,21 @@ const LOCALAPI_SOCKET_NAME: &str = "roomler.sock";
 #[cfg(unix)]
 const LOCALAPI_SYSTEM_DIR: &str = "/var/run/roomler";
 
-/// The PER-USER socket path — `$XDG_RUNTIME_DIR/roomler.sock` when the
-/// runtime dir is set (systemd guarantees it's 0700 + user-owned — the right
-/// home for a control socket), else a `roomler/` subdir under the temp dir
-/// (locked to 0700 by the listener). The socket itself is chmod 0600.
+/// The PER-USER socket path of this process's account
+/// ([`per_user_socket_path_for`]): `$XDG_RUNTIME_DIR/roomler.sock` off
+/// macOS, `<per-user temp folder>/roomler/roomler.sock` on macOS, each only
+/// when that directory is private to this account. `None` otherwise, and
+/// always for root on macOS. The socket itself is chmod 0600.
 #[cfg(unix)]
-pub(crate) fn user_socket_path() -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return std::path::PathBuf::from(dir).join(LOCALAPI_SOCKET_NAME);
-    }
-    // No runtime dir (common on macOS, where temp_dir() is already per-user).
-    std::env::temp_dir()
-        .join("roomler")
-        .join(LOCALAPI_SOCKET_NAME)
+pub(crate) fn per_user_socket_path() -> Option<std::path::PathBuf> {
+    // SAFETY: geteuid never fails.
+    let euid = unsafe { libc::geteuid() };
+    per_user_socket_path_for(
+        euid,
+        std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from),
+        std::env::temp_dir(),
+        &dir_facts,
+    )
 }
 
 /// The SYSTEM socket path, used by a daemon privileged enough to bind it.
@@ -4266,16 +4268,19 @@ pub fn system_socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(LOCALAPI_SYSTEM_DIR).join(LOCALAPI_SOCKET_NAME)
 }
 
-/// Where a CLIENT looks, in order: a per-user daemon first (unchanged fast
-/// path for every existing install), then the system daemon.
+/// Where a CLIENT looks, in order: its own account's per-user daemon first,
+/// when it has a private directory for one, then the system daemon.
 #[cfg(unix)]
-pub(crate) fn unix_socket_candidates() -> [std::path::PathBuf; 2] {
-    [user_socket_path(), system_socket_path()]
+pub(crate) fn unix_socket_candidates() -> Vec<std::path::PathBuf> {
+    per_user_socket_path()
+        .into_iter()
+        .chain(std::iter::once(system_socket_path()))
+        .collect()
 }
 
 /// What `lstat` says about a directory an endpoint could live in, as plain
 /// facts, so the rule that reads them is tested on every platform.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DirFacts {
     pub(crate) is_dir: bool,
@@ -4284,44 +4289,124 @@ pub(crate) struct DirFacts {
     pub(crate) mode: u32,
 }
 
-/// The per-user endpoint for the account `euid`, from its runtime dir or
-/// its temp dir.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `lstat` of `dir`: its last component is never followed.
+#[cfg(unix)]
+fn dir_facts(dir: &std::path::Path) -> Option<DirFacts> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir).ok()?;
+    Some(DirFacts {
+        is_dir: m.is_dir(),
+        is_symlink: m.file_type().is_symlink(),
+        uid: m.uid(),
+        mode: m.mode(),
+    })
+}
+
+/// #3736 — a directory where only `euid` (and root) can create an entry: a
+/// real directory, not a link to one, owned by `euid`, and writable by
+/// neither its group nor anyone else.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn private_dir(facts: &DirFacts, euid: u32) -> bool {
+    facts.is_dir && !facts.is_symlink && facts.uid == euid && facts.mode & 0o022 == 0
+}
+
+/// #3736 — the per-user endpoint of the account `euid`, or `None` when it has
+/// no private directory for one. Never a shared directory such as `/tmp`: a
+/// per-user endpoint lives where only its own account can create it.
+///
+/// - Off macOS: `runtime_dir` (`$XDG_RUNTIME_DIR`, which logind makes 0700
+///   and the account's) and nothing else. Root under `sudo`, cron or a system
+///   service has none, so it goes straight to the system socket.
+/// - On macOS: the per-user temp folder (`/var/folders/…/T`, what launchd sets
+///   `TMPDIR` to and what `temp_dir()` reads without it), and never for root,
+///   whose daemon serves the system socket.
+///
+/// Either directory counts only when [`private_dir`] holds for `euid`,
+/// as `facts` (`lstat`) reads it. A trailing slash is dropped first, because
+/// `lstat("dir/")` follows a link named `dir`.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn per_user_socket_path_for(
     euid: u32,
     runtime_dir: Option<std::path::PathBuf>,
     temp_dir: std::path::PathBuf,
     facts: &dyn Fn(&std::path::Path) -> Option<DirFacts>,
 ) -> Option<std::path::PathBuf> {
-    let _ = (euid, facts);
-    Some(match runtime_dir {
-        Some(dir) => dir.join(LOCALAPI_SOCKET_NAME),
-        None => temp_dir.join("roomler").join(LOCALAPI_SOCKET_NAME),
-    })
+    let private = |dir: std::path::PathBuf| {
+        let dir: std::path::PathBuf = dir.components().collect();
+        facts(&dir)
+            .is_some_and(|f| private_dir(&f, euid))
+            .then_some(dir)
+    };
+    if cfg!(target_os = "macos") {
+        if euid == 0 {
+            return None;
+        }
+        private(temp_dir).map(|dir| dir.join("roomler").join(LOCALAPI_SOCKET_NAME))
+    } else {
+        private(runtime_dir?).map(|dir| dir.join(LOCALAPI_SOCKET_NAME))
+    }
 }
 
-/// Whether a client running as `caller` keeps a socket whose server runs
-/// as `server`.
+/// #3736 — whether a client running as `caller` keeps a socket whose server
+/// runs as `server`: its own account, or root, the two accounts a LocalAPI
+/// daemon it may talk to runs as.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn server_uid_trusted(server: u32, caller: u32) -> bool {
-    let _ = (server, caller);
-    true
+    server == caller || server == 0
 }
 
-/// The endpoints a daemon serves: the system socket when it could bind it,
-/// and the per-user one.
+/// #3736 — the endpoints a daemon serves: the system socket alone when it
+/// could bind it, else its own per-user one, when it has a private directory
+/// for it, else none.
+///
+/// A system daemon serves no per-user path beside its own (it once did, for
+/// CLIs that predate the system socket, 2026-08). Nothing still supported
+/// needs one: the CLI on a daemon host re-execs `roomlerd cli`, the
+/// standalone CLI knows the system socket since tunnel-v0.4.149, and the
+/// companion runs as the person, whom that root-only path never admitted.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn unix_endpoints(
     system: &std::path::Path,
     system_bound: bool,
     per_user: Option<std::path::PathBuf>,
 ) -> Vec<std::path::PathBuf> {
-    let mut endpoints = Vec::new();
     if system_bound {
-        endpoints.push(system.to_path_buf());
+        vec![system.to_path_buf()]
+    } else {
+        per_user.into_iter().collect()
     }
-    endpoints.extend(per_user);
-    endpoints
+}
+
+/// #3736 — why this account has no per-user socket to try, for a "not
+/// running" message: `None` for root, who reaches the system socket, and
+/// whenever there is one.
+#[cfg(unix)]
+pub fn no_per_user_socket_note() -> Option<String> {
+    // SAFETY: geteuid never fails.
+    if unsafe { libc::geteuid() } == 0 || per_user_socket_path().is_some() {
+        return None;
+    }
+    Some(if cfg!(target_os = "macos") {
+        "this account's temp folder is not private to it, so there is no per-user socket to try"
+            .to_string()
+    } else {
+        match std::env::var_os("XDG_RUNTIME_DIR") {
+            None => "XDG_RUNTIME_DIR is not set (a login session sets it), so there is no \
+                     per-user socket to try"
+                .to_string(),
+            Some(dir) => format!(
+                "XDG_RUNTIME_DIR ({}) is not a directory private to this account, so there \
+                 is no per-user socket to try",
+                std::path::Path::new(&dir).display()
+            ),
+        }
+    })
+}
+
+/// Windows has no per-user socket: the pipe is one name for every account.
+#[cfg(windows)]
+pub fn no_per_user_socket_note() -> Option<String> {
+    None
 }
 
 /// Bind the daemon's control socket, preferring the SYSTEM path.
@@ -4331,13 +4416,12 @@ pub(crate) fn unix_endpoints(
 /// and a uid is only a PROXY for the thing we actually need) this TESTS the
 /// capability: if `/var/run/roomler` can be created and bound, we are the
 /// system daemon and belong there. An unprivileged daemon fails that and
-/// keeps exactly its current per-user path.
+/// serves its own per-user path, which lives only in a directory private to
+/// its account ([`per_user_socket_path_for`]).
 ///
-/// A system daemon ALSO binds the per-user path, best-effort. That is
-/// forward-compat for one release, the same shape as the P2a rollout: a
-/// `roomler` CLI that predates this change only knows the per-user path, and
-/// packaging does not guarantee the CLI and the daemon step forward in the
-/// same instant. Drop the second bind once the fleet is past it.
+/// #3736 — a system daemon serves the system socket alone, and a per-user
+/// daemon with no private directory serves nothing and logs why
+/// ([`unix_endpoints`]): never a socket in a shared temp dir.
 #[cfg(unix)]
 async fn serve_unix(
     state: Arc<dyn LocalApiState>,
@@ -4345,24 +4429,13 @@ async fn serve_unix(
 ) -> std::io::Result<()> {
     let system = system_socket_path();
     let bound = prepare_unix_listener(&system);
-    let plan = unix_endpoints(&system, bound.is_ok(), Some(user_socket_path()));
+    let plan = unix_endpoints(&system, bound.is_ok(), per_user_socket_path());
     match bound {
         Ok(listener) => {
             tracing::info!(
                 path = %system.display(),
                 "localapi: system-daemon socket (privileged); a user session reaches it here"
             );
-            for legacy in plan.into_iter().filter(|p| *p != system) {
-                if let Ok(l) = prepare_unix_listener(&legacy) {
-                    let st = state.clone();
-                    let sd = shutdown.clone();
-                    tracing::info!(
-                        path = %legacy.display(),
-                        "localapi: also serving the legacy per-user path (pre-split CLIs)"
-                    );
-                    tokio::spawn(async move { accept_unix(l, legacy, st, sd).await });
-                }
-            }
             accept_unix(listener, system, state, shutdown).await
         }
         Err(e) => {
@@ -4372,10 +4445,17 @@ async fn serve_unix(
             );
             match plan.into_iter().next() {
                 Some(path) => serve_unix_at(path, state, shutdown).await,
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "localapi: no per-user endpoint for this account",
-                )),
+                None => {
+                    let why = no_per_user_socket_note()
+                        .unwrap_or_else(|| "there is no per-user socket for it".to_string());
+                    tracing::warn!(
+                        "localapi: not served: this account cannot bind the system socket, and {why}"
+                    );
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("localapi: not served: {why}"),
+                    ))
+                }
             }
         }
     }
@@ -4407,9 +4487,10 @@ fn prepare_unix_listener(path: &std::path::Path) -> std::io::Result<tokio::net::
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
-        // Lock the parent to owner-only when we own it (the temp-subdir case);
-        // for $XDG_RUNTIME_DIR this is already true and the chmod is harmless
-        // (ignored if we don't own it).
+        // Lock the parent to owner-only: the `roomler/` subdir of a Mac's
+        // per-user temp folder, or `/var/run/roomler`. A per-user parent is
+        // in a directory private to this account, and for $XDG_RUNTIME_DIR
+        // this is already true (#3736).
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     // A stale socket from an unclean exit makes bind fail with EADDRINUSE.
@@ -4830,6 +4911,14 @@ pub struct Client {
 /// `\\.\pipe\roomler` / `$XDG_RUNTIME_DIR/roomler.sock`). "Daemon not running"
 /// surfaces as [`std::io::ErrorKind::NotFound`] — callers should render that as
 /// "device service not running", not a hard failure.
+///
+/// #3736 — an endpoint is kept only when the account serving it is this
+/// process's own or the system's: on Unix the server's uid, from the kernel,
+/// is this process's or root's ([`server_uid_trusted`]); on Windows the pipe's
+/// owner is SYSTEM, the Administrators group or this account
+/// ([`pipe_owner_trusted`]). Any other is refused with
+/// [`std::io::ErrorKind::PermissionDenied`], naming the endpoint and the
+/// account, and on Unix the next candidate is tried.
 pub async fn connect() -> std::io::Result<Client> {
     #[cfg(windows)]
     {
@@ -4837,14 +4926,14 @@ pub async fn connect() -> std::io::Result<Client> {
     }
     #[cfg(not(windows))]
     {
-        // Try a per-user daemon first (unchanged, and the common case), then
-        // the system daemon. Without the second candidate a root daemon is
-        // invisible to a user session on macOS, where the per-user path lives
-        // under ROOT's `/var/folders/…` — the CLI would report "not running"
-        // for a daemon that is running perfectly well.
+        // Try this account's per-user daemon first, then the system daemon.
+        // Without the second candidate a root daemon is invisible to a user
+        // session on macOS, where the per-user path lives under the person's
+        // own `/var/folders/…`: the CLI would report "not running" for a
+        // daemon that is running perfectly well.
         // SAFETY: geteuid never fails.
         let caller = unsafe { libc::geteuid() };
-        connect_first_trusted(unix_socket_candidates().to_vec(), caller, |_, stream| {
+        connect_first_trusted(unix_socket_candidates(), caller, |_, stream| {
             Ok(stream.peer_cred()?.uid())
         })
         .await
@@ -4898,7 +4987,7 @@ fn untrusted_socket(path: &std::path::Path, server: u32, caller: u32) -> std::io
         std::io::ErrorKind::PermissionDenied,
         format!(
             "{} is served by uid {server}, which is neither this account (uid {caller}) nor root, \
-             so it was not used",
+             so it was not used; to talk to that daemon, run this as uid {server}",
             path.display()
         ),
     )
@@ -4918,13 +5007,15 @@ fn untrusted_socket(path: &std::path::Path, server: u32, caller: u32) -> std::io
 /// Returns `Some(path)` only when BOTH exist AND different processes answer
 /// them, i.e. exactly when a caller could be looking at the wrong one.
 ///
-/// #2511 — both existing is not two daemons. A system daemon ALSO binds the
-/// legacy per-user path (`serve_unix`), so a root CLI on a host with one root
-/// daemon found both, and told its reader a second daemon ran and to use the
-/// sudo they already had: on every `roomler exec <linux host> -- roomler
-/// status`. Each socket is now asked who answers it, by the peer's PID. A PID
-/// that cannot be read keeps the note, because staying silent would hide a
-/// real second daemon.
+/// #2511 — both existing is not two daemons. A system daemon older than #3736
+/// also binds a per-user path, so a root CLI on a host with one root daemon
+/// found both, and told its reader a second daemon ran and to use the sudo
+/// they already had: on every `roomler exec <linux host> -- roomler status`.
+/// Each socket is asked who answers it, by the peer's PID. A PID that cannot
+/// be read keeps the note, because staying silent would hide a real second
+/// daemon. Since #3736 root has no per-user candidate on its own (no private
+/// runtime dir under `sudo`, cron or a system service; never on a Mac), and
+/// with no per-user candidate there is nothing to compare.
 ///
 /// #2871 — `exists()` on the system socket answers **false to the very caller
 /// this note is for**: its directory is `0700 root` ([`prepare_unix_listener`]),
@@ -4936,7 +5027,8 @@ fn untrusted_socket(path: &std::path::Path, server: u32, caller: u32) -> std::io
 /// FR-97 P2g), so that is read as the root half's evidence too.
 #[cfg(unix)]
 pub async fn other_daemon_socket() -> Option<std::path::PathBuf> {
-    let [user, system] = unix_socket_candidates();
+    let user = per_user_socket_path()?;
+    let system = system_socket_path();
     let user_exists = user.exists();
     let system_exists = system.exists() || macos_root_half_serves_me().await;
     let same_process = if user_exists && system_exists {
@@ -5055,42 +5147,29 @@ pub(crate) fn pipe_busy_backoff(attempt: u32) -> Option<std::time::Duration> {
 }
 
 /// Named-pipe connect, parameterised on the pipe name so tests can target a
-/// private one. Retries `ERROR_PIPE_BUSY` (every listening instance taken)
-/// on the bounded [`pipe_busy_backoff`] ladder; any other error (notably
-/// `ERROR_FILE_NOT_FOUND` = daemon not running) propagates immediately.
+/// private one, for this process's own account ([`connect_windows_checked`]).
 #[cfg(windows)]
 pub(crate) async fn connect_windows_at(pipe_name: &str) -> std::io::Result<Client> {
-    use tokio::net::windows::named_pipe::ClientOptions;
-    const ERROR_PIPE_BUSY: i32 = 231;
-    let mut attempt = 0u32;
-    let pipe = loop {
-        match ClientOptions::new().open(pipe_name) {
-            Ok(p) => break p,
-            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => match pipe_busy_backoff(attempt)
-            {
-                Some(delay) => {
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-                None => return Err(e),
-            },
-            Err(e) => return Err(e),
-        }
-    };
-    Ok(Client::new(Box::new(pipe)))
+    let caller = own_account_sid().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "localapi: this process's own account cannot be read",
+        )
+    })?;
+    connect_windows_checked(pipe_name, &caller).await
 }
 
 /// Unix-socket connect, parameterised on the path so tests can target a private
-/// one.
+/// one. #3736 — kept only when this process's own account or root serves it
+/// ([`server_uid_trusted`]).
 #[cfg(unix)]
 pub async fn connect_unix_at(path: std::path::PathBuf) -> std::io::Result<Client> {
-    let stream = tokio::net::UnixStream::connect(path).await?;
-    Ok(Client::new(Box::new(stream)))
+    // SAFETY: geteuid never fails.
+    connect_unix_checked(path, unsafe { libc::geteuid() }).await
 }
 
 /// [`connect_unix_at`] for a client running as `caller`.
 #[cfg(unix)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn connect_unix_checked(
     path: std::path::PathBuf,
     caller: u32,
@@ -5101,36 +5180,212 @@ pub(crate) async fn connect_unix_checked(
     .await
 }
 
-/// Whether a client running as the account `caller_sid` keeps a pipe whose
-/// owner is `owner_sid` (both as `S-1-…` text).
-#[cfg_attr(not(test), allow(dead_code))]
+/// SYSTEM's SID.
+const SYSTEM_SID: &str = "S-1-5-18";
+/// The Administrators group's SID: the owner of what an elevated
+/// administrator creates, unless policy makes it the person.
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// #3736 — whether a client running as the account `caller_sid` keeps a pipe
+/// whose owner is `owner_sid` (both as `S-1-…` text): SYSTEM, the
+/// Administrators group, or the caller's own account. These are the owners
+/// the daemon's pipe has (a SYSTEM worker's, an elevated one's, or a worker
+/// that runs as the person), and no other account can make SYSTEM or the
+/// Administrators group the owner of a pipe it creates. An owner that could
+/// not be read is no account at all.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn pipe_owner_trusted(owner_sid: &str, caller_sid: &str) -> bool {
-    let _ = (owner_sid, caller_sid);
-    true
+    owner_sid == SYSTEM_SID
+        || owner_sid == ADMINISTRATORS_SID
+        || (!owner_sid.is_empty() && owner_sid == caller_sid)
 }
 
-/// The access a pipe client asks for.
+/// #3736 — the access a pipe client asks for: reading and writing data, and
+/// nothing else. Never `GENERIC_WRITE`, whose `FILE_APPEND_DATA` is the
+/// right to create an instance of the pipe, and nothing that changes the
+/// pipe itself (`FILE_WRITE_ATTRIBUTES`: no client sets a pipe's state).
+/// `GENERIC_READ` carries `READ_CONTROL`, which reading the owner needs.
 #[cfg(windows)]
-#[cfg_attr(not(test), allow(dead_code))]
-const PIPE_CLIENT_ACCESS: u32 =
-    windows_sys::Win32::Foundation::GENERIC_READ | windows_sys::Win32::Foundation::GENERIC_WRITE;
+const PIPE_CLIENT_ACCESS: u32 = windows_sys::Win32::Foundation::GENERIC_READ
+    | windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
 
-/// The flags a pipe client opens with.
+/// #3736 — overlapped, for tokio, and at identification level: the server
+/// may learn who the client is, and may never act as it.
 #[cfg(windows)]
-#[cfg_attr(not(test), allow(dead_code))]
 const PIPE_CLIENT_FLAGS: u32 = windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED
     | windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT
     | windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 
-/// [`connect_windows_at`] for a client running as the account `caller_sid`.
+/// #3736 — [`connect_windows_at`] for a client running as the account
+/// `caller_sid`: the pipe is opened with [`PIPE_CLIENT_ACCESS`] and
+/// [`PIPE_CLIENT_FLAGS`], retrying `ERROR_PIPE_BUSY` (every listening
+/// instance taken) on the bounded [`pipe_busy_backoff`] ladder, and any other
+/// open error (notably `ERROR_FILE_NOT_FOUND` = daemon not running)
+/// propagates immediately. Then it is kept only when [`pipe_owner_trusted`]
+/// holds for its owner, read through the client's own handle. Not the server
+/// process's token: a person may not open a SYSTEM process's token, so that
+/// check would refuse the real daemon.
 #[cfg(windows)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn connect_windows_checked(
     pipe_name: &str,
     caller_sid: &str,
 ) -> std::io::Result<Client> {
-    let _ = caller_sid;
-    connect_windows_at(pipe_name).await
+    let pipe = open_pipe_client(pipe_name).await?;
+    let (owner, name) = pipe_owner(&pipe)?;
+    if !pipe_owner_trusted(&owner, caller_sid) {
+        let who = match &name {
+            Some(n) => format!("{n} ({owner})"),
+            None => owner.clone(),
+        };
+        let account = name.as_deref().unwrap_or(&owner);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{pipe_name} is owned by {who}, which is neither SYSTEM, the Administrators \
+                 group nor this account ({caller_sid}), so it was not used. Where the device \
+                 service runs as {account} (an attended install), run this as {account}"
+            ),
+        ));
+    }
+    Ok(Client::new(Box::new(pipe)))
+}
+
+/// [`connect_windows_checked`]'s open: the exact access and flags, on the
+/// busy ladder.
+#[cfg(windows)]
+async fn open_pipe_client(
+    pipe_name: &str,
+) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
+    let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut attempt = 0u32;
+    loop {
+        // SAFETY: a NUL-terminated name; the handle is handed to tokio below,
+        // which owns it from then on, or no handle was made.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                PIPE_CLIENT_ACCESS,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                PIPE_CLIENT_FLAGS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE {
+            // SAFETY: a live pipe handle opened overlapped, owned by nothing
+            // else; tokio takes it (and closes it on failure).
+            return unsafe {
+                tokio::net::windows::named_pipe::NamedPipeClient::from_raw_handle(handle as _)
+            };
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(e);
+        }
+        match pipe_busy_backoff(attempt) {
+            Some(delay) => {
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            None => return Err(e),
+        }
+    }
+}
+
+/// The owner of the pipe `pipe` is a client of, as `S-1-…` text, and its
+/// account name when it resolves. Read through the client's own handle
+/// (its `READ_CONTROL`). An owner that cannot be read is an error.
+#[cfg(windows)]
+fn pipe_owner(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeClient,
+) -> std::io::Result<(String, Option<String>)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a live pipe handle opened with READ_CONTROL; `owner` points into
+    // `sd`, which the call allocates and is freed below, once.
+    let rc = unsafe {
+        GetSecurityInfo(
+            pipe.as_raw_handle() as _,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    let read = (rc == 0 && !owner.is_null()).then(|| (sid_text(owner), account_name(owner)));
+    if !sd.is_null() {
+        // SAFETY: the one descriptor GetSecurityInfo allocated, freed once.
+        unsafe { LocalFree(sd as _) };
+    }
+    match read {
+        Some((Some(sid), name)) => Ok((sid, name)),
+        _ if rc != 0 => Err(std::io::Error::from_raw_os_error(rc as i32)),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "localapi: the pipe's owner cannot be read",
+        )),
+    }
+}
+
+/// `DOMAIN\name` of `sid`, when it resolves.
+#[cfg(windows)]
+fn account_name(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+    use windows_sys::Win32::Security::{LookupAccountSidW, SID_NAME_USE};
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let mut name_len = name.len() as u32;
+    let mut domain_len = domain.len() as u32;
+    let mut kind: SID_NAME_USE = 0;
+    // SAFETY: `sid` is valid for this call; the buffers are writable for the
+    // lengths passed, which the call updates to the characters written.
+    let ok = unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut name_len,
+            domain.as_mut_ptr(),
+            &mut domain_len,
+            &mut kind,
+        )
+    } != 0;
+    if !ok {
+        return None;
+    }
+    let name = String::from_utf16(&name[..name_len as usize]).ok()?;
+    let domain = String::from_utf16(&domain[..domain_len as usize]).ok()?;
+    Some(if domain.is_empty() {
+        name
+    } else {
+        format!("{domain}\\{name}")
+    })
+}
+
+/// This process's own account, as `S-1-…` text: its token's user.
+#[cfg(windows)]
+fn own_account_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = std::ptr::null_mut();
+    // SAFETY: this process's own token; closed below, once.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let facts = token_facts(token);
+    // SAFETY: the token opened above, closed once.
+    unsafe { CloseHandle(token) };
+    facts.and_then(|f| f.sid)
 }
 
 /// FR-97 P2g — [`connect_unix_at`], kept only when the process serving the
@@ -5947,12 +6202,16 @@ pub struct LanCaptureStatus {
 mod tests {
     use super::*;
 
-    /// #2511 — one process behind both sockets is one daemon (the system
-    /// daemon's legacy per-user bind), and only that case goes quiet.
+    /// #2511 — one process behind both sockets is one daemon (a system daemon
+    /// older than #3736 also binds a per-user path), and only that case goes
+    /// quiet.
     #[cfg(unix)]
     #[test]
     fn one_daemon_behind_both_sockets_is_not_a_second_daemon() {
-        assert!(!second_daemon(true, true, Some(true)), "the legacy bind");
+        assert!(
+            !second_daemon(true, true, Some(true)),
+            "an older system daemon's per-user bind"
+        );
         assert!(second_daemon(true, true, Some(false)), "macOS's two halves");
         assert!(second_daemon(true, true, None), "unknowable: keep the note");
         assert!(
@@ -9812,18 +10071,23 @@ mod tests {
     /// system candidate at all, a root daemon is invisible from a user
     /// session on macOS — `temp_dir()` is per-user there, so the CLI would
     /// search its own `/var/folders/…`, find nothing, and report "not
-    /// running" for a daemon that is running.
+    /// running" for a daemon that is running. #3736: the per-user candidate
+    /// is there only when this account has a private directory for it.
     #[cfg(unix)]
     #[test]
     fn socket_candidates_prefer_the_per_user_daemon() {
         let cands = super::unix_socket_candidates();
-        assert_eq!(cands[0], super::user_socket_path(), "per-user first");
-        assert_eq!(cands[1], super::system_socket_path(), "system second");
-        assert_ne!(cands[0], cands[1], "the two must be distinct paths");
+        let system = super::system_socket_path();
+        match super::per_user_socket_path() {
+            Some(per_user) => {
+                assert_eq!(cands, vec![per_user, system.clone()], "per-user first");
+            }
+            None => assert_eq!(cands, vec![system.clone()], "the system socket alone"),
+        }
+        assert_eq!(cands.last(), Some(&system), "system last");
         assert!(
-            cands[1].starts_with("/var/run/roomler"),
-            "the system path must be well-known, not per-user: {:?}",
-            cands[1]
+            system.starts_with("/var/run/roomler"),
+            "the system path must be well-known, not per-user: {system:?}"
         );
         // Every candidate is the same socket FILE name — only the directory
         // (and therefore the privilege domain) differs.

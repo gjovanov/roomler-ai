@@ -937,8 +937,15 @@ The on-host control surface — how `roomler`, `roomler-desktop`, and scripts ta
 to a running `roomlerd` without any token:
 
 - **Endpoints**: Windows named pipe `\\.\pipe\roomler` (SYSTEM + Admins +
-  Interactive Users, no-write-up); Unix socket `$XDG_RUNTIME_DIR/roomler.sock`
-  (0600).
+  Interactive Users, no-write-up); Unix socket `/var/run/roomler/roomler.sock`
+  for a system daemon, else `$XDG_RUNTIME_DIR/roomler.sock` (the per-user temp
+  folder's `roomler/roomler.sock` on macOS), 0600, and only in a directory
+  private to the daemon's account.
+- **Who a client keeps** (#3736): an endpoint served by its own account, root
+  or SYSTEM (on Windows, a pipe owned by SYSTEM, the Administrators group or
+  its own account). Any other is refused by name, and on Unix the client goes
+  on to the system socket. The pipe client opens with read and write data
+  only, at identification level. Detail: [security-baseline.md](security-baseline.md).
 - **Protocol**: newline-delimited JSON, `{"t": "<verb>", "d": {…}}`.
 
 | Verbs | Purpose |
