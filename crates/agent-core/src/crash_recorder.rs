@@ -400,7 +400,11 @@ impl<'a> Place<'a> {
         #[cfg(windows)]
         if in_machine_tree(dir) && held_switch_on() {
             use crate::machine_tree::{HeldPath, Seal};
-            let held = HeldPath::machine(dir, Seal::Readable).map_err(left_alone)?;
+            let held = HeldPath::machine(dir, Seal::Readable).map_err(|refused| {
+                // A crash that goes unrecorded: the next record carries it.
+                SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
+                left_alone(refused)
+            })?;
             if held.resealed() {
                 // An earlier build's open folder, sealed in place with nothing
                 // handed down: each record name is sealed by its own handle
@@ -437,16 +441,17 @@ impl<'a> Place<'a> {
     }
 }
 
-/// FR-145 — a record left alone: one WARN per process start, counted with the
-/// suppression tally, and an error [`record_with_log_tail`] does not log again.
-/// The crash is never written anywhere else.
+/// FR-145 — records left alone, written or read: one WARN per process start,
+/// and an error [`record_with_log_tail`] does not log again. The crash is
+/// never written anywhere else. Only the writer counts a refusal with the
+/// suppression tally, as one crash that went unrecorded; a refused read is
+/// not a crash (R145).
 #[cfg(windows)]
 fn left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::Error {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!("{LEFT_ALONE}{refused}");
     }
-    SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
     std::io::Error::other(format!("{LEFT_ALONE}{refused}"))
 }
 
@@ -1937,6 +1942,48 @@ mod tests {
             );
             let refused = written.expect_err("a junction above crashes is refused");
             assert!(refused.to_string().contains("link"), "{refused}");
+            println!("{CHECKED}");
+        }
+
+        /// R145: a read walk that is refused (a junction above `crashes`)
+        /// is not a suppressed crash: the tally the next record carries
+        /// stays as it was. Control: a refused write is one.
+        #[test]
+        fn a_refused_read_is_not_counted_as_a_suppressed_crash() {
+            use super::super::{SUPPRESSED_SINCE_LAST, scan_dir};
+            use std::sync::atomic::Ordering;
+            let Some(root) = child() else {
+                return run(
+                    "a_refused_read_is_not_counted_as_a_suppressed_crash",
+                    "a refused read and the crash tally",
+                );
+            };
+            let machine = crate::appdirs::machine_global_dir();
+            let crashes = machine.join("crashes");
+            let parent = machine.parent().unwrap().to_path_buf();
+            let above = root.join("above");
+            std::fs::create_dir_all(above.join("roomler").join("crashes")).unwrap();
+            std::fs::rename(&parent, root.join("roomler-parent-aside")).unwrap();
+            junction(&parent, &above);
+
+            let before = SUPPRESSED_SINCE_LAST.load(Ordering::Relaxed);
+            for _ in 0..3 {
+                assert!(scan_dir(&crashes).is_empty(), "nothing is read");
+            }
+            let after_reads = SUPPRESSED_SINCE_LAST.load(Ordering::Relaxed);
+            let written = record_inner_at(
+                &crashes,
+                CrashReason::SupervisorDetected,
+                "worker exit: a test",
+                Some("the worker's last line".into()),
+            );
+            let after_write = SUPPRESSED_SINCE_LAST.load(Ordering::Relaxed);
+            assert_eq!(
+                after_reads, before,
+                "three refused reads are not suppressed crashes"
+            );
+            assert!(written.is_err(), "the write is refused: {written:?}");
+            assert_eq!(after_write, before + 1, "the refused write is one");
             println!("{CHECKED}");
         }
 
