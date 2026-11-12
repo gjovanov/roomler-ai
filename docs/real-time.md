@@ -57,7 +57,7 @@ The shared rules live in `crates/remote_control/src/upgrade_auth.rs`.
 
 From 0.4.210 every native dial puts its credential in an `Authorization: Bearer`
 header whose value is marked sensitive: the daemon's control socket
-(`agents/roomlerd/src/signaling.rs:1794`), its central and regional DERP sockets
+(`agents/roomlerd/src/signaling.rs:1842`), its central and regional DERP sockets
 (`agents/roomlerd/src/derp.rs:381`) and the CLI's tunnel-client socket. The URL
 names the role and the tenant only. The rule is one function in each client
 (`agents/roomlerd/src/ws_connect.rs:224`, `agents/roomler-cli/src/forward.rs:442`):
@@ -651,9 +651,9 @@ UDP-blocked:
 - A `401` on upgrade (after [the one query-form redial](#how-the-daemon-and-the-cli-dial-3656)
   where that applies) is not fatal. It closes the sessions the agent kept, and
   FR-103 looks for a newer token in the config file, else renews this one, and
-  retries once (`agents/roomlerd/src/signaling.rs:1284`). Otherwise the agent
+  retries once (`agents/roomlerd/src/signaling.rs:1311`). Otherwise the agent
   waits 30 s, 60 s, 5 min, then an hour between tries
-  (`agents/roomlerd/src/signaling.rs:1595`), and the third refusal in a row raises
+  (`agents/roomlerd/src/signaling.rs:1639`), and the third refusal in a row raises
   the re-enrollment prompt on the primary org.
 - Agents also enforce **receive-liveness**: no inbound frame for 80 s ⇒ reconnect —
   this heals half-open sockets that TLS-inspecting middleboxes keep artificially
@@ -694,7 +694,7 @@ flowchart LR
 | `cause` | its fields | what ended the socket |
 |---|---|---|
 | `close` | `code`, `reason` (quoted) | the device sent a close frame with a status code |
-| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2282`) |
+| `close_no_frame` | — | a close frame with no status code: the daemon's own clean stop, on a service stop, a restart or an update (`agents/roomlerd/src/signaling.rs:2336`) |
 | `error` | `kind`, `error` (quoted) | the read failed; `kind` below |
 | `liveness_deadline` | `elapsed_s` | no frame for longer than `rc.ws_rx_deadline_secs` (90 s by default): a half-open socket, reaped (`socket.rs:556`). The check runs on a tick, so `elapsed_s` reads past the deadline |
 | `cancelled` | `by` | the Hub cancelled the loop; `by` below |
