@@ -45,7 +45,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 use tunnel_core::policy::{
-    GateResult, Principal, ProtocolKind, ResolvedSubject, check_forward_request,
+    GateResult, PolicySubject, Principal, ProtocolKind, ResolvedSubject, TunnelPolicy,
+    check_forward_request,
 };
 use tunnel_core::transport::{TRANSPORT_QUIC_V1, TRANSPORT_WEBRTC_DC_V1};
 
@@ -985,6 +986,45 @@ fn forward_forward_msg(
     }
 }
 
+/// The role ids a forward is matched with (#3635): what `lookup` reads, which
+/// in the gate is the roles the originator's owner holds in the org whose
+/// `policies` decide the forward, read on every forward request so a role
+/// given or taken back counts from the next forward on.
+///
+/// - No live policy names a role: empty, and `lookup` is never called. A
+///   role list can change no decision then, and the common case should not
+///   pay a read for the rare one.
+/// - `lookup` fails: empty, with a WARN naming the origin. Role subjects then
+///   match nobody and every other subject kind evaluates as before; an
+///   unreadable role list never turns into an allow.
+async fn forward_role_ids<F, Fut, E>(
+    policies: &[TunnelPolicy],
+    lookup: F,
+    origin: ObjectId,
+) -> Vec<ObjectId>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<ObjectId>, E>>,
+    E: std::fmt::Display,
+{
+    let names_a_role = policies.iter().any(|p| {
+        p.deleted_at.is_none()
+            && p.subjects
+                .iter()
+                .any(|s| matches!(s, PolicySubject::RoleId { .. }))
+    });
+    if !names_a_role {
+        return Vec::new();
+    }
+    match lookup().await {
+        Ok(role_ids) => role_ids,
+        Err(e) => {
+            warn!(%origin, %e, "tunnel forward: roles unreadable; role subjects will not match this forward");
+            Vec::new()
+        }
+    }
+}
+
 /// Server-side forward gate + relay, shared by TCP CONNECT
 /// (`proto = Tcp`) and UDP ASSOCIATE (`proto = Udp`) forwards. The ACL
 /// eval, cross-tenant gate, agent-liveness re-check, and audit trail are
@@ -1062,6 +1102,11 @@ async fn handle_forward_request(
         }
     };
 
+    // The org whose policies decide this forward: the target device's. A
+    // forward between two orgs is refused below (`CrossTenant`) whatever its
+    // policies say.
+    let policy_tenant = s.agent_tenant_id;
+
     // Active policies for the agent's tenant. Server-side ACL is
     // the auth boundary; the agent runs its own minimal allowlist
     // as defence-in-depth (T2.6).
@@ -1072,7 +1117,7 @@ async fn handle_forward_request(
     // (`routes::tunnel::tunnel_policy_manager`).
     let policies = match state
         .tunnel_policies
-        .list_active_for_tenant(s.agent_tenant_id)
+        .list_active_for_tenant(policy_tenant)
         .await
     {
         Ok(p) => p,
@@ -1082,13 +1127,23 @@ async fn handle_forward_request(
         }
     };
 
+    // The roles a `RoleId` subject is matched against: those the originator's
+    // owner holds in `policy_tenant`, read now, on this forward (#3635).
+    let tenants = &state.tenants;
+    let owner = orig.owner_user_id;
+    let role_ids = forward_role_ids(
+        &policies,
+        move || tenants.member_live_role_ids(policy_tenant, owner),
+        orig.log_id(),
+    )
+    .await;
+
     let subject = ResolvedSubject {
+        // `UserId` subjects match the originator's owner: the person who
+        // enrolled the tunnel client, or the device's owner, read when the
+        // device's socket connected.
         user_id: orig.owner_user_id,
-        // T2.6 will resolve role_ids via the existing tenant
-        // membership lookup. For T2.5 we use an empty list — only
-        // UserId / TunnelClientId / AgentId / AllUsers policy subjects
-        // match.
-        role_ids: Vec::new(),
+        role_ids,
         // Subject-agnostic (P3b-2): a tunnel-client WS carries
         // `Principal::TunnelClient`, an agent driving the client role over
         // its own WS carries `Principal::Agent`. The ACL evaluator
@@ -2127,4 +2182,222 @@ pub fn ws_upgrade_tunnel_client(
         )
         .await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use tunnel_core::policy::{
+        Decision, DestinationRule, HostPattern, PolicyTarget, PortRange, evaluate,
+    };
+
+    /// A policy granting `127.0.0.1:port` on every device to `subjects`.
+    fn policy(subjects: Vec<PolicySubject>, port: u16) -> TunnelPolicy {
+        let now = DateTime::now();
+        TunnelPolicy {
+            id: Some(ObjectId::new()),
+            tenant_id: ObjectId::new(),
+            name: format!("grant :{port}"),
+            subjects,
+            targets: vec![PolicyTarget::AllAgents],
+            allowlist: vec![DestinationRule {
+                host_pattern: HostPattern::Cidr("127.0.0.0/8".into()),
+                port_range: PortRange {
+                    low: port,
+                    high: port,
+                },
+                proto: ProtocolKind::Any,
+            }],
+            max_concurrent_flows: None,
+            max_bytes_per_session: None,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+        }
+    }
+
+    fn role(role_id: ObjectId) -> PolicySubject {
+        PolicySubject::RoleId { role_id }
+    }
+
+    /// [`forward_role_ids`] over `policies` with a lookup that answers
+    /// `answer`, and how many times the lookup ran.
+    fn resolve(
+        policies: &[TunnelPolicy],
+        answer: Result<Vec<ObjectId>, &'static str>,
+    ) -> (Vec<ObjectId>, u32) {
+        let calls = Cell::new(0);
+        let lookup = || {
+            calls.set(calls.get() + 1);
+            std::future::ready(answer)
+        };
+        let roles =
+            futures::executor::block_on(forward_role_ids(policies, lookup, ObjectId::new()));
+        (roles, calls.get())
+    }
+
+    /// Whether `evaluate` lets `subject` reach `127.0.0.1:port` on some device.
+    fn allows(policies: &[TunnelPolicy], subject: &ResolvedSubject, port: u16) -> bool {
+        matches!(
+            evaluate(
+                policies,
+                subject,
+                ObjectId::new(),
+                "127.0.0.1",
+                port,
+                ProtocolKind::Tcp
+            ),
+            Decision::Allow { .. }
+        )
+    }
+
+    /// A `tracing` writer into a buffer, so a test reads the WARN line the
+    /// gate writes. Installed thread-scoped (`with_default`), so a parallel
+    /// test's events never land in it.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with every WARN+ event captured; return its value and the text.
+    fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let buf = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+        (out, text)
+    }
+
+    /// No live policy names a role: no role list can change the decision, so
+    /// none is read.
+    #[test]
+    fn without_a_role_subject_the_roles_are_not_read() {
+        let others = vec![
+            policy(
+                vec![PolicySubject::UserId {
+                    user_id: ObjectId::new(),
+                }],
+                9001,
+            ),
+            policy(
+                vec![PolicySubject::TunnelClientId {
+                    tunnel_client_id: ObjectId::new(),
+                }],
+                9002,
+            ),
+            policy(
+                vec![PolicySubject::AgentId {
+                    agent_id: ObjectId::new(),
+                }],
+                9003,
+            ),
+            policy(vec![PolicySubject::AllUsers], 9004),
+        ];
+        assert_eq!(resolve(&others, Ok(vec![ObjectId::new()])), (vec![], 0));
+        assert_eq!(resolve(&[], Ok(vec![ObjectId::new()])), (vec![], 0));
+    }
+
+    /// A policy the evaluator skips (deleted) names no role either.
+    #[test]
+    fn a_deleted_role_policy_reads_nothing() {
+        let mut gone = policy(vec![role(ObjectId::new())], 9000);
+        gone.deleted_at = Some(DateTime::now());
+        assert_eq!(resolve(&[gone], Ok(vec![ObjectId::new()])), (vec![], 0));
+    }
+
+    /// A live role subject: the roles are read once, returned as read, and
+    /// decide the role policy: a holder is allowed, anyone else is not.
+    #[test]
+    fn a_role_subject_reads_the_roles_and_they_decide_the_policy() {
+        let ops = ObjectId::new();
+        let other = ObjectId::new();
+        let policies = vec![policy(vec![role(ops)], 9000)];
+
+        let (held, calls) = resolve(&policies, Ok(vec![other, ops]));
+        assert_eq!((held.clone(), calls), (vec![other, ops], 1));
+        let holder = ResolvedSubject {
+            user_id: ObjectId::new(),
+            role_ids: held,
+            principal: Principal::TunnelClient(ObjectId::new()),
+        };
+        assert!(allows(&policies, &holder, 9000), "a holder of the role");
+
+        let (none_held, _) = resolve(&policies, Ok(vec![other]));
+        let not_holder = ResolvedSubject {
+            role_ids: none_held,
+            ..holder
+        };
+        assert!(!allows(&policies, &not_holder, 9000), "a person without it");
+    }
+
+    /// The read fails: no roles, a WARN that names the origin and the error,
+    /// and never an allow through a role. A user subject in the same set still
+    /// allows its user: only role subjects lose.
+    #[test]
+    fn an_unreadable_role_list_is_no_roles_and_a_warn_never_an_allow() {
+        let person = ObjectId::new();
+        let origin = ObjectId::new();
+        let ops = ObjectId::new();
+        let policies = vec![
+            policy(vec![role(ops)], 9000),
+            policy(vec![PolicySubject::UserId { user_id: person }], 9001),
+        ];
+        let calls = Cell::new(0);
+        let (roles, warns) = capture_warns(|| {
+            futures::executor::block_on(forward_role_ids(
+                &policies,
+                || {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Err::<Vec<ObjectId>, _>("role store unreachable"))
+                },
+                origin,
+            ))
+        });
+
+        assert_eq!((roles.clone(), calls.get()), (vec![], 1));
+        assert!(warns.contains("WARN"), "a WARN is written: {warns}");
+        assert!(warns.contains("roles unreadable"), "{warns}");
+        assert!(
+            warns.contains(&origin.to_hex()),
+            "the WARN names the origin: {warns}"
+        );
+        assert!(
+            warns.contains("role store unreachable"),
+            "and the error: {warns}"
+        );
+
+        let subject = ResolvedSubject {
+            user_id: person,
+            role_ids: roles,
+            principal: Principal::Agent(origin),
+        };
+        assert!(
+            !allows(&policies, &subject, 9000),
+            "an unreadable role list never allows through a role"
+        );
+        assert!(
+            allows(&policies, &subject, 9001),
+            "a user subject in the same set evaluates as before"
+        );
+    }
 }

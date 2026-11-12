@@ -47,3 +47,6 @@ tracing.workspace = true
 # FR-115 P4a — the relay allowance tests' month boundary (UTC); the
 # arithmetic itself lives in `roomler-ai-services::relay_allowance`.
 chrono.workspace = true
+# #3635 — the forward gate's role-read tests capture the WARN it writes when
+# the roles are unreadable.
+tracing-subscriber.workspace = true

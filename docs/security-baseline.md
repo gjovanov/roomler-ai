@@ -323,12 +323,15 @@ roles do not.
   `not_a_member`. For a holder, another org's policy or an id that names nothing is
   a 404.
 - ⚠️ **The forward itself reads no permission bit, and must not.**
-  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:994`) asks only
+  `handle_forward_request` (`crates/modules/network/src/tunnel.rs:1034`) asks only
   the policies: default deny, first match. The policy IS the grant. It exists to let
   people who hold no management bit reach what a holder named them for, so a bit on
-  the forward would either defeat it or repeat it. What keeps the chain sound is who
-  may write the policy, and the exit device's own `forward_acl` stays its last word
-  ([tunnels.md](tunnels.md#policy--two-independent-gates)).
+  the forward would either defeat it or repeat it. When a policy names a role, the
+  forward reads which roles the person holds in the org at that forward; in a policy a
+  role is a group of people, and its permission bits are not read
+  ([tunnels.md](tunnels.md#who-a-forward-is-matched-as-3635)). What keeps the
+  chain sound is who may write the policy, and the exit device's own `forward_acl`
+  stays its last word ([tunnels.md](tunnels.md#policy--two-independent-gates)).
 - **The web app asks the mask first** (`canManageTunnelPolicies`,
   `ui/src/utils/permissions.ts:375`). The store sends nothing for a caller without
   the bit, a server 403 lands in the same state, and the Tunnel ACL tab then says who
@@ -784,9 +787,10 @@ for (its `sub`), with their permissions read at enrollment time.
 
 A tunnel client acts for the person whose enrollment token enrolled it
 (`owner_user_id`; for a paired client, whoever approved the pairing): the forward gate
-matches it as that person, `AllUsers` included, and its overlay node is a peer of the
-org's mesh. So it lasts only as long as that person's membership of the org, as a call
-seat and a room membership do ([§3](#the-media-socket-admits-only-the-calls-participants)):
+matches it as that person (`AllUsers`, `UserId`, and the roles they hold in the org),
+and its overlay node is a peer of the org's mesh. So it lasts only as long as that
+person's membership of the org, as a call seat and a room membership do
+([§3](#the-media-socket-admits-only-the-calls-participants)):
 
 - **Removed from the org, or leaving it, removes the person's tunnel clients there**,
   the way a device manager's `DELETE …/tunnel-client/{cid}` removes one

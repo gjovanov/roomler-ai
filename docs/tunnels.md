@@ -985,15 +985,16 @@ Locked by lib tests, each shown red with a one-line negative control:
 ## Policy — two independent gates
 
 1. **Server-side ACL** (`tunnel_policies`, default-deny): evaluated per flow open
-   as *subject* (user / tunnel client / agent) ×
-   *target* (agent) × *destination* (`host:port`, protocol). Read and written
+   as *subject* (user / role / tunnel client / agent / all users) ×
+   *target* (agent) × *destination* (`host:port`, protocol), the originator
+   matched as [below](#who-a-forward-is-matched-as-3635). Read and written
    only by holders of `MANAGE_AGENTS` (the org's owner and admins), on the
    **Network → ACL** page's Tunnel ACL tab, as the overlay ACL is; every route, the
    list included, refuses a member without it 403 `forbidden`
    ([security-baseline.md](security-baseline.md#a-tunnel-policy-is-a-grant-manage_agents-reads-included)).
    The forward itself reads no permission bit: the policy is the grant, made to let
    people who hold no management bit reach what a holder named them for
-   (`crates/modules/network/src/tunnel.rs:1069`). Every decision lands in
+   (`crates/modules/network/src/tunnel.rs:1114`). Every decision lands in
    `tunnel_audit` (90 d). A device the org
    removed is refused as a target while it is removed; if its machine enrolls
    again, the device is taken out of every live policy's subjects and targets
@@ -1001,6 +1002,63 @@ Locked by lib tests, each shown red with a one-line negative control:
    policy left naming nobody grants nothing and stays in the list to edit.
 2. **Agent-local `forward_acl`** (config.toml): the exit machine's own last word —
    it survives a compromised server. Empty-but-enabled means "trust the server".
+
+### Who a forward is matched as (#3635)
+
+A forward is matched in the org whose policies decide it, the target device's
+(`policy_tenant`, `crates/modules/network/src/tunnel.rs:1108`); a forward from
+another org is refused `cross_tenant` whatever those policies say. In that org the
+originator is matched as the person it acts for, its `owner_user_id`:
+
+| Originator | `UserId` | `RoleId` | `TunnelClientId` / `AgentId` | `AllUsers` |
+|---|---|---|---|---|
+| A tunnel client: `roomler` on its own socket, with its tunnel-client credential | the person who enrolled it; for a paired client, whoever approved the pairing | a role that person holds in the org | `TunnelClientId` = this client; an `AgentId` never matches it | yes |
+| A device opening forwards over its own device socket: `forward --daemon`, a declared route, a supervised SOCKS5 listener ([tunnel-install.md](tunnel-install.md#declared-routes-daemon-supervised--p6)) | the device's owner, as read when the device's socket connected | a role the device's owner holds in the org | `AgentId` = this device; a `TunnelClientId` never matches it | yes |
+
+The roles come from `forward_role_ids` (`crates/modules/network/src/tunnel.rs:1000`),
+through `TenantDao::member_live_role_ids` (`crates/services/src/dao/tenant.rs:649`):
+
+- **On every forward request**, never at enrollment or when the socket connects. A
+  role given counts from the person's next forward, on a tunnel that is already open
+  too; a role taken back, or the person's removal from the org, refuses the next one
+  (`acl_denied`).
+- **Only roles that org has count**: a role of another org, or one this org no longer
+  has, satisfies no policy here.
+- **Only when a live policy names a role.** Otherwise no role list could change the
+  decision, and nothing is read.
+- **A read that fails gives no roles**, with a WARN naming the origin
+  (`tunnel forward: roles unreadable; role subjects will not match this forward`).
+  Role subjects then match nobody on that forward, every other subject kind evaluates
+  as before, and it never becomes an allow.
+- **A device acts for its owner**, so it matches its owner's roles, and stops matching
+  them once the owner is no longer a member of the org: they hold no role there. The
+  device itself stays, because removing one is a device manager's decision.
+- **A role is a group of people here.** The forward reads which roles the person
+  holds, never a role's permission bits: the policy is the grant (item 1).
+
+```mermaid
+flowchart TD
+    REQ["rc:tunnel.tcp.request / rc:tunnel.udp.request"] --> POL["read the live policies<br/>of the target device's org"]
+    POL --> ANY{"does a live policy<br/>name a role?"}
+    ANY -- no --> NONE["no roles, nothing read"]
+    ANY -- yes --> READ["read the roles the owner holds in that org,<br/>keeping roles the org has"]
+    READ -- read --> ROLES["those roles"]
+    READ -- failed --> WARN["no roles + WARN"]
+    NONE --> EVAL["evaluate: first match wins, default deny"]
+    ROLES --> EVAL
+    WARN --> EVAL
+    EVAL -- allow --> FWD["relay the forward to the device"]
+    EVAL -- deny --> REJ["reject: acl_denied"]
+```
+
+| Test | What it locks |
+|---|---|
+| `tunnel_role_subject_tests::a_role_subject_forwards_for_a_member_who_holds_the_role_and_for_no_one_else` (`crates/tests/src/tunnel_role_subject_tests.rs:278`) | a holder of the role forwards; a member without it is refused `acl_denied` |
+| `…::the_role_is_read_on_every_forward_so_losing_it_or_the_org_stops_the_next_one` (`:323`) | on one open session: the role taken back refuses, given back allows, the person removed from the org refuses |
+| `…::a_device_forwards_on_its_owners_roles_until_its_owner_leaves_the_org` (`:379`) | a device forwards on its owner's role, and is refused once the owner left the org |
+| `…::a_role_of_another_org_or_one_the_org_deleted_satisfies_no_policy_here` (`:436`) | a role of another org, and a role the org deleted, grant nothing here |
+| `…::the_other_subject_kinds_forward_as_before` (`:516`) | user, tunnel client, all users and device subjects as before; a role-or-user policy still forwards through the user |
+| `tunnel::tests` (`crates/modules/network/src/tunnel.rs:2188`) | no live role subject: no read; only a deleted role policy: no read; the roles read decide the role policy; a failed read: no roles, the WARN, no allow, while a user subject still allows |
 
 ### A retired agent-session grant is refused (FR-137)
 
@@ -1013,7 +1071,7 @@ reach whatever the device may reach. So:
 - `net_grant` stays on `ClientMsg::TunnelOpen`, parse-only
   (`crates/remote_control/src/signaling.rs:1363`), and no build sends it;
 - the server refuses any open that carries one, at step 3c
-  (`crates/modules/network/src/tunnel.rs:697`), before a tunnel session exists
+  (`crates/modules/network/src/tunnel.rs:698`), before a tunnel session exists
   (step 4, `:780`), with `rc:error {code: net_grant_refused}`
   (`NET_GRANT_REFUSED`, `signaling.rs:102`). An old device reads that code as the
   end of its grant, never as a reason to retry.
@@ -1028,9 +1086,10 @@ reserved are listed in
 
 A tunnel client acts for the person whose enrollment token enrolled it, its
 `owner_user_id`: the gate above matches it as that person (`AllUsers`, their
-`UserId` grants), and its overlay node is a peer of the org's mesh. For a paired
-client that person is whoever approved the pairing, so an admin who mints the token
-for someone else's laptop, or approves its pairing, owns that client.
+`UserId` grants, and the roles they hold in the org for `RoleId` grants), and its
+overlay node is a peer of the org's mesh. For a paired client that person is
+whoever approved the pairing, so an admin who mints the token for someone else's
+laptop, or approves its pairing, owns that client.
 
 Three things end one, all through one removal (`end_tunnel_client`,
 `crates/modules/network/src/routes/tunnel.rs`): the row is tombstoned and its
@@ -1048,7 +1107,11 @@ cannot be followed by a lease nothing would release.
 From the tombstone on, a reconnect is told `rc:tunnel.revoked` and stops, a renewal
 and the agent roster answer 401, and the client takes no address. Its open socket
 closes at the next 60 s revocation poll, on whichever pod holds it; until then it can
-still open forwards, the window a `DELETE` has always had.
+still open forwards, the window a `DELETE` has always had. A grant through a role has
+no such window: the forward reads the owner's roles in the org on every request, and
+a person who is no longer a member holds none there, so their next forward through a
+`RoleId` grant is refused `acl_denied`
+([above](#who-a-forward-is-matched-as-3635)).
 
 - **The membership hook never stops the removal's cascade.** It tries every client,
   and logs one it could not finish at ERROR with `alert = membership_tunnel_end`: a
@@ -1066,7 +1129,9 @@ still open forwards, the window a `DELETE` has always had.
   an operator step that runs the removal's own cascade per (org, person).
 - **Devices the person enrolled are not removed with them.** A device is not a tunnel
   client, and removing one stays a device manager's decision. Tunnel policies naming
-  the person are left in place for an admin to edit.
+  the person are left in place for an admin to edit. A device the person owns stops
+  matching `RoleId` grants at once, because the forward reads its owner's roles in
+  the org on every request and its owner holds none there any more.
 
 ## LocalAPI
 
