@@ -2330,6 +2330,47 @@ runs no overlay of its own) and, since #2892, says so: the address lines read
 half's own enrollments stay "overlay OFF" — they are off the mesh by design, and
 the line under them says that instead of prescribing netstack.
 
+### Which account each step of the package's script writes as (#3702)
+
+The package's post-install script runs as root, at an install by hand and at
+every self-update through the update helper. Root writes only under folders
+that root alone can write. What belongs to the person at the console, the two
+login items in `~/Library/LaunchAgents`, is made, written and removed by that
+person's own account, so the system applies that account's rights and nothing
+more.
+
+| Step | Writes as | Where | Anchor |
+|---|---|---|---|
+| Sweep the bundles of earlier layouts | root | `/Applications`, `/Library/Roomler` | `agents/roomlerd/packaging/macos/postinstall:33-36`, `:51-61` |
+| Move or copy the system config and log folders | root | `/etc`, `/var/log` | `agents/roomlerd/packaging/macos/postinstall:79-108` |
+| Make `~/Library/LaunchAgents`, write `com.roomler.agent.plist` and `com.roomler.desktop.plist` | **the console user** (`sudo -n -u`) | the person's home | `agents/roomlerd/packaging/macos/postinstall:228-269`, `:295`, `:382` |
+| Remove the agent's login item on a Mac whose root daemon runs the GUI worker | **the console user** | the person's home | `agents/roomlerd/packaging/macos/postinstall:282` |
+| Load the login items into `gui/<uid>` | root, through `launchctl` (no file written) | launchd | `agents/roomlerd/packaging/macos/postinstall:161` |
+| Write, load or remove the root daemon's and the update helper's plists | root | `/Library/LaunchDaemons`, `/etc/roomler`, `/var/log/roomler` | `agents/roomlerd/packaging/macos/postinstall:450-452`, `:526`, `:479`, `:563` |
+
+- **`sudo -u`, not `launchctl asuser`.** `sudo -u` changes the uid, gid and
+  groups; `launchctl asuser` changes only the bootstrap context. `-n` because
+  root needs no password and a run by the update helper has no terminal.
+- **A login item is placed only as launchd loads it**: a regular file, not a
+  link, with one name, owned by the console user, mode 644. Anything else at
+  its path (a link, a folder, a file of another owner) is removed by the
+  person's account first, so nothing is written through it. An item the person
+  already owns is rewritten in place, which also works in a
+  `~/Library/LaunchAgents` that is not the person's own folder.
+- **An item that cannot be placed is reported, not fatal.** The script prints
+  `SKIPPED the login item …` with the reason, does not load that item (nor stop a
+  running companion), and the install still succeeds. On a Mac whose root
+  daemon runs the GUI worker, an agent item the person's account cannot remove
+  is reported with the command that removes it.
+- **No scratch file.** `launchctl bootstrap`'s error text is kept in a shell
+  variable (`BOOTSTRAP_ERR`, `UPDATE_ERR`, `:161`, `:544`, `:552`), so the script
+  writes nothing to `/tmp`.
+
+`installer-smoke`'s macOS job holds this on a real install: the runner's own
+companion item starts as a link to a root-owned file, and after the install that
+file is unchanged while both items are regular files of the console user with
+mode 644; after the last install no `roomler-*.err` file is in `/tmp`.
+
 ### Two configurations — which one the app and the CLI edit (#2871)
 
 The two halves are **two enrollments with two configuration files**, and that
