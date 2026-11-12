@@ -77,6 +77,14 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
+    # #3737 — a file of the SYSTEM service's former anchor folder is opened
+    # below the folder's own handle (NtOpenFile with a root directory), and a
+    # registry key is deleted through its handle (NtDeleteKey): ntdll, which
+    # the loader maps into every process before anything else.
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_Registry",
+    "Win32_System_IO",
 ] }
 
 [features]

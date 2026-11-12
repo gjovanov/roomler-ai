@@ -43,6 +43,9 @@ mod folder_gate;
 pub mod logging;
 pub mod logs_upload;
 pub mod machine;
+/// #3737 — a machine registry key only SYSTEM and Administrators may change or
+/// read: where the Windows SYSTEM service keeps its anchor and SSH host key.
+pub mod machine_key;
 /// #3609 — the chain a Windows background service loads its machine
 /// enrollment from: repaired, then checked, and written only through new files.
 pub mod machine_tree;

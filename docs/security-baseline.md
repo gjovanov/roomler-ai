@@ -538,6 +538,8 @@ answer only ever stops a device: a deny is never credited, and a domain account
 that is an administrator only through a domain group reads as no administrator,
 because an answer that needed a domain controller would flap SYSTEM mode.
 
+The SYSTEM service's FR-94 anchor is no file: it is read only from `HKLM\SOFTWARE\Roomler\ExecService`, a key that SYSTEM or Administrators own and no other account may change, read or create, below a parent no other account may change, neither of them a registry link (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)). A writer makes a key that fails that check again rather than sealing it where it stands, so a handle opened while it was loose reaches nothing.
+
 ### A viewer's file transfer acts as the person at the screen (#3048, #3669, #3688)
 
 On a Windows background-service install the worker is LocalSystem. What a

@@ -13,7 +13,7 @@ Every enrolled device and every `roomler` tunnel client holds a long-lived crede
 | **Tunnel enrollment token** | a member (`POST /api/tenant/{tid}/tunnel-client/enroll-token`) | 10 min, **single use** (#3328) | — | used, or 10 min pass; refused, unspent, once its member has left the org | pasted once into `roomler enroll`; never stored |
 | **Agent token** (`aud = agent`) | `POST /api/agent/enroll` | 365 days (`rc.agent_token_ttl_secs`) | **the device** (`POST /api/agent/self/renew`) | the device is removed (generation), or it lapses past the grace | the daemon's `config.toml` (`agent_token`, or `[[orgs]].agent_token`) |
 | **Tunnel-client token** (`aud = tunnel-client`) | `POST /api/tunnel-client/enroll` | 365 days | **the `roomler` CLI** (`POST /api/tunnel-client/renew`) | the client is removed (generation), or it lapses past the grace | the CLI's `config.toml`, `0600` |
-| **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | `%ProgramData%\roomler\roomler\exec-service\anchor.json`, SYSTEM + Administrators only |
+| **Service credential** (`AgentService`, FR-94) | `POST /api/agent/anchor`, elevated | 365 days | the SYSTEM service (`POST /api/agent/service/renew`) | the device is un-anchored, re-anchored or removed | the registry key `HKLM\SOFTWARE\Roomler\ExecService`, value `Anchor`: SYSTEM + Administrators only, nobody else may read it (#3737, [`fleet-rpc.md`](fleet-rpc.md#where-the-anchor-lives-3737)) |
 
 FR-104 adds one variation on the first row: an enrollment token minted with `anchor: true` may also anchor the device it enrolled, once ([`fleet-rpc.md`](fleet-rpc.md) § Anchoring).
 
