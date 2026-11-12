@@ -4879,4 +4879,44 @@ mod tests {
         assert!(!r.table.keeping(), "nothing kept, no window: today's gate");
         assert_eq!(r.closes(), 1);
     }
+
+    /// FR-138 P4-1 — the switch defaults on. Only `0`, `false`, `no` or
+    /// `off` turns it off; an empty or an unknown value keeps it on, as every
+    /// default-on gate reads (`tunnel_core::env::flag`). The resume scope
+    /// still stages the fleet: with no window the switch on is the switch off
+    /// (P4-0, the tests above).
+    #[test]
+    fn p4_1_the_switch_defaults_on() {
+        let code: String = include_str!("session_table.rs")
+            .split("\nmod tests {")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert!(
+            code.contains(
+                "fnsurvive_enabled()->bool{tunnel_core::env::flag(\"RC_SESSIONS_SURVIVE_REATTACH\",true)}"
+            ),
+            "the switch reads default-on"
+        );
+        // That reading, on a suffix nothing else reads.
+        const SUFFIX: &str = "FR138_P4_1_TEST_SWITCH";
+        let var = format!("ROOMLERD_{SUFFIX}");
+        assert!(tunnel_core::env::flag(SUFFIX, true), "unset is on");
+        for (value, on) in [
+            ("", true),
+            ("garbage", true),
+            ("1", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("No", false),
+            ("OFF", false),
+        ] {
+            // SAFETY: a suffix no other test reads, set and removed here alone.
+            unsafe { std::env::set_var(&var, value) };
+            assert_eq!(tunnel_core::env::flag(SUFFIX, true), on, "{value:?}");
+        }
+        unsafe { std::env::remove_var(&var) };
+    }
 }
