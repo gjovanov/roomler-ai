@@ -52,6 +52,13 @@ const DEAD_PATH_CLOSE: Duration = Duration::from_secs(2);
 /// they settle within milliseconds, and a real leak never settles at all.
 const SETTLE: Duration = Duration::from_secs(20);
 
+/// How long the dead-path test's router holds each packet before it counts
+/// and forwards it. The router does both on a task of its own, after the
+/// send that queued the packet has returned, and a loaded runner starts that
+/// task late: 0.3-13 ms late in a 2-CPU stress run (#3716). This makes the
+/// lag certain on every run instead of one run in three.
+const ROUTER_LAG: Duration = Duration::from_millis(20);
+
 /// A runtime of the test's own. The agent and the stand-in viewer get one
 /// each, so the agent's counts the agent's tasks alone, and the virtual
 /// network's router, which every baseline holds.
@@ -102,10 +109,13 @@ struct Wire {
     from_agent: AtomicU64,
 }
 
-async fn wan(wire: &Arc<Wire>) -> (Arc<Net>, Arc<Net>) {
+/// The agent's and the viewer's networks, joined by a router that holds each
+/// packet `lag` before it counts and forwards it.
+async fn wan(wire: &Arc<Wire>, lag: Duration) -> (Arc<Net>, Arc<Net>) {
     let wan = Arc::new(Mutex::new(
         Router::new(RouterConfig {
             cidr: "1.2.3.0/24".to_owned(),
+            min_delay: lag,
             ..Default::default()
         })
         .expect("router"),
@@ -290,7 +300,7 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
     let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
-        let (agent_net, viewer_net) = wan(&wire).await;
+        let (agent_net, viewer_net) = wan(&wire, ROUTER_LAG).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
@@ -351,7 +361,7 @@ fn a_healthy_close_still_takes_milliseconds() {
     let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
-        let (agent_net, viewer_net) = wan(&wire).await;
+        let (agent_net, viewer_net) = wan(&wire, Duration::ZERO).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
@@ -392,7 +402,7 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
     let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
-        let (agent_net, viewer_net) = wan(&wire).await;
+        let (agent_net, viewer_net) = wan(&wire, Duration::ZERO).await;
         let baseline = alive();
         let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
@@ -512,7 +522,7 @@ fn many_writers_share_one_ordered_channel() {
         .expect("runtime")
         .block_on(async {
             let wire = Arc::new(Wire::default());
-            let (agent_net, viewer_net) = wan(&wire).await;
+            let (agent_net, viewer_net) = wan(&wire, Duration::ZERO).await;
             let viewer = peer(viewer_net).await;
             let agent = peer(agent_net).await;
 
