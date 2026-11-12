@@ -1455,22 +1455,22 @@ jobs:
           cargo test -p roomlerd --lib --features clipboard,enigo-input -- macos_supervisor:: clipboard::mac_gate_tests input::layout_mac:: apps:: macos_spawn:: thread_dump:: encode::clock:: exec::tests::a_command_keeps_only_its_standard_streams
 
       # #3757 — a Mac's root daemon declines the `files` channel of a session
-      # no GUI worker serves, with a reason the viewer shows, and every other
-      # process serves it as before. In the test build the step above made
-      # (the same features): the module as the runner's user (the decision,
-      # declined and served channels over an in-process peer pair, this
-      # process served by its own euid), and the root half's hello still
-      # offering file transfer; then the same binary under sudo, where the
-      # Mac's own euid 0 declines. ROOMLERD_TEST_REQUIRE_ROOT turns the root
-      # test's skip into a failure, and the step fails unless that test ran.
+      # no GUI worker serves; every other process serves it as before. In the
+      # step above's test build: the module (and the root half's hello still
+      # offering file transfer) as the runner's user, then the same binary
+      # under sudo, where the Mac's own euid 0 declines. The step fails unless
+      # the root test ran and passed (ROOMLERD_TEST_REQUIRE_ROOT: no skip).
       - name: cargo test the files channel on a Mac's root daemon (#3757)
         run: |
-          set -euo pipefail
+          set -eu
           cargo test -p roomlerd --lib --features clipboard,enigo-input -- peer::files_channel_tests:: encode::caps::tests::a_macs_root_half_still_offers_file_transfer --nocapture
           cargo test -p roomlerd --lib --features clipboard,enigo-input --no-run --message-format=json > /tmp/files3757.json
           BIN=$(jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and .executable != null) | .executable' /tmp/files3757.json | head -1)
           if [ -z "$BIN" ]; then echo "::error::no roomlerd lib test binary in the build output"; exit 1; fi
-          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture 2>&1 | tee /tmp/files3757-root.log
+          RC=0
+          sudo ROOMLERD_TEST_REQUIRE_ROOT=1 "$BIN" peer::files_channel_tests:: --nocapture > /tmp/files3757-root.log 2>&1 || RC=$?
+          cat /tmp/files3757-root.log
+          if [ "$RC" != 0 ]; then echo "::error::the files channel tests failed under sudo (exit $RC)"; exit 1; fi
           grep -q 'as_root::a_root_process_on_a_mac_declines_the_files_channel \.\.\. ok' /tmp/files3757-root.log \
             || { echo "::error::the root test did not run and pass under sudo"; exit 1; }
 
