@@ -3889,7 +3889,9 @@ async fn install_from_helper(
     }
     tracing::info!(
         %latest,
-        "update-helper: installed — postinstall re-bootstrapped the agent halves"
+        "update-helper: installed — postinstall reloaded the root daemon (when it is \
+         enabled); a person's login items reload only if that person is signed in at \
+         the console, else at the next sign-in (/var/log/install.log says which)"
     );
     Ok(())
 }
