@@ -29,6 +29,9 @@
 #     the peer never acks, so a data channel's close waited forever behind
 #     the video writer, and with it the peer connection's close: its ICE
 #     agent, sockets and this association lived until the process exited.
+#     A write holds its stream's `write_turn` from its shutdown check until
+#     its chunks are queued, and the reset waits for that turn on its task,
+#     so it never goes ahead of a write the check let through.
 
 [package]
 edition = "2021"
