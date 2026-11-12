@@ -668,7 +668,7 @@ environment (a systemd drop-in); remote config cannot reach it
 The viewer chooses an upload's `id`, and the daemon names the upload's staging
 folder after it. So the id is one plain name: letters, digits, `.`, `_` and
 `-`, not starting with `.`, at most 128 bytes (`transfer_id`,
-`agents/roomlerd/src/files.rs:1332`). Every entry that takes an id from the
+`agents/roomlerd/src/files.rs:1471`). Every entry that takes an id from the
 files channel checks it first, on every OS and before anything on disk is
 touched: `files:begin`, `files:resume`, `files:cancel` and `files:end`. Any
 other id is refused with a `files:error` the viewer shows. `partial_dir_for`,
@@ -693,13 +693,13 @@ folder on its way is one another account can write
 
 - **Its default folder** is its XDG Downloads when that exists and passes, else
   `~/Downloads`, made 0700 when a file arrives, else a refusal the viewer shows
-  (`default_download_dir`, `agents/roomlerd/src/files.rs:4522`). The folder each
+  (`default_download_dir`, `agents/roomlerd/src/files.rs:4661`). The folder each
   is opened to must be the writer's own: for root, one no other account may
   write; for a per-user daemon, one not every account may, unless its file
   system keeps no owners or modes, where it need only be one the daemon can
   write into. Never the temp dir. Root's home is the one its account names,
   never `HOME`, and must pass root's rule itself
-  (`own_home_and_downloads`, `files.rs:4825`); FR-84's rule judges a
+  (`own_home_and_downloads`, `files.rs:4964`); FR-84's rule judges a
   configured or a chosen folder against that home too.
 - **Its staging** (`.roomler-partial`, `<id>`, `meta.json`, `data`) is made with
   explicit modes whatever the umask, and is used, resumed or registered by the
@@ -710,11 +710,11 @@ folder on its way is one another account can write
   mounted with fixed modes) cannot hold staging of the writer's own: its upload
   stages in the writer's own private folder, `~/.local/state/roomler/staging` or
   root's `/var/lib/roomler/staging`, and is copied across at its end
-  (`stage_held`, `files.rs:4606`). There root still never places into a
+  (`stage_held`, `files.rs:4745`). There root still never places into a
   folder another account can write, and its private folder sits only in a
   `/var/lib/roomler` that is root's and no other account may write.
 - **A root writer's resume and end** place only in a folder the rule gives it
-  now (`root_may_place_in`, `files.rs:4726`): the one the partial sits beside,
+  now (`root_may_place_in`, `files.rs:4865`): the one the partial sits beside,
   or, for one staged in root's private folder, the one its notes record. Never
   where its notes alone say.
 - **A transfer holds** its folders from its begin, or its resume, to its end, and

@@ -5273,7 +5273,7 @@ to-activate, so the browser never sees a bait-and-switch.
   folder. Filename sanitization + collision-safe rename + 2 GiB
   per-transfer cap. An upload's `id` names its staging folder, so it is one
   plain name: letters, digits, `.`, `_` and `-`, not starting with `.`, at
-  most 128 bytes (`transfer_id`, `agents/roomlerd/src/files.rs:1332`).
+  most 128 bytes (`transfer_id`, `agents/roomlerd/src/files.rs:1471`).
   `files:begin`, `files:resume`, `files:cancel` and `files:end` check it
   first, on every OS, and answer any other id with a `files:error`; the
   viewer's ids (`up-<base36>-<base36>`) are such names (#3688).
