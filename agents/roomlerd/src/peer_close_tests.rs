@@ -17,7 +17,7 @@
 //! `RTCPeerConnection::close` the agent's sessions do, through the agent's own
 //! budget. Every assertion is black-box: how long the close took, whether the
 //! parked writer was let go, whether the closed peer still transmits, and the
-//! tasks alive on a runtime of the test's own.
+//! agent's tasks alive on a runtime of its own (the viewer runs on another).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,17 +49,30 @@ const DEAD_PATH_CLOSE: Duration = Duration::from_secs(2);
 
 /// How long a closed peer's tasks get to finish. Everything they wait on is
 /// local and already signalled, so this is slack, not a timing assumption:
-/// alone they settle within milliseconds, but under the whole lib suite in
-/// parallel 5 s was once too short, and a real leak never settles at all.
+/// they settle within milliseconds, and a real leak never settles at all.
 const SETTLE: Duration = Duration::from_secs(20);
 
-/// A runtime of the test's own: its task count is the two peers' alone.
+/// A runtime of the test's own. The agent and the stand-in viewer get one
+/// each, so the agent's counts the agent's tasks alone, and the virtual
+/// network's router, which every baseline holds.
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("runtime")
+}
+
+/// Runs `work` on the viewer's runtime. A webrtc-rs peer spawns its tasks on
+/// the runtime its calls run on, so the viewer's calls all come through here:
+/// the browser it stands in for is not what these tests count. Its peer, the
+/// one that offers, now and then keeps two tasks alive after its close,
+/// whichever peer closes first, and on a shared runtime they read as the agent's.
+async fn on_viewer<T: Send + 'static>(
+    viewer_rt: &tokio::runtime::Handle,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    viewer_rt.spawn(work).await.expect("the viewer's task")
 }
 
 fn alive() -> usize {
@@ -157,6 +170,7 @@ async fn peer(net: Arc<Net>) -> Arc<RTCPeerConnection> {
 /// The viewer offers with a data channel, as the browser does, and the agent
 /// answers. Returns both ends once the channel is open: the agent's, the viewer's.
 async fn connect(
+    viewer_rt: &tokio::runtime::Handle,
     viewer: &Arc<RTCPeerConnection>,
     agent: &Arc<RTCPeerConnection>,
 ) -> (Arc<RTCDataChannel>, Arc<RTCDataChannel>) {
@@ -172,18 +186,23 @@ async fn connect(
             }));
         })
     }));
-    let viewer_end = viewer
-        .create_data_channel("video", None)
-        .await
-        .expect("data channel");
-    let offer = viewer.create_offer(None).await.expect("offer");
-    let mut gathered = viewer.gathering_complete_promise().await;
-    viewer
-        .set_local_description(offer)
-        .await
-        .expect("offer set");
-    let _ = gathered.recv().await;
-    let offer = viewer.local_description().await.expect("offer");
+    let viewer_offers = Arc::clone(viewer);
+    let (viewer_end, offer) = on_viewer(viewer_rt, async move {
+        let viewer = viewer_offers;
+        let viewer_end = viewer
+            .create_data_channel("video", None)
+            .await
+            .expect("data channel");
+        let offer = viewer.create_offer(None).await.expect("offer");
+        let mut gathered = viewer.gathering_complete_promise().await;
+        viewer
+            .set_local_description(offer)
+            .await
+            .expect("offer set");
+        let _ = gathered.recv().await;
+        (viewer_end, viewer.local_description().await.expect("offer"))
+    })
+    .await;
     agent.set_remote_description(offer).await.expect("offer in");
     let answer = agent.create_answer(None).await.expect("answer");
     let mut gathered = agent.gathering_complete_promise().await;
@@ -193,10 +212,14 @@ async fn connect(
         .expect("answer set");
     let _ = gathered.recv().await;
     let answer = agent.local_description().await.expect("answer");
-    viewer
-        .set_remote_description(answer)
-        .await
-        .expect("answer in");
+    let viewer_answered = Arc::clone(viewer);
+    on_viewer(viewer_rt, async move {
+        viewer_answered
+            .set_remote_description(answer)
+            .await
+            .expect("answer in");
+    })
+    .await;
     let agent_end = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("the channel opens")
@@ -235,6 +258,17 @@ fn states(agent: &RTCPeerConnection, dc: &RTCDataChannel) -> String {
     )
 }
 
+/// The viewer's tab closes: its peer closes on its own runtime, and its last
+/// reference goes there too. Its result is not checked: after the agent's
+/// goodbye its association can be gone, and its close goes on through every
+/// step but says `sending reset packet in non-Established state`.
+async fn close_viewer(viewer_rt: &tokio::runtime::Handle, viewer: Arc<RTCPeerConnection>) {
+    on_viewer(viewer_rt, async move {
+        let _ = viewer.close().await;
+    })
+    .await;
+}
+
 /// `RTCPeerConnection::close` inline under the agent's budget, which drops it
 /// on an overrun: the close as the agent ran it before #3716, without the
 /// background safety net (`peer_close::close`), so these two tests hold
@@ -253,13 +287,14 @@ async fn close_like_the_agent(agent: &RTCPeerConnection) {
 
 #[test]
 fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
+    let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
         let (agent_net, viewer_net) = wan(&wire).await;
         let baseline = alive();
-        let viewer = peer(viewer_net).await;
+        let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
-        let (dc, _) = connect(&viewer, &agent).await;
+        let (dc, _) = connect(viewer_rt.handle(), &viewer, &agent).await;
         let (writer, last_sent) = video_writer(&dc);
         tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -274,7 +309,7 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // The viewer's tab closes; its goodbye is lost on the dead wire.
-        viewer.close().await.expect("viewer close");
+        close_viewer(viewer_rt.handle(), viewer).await;
 
         let started = Instant::now();
         close_like_the_agent(&agent).await;
@@ -301,7 +336,7 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
         );
 
         // The session drops its peer after the close, as `AgentPeer` does.
-        drop((dc, agent, viewer));
+        drop((dc, agent));
         let left = settle_to(baseline).await;
         assert!(
             left <= baseline,
@@ -313,13 +348,14 @@ fn a_dead_path_under_a_data_channel_writer_does_not_stall_the_close() {
 
 #[test]
 fn a_healthy_close_still_takes_milliseconds() {
+    let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
         let (agent_net, viewer_net) = wan(&wire).await;
         let baseline = alive();
-        let viewer = peer(viewer_net).await;
+        let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
-        let (dc, _) = connect(&viewer, &agent).await;
+        let (dc, _) = connect(viewer_rt.handle(), &viewer, &agent).await;
         let (writer, _last_sent) = video_writer(&dc);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -336,8 +372,8 @@ fn a_healthy_close_still_takes_milliseconds() {
             tokio::time::timeout(SETTLE, writer).await.is_ok(),
             "the writer outlived its channel's close"
         );
-        viewer.close().await.expect("viewer close");
-        drop((dc, agent, viewer));
+        close_viewer(viewer_rt.handle(), viewer).await;
+        drop((dc, agent));
         let left = settle_to(baseline).await;
         assert!(
             left <= baseline,
@@ -353,13 +389,14 @@ fn a_healthy_close_still_takes_milliseconds() {
 /// interceptors' loops ending): checked against that, this test fails.
 #[test]
 fn a_close_its_caller_stopped_waiting_for_still_finishes() {
+    let viewer_rt = runtime();
     runtime().block_on(async {
         let wire = Arc::new(Wire::default());
         let (agent_net, viewer_net) = wan(&wire).await;
         let baseline = alive();
-        let viewer = peer(viewer_net).await;
+        let viewer = on_viewer(viewer_rt.handle(), peer(viewer_net)).await;
         let agent = peer(agent_net).await;
-        let (dc, _) = connect(&viewer, &agent).await;
+        let (dc, _) = connect(viewer_rt.handle(), &viewer, &agent).await;
 
         let session = bson::oid::ObjectId::new();
         let mut close = Box::pin(close_peer_connection(Arc::clone(&agent), session));
@@ -372,8 +409,8 @@ fn a_close_its_caller_stopped_waiting_for_still_finishes() {
         );
         drop(close);
 
-        viewer.close().await.expect("viewer close");
-        drop((dc, agent, viewer));
+        close_viewer(viewer_rt.handle(), viewer).await;
+        drop((dc, agent));
         let left = settle_to(baseline).await;
         assert!(
             left <= baseline,
@@ -480,8 +517,10 @@ fn many_writers_share_one_ordered_channel() {
             let agent = peer(agent_net).await;
 
             // The viewer's end keeps every message it receives. Nothing is
-            // sent before the handler is in place.
-            let (dc, receiving) = connect(&viewer, &agent).await;
+            // sent before the handler is in place. The viewer shares this
+            // runtime: nothing here counts tasks.
+            let viewer_rt = tokio::runtime::Handle::current();
+            let (dc, receiving) = connect(&viewer_rt, &viewer, &agent).await;
             assert!(
                 dc.ordered() && receiving.ordered(),
                 "the channel must be ordered"
