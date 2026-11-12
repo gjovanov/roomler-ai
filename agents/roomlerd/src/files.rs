@@ -7281,6 +7281,47 @@ mod seat_user_tests {
             );
         }
 
+        /// #3688 — a person who leaves seat0 partway through a folder ends its
+        /// download at the next file, not only at the next folder, as a Windows
+        /// walk ends at its next step
+        /// (`a_walk_whose_person_signs_out_ends_in_an_error_not_a_short_zip`):
+        /// before it opens each file too, the walk asks who is there. Here one
+        /// folder holds two files, and the person is there for its listing and
+        /// its first file, and gone by its second. The file under way when
+        /// they left still goes, none after it, and the viewer is told why
+        /// with `files:error`, never `files:eof`.
+        #[tokio::test]
+        async fn a_person_who_leaves_the_screen_between_two_files_ends_it_at_the_next_file() {
+            use crate::peer::folder_download_as_the_person_tests::download;
+            if !root() {
+                return;
+            }
+            let (home, person) = nobodys_home();
+            let root_dir = home.path().join("flat");
+            std::fs::create_dir(&root_dir).unwrap();
+            let files: [&[u8]; 2] = [b"one of the folder's two files", b"the other of the two"];
+            std::fs::write(root_dir.join("one.txt"), files[0]).unwrap();
+            std::fs::write(root_dir.join("two.txt"), files[1]).unwrap();
+            let got = {
+                let seat = at_the_screen(&person, home.path());
+                let _as = stand_in::seat_leaving_after(seat, 2).await;
+                download(&root_dir).await
+            };
+            let said = got.said();
+            assert!(
+                !said.iter().any(|m| m.contains("files:eof")),
+                "never files:eof: {said:?}"
+            );
+            let last = said.last().expect("a last message");
+            assert!(
+                last.contains(r#""t":"files:error""#) && last.contains(NOT_THE_PERSON),
+                "the walk's error reaches the viewer: {last}"
+            );
+            // A folder lists in no set order, so either file may be first.
+            let sent = files.iter().filter(|file| got.has(file)).count();
+            assert_eq!(sent, 1, "the file under way went, and none after it");
+        }
+
         /// #3688 — with nobody at seat0 a received file is the daemon's, in
         /// the default folder, which on a server is the shared `/tmp`: it is
         /// born root's and 0600, its partial and the partial's notes
@@ -7796,6 +7837,99 @@ CAN_GRAPHICAL=0
             ),
             other => panic!("another uid's account was taken: {other:?}"),
         }
+    }
+
+    /// #3688 — a host with no logind at all (`loginctl` not installed, or a
+    /// host systemd did not boot: a container, WSL without systemd, a minimal
+    /// VM) has no seat0, so nobody is at its screen. A read there gets the
+    /// nobody text ([`FsAs::Nobody`]), which the drop-in answers, never "Try
+    /// again" on every read; a received file is the daemon's alone, as
+    /// before. Every other failure of the lookup still cannot tell.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_host_with_no_logind_has_nobody_at_the_screen() {
+        use crate::companion::{loginctl_did_not_start, loginctl_failed};
+        let not_asked =
+            |_: &str| -> std::result::Result<(crate::fs_identity::Account, PathBuf), String> {
+                panic!("no account is resolved for nobody")
+            };
+        let seat = ["show-seat", "seat0"];
+        let no_seat = [
+            (
+                "loginctl is not installed",
+                loginctl_did_not_start(std::io::ErrorKind::NotFound.into()),
+            ),
+            (
+                "systemd did not boot this host",
+                loginctl_failed(
+                    &seat,
+                    "System has not been booted with systemd as init system (PID 1). Can't \
+                     operate.\nFailed to connect to bus: Host is down\n",
+                ),
+            ),
+        ];
+        for (host, found) in no_seat {
+            let at_seat0 = seat_of(Err(found), not_asked);
+            assert!(matches!(at_seat0, Seat::Nobody(_)), "{host}: {at_seat0:?}");
+            let seated = at_seat0.clone();
+            assert_eq!(
+                linux_fs_as(true, true, true, move || seated),
+                FsAs::Nobody,
+                "{host}: a read"
+            );
+            assert_eq!(
+                linux_fs_as(true, true, false, move || at_seat0),
+                FsAs::DaemonAlone,
+                "{host}: a received file"
+            );
+        }
+        let not_known = [
+            (
+                "the bus does not answer",
+                loginctl_failed(&seat, "Failed to connect to bus: Connection refused"),
+            ),
+            (
+                "logind does not answer in time",
+                loginctl_failed(&seat, "Failed to get properties: Connection timed out"),
+            ),
+            (
+                "loginctl would not start",
+                loginctl_did_not_start(std::io::ErrorKind::PermissionDenied.into()),
+            ),
+        ];
+        for (failure, found) in not_known {
+            let at_seat0 = seat_of(Err(found), not_asked);
+            assert!(
+                matches!(at_seat0, Seat::CannotTell(_)),
+                "{failure}: {at_seat0:?}"
+            );
+        }
+    }
+
+    /// #3688 — a received file's log line says which of the two it is,
+    /// though both write as the daemon alone: nobody at seat0, or who is
+    /// there not known (the lookup failed or ran out of its time).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_received_files_log_line_tells_nobody_from_not_known() {
+        let logged = |seat: Seat| {
+            let log = crate::peer::files_log_tests::Logged::start(tracing::Level::DEBUG);
+            assert_eq!(
+                linux_fs_as(true, true, false, move || seat),
+                FsAs::DaemonAlone
+            );
+            log.text()
+        };
+        let nobody = logged(Seat::Nobody("seat0 has no active session".into()));
+        assert!(nobody.contains("nobody at seat0"), "nobody: {nobody}");
+        let unknown = logged(Seat::CannotTell(
+            "the seat0 lookup did not answer within 1.5s".into(),
+        ));
+        assert!(
+            !unknown.contains("nobody"),
+            "who is there is not known, not nobody: {unknown}"
+        );
+        assert!(unknown.contains("not known"), "not known: {unknown}");
     }
 
     /// The process-wide drop folder a test set, unset again when this drops

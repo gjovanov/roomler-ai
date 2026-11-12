@@ -1261,15 +1261,24 @@ fn loginctl_show(args: &[&str]) -> Result<String> {
         .args(args)
         .arg("--no-pager")
         .output()
-        .context("spawning loginctl (is systemd-logind running?)")?;
+        .map_err(loginctl_did_not_start)?;
     if !out.status.success() {
-        anyhow::bail!(
-            "loginctl {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(loginctl_failed(args, &String::from_utf8_lossy(&out.stderr)));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The pure half of [`loginctl_show`] when `loginctl` did not start.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) fn loginctl_did_not_start(e: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(e).context("spawning loginctl (is systemd-logind running?)")
+}
+
+/// The pure half of [`loginctl_show`] when `loginctl <args>` failed, from
+/// what it wrote to stderr.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+pub(crate) fn loginctl_failed(args: &[&str], stderr: &str) -> anyhow::Error {
+    anyhow::anyhow!("loginctl {} failed: {}", args.join(" "), stderr.trim())
 }
 
 /// The pure half of [`seat0_uid`]: seat0's active session out of `show-seat
@@ -2344,5 +2353,44 @@ mod nobody_at_the_screen_tests {
         );
         let failed = anyhow::anyhow!("loginctl show-seat seat0 failed: Failed to connect to bus");
         assert!(!is_nobody_at_the_screen(&failed), "a lookup that failed");
+    }
+
+    /// A host with no logind at all has no seat, so nobody is at its screen,
+    /// and its lookup says so by its type: `loginctl` is not installed, or
+    /// systemd is not what booted the host (a container, WSL without systemd,
+    /// a minimal VM). Every other failure of the lookup is not nobody: a bus
+    /// or a logind that does not answer, a `loginctl` that would not start for
+    /// another reason. Who is there is then not known.
+    #[test]
+    fn a_host_with_no_logind_has_nobody_at_the_screen() {
+        use super::{loginctl_did_not_start, loginctl_failed};
+        let seat = ["show-seat", "seat0"];
+        let not_installed = loginctl_did_not_start(std::io::ErrorKind::NotFound.into());
+        assert!(
+            is_nobody_at_the_screen(&not_installed),
+            "loginctl is not installed: {not_installed:#}"
+        );
+        let not_booted = loginctl_failed(
+            &seat,
+            "System has not been booted with systemd as init system (PID 1). Can't operate.\n\
+             Failed to connect to bus: Host is down\n",
+        );
+        assert!(
+            is_nobody_at_the_screen(&not_booted),
+            "systemd did not boot this host: {not_booted:#}"
+        );
+        for stderr in [
+            "Failed to connect to bus: Connection refused",
+            "Failed to get properties: Connection timed out",
+            "",
+        ] {
+            let failed = loginctl_failed(&seat, stderr);
+            assert!(!is_nobody_at_the_screen(&failed), "{stderr:?}: {failed:#}");
+        }
+        let would_not_start = loginctl_did_not_start(std::io::ErrorKind::PermissionDenied.into());
+        assert!(
+            !is_nobody_at_the_screen(&would_not_start),
+            "loginctl would not start: {would_not_start:#}"
+        );
     }
 }

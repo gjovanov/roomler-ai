@@ -16797,3 +16797,107 @@ mod stopped_at_screen_tests {
         }
     }
 }
+
+/// #3688 — text the viewer sends on the files channel (an id, a path, a
+/// name), and an error that may quote it, is logged escaped: a line break in
+/// it never starts a log line of its own. At the end of the file, so no line
+/// above moves.
+#[cfg(test)]
+pub(crate) mod files_log_tests {
+    use super::*;
+
+    /// What is logged on this thread while it lives, as the daemon's log
+    /// file writes it: no colour, one event a line. A `#[tokio::test]` polls
+    /// its body, and the tasks it spawns, on its own thread.
+    pub(crate) struct Logged {
+        buf: Arc<std::sync::Mutex<Vec<u8>>>,
+        _default: tracing::subscriber::DefaultGuard,
+        // Two dispatchers, never one: with one, a callsite's interest is
+        // taken once for every thread (`derp`'s `logged`).
+        _second: tracing::Dispatch,
+    }
+
+    impl Logged {
+        pub(crate) fn start(level: tracing::Level) -> Self {
+            #[derive(Clone)]
+            struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Buf {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let writer = Buf(buf.clone());
+            let second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_max_level(level)
+                .with_writer(move || writer.clone())
+                .finish();
+            Self {
+                buf,
+                _default: tracing::subscriber::set_default(subscriber),
+                _second: second,
+            }
+        }
+
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// A channel that takes everything and keeps nothing.
+    #[derive(Clone)]
+    struct Quiet;
+    impl DownloadSink for Quiet {
+        async fn buffered(&self) -> usize {
+            0
+        }
+        async fn send_chunk(&self, _chunk: &bytes::Bytes) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn send_json(&self, _msg: &crate::files::FilesOutgoing<'_>) {}
+        fn gone(&self) -> bool {
+            false
+        }
+    }
+
+    /// A folder download asked with a line break in its id and in its path:
+    /// the line saying it failed holds both, each escaped. Off Windows the
+    /// path names a file, so the error quotes it too ("not a directory").
+    #[tokio::test]
+    async fn a_viewers_id_or_path_never_starts_a_log_line_of_its_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let asked = temp.path().join("a\nSECOND LINE from a path");
+        #[cfg(unix)]
+        std::fs::write(&asked, b"a file, not a folder").unwrap();
+        let log = Logged::start(tracing::Level::INFO);
+        outgoing_zip(
+            Quiet,
+            crate::files::FilesHandler::new(),
+            bson::oid::ObjectId::new(),
+            "z1\nSECOND LINE from an id".into(),
+            asked.to_string_lossy().into_owned(),
+        )
+        .await;
+        let text = log.text();
+        assert!(
+            text.contains("files: begin_outgoing_zip failed"),
+            "the failure is logged: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("SECOND LINE")),
+            "a line break from the viewer started a log line: {text}"
+        );
+        assert!(
+            text.contains(r"z1\nSECOND LINE from an id"),
+            "the id, escaped: {text}"
+        );
+    }
+}
