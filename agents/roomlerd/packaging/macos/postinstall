@@ -16,6 +16,11 @@
 # immediately. Root writes only under root-owned system folders, and keeps
 # launchctl's error text in a variable, never in a file.
 #
+# With nobody signed in at the console only that person's half is skipped
+# (`persons_half`); the root daemon and the update helper run on both roads,
+# through the same lines (#3783). scripts/macos-postinstall-check.sh runs this
+# script on both roads with stand-ins for launchctl and the other macOS tools.
+#
 # Apple's installer sanitises the environment, so the console user comes from
 # the owner of /dev/console, the reliable idiom on macOS installers.
 
@@ -107,28 +112,11 @@ if [ -f /etc/roomler-agent/config.toml ] && [ ! -f /etc/roomler/config.toml ]; t
   fi
 fi
 
-# No GUI session — installed over SSH, at the login window, or on a runner.
-# There is no `gui/<uid>` domain to bootstrap into, and `root` has no Aqua
-# domain either.
-#
-# This must NOT fail the install. The payload is already on disk by the time
-# scripts run, so aborting here leaves a HALF-APPLIED install reported as a
-# failure ("An error occurred while running scripts") with nothing saying why —
-# which is what `set -euo pipefail` plus an unguarded `bootstrap` used to do.
-# The plist cannot be placed without a home directory to place it in, so the
-# honest outcome is: payload installed, autostart deferred to the next login,
-# said plainly.
-if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
-  echo "roomlerd: payload installed, but NO GUI session is logged in"
-  echo "  (console user is '${CONSOLE_USER:-unknown}'), so the LaunchAgent was"
-  echo "  not registered. Log in on this Mac and re-run the installer, or:"
-  echo "    sudo installer -pkg <the .pkg> -target /"
-  echo "  Screen capture and input need a login session and cannot run without one."
-  exit 0
-fi
-
-CONSOLE_UID=$(id -u "$CONSOLE_USER")
-CONSOLE_HOME=$(dscl . -read /Users/"$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')
+# ---------------------------------------------------------------------------
+# Two roads, chosen once, below `persons_half`: a person signed in at the
+# console, or nobody (the login window, SSH, a runner). Everything from here to
+# `persons_half` is definitions only, so both roads have them. #3783
+# ---------------------------------------------------------------------------
 
 # Replace a possibly-RUNNING launchd service with its freshly-installed plist.
 #
@@ -216,287 +204,335 @@ daemon_supervises_gui_worker() {
     /etc/roomler/config.toml
 }
 
-LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
-PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.agent.plist"
-PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
+# ---------------------------------------------------------------------------
+# The person's half: the two login items in the console user's
+# ~/Library/LaunchAgents, loaded into that user's gui/<uid> domain, and the
+# menu-bar app. It is the only part of this script that needs a GUI session,
+# and the road below runs it only where one exists. Called as a plain command,
+# so `set -e` holds inside it exactly as it did when these lines ran at the
+# top level.
+# ---------------------------------------------------------------------------
+persons_half() {
+  CONSOLE_UID=$(id -u "$CONSOLE_USER")
+  CONSOLE_HOME=$(dscl . -read /Users/"$CONSOLE_USER" NFSHomeDirectory | awk '{print $2}')
 
-# The login items belong to the person at the console, so that person's own
-# account makes, writes and removes them. `sudo -u '#<uid>'` runs the tool with
-# the uid the checks below compare against, and with that account's gid and
-# groups, so the system applies that account's rights and nothing more;
-# `launchctl asuser` changes only the bootstrap context, not the uid. `-n`:
-# root needs no password, and nothing may wait on a prompt.
-as_person() {
-  /usr/bin/sudo -n -u "#$CONSOLE_UID" -- "$@"
-}
+  LAUNCH_AGENTS_DIR="$CONSOLE_HOME/Library/LaunchAgents"
+  PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.agent.plist"
+  PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.agent.plist"
 
-# A login item as launchd loads it: a regular file, not a link, with one name,
-# owned by the console user.
-persons_own_file() {
-  [ ! -L "$1" ] && [ -f "$1" ] && [ "$(stat -f '%u:%l' "$1")" = "$CONSOLE_UID:1" ]
-}
+  # The login items belong to the person at the console, so that person's own
+  # account makes, writes and removes them. `sudo -u '#<uid>'` runs the tool with
+  # the uid the checks below compare against, and with that account's gid and
+  # groups, so the system applies that account's rights and nothing more;
+  # `launchctl asuser` changes only the bootstrap context, not the uid. `-n`:
+  # root needs no password, and nothing may wait on a prompt.
+  as_person() {
+    /usr/bin/sudo -n -u "#$CONSOLE_UID" -- "$@"
+  }
 
-# Anything else at the item's path (a link, a folder, another owner's file).
-in_the_way() {
-  { [ -L "$1" ] || [ -e "$1" ]; } && ! persons_own_file "$1"
-}
+  # A login item as launchd loads it: a regular file, not a link, with one name,
+  # owned by the console user.
+  persons_own_file() {
+    [ ! -L "$1" ] && [ -f "$1" ] && [ "$(stat -f '%u:%l' "$1")" = "$CONSOLE_UID:1" ]
+  }
 
-# A command printed below for the person to run with sudo, on a path under the
-# home, is printed only when this holds: the person at the console is an
-# administrator of this Mac, so they run it for themselves, and the path names
-# the folder it reads as (the home an absolute path to a real folder, its
-# Library a real folder of the person's own, neither a link). Root only tests
-# and reads here. Call it only as an `if` condition. Where it does not hold,
-# no command is printed and the message names the section of the docs.
-INSTALL_DOC="docs/installation.md, section \"Which account each step of the package's script writes as\""
-sudo_line_fits() {
-  /usr/sbin/dseditgroup -o checkmember -m "$CONSOLE_USER" admin >/dev/null 2>&1 || return 1
-  case "$CONSOLE_HOME" in /*[!/]) ;; *) return 1 ;; esac
-  { [ ! -L "$CONSOLE_HOME" ] && [ -d "$CONSOLE_HOME" ]; } || return 1
-  { [ ! -L "$CONSOLE_HOME/Library" ] && [ -d "$CONSOLE_HOME/Library" ]; } || return 1
-  [ "$(stat -f '%u' "$CONSOLE_HOME/Library" 2>/dev/null)" = "$CONSOLE_UID" ]
-}
-no_command_line() {
-  echo "  It has to be a folder of $CONSOLE_USER's own before the next install;"
-  echo "  see $INSTALL_DOC."
-}
+  # Anything else at the item's path (a link, a folder, another owner's file).
+  in_the_way() {
+    { [ -L "$1" ] || [ -e "$1" ]; } && ! persons_own_file "$1"
+  }
 
-# When the folder is why an item cannot be added or removed, say which case it
-# is and, where `sudo_line_fits`, the one line the person runs before
-# installing again. Root changes nothing under a home, this folder included.
-# Returns 1, and says nothing, when the folder is the person's own.
-DIR_ERR=""
-folder_not_the_persons() {
-  if [ "${CONSOLE_HOME#/}" = "$CONSOLE_HOME" ]; then
-    # The folder's path is then not under a home at all: name the home.
-    echo "  The home of $CONSOLE_USER could not be read as an absolute path, so no"
-    echo "  login item can go under it; see $INSTALL_DOC."
-  elif [ -L "$LAUNCH_AGENTS_DIR" ]; then
-    echo "  $LAUNCH_AGENTS_DIR is a link, not a folder."
-    no_command_line
-  elif [ ! -e "$LAUNCH_AGENTS_DIR" ]; then
-    echo "  $LAUNCH_AGENTS_DIR is missing, and the account of $CONSOLE_USER could not make it${DIR_ERR:+: $DIR_ERR}"
-    if sudo_line_fits; then
-      echo "  $CONSOLE_USER is an administrator of this Mac and can run this, then install again:"
-      echo "    sudo mkdir -p \"$LAUNCH_AGENTS_DIR\" && sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
-    else
+  # A command printed below for the person to run with sudo, on a path under the
+  # home, is printed only when this holds: the person at the console is an
+  # administrator of this Mac, so they run it for themselves, and the path names
+  # the folder it reads as (the home an absolute path to a real folder, its
+  # Library a real folder of the person's own, neither a link). Root only tests
+  # and reads here. Call it only as an `if` condition. Where it does not hold,
+  # no command is printed and the message names the section of the docs.
+  INSTALL_DOC="docs/installation.md, section \"Which account each step of the package's script writes as\""
+  sudo_line_fits() {
+    /usr/sbin/dseditgroup -o checkmember -m "$CONSOLE_USER" admin >/dev/null 2>&1 || return 1
+    case "$CONSOLE_HOME" in /*[!/]) ;; *) return 1 ;; esac
+    { [ ! -L "$CONSOLE_HOME" ] && [ -d "$CONSOLE_HOME" ]; } || return 1
+    { [ ! -L "$CONSOLE_HOME/Library" ] && [ -d "$CONSOLE_HOME/Library" ]; } || return 1
+    [ "$(stat -f '%u' "$CONSOLE_HOME/Library" 2>/dev/null)" = "$CONSOLE_UID" ]
+  }
+  no_command_line() {
+    echo "  It has to be a folder of $CONSOLE_USER's own before the next install;"
+    echo "  see $INSTALL_DOC."
+  }
+
+  # When the folder is why an item cannot be added or removed, say which case it
+  # is and, where `sudo_line_fits`, the one line the person runs before
+  # installing again. Root changes nothing under a home, this folder included.
+  # Returns 1, and says nothing, when the folder is the person's own.
+  DIR_ERR=""
+  folder_not_the_persons() {
+    if [ "${CONSOLE_HOME#/}" = "$CONSOLE_HOME" ]; then
+      # The folder's path is then not under a home at all: name the home.
+      echo "  The home of $CONSOLE_USER could not be read as an absolute path, so no"
+      echo "  login item can go under it; see $INSTALL_DOC."
+    elif [ -L "$LAUNCH_AGENTS_DIR" ]; then
+      echo "  $LAUNCH_AGENTS_DIR is a link, not a folder."
       no_command_line
-    fi
-  elif [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
-    echo "  $LAUNCH_AGENTS_DIR is not a folder."
-    no_command_line
-  elif [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR")" != "$CONSOLE_UID" ]; then
-    echo "  $LAUNCH_AGENTS_DIR belongs to $(stat -f '%Su' "$LAUNCH_AGENTS_DIR" 2>/dev/null || echo 'another account'), not to $CONSOLE_USER,"
-    echo "  so the account of $CONSOLE_USER cannot add or remove an item in it."
-    # chown follows a link, and hands over whatever the folder is: only a real
-    # folder of root's (this branch is past the link and not-a-folder tests).
-    if [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR" 2>/dev/null)" = 0 ] && sudo_line_fits; then
-      echo "  $CONSOLE_USER is an administrator of this Mac and can run this, then install again:"
-      echo "    sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
-    else
+    elif [ ! -e "$LAUNCH_AGENTS_DIR" ]; then
+      echo "  $LAUNCH_AGENTS_DIR is missing, and the account of $CONSOLE_USER could not make it${DIR_ERR:+: $DIR_ERR}"
+      if sudo_line_fits; then
+        echo "  $CONSOLE_USER is an administrator of this Mac and can run this, then install again:"
+        echo "    sudo mkdir -p \"$LAUNCH_AGENTS_DIR\" && sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+      else
+        no_command_line
+      fi
+    elif [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
+      echo "  $LAUNCH_AGENTS_DIR is not a folder."
       no_command_line
+    elif [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR")" != "$CONSOLE_UID" ]; then
+      echo "  $LAUNCH_AGENTS_DIR belongs to $(stat -f '%Su' "$LAUNCH_AGENTS_DIR" 2>/dev/null || echo 'another account'), not to $CONSOLE_USER,"
+      echo "  so the account of $CONSOLE_USER cannot add or remove an item in it."
+      # chown follows a link, and hands over whatever the folder is: only a real
+      # folder of root's (this branch is past the link and not-a-folder tests).
+      if [ "$(stat -f '%u' "$LAUNCH_AGENTS_DIR" 2>/dev/null)" = 0 ] && sudo_line_fits; then
+        echo "  $CONSOLE_USER is an administrator of this Mac and can run this, then install again:"
+        echo "    sudo chown $CONSOLE_USER \"$LAUNCH_AGENTS_DIR\""
+      else
+        no_command_line
+      fi
+    else
+      return 1
     fi
-  else
-    return 1
-  fi
-}
+  }
 
-# Place one login item as the person: anything in the way is removed first
-# where the person's account can remove it, so nothing is written through it;
-# an item the person owns is rewritten in place. Placed means a file of the
-# person's with mode 644. Otherwise it says SKIPPED and why, and returns 1: the
-# caller then neither loads the item nor fails. A rewrite that fails over an
-# item of the person's leaves that item placed, says so in a WARNING (which
-# says it may be incomplete where the person's `cmp` does not find it equal to
-# this package's), and sets ITEM_STALE=1 for the caller.
-ITEM_STALE=0
-place_login_item() {
-  item_source="$1"; item_target="$2"; item_err=""; ITEM_STALE=0
-  DIR_ERR=$(as_person /bin/mkdir -p "$LAUNCH_AGENTS_DIR" 2>&1) || true
-  if [ -L "$LAUNCH_AGENTS_DIR" ] || [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
-    echo "SKIPPED the login item $item_target:"
+  # Place one login item as the person: anything in the way is removed first
+  # where the person's account can remove it, so nothing is written through it;
+  # an item the person owns is rewritten in place. Placed means a file of the
+  # person's with mode 644. Otherwise it says SKIPPED and why, and returns 1: the
+  # caller then neither loads the item nor fails. A rewrite that fails over an
+  # item of the person's leaves that item placed, says so in a WARNING (which
+  # says it may be incomplete where the person's `cmp` does not find it equal to
+  # this package's), and sets ITEM_STALE=1 for the caller.
+  ITEM_STALE=0
+  place_login_item() {
+    item_source="$1"; item_target="$2"; item_err=""; ITEM_STALE=0
+    DIR_ERR=$(as_person /bin/mkdir -p "$LAUNCH_AGENTS_DIR" 2>&1) || true
+    if [ -L "$LAUNCH_AGENTS_DIR" ] || [ ! -d "$LAUNCH_AGENTS_DIR" ]; then
+      echo "SKIPPED the login item $item_target:"
+      folder_not_the_persons || true
+      return 1
+    fi
+    if in_the_way "$item_target"; then
+      item_err=$(as_person /bin/rm -f "$item_target" 2>&1) || true
+    fi
+    if in_the_way "$item_target"; then
+      item_err="the account of $CONSOLE_USER could not remove what is at that path${item_err:+: $item_err}"
+    else
+      item_err=$(as_person /bin/cp "$item_source" "$item_target" 2>&1 &&
+        as_person /bin/chmod 644 "$item_target" 2>&1) || ITEM_STALE=1
+    fi
+    if persons_own_file "$item_target" && [ "$(stat -f '%Lp' "$item_target")" = 644 ]; then
+      if [ "$ITEM_STALE" = 1 ]; then
+        echo "WARNING: the account of $CONSOLE_USER could not rewrite the login item $item_target,"
+        if as_person /usr/bin/cmp -s "$item_source" "$item_target" >/dev/null 2>&1; then
+          echo "  so the one already there stays in place: $item_err"
+        else
+          echo "  and the one there does not compare equal to this package's, so it may be incomplete: $item_err"
+        fi
+      fi
+      return 0
+    fi
+    echo "SKIPPED the login item $item_target: it is not a file of $CONSOLE_USER with mode 644"
+    [ -z "$item_err" ] || echo "  $item_err"
     folder_not_the_persons || true
     return 1
-  fi
-  if in_the_way "$item_target"; then
-    item_err=$(as_person /bin/rm -f "$item_target" 2>&1) || true
-  fi
-  if in_the_way "$item_target"; then
-    item_err="the account of $CONSOLE_USER could not remove what is at that path${item_err:+: $item_err}"
-  else
-    item_err=$(as_person /bin/cp "$item_source" "$item_target" 2>&1 &&
-      as_person /bin/chmod 644 "$item_target" 2>&1) || ITEM_STALE=1
-  fi
-  if persons_own_file "$item_target" && [ "$(stat -f '%Lp' "$item_target")" = 644 ]; then
-    if [ "$ITEM_STALE" = 1 ]; then
-      echo "WARNING: the account of $CONSOLE_USER could not rewrite the login item $item_target,"
-      if as_person /usr/bin/cmp -s "$item_source" "$item_target" >/dev/null 2>&1; then
-        echo "  so the one already there stays in place: $item_err"
-      else
-        echo "  and the one there does not compare equal to this package's, so it may be incomplete: $item_err"
+  }
+
+  if daemon_supervises_gui_worker; then
+    # FR-43 P2 — the root daemon owns the worker here, so the LaunchAgent must
+    # not exist. Note this REMOVES the plist rather than merely skipping the
+    # bootstrap: a plist left in ~/Library/LaunchAgents is loaded by launchd at
+    # the next login, so skipping alone would postpone the breakage by one
+    # login instead of fixing it.
+    #
+    # Booting the job out is not a new hazard — `replace_launchd_service` has
+    # always booted this exact label out as its first act. The change is that we
+    # no longer bootstrap it back.
+    launchctl bootout "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null || true
+    rm_err=$(as_person /bin/rm -f "$PLIST_TARGET" 2>&1) || true
+    if [ -L "$PLIST_TARGET" ] || [ -e "$PLIST_TARGET" ]; then
+      echo "WARNING: the account of $CONSOLE_USER could not remove \"$PLIST_TARGET\","
+      echo "  so launchd loads it at the next login and the per-user agent comes back."
+      [ -z "$rm_err" ] || echo "  $rm_err"
+      folder_said=0
+      if folder_not_the_persons; then folder_said=1; fi
+      # Through a link in the folder's place, rm acts in another folder: the
+      # line is printed only for a real folder.
+      if [ ! -L "$LAUNCH_AGENTS_DIR" ] && [ -d "$LAUNCH_AGENTS_DIR" ] && sudo_line_fits; then
+        echo "  $CONSOLE_USER is an administrator of this Mac and can remove only this item with:"
+        echo "    sudo rm -f \"$PLIST_TARGET\""
+      elif [ "$folder_said" = 0 ]; then
+        echo "  See $INSTALL_DOC."
       fi
     fi
-    return 0
-  fi
-  echo "SKIPPED the login item $item_target: it is not a file of $CONSOLE_USER with mode 644"
-  [ -z "$item_err" ] || echo "  $item_err"
-  folder_not_the_persons || true
-  return 1
-}
-
-if daemon_supervises_gui_worker; then
-  # FR-43 P2 — the root daemon owns the worker here, so the LaunchAgent must
-  # not exist. Note this REMOVES the plist rather than merely skipping the
-  # bootstrap: a plist left in ~/Library/LaunchAgents is loaded by launchd at
-  # the next login, so skipping alone would postpone the breakage by one
-  # login instead of fixing it.
-  #
-  # Booting the job out is not a new hazard — `replace_launchd_service` has
-  # always booted this exact label out as its first act. The change is that we
-  # no longer bootstrap it back.
-  launchctl bootout "gui/$CONSOLE_UID/com.roomler.agent" 2>/dev/null || true
-  rm_err=$(as_person /bin/rm -f "$PLIST_TARGET" 2>&1) || true
-  if [ -L "$PLIST_TARGET" ] || [ -e "$PLIST_TARGET" ]; then
-    echo "WARNING: the account of $CONSOLE_USER could not remove \"$PLIST_TARGET\","
-    echo "  so launchd loads it at the next login and the per-user agent comes back."
-    [ -z "$rm_err" ] || echo "  $rm_err"
-    folder_said=0
-    if folder_not_the_persons; then folder_said=1; fi
-    # Through a link in the folder's place, rm acts in another folder: the
-    # line is printed only for a real folder.
-    if [ ! -L "$LAUNCH_AGENTS_DIR" ] && [ -d "$LAUNCH_AGENTS_DIR" ] && sudo_line_fits; then
-      echo "  $CONSOLE_USER is an administrator of this Mac and can remove only this item with:"
-      echo "    sudo rm -f \"$PLIST_TARGET\""
-    elif [ "$folder_said" = 0 ]; then
-      echo "  See $INSTALL_DOC."
+    echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID); the GUI worker"
+    echo "  is owned by the ROOT DAEMON (macos_supervise_gui_worker = true in"
+    echo "  /etc/roomler/config.toml), so the per-user LaunchAgent was NOT loaded."
+    echo "  The daemon spawns and babysits the worker itself; one device row both"
+    echo "  holds the enrollment and serves the screen."
+    echo "  To go back to the per-user LaunchAgent, set that key false (or remove"
+    echo "  it) and re-run the installer."
+  elif ! place_login_item "$PLIST_SOURCE" "$PLIST_TARGET"; then
+    echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but its login item"
+    echo "  is not in place, so it was not loaded"
+  else
+    # Load the agent into the user's launchd domain — via the drain-aware
+    # replacement above, because on a self-update the previous instance is still
+    # dying when this runs (see replace_launchd_service).
+    #
+    # A final failure is reported, not fatal: the plist is in ~/Library/LaunchAgents,
+    # so launchd starts it at the next login regardless. Trading a working install
+    # for a launchctl edge case (a session that exists but will not accept a
+    # bootstrap) is the wrong way round.
+    if ! replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
+      echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
+      echo "  bootstrap failed after retries: $BOOTSTRAP_ERR"
+      echo "  The plist is in place, so it will start at the next login, or now via:"
+      echo "    launchctl bootstrap gui/$CONSOLE_UID \"$PLIST_TARGET\""
+    elif [ "$ITEM_STALE" = 1 ]; then
+      echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), and started on the"
+      echo "  login item that was already there, which this install could not rewrite"
+    else
+      echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
     fi
   fi
-  echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID); the GUI worker"
-  echo "  is owned by the ROOT DAEMON (macos_supervise_gui_worker = true in"
-  echo "  /etc/roomler/config.toml), so the per-user LaunchAgent was NOT loaded."
-  echo "  The daemon spawns and babysits the worker itself; one device row both"
-  echo "  holds the enrollment and serves the screen."
-  echo "  To go back to the per-user LaunchAgent, set that key false (or remove"
-  echo "  it) and re-run the installer."
-elif ! place_login_item "$PLIST_SOURCE" "$PLIST_TARGET"; then
-  echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but its login item"
-  echo "  is not in place, so it was not loaded"
-else
-  # Load the agent into the user's launchd domain — via the drain-aware
-  # replacement above, because on a self-update the previous instance is still
-  # dying when this runs (see replace_launchd_service).
+
+  # The desktop companion (menu-bar app), same user domain. It is a UI surface,
+  # not a service: it holds no session and captures nothing, so a failure to
+  # start it must never fail the install — but it IS the only place that tells
+  # the user which macOS permission is missing, which the OS never does.
   #
-  # A final failure is reported, not fatal: the plist is in ~/Library/LaunchAgents,
-  # so launchd starts it at the next login regardless. Trading a working install
-  # for a launchctl edge case (a session that exists but will not accept a
-  # bootstrap) is the wrong way round.
-  if ! replace_launchd_service "gui/$CONSOLE_UID" com.roomler.agent "$PLIST_TARGET"; then
-    echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), but launchctl"
-    echo "  bootstrap failed after retries: $BOOTSTRAP_ERR"
-    echo "  The plist is in place, so it will start at the next login, or now via:"
-    echo "    launchctl bootstrap gui/$CONSOLE_UID \"$PLIST_TARGET\""
-  elif [ "$ITEM_STALE" = 1 ]; then
-    echo "roomlerd installed for $CONSOLE_USER (uid=$CONSOLE_UID), and started on the"
-    echo "  login item that was already there, which this install could not rewrite"
+  # ⚠️⚠️ The companion enforces a SINGLE INSTANCE (tauri-plugin-single-instance):
+  # a second launch hands its arguments to the first and EXITS 0. So a companion
+  # that outlives this script defeats the update: the freshly installed one
+  # starts, defers to the old one and quits, launchd records a clean exit, and
+  # `bootstrap` has already reported success.
+  #
+  # `bootout` cannot rule that out, because it only reaches launchd's instance of
+  # `com.roomler.desktop`. An app a person opened from Finder, Spotlight or the
+  # Dock runs under LaunchServices' own job (`application.<bundle-id>.<n>`),
+  # which nothing here addresses. Field 2026-09-25: a 0.4.92 companion kept
+  # running through NINE updates on a Mac whose install.log said "Roomler
+  # menu-bar app started" after every one — `launchctl print` showed the job
+  # `runs = 1, last exit code = 0, not running`, the process was executing an
+  # unlinked inode, and the operator saw "v0.4.92" on a 0.4.101 host.
+  # Reproduced deterministically: `open -a Roomler.app`, then this block's
+  # previous form.
+  #
+  # So: stop EVERY instance of the console user's companion, however it was
+  # started, before starting the new one — matched on the executable path's TAIL,
+  # so a copy of the app outside /Applications cannot hold the lock either.
+  # SIGTERM first (it exits in ~0.5 s, measured), SIGKILL only for stragglers.
+  # Only the console user's: another logged-in user's companion has no plist of
+  # ours to bring it back, and a stale menu-bar app beats an absent one.
+  # ⚠️ Everything below runs under `set -euo pipefail` and must never fail the
+  # install: `pkill` exits 1 when nothing matched, which is the common case.
+  COMPANION_EXE_RE='/Roomler\.app/Contents/MacOS/roomler-desktop( |$)'
+
+  stop_companions() {
+    pkill -TERM -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" 2>/dev/null || return 0
+    n=0
+    while pgrep -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" >/dev/null 2>&1; do
+      n=$((n + 1))
+      if [ "$n" -ge 20 ]; then
+        pkill -KILL -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" 2>/dev/null || true
+        sleep 1
+        break
+      fi
+      sleep 0.5
+    done
+  }
+
+  # Did the new companion come up AND STAY up? A single-instance loser also
+  # starts — and reads as `running` for a moment — before it exits 0, so one look
+  # proves nothing: require the same pid on two looks two seconds apart.
+  companion_pid() {
+    launchctl print "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null \
+      | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true
+  }
+  companion_running() {
+    first=$(companion_pid)
+    [ -n "$first" ] || return 1
+    sleep 2
+    second=$(companion_pid)
+    [ -n "$second" ] && [ "$second" = "$first" ]
+  }
+
+  DESKTOP_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.desktop.plist"
+  DESKTOP_PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.desktop.plist"
+  if [ ! -f "$DESKTOP_PLIST_SOURCE" ] || [ ! -d /Applications/Roomler.app ]; then
+    echo "NOTE: the menu-bar companion is not in this package; skipping"
+  elif ! place_login_item "$DESKTOP_PLIST_SOURCE" "$DESKTOP_PLIST_TARGET"; then
+    echo "Roomler menu-bar app installed, but its login item is not in place, so"
+    echo "  the running one was left as it is"
   else
-    echo "roomlerd installed and started for $CONSOLE_USER (uid=$CONSOLE_UID)"
-  fi
-fi
-
-# The desktop companion (menu-bar app), same user domain. It is a UI surface,
-# not a service: it holds no session and captures nothing, so a failure to
-# start it must never fail the install — but it IS the only place that tells
-# the user which macOS permission is missing, which the OS never does.
-#
-# ⚠️⚠️ The companion enforces a SINGLE INSTANCE (tauri-plugin-single-instance):
-# a second launch hands its arguments to the first and EXITS 0. So a companion
-# that outlives this script defeats the update: the freshly installed one
-# starts, defers to the old one and quits, launchd records a clean exit, and
-# `bootstrap` has already reported success.
-#
-# `bootout` cannot rule that out, because it only reaches launchd's instance of
-# `com.roomler.desktop`. An app a person opened from Finder, Spotlight or the
-# Dock runs under LaunchServices' own job (`application.<bundle-id>.<n>`),
-# which nothing here addresses. Field 2026-09-25: a 0.4.92 companion kept
-# running through NINE updates on a Mac whose install.log said "Roomler
-# menu-bar app started" after every one — `launchctl print` showed the job
-# `runs = 1, last exit code = 0, not running`, the process was executing an
-# unlinked inode, and the operator saw "v0.4.92" on a 0.4.101 host.
-# Reproduced deterministically: `open -a Roomler.app`, then this block's
-# previous form.
-#
-# So: stop EVERY instance of the console user's companion, however it was
-# started, before starting the new one — matched on the executable path's TAIL,
-# so a copy of the app outside /Applications cannot hold the lock either.
-# SIGTERM first (it exits in ~0.5 s, measured), SIGKILL only for stragglers.
-# Only the console user's: another logged-in user's companion has no plist of
-# ours to bring it back, and a stale menu-bar app beats an absent one.
-# ⚠️ Everything below runs under `set -euo pipefail` and must never fail the
-# install: `pkill` exits 1 when nothing matched, which is the common case.
-COMPANION_EXE_RE='/Roomler\.app/Contents/MacOS/roomler-desktop( |$)'
-
-stop_companions() {
-  pkill -TERM -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" 2>/dev/null || return 0
-  n=0
-  while pgrep -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" >/dev/null 2>&1; do
-    n=$((n + 1))
-    if [ "$n" -ge 20 ]; then
-      pkill -KILL -U "$CONSOLE_UID" -f "$COMPANION_EXE_RE" 2>/dev/null || true
-      sleep 1
-      break
+    stop_companions
+    # Same drain-aware replacement — the tray dies faster than the agent, but the
+    # race is the same shape and the retry costs nothing when it isn't needed.
+    if ! replace_launchd_service "gui/$CONSOLE_UID" com.roomler.desktop "$DESKTOP_PLIST_TARGET"; then
+      echo "Roomler menu-bar app installed; it will start at the next login"
+    elif companion_running; then
+      echo "Roomler menu-bar app started for $CONSOLE_USER"
+    else
+      # Say so: this line printed "started" through nine updates while nothing
+      # had restarted.
+      echo "WARNING: the Roomler menu-bar app was registered but did not stay running"
+      echo "  launchd: $(launchctl print "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null \
+        | grep -E 'state =|last exit code =' | head -2 | tr -s '\t\n ' ' ' || true)"
+      echo "  still running elsewhere? pgrep -lf roomler-desktop"
     fi
-    sleep 0.5
-  done
-}
-
-# Did the new companion come up AND STAY up? A single-instance loser also
-# starts — and reads as `running` for a moment — before it exits 0, so one look
-# proves nothing: require the same pid on two looks two seconds apart.
-companion_pid() {
-  launchctl print "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null \
-    | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true
-}
-companion_running() {
-  first=$(companion_pid)
-  [ -n "$first" ] || return 1
-  sleep 2
-  second=$(companion_pid)
-  [ -n "$second" ] && [ "$second" = "$first" ]
-}
-
-DESKTOP_PLIST_SOURCE="/Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.desktop.plist"
-DESKTOP_PLIST_TARGET="$LAUNCH_AGENTS_DIR/com.roomler.desktop.plist"
-if [ ! -f "$DESKTOP_PLIST_SOURCE" ] || [ ! -d /Applications/Roomler.app ]; then
-  echo "NOTE: the menu-bar companion is not in this package; skipping"
-elif ! place_login_item "$DESKTOP_PLIST_SOURCE" "$DESKTOP_PLIST_TARGET"; then
-  echo "Roomler menu-bar app installed, but its login item is not in place, so"
-  echo "  the running one was left as it is"
-else
-  stop_companions
-  # Same drain-aware replacement — the tray dies faster than the agent, but the
-  # race is the same shape and the retry costs nothing when it isn't needed.
-  if ! replace_launchd_service "gui/$CONSOLE_UID" com.roomler.desktop "$DESKTOP_PLIST_TARGET"; then
-    echo "Roomler menu-bar app installed; it will start at the next login"
-  elif companion_running; then
-    echo "Roomler menu-bar app started for $CONSOLE_USER"
-  else
-    # Say so: this line printed "started" through nine updates while nothing
-    # had restarted.
-    echo "WARNING: the Roomler menu-bar app was registered but did not stay running"
-    echo "  launchd: $(launchctl print "gui/$CONSOLE_UID/com.roomler.desktop" 2>/dev/null \
-      | grep -E 'state =|last exit code =' | head -2 | tr -s '\t\n ' ' ' || true)"
-    echo "  still running elsewhere? pgrep -lf roomler-desktop"
   fi
-fi
 
-# #3164 — the panes list the agent as `roomlerd` (the bundle's file name); the
-# menu-bar app's own "Roomler" entry changes nothing. Since #3164 macOS's own
-# "Quit & Reopen" restarts the agent instead of leaving it offline.
-echo "In System Settings > Privacy & Security, turn on 'roomlerd' under Screen &"
-echo "System Audio Recording and under Accessibility ('Roomler' is the menu-bar app)."
-echo "macOS applies Screen Recording after roomlerd restarts: choose Quit & Reopen"
-echo "when macOS offers it, Restart in the Roomler menu-bar app, or run:"
-echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+  # #3164 — the panes list the agent as `roomlerd` (the bundle's file name); the
+  # menu-bar app's own "Roomler" entry changes nothing. Since #3164 macOS's own
+  # "Quit & Reopen" restarts the agent instead of leaving it offline.
+  echo "In System Settings > Privacy & Security, turn on 'roomlerd' under Screen &"
+  echo "System Audio Recording and under Accessibility ('Roomler' is the menu-bar app)."
+  echo "macOS applies Screen Recording after roomlerd restarts: choose Quit & Reopen"
+  echo "when macOS offers it, Restart in the Roomler menu-bar app, or run:"
+  echo "  launchctl kickstart -k gui/$CONSOLE_UID/com.roomler.agent"
+}
+
+# ---------------------------------------------------------------------------
+# The road. No GUI session — installed over SSH, at the login window, or on a
+# runner. There is no `gui/<uid>` domain to bootstrap into, and `root` has no
+# Aqua domain either.
+#
+# Only the person's half needs a session. The root daemon and the update helper
+# below are system jobs, and BOTH roads run them, through the same lines.
+# #3783: this branch used to end the script with `exit 0`, so an update with
+# nobody signed in (the update helper runs at load, so after a restart it can
+# install before anyone signs in) put the new version on disk while the root
+# daemon kept running the old one, and left the helper as it was.
+#
+# This road must NOT fail the install. The payload is already on disk by the
+# time scripts run, so aborting here leaves a HALF-APPLIED install reported as a
+# failure ("An error occurred while running scripts") with nothing saying why —
+# which is what `set -euo pipefail` plus an unguarded `bootstrap` used to do.
+# The person's items cannot be placed without a home directory to place them
+# in, so that half waits for a sign-in, said plainly. Where they are already in
+# place (every update of a Mac a person has used), launchd loads them at that
+# person's next sign-in (RunAtLoad), and they start the bundle on disk, which
+# is this install's.
+# ---------------------------------------------------------------------------
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = root ]; then
+  echo "roomlerd: payload installed, but NO GUI session is logged in"
+  echo "  (console user is '${CONSOLE_USER:-unknown}'), so the per-user half was not"
+  echo "  touched: no login item placed or loaded, the menu-bar app not restarted."
+  echo "  The root daemon and the update helper are handled below, as on any install."
+  echo "  Login items already in ~/Library/LaunchAgents start this version at the"
+  echo "  next sign-in. On a first install, sign in and run the installer again:"
+  echo "    sudo installer -pkg <the .pkg> -target /"
+  echo "  Screen capture and input need a login session and cannot run without one."
+else
+  persons_half
+fi
 
 # ---------------------------------------------------------------------------
 # The privileged half — OPT-IN.

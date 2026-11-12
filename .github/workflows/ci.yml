@@ -2802,3 +2802,26 @@ jobs:
         run: bash scripts/code-map-audit.sh --selftest
       - name: Audit the code maps
         run: bash scripts/code-map-audit.sh
+
+  macos-postinstall:
+    # #3783 — the macOS package's post-install script, run on both of its
+    # roads: a person signed in at the console, and nobody (the login window,
+    # where the update helper installs after every restart). It runs as root on
+    # every enrolled Mac at every update, and a wrong road takes the owner's
+    # remote access or freezes the Mac's updates with nobody at the keyboard.
+    # The real script runs in a throwaway container with stand-ins for
+    # launchctl and the other macOS tools (scripts/macos-postinstall-check.sh
+    # says what each case checks and what only a Mac shows).
+    #
+    # Appended after the last job, so no line a doc anchors moved.
+    name: macOS post-install roads
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.heavy == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the post-install script on both roads
+        run: bash scripts/macos-postinstall-check.sh
