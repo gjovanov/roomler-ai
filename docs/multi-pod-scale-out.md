@@ -207,9 +207,11 @@ device's claim and the viewer's rejoin
 | A row nobody claims | the row, past its `resume_by` | the sweep, one pod at a time (`run_sweep`, `crates/modules/remote/src/sweep.rs:94`) |
 
 The fencing number keeps a pod that no longer holds the session from undoing a resume: its late
-detach or end carries the number it held, and lands nowhere. A session on `derp` still redials,
-because `/derp` is pod-local and its path goes down with the pod. The switches, and what an operator
-reads before and after a roll, are in
+detach or end carries the number it held, and lands nowhere. A session on `derp` is the exception to
+the table's first row: `/derp` is pod-local, so its path goes down with the pod. It is kept when the
+mesh rebuilds that path before ICE gives up on the pair, as a Windows session's was about 4 s after
+the cut on 2026-11-12, and it redials otherwise, with no `agent_busy` either way. The switches, and
+what an operator reads before and after a roll, are in
 [deployment.md](deployment.md#a-roll-and-a-live-remote-session-fr-138).
 
 ## Stages
