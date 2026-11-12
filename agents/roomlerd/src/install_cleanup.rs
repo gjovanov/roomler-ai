@@ -241,44 +241,80 @@ const INSTALL_DIR_PRODUCT_FILES: &[&str] = &[
 /// (the CA runs `Return='ignore'`; PendingFileRenameOperations
 /// clears them on the next reboot, after which a later invocation
 /// removes the then-empty dir).
+///
+/// FR-145: the folder is reached by handle from the base it lives below (the
+/// machine's `Program Files` for a per-Machine install; for a per-User one,
+/// the profile the system records for this account's SID), each folder on the
+/// way opened below the one above it and never through a link; the product
+/// files are deleted below the held folder, and the folder through the held
+/// folder above it.
 #[cfg(target_os = "windows")]
 fn cleanup_vacated_install_dir(target: TargetFlavour, report: &mut CleanupReport, dry_run: bool) {
-    let flavour = match target {
-        TargetFlavour::PerUser => crate::updater::WindowsInstallFlavour::PerUser,
-        TargetFlavour::PerMachine => crate::updater::WindowsInstallFlavour::PerMachine,
+    let name = crate::updater::LEGACY_INSTALL_FOLDER_NAME;
+    let base = match target {
+        TargetFlavour::PerMachine => crate::appdirs::machine_program_files(),
+        TargetFlavour::PerUser => match crate::win_token::own_user_sid()
+            .and_then(|sid| crate::appdirs::profile_of_account(&sid))
+        {
+            Some(profile) => profile,
+            None => {
+                report.skipped.push(
+                    "vacated-dir sweep: the system records no profile for this account".to_string(),
+                );
+                return;
+            }
+        },
     };
-    let Some(dir) =
-        crate::updater::install_dir_with_name(flavour, crate::updater::LEGACY_INSTALL_FOLDER_NAME)
-    else {
-        report.skipped.push(
-            "vacated-dir sweep: the system names no local application data folder for this account"
-                .to_string(),
-        );
-        return;
+    let dir = match target {
+        TargetFlavour::PerMachine => base.join(name),
+        TargetFlavour::PerUser => base
+            .join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join(name),
     };
-    sweep_vacated_dir(&dir, report, dry_run);
+    sweep_vacated_dir(&base, &dir, report, dry_run);
 }
 
-/// The sweep of one vacated install folder, `dir`: what
+/// The sweep of one vacated install folder, `dir`, below `base`: what
 /// [`cleanup_vacated_install_dir`] does once it has named it. A `dir` that
 /// is a folder link, or sits below one, is left as it is, and so is what the
 /// link leads to.
 #[cfg(target_os = "windows")]
-fn sweep_vacated_dir(dir: &Path, report: &mut CleanupReport, dry_run: bool) {
-    if let Some(link) = roomler_node_core::recording_dir::link_component(dir) {
+fn sweep_vacated_dir(base: &Path, dir: &Path, report: &mut CleanupReport, dry_run: bool) {
+    use roomler_node_core::machine_tree::{HeldPath, Why};
+    let left = |report: &mut CleanupReport, why: &dyn std::fmt::Display| {
         report.skipped.push(format!(
-            "vacated dir {} left in place: {} is a link",
-            dir.display(),
-            link.display()
+            "vacated dir {} left in place: {why}",
+            dir.display()
         ));
-        return;
-    }
-    if !dir.is_dir() {
-        report
-            .skipped
-            .push(format!("vacated dir {} not present", dir.display()));
-        return;
-    }
+    };
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return left(report, &"it names no folder");
+    };
+    // The folder above it, held by handle from `base`.
+    let above = if parent == base {
+        HeldPath::base(base).map(Some)
+    } else {
+        HeldPath::below(base, parent)
+    };
+    let held = match above.and_then(|above| match above {
+        Some(above) => above
+            .open_dir(name)
+            .map(|held| held.map(|held| (above, held))),
+        None => Ok(None),
+    }) {
+        Ok(Some(held)) => held,
+        Ok(None) => {
+            report
+                .skipped
+                .push(format!("vacated dir {} not present", dir.display()));
+            return;
+        }
+        Err(refused) => return left(report, &refused),
+    };
+    let (above, held) = held;
     // Paranoia guard: never sweep the directory we are running from.
     if let Ok(own) = std::env::current_exe()
         && let Some(own_dir) = own.parent()
@@ -297,25 +333,29 @@ fn sweep_vacated_dir(dir: &Path, report: &mut CleanupReport, dry_run: bool) {
         ));
         return;
     }
-    for name in INSTALL_DIR_PRODUCT_FILES {
-        let file = dir.join(name);
-        if file.is_file() {
-            match std::fs::remove_file(&file) {
-                Ok(()) => report.removed.push(format!("stale {}", file.display())),
-                Err(e) => report
+    for file in INSTALL_DIR_PRODUCT_FILES {
+        let path = dir.join(file);
+        match held.remove_file(file) {
+            Ok(true) => report.removed.push(format!("stale {}", path.display())),
+            Ok(false) => {}
+            Err(refused) if matches!(refused.why, Why::Link) => left(report, &refused),
+            Err(refused) => {
+                report
                     .errors
-                    .push(format!("remove {}: {e}", file.display())),
+                    .push(format!("remove {}: {}", path.display(), refused.why))
             }
         }
     }
-    match std::fs::remove_dir(dir) {
-        Ok(()) => report
+    drop(held);
+    match above.remove_empty_dir(name) {
+        Ok(true) => report
             .removed
             .push(format!("vacated install dir {}", dir.display())),
-        Err(e) => report.skipped.push(format!(
-            "vacated dir {} left in place (non-product files or locks): {e}",
+        Ok(false) => report.skipped.push(format!(
+            "vacated dir {} left in place (non-product files or locks)",
             dir.display()
         )),
+        Err(refused) => left(report, &refused),
     }
 }
 
@@ -368,27 +408,31 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
         }
     }
 
-    // 2. The data dirs below the profile of the session's user, as
+    // 2. The data dirs below the profile the system records for the
+    //    session's account (FR-145: by its SID, never by its user name), as
     //    `plan_per_user_removal` decides (#3702).
     #[cfg(feature = "system-context")]
     {
+        use crate::system_context::user_profile;
         let plan = plan_per_user_removal(
             crate::win_token::own_user_sid().as_deref(),
-            || match crate::system_context::user_profile::session_user_name() {
-                Some(name) => SessionAccount::User { name, sid: None },
+            || match user_profile::session_user_name() {
+                Some(name) => SessionAccount::User {
+                    name,
+                    sid: user_profile::session_account_sid(),
+                },
                 None => SessionAccount::Nobody,
             },
-            |_| None,
-            Path::new(r"C:\Users"),
+            crate::appdirs::profile_of_account,
         );
         remove_per_user_trees(plan, report, dry_run);
     }
 
-    // Without the system-context feature compiled in, the
-    // active_user_profile_root helper isn't available; the cleanup
-    // becomes a perUser-self-deletes-its-own-dirs operation. Since
-    // perMachine MSI normally has the feature on, this branch only
-    // matters for the default build used in headless CI tests.
+    // Without the system-context feature compiled in, the session's
+    // account cannot be read; the cleanup becomes a
+    // perUser-self-deletes-its-own-dirs operation. Since perMachine MSI
+    // normally has the feature on, this branch only matters for the
+    // default build used in headless CI tests.
     #[cfg(not(feature = "system-context"))]
     {
         report
@@ -398,11 +442,13 @@ fn cleanup_per_user_artifacts(report: &mut CleanupReport, dry_run: bool) {
 }
 
 /// #3702 — what the per-user clean-up does with a person's data trees: the
-/// trees it removes, and one line for each tree it leaves, saying why.
+/// profile whose trees it removes, or the line that says why it removes none.
+/// FR-145: each tree is checked and removed by the same walk, at removal
+/// ([`remove_per_user_trees`]).
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 #[derive(Debug, Default)]
 struct PerUserPlan {
-    remove: Vec<std::path::PathBuf>,
+    profile: Option<std::path::PathBuf>,
     left: Vec<String>,
 }
 
@@ -414,58 +460,55 @@ enum SessionAccount {
     /// Nobody is signed in to the session, or its user cannot be read.
     Nobody,
     /// The session's user: its name, and its account's SID when it could be
-    /// told.
+    /// told (`session_account_sid`).
     User { name: String, sid: Option<String> },
 }
 
-/// The data trees below `profile_root`: BOTH the legacy `roomler-agent` app
-/// segment AND the new `roomler` segment (the binary rename, `appdirs.rs`),
-/// local and roaming. A cross-flavour switch must scrub whichever segment the
-/// OTHER flavour landed on, so both are named here rather than routed through
-/// `appdirs` (which resolves to only ONE segment per host).
+/// The app segments a cross-flavour switch scrubs: the legacy `roomler-agent`
+/// one, from before the binary rename, and today's `roomler` (`appdirs.rs`).
+/// Both are named here rather than routed through `appdirs`, which resolves
+/// to only ONE segment per host.
+#[cfg(target_os = "windows")]
+const SEGMENTS: [&str; 2] = ["roomler-agent", "roomler"];
+
+/// The data trees below `profile_root`, each as (area, segment): BOTH the
+/// legacy `roomler-agent` app segment AND the new `roomler` segment, local
+/// and roaming. A cross-flavour switch must scrub whichever segment the OTHER
+/// flavour landed on.
+#[cfg(all(target_os = "windows", feature = "system-context"))]
+const PER_USER_TREES: [(&str, &str); 4] = [
+    ("Local", "roomler-agent"),
+    ("Roaming", "roomler-agent"),
+    ("Local", "roomler"),
+    ("Roaming", "roomler"),
+];
+
+/// The data trees below `profile_root` ([`PER_USER_TREES`]), as paths.
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 fn per_user_trees(profile_root: &Path) -> [std::path::PathBuf; 4] {
-    let tree = |area: &str, segment: &str| {
+    PER_USER_TREES.map(|(area, segment)| {
         profile_root
             .join("AppData")
             .join(area)
             .join("roomler")
             .join(segment)
-    };
-    [
-        tree("Local", "roomler-agent"),
-        tree("Roaming", "roomler-agent"),
-        tree("Local", "roomler"),
-        tree("Roaming", "roomler"),
-    ]
+    })
 }
 
-/// #3702 — the plan for the data trees ([`per_user_trees`]) below
-/// `profile_root`, the profile of the person signed in to this process's
-/// session. When the step cannot read the SID of the account it runs as
-/// (`None`), or that account is the service account, it removes none and
-/// asks `profile_root` nothing. A tree that is a link, holds one, or is
-/// reached through one below the profile (`appdirs::link_below`,
-/// [`link_inside`]) is left in place with a line that names it; the others
-/// are still planned.
+/// #3702 — the plan for the data trees ([`per_user_trees`]) below the
+/// profile of the person signed in to this process's session. When the step
+/// cannot read the SID of the account it runs as (`None`), or that account is
+/// the service account, it removes none and asks `session` nothing. FR-145:
+/// the profile is the one the system records for the session's account
+/// (`profile_of` its SID, `appdirs::profile_of_account`), never a folder named
+/// after its user; with none recorded, or an account it cannot tell, nothing
+/// is removed and the plan's line says which.
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 fn plan_per_user_removal(
     own_sid: Option<&str>,
     session: impl FnOnce() -> SessionAccount,
     profile_of: impl FnOnce(&str) -> Option<std::path::PathBuf>,
-    users_root: &Path,
 ) -> PerUserPlan {
-    // The profile lookup is passed in, so a test names its own. The profile
-    // is the session user's name below `users_root`; `profile_of` (the
-    // profile the system records for a SID) is not read yet.
-    let _ = profile_of;
-    let profile_root = || match session() {
-        SessionAccount::Nobody => None,
-        SessionAccount::User { name, sid } => {
-            let _ = sid;
-            Some(users_root.join(name))
-        }
-    };
     let mut plan = PerUserPlan::default();
     let Some(own_sid) = own_sid else {
         plan.left.push(
@@ -484,79 +527,96 @@ fn plan_per_user_removal(
         );
         return plan;
     }
-    let Some(root) = profile_root() else {
-        plan.left
-            .push("no active interactive session — user data dirs not reachable".to_string());
-        return plan;
-    };
-    for tree in per_user_trees(&root) {
-        let why = match crate::appdirs::link_below(&root, &tree) {
-            Some(link) => Some(format!("{} is a link", link.display())),
-            None if std::fs::symlink_metadata(&tree).is_err() => {
-                plan.left
-                    .push(format!("user data dir {} not present", tree.display()));
-                continue;
-            }
-            None => link_inside(&tree),
-        };
-        match why {
-            Some(why) => plan.left.push(format!(
-                "user data dir {} left in place: {why}",
-                tree.display()
-            )),
-            None => plan.remove.push(tree),
-        }
+    match session() {
+        SessionAccount::Nobody => plan
+            .left
+            .push("no active interactive session — user data dirs not reachable".to_string()),
+        SessionAccount::User { sid: None, .. } => plan.left.push(
+            "user data dirs left in place: cannot tell the session's account, so no profile is \
+             looked up and no user data dir removed"
+                .to_string(),
+        ),
+        SessionAccount::User { sid: Some(sid), .. } => match profile_of(&sid) {
+            Some(profile) => plan.profile = Some(profile),
+            None => plan.left.push(
+                "user data dirs left in place: the system records no profile for the session's \
+                 account, so no user data dir is removed"
+                    .to_string(),
+            ),
+        },
     }
     plan
 }
 
-/// The first entry below `tree` that is a link (a symbolic link, or a
-/// junction) or cannot be read, found without following any link, as a line
-/// that names it. `None` when every entry is a plain file or folder.
-#[cfg(all(target_os = "windows", feature = "system-context"))]
-fn link_inside(tree: &Path) -> Option<String> {
-    let mut folders = vec![tree.to_path_buf()];
-    while let Some(folder) = folders.pop() {
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            return Some(format!("{} cannot be read", folder.display()));
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                return Some(format!("{} cannot be read", folder.display()));
-            };
-            let path = entry.path();
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Some(format!("{} is a link", path.display()));
-                }
-                Ok(meta) if meta.is_dir() => folders.push(path),
-                Ok(_) => {}
-                Err(_) => return Some(format!("{} cannot be read", path.display())),
-            }
-        }
-    }
-    None
-}
-
-/// Carry out `plan`: report the trees it leaves, then remove the others
-/// (`dry_run`: only say so).
+/// Carry out `plan`: report why it removes nothing, or remove each data tree
+/// of its profile (`dry_run`: only say so). FR-145: each tree is reached by
+/// handle from the profile (`AppData\<area>\roomler`, each folder opened
+/// below the one above it, never through a link) and removed by
+/// `HeldPath::remove_tree` below the folder that walk holds: the walk that
+/// finds no link is the walk whose handles delete. A tree with a link on the
+/// way or in it is left in place, with a line that names the link.
 #[cfg(all(target_os = "windows", feature = "system-context"))]
 fn remove_per_user_trees(plan: PerUserPlan, report: &mut CleanupReport, dry_run: bool) {
+    use roomler_node_core::machine_tree::HeldPath;
     report.skipped.extend(plan.left);
-    for path in plan.remove {
-        if dry_run {
-            report
-                .removed
-                .push(format!("[dry-run] rmdir /s {}", path.display()));
-            continue;
+    let Some(profile) = plan.profile else {
+        return;
+    };
+    let base = HeldPath::base(&profile);
+    for ((area, segment), tree) in PER_USER_TREES.into_iter().zip(per_user_trees(&profile)) {
+        let removal = match &base {
+            Ok(base) => base.walk(&["AppData", area, "roomler"]),
+            Err(refused) => Err(refused.clone()),
         }
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => report
-                .removed
-                .push(format!("user data dir {}", path.display())),
-            Err(e) => report
-                .errors
-                .push(format!("rmdir {}: {}", path.display(), e)),
+        .and_then(|held| match held {
+            Some(held) => held.remove_tree(segment, dry_run).map(Some),
+            None => Ok(None),
+        });
+        report_removal("user data dir", &tree, removal, dry_run, report);
+    }
+}
+
+/// One tree's report lines, from what its walk and `remove_tree` did:
+/// `"<what> <tree>"` when removed (`"[dry-run] rmdir /s <tree>"` when it
+/// would be), `"<what> <tree> not present"`, `"<what> <tree> left in place:
+/// <path> is a link …"` for each link that kept it (or the refusal that
+/// stopped the walk), and an error line for anything that could not be
+/// removed for another reason.
+#[cfg(target_os = "windows")]
+fn report_removal(
+    what: &str,
+    tree: &Path,
+    removal: Result<
+        Option<roomler_node_core::machine_tree::TreeRemoval>,
+        roomler_node_core::machine_tree::held::Refusal,
+    >,
+    dry_run: bool,
+    report: &mut CleanupReport,
+) {
+    use roomler_node_core::machine_tree::Why;
+    let shown = tree.display();
+    let removal = match removal {
+        Ok(Some(removal)) if removal.present => removal,
+        Ok(_) => return report.skipped.push(format!("{what} {shown} not present")),
+        Err(refused) => {
+            return report
+                .skipped
+                .push(format!("{what} {shown} left in place: {refused}"));
+        }
+    };
+    if dry_run && removal.would_remove() {
+        return report.removed.push(format!("[dry-run] rmdir /s {shown}"));
+    }
+    if removal.root_removed {
+        return report.removed.push(format!("{what} {shown}"));
+    }
+    for (at, why) in removal.left {
+        match why {
+            Why::Io(e) => report.errors.push(format!("rmdir {}: {e}", at.display())),
+            why => report.skipped.push(format!(
+                "{what} {shown} left in place: {} {why}",
+                at.display()
+            )),
         }
     }
 }
@@ -604,44 +664,37 @@ fn cleanup_per_machine_artifacts(report: &mut CleanupReport, dry_run: bool) {
 /// machine's `ProgramData` (a test names a folder of its own).
 ///
 /// ACL'd to SYSTEM at create time; the perUser MSI's user-token CA may not be
-/// able to delete it. Scrub BOTH the legacy `roomler-agent` segment AND the new
-/// `roomler` segment (binary rename, `appdirs.rs`) so a cross-flavour switch
-/// doesn't leave the other segment's tree behind. Not routed through
-/// `machine_global_dir` (which resolves to only ONE segment per host); rooted
-/// at the machine's folder as the system names it.
+/// able to delete it. Scrub BOTH [`SEGMENTS`] (binary rename, `appdirs.rs`) so
+/// a cross-flavour switch doesn't leave the other segment's tree behind. Not
+/// routed through `machine_global_dir` (which resolves to only ONE segment
+/// per host); rooted at the machine's folder as the system names it.
+///
+/// FR-145: `program_data` is held by handle, `roomler\<segment>` walked below
+/// it (never through a link), and `service-logs` removed by
+/// `HeldPath::remove_tree` below the segment folder that walk holds. A link on
+/// the way or in the tree leaves it, with a line that names the link.
 #[cfg(target_os = "windows")]
 fn cleanup_per_machine_service_logs(
     program_data: &Path,
     report: &mut CleanupReport,
     dry_run: bool,
 ) {
-    {
-        for segment in ["roomler-agent", "roomler"] {
-            let path = program_data
-                .join("roomler")
-                .join(segment)
-                .join("service-logs");
-            if path.exists() {
-                if dry_run {
-                    report
-                        .removed
-                        .push(format!("[dry-run] rmdir /s {}", path.display()));
-                } else {
-                    match std::fs::remove_dir_all(&path) {
-                        Ok(()) => report
-                            .removed
-                            .push(format!("service log dir {}", path.display())),
-                        Err(e) => report
-                            .errors
-                            .push(format!("rmdir {}: {}", path.display(), e)),
-                    }
-                }
-            } else {
-                report
-                    .skipped
-                    .push(format!("service log dir {} not present", path.display()));
-            }
+    use roomler_node_core::machine_tree::HeldPath;
+    let base = HeldPath::base(program_data);
+    for segment in SEGMENTS {
+        let path = program_data
+            .join("roomler")
+            .join(segment)
+            .join("service-logs");
+        let removal = match &base {
+            Ok(base) => base.walk(&["roomler", segment]),
+            Err(refused) => Err(refused.clone()),
         }
+        .and_then(|held| match held {
+            Some(held) => held.remove_tree("service-logs", dry_run).map(Some),
+            None => Ok(None),
+        });
+        report_removal("service log dir", &path, removal, dry_run, report);
     }
 }
 
@@ -826,7 +879,7 @@ mod tests {
         junction(&parent, &real);
         for dir in [at, parent.join("roomler-agent")] {
             let mut report = CleanupReport::default();
-            sweep_vacated_dir(&dir, &mut report, false);
+            sweep_vacated_dir(root.path(), &dir, &mut report, false);
             assert!(real.join("roomlerd.exe").is_file(), "{report:?}");
             assert!(
                 real.join("roomler-agent").join("roomlerd.exe").is_file(),
@@ -840,7 +893,7 @@ mod tests {
         }
         // The same folder, reached with no link, is swept.
         let mut report = CleanupReport::default();
-        sweep_vacated_dir(&real.join("roomler-agent"), &mut report, false);
+        sweep_vacated_dir(root.path(), &real.join("roomler-agent"), &mut report, false);
         assert!(!real.join("roomler-agent").exists(), "{report:?}");
     }
 
@@ -876,7 +929,9 @@ mod tests {
         junction(&roaming.join("roomler"), &elsewhere);
 
         let plan = plan_for(Some(A_PERSON), &profile);
-        assert_eq!(plan.remove, vec![local.join("roomler")], "{plan:?}");
+        assert_eq!(plan.profile.as_deref(), Some(profile.as_path()), "{plan:?}");
+        let mut report = CleanupReport::default();
+        remove_per_user_trees(plan, &mut report, false);
         for tree in [
             local.join("roomler-agent"),
             roaming.join("roomler").join("roomler-agent"),
@@ -884,15 +939,13 @@ mod tests {
         ] {
             let named = tree.display().to_string();
             assert!(
-                plan.left
+                report
+                    .skipped
                     .iter()
                     .any(|line| line.contains(&named) && line.contains("link")),
-                "no line names {named}: {plan:?}"
+                "no line names {named}: {report:?}"
             );
         }
-
-        let mut report = CleanupReport::default();
-        remove_per_user_trees(plan, &mut report, false);
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.skipped.len(), 3, "{report:?}");
         assert!(!local.join("roomler").exists(), "{report:?}");
@@ -906,14 +959,17 @@ mod tests {
         let empty = root.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         let plan = plan_for(Some(A_PERSON), &empty);
-        assert!(plan.remove.is_empty(), "{plan:?}");
+        let mut report = CleanupReport::default();
+        remove_per_user_trees(plan, &mut report, false);
+        assert!(report.removed.is_empty(), "{report:?}");
         assert_eq!(
-            plan.left
+            report
+                .skipped
                 .iter()
                 .filter(|line| line.contains("not present"))
                 .count(),
             4,
-            "{plan:?}"
+            "{report:?}"
         );
     }
 
@@ -927,9 +983,8 @@ mod tests {
             Some(roomler_node_core::machine_tree::SYSTEM),
             || panic!("a profile was looked up on the service account"),
             |_| panic!("a profile was looked up on the service account"),
-            Path::new(r"C:\Users"),
         );
-        assert!(plan.remove.is_empty(), "{plan:?}");
+        assert!(plan.profile.is_none(), "{plan:?}");
         assert_eq!(plan.left.len(), 1, "{plan:?}");
         for words in [
             "service account",
@@ -957,21 +1012,19 @@ mod tests {
                 sid: Some(A_PERSON.into()),
             },
             |sid| (sid == A_PERSON).then(|| profile.to_path_buf()),
-            profile.parent().unwrap(),
         )
     }
 
     /// The plan with the profile lookup a test names: `session` is the
-    /// session's account, `profile_of` the profile the system records for a
-    /// SID, and `users_root` the folder that holds the profiles by name.
+    /// session's account, and `profile_of` the profile the system records
+    /// for a SID.
     #[cfg(all(target_os = "windows", feature = "system-context"))]
     fn plan_with(
         own_sid: Option<&str>,
         session: SessionAccount,
         profile_of: impl FnOnce(&str) -> Option<std::path::PathBuf>,
-        users_root: &Path,
     ) -> PerUserPlan {
-        plan_per_user_removal(own_sid, || session, profile_of, users_root)
+        plan_per_user_removal(own_sid, || session, profile_of)
     }
 
     /// The four data trees of `profile`, each holding `keep.txt`.
@@ -994,7 +1047,7 @@ mod tests {
         let program_data = root.path().join("ProgramData");
         std::fs::create_dir_all(&program_data).unwrap();
         let other = root.path().join("other");
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             let logs = other.join(segment).join("service-logs");
             std::fs::create_dir_all(&logs).unwrap();
             std::fs::write(logs.join("a.log"), "x").unwrap();
@@ -1002,7 +1055,7 @@ mod tests {
         junction(&program_data.join("roomler"), &other);
         let mut report = CleanupReport::default();
         cleanup_per_machine_service_logs(&program_data, &mut report, false);
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             assert!(
                 other
                     .join(segment)
@@ -1045,7 +1098,7 @@ mod tests {
     fn the_per_machine_clean_up_still_removes_both_segments_service_logs() {
         let root = tempfile::tempdir().unwrap();
         let program_data = root.path().join("ProgramData");
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             let logs = program_data
                 .join("roomler")
                 .join(segment)
@@ -1055,7 +1108,7 @@ mod tests {
         }
         let mut report = CleanupReport::default();
         cleanup_per_machine_service_logs(&program_data, &mut report, false);
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             let logs = program_data
                 .join("roomler")
                 .join(segment)
@@ -1085,7 +1138,7 @@ mod tests {
         let profile = root.path().join("profile");
         make_trees(&profile);
         let elsewhere = root.path().join("elsewhere");
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             std::fs::create_dir_all(elsewhere.join(segment)).unwrap();
             std::fs::write(elsewhere.join(segment).join("keep.txt"), "x").unwrap();
         }
@@ -1097,7 +1150,7 @@ mod tests {
         junction(&local, &elsewhere);
         let mut report = CleanupReport::default();
         remove_per_user_trees(plan, &mut report, false);
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             assert!(
                 elsewhere.join(segment).join("keep.txt").is_file(),
                 "nothing the junction leads to is removed: {report:?}"
@@ -1112,7 +1165,7 @@ mod tests {
             "a line names the link: {report:?}"
         );
         let roaming = profile.join("AppData").join("Roaming").join("roomler");
-        for segment in ["roomler-agent", "roomler"] {
+        for segment in SEGMENTS {
             assert!(!roaming.join(segment).exists(), "{report:?}");
         }
     }
@@ -1133,12 +1186,9 @@ mod tests {
             name: "p".into(),
             sid: Some(A_PERSON.into()),
         };
-        let plan = plan_with(
-            Some(A_PERSON),
-            account.clone(),
-            |sid| (sid == A_PERSON).then(|| recorded.clone()),
-            root.path(),
-        );
+        let plan = plan_with(Some(A_PERSON), account.clone(), |sid| {
+            (sid == A_PERSON).then(|| recorded.clone())
+        });
         let mut report = CleanupReport::default();
         remove_per_user_trees(plan, &mut report, false);
         for tree in per_user_trees(&by_name) {
@@ -1152,7 +1202,7 @@ mod tests {
         }
 
         make_trees(&recorded);
-        let plan = plan_with(Some(A_PERSON), account, |_| None, root.path());
+        let plan = plan_with(Some(A_PERSON), account, |_| None);
         let mut report = CleanupReport::default();
         remove_per_user_trees(plan, &mut report, false);
         assert!(report.removed.is_empty(), "{report:?}");
@@ -1181,9 +1231,8 @@ mod tests {
             None,
             || panic!("a profile was looked up for an account the step cannot name"),
             |_| panic!("a profile was looked up for an account the step cannot name"),
-            Path::new(r"C:\Users"),
         );
-        assert!(plan.remove.is_empty(), "{plan:?}");
+        assert!(plan.profile.is_none(), "{plan:?}");
         assert_eq!(plan.left.len(), 1, "{plan:?}");
         for words in [
             "cannot tell which account",

@@ -222,7 +222,7 @@ fn record_inner_at(
     summary: &str,
     log_tail_override: Option<String>,
 ) -> std::io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
+    let place = Place::to_write(dir)?;
 
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -237,7 +237,7 @@ fn record_inner_at(
     // uploader). See `should_suppress` for the rate-limit + cap
     // contract; `log_suppression_throttled` keeps the warn from
     // spamming.
-    if let Some(reason) = should_suppress(dir, now_unix) {
+    if let Some(reason) = place.should_suppress(now_unix) {
         // rc.51: tally the suppressed write so the next sidecar that
         // DOES land carries the count — loop intensity stays visible.
         SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
@@ -283,8 +283,18 @@ fn record_inner_at(
     // those alone.
     fit_to_envelope(&mut payload, MAX_PAYLOAD_BYTES);
 
-    let final_path = dir.join(format!("{now_unix}-{pid}.json"));
-    let tmp_path = dir.join(format!("{now_unix}-{pid}.json.tmp"));
+    let name = format!("{now_unix}-{pid}.json");
+    #[cfg(windows)]
+    if let Place::Held(held) = &place {
+        // FR-145 — a fresh temp file below the held folder, flushed (#2955),
+        // then renamed onto the name by handle.
+        let json =
+            serde_json::to_vec(&payload).map_err(|e| std::io::Error::other(e.to_string()))?;
+        held.write_file(&name, &json, crate::machine_tree::Seal::Readable)?;
+        return Ok(held.path().join(name));
+    }
+    let final_path = dir.join(&name);
+    let tmp_path = dir.join(format!("{name}.tmp"));
     {
         let mut f = fs::File::create(&tmp_path)?;
         serde_json::to_writer(&mut f, &payload)
@@ -342,17 +352,182 @@ fn supervisor_crashes_dir() -> std::io::Result<PathBuf> {
         })
 }
 
+/// FR-145 — where a record is written: below the machine's folder, held by
+/// handle ([`crate::machine_tree::HeldPath`]), or a plain path (the person's
+/// own daemon in its profile; macOS and Linux).
+enum Place<'a> {
+    Plain(&'a Path),
+    #[cfg(windows)]
+    Held(crate::machine_tree::HeldPath),
+}
+
+/// The start of the error a record left alone answers with: logged once per
+/// process start ([`left_alone`]), never again by [`record_with_log_tail`].
+const LEFT_ALONE: &str = "crash_recorder: crash records left alone: ";
+
+impl<'a> Place<'a> {
+    /// `dir`, ready to take a record. On Windows a folder below the machine's
+    /// `ProgramData` (the supervisor's `crashes`, a SYSTEM worker's
+    /// `service-logs\crashes`) is reached by handle and sealed
+    /// (`Seal::Readable`, D10: a worker running as the person drains it); a
+    /// link on the way leaves the record unwritten. Any other folder is made
+    /// as before.
+    fn to_write(dir: &'a Path) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        if in_machine_tree(dir) && held_switch_on() {
+            use crate::machine_tree::{HeldPath, Seal};
+            let held = HeldPath::machine(dir, Seal::Readable).map_err(left_alone)?;
+            if held.resealed() {
+                // An earlier build's open folder: a record name that is not a
+                // plain file of SYSTEM's or Administrators' goes.
+                let gone = held.keep_only_plain(|n| n.ends_with(".json") || n.ends_with(".tmp"));
+                if !gone.is_empty() {
+                    let gone: Vec<String> = gone.iter().map(ToString::to_string).collect();
+                    tracing::warn!(
+                        ?gone,
+                        "crash_recorder: crashes sealed; removed what was not a record"
+                    );
+                }
+            }
+            return Ok(Self::Held(held));
+        }
+        fs::create_dir_all(dir)?;
+        Ok(Self::Plain(dir))
+    }
+
+    /// [`should_suppress`], over this folder's entries.
+    fn should_suppress(&self, now_unix: i64) -> Option<SuppressReason> {
+        match self {
+            Self::Plain(dir) => should_suppress(dir, now_unix),
+            #[cfg(windows)]
+            Self::Held(held) => {
+                let entries = held.entries().ok()?;
+                suppress_among(entries.iter().map(|e| e.name.as_str()), now_unix)
+            }
+        }
+    }
+}
+
+/// FR-145 — a record left alone: one WARN per process start, counted with the
+/// suppression tally, and an error [`record_with_log_tail`] does not log again.
+/// The crash is never written anywhere else.
+#[cfg(windows)]
+fn left_alone(refused: crate::machine_tree::held::Refusal) -> std::io::Error {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("{LEFT_ALONE}{refused}");
+    }
+    SUPPRESSED_SINCE_LAST.fetch_add(1, Ordering::Relaxed);
+    std::io::Error::other(format!("{LEFT_ALONE}{refused}"))
+}
+
+/// `dir` is below the machine's `ProgramData`.
+#[cfg(windows)]
+fn in_machine_tree(dir: &Path) -> bool {
+    crate::appdirs::names_below(dir, &crate::appdirs::machine_program_data())
+        .is_some_and(|names| !names.is_empty())
+}
+
+/// FR-145's kill switch (`ROOMLERD_MACHINE_TREE_HELD=0`): off, the records are
+/// written and read by path as before, with one WARN naming the switch.
+#[cfg(windows)]
+fn held_switch_on() -> bool {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let on = crate::machine_tree::Switches::from_env().held;
+    if !on && !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "crash_recorder: ROOMLERD_MACHINE_TREE_HELD=0: crash records in the machine folder \
+             are written and read by path, not by handle"
+        );
+    }
+    on
+}
+
+/// A pending sidecar: its name and the folder it was read from, so the
+/// uploader deletes what it read through the same folder (FR-145: below the
+/// machine's folder, by handle), never by a path looked up again.
+#[derive(Clone)]
+pub struct Sidecar {
+    path: PathBuf,
+    name: String,
+    len: u64,
+    modified_unix: i64,
+    folder: SidecarFolder,
+}
+
+#[derive(Clone)]
+enum SidecarFolder {
+    Plain,
+    #[cfg(windows)]
+    Held(std::sync::Arc<crate::machine_tree::HeldPath>),
+}
+
+impl std::fmt::Debug for Sidecar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Sidecar").field(&self.path).finish()
+    }
+}
+
+impl Sidecar {
+    /// The sidecar at `path`, read by path: a folder outside the machine's.
+    /// `None` when it is not there.
+    pub fn plain(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        let modified_unix = meta
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        Some(Self {
+            path: path.to_path_buf(),
+            name: path.file_name()?.to_str()?.to_string(),
+            len: meta.len(),
+            modified_unix,
+            folder: SidecarFolder::Plain,
+        })
+    }
+
+    /// Where it is, for log lines.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Its identity for the uploader's ledger: `<len>:<mtime> <file name>`,
+    /// from when it was read.
+    pub fn signature(&self) -> String {
+        format!("{}:{} {}", self.len, self.modified_unix, self.name)
+    }
+
+    /// Delete it: below the machine's folder through the folder it was read
+    /// from, by handle (a link of its name refused); elsewhere by path.
+    /// `NotFound` when it is not there.
+    pub fn remove(&self) -> std::io::Result<()> {
+        match &self.folder {
+            SidecarFolder::Plain => fs::remove_file(&self.path),
+            #[cfg(windows)]
+            SidecarFolder::Held(held) => match held.remove_file(&self.name) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(std::io::ErrorKind::NotFound.into()),
+                Err(refused) => Err(refused.into()),
+            },
+        }
+    }
+}
+
 /// Drain pending crash payloads from BOTH the worker + supervisor
 /// dirs (deduped by file path on the rare case they're the same
-/// directory). Returned tuples carry the on-disk path so the
-/// uploader can delete each on successful POST.
+/// directory). Returned tuples carry the sidecar (its name and folder) so
+/// the uploader can delete each on successful POST.
 ///
 /// Oversized or unreadable files are logged + left on disk — better to
 /// leak a few orphan sidecars than to silently lose a crash record. A
 /// file that does not parse is moved ONCE into `malformed/` (#2955): kept
-/// for a later look, never re-warned on every start.
-pub fn pending_all() -> Vec<(PathBuf, AgentCrashPayload)> {
-    let mut out: Vec<(PathBuf, AgentCrashPayload)> = Vec::new();
+/// for a later look, never re-warned on every start. FR-145: below the
+/// machine's folder each is listed and read below the folder's handle,
+/// never through a link.
+pub fn pending_all() -> Vec<(Sidecar, AgentCrashPayload)> {
+    let mut out: Vec<(Sidecar, AgentCrashPayload)> = Vec::new();
     let mut seen_dirs: Vec<PathBuf> = Vec::with_capacity(2);
     for ctx in [WriterContext::Worker, WriterContext::Supervisor] {
         if let Ok(dir) = crashes_dir_for(ctx) {
@@ -369,7 +544,11 @@ pub fn pending_all() -> Vec<(PathBuf, AgentCrashPayload)> {
     out
 }
 
-fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
+fn scan_dir(dir: &Path) -> Vec<(Sidecar, AgentCrashPayload)> {
+    #[cfg(windows)]
+    if in_machine_tree(dir) && held_switch_on() {
+        return scan_held(dir);
+    }
     let mut out = Vec::new();
     let read_dir = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -404,7 +583,11 @@ fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
             }
         };
         match serde_json::from_slice::<AgentCrashPayload>(&bytes) {
-            Ok(payload) => out.push((path, payload)),
+            Ok(payload) => {
+                if let Some(sidecar) = Sidecar::plain(&path) {
+                    out.push((sidecar, payload));
+                }
+            }
             // #2955 — moved aside ONCE: kept for a later look, but never
             // re-read and re-warned on every start. A torn write (a power
             // loss mid-record) is NUL-filled, and no future parser reads it.
@@ -419,6 +602,78 @@ fn scan_dir(dir: &PathBuf) -> Vec<(PathBuf, AgentCrashPayload)> {
                     file = %path.display(),
                     error = %e,
                     move_error = %qe,
+                    "crash_recorder: skipping malformed sidecar"
+                ),
+            },
+        }
+    }
+    out
+}
+
+/// FR-145 — [`scan_dir`] below the machine's folder: `dir` reached from the
+/// machine's `ProgramData` by handle (making nothing), its entries listed and
+/// each record read below its handle, never through a link; a record that
+/// does not parse goes into `malformed`, renamed by handle.
+#[cfg(windows)]
+fn scan_held(dir: &Path) -> Vec<(Sidecar, AgentCrashPayload)> {
+    use crate::machine_tree::{HeldPath, Seal};
+    let mut out = Vec::new();
+    let held = match HeldPath::below(&crate::appdirs::machine_program_data(), dir) {
+        Ok(Some(held)) => std::sync::Arc::new(held),
+        Ok(None) => return out,
+        Err(refused) => {
+            let _ = left_alone(refused);
+            return out;
+        }
+    };
+    let entries = match held.entries() {
+        Ok(entries) => entries,
+        Err(refused) => {
+            tracing::warn!(%refused, "crash_recorder: listing the crashes folder failed");
+            return out;
+        }
+    };
+    for entry in entries {
+        if entry.is_dir || !entry.name.ends_with(".json") {
+            continue;
+        }
+        let path = held.path().join(&entry.name);
+        if entry.len > MAX_PAYLOAD_BYTES as u64 {
+            tracing::warn!(file = %path.display(), bytes = entry.len, "crash_recorder: skipping oversized sidecar");
+            continue;
+        }
+        let bytes = match held.read_file(&entry.name, MAX_PAYLOAD_BYTES as u64) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(refused) => {
+                tracing::warn!(%refused, "crash_recorder: read failed");
+                continue;
+            }
+        };
+        match serde_json::from_slice::<AgentCrashPayload>(&bytes) {
+            Ok(payload) => out.push((
+                Sidecar {
+                    path,
+                    name: entry.name,
+                    len: entry.len,
+                    modified_unix: entry.modified_unix,
+                    folder: SidecarFolder::Held(held.clone()),
+                },
+                payload,
+            )),
+            Err(e) => match held
+                .sealed_dir(MALFORMED_DIR, Seal::Readable)
+                .and_then(|into| held.rename_file(&entry.name, &into, &entry.name, false))
+            {
+                Ok(()) => tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    "crash_recorder: malformed sidecar moved aside into {MALFORMED_DIR}"
+                ),
+                Err(refused) => tracing::warn!(
+                    file = %path.display(),
+                    error = %e,
+                    move_error = %refused,
                     "crash_recorder: skipping malformed sidecar"
                 ),
             },
@@ -467,7 +722,9 @@ impl SuppressReason {
 }
 
 fn is_suppression_message(msg: &str) -> bool {
-    msg == SuppressReason::RecentSidecar.as_str() || msg == SuppressReason::HardCapReached.as_str()
+    msg == SuppressReason::RecentSidecar.as_str()
+        || msg == SuppressReason::HardCapReached.as_str()
+        || msg.starts_with(LEFT_ALONE)
 }
 
 /// Pure: should the next sidecar write to `dir` be suppressed?
@@ -485,21 +742,27 @@ fn is_suppression_message(msg: &str) -> bool {
 /// Pure over dir contents + clock so tests drive every branch
 /// without mocks.
 pub fn should_suppress(dir: &Path, now_unix: i64) -> Option<SuppressReason> {
-    let entries: Vec<i64> = match fs::read_dir(dir) {
-        Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| {
-                let p = e.path();
-                if p.extension().and_then(|s| s.to_str()) != Some("json") {
-                    return None;
-                }
-                let stem = p.file_stem()?.to_str()?;
-                let (ts_str, _) = stem.split_once('-')?;
-                ts_str.parse::<i64>().ok()
-            })
-            .collect(),
-        Err(_) => return None,
-    };
+    let names: Vec<String> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    suppress_among(names.iter().map(String::as_str), now_unix)
+}
+
+/// [`should_suppress`] over a folder's entry names (FR-145: below the
+/// machine's folder, its listing by handle).
+fn suppress_among<'n>(
+    names: impl Iterator<Item = &'n str>,
+    now_unix: i64,
+) -> Option<SuppressReason> {
+    let entries: Vec<i64> = names
+        .filter_map(|name| {
+            let stem = name.strip_suffix(".json")?;
+            let (ts_str, _) = stem.split_once('-')?;
+            ts_str.parse::<i64>().ok()
+        })
+        .collect();
 
     if entries.len() >= HARD_CAP {
         return Some(SuppressReason::HardCapReached);
