@@ -1549,8 +1549,8 @@ jobs:
           # 2. per-User: the release chosen above, then this branch over it.
           Invoke-Msi '/i' (Save-Msi $newest 'pu') (Join-Path $logDir 'fr133-newest-peruser.log') ''
           $was = Assert-Entries "$($newest.tag_name) per-User installed" @($old.pu, $new.pu) ''
-          if ($was -cne $new.pu) { Write-Host "the newest release registers the pre-P1 name: this cell is the rename upgrade" }
-          else { Write-Host "::notice::the newest release already registers '$was'; cell 1 above is the pre-P1 case" }
+          if ($was -cne $new.pu) { Write-Host "the newest release at or below this build registers the pre-P1 name: this cell is the rename upgrade" }
+          else { Write-Host "::notice::the newest release at or below this build already registers '$was'; cell 1 above is the pre-P1 case" }
           Invoke-Msi '/i' $pu (Join-Path $logDir 'fr133-branch-peruser.log') ''
           $null = Assert-Entries 'per-User upgraded to this branch' @($new.pu) $nextMsi
           # The Start-menu entry follows the name, and the old one leaves with
@@ -1563,8 +1563,9 @@ jobs:
           $exe = Join-Path $env:LOCALAPPDATA 'Programs\Roomler\roomlerd.exe'
           if (Test-Path $exe) { throw "$exe survived install.ps1 -Uninstall" }
 
-          # 3. per-Machine + SystemContext: the newest release, then a hand-run
-          #    upgrade to this branch with NO property, which must keep the switch.
+          # 3. per-Machine + SystemContext: the newest release at or below this
+          #    build, then a hand-run upgrade to this branch with NO property,
+          #    which must keep the switch.
           Invoke-Msi '/i' (Save-Msi $newest 'pm') (Join-Path $logDir 'fr133-newest-permachine.log') 'ENABLE_SYSTEM_CONTEXT=1'
           Wait-Running "$($newest.tag_name) per-Machine"
           if (-not (Get-Swap)) { throw "$($newest.tag_name) per-Machine installed with ENABLE_SYSTEM_CONTEXT=1, but the swap is off" }
@@ -1578,10 +1579,11 @@ jobs:
           if (Get-Service Roomler -ErrorAction SilentlyContinue) { throw 'the Roomler service survived install.ps1 -Uninstall' }
           Write-Host 'FR-133 P1: each upgrade left one entry under the new name, and install.ps1 -Uninstall removed both names'
 
-      # The MSIs the step above built one version above the newest release: what
-      # a vmtest field cell installs over a released one. CI builds, unsigned:
-      # never ship them. Not on a master push: nobody field-tests those, and at
-      # 40 MB a run they would only fill the account's Actions storage.
+      # The MSIs the step above built one version above the newest release at
+      # or below this build: what a vmtest field cell installs over that
+      # release. CI builds, unsigned: never ship them. Not on a master push:
+      # nobody field-tests those, and at 40 MB a run they would only fill the
+      # account's Actions storage.
       - name: Upload this branch's MSIs (FR-133 field cell)
         if: ${{ !cancelled() && github.event_name != 'push' }}
         uses: actions/upload-artifact@v4
@@ -2111,8 +2113,8 @@ jobs:
           printf '%s\n' "$pkg_lines" | sed 's/^.*postinstall: /    /' | tail -3
           [ -n "$pkg_lines" ] \
             || { echo "::error::no install said it skipped the helper for the opt-out marker"; exit 1; }
-          # The helper spaces its runs 60 s apart (launchd's ThrottleInterval
-          # twin) and a first run has no stamp yet, so this waits about 60 s.
+          # The helper's own 60 s run spacing is Linux-only (launchd's
+          # ThrottleInterval spaces it here), so a run by hand answers at once.
           echo "--- the update helper, run once by hand ---"
           rc=0
           out="$(sudo env RUST_LOG=info NO_COLOR=1 \
@@ -2284,12 +2286,13 @@ jobs:
           # to the legacy name, marker and all, so the migration still runs, and
           # it must carry the opt-out across too. Both readers of the marker
           # dual-read, so the live channel stays shut throughout.
-          # RETIRED-NAME-ANCHOR(2): the migration SOURCE, seeded on purpose.
           "$BUNDLE_CHECK"
+          # RETIRED-NAME-ANCHOR(4): the migration SOURCE, seeded on purpose.
           test ! -e /etc/roomler-agent \
             || { echo "::error::/etc/roomler-agent exists before the migration is seeded"; exit 1; }
-          sudo mv /etc/roomler /etc/roomler-agent
-          sudo touch /etc/roomler-agent/enable-daemon
+          sudo mv /etc/roomler /etc/roomler-agent \
+            && sudo touch /etc/roomler-agent/enable-daemon \
+            || { echo "::error::could not seed the migration source (the config folder under its legacy name, enable-daemon in it)"; exit 1; }
           sudo installer -verbose -pkg dist/smoke.pkg -target /
           dump_log
           test -f /Library/LaunchDaemons/com.roomler.daemon.plist \
@@ -2354,14 +2357,15 @@ jobs:
           fi
 
           echo "=== a helper loaded while the marker is set: it runs once and exits on the marker ==="
-          sudo cp /Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist "$plist"
-          sudo chown root:wheel "$plist"
-          sudo chmod 644 "$plist"
-          sudo mkdir -p /var/log/roomler
-          sudo launchctl bootstrap system "$plist"
-          # RunAtLoad starts it at once; it may first wait out its 60 s run
-          # spacing. The removal below waits only 10 s for an idle job, so wait
-          # here until it has run and is idle.
+          sudo cp /Library/Roomler/roomlerd.app/Contents/Resources/com.roomler.update.plist "$plist" \
+            && sudo chown root:wheel "$plist" \
+            && sudo chmod 644 "$plist" \
+            && sudo mkdir -p /var/log/roomler \
+            && sudo launchctl bootstrap system "$plist" \
+            || { echo "::error::could not place and load the bundle's update helper plist by hand"; exit 1; }
+          # RunAtLoad starts it at once, and on macOS the helper keeps no run
+          # spacing of its own. The removal below waits only 10 s for an idle
+          # job, so wait here until it has run and is idle.
           idle=0
           for _ in $(seq 1 60); do
             state=$(sudo launchctl print system/com.roomler.update 2>/dev/null || true)
@@ -2405,8 +2409,9 @@ jobs:
           fi
           echo "  opt-out removes the helper"
           # Back at the current path for the steps that follow.
-          sudo mv /etc/roomler-agent/disable-auto-update /etc/roomler/disable-auto-update
-          sudo rmdir /etc/roomler-agent
+          sudo mv /etc/roomler-agent/disable-auto-update /etc/roomler/disable-auto-update \
+            && sudo rmdir /etc/roomler-agent \
+            || { echo "::error::could not move the opt-out marker back to /etc/roomler and remove the legacy folder"; exit 1; }
 
       # A rewrite that fails over a login item of the person's: the script keeps
       # the item that is there, still loads it, and says so in a WARNING
